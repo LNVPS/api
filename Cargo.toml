@@ -1,0 +1,16 @@
+[package]
+name = "lnvps"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+http = "1.1.0"
+proxmox-client = { git = "https://github.com/proxmox/proxmox-rs", version = "0.3.1", features = ["hyper-client"] }
+proxmox-login = { git = "https://github.com/proxmox/proxmox-rs", version = "0.1.1" }
+tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
+anyhow = "1.0.83"
+log = "0.4.21"
+config = "0.14.0"
+pretty_env_logger = "0.5.0"
