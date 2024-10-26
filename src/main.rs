@@ -1,23 +1,29 @@
 use std::default;
-
+use config::{Config, ConfigBuilder};
 use log::info;
 use proxmox_client::{AuthenticationKind, HttpApiClient, TlsOptions, Token};
+use crate::settings::Settings;
+
+mod settings;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     pretty_env_logger::init();
 
-    let addr = "https://10.97.0.234:8006/";
-    let url = addr.parse().unwrap();
+    let config: Settings = Config::builder()
+        .add_source("config.toml")
+        .build()?.try_deserialize()?;
+
     let client = proxmox_client::Client::with_options(
-        url,
+        config.server,
         TlsOptions::Insecure,
         Default::default())?;
 
     client.set_authentication(AuthenticationKind::Token(Token {
-        userid: "root@pam!test-dev".to_string(),
+        userid: config.token_id.clone(),
         prefix: "PVEAPIToken".to_string(),
-        value: "e2d8d39f-63ce-48f0-a025-b428d29a26e3".to_string(),
+        value: config.secret.clone(),
+        perl_compat: false,
     }));
 
     let rsp = client.get("/api2/json/version").await?;

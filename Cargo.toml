@@ -7,10 +7,10 @@ edition = "2021"
 
 [dependencies]
 http = "1.1.0"
-proxmox-client = { git = "https://github.com/proxmox/proxmox-rs", version = "0.3.1", features = ["hyper-client"] }
-proxmox-login = { git = "https://github.com/proxmox/proxmox-rs", version = "0.1.1" }
+proxmox-client = { git = "git://git.proxmox.com/git/proxmox.git", branch = "master", features = ["hyper-client"] }
 tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1.0.83"
 log = "0.4.21"
-config = "0.14.0"
+config = { version = "0.14.0", features = ["toml"] }
 pretty_env_logger = "0.5.0"
+serde = { version = "1.0.213", features = ["derive"] }
