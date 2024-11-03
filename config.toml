@@ -1,5 +1,2 @@
-server = "https://10.97.0.234:8006/"
-user = "root"
-realm = "pam"
-token_id = "test-dev"
-secret = "e2d8d39f-63ce-48f0-a025-b428d29a26e3"
+# MySQL database connection string
+db = "mysql://root:root@localhost:3376/lnvps"

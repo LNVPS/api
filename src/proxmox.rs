@@ -1,10 +1,8 @@
-use std::fmt::Debug;
-use std::ops::Deref;
 use anyhow::Error;
-use log::info;
-use reqwest::{Body, ClientBuilder, Request, RequestBuilder, Url};
-use serde::{Deserialize, Deserializer, Serialize};
+use reqwest::{Body, ClientBuilder, Url};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt::Debug;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ClientToken {
@@ -23,7 +21,8 @@ impl Client {
     pub fn new(base: Url) -> Self {
         let mut client = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
-            .build().expect("Failed to build client");
+            .build()
+            .expect("Failed to build client");
 
         Self {
             base,
@@ -54,38 +53,50 @@ impl Client {
         Ok(rsp.data)
     }
 
-    pub async fn list_vms(&self, node: &str) -> Result<Vec<VmInfo>, Error> {
-        let rsp: ResponseBase<Vec<VmInfo>> = self.get(&format!("/api2/json/nodes/{}/qemu", node)).await?;
+    pub async fn list_vms(&self, node: &str, full: bool) -> Result<Vec<VmInfo>, Error> {
+        let rsp: ResponseBase<Vec<VmInfo>> =
+            self.get(&format!("/api2/json/nodes/{node}/qemu")).await?;
         Ok(rsp.data)
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
-        let rsp = self.client
+        Ok(self
+            .client
             .get(self.base.join(path)?)
-            .header("Authorization", format!("PVEAPIToken={}", self.token.password))
-            .send().await?
-            .error_for_status()?;
-        let text = rsp.text().await?;
-        info!("{}->{}", path, text);
-        Ok(serde_json::from_str(&text)?)
+            .header(
+                "Authorization",
+                format!("PVEAPIToken={}", self.token.password),
+            )
+            .send()
+            .await?
+            .json::<T>()
+            .await
+            .map_err(|e| Error::new(e))?)
     }
 
-    async fn post<T: DeserializeOwned, R: Into<Body>>(&self, path: &str, body: R) -> Result<T, Error> {
-        Ok(
-            self.client
-                .post(self.base.join(path)?)
-                .header("Authorization", format!("PVEAPIToken={}", self.token.password))
-                .body(body)
-                .send().await?
-                .error_for_status()?
-                .json().await?
-        )
+    async fn post<T: DeserializeOwned, R: Into<Body>>(
+        &self,
+        path: &str,
+        body: R,
+    ) -> Result<T, Error> {
+        Ok(self
+            .client
+            .post(self.base.join(path)?)
+            .header(
+                "Authorization",
+                format!("PVEAPIToken={}", self.token.password),
+            )
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 }
 
 #[derive(Deserialize)]
-pub struct ResponseBase<T>
-{
+pub struct ResponseBase<T> {
     pub data: T,
 }
 
@@ -132,4 +143,12 @@ pub struct VmInfo {
     pub status: VmStatus,
     #[serde(rename = "vmid")]
     pub vm_id: i32,
+    pub cpus: Option<u16>,
+    #[serde(rename = "maxdisk")]
+    pub max_disk: Option<u64>,
+    #[serde(rename = "maxmem")]
+    pub max_mem: Option<u64>,
+    pub name: Option<String>,
+    pub tags: Option<String>,
+    pub uptime: Option<u64>,
 }

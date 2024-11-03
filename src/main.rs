@@ -1,32 +1,26 @@
-use config::{Config, File};
-use log::info;
-use crate::proxmox::{Client, VersionResponse};
+use crate::provisioner::Provisioner;
 use crate::settings::Settings;
+use config::{Config, File};
+use sqlx::MySqlPool;
 
-mod settings;
+mod db;
+mod provisioner;
 mod proxmox;
+mod settings;
+mod vm;
 
-#[tokio::main]
+#[rocket::main]
 async fn main() -> Result<(), anyhow::Error> {
     pretty_env_logger::init();
 
     let config: Settings = Config::builder()
         .add_source(File::with_name("config.toml"))
-        .build()?.try_deserialize()?;
+        .build()?
+        .try_deserialize()?;
 
-    let client = Client::new(config.server.parse()?)
-        .with_api_token(
-            &config.user,
-            &config.realm,
-            &config.token_id,
-            &config.secret,
-        );
+    let db = MySqlPool::connect(&config.db).await?;
+    sqlx::migrate!("./migrations").run(&db).await?;
+    let provisioner = Provisioner::new(db.clone());
 
-    let nodes = client.list_nodes().await.expect("Error listing nodes");
-    for n in &nodes {
-        let vms = client.list_vms(&n.name).await?;
-        for vm in &vms {
-        }
-    }
     Ok(())
 }
