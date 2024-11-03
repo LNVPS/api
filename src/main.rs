@@ -1,33 +1,32 @@
-use std::default;
-use config::{Config, ConfigBuilder};
+use config::{Config, File};
 use log::info;
-use proxmox_client::{AuthenticationKind, HttpApiClient, TlsOptions, Token};
+use crate::proxmox::{Client, VersionResponse};
 use crate::settings::Settings;
 
 mod settings;
+mod proxmox;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     pretty_env_logger::init();
 
     let config: Settings = Config::builder()
-        .add_source("config.toml")
+        .add_source(File::with_name("config.toml"))
         .build()?.try_deserialize()?;
 
-    let client = proxmox_client::Client::with_options(
-        config.server,
-        TlsOptions::Insecure,
-        Default::default())?;
+    let client = Client::new(config.server.parse()?)
+        .with_api_token(
+            &config.user,
+            &config.realm,
+            &config.token_id,
+            &config.secret,
+        );
 
-    client.set_authentication(AuthenticationKind::Token(Token {
-        userid: config.token_id.clone(),
-        prefix: "PVEAPIToken".to_string(),
-        value: config.secret.clone(),
-        perl_compat: false,
-    }));
-
-    let rsp = client.get("/api2/json/version").await?;
-    let string = String::from_utf8(rsp.body)?;
-    info!("Version: {}", string);
+    let nodes = client.list_nodes().await.expect("Error listing nodes");
+    for n in &nodes {
+        let vms = client.list_vms(&n.name).await?;
+        for vm in &vms {
+        }
+    }
     Ok(())
 }

@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-http = "1.1.0"
-proxmox-client = { git = "git://git.proxmox.com/git/proxmox.git", branch = "master", features = ["hyper-client"] }
 tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1.0.83"
 log = "0.4.21"
 config = { version = "0.14.0", features = ["toml"] }
 pretty_env_logger = "0.5.0"
 serde = { version = "1.0.213", features = ["derive"] }
+reqwest = { version = "0.12.8", features = ["json"] }
+serde_json = "1.0.132"
