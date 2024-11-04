@@ -75,6 +75,7 @@ create table vm_payment
 	expires timestamp not null,
 	amount bigint unsigned not null,
 	invoice varchar(2048) not null,
+	time_value integer unsigned not null,
 	is_paid bit(1) not null,
 
     constraint fk_vm_payment_vm foreign key (vm_id) references vm (id)

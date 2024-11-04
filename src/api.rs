@@ -4,7 +4,7 @@ use crate::provisioner::Provisioner;
 use anyhow::Error;
 use rocket::serde::json::Json;
 use rocket::{get, routes, Responder, Route, State};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub fn routes() -> Vec<Route> {
     routes![v1_list_vms]

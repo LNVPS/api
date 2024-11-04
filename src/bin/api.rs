@@ -1,22 +1,16 @@
-extern crate core;
-
-use crate::cors::CORS;
-use crate::provisioner::Provisioner;
-use crate::settings::Settings;
 use anyhow::Error;
 use config::{Config, File};
+use lnvps::api;
+use lnvps::cors::CORS;
+use lnvps::provisioner::Provisioner;
 use log::error;
-use rocket::routes;
-use sqlx::MySqlPool;
+use serde::{Deserialize, Serialize};
+use sqlx::{Executor, MySqlPool};
 
-mod api;
-mod cors;
-mod db;
-mod nip98;
-mod provisioner;
-mod proxmox;
-mod settings;
-mod vm;
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Settings {
+    pub db: String,
+}
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
@@ -28,8 +22,14 @@ async fn main() -> Result<(), Error> {
         .try_deserialize()?;
 
     let db = MySqlPool::connect(&config.db).await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
-    let provisioner = Provisioner::new(db);
+    sqlx::migrate!().run(&db).await?;
+    let provisioner = Provisioner::new(db.clone());
+    #[cfg(debug_assertions)]
+    {
+        let setup_script = include_str!("../../dev_setup.sql");
+        db.execute(setup_script).await?;
+        provisioner.auto_discover().await?;
+    }
 
     if let Err(e) = rocket::build()
         .attach(CORS)

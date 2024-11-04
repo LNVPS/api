@@ -1,43 +1,32 @@
 use anyhow::Error;
 use reqwest::{Body, ClientBuilder, Url};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::Deserialize;
 use std::fmt::Debug;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct ClientToken {
-    username: String,
-    realm: String,
-    password: String,
-}
-
-pub struct Client {
+pub struct ProxmoxClient {
     base: Url,
-    token: ClientToken,
+    token: String,
     client: reqwest::Client,
 }
 
-impl Client {
+impl ProxmoxClient {
     pub fn new(base: Url) -> Self {
-        let mut client = ClientBuilder::new()
+        let client = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
             .build()
             .expect("Failed to build client");
 
         Self {
             base,
-            token: ClientToken::default(),
+            token: String::new(),
             client,
         }
     }
 
-    pub fn with_api_token(mut self, user: &str, realm: &str, token_id: &str, secret: &str) -> Self {
+    pub fn with_api_token(mut self, token: &str) -> Self {
         // PVEAPIToken=USER@REALM!TOKENID=UUID
-        self.token = ClientToken {
-            username: user.to_string(),
-            realm: realm.to_string(),
-            password: format!("{}@{}!{}={}", user, realm, token_id, secret),
-        };
+        self.token = token.to_string();
         self
     }
 
@@ -58,15 +47,16 @@ impl Client {
             self.get(&format!("/api2/json/nodes/{node}/qemu")).await?;
         Ok(rsp.data)
     }
+    pub async fn list_storage(&self) -> Result<Vec<NodeStorage>, Error> {
+        let rsp: ResponseBase<Vec<NodeStorage>> = self.get("/api2/json/storage").await?;
+        Ok(rsp.data)
+    }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
         Ok(self
             .client
             .get(self.base.join(path)?)
-            .header(
-                "Authorization",
-                format!("PVEAPIToken={}", self.token.password),
-            )
+            .header("Authorization", format!("PVEAPIToken={}", self.token))
             .send()
             .await?
             .json::<T>()
@@ -82,10 +72,7 @@ impl Client {
         Ok(self
             .client
             .post(self.base.join(path)?)
-            .header(
-                "Authorization",
-                format!("PVEAPIToken={}", self.token.password),
-            )
+            .header("Authorization", format!("PVEAPIToken={}", self.token))
             .body(body)
             .send()
             .await?
@@ -151,4 +138,30 @@ pub struct VmInfo {
     pub name: Option<String>,
     pub tags: Option<String>,
     pub uptime: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageType {
+    LVMThin,
+    Dir,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageContent {
+    Images,
+    RootDir,
+    Backup,
+    ISO,
+    VZTmpL,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeStorage {
+    pub storage: String,
+    #[serde(rename = "type")]
+    pub kind: Option<StorageType>,
+    #[serde(rename = "thinpool")]
+    pub thin_pool: Option<String>,
 }

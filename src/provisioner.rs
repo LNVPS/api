@@ -1,6 +1,9 @@
 use crate::db;
+use crate::db::{VmHost, VmHostDisk};
+use crate::host::proxmox::ProxmoxClient;
 use crate::vm::VMSpec;
 use anyhow::Error;
+use log::{info, warn};
 use sqlx::{MySqlPool, Row};
 
 #[derive(Debug, Clone)]
@@ -11,6 +14,47 @@ pub struct Provisioner {
 impl Provisioner {
     pub fn new(db: MySqlPool) -> Self {
         Self { db }
+    }
+
+    /// Auto-discover resources
+    pub async fn auto_discover(&self) -> Result<(), Error> {
+        let hosts = self.list_hosts().await?;
+        for host in hosts {
+            let api = ProxmoxClient::new(host.ip.parse()?).with_api_token(&host.api_token);
+
+            let nodes = api.list_nodes().await?;
+            if let Some(node) = nodes.iter().find(|n| n.name == host.name) {
+                // Update host resources
+                if node.max_cpu.unwrap_or(host.cpu) != host.cpu
+                    || node.max_mem.unwrap_or(host.memory) != host.memory
+                {
+                    let mut host = host.clone();
+                    host.cpu = node.max_cpu.unwrap_or(host.cpu);
+                    host.memory = node.max_mem.unwrap_or(host.memory);
+                    info!("Patching host: {:?}", host);
+                    self.update_host(host).await?;
+                }
+                // Update disk info
+                let storages = api.list_storage().await?;
+                let host_disks = self.list_host_disks(host.id).await?;
+                for storage in storages {
+                    let host_storage =
+                        if let Some(s) = host_disks.iter().find(|d| d.name == storage.storage) {
+                            s
+                        } else {
+                            warn!("Disk not found: {} on {}", storage.storage, host.name);
+                            continue;
+                        };
+                }
+            }
+            info!(
+                "Discovering resources from: {} v{}",
+                &host.name,
+                api.version().await?.version
+            );
+        }
+
+        Ok(())
     }
 
     /// Provision a new VM
@@ -42,5 +86,34 @@ impl Provisioner {
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
+    }
+
+    /// List VM's owned by a specific user
+    pub async fn list_hosts(&self) -> Result<Vec<VmHost>, Error> {
+        sqlx::query_as("select * from vm_host")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    /// List VM's owned by a specific user
+    pub async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>, Error> {
+        sqlx::query_as("select * from vm_host_disk where host_id = ?")
+            .bind(&host_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    /// Update host resources (usually from [auto_discover])
+    pub async fn update_host(&self, host: VmHost) -> Result<(), Error> {
+        sqlx::query("update vm_host set name = ?, cpu = ?, memory = ? where id = ?")
+            .bind(&host.name)
+            .bind(&host.cpu)
+            .bind(&host.memory)
+            .bind(&host.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 }

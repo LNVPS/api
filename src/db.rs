@@ -13,13 +13,14 @@ pub struct User {
     pub created: DateTime<Utc>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::Type, Clone, Debug)]
+#[repr(u8)]
 /// The type of VM host
 pub enum VmHostKind {
-    Proxmox,
+    Proxmox = 0,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone, Debug)]
 /// A VM host
 pub struct VmHost {
     pub id: u64,
@@ -35,7 +36,7 @@ pub struct VmHost {
     pub api_token: String,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone, Debug)]
 pub struct VmHostDisk {
     pub id: u64,
     pub host_id: u64,
@@ -46,34 +47,36 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::Type, Clone, Debug)]
+#[repr(u8)]
 pub enum DiskType {
-    HDD,
-    SSD,
+    HDD = 0,
+    SSD = 1,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, sqlx::Type, Clone, Debug)]
+#[repr(u8)]
 pub enum DiskInterface {
-    SATA,
-    SCSI,
-    PCIe,
+    SATA = 0,
+    SCSI = 1,
+    PCIe = 2,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone, Debug)]
 pub struct VmOsImage {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone, Debug)]
 pub struct IpRange {
     pub id: u64,
     pub cidr: String,
     pub enabled: bool,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, Clone, Debug)]
 pub struct Vm {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
