@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
+use rocket::serde::Serialize;
+use sqlx::FromRow;
 
+#[derive(Serialize, FromRow)]
 /// Users who buy VM's
 pub struct User {
     /// Unique ID of this user (database generated)
@@ -10,11 +13,13 @@ pub struct User {
     pub created: DateTime<Utc>,
 }
 
+#[derive(Serialize)]
 /// The type of VM host
 pub enum VmHostKind {
     Proxmox,
 }
 
+#[derive(Serialize, FromRow)]
 /// A VM host
 pub struct VmHost {
     pub id: u64,
@@ -30,6 +35,7 @@ pub struct VmHost {
     pub api_token: String,
 }
 
+#[derive(Serialize, FromRow)]
 pub struct VmHostDisk {
     pub id: u64,
     pub host_id: u64,
@@ -40,29 +46,34 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
+#[derive(Serialize)]
 pub enum DiskType {
     HDD,
     SSD,
 }
 
+#[derive(Serialize)]
 pub enum DiskInterface {
     SATA,
     SCSI,
     PCIe,
 }
 
+#[derive(Serialize, FromRow)]
 pub struct VmOsImage {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
 }
 
+#[derive(Serialize, FromRow)]
 pub struct IpRange {
     pub id: u64,
     pub cidr: String,
     pub enabled: bool,
 }
 
+#[derive(Serialize, FromRow)]
 pub struct Vm {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
