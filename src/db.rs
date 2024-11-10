@@ -77,6 +77,19 @@ pub struct IpRange {
 }
 
 #[derive(Serialize, FromRow, Clone, Debug)]
+pub struct VmTemplate {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk_size: u64,
+    pub disk_id: u64,
+}
+
+#[derive(Serialize, FromRow, Clone, Debug)]
 pub struct Vm {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
