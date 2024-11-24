@@ -1,24 +1,27 @@
-use crate::db;
-use crate::db::{VmHost, VmHostDisk};
-use crate::host::proxmox::ProxmoxClient;
-use crate::vm::VMSpec;
-use anyhow::{Error, Result};
+use crate::host::proxmox::{CreateVm, ProxmoxClient, VmBios};
+use anyhow::{bail, Result};
+use lnvps_db::{LNVpsDb, Vm, VmTemplate};
 use log::{info, warn};
-use sqlx::{MySqlPool, Row};
+use rocket::async_trait;
 
-#[derive(Debug, Clone)]
-pub struct Provisioner {
-    db: MySqlPool,
+#[async_trait]
+pub trait Provisioner: Send + Sync {
+    /// Provision a new VM
+    async fn provision(&self, spec: VmTemplate) -> Result<Vm>;
 }
 
-impl Provisioner {
-    pub fn new(db: MySqlPool) -> Self {
-        Self { db }
+pub struct LNVpsProvisioner {
+    db: Box<dyn LNVpsDb>,
+}
+
+impl LNVpsProvisioner {
+    pub fn new(db: impl LNVpsDb + 'static) -> Self {
+        Self { db: Box::new(db) }
     }
 
     /// Auto-discover resources
     pub async fn auto_discover(&self) -> Result<()> {
-        let hosts = self.list_hosts().await?;
+        let hosts = self.db.list_hosts().await?;
         for host in hosts {
             let api = ProxmoxClient::new(host.ip.parse()?).with_api_token(&host.api_token);
 
@@ -32,11 +35,11 @@ impl Provisioner {
                     host.cpu = node.max_cpu.unwrap_or(host.cpu);
                     host.memory = node.max_mem.unwrap_or(host.memory);
                     info!("Patching host: {:?}", host);
-                    self.update_host(host).await?;
+                    self.db.update_host(host).await?;
                 }
                 // Update disk info
                 let storages = api.list_storage().await?;
-                let host_disks = self.list_host_disks(host.id).await?;
+                let host_disks = self.db.list_host_disks(host.id).await?;
                 for storage in storages {
                     let host_storage =
                         if let Some(s) = host_disks.iter().find(|d| d.name == storage.storage) {
@@ -45,6 +48,8 @@ impl Provisioner {
                             warn!("Disk not found: {} on {}", storage.storage, host.name);
                             continue;
                         };
+
+                    // TODO: patch host storage info
                 }
             }
             info!(
@@ -56,72 +61,67 @@ impl Provisioner {
 
         Ok(())
     }
+}
 
-    /// Provision a new VM
-    pub async fn provision(&self, spec: VMSpec) -> Result<db::Vm> {
-        todo!()
-    }
+#[async_trait]
+impl Provisioner for LNVpsProvisioner {
+    async fn provision(&self, spec: VmTemplate) -> Result<Vm> {
+        let hosts = self.db.list_hosts().await?;
 
-    /// Insert/Fetch user id
-    pub async fn upsert_user(&self, pubkey: &[u8; 32]) -> Result<u64> {
-        let res = sqlx::query("insert ignore into users(pubkey) values(?) returning id")
-            .bind(pubkey.as_slice())
-            .fetch_optional(&self.db)
-            .await?;
-        match res {
-            None => sqlx::query("select id from users where pubkey = ?")
-                .bind(pubkey.as_slice())
-                .fetch_one(&self.db)
-                .await?
-                .try_get(0)
-                .map_err(Error::new),
-            Some(res) => res.try_get(0).map_err(Error::new),
+        // try any host
+        // TODO: impl resource usage based provisioning
+        for host in hosts {
+            let api = ProxmoxClient::new(host.ip.parse()?).with_api_token(&host.api_token);
+
+            let nodes = api.list_nodes().await?;
+            let node = if let Some(n) = nodes.iter().find(|n| n.name == host.name) {
+                n
+            } else {
+                continue;
+            };
+            let host_disks = self.db.list_host_disks(host.id).await?;
+            let disk_name = if let Some(d) = host_disks.first() {
+                d
+            } else {
+                continue;
+            };
+            let next_id = 101;
+            let vm_result = api
+                .create_vm(
+                    &node.name,
+                    CreateVm {
+                        vm_id: next_id,
+                        bios: Some(VmBios::OVMF),
+                        boot: Some("order=scsi0".to_string()),
+                        cores: Some(spec.cpu as i32),
+                        cpu: Some("kvm64".to_string()),
+                        memory: Some((spec.memory / 1024 / 1024).to_string()),
+                        machine: Some("q35".to_string()),
+                        scsi_hw: Some("virtio-scsi-pci".to_string()),
+                        efi_disk_0: Some(format!("{}:vm-{next_id}-efi,size=1M", &disk_name.name)),
+                        net: Some("virtio=auto,bridge=vmbr0,tag=100".to_string()),
+                        ip_config: Some(format!("ip=auto,ipv6=auto")),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+            return Ok(Vm {
+                id: 0,
+                host_id: 0,
+                user_id: 0,
+                image_id: 0,
+                template_id: 0,
+                ssh_key_id: 0,
+                created: Default::default(),
+                expires: Default::default(),
+                cpu: 0,
+                memory: 0,
+                disk_size: 0,
+                disk_id: 0,
+            });
         }
-    }
 
-    /// List VM templates
-    pub async fn list_vm_templates(&self) -> Result<Vec<db::VmTemplate>> {
-        sqlx::query_as("select * from vm_template where enabled = 1 and (expires is null or expires < now())")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
-    }
-
-    /// List VM's owned by a specific user
-    pub async fn list_vms(&self, id: u64) -> Result<Vec<db::Vm>> {
-        sqlx::query_as("select * from vm where user_id = ?")
-            .bind(&id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
-    }
-
-    /// List VM's owned by a specific user
-    pub async fn list_hosts(&self) -> Result<Vec<VmHost>> {
-        sqlx::query_as("select * from vm_host")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
-    }
-
-    /// List VM's owned by a specific user
-    pub async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>> {
-        sqlx::query_as("select * from vm_host_disk where host_id = ?")
-            .bind(&host_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
-    }
-
-    /// Update host resources (usually from [auto_discover])
-    pub async fn update_host(&self, host: VmHost) -> Result<()> {
-        sqlx::query("update vm_host set name = ?, cpu = ?, memory = ? where id = ?")
-            .bind(&host.name)
-            .bind(&host.cpu)
-            .bind(&host.memory)
-            .bind(&host.id)
-            .execute(&self.db)
-            .await?;
-        Ok(())
+        bail!("Failed to create VM")
     }
 }

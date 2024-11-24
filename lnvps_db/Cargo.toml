@@ -1,0 +1,15 @@
+[package]
+name = "lnvps_db"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["mysql"]
+mysql = ["sqlx/mysql"]
+
+[dependencies]
+anyhow = "1.0.83"
+sqlx = { version = "0.8.2", features = ["chrono", "migrate", "runtime-tokio"] }
+serde = { version = "1.0.213", features = ["derive"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+async-trait = "0.1.83"

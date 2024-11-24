@@ -1383,6 +1383,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "config",
+ "lnvps_db",
  "log",
  "nostr",
  "pretty_env_logger",
@@ -1390,8 +1391,18 @@ dependencies = [
  "rocket",
  "serde",
  "serde_json",
- "sqlx",
  "tokio",
+]
+
+[[package]]
+name = "lnvps_db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "sqlx",
 ]
 
 [[package]]
@@ -1543,10 +1554,11 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.35.0"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56db234b2e07901e372f34e9463f91590579cd8e6dbd34ed2ccc7e461e4ba639"
+checksum = "14ad56c1d9a59f4edc46b17bc64a217b38b99baefddc0080f85ad98a0855336d"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bech32",
  "bip39",

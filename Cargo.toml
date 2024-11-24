@@ -7,16 +7,16 @@ edition = "2021"
 name = "api"
 
 [dependencies]
+lnvps_db = { path = "lnvps_db" }
 tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
 anyhow = "1.0.83"
 log = "0.4.21"
-config = { version = "0.14.0", features = ["toml"] }
+config = { version = "0.14.0", features = ["yaml"] }
 pretty_env_logger = "0.5.0"
 serde = { version = "1.0.213", features = ["derive"] }
 reqwest = { version = "0.12.8", features = ["json"] }
 serde_json = "1.0.132"
-sqlx = { version = "0.8.2", features = ["mysql", "chrono", "migrate", "runtime-tokio"] }
 rocket = { version = "0.5.1", features = ["json"] }
 chrono = { version = "0.4.38", features = ["serde"] }
-nostr = { version = "0.35.0", default-features = false, features = ["std"] }
+nostr = { version = "0.36.0", default-features = false, features = ["std"] }
 base64 = "0.22.1"
