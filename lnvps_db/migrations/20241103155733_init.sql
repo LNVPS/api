@@ -6,7 +6,7 @@ create table users
     email         varchar(200),
     contact_nip4  bit(1) not null,
     contact_nip17 bit(1) not null,
-    contact_email bit(1) not null,
+    contact_email bit(1) not null
 );
 create unique index ix_user_pubkey on users (pubkey);
 create unique index ix_user_email on users (email);
@@ -55,14 +55,14 @@ create table vm_host_disk
 create table vm_os_image
 (
     id           integer unsigned not null auto_increment primary key,
-    name         varchar(200)  not null,
     distribution smallint unsigned not null,
     flavour      varchar(50)   not null,
     version      varchar(50)   not null,
     enabled      bit(1)        not null,
-    url          varchar(1024) not null,
+    release_date timestamp     not null,
+    url          varchar(1024) not null
 );
-create unique index ix_vm_os_image_name on vm_os_image (name);
+create unique index ix_vm_os_image on vm_os_image (distribution, flavour, version);
 create table ip_range
 (
     id        integer unsigned not null auto_increment primary key,
@@ -72,6 +72,7 @@ create table ip_range
 
     constraint fk_ip_range_region foreign key (region_id) references vm_host_region (id)
 );
+create unique index ix_ip_range_cidr on ip_range (cidr);
 create table vm_cost_plan
 (
     id              integer unsigned not null auto_increment primary key,

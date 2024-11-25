@@ -1,13 +1,22 @@
 use crate::nip98::Nip98Auth;
 use crate::provisioner::Provisioner;
-use anyhow::Error;
-use lnvps_db::{LNVpsDb, Vm, VmTemplate};
+use lnvps_db::hydrate::Hydrate;
+use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
 use rocket::serde::json::Json;
 use rocket::{get, post, routes, Responder, Route, State};
 use serde::{Deserialize, Serialize};
+use ssh_key::PublicKey;
 
 pub fn routes() -> Vec<Route> {
-    routes![v1_list_vms, v1_list_vm_templates, v1_provision_vm]
+    routes![
+        v1_list_vms,
+        v1_list_vm_templates,
+        v1_list_vm_images,
+        v1_list_ssh_keys,
+        v1_add_ssh_key,
+        v1_create_vm_order,
+        v1_renew_vm
+    ]
 }
 
 type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
@@ -21,6 +30,9 @@ impl<T: Serialize> ApiData<T> {
     pub fn ok(data: T) -> ApiResult<T> {
         Ok(Json::from(ApiData { data }))
     }
+    pub fn err(msg: &str) -> ApiResult<T> {
+        Err(msg.into())
+    }
 }
 
 #[derive(Responder)]
@@ -29,30 +41,86 @@ struct ApiError {
     pub error: String,
 }
 
-impl From<Error> for ApiError {
-    fn from(value: Error) -> Self {
+impl ApiError {
+    pub fn new(error: &str) -> Self {
+        Self {
+            error: error.to_owned(),
+        }
+    }
+}
+
+impl<T: ToString> From<T> for ApiError {
+    fn from(value: T) -> Self {
         Self {
             error: value.to_string(),
         }
     }
 }
 
-#[get("/api/v1/vms")]
+#[get("/api/v1/vm")]
 async fn v1_list_vms(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<Vm>> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
-    let vms = db.list_user_vms(uid).await?;
+    let mut vms = db.list_user_vms(uid).await?;
+    for vm in &mut vms {
+        vm.hydrate_up(db).await?;
+    }
+    ApiData::ok(vms)
+}
+
+#[get("/api/v1/image")]
+async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmOsImage>> {
+    let vms = db.list_os_image().await?;
     ApiData::ok(vms)
 }
 
 #[get("/api/v1/vm/templates")]
 async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmTemplate>> {
-    let vms = db.list_vm_templates().await?;
+    let mut vms = db.list_vm_templates().await?;
+    for vm in &mut vms {
+        vm.hydrate_up(db).await?;
+    }
     ApiData::ok(vms)
 }
 
+#[get("/api/v1/ssh-key")]
+async fn v1_list_ssh_keys(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+) -> ApiResult<Vec<UserSshKey>> {
+    let uid = db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+    let keys = db.list_user_ssh_key(uid).await?;
+    ApiData::ok(keys)
+}
+
+#[post("/api/v1/ssh-key", data = "<req>", format = "json")]
+async fn v1_add_ssh_key(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    req: Json<CreateSshKey>,
+) -> ApiResult<UserSshKey> {
+    let uid = db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+
+    let pk: PublicKey = req.key_data.parse()?;
+    let key_name = if !req.name.is_empty() {
+        &req.name
+    } else {
+        pk.comment()
+    };
+    let mut new_key = UserSshKey {
+        name: key_name.to_string(),
+        user_id: uid,
+        key_data: pk.to_openssh()?,
+        ..Default::default()
+    };
+    let key_id = db.insert_user_ssh_key(&new_key).await?;
+    new_key.id = key_id;
+
+    ApiData::ok(new_key)
+}
+
 #[post("/api/v1/vm", data = "<req>", format = "json")]
-async fn v1_provision_vm(
+async fn v1_create_vm_order(
     auth: Nip98Auth,
     db: &State<Box<dyn LNVpsDb>>,
     provisioner: &State<Box<dyn Provisioner>>,
@@ -62,15 +130,50 @@ async fn v1_provision_vm(
     let uid = db.upsert_user(&pubkey).await?;
 
     let req = req.0;
-    let rsp = provisioner.provision(req.into()).await?;
+    let mut rsp = provisioner
+        .provision(uid, req.template_id, req.image_id, req.ssh_key_id)
+        .await?;
+    rsp.hydrate_up(db).await?;
+
+    ApiData::ok(rsp)
+}
+
+#[get("/api/v1/vm/<id>/renew")]
+async fn v1_renew_vm(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    provisioner: &State<Box<dyn Provisioner>>,
+    id: u64,
+) -> ApiResult<VmPayment> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if uid != vm.user_id {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    let rsp = provisioner.renew(id).await?;
     ApiData::ok(rsp)
 }
 
 #[derive(Deserialize)]
-pub struct CreateVmRequest {}
+struct CreateVmRequest {
+    template_id: u64,
+    image_id: u64,
+    ssh_key_id: u64,
+}
 
-impl Into<VmTemplate> for CreateVmRequest {
-    fn into(self) -> VmTemplate {
-        todo!()
+impl From<CreateVmRequest> for VmTemplate {
+    fn from(val: CreateVmRequest) -> Self {
+        VmTemplate {
+            id: val.template_id,
+            ..Default::default()
+        }
     }
+}
+
+#[derive(Deserialize)]
+struct CreateSshKey {
+    name: String,
+    key_data: String,
 }

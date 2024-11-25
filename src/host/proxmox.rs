@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::info;
 use reqwest::{ClientBuilder, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -42,46 +43,56 @@ impl ProxmoxClient {
         Ok(rsp.data)
     }
 
+    pub async fn get_vm_status(&self, node: &str, vm_id: i32) -> Result<VmInfo> {
+        let rsp: ResponseBase<VmInfo> = self
+            .get(&format!(
+                "/api2/json/nodes/{node}/qemu/{vm_id}/status/current"
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
     pub async fn list_vms(&self, node: &str, full: bool) -> Result<Vec<VmInfo>> {
         let rsp: ResponseBase<Vec<VmInfo>> =
             self.get(&format!("/api2/json/nodes/{node}/qemu")).await?;
         Ok(rsp.data)
     }
+
     pub async fn list_storage(&self) -> Result<Vec<NodeStorage>> {
         let rsp: ResponseBase<Vec<NodeStorage>> = self.get("/api2/json/storage").await?;
         Ok(rsp.data)
     }
 
-    pub async fn create_vm(&self, node: &str, req: CreateVm) -> Result<VmInfo> {
-        let rsp: ResponseBase<VmInfo> = self
-            .post(&format!("/api2/json/nodes/{node}/qemu"), req)
+    pub async fn create_vm(&self, req: CreateVm) -> Result<VmInfo> {
+        info!("{}", serde_json::to_string_pretty(&req)?);
+        let _rsp: ResponseBase<Option<String>> = self
+            .post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
             .await?;
-        Ok(rsp.data)
+        self.get_vm_status(&req.node, req.vm_id).await
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        Ok(self
-            .client
+        self.client
             .get(self.base.join(path)?)
             .header("Authorization", format!("PVEAPIToken={}", self.token))
             .send()
             .await?
             .json::<T>()
             .await
-            .map_err(|e| anyhow::Error::new(e))?)
+            .map_err(anyhow::Error::new)
     }
 
     async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
-        Ok(self
+        let rsp = self
             .client
             .post(self.base.join(path)?)
             .header("Authorization", format!("PVEAPIToken={}", self.token))
-            .json(&body)
+            .json::<R>(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        let rsp = rsp.text().await?;
+        info!("<< {}", rsp);
+        Ok(serde_json::from_str(&rsp)?)
     }
 }
 

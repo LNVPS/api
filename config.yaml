@@ -1,2 +1,6 @@
 # MySQL database connection string
 db: "mysql://root:root@localhost:3376/lnvps"
+lnd:
+  url: "https://127.0.0.1:10003"
+  cert: "/home/kieran/.polar/networks/2/volumes/lnd/alice/tls.cert"
+  macaroon: "/home/kieran/.polar/networks/2/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"

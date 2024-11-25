@@ -18,12 +18,13 @@ pub struct User {
     pub contact_email: bool,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
 pub struct UserSshKey {
     pub id: u64,
     pub name: String,
     pub user_id: u64,
     pub created: DateTime<Utc>,
+    #[serde(skip_serializing)]
     pub key_data: String,
 
     #[sqlx(skip)]
@@ -79,24 +80,29 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type, Default)]
+#[serde(rename_all = "lowercase")]
 #[repr(u16)]
 pub enum DiskType {
+    #[default]
     HDD = 0,
     SSD = 1,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type, Default)]
+#[serde(rename_all = "lowercase")]
 #[repr(u16)]
 pub enum DiskInterface {
+    #[default]
     SATA = 0,
     SCSI = 1,
     PCIe = 2,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type, Default)]
 #[repr(u16)]
 pub enum OsDistribution {
+    #[default]
     Ubuntu = 0,
     Debian = 1,
 }
@@ -106,11 +112,12 @@ pub enum OsDistribution {
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
 pub struct VmOsImage {
     pub id: u64,
-    pub name: String,
     pub distribution: OsDistribution,
     pub flavour: String,
     pub version: String,
     pub enabled: bool,
+    pub release_date: DateTime<Utc>,
+    #[serde(skip_serializing)]
     /// URL location of cloud image
     pub url: String,
 }
@@ -124,6 +131,7 @@ pub struct IpRange {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
 #[repr(u16)]
 pub enum VmCostPlanIntervalType {
     Day = 0,
@@ -144,7 +152,7 @@ pub struct VmCostPlan {
 
 /// Offers.
 /// These are the same as the offers visible to customers
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
 pub struct VmTemplate {
     pub id: u64,
     pub name: String,
@@ -154,6 +162,7 @@ pub struct VmTemplate {
     pub expires: Option<DateTime<Utc>>,
     pub cpu: u16,
     pub memory: u64,
+    pub disk_size: u64,
     pub disk_type: DiskType,
     pub disk_interface: DiskInterface,
     pub cost_plan_id: u64,
@@ -167,7 +176,7 @@ pub struct VmTemplate {
     pub region: Option<VmHostRegion>,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
 pub struct Vm {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
@@ -193,6 +202,19 @@ pub struct Vm {
     pub disk_size: u64,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
+
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<VmOsImage>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<VmTemplate>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<UserSshKey>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payments: Option<Vec<VmPayment>>,
 }
 
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]

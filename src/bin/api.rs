@@ -1,15 +1,25 @@
 use anyhow::Error;
 use config::{Config, File};
+use fedimint_tonic_lnd::connect;
 use lnvps::api;
 use lnvps::cors::CORS;
 use lnvps::provisioner::{LNVpsProvisioner, Provisioner};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Settings {
     pub db: String,
+    pub lnd: LndConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LndConfig {
+    pub url: String,
+    pub cert: PathBuf,
+    pub macaroon: PathBuf,
 }
 
 #[rocket::main]
@@ -24,7 +34,8 @@ async fn main() -> Result<(), Error> {
     let db = LNVpsDbMysql::new(&config.db).await?;
     db.migrate().await?;
 
-    let provisioner = LNVpsProvisioner::new(db.clone());
+    let lnd = connect(config.lnd.url, config.lnd.cert, config.lnd.macaroon).await?;
+    let provisioner = LNVpsProvisioner::new(db.clone(), lnd.clone());
     #[cfg(debug_assertions)]
     {
         let setup_script = include_str!("../../dev_setup.sql");

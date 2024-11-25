@@ -25,11 +25,11 @@ impl LNVpsDbMysql {
 
 #[async_trait]
 impl LNVpsDb for LNVpsDbMysql {
-    async fn migrate(&self) -> anyhow::Result<()> {
+    async fn migrate(&self) -> Result<()> {
         sqlx::migrate!().run(&self.db).await.map_err(Error::new)
     }
 
-    async fn upsert_user(&self, pubkey: &[u8; 32]) -> anyhow::Result<u64> {
+    async fn upsert_user(&self, pubkey: &[u8; 32]) -> Result<u64> {
         let res = sqlx::query("insert ignore into users(pubkey) values(?) returning id")
             .bind(pubkey.as_slice())
             .fetch_optional(&self.db)
@@ -46,7 +46,11 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn get_user(&self, id: u64) -> Result<User> {
-        todo!()
+        sqlx::query_as("select * from users where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn update_user(&self, user: &User) -> Result<()> {
@@ -57,12 +61,23 @@ impl LNVpsDb for LNVpsDbMysql {
         todo!()
     }
 
-    async fn insert_user_ssh_key(&self, new_key: UserSshKey) -> Result<u64> {
-        todo!()
+    async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> Result<u64> {
+        Ok(sqlx::query("insert into user_ssh_key(name,user_id,key_data) values(?, ?, ?) returning id")
+            .bind(&new_key.name)
+            .bind(&new_key.user_id)
+            .bind(&new_key.key_data)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
     }
 
     async fn get_user_ssh_key(&self, id: u64) -> Result<UserSshKey> {
-        todo!()
+        sqlx::query_as("select * from user_ssh_key where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn delete_user_ssh_key(&self, id: u64) -> Result<()> {
@@ -70,21 +85,29 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_user_ssh_key(&self, user_id: u64) -> Result<Vec<UserSshKey>> {
-        todo!()
+        sqlx::query_as("select * from user_ssh_key where user_id = ?")
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn get_host_region(&self, id: u64) -> Result<VmHostRegion> {
-        todo!()
+        sqlx::query_as("select * from vm_host_region where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
-    async fn list_hosts(&self) -> anyhow::Result<Vec<VmHost>> {
+    async fn list_hosts(&self) -> Result<Vec<VmHost>> {
         sqlx::query_as("select * from vm_host")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
     }
 
-    async fn update_host(&self, host: VmHost) -> anyhow::Result<()> {
+    async fn update_host(&self, host: &VmHost) -> Result<()> {
         sqlx::query("update vm_host set name = ?, cpu = ?, memory = ? where id = ?")
             .bind(&host.name)
             .bind(&host.cpu)
@@ -95,7 +118,7 @@ impl LNVpsDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn list_host_disks(&self, host_id: u64) -> anyhow::Result<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>> {
         sqlx::query_as("select * from vm_host_disk where host_id = ?")
             .bind(&host_id)
             .fetch_all(&self.db)
@@ -103,20 +126,46 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn get_os_image(&self, id: u64) -> Result<VmOsImage> {
+        sqlx::query_as("select * from vm_os_image where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn list_os_image(&self) -> Result<Vec<VmOsImage>> {
-        todo!()
+        sqlx::query_as("select * from vm_os_image")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn list_ip_range(&self) -> Result<Vec<IpRange>> {
-        todo!()
+        sqlx::query_as("select * from ip_range")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn get_cost_plan(&self, id: u64) -> Result<VmCostPlan> {
-        todo!()
+        sqlx::query_as("select * from vm_cost_plan where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
-    async fn list_vm_templates(&self) -> anyhow::Result<Vec<VmTemplate>> {
-        sqlx::query_as("select * from vm_template where enabled = 1 and (expires is null or expires > now())")
+    async fn get_vm_template(&self, id: u64) -> Result<VmTemplate> {
+        sqlx::query_as("select * from vm_template where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_vm_templates(&self) -> Result<Vec<VmTemplate>> {
+        sqlx::query_as("select * from vm_template")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
@@ -130,23 +179,71 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn insert_vm(&self, vm: Vm) -> Result<u64> {
-        todo!()
+    async fn get_vm(&self, vm_id: u64) -> Result<Vm> {
+        sqlx::query_as("select * from vm where id = ?")
+            .bind(&vm_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,cpu,memory,disk_size,disk_id) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+            .bind(&vm.host_id)
+            .bind(&vm.user_id)
+            .bind(&vm.image_id)
+            .bind(&vm.template_id)
+            .bind(&vm.ssh_key_id)
+            .bind(&vm.created)
+            .bind(&vm.expires)
+            .bind(&vm.cpu)
+            .bind(&vm.memory)
+            .bind(&vm.disk_size)
+            .bind(&vm.disk_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
     }
 
     async fn get_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        todo!()
+        sqlx::query_as("select * from vm_ip_assignment where vm_id=?")
+            .bind(vm_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>> {
-        todo!()
+        sqlx::query_as("select * from vm_payment where vm_id=?")
+            .bind(vm_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
-    async fn insert_vm_payment(&self, vm_payment: VmPayment) -> Result<u64> {
-        todo!()
+    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<u64> {
+        Ok(sqlx::query("insert into vm_payment(vm_id,created,expires,amount,invoice,time_value,is_paid) values(?,?,?,?,?,?,?) returning id")
+            .bind(&vm_payment.vm_id)
+            .bind(&vm_payment.created)
+            .bind(&vm_payment.expires)
+            .bind(&vm_payment.amount)
+            .bind(&vm_payment.invoice)
+            .bind(&vm_payment.time_value)
+            .bind(&vm_payment.is_paid)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
     }
 
-    async fn update_vm_payment(&self, vm_payment: VmPayment) -> Result<()> {
-        todo!()
+    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
+        sqlx::query("update vm_payment set is_paid = ? where id = ?")
+            .bind(&vm_payment.is_paid)
+            .bind(&vm_payment.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
     }
 }
