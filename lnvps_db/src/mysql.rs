@@ -1,4 +1,7 @@
-use crate::{IpRange, LNVpsDb, User, UserSshKey, Vm, VmCostPlan, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
+use crate::{
+    IpRange, LNVpsDb, User, UserSshKey, Vm, VmCostPlan, VmHost, VmHostDisk, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, Row};
@@ -11,9 +14,7 @@ pub struct LNVpsDbMysql {
 impl LNVpsDbMysql {
     pub async fn new(conn: &str) -> Result<Self> {
         let db = MySqlPool::connect(conn).await?;
-        Ok(Self {
-            db
-        })
+        Ok(Self { db })
     }
 
     #[cfg(debug_assertions)]
@@ -62,14 +63,16 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> Result<u64> {
-        Ok(sqlx::query("insert into user_ssh_key(name,user_id,key_data) values(?, ?, ?) returning id")
-            .bind(&new_key.name)
-            .bind(&new_key.user_id)
-            .bind(&new_key.key_data)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
-            .try_get(0)?)
+        Ok(sqlx::query(
+            "insert into user_ssh_key(name,user_id,key_data) values(?, ?, ?) returning id",
+        )
+        .bind(&new_key.name)
+        .bind(new_key.user_id)
+        .bind(&new_key.key_data)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::new)?
+        .try_get(0)?)
     }
 
     async fn get_user_ssh_key(&self, id: u64) -> Result<UserSshKey> {
@@ -109,7 +112,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn get_host(&self, id: u64) -> Result<VmHost> {
         sqlx::query_as("select * from vm_host where id = ?")
-            .bind(&id)
+            .bind(id)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
@@ -118,9 +121,9 @@ impl LNVpsDb for LNVpsDbMysql {
     async fn update_host(&self, host: &VmHost) -> Result<()> {
         sqlx::query("update vm_host set name = ?, cpu = ?, memory = ? where id = ?")
             .bind(&host.name)
-            .bind(&host.cpu)
-            .bind(&host.memory)
-            .bind(&host.id)
+            .bind(host.cpu)
+            .bind(host.memory)
+            .bind(host.id)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -128,7 +131,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>> {
         sqlx::query_as("select * from vm_host_disk where host_id = ?")
-            .bind(&host_id)
+            .bind(host_id)
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
@@ -188,7 +191,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn list_user_vms(&self, id: u64) -> Result<Vec<Vm>> {
         sqlx::query_as("select * from vm where user_id = ?")
-            .bind(&id)
+            .bind(id)
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
@@ -196,7 +199,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn get_vm(&self, vm_id: u64) -> Result<Vm> {
         sqlx::query_as("select * from vm where id = ?")
-            .bind(&vm_id)
+            .bind(vm_id)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
@@ -204,17 +207,17 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
         Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,cpu,memory,disk_size,disk_id) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
-            .bind(&vm.host_id)
-            .bind(&vm.user_id)
-            .bind(&vm.image_id)
-            .bind(&vm.template_id)
-            .bind(&vm.ssh_key_id)
-            .bind(&vm.created)
-            .bind(&vm.expires)
-            .bind(&vm.cpu)
-            .bind(&vm.memory)
-            .bind(&vm.disk_size)
-            .bind(&vm.disk_id)
+            .bind(vm.host_id)
+            .bind(vm.user_id)
+            .bind(vm.image_id)
+            .bind(vm.template_id)
+            .bind(vm.ssh_key_id)
+            .bind(vm.created)
+            .bind(vm.expires)
+            .bind(vm.cpu)
+            .bind(vm.memory)
+            .bind(vm.disk_size)
+            .bind(vm.disk_id)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)?
@@ -222,14 +225,16 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64> {
-        Ok(sqlx::query("insert into vm_ip_assignment(vm_id,ip_range_id,ip) values(?, ?, ?) returning id")
-            .bind(&ip_assignment.vm_id)
-            .bind(&ip_assignment.ip_range_id)
-            .bind(&ip_assignment.ip)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
-            .try_get(0)?)
+        Ok(sqlx::query(
+            "insert into vm_ip_assignment(vm_id,ip_range_id,ip) values(?, ?, ?) returning id",
+        )
+        .bind(ip_assignment.vm_id)
+        .bind(ip_assignment.ip_range_id)
+        .bind(&ip_assignment.ip)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::new)?
+        .try_get(0)?)
     }
 
     async fn list_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
@@ -257,15 +262,16 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,invoice,time_value,is_paid) values(?,?,?,?,?,?,?,?)")
+        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,invoice,time_value,is_paid,rate) values(?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
-            .bind(&vm_payment.vm_id)
-            .bind(&vm_payment.created)
-            .bind(&vm_payment.expires)
-            .bind(&vm_payment.amount)
+            .bind(vm_payment.vm_id)
+            .bind(vm_payment.created)
+            .bind(vm_payment.expires)
+            .bind(vm_payment.amount)
             .bind(&vm_payment.invoice)
-            .bind(&vm_payment.time_value)
-            .bind(&vm_payment.is_paid)
+            .bind(vm_payment.time_value)
+            .bind(vm_payment.is_paid)
+            .bind(vm_payment.rate)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
@@ -274,7 +280,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn get_vm_payment(&self, id: &Vec<u8>) -> Result<VmPayment> {
         sqlx::query_as("select * from vm_payment where id=?")
-            .bind(&id)
+            .bind(id)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
@@ -282,7 +288,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn update_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
         sqlx::query("update vm_payment set is_paid = ? where id = ?")
-            .bind(&vm_payment.is_paid)
+            .bind(vm_payment.is_paid)
             .bind(&vm_payment.id)
             .execute(&self.db)
             .await
@@ -298,14 +304,14 @@ impl LNVpsDb for LNVpsDbMysql {
         let mut tx = self.db.begin().await?;
 
         sqlx::query("update vm_payment set is_paid = true, settle_index = ? where id = ?")
-            .bind(&vm_payment.settle_index)
+            .bind(vm_payment.settle_index)
             .bind(&vm_payment.id)
             .execute(&mut *tx)
             .await?;
 
         sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ?")
-            .bind(&vm_payment.time_value)
-            .bind(&vm_payment.vm_id)
+            .bind(vm_payment.time_value)
+            .bind(vm_payment.vm_id)
             .execute(&mut *tx)
             .await?;
 
@@ -314,9 +320,11 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn last_paid_invoice(&self) -> Result<Option<VmPayment>> {
-        sqlx::query_as("select * from vm_payment where is_paid = true order by settle_index desc limit 1")
-            .fetch_optional(&self.db)
-            .await
-            .map_err(Error::new)
+        sqlx::query_as(
+            "select * from vm_payment where is_paid = true order by settle_index desc limit 1",
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::new)
     }
 }

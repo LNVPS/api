@@ -246,6 +246,8 @@ pub struct VmPayment {
     pub amount: u64,
     pub invoice: String,
     pub is_paid: bool,
+    /// Exchange rate
+    pub rate: f32,
 
     /// Number of seconds this payment will add to vm expiry
     #[serde(skip_serializing)]

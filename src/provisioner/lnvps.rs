@@ -1,3 +1,4 @@
+use crate::exchange::{Currency, ExchangeRateCache, Ticker};
 use crate::host::proxmox::ProxmoxClient;
 use crate::provisioner::Provisioner;
 use anyhow::{bail, Result};
@@ -21,13 +22,15 @@ use std::time::Duration;
 pub struct LNVpsProvisioner {
     db: Box<dyn LNVpsDb>,
     lnd: Client,
+    rates: ExchangeRateCache,
 }
 
 impl LNVpsProvisioner {
-    pub fn new<D: LNVpsDb + 'static>(db: D, lnd: Client) -> Self {
+    pub fn new<D: LNVpsDb + 'static>(db: D, lnd: Client, rates: ExchangeRateCache) -> Self {
         Self {
             db: Box::new(db),
             lnd,
+            rates,
         }
     }
 
@@ -155,22 +158,25 @@ impl Provisioner for LNVpsProvisioner {
                 .add(Months::new((12 * cost_plan.interval_amount) as u32)),
         };
 
-        const BTC_MILLI_SATS: u64 = 100_000_000_000;
+        const BTC_SATS: f64 = 100_000_000.0;
         const INVOICE_EXPIRE: i64 = 3600;
 
-        let cost = cost_plan.amount
-            * match cost_plan.currency.as_str() {
-                "EUR" => 1_100_000, //TODO: rates
-                "BTC" => 1,         // BTC amounts are always millisats
-                c => bail!("Unknown currency {c}"),
-            };
-        info!("Creating invoice for {vm_id} for {cost} mSats");
+        let ticker = Ticker::btc_rate(cost_plan.currency.as_str())?;
+        let rate = if let Some(r) = self.rates.get_rate(ticker).await {
+            r
+        } else {
+            bail!("No exchange rate found")
+        };
+
+        let cost_btc = cost_plan.amount as f32 / rate;
+        let cost_msat = (cost_btc as f64 * BTC_SATS) as i64 * 1000;
+        info!("Creating invoice for {vm_id} for {} sats", cost_msat / 1000);
         let mut lnd = self.lnd.clone();
         let invoice = lnd
             .lightning()
             .add_invoice(Invoice {
                 memo: format!("VM renewal {vm_id} to {new_expire}"),
-                value_msat: cost as i64,
+                value_msat: cost_msat,
                 expiry: INVOICE_EXPIRE,
                 ..Default::default()
             })
@@ -182,10 +188,11 @@ impl Provisioner for LNVpsProvisioner {
             vm_id,
             created: Utc::now(),
             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE as u64)),
-            amount: cost,
+            amount: cost_msat as u64,
             invoice: invoice.payment_request.clone(),
             time_value: (new_expire - vm.expires).num_seconds() as u64,
             is_paid: false,
+            rate,
             ..Default::default()
         };
         self.db.insert_vm_payment(&vm_payment).await?;

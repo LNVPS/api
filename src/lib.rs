@@ -6,3 +6,4 @@ pub mod nip98;
 pub mod provisioner;
 pub mod status;
 pub mod worker;
+pub mod exchange;

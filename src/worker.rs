@@ -1,3 +1,4 @@
+use crate::exchange::ExchangeRateCache;
 use crate::host::proxmox::{CreateVm, ProxmoxClient, VmBios, VmStatus};
 use crate::provisioner::lnvps::LNVpsProvisioner;
 use crate::provisioner::Provisioner;
@@ -35,9 +36,10 @@ impl Worker {
         db: D,
         lnd: Client,
         vm_state_cache: VmStateCache,
+        rates: ExchangeRateCache,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
-        let p = LNVpsProvisioner::new(db.clone(), lnd.clone());
+        let p = LNVpsProvisioner::new(db.clone(), lnd.clone(), rates);
         Self {
             read_only,
             db: Box::new(db),

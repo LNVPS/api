@@ -1,10 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub mod hydrate;
 mod model;
 #[cfg(feature = "mysql")]
 mod mysql;
-pub mod hydrate;
 
 pub use model::*;
 #[cfg(feature = "mysql")]

@@ -3,6 +3,7 @@ use config::{Config, File};
 use fedimint_tonic_lnd::connect;
 use lnvps::api;
 use lnvps::cors::CORS;
+use lnvps::exchange::ExchangeRateCache;
 use lnvps::invoice::InvoiceHandler;
 use lnvps::provisioner::lnvps::LNVpsProvisioner;
 use lnvps::provisioner::Provisioner;
@@ -42,8 +43,10 @@ async fn main() -> Result<(), Error> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
 
+
+    let exchange = ExchangeRateCache::new();
     let lnd = connect(settings.lnd.url, settings.lnd.cert, settings.lnd.macaroon).await?;
-    let provisioner = LNVpsProvisioner::new(db.clone(), lnd.clone());
+    let provisioner = LNVpsProvisioner::new(db.clone(), lnd.clone(), exchange.clone());
     #[cfg(debug_assertions)]
     {
         let setup_script = include_str!("../../dev_setup.sql");
@@ -52,7 +55,7 @@ async fn main() -> Result<(), Error> {
     }
 
     let status = VmStateCache::new();
-    let mut worker = Worker::new(settings.read_only, db.clone(), lnd.clone(), status.clone());
+    let mut worker = Worker::new(settings.read_only, db.clone(), lnd.clone(), status.clone(), exchange.clone());
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
@@ -84,6 +87,21 @@ async fn main() -> Result<(), Error> {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
+    // refresh rates every 1min
+    let rates = exchange.clone();
+    tokio::spawn(async move {
+        loop {
+            match rates.fetch_rates().await {
+                Ok(z) => {
+                    for r in z {
+                        rates.set_rate(r.0, r.1).await;
+                    }
+                }
+                Err(e) => error!("Failed to fetch rates: {}", e)
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
 
     let db: Box<dyn LNVpsDb> = Box::new(db.clone());
     let pv: Box<dyn Provisioner> = Box::new(provisioner);
@@ -101,6 +119,7 @@ async fn main() -> Result<(), Error> {
         .manage(db)
         .manage(pv)
         .manage(status)
+        .manage(exchange)
         .mount("/", api::routes())
         .launch()
         .await
