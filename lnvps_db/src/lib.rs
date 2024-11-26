@@ -88,10 +88,10 @@ pub trait LNVpsDb: Sync + Send {
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64>;
 
     /// List VM ip assignments
-    async fn get_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>>;
+    async fn list_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>>;
 
     /// List VM ip assignments by IP range
-    async fn get_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>>;
+    async fn list_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>>;
 
     /// List payments by VM id
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>>;

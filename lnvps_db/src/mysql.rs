@@ -232,7 +232,7 @@ impl LNVpsDb for LNVpsDbMysql {
             .try_get(0)?)
     }
 
-    async fn get_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
+    async fn list_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
         sqlx::query_as("select * from vm_ip_assignment where vm_id = ?")
             .bind(vm_id)
             .fetch_all(&self.db)
@@ -240,7 +240,7 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn get_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>> {
+    async fn list_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>> {
         sqlx::query_as("select * from vm_ip_assignment where ip_range_id = ?")
             .bind(range_id)
             .fetch_all(&self.db)

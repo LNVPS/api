@@ -57,7 +57,7 @@ impl Worker {
         if self.read_only {
             bail!("Cant spawn VM's in read-only mode");
         }
-        let mut ips = self.db.get_vm_ip_assignments(vm.id).await?;
+        let mut ips = self.db.list_vm_ip_assignments(vm.id).await?;
         if ips.is_empty() {
             ips = self.provisioner.allocate_ips(vm.id).await?;
         }

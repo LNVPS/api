@@ -80,6 +80,7 @@ async fn v1_list_vms(
     let mut ret = vec![];
     for mut vm in vms {
         vm.hydrate_up(db).await?;
+        vm.hydrate_down(db).await?;
         if let Some(t) = &mut vm.template {
             t.hydrate_up(db).await?;
         }
@@ -105,6 +106,7 @@ async fn v1_get_vm(
         return ApiData::err("VM doesnt belong to you");
     }
     vm.hydrate_up(db).await?;
+    vm.hydrate_down(db).await?;
     if let Some(t) = &mut vm.template {
         t.hydrate_up(db).await?;
     }

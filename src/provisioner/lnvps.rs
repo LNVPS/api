@@ -195,7 +195,7 @@ impl Provisioner for LNVpsProvisioner {
 
     async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
         let mut vm = self.db.get_vm(vm_id).await?;
-        let ips = self.db.get_vm_ip_assignments(vm.id).await?;
+        let ips = self.db.list_vm_ip_assignments(vm.id).await?;
 
         if !ips.is_empty() {
             bail!("IP resources are already assigned");
@@ -217,7 +217,7 @@ impl Provisioner for LNVpsProvisioner {
         // TODO: pick round-robin ranges
         for range in ip_ranges {
             let range_cidr: IpNetwork = range.cidr.parse()?;
-            let ips = self.db.get_vm_ip_assignments_in_range(range.id).await?;
+            let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
             let ips: HashSet<IpAddr> = ips.iter().map(|i| i.ip.parse().unwrap()).collect();
 
             // pick an IP at random

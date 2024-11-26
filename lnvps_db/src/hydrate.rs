@@ -25,9 +25,11 @@ impl Hydrate for Vm {
     }
 
     async fn hydrate_down(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()> {
-        let payments = db.list_vm_payment(self.id).await?;
+        //let payments = db.list_vm_payment(self.id).await?;
+        let ips = db.list_vm_ip_assignments(self.id).await?;
 
-        self.payments = Some(payments);
+        //self.payments = Some(payments);
+        self.ip_assignments = Some(ips);
         Ok(())
     }
 }

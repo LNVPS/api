@@ -217,9 +217,13 @@ pub struct Vm {
     #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key: Option<UserSshKey>,
+
     #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payments: Option<Vec<VmPayment>>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_assignments: Option<Vec<VmIpAssignment>>,
 }
 
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
