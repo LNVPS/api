@@ -19,6 +19,7 @@ pub enum WorkJob {
 }
 
 pub struct Worker {
+    read_only: bool,
     db: Box<dyn LNVpsDb>,
     lnd: Client,
     provisioner: Box<dyn Provisioner>,
@@ -28,10 +29,16 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new<D: LNVpsDb + Clone + 'static>(db: D, lnd: Client, vm_state_cache: VmStateCache) -> Self {
+    pub fn new<D: LNVpsDb + Clone + 'static>(
+        read_only: bool,
+        db: D,
+        lnd: Client,
+        vm_state_cache: VmStateCache,
+    ) -> Self {
         let (tx, rx) = unbounded_channel();
         let p = LNVpsProvisioner::new(db.clone(), lnd.clone());
         Self {
+            read_only,
             db: Box::new(db),
             provisioner: Box::new(p),
             vm_state_cache,
@@ -47,6 +54,9 @@ impl Worker {
 
     /// Spawn a VM on the host
     async fn spawn_vm(&self, vm: &Vm, vm_host: &VmHost, client: &ProxmoxClient) -> Result<()> {
+        if self.read_only {
+            bail!("Cant spawn VM's in read-only mode");
+        }
         let mut ips = self.db.get_vm_ip_assignments(vm.id).await?;
         if ips.is_empty() {
             ips = self.provisioner.allocate_ips(vm.id).await?;
@@ -113,7 +123,7 @@ impl Worker {
                 let state = VmState {
                     state: match s.status {
                         VmStatus::Stopped => VmRunningState::Stopped,
-                        VmStatus::Running => VmRunningState::Running
+                        VmStatus::Running => VmRunningState::Running,
                     },
                     cpu_usage: s.cpu.unwrap_or(0.0),
                     mem_usage: s.mem.unwrap_or(0) as f32 / s.max_mem.unwrap_or(1) as f32,
@@ -138,7 +148,7 @@ impl Worker {
             match job {
                 WorkJob::CheckVm { vm_id } => {
                     if let Err(e) = self.check_vm(vm_id).await {
-                        error!("Failed to check VM {}: {:?}", vm_id, e);
+                        error!("Failed to check VM {}: {}", vm_id, e);
                     }
                 }
                 WorkJob::SendNotification { .. } => {}

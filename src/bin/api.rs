@@ -18,6 +18,7 @@ use std::time::Duration;
 pub struct Settings {
     pub db: String,
     pub lnd: LndConfig,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Error> {
     }
 
     let status = VmStateCache::new();
-    let mut worker = Worker::new(db.clone(), lnd.clone(), status.clone());
+    let mut worker = Worker::new(config.read_only, db.clone(), lnd.clone(), status.clone());
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
