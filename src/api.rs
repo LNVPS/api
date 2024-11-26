@@ -126,7 +126,7 @@ async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmT
     for vm in &mut vms {
         vm.hydrate_up(db).await?;
     }
-    let ret: Vec<VmTemplate> = vms.iter().filter(|v| v.enabled).collect();
+    let ret: Vec<VmTemplate> = vms.into_iter().filter(|v| v.enabled).collect();
     ApiData::ok(ret)
 }
 
