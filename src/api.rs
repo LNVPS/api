@@ -126,7 +126,7 @@ async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmT
     for vm in &mut vms {
         vm.hydrate_up(db).await?;
     }
-    ApiData::ok(vms)
+    ApiData::ok(vms.iter().filter(|v| v.enabled).collect())
 }
 
 #[get("/api/v1/ssh-key")]
