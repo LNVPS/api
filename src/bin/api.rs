@@ -11,11 +11,13 @@ use lnvps::worker::{WorkJob, Worker};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Settings {
+    pub listen: Option<String>,
     pub db: String,
     pub lnd: LndConfig,
     pub read_only: bool,
@@ -32,15 +34,15 @@ pub struct LndConfig {
 async fn main() -> Result<(), Error> {
     pretty_env_logger::init();
 
-    let config: Settings = Config::builder()
+    let settings: Settings = Config::builder()
         .add_source(File::with_name("config.yaml"))
         .build()?
         .try_deserialize()?;
 
-    let db = LNVpsDbMysql::new(&config.db).await?;
+    let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
 
-    let lnd = connect(config.lnd.url, config.lnd.cert, config.lnd.macaroon).await?;
+    let lnd = connect(settings.lnd.url, settings.lnd.cert, settings.lnd.macaroon).await?;
     let provisioner = LNVpsProvisioner::new(db.clone(), lnd.clone());
     #[cfg(debug_assertions)]
     {
@@ -50,7 +52,7 @@ async fn main() -> Result<(), Error> {
     }
 
     let status = VmStateCache::new();
-    let mut worker = Worker::new(config.read_only, db.clone(), lnd.clone(), status.clone());
+    let mut worker = Worker::new(settings.read_only, db.clone(), lnd.clone(), status.clone());
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
@@ -85,7 +87,16 @@ async fn main() -> Result<(), Error> {
 
     let db: Box<dyn LNVpsDb> = Box::new(db.clone());
     let pv: Box<dyn Provisioner> = Box::new(provisioner);
-    if let Err(e) = rocket::build()
+
+    let mut config = rocket::Config::default();
+    let ip: SocketAddr = match &settings.listen {
+        Some(i) => i.parse()?,
+        None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000),
+    };
+    config.address = ip.ip();
+    config.port = ip.port();
+
+    if let Err(e) = rocket::Rocket::custom(config)
         .attach(CORS)
         .manage(db)
         .manage(pv)
