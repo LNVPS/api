@@ -1,14 +1,19 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use sqlx::FromRow;
 
+#[serde_as]
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
 /// Users who buy VM's
 pub struct User {
     /// Unique ID of this user (database generated)
     pub id: u64,
+
     /// The nostr public key for this user
+    #[serde_as(as = "serde_with::hex::Hex")]
     pub pubkey: Vec<u8>,
+
     /// When this user first started using the service (first login)
     pub created: DateTime<Utc>,
 
@@ -222,16 +227,26 @@ pub struct VmIpAssignment {
     pub id: u64,
     pub vm_id: u64,
     pub ip_range_id: u64,
+    pub ip: String,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[serde_as]
+#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
 pub struct VmPayment {
-    pub id: u64,
+    /// Payment hash
+    #[serde_as(as = "serde_with::hex::Hex")]
+    pub id: Vec<u8>,
     pub vm_id: u64,
     pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
     pub amount: u64,
     pub invoice: String,
-    pub time_value: u64,
     pub is_paid: bool,
+
+    /// Number of seconds this payment will add to vm expiry
+    #[serde(skip_serializing)]
+    pub time_value: u64,
+
+    #[serde(skip_serializing)]
+    pub settle_index: Option<u64>,
 }

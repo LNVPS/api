@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use log::info;
 use reqwest::{ClientBuilder, Url};
 use serde::de::DeserializeOwned;
@@ -72,14 +72,20 @@ impl ProxmoxClient {
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.client
+        let rsp = self
+            .client
             .get(self.base.join(path)?)
             .header("Authorization", format!("PVEAPIToken={}", self.token))
             .send()
-            .await?
-            .json::<T>()
-            .await
-            .map_err(anyhow::Error::new)
+            .await?;
+        let status = rsp.status();
+        let text = rsp.text().await?;
+        info!("<< {}", text);
+        if status.is_success() {
+            Ok(serde_json::from_str(&text)?)
+        } else {
+            bail!("{}", status);
+        }
     }
 
     async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
@@ -87,12 +93,19 @@ impl ProxmoxClient {
             .client
             .post(self.base.join(path)?)
             .header("Authorization", format!("PVEAPIToken={}", self.token))
-            .json::<R>(&body)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .body(serde_json::to_string(&body)?)
             .send()
             .await?;
-        let rsp = rsp.text().await?;
-        info!("<< {}", rsp);
-        Ok(serde_json::from_str(&rsp)?)
+        let status = rsp.status();
+        let text = rsp.text().await?;
+        info!("<< {}", text);
+        if status.is_success() {
+            Ok(serde_json::from_str(&text)?)
+        } else {
+            bail!("{}", status);
+        }
     }
 }
 

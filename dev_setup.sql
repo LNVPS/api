@@ -22,8 +22,8 @@ insert
 ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
 values(5, 1,"Server","11",1,"https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw","2021-08-14");
 insert
-ignore into ip_range(id,cidr,enabled)
-values(1,"185.18.221.80/28",1);
+ignore into ip_range(id,cidr,enabled,region_id)
+values(1,"185.18.221.80/28",1,1);
 insert
 ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
 values(1,"tiny_monthly",2,"EUR",1,1);

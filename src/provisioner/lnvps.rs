@@ -1,30 +1,22 @@
 use crate::host::proxmox::ProxmoxClient;
+use crate::provisioner::Provisioner;
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
 use fedimint_tonic_lnd::lnrpc::Invoice;
+use fedimint_tonic_lnd::tonic::async_trait;
 use fedimint_tonic_lnd::Client;
-use lnvps_db::{LNVpsDb, Vm, VmCostPlanIntervalType, VmOsImage, VmPayment};
+use ipnetwork::IpNetwork;
+use lnvps_db::hydrate::Hydrate;
+use lnvps_db::{
+    IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmOsImage, VmPayment,
+};
 use log::{info, warn};
-use rocket::async_trait;
-use rocket::yansi::Paint;
+use rand::seq::IteratorRandom;
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::ops::Add;
 use std::path::PathBuf;
 use std::time::Duration;
-
-#[async_trait]
-pub trait Provisioner: Send + Sync {
-    /// Provision a new VM
-    async fn provision(
-        &self,
-        user_id: u64,
-        template_id: u64,
-        image_id: u64,
-        ssh_key_id: u64,
-    ) -> Result<Vm>;
-
-    /// Create a renewal payment
-    async fn renew(&self, vm_id: u64) -> Result<VmPayment>;
-}
 
 pub struct LNVpsProvisioner {
     db: Box<dyn LNVpsDb>,
@@ -32,7 +24,7 @@ pub struct LNVpsProvisioner {
 }
 
 impl LNVpsProvisioner {
-    pub fn new(db: impl LNVpsDb + 'static, lnd: Client) -> Self {
+    pub fn new<D: LNVpsDb + 'static>(db: D, lnd: Client) -> Self {
         Self {
             db: Box::new(db),
             lnd,
@@ -143,6 +135,15 @@ impl Provisioner for LNVpsProvisioner {
         let template = self.db.get_vm_template(vm.template_id).await?;
         let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
 
+        /// Reuse existing payment until expired
+        let payments = self.db.list_vm_payment(vm.id).await?;
+        if let Some(px) = payments
+            .into_iter()
+            .find(|p| p.expires > Utc::now() && !p.is_paid)
+        {
+            return Ok(px);
+        }
+
         // push the expiration forward by cost plan interval amount
         let new_expire = match cost_plan.interval_type {
             VmCostPlanIntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
@@ -175,19 +176,74 @@ impl Provisioner for LNVpsProvisioner {
             })
             .await?;
 
-        let mut vm_payment = VmPayment {
-            id: 0,
+        let invoice = invoice.into_inner();
+        let vm_payment = VmPayment {
+            id: invoice.r_hash.clone(),
             vm_id,
             created: Utc::now(),
             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE as u64)),
             amount: cost,
-            invoice: invoice.into_inner().payment_request,
+            invoice: invoice.payment_request.clone(),
             time_value: (new_expire - vm.expires).num_seconds() as u64,
             is_paid: false,
+            ..Default::default()
         };
-        let payment_id = self.db.insert_vm_payment(&vm_payment).await?;
-        vm_payment.id = payment_id;
+        self.db.insert_vm_payment(&vm_payment).await?;
 
         Ok(vm_payment)
+    }
+
+    async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
+        let mut vm = self.db.get_vm(vm_id).await?;
+        let ips = self.db.get_vm_ip_assignments(vm.id).await?;
+
+        if !ips.is_empty() {
+            bail!("IP resources are already assigned");
+        }
+
+        vm.hydrate_up(&self.db).await?;
+        let ip_ranges = self.db.list_ip_range().await?;
+        let ip_ranges: Vec<IpRange> = ip_ranges
+            .into_iter()
+            .filter(|i| i.region_id == vm.template.as_ref().unwrap().region_id)
+            .collect();
+
+        if ip_ranges.is_empty() {
+            bail!("No ip range found in this region");
+        }
+
+        let mut ret = vec![];
+        /// Try all ranges
+        // TODO: pick round-robin ranges
+        for range in ip_ranges {
+            let range_cidr: IpNetwork = range.cidr.parse()?;
+            let ips = self.db.get_vm_ip_assignments_in_range(range.id).await?;
+            let ips: HashSet<IpAddr> = ips.iter().map(|i| i.ip.parse().unwrap()).collect();
+
+            // pick an IP at random
+            let cidr: Vec<IpAddr> = {
+                let mut rng = rand::thread_rng();
+                range_cidr.iter().choose(&mut rng).into_iter().collect()
+            };
+
+            for ip in cidr {
+                if !ips.contains(&ip) {
+                    info!("Attempting to allocate IP for {vm_id} to {ip}");
+                    let mut assignment = VmIpAssignment {
+                        id: 0,
+                        vm_id,
+                        ip_range_id: range.id,
+                        ip: IpNetwork::new(ip, range_cidr.prefix())?.to_string(),
+                    };
+                    let id = self.db.insert_vm_ip_assignment(&assignment).await?;
+                    assignment.id = id;
+
+                    ret.push(assignment);
+                    break;
+                }
+            }
+        }
+
+        Ok(ret)
     }
 }

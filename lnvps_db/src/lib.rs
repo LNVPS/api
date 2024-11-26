@@ -45,6 +45,9 @@ pub trait LNVpsDb: Sync + Send {
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> Result<Vec<VmHost>>;
 
+    /// List VM's owned by a specific user
+    async fn get_host(&self, id: u64) -> Result<VmHost>;
+
     /// Update host resources (usually from [auto_discover])
     async fn update_host(&self, host: &VmHost) -> Result<()>;
 
@@ -69,6 +72,9 @@ pub trait LNVpsDb: Sync + Send {
     /// List VM templates
     async fn list_vm_templates(&self) -> Result<Vec<VmTemplate>>;
 
+    /// List all VM's
+    async fn list_vms(&self) -> Result<Vec<Vm>>;
+
     /// List VM's owned by a specific user
     async fn list_user_vms(&self, id: u64) -> Result<Vec<Vm>>;
 
@@ -79,14 +85,29 @@ pub trait LNVpsDb: Sync + Send {
     async fn insert_vm(&self, vm: &Vm) -> Result<u64>;
 
     /// List VM ip assignments
+    async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64>;
+
+    /// List VM ip assignments
     async fn get_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>>;
+
+    /// List VM ip assignments by IP range
+    async fn get_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>>;
 
     /// List payments by VM id
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>>;
 
     /// Insert a new VM payment record
-    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<u64>;
+    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()>;
+
+    /// Get VM payment by payment id
+    async fn get_vm_payment(&self, id: &Vec<u8>) -> Result<VmPayment>;
 
     /// Update a VM payment record
     async fn update_vm_payment(&self, vm_payment: &VmPayment) -> Result<()>;
+
+    /// Mark a payment as paid and update the vm expiry
+    async fn vm_payment_paid(&self, id: &VmPayment) -> Result<()>;
+
+    /// Return the most recently settled invoice
+    async fn last_paid_invoice(&self) -> Result<Option<VmPayment>>;
 }

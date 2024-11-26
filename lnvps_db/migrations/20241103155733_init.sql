@@ -130,20 +130,24 @@ create table vm_ip_assignment
     id          integer unsigned not null auto_increment primary key,
     vm_id       integer unsigned not null,
     ip_range_id integer unsigned not null,
+    ip          varchar(255) not null,
 
     constraint fk_vm_ip_assignment_vm foreign key (vm_id) references vm (id),
     constraint fk_vm_ip_range foreign key (ip_range_id) references ip_range (id)
 );
+create unique index ix_vm_ip_assignment_ip on vm_ip_assignment (ip);
 create table vm_payment
 (
-    id         binary(32) not null,
-    vm_id      integer unsigned not null,
-    created    timestamp default current_timestamp,
-    expires    timestamp     not null,
-    amount     bigint unsigned not null,
-    invoice    varchar(2048) not null,
-    time_value bigint unsigned not null,
-    is_paid    bit(1)        not null,
+    id           binary(32) not null,
+    vm_id        integer unsigned not null,
+    created      timestamp default current_timestamp,
+    expires      timestamp     not null,
+    amount       bigint unsigned not null,
+    invoice      varchar(2048) not null,
+    time_value   bigint unsigned not null,
+    is_paid      bit(1)        not null,
+    settle_index bigint unsigned,
 
     constraint fk_vm_payment_vm foreign key (vm_id) references vm (id)
 );
+create unique index ix_vm_payment_id on vm_payment (id);

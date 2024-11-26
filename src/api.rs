@@ -2,6 +2,7 @@ use crate::nip98::Nip98Auth;
 use crate::provisioner::Provisioner;
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
+use nostr::util::hex;
 use rocket::serde::json::Json;
 use rocket::{get, post, routes, Responder, Route, State};
 use serde::{Deserialize, Serialize};
@@ -10,12 +11,14 @@ use ssh_key::PublicKey;
 pub fn routes() -> Vec<Route> {
     routes![
         v1_list_vms,
+        v1_get_vm,
         v1_list_vm_templates,
         v1_list_vm_images,
         v1_list_ssh_keys,
         v1_add_ssh_key,
         v1_create_vm_order,
-        v1_renew_vm
+        v1_renew_vm,
+        v1_get_payment
     ]
 }
 
@@ -64,8 +67,26 @@ async fn v1_list_vms(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>) -> ApiResult
     let mut vms = db.list_user_vms(uid).await?;
     for vm in &mut vms {
         vm.hydrate_up(db).await?;
+        if let Some(t) = &mut vm.template {
+            t.hydrate_up(db).await?;
+        }
     }
     ApiData::ok(vms)
+}
+
+#[get("/api/v1/vm/<id>")]
+async fn v1_get_vm(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>, id: u64) -> ApiResult<Vm> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let mut vm = db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM doesnt belong to you");
+    }
+    vm.hydrate_up(db).await?;
+    if let Some(t) = &mut vm.template {
+        t.hydrate_up(db).await?;
+    }
+    ApiData::ok(vm)
 }
 
 #[get("/api/v1/image")]
@@ -156,6 +177,27 @@ async fn v1_renew_vm(
     ApiData::ok(rsp)
 }
 
+#[get("/api/v1/payment/<id>")]
+async fn v1_get_payment(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    id: &str,
+) -> ApiResult<VmPayment> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let id = if let Ok(i) = hex::decode(id) {
+        i
+    } else {
+        return ApiData::err("Invalid payment id");
+    };
+    let payment = db.get_vm_payment(&id).await?;
+    let vm = db.get_vm(payment.vm_id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    ApiData::ok(payment)
+}
 #[derive(Deserialize)]
 struct CreateVmRequest {
     template_id: u64,
