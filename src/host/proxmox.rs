@@ -80,7 +80,7 @@ impl ProxmoxClient {
             .await?;
         let status = rsp.status();
         let text = rsp.text().await?;
-        info!("<< {}", text);
+        //info!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
@@ -100,7 +100,7 @@ impl ProxmoxClient {
             .await?;
         let status = rsp.status();
         let text = rsp.text().await?;
-        info!("<< {}", text);
+        //info!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {

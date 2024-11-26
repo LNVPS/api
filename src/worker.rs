@@ -3,6 +3,7 @@ use crate::provisioner::lnvps::LNVpsProvisioner;
 use crate::provisioner::Provisioner;
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::{bail, Result};
+use chrono::Utc;
 use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, Vm, VmHost};
@@ -137,7 +138,9 @@ impl Worker {
             }
             Err(e) => {
                 warn!("Failed to get VM status: {}", e);
-                self.spawn_vm(&vm, &host, &client).await?;
+                if vm.expires > Utc::now() {
+                    self.spawn_vm(&vm, &host, &client).await?;
+                }
             }
         }
         Ok(())
