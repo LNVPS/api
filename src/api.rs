@@ -1,5 +1,6 @@
 use crate::nip98::Nip98Auth;
 use crate::provisioner::Provisioner;
+use crate::status::{VmState, VmStateCache};
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
 use nostr::util::hex;
@@ -60,22 +61,37 @@ impl<T: ToString> From<T> for ApiError {
     }
 }
 
+#[derive(Serialize)]
+struct ApiVmStatus {
+    #[serde(flatten)]
+    pub vm: Vm,
+    pub status: VmState,
+}
+
 #[get("/api/v1/vm")]
-async fn v1_list_vms(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<Vm>> {
+async fn v1_list_vms(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>, vm_state: &State<VmStateCache>) -> ApiResult<Vec<ApiVmStatus>> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
     let mut vms = db.list_user_vms(uid).await?;
-    for vm in &mut vms {
+    let mut ret = vec![];
+    for mut vm in vms {
         vm.hydrate_up(db).await?;
         if let Some(t) = &mut vm.template {
             t.hydrate_up(db).await?;
         }
+
+        let state = vm_state.get_state(vm.id).await;
+        ret.push(ApiVmStatus {
+            vm,
+            status: state,
+        });
     }
-    ApiData::ok(vms)
+
+    ApiData::ok(ret)
 }
 
 #[get("/api/v1/vm/<id>")]
-async fn v1_get_vm(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>, id: u64) -> ApiResult<Vm> {
+async fn v1_get_vm(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>, vm_state: &State<VmStateCache>, id: u64) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
     let mut vm = db.get_vm(id).await?;
@@ -86,7 +102,11 @@ async fn v1_get_vm(auth: Nip98Auth, db: &State<Box<dyn LNVpsDb>>, id: u64) -> Ap
     if let Some(t) = &mut vm.template {
         t.hydrate_up(db).await?;
     }
-    ApiData::ok(vm)
+    let state = vm_state.get_state(vm.id).await;
+    ApiData::ok(ApiVmStatus {
+        vm,
+        status: state,
+    })
 }
 
 #[get("/api/v1/image")]

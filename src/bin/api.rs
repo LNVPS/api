@@ -6,6 +6,7 @@ use lnvps::cors::CORS;
 use lnvps::invoice::InvoiceHandler;
 use lnvps::provisioner::lnvps::LNVpsProvisioner;
 use lnvps::provisioner::Provisioner;
+use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
@@ -47,7 +48,8 @@ async fn main() -> Result<(), Error> {
         provisioner.auto_discover().await?;
     }
 
-    let mut worker = Worker::new(db.clone(), lnd.clone());
+    let status = VmStateCache::new();
+    let mut worker = Worker::new(db.clone(), lnd.clone(), status.clone());
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
@@ -86,6 +88,7 @@ async fn main() -> Result<(), Error> {
         .attach(CORS)
         .manage(db)
         .manage(pv)
+        .manage(status)
         .mount("/", api::routes())
         .launch()
         .await

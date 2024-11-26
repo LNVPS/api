@@ -5,3 +5,4 @@ pub mod invoice;
 pub mod nip98;
 pub mod provisioner;
 pub mod worker;
+pub mod status;

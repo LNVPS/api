@@ -1,6 +1,7 @@
-use crate::host::proxmox::{CreateVm, ProxmoxClient, VmBios};
+use crate::host::proxmox::{CreateVm, ProxmoxClient, VmBios, VmStatus};
 use crate::provisioner::lnvps::LNVpsProvisioner;
 use crate::provisioner::Provisioner;
+use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::{bail, Result};
 use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
@@ -10,6 +11,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub enum WorkJob {
     /// Check the VM status matches database state
+    ///
     /// This job starts a vm if stopped and also creates the vm if it doesn't exist yet
     CheckVm { vm_id: u64 },
     /// Send a notification to the users chosen contact preferences
@@ -20,17 +22,19 @@ pub struct Worker {
     db: Box<dyn LNVpsDb>,
     lnd: Client,
     provisioner: Box<dyn Provisioner>,
+    vm_state_cache: VmStateCache,
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
 }
 
 impl Worker {
-    pub fn new<D: LNVpsDb + Clone + 'static>(db: D, lnd: Client) -> Self {
+    pub fn new<D: LNVpsDb + Clone + 'static>(db: D, lnd: Client, vm_state_cache: VmStateCache) -> Self {
         let (tx, rx) = unbounded_channel();
         let p = LNVpsProvisioner::new(db.clone(), lnd.clone());
         Self {
             db: Box::new(db),
             provisioner: Box::new(p),
+            vm_state_cache,
             lnd,
             tx,
             rx,
@@ -88,7 +92,6 @@ impl Worker {
                 scsi_1: Some(format!("{}:cloudinit", &drive.name)),
                 scsi_hw: Some("virtio-scsi-pci".to_string()),
                 ssh_keys: Some(urlencoding::encode(&ssh_key.key_data).to_string()),
-                tags: Some("lnvps.net".to_string()),
                 efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
                 ..Default::default()
             })
@@ -107,6 +110,20 @@ impl Worker {
         match client.get_vm_status(&host.name, (vm.id + 100) as i32).await {
             Ok(s) => {
                 info!("VM {} status: {:?}", vm_id, s.status);
+                let state = VmState {
+                    state: match s.status {
+                        VmStatus::Stopped => VmRunningState::Stopped,
+                        VmStatus::Running => VmRunningState::Running
+                    },
+                    cpu_usage: s.cpu.unwrap_or(0.0),
+                    mem_usage: s.mem.unwrap_or(0) as f32 / s.max_mem.unwrap_or(1) as f32,
+                    uptime: s.uptime.unwrap_or(0),
+                    net_in: s.net_in.unwrap_or(0),
+                    net_out: s.net_out.unwrap_or(0),
+                    disk_write: s.disk_write.unwrap_or(0),
+                    disk_read: s.disk_read.unwrap_or(0),
+                };
+                self.vm_state_cache.set_state(vm_id, state).await?;
             }
             Err(e) => {
                 warn!("Failed to get VM status: {}", e);

@@ -165,6 +165,16 @@ pub struct VmInfo {
     pub name: Option<String>,
     pub tags: Option<String>,
     pub uptime: Option<u64>,
+    pub cpu: Option<f32>,
+    pub mem: Option<u64>,
+    #[serde(rename = "netin")]
+    pub net_in: Option<u64>,
+    #[serde(rename = "netout")]
+    pub net_out: Option<u64>,
+    #[serde(rename = "diskwrite")]
+    pub disk_write: Option<u64>,
+    #[serde(rename = "diskread")]
+    pub disk_read: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
