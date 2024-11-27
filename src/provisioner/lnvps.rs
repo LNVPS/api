@@ -60,7 +60,7 @@ impl LNVpsProvisioner {
         let storages = client.list_storage(node).await?;
         if let Some(s) = storages
             .iter()
-            .find(|s| s.contents().contains(&StorageContent::Import))
+            .find(|s| s.contents().contains(&StorageContent::ISO))
         {
             Ok(s.storage.clone())
         } else {
@@ -87,7 +87,7 @@ impl Provisioner for LNVpsProvisioner {
                     continue;
                 }
                 let t_download = client.download_image(DownloadUrlRequest {
-                    content: StorageContent::Import,
+                    content: StorageContent::ISO,
                     node: host.name.clone(),
                     storage: iso_storage.clone(),
                     url: image.url.clone(),
