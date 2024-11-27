@@ -307,6 +307,7 @@ pub struct VmInfo {
 pub enum StorageType {
     LVMThin,
     Dir,
+    ZFSPool
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
