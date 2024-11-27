@@ -5,31 +5,14 @@ use lnvps::api;
 use lnvps::cors::CORS;
 use lnvps::exchange::ExchangeRateCache;
 use lnvps::invoice::InvoiceHandler;
-use lnvps::provisioner::lnvps::LNVpsProvisioner;
 use lnvps::provisioner::Provisioner;
+use lnvps::settings::Settings;
 use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
-use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::time::Duration;
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Settings {
-    pub listen: Option<String>,
-    pub db: String,
-    pub lnd: LndConfig,
-    pub read_only: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct LndConfig {
-    pub url: String,
-    pub cert: PathBuf,
-    pub macaroon: PathBuf,
-}
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
@@ -43,19 +26,22 @@ async fn main() -> Result<(), Error> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
 
-
     let exchange = ExchangeRateCache::new();
     let lnd = connect(settings.lnd.url, settings.lnd.cert, settings.lnd.macaroon).await?;
-    let provisioner = LNVpsProvisioner::new(db.clone(), lnd.clone(), exchange.clone());
     #[cfg(debug_assertions)]
     {
         let setup_script = include_str!("../../dev_setup.sql");
         db.execute(setup_script).await?;
-        provisioner.auto_discover().await?;
     }
 
     let status = VmStateCache::new();
-    let mut worker = Worker::new(settings.read_only, db.clone(), lnd.clone(), status.clone(), exchange.clone());
+    let worker_provisioner =
+        settings
+            .provisioner
+            .get_provisioner(db.clone(), lnd.clone(), exchange.clone());
+    worker_provisioner.init().await?;
+
+    let mut worker = Worker::new(db.clone(), worker_provisioner, status.clone());
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
@@ -97,11 +83,16 @@ async fn main() -> Result<(), Error> {
                         rates.set_rate(r.0, r.1).await;
                     }
                 }
-                Err(e) => error!("Failed to fetch rates: {}", e)
+                Err(e) => error!("Failed to fetch rates: {}", e),
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
+
+    let provisioner =
+        settings
+            .provisioner
+            .get_provisioner(db.clone(), lnd.clone(), exchange.clone());
 
     let db: Box<dyn LNVpsDb> = Box::new(db.clone());
     let pv: Box<dyn Provisioner> = Box::new(provisioner);

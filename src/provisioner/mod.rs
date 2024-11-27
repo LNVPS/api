@@ -6,6 +6,9 @@ pub mod lnvps;
 
 #[async_trait]
 pub trait Provisioner: Send + Sync {
+    /// Do any necessary initialization
+    async fn init(&self) -> Result<()>;
+
     /// Provision a new VM for a user on the database
     ///
     /// Note:
@@ -24,4 +27,7 @@ pub trait Provisioner: Send + Sync {
 
     /// Allocate ips for a VM
     async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>>;
+
+    /// Spawn a VM on the host
+    async fn spawn_vm(&self, vm_id: u64) -> Result<()>;
 }

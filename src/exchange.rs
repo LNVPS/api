@@ -2,7 +2,7 @@ use anyhow::{Error, Result};
 use log::info;
 use rocket::serde::Deserialize;
 use std::collections::HashMap;
-use std::fmt::{write, Display, Formatter};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -63,7 +63,6 @@ pub struct ExchangeRateCache {
 
 #[derive(Deserialize)]
 struct MempoolRates {
-    pub time: u64,
     #[serde(rename = "USD")]
     pub usd: Option<f32>,
     #[serde(rename = "EUR")]
@@ -72,13 +71,16 @@ struct MempoolRates {
 
 impl ExchangeRateCache {
     pub fn new() -> Self {
-        Self { cache: Arc::new(RwLock::new(HashMap::new())) }
+        Self {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     pub async fn fetch_rates(&self) -> Result<Vec<TickerRate>> {
         let rsp = reqwest::get("https://mempool.space/api/v1/prices")
             .await?
-            .text().await?;
+            .text()
+            .await?;
         let rates: MempoolRates = serde_json::from_str(&rsp)?;
 
         let mut ret = vec![];

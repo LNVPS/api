@@ -14,3 +14,4 @@ serde = { version = "1.0.213", features = ["derive"] }
 serde_with = { version = "3.11.0", features = ["macros", "hex"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 async-trait = "0.1.83"
+url = "2.5.4"

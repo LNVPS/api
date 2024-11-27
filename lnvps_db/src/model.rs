@@ -1,7 +1,10 @@
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use sqlx::FromRow;
+use std::path::PathBuf;
+use url::Url;
 
 #[serde_as]
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
@@ -122,9 +125,24 @@ pub struct VmOsImage {
     pub version: String,
     pub enabled: bool,
     pub release_date: DateTime<Utc>,
+
     #[serde(skip_serializing)]
     /// URL location of cloud image
     pub url: String,
+}
+
+impl VmOsImage {
+    pub fn filename(&self) -> Result<String> {
+        let u: Url = self.url.parse()?;
+        let mut name: PathBuf = u
+            .path_segments()
+            .ok_or(anyhow!("Invalid URL"))?
+            .last()
+            .ok_or(anyhow!("Invalid URL"))?
+            .parse()?;
+        name.set_extension("img");
+        Ok(name.to_string_lossy().to_string())
+    }
 }
 
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]

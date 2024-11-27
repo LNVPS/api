@@ -1808,6 +1808,7 @@ dependencies = [
  "serde",
  "serde_with",
  "sqlx",
+ "url",
 ]
 
 [[package]]

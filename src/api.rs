@@ -45,14 +45,6 @@ struct ApiError {
     pub error: String,
 }
 
-impl ApiError {
-    pub fn new(error: &str) -> Self {
-        Self {
-            error: error.to_owned(),
-        }
-    }
-}
-
 impl<T: ToString> From<T> for ApiError {
     fn from(value: T) -> Self {
         Self {
@@ -76,13 +68,13 @@ async fn v1_list_vms(
 ) -> ApiResult<Vec<ApiVmStatus>> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
-    let mut vms = db.list_user_vms(uid).await?;
+    let vms = db.list_user_vms(uid).await?;
     let mut ret = vec![];
     for mut vm in vms {
-        vm.hydrate_up(db).await?;
-        vm.hydrate_down(db).await?;
+        vm.hydrate_up(db.inner()).await?;
+        vm.hydrate_down(db.inner()).await?;
         if let Some(t) = &mut vm.template {
-            t.hydrate_up(db).await?;
+            t.hydrate_up(db.inner()).await?;
         }
 
         let state = vm_state.get_state(vm.id).await;
@@ -105,10 +97,10 @@ async fn v1_get_vm(
     if vm.user_id != uid {
         return ApiData::err("VM doesnt belong to you");
     }
-    vm.hydrate_up(db).await?;
-    vm.hydrate_down(db).await?;
+    vm.hydrate_up(db.inner()).await?;
+    vm.hydrate_down(db.inner()).await?;
     if let Some(t) = &mut vm.template {
-        t.hydrate_up(db).await?;
+        t.hydrate_up(db.inner()).await?;
     }
     let state = vm_state.get_state(vm.id).await;
     ApiData::ok(ApiVmStatus { vm, status: state })
@@ -124,7 +116,7 @@ async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmOsIm
 async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmTemplate>> {
     let mut vms = db.list_vm_templates().await?;
     for vm in &mut vms {
-        vm.hydrate_up(db).await?;
+        vm.hydrate_up(db.inner()).await?;
     }
     let ret: Vec<VmTemplate> = vms.into_iter().filter(|v| v.enabled).collect();
     ApiData::ok(ret)
@@ -180,7 +172,7 @@ async fn v1_create_vm_order(
     let mut rsp = provisioner
         .provision(uid, req.template_id, req.image_id, req.ssh_key_id)
         .await?;
-    rsp.hydrate_up(db).await?;
+    rsp.hydrate_up(db.inner()).await?;
 
     ApiData::ok(rsp)
 }

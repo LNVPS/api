@@ -1,9 +1,12 @@
-use anyhow::{bail, Result};
-use log::info;
+use anyhow::{anyhow, bail, Result};
+use log::{error, info};
 use reqwest::{ClientBuilder, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::str::FromStr;
+use std::time::Duration;
+use tokio::time::sleep;
 
 pub struct ProxmoxClient {
     base: Url,
@@ -52,23 +55,101 @@ impl ProxmoxClient {
         Ok(rsp.data)
     }
 
-    pub async fn list_vms(&self, node: &str, full: bool) -> Result<Vec<VmInfo>> {
+    pub async fn list_vms(&self, node: &str) -> Result<Vec<VmInfo>> {
         let rsp: ResponseBase<Vec<VmInfo>> =
             self.get(&format!("/api2/json/nodes/{node}/qemu")).await?;
         Ok(rsp.data)
     }
 
-    pub async fn list_storage(&self) -> Result<Vec<NodeStorage>> {
-        let rsp: ResponseBase<Vec<NodeStorage>> = self.get("/api2/json/storage").await?;
+    pub async fn list_storage(&self, node: &str) -> Result<Vec<NodeStorage>> {
+        let rsp: ResponseBase<Vec<NodeStorage>> =
+            self.get(&format!("/api2/json/nodes/{node}/storage")).await?;
         Ok(rsp.data)
     }
 
-    pub async fn create_vm(&self, req: CreateVm) -> Result<VmInfo> {
+    /// List files in a storage pool
+    pub async fn list_storage_files(&self, node: &str, storage: &str) -> Result<Vec<StorageContentEntry>> {
+        let rsp: ResponseBase<Vec<StorageContentEntry>> =
+            self.get(&format!("/api2/json/nodes/{node}/storage/{storage}/content")).await?;
+        Ok(rsp.data)
+    }
+
+    /// Create a new VM
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
+    pub async fn create_vm(&self, req: CreateVm) -> Result<TaskId> {
         info!("{}", serde_json::to_string_pretty(&req)?);
-        let _rsp: ResponseBase<Option<String>> = self
+        let rsp: ResponseBase<Option<String>> = self
             .post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
             .await?;
-        self.get_vm_status(&req.node, req.vm_id).await
+        if let Some(id) = rsp.data {
+            Ok(TaskId { id, node: req.node })
+        } else {
+            Err(anyhow!("Failed to configure VM"))
+        }
+    }
+
+    /// Configure a VM
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
+    pub async fn configure_vm(&self, req: ConfigureVm) -> Result<TaskId> {
+        info!("{}", serde_json::to_string_pretty(&req)?);
+        let rsp: ResponseBase<Option<String>> = self
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/config", req.node, req.vm_id),
+                &req,
+            )
+            .await?;
+        if let Some(id) = rsp.data {
+            Ok(TaskId { id, node: req.node })
+        } else {
+            Err(anyhow!("Failed to configure VM"))
+        }
+    }
+
+    /// Get the current status of a running task
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/tasks/{upid}/status
+    pub async fn get_task_status(&self, task: &TaskId) -> Result<TaskStatus> {
+        let rsp: ResponseBase<TaskStatus> = self
+            .get(&format!(
+                "/api2/json/nodes/{}/tasks/{}/status",
+                task.node, task.id
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Helper function to wait for a task to complete
+    pub async fn wait_for_task(&self, task: &TaskId) -> Result<TaskStatus> {
+        loop {
+            let s = self.get_task_status(task).await?;
+            if s.is_finished() {
+                if s.is_success() {
+                    return Ok(s);
+                } else {
+                    bail!(
+                        "Task finished with error: {}",
+                        s.exit_status.unwrap_or("no error message".to_string())
+                    );
+                }
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Download an image to the host disk
+    pub async fn download_image(&self, req: DownloadUrlRequest) -> Result<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .post(
+                &format!(
+                    "/api2/json/nodes/{}/storage/{}/download-url",
+                    req.node, req.storage
+                ),
+                &req,
+            )
+            .await?;
+        Ok(TaskId { id: rsp.data, node: req.node })
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -80,7 +161,8 @@ impl ProxmoxClient {
             .await?;
         let status = rsp.status();
         let text = rsp.text().await?;
-        //info!("<< {}", text);
+        #[cfg(debug_assertions)]
+        info!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
@@ -100,12 +182,55 @@ impl ProxmoxClient {
             .await?;
         let status = rsp.status();
         let text = rsp.text().await?;
-        //info!("<< {}", text);
+        #[cfg(debug_assertions)]
+        info!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
             bail!("{}", status);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskId {
+    pub id: String,
+    pub node: String,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskState {
+    Running,
+    Stopped,
+}
+
+#[derive(Deserialize)]
+pub struct TaskStatus {
+    pub id: String,
+    pub node: String,
+    pub pid: u32,
+    #[serde(rename = "pstart")]
+    pub p_start: u64,
+    #[serde(rename = "starttime")]
+    pub start_time: u64,
+    pub status: TaskState,
+    #[serde(rename = "type")]
+    pub task_type: String,
+    #[serde(rename = "upid")]
+    pub up_id: String,
+    pub user: String,
+    #[serde(rename = "exitstatus")]
+    pub exit_status: Option<String>,
+}
+
+impl TaskStatus {
+    pub fn is_finished(&self) -> bool {
+        self.status == TaskState::Stopped
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.is_finished() && self.exit_status == Some("OK".to_string())
     }
 }
 
@@ -184,7 +309,7 @@ pub enum StorageType {
     Dir,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageContent {
     Images,
@@ -192,15 +317,60 @@ pub enum StorageContent {
     Backup,
     ISO,
     VZTmpL,
+    Import,
+}
+
+impl FromStr for StorageContent {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "images" => Ok(StorageContent::Images),
+            "rootdir" => Ok(StorageContent::RootDir),
+            "backup" => Ok(StorageContent::Backup),
+            "iso" => Ok(StorageContent::ISO),
+            "vztmpl" => Ok(StorageContent::VZTmpL),
+            "import" => Ok(StorageContent::Import),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct NodeStorage {
+    pub content: String,
     pub storage: String,
     #[serde(rename = "type")]
     pub kind: Option<StorageType>,
     #[serde(rename = "thinpool")]
     pub thin_pool: Option<String>,
+}
+
+impl NodeStorage {
+    pub fn contents(&self) -> Vec<StorageContent> {
+        self.content
+            .split(",")
+            .map_while(|s| s.parse().ok())
+            .collect()
+    }
+}
+#[derive(Debug, Serialize)]
+pub struct DownloadUrlRequest {
+    pub content: StorageContent,
+    pub node: String,
+    pub storage: String,
+    pub url: String,
+    pub filename: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StorageContentEntry {
+    pub format: String,
+    pub size: u64,
+    #[serde(rename = "volid")]
+    pub vol_id: String,
+    #[serde(rename = "vmid")]
+    pub vm_id: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -215,6 +385,25 @@ pub struct CreateVm {
     pub node: String,
     #[serde(rename = "vmid")]
     pub vm_id: i32,
+    #[serde(flatten)]
+    pub config: VmConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ConfigureVm {
+    pub node: String,
+    #[serde(rename = "vmid")]
+    pub vm_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(flatten)]
+    pub config: VmConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct VmConfig {
     #[serde(rename = "onboot")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_boot: Option<bool>,

@@ -1,19 +1,20 @@
 use crate::{LNVpsDb, Vm, VmTemplate};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::ops::Deref;
 
 #[async_trait]
-pub trait Hydrate {
+pub trait Hydrate<D> {
     /// Load parent resources
-    async fn hydrate_up(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()>;
+    async fn hydrate_up(&mut self, db: &D) -> Result<()>;
 
     /// Load child resources
-    async fn hydrate_down(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()>;
+    async fn hydrate_down(&mut self, db: &D) -> Result<()>;
 }
 
 #[async_trait]
-impl Hydrate for Vm {
-    async fn hydrate_up(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()> {
+impl<D: Deref<Target = dyn LNVpsDb> + Sync> Hydrate<D> for Vm {
+    async fn hydrate_up(&mut self, db: &D) -> Result<()> {
         let image = db.get_os_image(self.image_id).await?;
         let template = db.get_vm_template(self.template_id).await?;
         let ssh_key = db.get_user_ssh_key(self.ssh_key_id).await?;
@@ -24,7 +25,7 @@ impl Hydrate for Vm {
         Ok(())
     }
 
-    async fn hydrate_down(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()> {
+    async fn hydrate_down(&mut self, db: &D) -> Result<()> {
         //let payments = db.list_vm_payment(self.id).await?;
         let ips = db.list_vm_ip_assignments(self.id).await?;
 
@@ -35,8 +36,8 @@ impl Hydrate for Vm {
 }
 
 #[async_trait]
-impl Hydrate for VmTemplate {
-    async fn hydrate_up(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()> {
+impl<D: Deref<Target = dyn LNVpsDb> + Sync> Hydrate<D> for VmTemplate {
+    async fn hydrate_up(&mut self, db: &D) -> Result<()> {
         let cost_plan = db.get_cost_plan(self.cost_plan_id).await?;
         let region = db.get_host_region(self.region_id).await?;
         self.cost_plan = Some(cost_plan);
@@ -44,7 +45,7 @@ impl Hydrate for VmTemplate {
         Ok(())
     }
 
-    async fn hydrate_down(&mut self, db: &Box<dyn LNVpsDb>) -> Result<()> {
+    async fn hydrate_down(&mut self, db: &D) -> Result<()> {
         todo!()
     }
 }

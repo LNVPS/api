@@ -1,9 +1,10 @@
 pub mod api;
 pub mod cors;
+pub mod exchange;
 pub mod host;
 pub mod invoice;
 pub mod nip98;
 pub mod provisioner;
+pub mod settings;
 pub mod status;
 pub mod worker;
-pub mod exchange;
