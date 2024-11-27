@@ -224,7 +224,7 @@ impl Provisioner for LNVpsProvisioner {
         let ip_ranges = self.db.list_ip_range().await?;
         let ip_ranges: Vec<IpRange> = ip_ranges
             .into_iter()
-            .filter(|i| i.region_id == vm.template.as_ref().unwrap().region_id)
+            .filter(|i| i.region_id == vm.template.as_ref().unwrap().region_id && i.enabled)
             .collect();
 
         if ip_ranges.is_empty() {
@@ -234,7 +234,8 @@ impl Provisioner for LNVpsProvisioner {
         let mut ret = vec![];
         // Try all ranges
         // TODO: pick round-robin ranges
-        for range in ip_ranges {
+        // TODO: pick one of each type
+        'ranges: for range in ip_ranges {
             let range_cidr: IpNetwork = range.cidr.parse()?;
             let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
             let ips: HashSet<IpAddr> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
@@ -258,7 +259,7 @@ impl Provisioner for LNVpsProvisioner {
                     assignment.id = id;
 
                     ret.push(assignment);
-                    break;
+                    break 'ranges;
                 }
             }
         }
