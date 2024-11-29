@@ -1,4 +1,5 @@
 use anyhow::Error;
+use clap::Parser;
 use config::{Config, File};
 use fedimint_tonic_lnd::connect;
 use lnvps::api;
@@ -14,12 +15,20 @@ use log::error;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+#[derive(Parser)]
+#[clap(about, version, author)]
+struct Args {
+    #[clap(short, long)]
+    config: Option<String>,
+}
+
 #[rocket::main]
 async fn main() -> Result<(), Error> {
     pretty_env_logger::init();
 
+    let args = Args::parse();
     let settings: Settings = Config::builder()
-        .add_source(File::with_name("config.yaml"))
+        .add_source(File::with_name(&args.config.unwrap_or("config.yaml".to_string())))
         .build()?
         .try_deserialize()?;
 

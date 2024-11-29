@@ -8,3 +8,4 @@ pub mod provisioner;
 pub mod settings;
 pub mod status;
 pub mod worker;
+pub mod router;

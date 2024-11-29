@@ -152,6 +152,14 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn get_ip_range(&self, id: u64) -> Result<IpRange> {
+        sqlx::query_as("select * from ip_range where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn list_ip_range(&self) -> Result<Vec<IpRange>> {
         sqlx::query_as("select * from ip_range")
             .fetch_all(&self.db)
@@ -206,7 +214,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,cpu,memory,disk_size,disk_id) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,cpu,memory,disk_size,disk_id,mac_address) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
@@ -218,6 +226,7 @@ impl LNVpsDb for LNVpsDbMysql {
             .bind(vm.memory)
             .bind(vm.disk_size)
             .bind(vm.disk_id)
+            .bind(&vm.mac_address)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)?

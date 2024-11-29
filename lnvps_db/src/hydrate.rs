@@ -1,4 +1,4 @@
-use crate::{LNVpsDb, Vm, VmTemplate};
+use crate::{LNVpsDb, Vm, VmIpAssignment, VmTemplate};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::ops::Deref;
@@ -42,6 +42,18 @@ impl<D: Deref<Target = dyn LNVpsDb> + Sync> Hydrate<D> for VmTemplate {
         let region = db.get_host_region(self.region_id).await?;
         self.cost_plan = Some(cost_plan);
         self.region = Some(region);
+        Ok(())
+    }
+
+    async fn hydrate_down(&mut self, db: &D) -> Result<()> {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl<D: Deref<Target = dyn LNVpsDb> + Sync> Hydrate<D> for VmIpAssignment {
+    async fn hydrate_up(&mut self, db: &D) -> Result<()> {
+        self.ip_range = Some(db.get_ip_range(self.ip_range_id).await?);
         Ok(())
     }
 

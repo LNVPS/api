@@ -1,4 +1,3 @@
-# MySQL database connection string
 db: "mysql://root:root@localhost:3376/lnvps"
 lnd:
   url: "https://127.0.0.1:10003"

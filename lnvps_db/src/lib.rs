@@ -61,6 +61,9 @@ pub trait LNVpsDb: Sync + Send {
     async fn list_os_image(&self) -> Result<Vec<VmOsImage>>;
 
     /// List available IP Ranges
+    async fn get_ip_range(&self, id: u64) -> Result<IpRange>;
+
+    /// List available IP Ranges
     async fn list_ip_range(&self) -> Result<Vec<IpRange>>;
 
     /// Get a VM cost plan by id

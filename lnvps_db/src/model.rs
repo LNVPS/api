@@ -149,6 +149,7 @@ impl VmOsImage {
 pub struct IpRange {
     pub id: u64,
     pub cidr: String,
+    pub gateway: String,
     pub enabled: bool,
     pub region_id: u64,
 }
@@ -225,6 +226,8 @@ pub struct Vm {
     pub disk_size: u64,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
+    /// Network MAC address
+    pub mac_address: String,
 
     #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,12 +247,16 @@ pub struct Vm {
     pub ip_assignments: Option<Vec<VmIpAssignment>>,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
 pub struct VmIpAssignment {
     pub id: u64,
     pub vm_id: u64,
     pub ip_range_id: u64,
     pub ip: String,
+
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_range: Option<IpRange>,
 }
 
 #[serde_as]

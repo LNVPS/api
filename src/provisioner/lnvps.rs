@@ -17,6 +17,8 @@ use lnvps_db::{
     VmPayment,
 };
 use log::{error, info, warn};
+use nostr::util::hex;
+use rand::random;
 use rand::seq::IteratorRandom;
 use reqwest::Url;
 use std::collections::HashSet;
@@ -82,17 +84,22 @@ impl Provisioner for LNVpsProvisioner {
             for image in self.db.list_os_image().await? {
                 info!("Downloading image {} on {}", image.url, host.name);
                 let i_name = image.filename()?;
-                if files.iter().any(|v| v.vol_id.ends_with(&format!("iso/{i_name}"))) {
+                if files
+                    .iter()
+                    .any(|v| v.vol_id.ends_with(&format!("iso/{i_name}")))
+                {
                     info!("Already downloaded, skipping");
                     continue;
                 }
-                let t_download = client.download_image(DownloadUrlRequest {
-                    content: StorageContent::ISO,
-                    node: host.name.clone(),
-                    storage: iso_storage.clone(),
-                    url: image.url.clone(),
-                    filename: i_name,
-                }).await?;
+                let t_download = client
+                    .download_image(DownloadUrlRequest {
+                        content: StorageContent::ISO,
+                        node: host.name.clone(),
+                        storage: iso_storage.clone(),
+                        url: image.url.clone(),
+                        filename: i_name,
+                    })
+                    .await?;
                 client.wait_for_task(&t_download).await?;
             }
         }
@@ -137,6 +144,12 @@ impl Provisioner for LNVpsProvisioner {
             memory: template.memory,
             disk_size: template.disk_size,
             disk_id: pick_disk.id,
+            mac_address: format!(
+                "bc:24:11:{}:{}:{}",
+                hex::encode(&[random::<u8>()]),
+                hex::encode(&[random::<u8>()]),
+                hex::encode(&[random::<u8>()])
+            ),
             ..Default::default()
         };
 
@@ -254,6 +267,7 @@ impl Provisioner for LNVpsProvisioner {
                         vm_id,
                         ip_range_id: range.id,
                         ip: IpNetwork::new(ip, range_cidr.prefix())?.to_string(),
+                        ..Default::default()
                     };
                     let id = self.db.insert_vm_ip_assignment(&assignment).await?;
                     assignment.id = id;
@@ -280,12 +294,23 @@ impl Provisioner for LNVpsProvisioner {
             ips = self.allocate_ips(vm.id).await?;
         }
 
+        // load ranges
+        for ip in &mut ips {
+            ip.hydrate_up(&self.db).await?;
+        }
+
         let mut ip_config = ips
             .iter()
             .map_while(|ip| {
                 if let Ok(net) = ip.ip.parse::<IpNetwork>() {
                     Some(match net {
-                        IpNetwork::V4(addr) => format!("ip={}", addr),
+                        IpNetwork::V4(addr) => {
+                            format!(
+                                "ip={},gw={}",
+                                addr,
+                                ip.ip_range.as_ref().map(|r| &r.gateway).unwrap()
+                            )
+                        }
                         IpNetwork::V6(addr) => format!("ip6={}", addr),
                     })
                 } else {
@@ -305,7 +330,7 @@ impl Provisioner for LNVpsProvisioner {
         let ssh_key = self.db.get_user_ssh_key(vm.ssh_key_id).await?;
 
         let mut net = vec![
-            "virtio".to_string(),
+            format!("virtio={}", vm.mac_address),
             format!("bridge={}", self.config.bridge),
         ];
         if let Some(t) = self.config.vlan {
