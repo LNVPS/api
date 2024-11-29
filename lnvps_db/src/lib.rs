@@ -78,6 +78,9 @@ pub trait LNVpsDb: Sync + Send {
     /// List all VM's
     async fn list_vms(&self) -> Result<Vec<Vm>>;
 
+    /// List expired VM's
+    async fn list_expired_vms(&self) -> Result<Vec<Vm>>;
+
     /// List VM's owned by a specific user
     async fn list_user_vms(&self, id: u64) -> Result<Vec<Vm>>;
 
@@ -86,6 +89,9 @@ pub trait LNVpsDb: Sync + Send {
 
     /// Insert a new VM record
     async fn insert_vm(&self, vm: &Vm) -> Result<u64>;
+
+    /// Delete a VM by id
+    async fn delete_vm(&self, vm_id: u64) -> Result<()>;
 
     /// List VM ip assignments
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64>;

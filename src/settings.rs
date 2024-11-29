@@ -12,6 +12,9 @@ pub struct Settings {
     pub db: String,
     pub lnd: LndConfig,
     pub provisioner: ProvisionerConfig,
+
+    /// Number of days after an expired VM is deleted
+    pub delete_after: u16,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

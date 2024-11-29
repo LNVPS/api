@@ -113,6 +113,27 @@ impl ProxmoxClient {
         }
     }
 
+    /// Delete VM
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
+    pub async fn delete_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+        let rsp: ResponseBase<Option<String>> = self
+            .req(
+                Method::DELETE,
+                &format!("/api2/json/nodes/{node}/qemu/{vm}"),
+                (),
+            )
+            .await?;
+        if let Some(id) = rsp.data {
+            Ok(TaskId {
+                id,
+                node: node.to_string(),
+            })
+        } else {
+            Err(anyhow!("Failed to configure VM"))
+        }
+    }
+
     /// Get the current status of a running task
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/tasks/{upid}/status
@@ -164,7 +185,7 @@ impl ProxmoxClient {
     /// Resize a disk on a VM
     pub async fn resize_disk(&self, req: ResizeDiskRequest) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
-            .put(
+            .req(
                 Method::PUT,
                 &format!("/api2/json/nodes/{}/qemu/{}/resize", &req.node, &req.vm_id),
                 &req,
@@ -181,6 +202,48 @@ impl ProxmoxClient {
         let rsp: ResponseBase<String> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/start", node, vm),
+                (),
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    /// Stop a VM
+    pub async fn stop_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/stop", node, vm),
+                (),
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    /// Stop a VM
+    pub async fn shutdown_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/shutdown", node, vm),
+                (),
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    /// Stop a VM
+    pub async fn reset_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/reset", node, vm),
                 (),
             )
             .await?;
@@ -209,10 +272,10 @@ impl ProxmoxClient {
     }
 
     async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
-        self.put(Method::POST, path, body).await
+        self.req(Method::POST, path, body).await
     }
 
-    async fn put<T: DeserializeOwned, R: Serialize>(
+    async fn req<T: DeserializeOwned, R: Serialize>(
         &self,
         method: Method,
         path: &str,
@@ -319,7 +382,7 @@ pub struct NodeResponse {
     pub uptime: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum VmStatus {
     Stopped,

@@ -30,4 +30,16 @@ pub trait Provisioner: Send + Sync {
 
     /// Spawn a VM on the host
     async fn spawn_vm(&self, vm_id: u64) -> Result<()>;
+
+    /// Start a VM
+    async fn start_vm(&self, vm_id: u64) -> Result<()>;
+
+    /// Stop a running VM
+    async fn stop_vm(&self, vm_id: u64) -> Result<()>;
+
+    /// Restart a VM
+    async fn restart_vm(&self, vm_id: u64) -> Result<()>;
+
+    /// Delete a VM
+    async fn delete_vm(&self, vm_id: u64) -> Result<()>;
 }

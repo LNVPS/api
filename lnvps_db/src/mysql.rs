@@ -197,6 +197,13 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn list_expired_vms(&self) -> Result<Vec<Vm>> {
+        sqlx::query_as("select * from vm where expires > current_timestamp()")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn list_user_vms(&self, id: u64) -> Result<Vec<Vm>> {
         sqlx::query_as("select * from vm where user_id = ?")
             .bind(id)
@@ -231,6 +238,15 @@ impl LNVpsDb for LNVpsDbMysql {
             .await
             .map_err(Error::new)?
             .try_get(0)?)
+    }
+
+    async fn delete_vm(&self, vm_id: u64) -> Result<()> {
+        sqlx::query("delete from vm where id = ?")
+            .bind(vm_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64> {

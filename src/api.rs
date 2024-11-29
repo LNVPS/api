@@ -1,13 +1,15 @@
 use crate::nip98::Nip98Auth;
 use crate::provisioner::Provisioner;
 use crate::status::{VmState, VmStateCache};
+use crate::worker::WorkJob;
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
 use nostr::util::hex;
 use rocket::serde::json::Json;
-use rocket::{get, post, routes, Responder, Route, State};
+use rocket::{get, patch, post, routes, Responder, Route, State};
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -19,7 +21,10 @@ pub fn routes() -> Vec<Route> {
         v1_add_ssh_key,
         v1_create_vm_order,
         v1_renew_vm,
-        v1_get_payment
+        v1_get_payment,
+        v1_start_vm,
+        v1_stop_vm,
+        v1_restart_vm
     ]
 }
 
@@ -195,6 +200,66 @@ async fn v1_renew_vm(
     ApiData::ok(rsp)
 }
 
+#[patch("/api/v1/vm/<id>/start")]
+async fn v1_start_vm(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    provisioner: &State<Box<dyn Provisioner>>,
+    worker: &State<UnboundedSender<WorkJob>>,
+    id: u64,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if uid != vm.user_id {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    provisioner.start_vm(id).await?;
+    worker.send(WorkJob::CheckVm { vm_id: id })?;
+    ApiData::ok(())
+}
+
+#[patch("/api/v1/vm/<id>/stop")]
+async fn v1_stop_vm(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    provisioner: &State<Box<dyn Provisioner>>,
+    worker: &State<UnboundedSender<WorkJob>>,
+    id: u64,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if uid != vm.user_id {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    provisioner.stop_vm(id).await?;
+    worker.send(WorkJob::CheckVm { vm_id: id })?;
+    ApiData::ok(())
+}
+
+#[patch("/api/v1/vm/<id>/restart")]
+async fn v1_restart_vm(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    provisioner: &State<Box<dyn Provisioner>>,
+    worker: &State<UnboundedSender<WorkJob>>,
+    id: u64,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if uid != vm.user_id {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    provisioner.restart_vm(id).await?;
+    worker.send(WorkJob::CheckVm { vm_id: id })?;
+    ApiData::ok(())
+}
+
 #[get("/api/v1/payment/<id>")]
 async fn v1_get_payment(
     auth: Nip98Auth,
@@ -216,6 +281,7 @@ async fn v1_get_payment(
 
     ApiData::ok(payment)
 }
+
 #[derive(Deserialize)]
 struct CreateVmRequest {
     template_id: u64,

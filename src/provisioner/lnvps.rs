@@ -1,4 +1,5 @@
 use crate::exchange::{ExchangeRateCache, Ticker};
+use crate::host::get_host_client;
 use crate::host::proxmox::{
     ConfigureVm, CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent,
     TaskState, VmBios, VmConfig,
@@ -57,14 +58,6 @@ impl LNVpsProvisioner {
         }
     }
 
-    fn get_host_client(host: &VmHost) -> Result<ProxmoxClient> {
-        Ok(match host.kind {
-            VmHostKind::Proxmox => {
-                ProxmoxClient::new(host.ip.parse()?).with_api_token(&host.api_token)
-            }
-        })
-    }
-
     async fn get_iso_storage(node: &str, client: &ProxmoxClient) -> Result<String> {
         let storages = client.list_storage(node).await?;
         if let Some(s) = storages
@@ -84,7 +77,7 @@ impl Provisioner for LNVpsProvisioner {
         // tell hosts to download images
         let hosts = self.db.list_hosts().await?;
         for host in hosts {
-            let client = Self::get_host_client(&host)?;
+            let client = get_host_client(&host)?;
             let iso_storage = Self::get_iso_storage(&host.name, &client).await?;
             let files = client.list_storage_files(&host.name, &iso_storage).await?;
 
@@ -294,7 +287,7 @@ impl Provisioner for LNVpsProvisioner {
         }
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
-        let client = Self::get_host_client(&host)?;
+        let client = get_host_client(&host)?;
 
         let mut ips = self.db.list_vm_ip_assignments(vm.id).await?;
         if ips.is_empty() {
@@ -415,6 +408,51 @@ impl Provisioner for LNVpsProvisioner {
 
         let j_start = client.start_vm(&host.name, vm_id as u64).await?;
         client.wait_for_task(&j_start).await?;
+
+        Ok(())
+    }
+
+    async fn start_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+
+        let client = get_host_client(&host)?;
+        let j_start = client.start_vm(&host.name, vm.id + 100).await?;
+        client.wait_for_task(&j_start).await?;
+        Ok(())
+    }
+
+    async fn stop_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+
+        let client = get_host_client(&host)?;
+        let j_start = client.shutdown_vm(&host.name, vm.id + 100).await?;
+        client.wait_for_task(&j_start).await?;
+
+        Ok(())
+    }
+
+    async fn restart_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+
+        let client = get_host_client(&host)?;
+        let j_start = client.reset_vm(&host.name, vm.id + 100).await?;
+        client.wait_for_task(&j_start).await?;
+
+        Ok(())
+    }
+
+    async fn delete_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+
+        let client = get_host_client(&host)?;
+        let j_start = client.delete_vm(&host.name, vm.id + 100).await?;
+        client.wait_for_task(&j_start).await?;
+
+        self.db.delete_vm(vm.id).await?;
 
         Ok(())
     }

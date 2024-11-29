@@ -1,4 +1,5 @@
 use anyhow::Error;
+use chrono::Utc;
 use clap::Parser;
 use config::{Config, File};
 use fedimint_tonic_lnd::connect;
@@ -28,7 +29,9 @@ async fn main() -> Result<(), Error> {
 
     let args = Args::parse();
     let settings: Settings = Config::builder()
-        .add_source(File::with_name(&args.config.unwrap_or("config.yaml".to_string())))
+        .add_source(File::with_name(
+            &args.config.unwrap_or("config.yaml".to_string()),
+        ))
         .build()?
         .try_deserialize()?;
 
@@ -68,16 +71,11 @@ async fn main() -> Result<(), Error> {
         }
     });
     // request work every 30s to check vm status
-    let db_clone = db.clone();
     let sender_clone = sender.clone();
     tokio::spawn(async move {
         loop {
-            if let Ok(vms) = db_clone.list_vms().await {
-                for vm in vms {
-                    if let Err(e) = sender_clone.send(WorkJob::CheckVm { vm_id: vm.id }) {
-                        error!("failed to send check vm: {}", e);
-                    }
-                }
+            if let Err(e) = sender_clone.send(WorkJob::CheckVms) {
+                error!("failed to send check vm: {}", e);
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
@@ -120,6 +118,7 @@ async fn main() -> Result<(), Error> {
         .manage(pv)
         .manage(status)
         .manage(exchange)
+        .manage(sender)
         .mount("/", api::routes())
         .launch()
         .await
