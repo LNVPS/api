@@ -69,6 +69,12 @@ struct MempoolRates {
     pub eur: Option<f32>,
 }
 
+impl Default for ExchangeRateCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExchangeRateCache {
     pub fn new() -> Self {
         Self {

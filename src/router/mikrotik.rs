@@ -1,7 +1,6 @@
-use std::net::IpAddr;
-use lnvps_db::VmIpAssignment;
-use rocket::async_trait;
 use crate::router::Router;
+use rocket::async_trait;
+use std::net::IpAddr;
 
 pub struct MikrotikRouter {
     url: String,
@@ -19,7 +18,12 @@ impl MikrotikRouter {
 
 #[async_trait]
 impl Router for MikrotikRouter {
-    async fn add_arp_entry(&self, ip: IpAddr, mac: &[u8; 6], comment: Option<&str>) -> anyhow::Result<()> {
+    async fn add_arp_entry(
+        &self,
+        ip: IpAddr,
+        mac: &[u8; 6],
+        comment: Option<&str>,
+    ) -> anyhow::Result<()> {
         todo!()
     }
 }

@@ -1,8 +1,8 @@
 use crate::exchange::{ExchangeRateCache, Ticker};
 use crate::host::get_host_client;
 use crate::host::proxmox::{
-    ConfigureVm, CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent,
-    TaskState, VmBios, VmConfig,
+    CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent, VmBios,
+    VmConfig,
 };
 use crate::provisioner::Provisioner;
 use crate::settings::{QemuConfig, SshConfig};
@@ -14,11 +14,8 @@ use fedimint_tonic_lnd::tonic::async_trait;
 use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
 use lnvps_db::hydrate::Hydrate;
-use lnvps_db::{
-    IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
-    VmPayment,
-};
-use log::{error, info, warn};
+use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
+use log::info;
 use nostr::util::hex;
 use rand::random;
 use rand::seq::IteratorRandom;
@@ -26,9 +23,7 @@ use reqwest::Url;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::ops::Add;
-use std::path::PathBuf;
 use std::time::Duration;
-use tokio::time::sleep;
 
 pub struct LNVpsProvisioner {
     db: Box<dyn LNVpsDb>,
@@ -146,9 +141,9 @@ impl Provisioner for LNVpsProvisioner {
             disk_id: pick_disk.id,
             mac_address: format!(
                 "bc:24:11:{}:{}:{}",
-                hex::encode(&[random::<u8>()]),
-                hex::encode(&[random::<u8>()]),
-                hex::encode(&[random::<u8>()])
+                hex::encode([random::<u8>()]),
+                hex::encode([random::<u8>()]),
+                hex::encode([random::<u8>()])
             ),
             ..Default::default()
         };

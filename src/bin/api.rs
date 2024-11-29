@@ -1,5 +1,4 @@
 use anyhow::Error;
-use chrono::Utc;
 use clap::Parser;
 use config::{Config, File};
 use fedimint_tonic_lnd::connect;

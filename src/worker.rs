@@ -1,11 +1,11 @@
 use crate::host::get_host_client;
-use crate::host::proxmox::{ProxmoxClient, VmInfo, VmStatus};
+use crate::host::proxmox::{VmInfo, VmStatus};
 use crate::provisioner::Provisioner;
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
 use chrono::{Days, Utc};
 use lnvps_db::LNVpsDb;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::ops::Add;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 

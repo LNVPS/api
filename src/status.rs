@@ -32,6 +32,12 @@ pub struct VmStateCache {
     state: Arc<RwLock<HashMap<u64, VmState>>>,
 }
 
+impl Default for VmStateCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VmStateCache {
     pub fn new() -> Self {
         Self {
