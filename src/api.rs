@@ -114,6 +114,7 @@ async fn v1_get_vm(
 #[get("/api/v1/image")]
 async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmOsImage>> {
     let vms = db.list_os_image().await?;
+    let vms: Vec<VmOsImage> = vms.into_iter().filter(|i| i.enabled).collect();
     ApiData::ok(vms)
 }
 
