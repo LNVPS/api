@@ -16,6 +16,7 @@ pub enum VmRunningState {
 
 #[derive(Clone, Serialize, Default)]
 pub struct VmState {
+    pub timestamp: u64,
     pub state: VmRunningState,
     pub cpu_usage: f32,
     pub mem_usage: f32,
@@ -51,8 +52,8 @@ impl VmStateCache {
         Ok(())
     }
 
-    pub async fn get_state(&self, id: u64) -> VmState {
+    pub async fn get_state(&self, id: u64) -> Option<VmState> {
         let guard = self.state.read().await;
-        guard.get(&id).cloned().unwrap_or_default()
+        guard.get(&id).cloned()
     }
 }

@@ -83,7 +83,10 @@ async fn v1_list_vms(
         }
 
         let state = vm_state.get_state(vm.id).await;
-        ret.push(ApiVmStatus { vm, status: state });
+        ret.push(ApiVmStatus {
+            vm,
+            status: state.unwrap_or_default(),
+        });
     }
 
     ApiData::ok(ret)
@@ -108,7 +111,10 @@ async fn v1_get_vm(
         t.hydrate_up(db.inner()).await?;
     }
     let state = vm_state.get_state(vm.id).await;
-    ApiData::ok(ApiVmStatus { vm, status: state })
+    ApiData::ok(ApiVmStatus {
+        vm,
+        status: state.unwrap_or_default(),
+    })
 }
 
 #[get("/api/v1/image")]

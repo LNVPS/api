@@ -55,6 +55,7 @@ impl Worker {
         // TODO: remove assumption
         let db_id = (s.vm_id - 100) as u64;
         let state = VmState {
+            timestamp: Utc::now().timestamp() as u64,
             state: match s.status {
                 VmStatus::Stopped => VmRunningState::Stopped,
                 VmStatus::Running => VmRunningState::Running,
@@ -116,6 +117,23 @@ impl Worker {
                         error!("{}", e);
                     }
                 }
+            }
+        }
+
+        let db_vms = self.db.list_vms().await?;
+        for vm in db_vms {
+            let state = if let Some(s) = self.vm_state_cache.get_state(vm.id).await {
+                if s.timestamp > Utc::now().timestamp() as u64 - 120 {
+                    Some(s)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if state.is_none() && vm.expires > Utc::now() {
+                self.check_vm(vm.id).await?;
             }
         }
         Ok(())

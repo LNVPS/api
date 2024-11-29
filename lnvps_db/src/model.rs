@@ -113,6 +113,12 @@ pub enum OsDistribution {
     #[default]
     Ubuntu = 0,
     Debian = 1,
+    CentOS = 2,
+    Fedora = 3,
+    FreeBSD = 4,
+    OpenSUSE = 5,
+    ArchLinux = 6,
+    RedHatEnterprise = 7,
 }
 
 /// OS Images are templates which are used as a basis for

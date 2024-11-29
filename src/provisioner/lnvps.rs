@@ -246,7 +246,7 @@ impl Provisioner for LNVpsProvisioner {
         'ranges: for range in ip_ranges {
             let range_cidr: IpNetwork = range.cidr.parse()?;
             let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
-            let ips: HashSet<IpAddr> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
+            let ips: HashSet<IpNetwork> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
 
             // pick an IP at random
             let cidr: Vec<IpAddr> = {
@@ -255,13 +255,14 @@ impl Provisioner for LNVpsProvisioner {
             };
 
             for ip in cidr {
-                if !ips.contains(&ip) {
+                let ip_net = IpNetwork::new(ip, range_cidr.prefix())?;
+                if !ips.contains(&ip_net) {
                     info!("Attempting to allocate IP for {vm_id} to {ip}");
                     let mut assignment = VmIpAssignment {
                         id: 0,
                         vm_id,
                         ip_range_id: range.id,
-                        ip: IpNetwork::new(ip, range_cidr.prefix())?.to_string(),
+                        ip: ip_net.to_string(),
                         ..Default::default()
                     };
                     let id = self.db.insert_vm_ip_assignment(&assignment).await?;
