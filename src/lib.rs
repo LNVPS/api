@@ -9,3 +9,4 @@ pub mod settings;
 pub mod status;
 pub mod worker;
 pub mod router;
+pub mod ssh_client;

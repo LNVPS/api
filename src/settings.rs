@@ -23,14 +23,26 @@ pub struct LndConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ProvisionerConfig {
-    Proxmox(QemuConfig),
+    Proxmox {
+        /// Readonly mode, don't spawn any VM's
+        read_only: bool,
+        /// Generic VM configuration
+        qemu: QemuConfig,
+        /// SSH config for issuing commands via CLI
+        ssh: Option<SshConfig>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SshConfig {
+    /// Location of SSH key used to run commands on the host
+    pub key: PathBuf,
+    /// Username used to run commands on the host, default = root
+    pub user: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QemuConfig {
-    /// Readonly mode, don't spawn any VM's
-    pub read_only: bool,
-
     /// Machine type (q35)
     pub machine: String,
 
@@ -44,7 +56,10 @@ pub struct QemuConfig {
     pub cpu: String,
 
     /// VLAN tag all spawned VM's
-    pub vlan: Option<u16>
+    pub vlan: Option<u16>,
+
+    /// Enable virtualization inside VM
+    pub kvm: bool,
 }
 
 impl ProvisionerConfig {
@@ -55,7 +70,11 @@ impl ProvisionerConfig {
         exchange: ExchangeRateCache,
     ) -> impl Provisioner + 'static {
         match self {
-            ProvisionerConfig::Proxmox(c) => LNVpsProvisioner::new(c.clone(), db, lnd, exchange),
+            ProvisionerConfig::Proxmox {
+                qemu,
+                ssh,
+                read_only,
+            } => LNVpsProvisioner::new(*read_only, qemu.clone(), ssh.clone(), db, lnd, exchange),
         }
     }
 }

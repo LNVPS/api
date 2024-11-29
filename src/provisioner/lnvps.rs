@@ -1,10 +1,11 @@
 use crate::exchange::{ExchangeRateCache, Ticker};
 use crate::host::proxmox::{
-    ConfigureVm, CreateVm, DownloadUrlRequest, ProxmoxClient, StorageContent, TaskState, VmBios,
-    VmConfig,
+    ConfigureVm, CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent,
+    TaskState, VmBios, VmConfig,
 };
 use crate::provisioner::Provisioner;
-use crate::settings::QemuConfig;
+use crate::settings::{QemuConfig, SshConfig};
+use crate::ssh_client::SshClient;
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
 use fedimint_tonic_lnd::lnrpc::Invoice;
@@ -32,12 +33,16 @@ pub struct LNVpsProvisioner {
     db: Box<dyn LNVpsDb>,
     lnd: Client,
     rates: ExchangeRateCache,
+    read_only: bool,
     config: QemuConfig,
+    ssh: Option<SshConfig>,
 }
 
 impl LNVpsProvisioner {
     pub fn new(
+        read_only: bool,
         config: QemuConfig,
+        ssh: Option<SshConfig>,
         db: impl LNVpsDb + 'static,
         lnd: Client,
         rates: ExchangeRateCache,
@@ -47,6 +52,8 @@ impl LNVpsProvisioner {
             lnd,
             rates,
             config,
+            read_only,
+            ssh,
         }
     }
 
@@ -282,7 +289,7 @@ impl Provisioner for LNVpsProvisioner {
     }
 
     async fn spawn_vm(&self, vm_id: u64) -> Result<()> {
-        if self.config.read_only {
+        if self.read_only {
             bail!("Cant spawn VM's in read-only mode");
         }
         let vm = self.db.get_vm(vm_id).await?;
@@ -337,17 +344,20 @@ impl Provisioner for LNVpsProvisioner {
             net.push(format!("tag={}", t));
         }
 
+        let vm_id = 100 + vm.id as i32;
+
         // create VM
         let t_create = client
             .create_vm(CreateVm {
                 node: host.name.clone(),
-                vm_id: (vm.id + 100) as i32,
+                vm_id,
                 config: VmConfig {
                     on_boot: Some(true),
                     bios: Some(VmBios::OVMF),
                     boot: Some("order=scsi0".to_string()),
                     cores: Some(vm.cpu as i32),
                     cpu: Some(self.config.cpu.clone()),
+                    kvm: Some(self.config.kvm),
                     ip_config: Some(ip_config.join(",")),
                     machine: Some(self.config.machine.clone()),
                     memory: Some((vm.memory / 1024 / 1024).to_string()),
@@ -363,7 +373,49 @@ impl Provisioner for LNVpsProvisioner {
             .await?;
         client.wait_for_task(&t_create).await?;
 
-        // TODO: Find a way to automate importing disk
+        // import the disk
+        // TODO: find a way to avoid using SSH
+        if let Some(ssh_config) = &self.ssh {
+            let image = self.db.get_os_image(vm.image_id).await?;
+            let host_addr: Url = host.ip.parse()?;
+            let mut ses = SshClient::new()?;
+            ses.connect(
+                (host_addr.host().unwrap().to_string(), 22),
+                &ssh_config.user,
+                &ssh_config.key,
+            )
+            .await?;
+
+            let cmd = format!(
+                "/usr/sbin/qm set {} --scsi0 {}:0,import-from=/var/lib/vz/template/iso/{}",
+                vm_id,
+                &drive.name,
+                &image.filename()?
+            );
+            let (code, rsp) = ses.execute(cmd.as_str()).await?;
+            info!("{}", rsp);
+
+            if code != 0 {
+                bail!("Failed to import disk, exit-code {}", code);
+            }
+        } else {
+            bail!("Cannot complete, no method available to import disk, consider configuring ssh")
+        }
+
+        // resize disk
+        let j_resize = client
+            .resize_disk(ResizeDiskRequest {
+                node: host.name.clone(),
+                vm_id,
+                disk: "scsi0".to_string(),
+                size: vm.disk_size.to_string(),
+            })
+            .await?;
+        client.wait_for_task(&j_resize).await?;
+
+        let j_start = client.start_vm(&host.name, vm_id as u64).await?;
+        client.wait_for_task(&j_start).await?;
+
         Ok(())
     }
 }

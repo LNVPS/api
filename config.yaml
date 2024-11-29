@@ -6,9 +6,11 @@ lnd:
 provisioner:
   proxmox:
     read_only: false
-    bios: "ovmf"
-    machine: "q35"
-    os_type: "l26"
-    bridge: "vmbr0"
-    cpu: "kvm64"
-    vlan: 100
+    qemu:
+      bios: "ovmf"
+      machine: "q35"
+      os_type: "l26"
+      bridge: "vmbr0"
+      cpu: "kvm64"
+      vlan: 100
+      kvm: false

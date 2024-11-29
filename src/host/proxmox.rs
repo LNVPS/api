@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
-use log::{error, info};
-use reqwest::{ClientBuilder, Url};
+use log::{debug, error, info};
+use reqwest::{ClientBuilder, Method, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -62,15 +62,23 @@ impl ProxmoxClient {
     }
 
     pub async fn list_storage(&self, node: &str) -> Result<Vec<NodeStorage>> {
-        let rsp: ResponseBase<Vec<NodeStorage>> =
-            self.get(&format!("/api2/json/nodes/{node}/storage")).await?;
+        let rsp: ResponseBase<Vec<NodeStorage>> = self
+            .get(&format!("/api2/json/nodes/{node}/storage"))
+            .await?;
         Ok(rsp.data)
     }
 
     /// List files in a storage pool
-    pub async fn list_storage_files(&self, node: &str, storage: &str) -> Result<Vec<StorageContentEntry>> {
-        let rsp: ResponseBase<Vec<StorageContentEntry>> =
-            self.get(&format!("/api2/json/nodes/{node}/storage/{storage}/content")).await?;
+    pub async fn list_storage_files(
+        &self,
+        node: &str,
+        storage: &str,
+    ) -> Result<Vec<StorageContentEntry>> {
+        let rsp: ResponseBase<Vec<StorageContentEntry>> = self
+            .get(&format!(
+                "/api2/json/nodes/{node}/storage/{storage}/content"
+            ))
+            .await?;
         Ok(rsp.data)
     }
 
@@ -78,7 +86,6 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
     pub async fn create_vm(&self, req: CreateVm) -> Result<TaskId> {
-        info!("{}", serde_json::to_string_pretty(&req)?);
         let rsp: ResponseBase<Option<String>> = self
             .post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
             .await?;
@@ -93,7 +100,6 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
     pub async fn configure_vm(&self, req: ConfigureVm) -> Result<TaskId> {
-        info!("{}", serde_json::to_string_pretty(&req)?);
         let rsp: ResponseBase<Option<String>> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/config", req.node, req.vm_id),
@@ -149,7 +155,39 @@ impl ProxmoxClient {
                 &req,
             )
             .await?;
-        Ok(TaskId { id: rsp.data, node: req.node })
+        Ok(TaskId {
+            id: rsp.data,
+            node: req.node,
+        })
+    }
+
+    /// Resize a disk on a VM
+    pub async fn resize_disk(&self, req: ResizeDiskRequest) -> Result<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .put(
+                Method::PUT,
+                &format!("/api2/json/nodes/{}/qemu/{}/resize", &req.node, &req.vm_id),
+                &req,
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: req.node,
+        })
+    }
+
+    /// Start a VM
+    pub async fn start_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/start", node, vm),
+                (),
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -162,7 +200,7 @@ impl ProxmoxClient {
         let status = rsp.status();
         let text = rsp.text().await?;
         #[cfg(debug_assertions)]
-        info!("<< {}", text);
+        debug!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
@@ -171,19 +209,30 @@ impl ProxmoxClient {
     }
 
     async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
+        self.put(Method::POST, path, body).await
+    }
+
+    async fn put<T: DeserializeOwned, R: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: R,
+    ) -> Result<T> {
+        let body = serde_json::to_string(&body)?;
+        debug!("{}", &body);
         let rsp = self
             .client
-            .post(self.base.join(path)?)
+            .request(method, self.base.join(path)?)
             .header("Authorization", format!("PVEAPIToken={}", self.token))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .body(serde_json::to_string(&body)?)
+            .body(body)
             .send()
             .await?;
         let status = rsp.status();
         let text = rsp.text().await?;
         #[cfg(debug_assertions)]
-        info!("<< {}", text);
+        debug!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
@@ -307,7 +356,7 @@ pub struct VmInfo {
 pub enum StorageType {
     LVMThin,
     Dir,
-    ZFSPool
+    ZFSPool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,6 +421,19 @@ pub struct StorageContentEntry {
     pub vol_id: String,
     #[serde(rename = "vmid")]
     pub vm_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ResizeDiskRequest {
+    pub node: String,
+    #[serde(rename = "vmid")]
+    pub vm_id: i32,
+    pub disk: String,
+    /// The new size.
+    ///
+    /// With the `+` sign the value is added to the actual size of the volume and without it,
+    /// the value is taken as an absolute one. Shrinking disk size is not supported.
+    pub size: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -450,4 +512,6 @@ pub struct VmConfig {
     #[serde(rename = "efidisk0")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub efi_disk_0: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kvm: Option<bool>,
 }
