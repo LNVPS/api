@@ -21,6 +21,7 @@ pub enum WorkJob {
 }
 
 pub struct Worker {
+    delete_after: u16,
     db: Box<dyn LNVpsDb>,
     provisioner: Box<dyn Provisioner>,
     vm_state_cache: VmStateCache,
@@ -32,6 +33,7 @@ impl Worker {
     pub fn new<D: LNVpsDb + Clone + 'static, P: Provisioner + 'static>(
         db: D,
         provisioner: P,
+        delete_after: u16,
         vm_state_cache: VmStateCache,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
@@ -39,6 +41,7 @@ impl Worker {
             db: Box::new(db),
             provisioner: Box::new(provisioner),
             vm_state_cache,
+            delete_after,
             tx,
             rx,
         }
@@ -73,7 +76,7 @@ impl Worker {
                 self.provisioner.stop_vm(db_vm.id).await?;
             }
             // Delete VM if expired > 3 days
-            if db_vm.expires.add(Days::new(3)) < Utc::now() {
+            if db_vm.expires.add(Days::new(self.delete_after as u64)) < Utc::now() {
                 info!("Deleting expired VM {}", db_vm.id);
                 self.provisioner.delete_vm(db_vm.id).await?;
             }

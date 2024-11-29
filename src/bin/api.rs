@@ -52,7 +52,12 @@ async fn main() -> Result<(), Error> {
             .get_provisioner(db.clone(), lnd.clone(), exchange.clone());
     worker_provisioner.init().await?;
 
-    let mut worker = Worker::new(db.clone(), worker_provisioner, status.clone());
+    let mut worker = Worker::new(
+        db.clone(),
+        worker_provisioner,
+        settings.delete_after,
+        status.clone(),
+    );
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
