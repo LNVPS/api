@@ -4,7 +4,7 @@ use crate::provisioner::Provisioner;
 use crate::settings::{Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
-use chrono::{Days, Utc};
+use chrono::{DateTime, Days, Utc};
 use lettre::message::MessageBuilder;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::SmtpTransportBuilder;
@@ -16,6 +16,7 @@ use rocket::futures::SinkExt;
 use std::ops::Add;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+#[derive(Debug)]
 pub enum WorkJob {
     /// Check all running VMS
     CheckVms,
@@ -38,6 +39,7 @@ pub struct Worker {
     vm_state_cache: VmStateCache,
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
+    last_check_vms: u64,
 }
 
 pub struct WorkerSettings {
@@ -69,6 +71,7 @@ impl Worker {
             settings: settings.into(),
             tx,
             rx,
+            last_check_vms: Utc::now().timestamp() as u64,
         }
     }
 
@@ -100,15 +103,26 @@ impl Worker {
             if db_vm.expires < Utc::now() && s.status == VmStatus::Running {
                 info!("Stopping expired VM {}", db_vm.id);
                 self.provisioner.stop_vm(db_vm.id).await?;
+                self.tx.send(WorkJob::SendNotification {
+                    user_id: db_vm.user_id,
+                    title: Some(format!("[VM{}] Expired", db_vm.id)),
+                    message: format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", db_vm.id, self.settings.delete_after)
+                })?;
             }
-            // Delete VM if expired > 3 days
+            // Delete VM if expired > self.settings.delete_after days
             if db_vm
                 .expires
                 .add(Days::new(self.settings.delete_after as u64))
                 < Utc::now()
+                && !db_vm.deleted
             {
                 info!("Deleting expired VM {}", db_vm.id);
                 self.provisioner.delete_vm(db_vm.id).await?;
+                self.tx.send(WorkJob::SendNotification {
+                    user_id: db_vm.user_id,
+                    title: Some(format!("[VM{}] Deleted", db_vm.id)),
+                    message: format!("Your VM #{} has been deleted!", db_vm.id),
+                })?;
             }
         }
 
@@ -127,6 +141,22 @@ impl Worker {
             Err(_) => {
                 if vm.expires > Utc::now() {
                     self.provisioner.spawn_vm(vm.id).await?;
+                    let vm_ips = self.db.list_vm_ip_assignments(vm.id).await?;
+                    let image = self.db.get_os_image(vm.image_id).await?;
+                    self.tx.send(WorkJob::SendNotification {
+                        user_id: vm.user_id,
+                        title: Some(format!("[VM{}] Created", vm.id)),
+                        message: format!(
+                            "Your VM #{} been created!\nOS: {}\nIPs: {}",
+                            vm.id,
+                            image,
+                            vm_ips
+                                .iter()
+                                .map(|i| i.to_string())
+                                .collect::<Vec<String>>()
+                                .join(", ")
+                        ),
+                    })?;
                 }
             }
         }
@@ -141,9 +171,14 @@ impl Worker {
             for node in client.list_nodes().await? {
                 info!("Checking vms for {}", node.name);
                 for vm in client.list_vms(&node.name).await? {
-                    info!("\t{}: {:?}", vm.vm_id, vm.status);
+                    let vm_id = vm.vm_id;
+                    info!("\t{}: {:?}", vm_id, vm.status);
                     if let Err(e) = self.handle_vm_info(vm).await {
                         error!("{}", e);
+                        self.queue_admin_notification(
+                            format!("Failed to check VM {}:\n{}", vm_id, e.to_string()),
+                            Some("Job Failed".to_string()),
+                        )?
                     }
                 }
             }
@@ -206,12 +241,42 @@ impl Worker {
         Ok(())
     }
 
+    fn queue_notification(
+        &self,
+        user_id: u64,
+        message: String,
+        title: Option<String>,
+    ) -> Result<()> {
+        self.tx.send(WorkJob::SendNotification {
+            user_id,
+            message,
+            title,
+        })?;
+        Ok(())
+    }
+
+    fn queue_admin_notification(&self, message: String, title: Option<String>) -> Result<()> {
+        if let Some(a) = self.settings.smtp.as_ref().and_then(|s| s.admin) {
+            self.queue_notification(a, message, title)?;
+        }
+        Ok(())
+    }
+
     pub async fn handle(&mut self) -> Result<()> {
-        while let Some(job) = self.rx.recv().await {
+        while let Some(ref job) = self.rx.recv().await {
             match job {
                 WorkJob::CheckVm { vm_id } => {
-                    if let Err(e) = self.check_vm(vm_id).await {
+                    if let Err(e) = self.check_vm(*vm_id).await {
                         error!("Failed to check VM {}: {}", vm_id, e);
+                        self.queue_admin_notification(
+                            format!(
+                                "Failed to check VM {}:\n{:?}\n{}",
+                                vm_id,
+                                &job,
+                                e.to_string()
+                            ),
+                            Some("Job Failed".to_string()),
+                        )?
                     }
                 }
                 WorkJob::SendNotification {
@@ -219,13 +284,28 @@ impl Worker {
                     message,
                     title,
                 } => {
-                    if let Err(e) = self.send_notification(user_id, message, title).await {
+                    if let Err(e) = self
+                        .send_notification(*user_id, message.clone(), title.clone())
+                        .await
+                    {
                         error!("Failed to send notification {}: {}", user_id, e);
+                        self.queue_admin_notification(
+                            format!(
+                                "Failed to send notification:\n{:?}\n{}",
+                                &job,
+                                e.to_string()
+                            ),
+                            Some("Job Failed".to_string()),
+                        )?
                     }
                 }
                 WorkJob::CheckVms => {
                     if let Err(e) = self.check_vms().await {
                         error!("Failed to check VMs: {}", e);
+                        self.queue_admin_notification(
+                            format!("Failed to check VM's:\n{:?}\n{}", &job, e.to_string()),
+                            Some("Job Failed".to_string()),
+                        )?
                     }
                 }
             }

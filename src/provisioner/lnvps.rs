@@ -356,6 +356,7 @@ impl Provisioner for LNVpsProvisioner {
                     scsi_hw: Some("virtio-scsi-pci".to_string()),
                     ssh_keys: Some(urlencoding::encode(&ssh_key.key_data).to_string()),
                     efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
+                    serial_0: Some("socket".to_string()),
                     ..Default::default()
                 },
             })
@@ -445,9 +446,12 @@ impl Provisioner for LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host)?;
-        let j_start = client.delete_vm(&host.name, vm.id + 100).await?;
-        client.wait_for_task(&j_start).await?;
+        // TODO: delete not implemented, stop only
+        //let j_start = client.delete_vm(&host.name, vm.id + 100).await?;
+        let j_stop = client.stop_vm(&host.name, vm.id + 100).await?;
+        client.wait_for_task(&j_stop).await?;
 
+        self.db.delete_vm_ip_assignment(vm.id).await?;
         self.db.delete_vm(vm.id).await?;
 
         Ok(())

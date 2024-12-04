@@ -102,6 +102,9 @@ pub trait LNVpsDb: Sync + Send {
     /// List VM ip assignments by IP range
     async fn list_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>>;
 
+    /// Delete assigned VM ips
+    async fn delete_vm_ip_assignment(&self, vm_id: u64) -> Result<()>;
+
     /// List payments by VM id
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>>;
 

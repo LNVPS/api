@@ -1,6 +1,6 @@
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use log::info;
+use log::{debug, info};
 use nostr::{Event, JsonUtil, Kind, Timestamp};
 use rocket::http::uri::{Absolute, Uri};
 use rocket::http::Status;
@@ -80,7 +80,7 @@ impl<'r> FromRequest<'r> for Nip98Auth {
                     return Outcome::Error((Status::new(401), "Event signature invalid"));
                 }
 
-                info!("{}", event.as_json());
+                debug!("{}", event.as_json());
                 Outcome::Success(Nip98Auth { event })
             } else {
                 Outcome::Error((Status::new(403), "Auth scheme must be Nostr"))

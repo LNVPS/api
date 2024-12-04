@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use sqlx::FromRow;
+use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use url::Url;
 
@@ -151,6 +152,12 @@ impl VmOsImage {
     }
 }
 
+impl Display for VmOsImage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} {}", self.distribution, self.version)
+    }
+}
+
 #[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
 pub struct IpRange {
     pub id: u64,
@@ -234,6 +241,8 @@ pub struct Vm {
     pub disk_id: u64,
     /// Network MAC address
     pub mac_address: String,
+    /// Is the VM deleted
+    pub deleted: bool,
 
     #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,6 +272,12 @@ pub struct VmIpAssignment {
     #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_range: Option<IpRange>,
+}
+
+impl Display for VmIpAssignment {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.ip)
+    }
 }
 
 #[serde_as]

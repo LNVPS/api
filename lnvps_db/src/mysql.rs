@@ -191,21 +191,21 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_vms(&self) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm")
+        sqlx::query_as("select * from vm ")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
     }
 
     async fn list_expired_vms(&self) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm where expires > current_timestamp()")
+        sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
     }
 
     async fn list_user_vms(&self, id: u64) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm where user_id = ?")
+        sqlx::query_as("select * from vm where user_id = ? and deleted = 0")
             .bind(id)
             .fetch_all(&self.db)
             .await
@@ -241,7 +241,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn delete_vm(&self, vm_id: u64) -> Result<()> {
-        sqlx::query("delete from vm where id = ?")
+        sqlx::query("update vm set deleted = 1 where id = ?")
             .bind(vm_id)
             .execute(&self.db)
             .await
@@ -263,7 +263,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        sqlx::query_as("select * from vm_ip_assignment where vm_id = ?")
+        sqlx::query_as("select * from vm_ip_assignment where vm_id = ? and deleted = 0")
             .bind(vm_id)
             .fetch_all(&self.db)
             .await
@@ -271,11 +271,19 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>> {
-        sqlx::query_as("select * from vm_ip_assignment where ip_range_id = ?")
+        sqlx::query_as("select * from vm_ip_assignment where ip_range_id = ? and deleted = 0")
             .bind(range_id)
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
+    }
+
+    async fn delete_vm_ip_assignment(&self, vm_id: u64) -> Result<()> {
+        sqlx::query("update vm_ip_assignment set deleted = 1 where vm_id = ?")
+            .bind(&vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>> {

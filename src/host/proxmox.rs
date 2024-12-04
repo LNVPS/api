@@ -577,4 +577,7 @@ pub struct VmConfig {
     pub efi_disk_0: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kvm: Option<bool>,
+    #[serde(rename = "serial0")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_0: Option<String>
 }
