@@ -38,7 +38,12 @@ async fn main() -> Result<(), Error> {
     db.migrate().await?;
 
     let exchange = ExchangeRateCache::new();
-    let lnd = connect(settings.lnd.url, settings.lnd.cert, settings.lnd.macaroon).await?;
+    let lnd = connect(
+        settings.lnd.url.clone(),
+        settings.lnd.cert.clone(),
+        settings.lnd.macaroon.clone(),
+    )
+    .await?;
     #[cfg(debug_assertions)]
     {
         let setup_script = include_str!("../../dev_setup.sql");
@@ -52,13 +57,18 @@ async fn main() -> Result<(), Error> {
             .get_provisioner(db.clone(), lnd.clone(), exchange.clone());
     worker_provisioner.init().await?;
 
-    let mut worker = Worker::new(
-        db.clone(),
-        worker_provisioner,
-        settings.delete_after,
-        status.clone(),
-    );
+    let mut worker = Worker::new(db.clone(), worker_provisioner, &settings, status.clone());
     let sender = worker.sender();
+
+    // send a startup notification
+    if let Some(admin) = &settings.smtp.and_then(|s| s.admin) {
+        sender.send(WorkJob::SendNotification {
+            title: Some("Startup".to_string()),
+            message: "System is starting!".to_string(),
+            user_id: *admin,
+        })?;
+    }
+
     tokio::spawn(async move {
         loop {
             if let Err(e) = worker.handle().await {

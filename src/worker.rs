@@ -1,11 +1,18 @@
 use crate::host::get_host_client;
 use crate::host::proxmox::{VmInfo, VmStatus};
 use crate::provisioner::Provisioner;
+use crate::settings::{Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
 use chrono::{Days, Utc};
+use lettre::message::MessageBuilder;
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::SmtpTransportBuilder;
+use lettre::AsyncTransport;
+use lettre::{AsyncSmtpTransport, SmtpTransport, Tokio1Executor, Transport};
 use lnvps_db::LNVpsDb;
 use log::{debug, error, info};
+use rocket::futures::SinkExt;
 use std::ops::Add;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -17,11 +24,15 @@ pub enum WorkJob {
     /// This job starts a vm if stopped and also creates the vm if it doesn't exist yet
     CheckVm { vm_id: u64 },
     /// Send a notification to the users chosen contact preferences
-    SendNotification { user_id: u64, message: String },
+    SendNotification {
+        user_id: u64,
+        message: String,
+        title: Option<String>,
+    },
 }
 
 pub struct Worker {
-    delete_after: u16,
+    settings: WorkerSettings,
     db: Box<dyn LNVpsDb>,
     provisioner: Box<dyn Provisioner>,
     vm_state_cache: VmStateCache,
@@ -29,11 +40,25 @@ pub struct Worker {
     rx: UnboundedReceiver<WorkJob>,
 }
 
+pub struct WorkerSettings {
+    pub delete_after: u16,
+    pub smtp: Option<SmtpConfig>,
+}
+
+impl Into<WorkerSettings> for &Settings {
+    fn into(self) -> WorkerSettings {
+        WorkerSettings {
+            delete_after: self.delete_after,
+            smtp: self.smtp.clone(),
+        }
+    }
+}
+
 impl Worker {
     pub fn new<D: LNVpsDb + Clone + 'static, P: Provisioner + 'static>(
         db: D,
         provisioner: P,
-        delete_after: u16,
+        settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
@@ -41,7 +66,7 @@ impl Worker {
             db: Box::new(db),
             provisioner: Box::new(provisioner),
             vm_state_cache,
-            delete_after,
+            settings: settings.into(),
             tx,
             rx,
         }
@@ -77,7 +102,11 @@ impl Worker {
                 self.provisioner.stop_vm(db_vm.id).await?;
             }
             // Delete VM if expired > 3 days
-            if db_vm.expires.add(Days::new(self.delete_after as u64)) < Utc::now() {
+            if db_vm
+                .expires
+                .add(Days::new(self.settings.delete_after as u64))
+                < Utc::now()
+            {
                 info!("Deleting expired VM {}", db_vm.id);
                 self.provisioner.delete_vm(db_vm.id).await?;
             }
@@ -139,6 +168,44 @@ impl Worker {
         Ok(())
     }
 
+    async fn send_notification(
+        &self,
+        user_id: u64,
+        message: String,
+        title: Option<String>,
+    ) -> Result<()> {
+        let user = self.db.get_user(user_id).await?;
+        if let Some(smtp) = self.settings.smtp.as_ref() {
+            if user.contact_email && user.email.is_some() {
+                // send email
+                let mut b = MessageBuilder::new().to(user.email.unwrap().parse()?);
+                if let Some(t) = title {
+                    b = b.subject(t);
+                }
+                if let Some(f) = &smtp.from {
+                    b = b.from(f.parse()?);
+                }
+                let msg = b.body(message)?;
+
+                let mut sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+                    .credentials(Credentials::new(
+                        smtp.username.to_string(),
+                        smtp.password.to_string(),
+                    ))
+                    .build();
+
+                sender.send(msg).await?;
+            }
+        }
+        if user.contact_nip4 {
+            // send DM
+        }
+        if user.contact_nip17 {
+            // send dm
+        }
+        Ok(())
+    }
+
     pub async fn handle(&mut self) -> Result<()> {
         while let Some(job) = self.rx.recv().await {
             match job {
@@ -147,7 +214,15 @@ impl Worker {
                         error!("Failed to check VM {}: {}", vm_id, e);
                     }
                 }
-                WorkJob::SendNotification { .. } => {}
+                WorkJob::SendNotification {
+                    user_id,
+                    message,
+                    title,
+                } => {
+                    if let Err(e) = self.send_notification(user_id, message, title).await {
+                        error!("Failed to send notification {}: {}", user_id, e);
+                    }
+                }
                 WorkJob::CheckVms => {
                     if let Err(e) = self.check_vms().await {
                         error!("Failed to check VMs: {}", e);

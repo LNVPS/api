@@ -28,3 +28,4 @@ rand = "0.8.5"
 clap = { version = "4.5.21", features = ["derive"] }
 ssh2 = "0.9.4"
 ssh-key = "0.6.7"
+lettre = { version = "0.11.10", features = ["tokio1-native-tls"] }

@@ -6,25 +6,48 @@ use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Settings {
     pub listen: Option<String>,
     pub db: String,
     pub lnd: LndConfig,
+
+    /// Main control process impl
     pub provisioner: ProvisionerConfig,
 
     /// Number of days after an expired VM is deleted
     pub delete_after: u16,
+
+    /// SMTP settings for sending emails
+    pub smtp: Option<SmtpConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LndConfig {
     pub url: String,
     pub cert: PathBuf,
     pub macaroon: PathBuf,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SmtpConfig {
+    /// Admin user id, for sending system notifications
+    pub admin: Option<u64>,
+
+    /// Email server host:port
+    pub server: String,
+
+    /// From header to use, otherwise empty
+    pub from: Option<String>,
+
+    /// Username for SMTP connection
+    pub username: String,
+
+    /// Password for SMTP connection
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ProvisionerConfig {
     Proxmox {
         /// Readonly mode, don't spawn any VM's
