@@ -5,6 +5,7 @@ use crate::host::proxmox::{
     VmConfig,
 };
 use crate::provisioner::Provisioner;
+use crate::router::Router;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use anyhow::{bail, Result};
@@ -15,7 +16,7 @@ use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
-use log::info;
+use log::{info, warn};
 use nostr::util::hex;
 use rand::random;
 use rand::seq::IteratorRandom;
@@ -27,6 +28,7 @@ use std::time::Duration;
 
 pub struct LNVpsProvisioner {
     db: Box<dyn LNVpsDb>,
+    router: Option<Box<dyn Router>>,
     lnd: Client,
     rates: ExchangeRateCache,
     read_only: bool,
@@ -40,11 +42,13 @@ impl LNVpsProvisioner {
         config: QemuConfig,
         ssh: Option<SshConfig>,
         db: impl LNVpsDb + 'static,
+        router: Option<impl Router + 'static>,
         lnd: Client,
         rates: ExchangeRateCache,
     ) -> Self {
         Self {
             db: Box::new(db),
+            router: router.map(|r| Box::new(r) as Box<dyn Router>),
             lnd,
             rates,
             config,
@@ -265,6 +269,12 @@ impl Provisioner for LNVpsProvisioner {
                         ip: ip_net.to_string(),
                         ..Default::default()
                     };
+
+                    // add arp entry for router
+                    if let Some(r) = self.router.as_ref() {
+                        r.add_arp_entry(ip, &vm.mac_address, Some(&format!("VM{}", vm.id)))
+                            .await?;
+                    }
                     let id = self.db.insert_vm_ip_assignment(&assignment).await?;
                     assignment.id = id;
 
@@ -272,6 +282,10 @@ impl Provisioner for LNVpsProvisioner {
                     break 'ranges;
                 }
             }
+        }
+
+        if ret.is_empty() {
+            bail!("No ip ranges found in this region");
         }
 
         Ok(ret)
@@ -450,6 +464,21 @@ impl Provisioner for LNVpsProvisioner {
         //let j_start = client.delete_vm(&host.name, vm.id + 100).await?;
         let j_stop = client.stop_vm(&host.name, vm.id + 100).await?;
         client.wait_for_task(&j_stop).await?;
+
+        if let Some(r) = self.router.as_ref() {
+            let ent = r.list_arp_entry().await?;
+            if let Some(ent) = ent.iter().find(|e| {
+                e.mac_address
+                    .as_ref()
+                    .map(|m| m.eq_ignore_ascii_case(&vm.mac_address))
+                    .unwrap_or(false)
+            }) {
+                r.remove_arp_entry(ent.id.as_ref().unwrap().as_str())
+                    .await?;
+            } else {
+                warn!("ARP entry not found, skipping")
+            }
+        }
 
         self.db.delete_vm_ip_assignment(vm.id).await?;
         self.db.delete_vm(vm.id).await?;

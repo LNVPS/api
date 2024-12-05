@@ -50,11 +50,12 @@ async fn main() -> Result<(), Error> {
         db.execute(setup_script).await?;
     }
 
+    let router = settings.router.as_ref().map(|r| r.get_router());
     let status = VmStateCache::new();
     let worker_provisioner =
         settings
             .provisioner
-            .get_provisioner(db.clone(), lnd.clone(), exchange.clone());
+            .get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
     worker_provisioner.init().await?;
 
     let mut worker = Worker::new(db.clone(), worker_provisioner, &settings, status.clone());
@@ -110,10 +111,11 @@ async fn main() -> Result<(), Error> {
         }
     });
 
+    let router = settings.router.as_ref().map(|r| r.get_router());
     let provisioner =
         settings
             .provisioner
-            .get_provisioner(db.clone(), lnd.clone(), exchange.clone());
+            .get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
 
     let db: Box<dyn LNVpsDb> = Box::new(db.clone());
     let pv: Box<dyn Provisioner> = Box::new(provisioner);

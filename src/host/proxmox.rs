@@ -282,10 +282,10 @@ impl ProxmoxClient {
         body: R,
     ) -> Result<T> {
         let body = serde_json::to_string(&body)?;
-        debug!("{}", &body);
+        debug!(">> {} {}: {}", method.clone(), path, &body);
         let rsp = self
             .client
-            .request(method, self.base.join(path)?)
+            .request(method.clone(), self.base.join(path)?)
             .header("Authorization", format!("PVEAPIToken={}", self.token))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
@@ -299,7 +299,7 @@ impl ProxmoxClient {
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
-            bail!("{}", status);
+            bail!("{} {}: {}", method, path, status);
         }
     }
 }
@@ -579,5 +579,5 @@ pub struct VmConfig {
     pub kvm: Option<bool>,
     #[serde(rename = "serial0")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub serial_0: Option<String>
+    pub serial_0: Option<String>,
 }

@@ -1,6 +1,6 @@
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use log::{debug, info};
+use log::debug;
 use nostr::{Event, JsonUtil, Kind, Timestamp};
 use rocket::http::uri::{Absolute, Uri};
 use rocket::http::Status;

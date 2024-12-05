@@ -1,6 +1,7 @@
 use crate::exchange::ExchangeRateCache;
 use crate::provisioner::lnvps::LNVpsProvisioner;
 use crate::provisioner::Provisioner;
+use crate::router::{MikrotikRouter, Router};
 use fedimint_tonic_lnd::Client;
 use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,9 @@ pub struct Settings {
 
     /// SMTP settings for sending emails
     pub smtp: Option<SmtpConfig>,
+
+    /// Network router config
+    pub router: Option<RouterConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -27,6 +31,18 @@ pub struct LndConfig {
     pub url: String,
     pub cert: PathBuf,
     pub macaroon: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum RouterConfig {
+    Mikrotik {
+        url: String,
+        username: String,
+        password: String,
+
+        /// Interface used to add arp entries
+        arp_interface: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -92,6 +108,7 @@ impl ProvisionerConfig {
     pub fn get_provisioner(
         &self,
         db: impl LNVpsDb + 'static,
+        router: Option<impl Router + 'static>,
         lnd: Client,
         exchange: ExchangeRateCache,
     ) -> impl Provisioner + 'static {
@@ -100,7 +117,28 @@ impl ProvisionerConfig {
                 qemu,
                 ssh,
                 read_only,
-            } => LNVpsProvisioner::new(*read_only, qemu.clone(), ssh.clone(), db, lnd, exchange),
+            } => LNVpsProvisioner::new(
+                *read_only,
+                qemu.clone(),
+                ssh.clone(),
+                db,
+                router,
+                lnd,
+                exchange,
+            ),
+        }
+    }
+}
+
+impl RouterConfig {
+    pub fn get_router(&self) -> impl Router + 'static {
+        match self {
+            RouterConfig::Mikrotik {
+                url,
+                username,
+                password,
+                arp_interface,
+            } => MikrotikRouter::new(&url, &username, &password, &arp_interface),
         }
     }
 }

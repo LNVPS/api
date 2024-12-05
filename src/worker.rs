@@ -4,12 +4,11 @@ use crate::provisioner::Provisioner;
 use crate::settings::{Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
-use chrono::{DateTime, Days, Utc};
+use chrono::{Days, Utc};
 use lettre::message::MessageBuilder;
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::SmtpTransportBuilder;
 use lettre::AsyncTransport;
-use lettre::{AsyncSmtpTransport, SmtpTransport, Tokio1Executor, Transport};
+use lettre::{AsyncSmtpTransport, Tokio1Executor, Transport};
 use lnvps_db::LNVpsDb;
 use log::{debug, error, info};
 use rocket::futures::SinkExt;
@@ -118,11 +117,16 @@ impl Worker {
             {
                 info!("Deleting expired VM {}", db_vm.id);
                 self.provisioner.delete_vm(db_vm.id).await?;
+                let title = Some(format!("[VM{}] Deleted", db_vm.id));
                 self.tx.send(WorkJob::SendNotification {
                     user_id: db_vm.user_id,
-                    title: Some(format!("[VM{}] Deleted", db_vm.id)),
+                    title: title.clone(),
                     message: format!("Your VM #{} has been deleted!", db_vm.id),
                 })?;
+                self.queue_admin_notification(
+                    format!("VM{} is ready for deletion", db_vm.id),
+                    title,
+                )?;
             }
         }
 
@@ -222,7 +226,7 @@ impl Worker {
                 }
                 let msg = b.body(message)?;
 
-                let mut sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+                let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
                     .credentials(Credentials::new(
                         smtp.username.to_string(),
                         smtp.password.to_string(),

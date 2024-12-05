@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rocket::async_trait;
+use rocket::serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// Router defines a network device used to access the hosts
@@ -10,9 +11,27 @@ use std::net::IpAddr;
 ///
 /// It also prevents people from re-assigning their IP to another in the range,
 #[async_trait]
-pub trait Router {
-    async fn add_arp_entry(&self, ip: IpAddr, mac: &[u8; 6], comment: Option<&str>) -> Result<()>;
+pub trait Router: Send + Sync {
+    async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>>;
+    async fn add_arp_entry(&self, ip: IpAddr, mac: &str, comment: Option<&str>) -> Result<()>;
+    async fn remove_arp_entry(&self, id: &str) -> Result<()>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArpEntry {
+    #[serde(rename = ".id")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "mac-address")]
+    pub mac_address: Option<String>,
+    pub interface: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[cfg(feature = "mikrotik")]
 mod mikrotik;
+#[cfg(feature = "mikrotik")]
 pub use mikrotik::*;
