@@ -5,7 +5,7 @@ use crate::settings::{Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
 use chrono::{Days, Utc};
-use lettre::message::MessageBuilder;
+use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor, Transport};
@@ -224,7 +224,13 @@ impl Worker {
                 if let Some(f) = &smtp.from {
                     b = b.from(f.parse()?);
                 }
-                let msg = b.body(message)?;
+                let template = include_str!("../email.html");
+                let html = MultiPart::alternative_plain_html(
+                    message.clone(),
+                    template.replace("%%_MESSAGE_%%", &message),
+                );
+
+                let msg = b.multipart(html)?;
 
                 let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
                     .credentials(Credentials::new(
