@@ -8,10 +8,11 @@ use chrono::{Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
-use lettre::{AsyncSmtpTransport, Tokio1Executor, Transport};
+use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_db::LNVpsDb;
 use log::{debug, error, info};
-use rocket::futures::SinkExt;
+use nostr::{EventBuilder, PublicKey};
+use nostr_sdk::Client;
 use std::ops::Add;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -38,6 +39,7 @@ pub struct Worker {
     vm_state_cache: VmStateCache,
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
+    client: Option<Client>,
     last_check_vms: u64,
 }
 
@@ -61,6 +63,7 @@ impl Worker {
         provisioner: P,
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
+        client: Option<Client>,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
         Self {
@@ -70,6 +73,7 @@ impl Worker {
             settings: settings.into(),
             tx,
             rx,
+            client,
             last_check_vms: Utc::now().timestamp() as u64,
         }
     }
@@ -243,10 +247,20 @@ impl Worker {
             }
         }
         if user.contact_nip4 {
-            // send DM
+            // send dm
         }
         if user.contact_nip17 {
-            // send dm
+            if let Some(c) = self.client.as_ref() {
+                let sig = c.signer().await?;
+                let ev = EventBuilder::private_msg(
+                    &sig,
+                    PublicKey::from_slice(&user.pubkey)?,
+                    message,
+                    None,
+                )
+                .await?;
+                c.send_event(ev).await?;
+            }
         }
         Ok(())
     }

@@ -12,6 +12,8 @@ use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
+use nostr::Keys;
+use nostr_sdk::Client;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -50,6 +52,16 @@ async fn main() -> Result<(), Error> {
         db.execute(setup_script).await?;
     }
 
+    let nostr_client = if let Some(ref c) = settings.nostr {
+        let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
+        for r in &c.relays {
+            cx.add_relay(r.clone()).await?;
+        }
+        cx.connect().await;
+        Some(cx)
+    } else {
+        None
+    };
     let router = settings.router.as_ref().map(|r| r.get_router());
     let status = VmStateCache::new();
     let worker_provisioner =
@@ -58,7 +70,13 @@ async fn main() -> Result<(), Error> {
             .get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
     worker_provisioner.init().await?;
 
-    let mut worker = Worker::new(db.clone(), worker_provisioner, &settings, status.clone());
+    let mut worker = Worker::new(
+        db.clone(),
+        worker_provisioner,
+        &settings,
+        status.clone(),
+        nostr_client.clone(),
+    );
     let sender = worker.sender();
 
     // send a startup notification

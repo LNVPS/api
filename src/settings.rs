@@ -24,6 +24,9 @@ pub struct Settings {
 
     /// Network router config
     pub router: Option<RouterConfig>,
+
+    /// Nostr config for sending DM's
+    pub nostr: Option<NostrConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -31,6 +34,12 @@ pub struct LndConfig {
     pub url: String,
     pub cert: PathBuf,
     pub macaroon: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NostrConfig {
+    pub relays: Vec<String>,
+    pub nsec: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -31,7 +31,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> Result<u64> {
-        let res = sqlx::query("insert ignore into users(pubkey) values(?) returning id")
+        let res = sqlx::query("insert ignore into users(pubkey,contact_nip17) values(?,1) returning id")
             .bind(pubkey.as_slice())
             .fetch_optional(&self.db)
             .await?;
