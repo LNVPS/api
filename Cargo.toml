@@ -9,7 +9,7 @@ name = "api"
 [features]
 default = ["mikrotik", "nostr-dm"]
 mikrotik = []
-nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip04", "nostr-sdk/nip44", "nostr-sdk/nip59"]
+nostr-dm = ["dep:nostr-sdk"]
 
 [dependencies]
 lnvps_db = { path = "lnvps_db" }
@@ -34,4 +34,5 @@ ssh2 = "0.9.4"
 ssh-key = "0.6.7"
 lettre = { version = "0.11.10", features = ["tokio1-native-tls"] }
 
-nostr-sdk = { version = "0.37.0", optional = true, default-features = false }
+#nostr-dm
+nostr-sdk = { version = "0.37.0", optional = true, default-features = false, features = ["nip44", "nip59"] }
