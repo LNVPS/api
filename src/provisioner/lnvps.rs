@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use std::ops::Add;
 use std::time::Duration;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 

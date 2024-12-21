@@ -5,16 +5,14 @@ use crate::worker::WorkJob;
 use anyhow::{bail, Result};
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
-use log::{debug, error, warn};
+use log::{debug, error};
 use nostr::util::hex;
 use rocket::futures::{Sink, SinkExt, StreamExt};
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, routes, Responder, Route, State};
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
-use std::error::Error;
 use std::fmt::Display;
-use std::mem::transmute;
 use tokio::sync::mpsc::UnboundedSender;
 use ws::Message;
 
@@ -305,7 +303,7 @@ async fn v1_terminal_proxy(
     id: u64,
     ws: ws::WebSocket,
 ) -> Result<ws::Channel<'static>, &'static str> {
-    let auth = Nip98Auth::from_base64(auth).map_err(|e| "Missing or invalid auth param")?;
+    let auth = Nip98Auth::from_base64(auth).map_err(|_| "Missing or invalid auth param")?;
     if auth.check(&format!("/api/v1/console/{id}"), "GET").is_err() {
         return Err("Invalid auth event");
     }
@@ -321,7 +319,7 @@ async fn v1_terminal_proxy(
         "Failed to open terminal proxy"
     })?;
     let ws = ws.config(Default::default());
-    Ok(ws.channel(move |mut stream| {
+    Ok(ws.channel(move |stream| {
         Box::pin(async move {
             let (mut tx_upstream, mut rx_upstream) = ws_upstream.split();
             let (mut tx_client, mut rx_client) = stream.split();

@@ -4,7 +4,7 @@ use crate::provisioner::Provisioner;
 use crate::settings::{Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
-use chrono::{Days, Utc};
+use chrono::{DateTime, Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
@@ -40,7 +40,7 @@ pub struct Worker {
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
     client: Option<Client>,
-    last_check_vms: u64,
+    last_check_vms: DateTime<Utc>,
 }
 
 pub struct WorkerSettings {
@@ -74,7 +74,7 @@ impl Worker {
             tx,
             rx,
             client,
-            last_check_vms: Utc::now().timestamp() as u64,
+            last_check_vms: Utc::now(),
         }
     }
 
@@ -102,6 +102,22 @@ impl Worker {
         self.vm_state_cache.set_state(db_id, state).await?;
 
         if let Ok(db_vm) = self.db.get_vm(db_id).await {
+            const BEFORE_EXPIRE_NOTIFICATION: u64 = 1;
+
+            // Send notification of VM expiring soon
+            if db_vm.expires < Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
+                && db_vm.expires
+                    > self
+                        .last_check_vms
+                        .add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
+            {
+                self.tx.send(WorkJob::SendNotification {
+                    user_id: db_vm.user_id,
+                    title: Some(format!("[VM{}] Expiring Soon", db_vm.id)),
+                    message: format!("Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.", db_vm.id, BEFORE_EXPIRE_NOTIFICATION)
+                })?;
+            }
+
             // Stop VM if expired and is running
             if db_vm.expires < Utc::now() && s.status == VmStatus::Running {
                 info!("Stopping expired VM {}", db_vm.id);
@@ -171,7 +187,7 @@ impl Worker {
         Ok(())
     }
 
-    pub async fn check_vms(&self) -> Result<()> {
+    pub async fn check_vms(&mut self) -> Result<()> {
         let hosts = self.db.list_hosts().await?;
         for host in hosts {
             let client = get_host_client(&host)?;
@@ -208,6 +224,8 @@ impl Worker {
                 self.check_vm(vm.id).await?;
             }
         }
+
+        self.last_check_vms = Utc::now();
         Ok(())
     }
 

@@ -1,17 +1,14 @@
 use anyhow::{anyhow, bail, Result};
 use log::debug;
 use reqwest::{ClientBuilder, Method, Url};
-use rocket::futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::handshake::client::{generate_key, Request};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 pub struct ProxmoxClient {
