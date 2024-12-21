@@ -111,6 +111,7 @@ impl Worker {
                         .last_check_vms
                         .add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
             {
+                info!("Sending expire soon notification VM {}", db_vm.id);
                 self.tx.send(WorkJob::SendNotification {
                     user_id: db_vm.user_id,
                     title: Some(format!("[VM{}] Expiring Soon", db_vm.id)),
@@ -193,10 +194,10 @@ impl Worker {
             let client = get_host_client(&host)?;
 
             for node in client.list_nodes().await? {
-                info!("Checking vms for {}", node.name);
+                debug!("Checking vms for {}", node.name);
                 for vm in client.list_vms(&node.name).await? {
                     let vm_id = vm.vm_id;
-                    info!("\t{}: {:?}", vm_id, vm.status);
+                    debug!("\t{}: {:?}", vm_id, vm.status);
                     if let Err(e) = self.handle_vm_info(vm).await {
                         error!("{}", e);
                         self.queue_admin_notification(
