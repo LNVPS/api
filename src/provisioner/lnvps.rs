@@ -16,15 +16,19 @@ use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
-use log::{info, warn};
+use log::{debug, info, warn};
 use nostr::util::hex;
 use rand::random;
 use rand::seq::IteratorRandom;
 use reqwest::Url;
+use rocket::futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::ops::Add;
 use std::time::Duration;
+use tokio::net::{TcpSocket, TcpStream};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub struct LNVpsProvisioner {
     db: Box<dyn LNVpsDb>,
@@ -484,5 +488,31 @@ impl Provisioner for LNVpsProvisioner {
         self.db.delete_vm(vm.id).await?;
 
         Ok(())
+    }
+
+    async fn terminal_proxy(
+        &self,
+        vm_id: u64,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        let client = get_host_client(&host)?;
+
+        let host_vm_id = vm.id + 100;
+        let term = client.terminal_proxy(&host.name, host_vm_id).await?;
+
+        let login_msg = format!("{}:{}\n", term.user, term.ticket);
+        let mut ws = client
+            .open_terminal_proxy(&host.name, host_vm_id, term)
+            .await?;
+        debug!("Sending login msg: {}", login_msg);
+        ws.send(Message::Text(login_msg)).await?;
+        if let Some(n) = ws.next().await {
+            debug!("{:?}", n);
+        } else {
+            bail!("No response from terminal_proxy");
+        }
+        ws.send(Message::Text("1:86:24:".to_string())).await?;
+        Ok(ws)
     }
 }

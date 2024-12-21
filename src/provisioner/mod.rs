@@ -1,6 +1,8 @@
 use anyhow::Result;
 use lnvps_db::{Vm, VmIpAssignment, VmPayment};
 use rocket::async_trait;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub mod lnvps;
 
@@ -42,4 +44,7 @@ pub trait Provisioner: Send + Sync {
 
     /// Delete a VM
     async fn delete_vm(&self, vm_id: u64) -> Result<()>;
+
+    /// Open terminal proxy connection
+    async fn terminal_proxy(&self, vm_id: u64) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 }

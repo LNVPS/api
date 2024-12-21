@@ -2,14 +2,21 @@ use crate::nip98::Nip98Auth;
 use crate::provisioner::Provisioner;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
+use anyhow::{bail, Result};
 use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
+use log::{debug, error, warn};
 use nostr::util::hex;
+use rocket::futures::{Sink, SinkExt, StreamExt};
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, routes, Responder, Route, State};
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
+use std::error::Error;
+use std::fmt::Display;
+use std::mem::transmute;
 use tokio::sync::mpsc::UnboundedSender;
+use ws::Message;
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -24,7 +31,8 @@ pub fn routes() -> Vec<Route> {
         v1_get_payment,
         v1_start_vm,
         v1_stop_vm,
-        v1_restart_vm
+        v1_restart_vm,
+        v1_terminal_proxy
     ]
 }
 
@@ -287,6 +295,112 @@ async fn v1_get_payment(
     }
 
     ApiData::ok(payment)
+}
+
+#[get("/api/v1/console/<id>?<auth>")]
+async fn v1_terminal_proxy(
+    auth: &str,
+    db: &State<Box<dyn LNVpsDb>>,
+    provisioner: &State<Box<dyn Provisioner>>,
+    id: u64,
+    ws: ws::WebSocket,
+) -> Result<ws::Channel<'static>, &'static str> {
+    let auth = Nip98Auth::from_base64(auth).map_err(|e| "Missing or invalid auth param")?;
+    if auth.check(&format!("/api/v1/console/{id}"), "GET").is_err() {
+        return Err("Invalid auth event");
+    }
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await.map_err(|_| "Insert failed")?;
+    let vm = db.get_vm(id).await.map_err(|_| "VM not found")?;
+    if uid != vm.user_id {
+        return Err("VM does not belong to you");
+    }
+
+    let ws_upstream = provisioner.terminal_proxy(vm.id).await.map_err(|e| {
+        error!("Failed to start terminal proxy: {}", e);
+        "Failed to open terminal proxy"
+    })?;
+    let ws = ws.config(Default::default());
+    Ok(ws.channel(move |mut stream| {
+        Box::pin(async move {
+            let (mut tx_upstream, mut rx_upstream) = ws_upstream.split();
+            let (mut tx_client, mut rx_client) = stream.split();
+
+            async fn process_client<S, E>(
+                msg: Result<Message, E>,
+                tx_upstream: &mut S,
+            ) -> Result<()>
+            where
+                S: SinkExt<Message> + Unpin,
+                <S as Sink<Message>>::Error: Display,
+                E: Display,
+            {
+                match msg {
+                    Ok(m) => {
+                        let m_up = match m {
+                            Message::Text(t) => Message::Text(format!("0:{}:{}", t.len(), t)),
+                            _ => panic!("todo"),
+                        };
+                        debug!("Sending data to upstream: {:?}", m_up);
+                        if let Err(e) = tx_upstream.send(m_up).await {
+                            bail!("Failed to send msg to upstream: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        bail!("Failed to read from client: {}", e);
+                    }
+                }
+                Ok(())
+            }
+
+            async fn process_upstream<S, E>(
+                msg: Result<Message, E>,
+                tx_client: &mut S,
+            ) -> Result<()>
+            where
+                S: SinkExt<Message> + Unpin,
+                <S as Sink<Message>>::Error: Display,
+                E: Display,
+            {
+                match msg {
+                    Ok(m) => {
+                        let m_down = match m {
+                            Message::Binary(data) => {
+                                Message::Text(String::from_utf8_lossy(&data).to_string())
+                            }
+                            _ => panic!("todo"),
+                        };
+                        debug!("Sending data to downstream: {:?}", m_down);
+                        if let Err(e) = tx_client.send(m_down).await {
+                            bail!("Failed to msg to client: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        bail!("Failed to read from upstream: {}", e);
+                    }
+                }
+                Ok(())
+            }
+
+            loop {
+                tokio::select! {
+                    Some(msg) = rx_client.next() => {
+                        if let Err(e) = process_client(msg, &mut tx_upstream).await {
+                            error!("{}", e);
+                            break;
+                        }
+                    },
+                    Some(msg) = rx_upstream.next() => {
+                        if let Err(e) = process_upstream(msg, &mut tx_client).await {
+                            error!("{}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }))
 }
 
 #[derive(Deserialize)]

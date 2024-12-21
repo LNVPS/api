@@ -1,12 +1,18 @@
 use anyhow::{anyhow, bail, Result};
 use log::debug;
 use reqwest::{ClientBuilder, Method, Url};
+use rocket::futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::handshake::client::{generate_key, Request};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 pub struct ProxmoxClient {
     base: Url,
@@ -253,7 +259,68 @@ impl ProxmoxClient {
         })
     }
 
+    /// Create terminal proxy session
+    pub async fn terminal_proxy(&self, node: &str, vm: u64) -> Result<TerminalProxyTicket> {
+        let rsp: ResponseBase<TerminalProxyTicket> = self
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/termproxy", node, vm),
+                (),
+            )
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Open websocket connection to terminal proxy
+    pub async fn open_terminal_proxy(
+        &self,
+        node: &str,
+        vm: u64,
+        req: TerminalProxyTicket,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        self.get_task_status(&TaskId {
+            id: req.upid,
+            node: node.to_string(),
+        })
+        .await?;
+
+        let mut url: Url = self.base.join(&format!(
+            "/api2/json/nodes/{}/qemu/{}/vncwebsocket",
+            node, vm
+        ))?;
+        url.set_scheme("wss").unwrap();
+        url.query_pairs_mut().append_pair("port", &req.port);
+        url.query_pairs_mut().append_pair("vncticket", &req.ticket);
+
+        let r = Request::builder()
+            .method("GET")
+            .header("Host", url.host().unwrap().to_string())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generate_key())
+            .header("Sec-WebSocket-Protocol", "binary")
+            .header("Authorization", format!("PVEAPIToken={}", self.token))
+            .uri(url.as_str())
+            .body(())?;
+
+        debug!("Connecting terminal proxy: {:?}", &r);
+        let (ws, _rsp) = tokio_tungstenite::connect_async_tls_with_config(
+            r,
+            None,
+            false,
+            Some(Connector::NativeTls(
+                native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()?,
+            )),
+        )
+        .await?;
+
+        Ok(ws)
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        debug!(">> GET {}", path);
         let rsp = self
             .client
             .get(self.base.join(path)?)
@@ -302,6 +369,14 @@ impl ProxmoxClient {
             bail!("{} {}: {}", method, path, status);
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalProxyTicket {
+    pub port: String,
+    pub ticket: String,
+    pub upid: String,
+    pub user: String,
 }
 
 #[derive(Debug, Clone)]

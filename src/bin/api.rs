@@ -16,6 +16,7 @@ use nostr::Keys;
 use nostr_sdk::Client;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use tokio::time::sleep;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -101,6 +102,7 @@ async fn main() -> Result<(), Error> {
             if let Err(e) = handler.listen().await {
                 error!("invoice-error: {}", e);
             }
+            sleep(Duration::from_secs(5)).await;
         }
     });
     // request work every 30s to check vm status

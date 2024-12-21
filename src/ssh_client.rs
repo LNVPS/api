@@ -1,5 +1,6 @@
 use anyhow::Result;
 use log::info;
+use ssh2::Channel;
 use std::io::Read;
 use std::path::PathBuf;
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -26,6 +27,11 @@ impl SshClient {
         self.session
             .userauth_pubkey_file(username, None, key, None)?;
         Ok(())
+    }
+
+    pub async fn open_channel(&mut self) -> Result<Channel> {
+        let channel = self.session.channel_session()?;
+        Ok(channel)
     }
 
     pub async fn execute(&mut self, command: &str) -> Result<(i32, String)> {
