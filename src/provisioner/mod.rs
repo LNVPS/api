@@ -50,4 +50,7 @@ pub trait Provisioner: Send + Sync {
         &self,
         vm_id: u64,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+
+    /// Re-Configure VM
+    async fn patch_vm(&self, vm_id: u64) -> Result<()>;
 }

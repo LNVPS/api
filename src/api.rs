@@ -30,7 +30,8 @@ pub fn routes() -> Vec<Route> {
         v1_start_vm,
         v1_stop_vm,
         v1_restart_vm,
-        v1_terminal_proxy
+        v1_terminal_proxy,
+        v1_patch_vm
     ]
 }
 
@@ -69,6 +70,11 @@ struct ApiVmStatus {
     #[serde(flatten)]
     pub vm: Vm,
     pub status: VmState,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VMPatchRequest {
+    pub ssh_key_id: Option<u64>,
 }
 
 #[get("/api/v1/vm")]
@@ -121,6 +127,35 @@ async fn v1_get_vm(
         vm,
         status: state.unwrap_or_default(),
     })
+}
+
+#[patch("/api/v1/vm/<id>", data = "<data>", format = "json")]
+async fn v1_patch_vm(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    provisioner: &State<Box<dyn Provisioner>>,
+    id: u64,
+    data: Json<VMPatchRequest>,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let mut vm = db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM doesnt belong to you");
+    }
+
+    if let Some(k) = data.ssh_key_id {
+        let ssh_key = db.get_user_ssh_key(k).await?;
+        if ssh_key.user_id != uid {
+            return ApiData::err("SSH key doesnt belong to you");
+        }
+        vm.ssh_key_id = ssh_key.id;
+    }
+
+    db.update_vm(&vm).await?;
+    provisioner.patch_vm(vm.id).await?;
+
+    ApiData::ok(())
 }
 
 #[get("/api/v1/image")]

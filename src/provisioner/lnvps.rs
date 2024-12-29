@@ -1,8 +1,8 @@
 use crate::exchange::{ExchangeRateCache, Ticker};
 use crate::host::get_host_client;
 use crate::host::proxmox::{
-    CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent, VmBios,
-    VmConfig,
+    ConfigureVm, CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent,
+    VmBios, VmConfig,
 };
 use crate::provisioner::Provisioner;
 use crate::router::Router;
@@ -71,6 +71,76 @@ impl LNVpsProvisioner {
         } else {
             bail!("No image storage found");
         }
+    }
+
+    async fn get_vm_config(&self, vm: &Vm) -> Result<VmConfig> {
+        let ssh_key = self.db.get_user_ssh_key(vm.ssh_key_id).await?;
+
+        let mut ips = self.db.list_vm_ip_assignments(vm.id).await?;
+        if ips.is_empty() {
+            ips = self.allocate_ips(vm.id).await?;
+        }
+
+        // load ranges
+        for ip in &mut ips {
+            ip.hydrate_up(&self.db).await?;
+        }
+
+        let mut ip_config = ips
+            .iter()
+            .map_while(|ip| {
+                if let Ok(net) = ip.ip.parse::<IpNetwork>() {
+                    Some(match net {
+                        IpNetwork::V4(addr) => {
+                            format!(
+                                "ip={},gw={}",
+                                addr,
+                                ip.ip_range.as_ref().map(|r| &r.gateway).unwrap()
+                            )
+                        }
+                        IpNetwork::V6(addr) => format!("ip6={}", addr),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        ip_config.push("ip6=auto".to_string());
+
+        let mut net = vec![
+            format!("virtio={}", vm.mac_address),
+            format!("bridge={}", self.config.bridge),
+        ];
+        if let Some(t) = self.config.vlan {
+            net.push(format!("tag={}", t));
+        }
+
+        let drives = self.db.list_host_disks(vm.host_id).await?;
+        let drive = if let Some(d) = drives.iter().find(|d| d.enabled) {
+            d
+        } else {
+            bail!("No host drive found!")
+        };
+
+        Ok(VmConfig {
+            cpu: Some(self.config.cpu.clone()),
+            kvm: Some(self.config.kvm),
+            ip_config: Some(ip_config.join(",")),
+            machine: Some(self.config.machine.clone()),
+            net: Some(net.join(",")),
+            os_type: Some(self.config.os_type.clone()),
+            on_boot: Some(true),
+            bios: Some(VmBios::OVMF),
+            boot: Some("order=scsi0".to_string()),
+            cores: Some(vm.cpu as i32),
+            memory: Some((vm.memory / 1024 / 1024).to_string()),
+            scsi_hw: Some("virtio-scsi-pci".to_string()),
+            serial_0: Some("socket".to_string()),
+            scsi_1: Some(format!("{}:cloudinit", &drive.name)),
+            ssh_keys: Some(urlencoding::encode(&ssh_key.key_data).to_string()),
+            efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
+            ..Default::default()
+        })
     }
 }
 
@@ -302,55 +372,6 @@ impl Provisioner for LNVpsProvisioner {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
         let client = get_host_client(&host)?;
-
-        let mut ips = self.db.list_vm_ip_assignments(vm.id).await?;
-        if ips.is_empty() {
-            ips = self.allocate_ips(vm.id).await?;
-        }
-
-        // load ranges
-        for ip in &mut ips {
-            ip.hydrate_up(&self.db).await?;
-        }
-
-        let mut ip_config = ips
-            .iter()
-            .map_while(|ip| {
-                if let Ok(net) = ip.ip.parse::<IpNetwork>() {
-                    Some(match net {
-                        IpNetwork::V4(addr) => {
-                            format!(
-                                "ip={},gw={}",
-                                addr,
-                                ip.ip_range.as_ref().map(|r| &r.gateway).unwrap()
-                            )
-                        }
-                        IpNetwork::V6(addr) => format!("ip6={}", addr),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        ip_config.push("ip6=auto".to_string());
-
-        let drives = self.db.list_host_disks(vm.host_id).await?;
-        let drive = if let Some(d) = drives.iter().find(|d| d.enabled) {
-            d
-        } else {
-            bail!("No host drive found!")
-        };
-
-        let ssh_key = self.db.get_user_ssh_key(vm.ssh_key_id).await?;
-
-        let mut net = vec![
-            format!("virtio={}", vm.mac_address),
-            format!("bridge={}", self.config.bridge),
-        ];
-        if let Some(t) = self.config.vlan {
-            net.push(format!("tag={}", t));
-        }
-
         let vm_id = 100 + vm.id as i32;
 
         // create VM
@@ -358,25 +379,7 @@ impl Provisioner for LNVpsProvisioner {
             .create_vm(CreateVm {
                 node: host.name.clone(),
                 vm_id,
-                config: VmConfig {
-                    on_boot: Some(true),
-                    bios: Some(VmBios::OVMF),
-                    boot: Some("order=scsi0".to_string()),
-                    cores: Some(vm.cpu as i32),
-                    cpu: Some(self.config.cpu.clone()),
-                    kvm: Some(self.config.kvm),
-                    ip_config: Some(ip_config.join(",")),
-                    machine: Some(self.config.machine.clone()),
-                    memory: Some((vm.memory / 1024 / 1024).to_string()),
-                    net: Some(net.join(",")),
-                    os_type: Some(self.config.os_type.clone()),
-                    scsi_1: Some(format!("{}:cloudinit", &drive.name)),
-                    scsi_hw: Some("virtio-scsi-pci".to_string()),
-                    ssh_keys: Some(urlencoding::encode(&ssh_key.key_data).to_string()),
-                    efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
-                    serial_0: Some("socket".to_string()),
-                    ..Default::default()
-                },
+                config: self.get_vm_config(&vm).await?,
             })
             .await?;
         client.wait_for_task(&t_create).await?;
@@ -394,6 +397,12 @@ impl Provisioner for LNVpsProvisioner {
             )
             .await?;
 
+            let drives = self.db.list_host_disks(vm.host_id).await?;
+            let drive = if let Some(d) = drives.iter().find(|d| d.enabled) {
+                d
+            } else {
+                bail!("No host drive found!")
+            };
             let cmd = format!(
                 "/usr/sbin/qm set {} --scsi0 {}:0,import-from=/var/lib/vz/template/iso/{}",
                 vm_id,
@@ -514,5 +523,29 @@ impl Provisioner for LNVpsProvisioner {
         }
         ws.send(Message::Text("1:86:24:".to_string())).await?;
         Ok(ws)
+    }
+
+    async fn patch_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        let client = get_host_client(&host)?;
+        let host_vm_id = vm.id + 100;
+
+        let t = client
+            .configure_vm(ConfigureVm {
+                node: host.name.clone(),
+                vm_id: host_vm_id as i32,
+                current: None,
+                snapshot: None,
+                config: VmConfig {
+                    scsi_0: None,
+                    scsi_1: None,
+                    efi_disk_0: None,
+                    ..self.get_vm_config(&vm).await?
+                },
+            })
+            .await?;
+        client.wait_for_task(&t).await?;
+        Ok(())
     }
 }

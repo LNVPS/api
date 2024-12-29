@@ -93,6 +93,9 @@ pub trait LNVpsDb: Sync + Send {
     /// Delete a VM by id
     async fn delete_vm(&self, vm_id: u64) -> Result<()>;
 
+    /// Update a VM
+    async fn update_vm(&self, vm: &Vm) -> Result<()>;
+
     /// List VM ip assignments
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64>;
 

@@ -31,10 +31,11 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> Result<u64> {
-        let res = sqlx::query("insert ignore into users(pubkey,contact_nip17) values(?,1) returning id")
-            .bind(pubkey.as_slice())
-            .fetch_optional(&self.db)
-            .await?;
+        let res =
+            sqlx::query("insert ignore into users(pubkey,contact_nip17) values(?,1) returning id")
+                .bind(pubkey.as_slice())
+                .fetch_optional(&self.db)
+                .await?;
         match res {
             None => sqlx::query("select id from users where pubkey = ?")
                 .bind(pubkey.as_slice())
@@ -243,6 +244,23 @@ impl LNVpsDb for LNVpsDbMysql {
     async fn delete_vm(&self, vm_id: u64) -> Result<()> {
         sqlx::query("update vm set deleted = 1 where id = ?")
             .bind(vm_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
+    }
+
+    async fn update_vm(&self, vm: &Vm) -> Result<()> {
+        sqlx::query("update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,cpu=?,memory=?,disk_size=?,disk_id=? where id=?")
+            .bind(vm.image_id)
+            .bind(vm.template_id)
+            .bind(vm.ssh_key_id)
+            .bind(vm.expires)
+            .bind(vm.cpu)
+            .bind(vm.memory)
+            .bind(vm.disk_size)
+            .bind(vm.disk_id)
+            .bind(vm.id)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
