@@ -13,7 +13,7 @@ use lnvps_db::LNVpsDb;
 use log::{debug, error, info};
 use nostr::{EventBuilder, PublicKey};
 use nostr_sdk::Client;
-use std::ops::Add;
+use std::ops::{Add, Sub};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug)]
@@ -209,6 +209,7 @@ impl Worker {
             }
         }
 
+        // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
         for vm in db_vms {
             let state = if let Some(s) = self.vm_state_cache.get_state(vm.id).await {
@@ -221,8 +222,15 @@ impl Worker {
                 None
             };
 
-            if state.is_none() && vm.expires > Utc::now() {
+            // create VM if not spawned yet
+            if vm.expires > Utc::now() && state.is_none() {
                 self.check_vm(vm.id).await?;
+            }
+
+            // delete vm if not paid (in new state)
+            if vm.expires < Utc::now().sub(Days::new(1)) && state.is_none() {
+                info!("Deleting unpaid VM {}", vm.id);
+                self.provisioner.delete_vm(vm.id).await?;
             }
         }
 
