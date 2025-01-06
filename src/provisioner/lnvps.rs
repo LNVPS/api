@@ -470,13 +470,13 @@ impl Provisioner for LNVpsProvisioner {
 
     async fn delete_vm(&self, vm_id: u64) -> Result<()> {
         let vm = self.db.get_vm(vm_id).await?;
-        let host = self.db.get_host(vm.host_id).await?;
+        //let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host)?;
         // TODO: delete not implemented, stop only
+        //let client = get_host_client(&host)?;
         //let j_start = client.delete_vm(&host.name, vm.id + 100).await?;
-        let j_stop = client.stop_vm(&host.name, vm.id + 100).await?;
-        client.wait_for_task(&j_stop).await?;
+        //let j_stop = client.stop_vm(&host.name, vm.id + 100).await?;
+        //client.wait_for_task(&j_stop).await?;
 
         if let Some(r) = self.router.as_ref() {
             let ent = r.list_arp_entry().await?;

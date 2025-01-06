@@ -228,7 +228,7 @@ impl Worker {
             }
 
             // delete vm if not paid (in new state)
-            if vm.expires < Utc::now().sub(Days::new(1)) && state.is_none() {
+            if !vm.deleted && vm.expires < Utc::now().sub(Days::new(1)) && state.is_none() {
                 info!("Deleting unpaid VM {}", vm.id);
                 self.provisioner.delete_vm(vm.id).await?;
             }
