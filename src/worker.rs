@@ -4,7 +4,7 @@ use crate::provisioner::Provisioner;
 use crate::settings::{Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
-use chrono::{DateTime, Days, Utc};
+use chrono::{DateTime, Datelike, Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
@@ -258,7 +258,9 @@ impl Worker {
                 let template = include_str!("../email.html");
                 let html = MultiPart::alternative_plain_html(
                     message.clone(),
-                    template.replace("%%_MESSAGE_%%", &message),
+                    template
+                        .replace("%%_MESSAGE_%%", &message)
+                        .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
                 );
 
                 let msg = b.multipart(html)?;
