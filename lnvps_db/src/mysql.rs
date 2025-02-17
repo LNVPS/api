@@ -222,7 +222,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,cpu,memory,disk_size,disk_id,mac_address) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,disk_id,mac_address) values(?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
@@ -230,9 +230,6 @@ impl LNVpsDb for LNVpsDbMysql {
             .bind(vm.ssh_key_id)
             .bind(vm.created)
             .bind(vm.expires)
-            .bind(vm.cpu)
-            .bind(vm.memory)
-            .bind(vm.disk_size)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .fetch_one(&self.db)
@@ -251,14 +248,11 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn update_vm(&self, vm: &Vm) -> Result<()> {
-        sqlx::query("update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,cpu=?,memory=?,disk_size=?,disk_id=? where id=?")
+        sqlx::query("update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=? where id=?")
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.ssh_key_id)
             .bind(vm.expires)
-            .bind(vm.cpu)
-            .bind(vm.memory)
-            .bind(vm.disk_size)
             .bind(vm.disk_id)
             .bind(vm.id)
             .execute(&self.db)

@@ -231,12 +231,6 @@ pub struct Vm {
     pub created: DateTime<Utc>,
     /// When the VM expires
     pub expires: DateTime<Utc>,
-    /// How many vCPU's this VM has
-    pub cpu: u16,
-    /// How much RAM this VM has in bytes
-    pub memory: u64,
-    /// How big the disk is on this VM in bytes
-    pub disk_size: u64,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
     /// Network MAC address

@@ -122,6 +122,12 @@ impl LNVpsProvisioner {
             bail!("No host drive found!")
         };
 
+        let template = if let Some(t) = &vm.template {
+            t
+        } else {
+            &self.db.get_vm_template(vm.template_id).await?
+        };
+
         Ok(VmConfig {
             cpu: Some(self.config.cpu.clone()),
             kvm: Some(self.config.kvm),
@@ -132,8 +138,8 @@ impl LNVpsProvisioner {
             on_boot: Some(true),
             bios: Some(VmBios::OVMF),
             boot: Some("order=scsi0".to_string()),
-            cores: Some(vm.cpu as i32),
-            memory: Some((vm.memory / 1024 / 1024).to_string()),
+            cores: Some(template.cpu as i32),
+            memory: Some((template.memory / 1024 / 1024).to_string()),
             scsi_hw: Some("virtio-scsi-pci".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &drive.name)),
@@ -213,9 +219,6 @@ impl Provisioner for LNVpsProvisioner {
             ssh_key_id: ssh_key.id,
             created: Utc::now(),
             expires: Utc::now(),
-            cpu: template.cpu,
-            memory: template.memory,
-            disk_size: template.disk_size,
             disk_id: pick_disk.id,
             mac_address: format!(
                 "bc:24:11:{}:{}:{}",
@@ -370,6 +373,7 @@ impl Provisioner for LNVpsProvisioner {
             bail!("Cant spawn VM's in read-only mode");
         }
         let vm = self.db.get_vm(vm_id).await?;
+        let template = self.db.get_vm_template(vm.template_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
         let client = get_host_client(&host)?;
         let vm_id = 100 + vm.id as i32;
@@ -425,7 +429,7 @@ impl Provisioner for LNVpsProvisioner {
                 node: host.name.clone(),
                 vm_id,
                 disk: "scsi0".to_string(),
-                size: vm.disk_size.to_string(),
+                size: template.disk_size.to_string(),
             })
             .await?;
         client.wait_for_task(&j_resize).await?;
