@@ -363,7 +363,7 @@ impl ProxmoxClient {
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
         } else {
-            bail!("{} {}: {}", method, path, status);
+            bail!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 }
