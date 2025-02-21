@@ -11,7 +11,7 @@ use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_db::LNVpsDb;
 use log::{debug, error, info};
-use nostr::{EventBuilder, PublicKey};
+use nostr::{EventBuilder, PublicKey, ToBech32};
 use nostr_sdk::Client;
 use std::ops::{Add, Sub};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -168,20 +168,25 @@ impl Worker {
                     self.provisioner.spawn_vm(vm.id).await?;
                     let vm_ips = self.db.list_vm_ip_assignments(vm.id).await?;
                     let image = self.db.get_os_image(vm.image_id).await?;
+                    let user = self.db.get_user(vm.user_id).await?;
+
+                    let msg = format!(
+                        "VM #{} been created!\n\nOS: {}\nIPs: {}\n\nNPUB: {}",
+                        vm.id,
+                        image,
+                        vm_ips
+                            .iter()
+                            .map(|i| i.to_string())
+                            .collect::<Vec<String>>()
+                            .join(", "),
+                        PublicKey::from_slice(&user.pubkey)?.to_bech32()?
+                    );
                     self.tx.send(WorkJob::SendNotification {
                         user_id: vm.user_id,
                         title: Some(format!("[VM{}] Created", vm.id)),
-                        message: format!(
-                            "Your VM #{} been created!\nOS: {}\nIPs: {}",
-                            vm.id,
-                            image,
-                            vm_ips
-                                .iter()
-                                .map(|i| i.to_string())
-                                .collect::<Vec<String>>()
-                                .join(", ")
-                        ),
+                        message: format!("Your {}", &msg),
                     })?;
+                    self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))?;
                 }
             }
         }
