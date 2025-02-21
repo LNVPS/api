@@ -12,6 +12,6 @@ provisioner:
       machine: "q35"
       os_type: "l26"
       bridge: "vmbr0"
-      cpu: "kvm64"
+      cpu: "host"
       vlan: 100
       kvm: false
