@@ -56,7 +56,16 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn update_user(&self, user: &User) -> Result<()> {
-        todo!()
+        sqlx::query(
+            "update users set email = ?, contact_nip17 = ?, contact_email = ? where id = ?",
+        )
+        .bind(&user.email)
+        .bind(user.contact_nip17)
+        .bind(user.contact_email)
+        .bind(user.id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(())
     }
 
     async fn delete_user(&self, id: u64) -> Result<()> {
@@ -248,16 +257,18 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn update_vm(&self, vm: &Vm) -> Result<()> {
-        sqlx::query("update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=? where id=?")
-            .bind(vm.image_id)
-            .bind(vm.template_id)
-            .bind(vm.ssh_key_id)
-            .bind(vm.expires)
-            .bind(vm.disk_id)
-            .bind(vm.id)
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+        sqlx::query(
+            "update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=? where id=?",
+        )
+        .bind(vm.image_id)
+        .bind(vm.template_id)
+        .bind(vm.ssh_key_id)
+        .bind(vm.expires)
+        .bind(vm.disk_id)
+        .bind(vm.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
         Ok(())
     }
 

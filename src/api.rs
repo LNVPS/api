@@ -18,6 +18,7 @@ use ws::Message;
 
 pub fn routes() -> Vec<Route> {
     routes![
+        v1_patch_account,
         v1_list_vms,
         v1_get_vm,
         v1_list_vm_templates,
@@ -75,6 +76,31 @@ struct ApiVmStatus {
 #[derive(Serialize, Deserialize)]
 struct VMPatchRequest {
     pub ssh_key_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountPatchRequest {
+    pub email: Option<String>,
+    pub contact_nip17: bool,
+    pub contact_email: bool,
+}
+
+#[patch("/api/v1/account", format = "json", data = "<req>")]
+async fn v1_patch_account(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+    req: Json<AccountPatchRequest>,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let mut user = db.get_user(uid).await?;
+
+    user.email = req.email.clone();
+    user.contact_nip17 = req.contact_nip17;
+    user.contact_email = req.contact_email;
+
+    db.update_user(&user).await?;
+    ApiData::ok(())
 }
 
 #[get("/api/v1/vm")]
