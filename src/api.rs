@@ -18,6 +18,7 @@ use ws::Message;
 
 pub fn routes() -> Vec<Route> {
     routes![
+        v1_get_account,
         v1_patch_account,
         v1_list_vms,
         v1_get_vm,
@@ -101,6 +102,22 @@ async fn v1_patch_account(
 
     db.update_user(&user).await?;
     ApiData::ok(())
+}
+
+#[get("/api/v1/account")]
+async fn v1_get_account(
+    auth: Nip98Auth,
+    db: &State<Box<dyn LNVpsDb>>,
+) -> ApiResult<AccountPatchRequest> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let mut user = db.get_user(uid).await?;
+
+    ApiData::ok(AccountPatchRequest {
+        email: user.email,
+        contact_nip17: user.contact_nip17,
+        contact_email: user.contact_email,
+    })
 }
 
 #[get("/api/v1/vm")]

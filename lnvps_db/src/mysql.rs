@@ -63,7 +63,7 @@ impl LNVpsDb for LNVpsDbMysql {
         .bind(user.contact_nip17)
         .bind(user.contact_email)
         .bind(user.id)
-        .fetch_one(&self.db)
+        .execute(&self.db)
         .await?;
         Ok(())
     }
