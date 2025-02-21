@@ -15,14 +15,14 @@ use fedimint_tonic_lnd::tonic::async_trait;
 use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
 use lnvps_db::hydrate::Hydrate;
-use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
+use lnvps_db::{DiskType, IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
 use log::{debug, info, warn};
 use nostr::util::hex;
 use rand::random;
 use rand::seq::IteratorRandom;
 use reqwest::Url;
 use rocket::futures::{SinkExt, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::ops::Add;
 use std::time::Duration;
@@ -407,11 +407,28 @@ impl Provisioner for LNVpsProvisioner {
             } else {
                 bail!("No host drive found!")
             };
+
+            // Disk import args
+            let mut disk_args: HashMap<&str, String> = HashMap::new();
+            disk_args.insert(
+                "import-from",
+                format!("/var/lib/vz/template/iso/{}", image.filename()?),
+            );
+            // If disk is SSD, enable discard + ssd options
+            if matches!(drive.kind, DiskType::SSD) {
+                disk_args.insert("discard", "on".to_string());
+                disk_args.insert("ssd", "1".to_string());
+            }
+
             let cmd = format!(
-                "/usr/sbin/qm set {} --scsi0 {}:0,import-from=/var/lib/vz/template/iso/{}",
+                "/usr/sbin/qm set {} --scsi0 {}:0,{}",
                 vm_id,
                 &drive.name,
-                &image.filename()?
+                disk_args
+                    .into_iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             let (code, rsp) = ses.execute(cmd.as_str()).await?;
             info!("{}", rsp);
