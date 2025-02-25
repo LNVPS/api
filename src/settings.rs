@@ -43,6 +43,7 @@ pub struct NostrConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RouterConfig {
     Mikrotik {
         url: String,
