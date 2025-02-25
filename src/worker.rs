@@ -48,11 +48,11 @@ pub struct WorkerSettings {
     pub smtp: Option<SmtpConfig>,
 }
 
-impl Into<WorkerSettings> for &Settings {
-    fn into(self) -> WorkerSettings {
+impl From<&Settings> for WorkerSettings {
+    fn from(val: &Settings) -> Self {
         WorkerSettings {
-            delete_after: self.delete_after,
-            smtp: self.smtp.clone(),
+            delete_after: val.delete_after,
+            smtp: val.smtp.clone(),
         }
     }
 }
@@ -206,7 +206,7 @@ impl Worker {
                     if let Err(e) = self.handle_vm_info(vm).await {
                         error!("{}", e);
                         self.queue_admin_notification(
-                            format!("Failed to check VM {}:\n{}", vm_id, e.to_string()),
+                            format!("Failed to check VM {}:\n{}", vm_id, e),
                             Some("Job Failed".to_string()),
                         )?
                     }
@@ -331,7 +331,7 @@ impl Worker {
                                 "Failed to check VM {}:\n{:?}\n{}",
                                 vm_id,
                                 &job,
-                                e.to_string()
+                                e
                             ),
                             Some("Job Failed".to_string()),
                         )?
@@ -351,7 +351,7 @@ impl Worker {
                             format!(
                                 "Failed to send notification:\n{:?}\n{}",
                                 &job,
-                                e.to_string()
+                                e
                             ),
                             Some("Job Failed".to_string()),
                         )?
@@ -361,7 +361,7 @@ impl Worker {
                     if let Err(e) = self.check_vms().await {
                         error!("Failed to check VMs: {}", e);
                         self.queue_admin_notification(
-                            format!("Failed to check VM's:\n{:?}\n{}", &job, e.to_string()),
+                            format!("Failed to check VM's:\n{:?}\n{}", &job, e),
                             Some("Job Failed".to_string()),
                         )?
                     }

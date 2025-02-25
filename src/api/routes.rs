@@ -1,23 +1,33 @@
+use crate::api::model::{
+    AccountPatchRequest, ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
+    ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
+};
 use crate::nip98::Nip98Auth;
 use crate::provisioner::Provisioner;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
 use anyhow::{bail, Result};
-use lnvps_db::hydrate::Hydrate;
-use lnvps_db::{LNVpsDb, UserSshKey, Vm, VmOsImage, VmPayment, VmTemplate};
+use lnvps_db::{IpRange, LNVpsDb};
 use log::{debug, error};
 use nostr::util::hex;
+use nostr_sdk::async_utility::futures_util::future::join_all;
 use rocket::futures::{Sink, SinkExt, StreamExt};
 use rocket::serde::json::Json;
-use rocket::{get, patch, post, routes, Responder, Route, State};
+use rocket::{get, patch, post, Responder, Route, State};
+use rocket_okapi::gen::OpenApiGenerator;
+use rocket_okapi::okapi::openapi3::Responses;
+use rocket_okapi::response::OpenApiResponderInner;
+use rocket_okapi::{openapi, openapi_get_routes};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use tokio::sync::mpsc::UnboundedSender;
 use ws::Message;
 
 pub fn routes() -> Vec<Route> {
-    routes![
+    openapi_get_routes![
         v1_get_account,
         v1_patch_account,
         v1_list_vms,
@@ -32,14 +42,13 @@ pub fn routes() -> Vec<Route> {
         v1_start_vm,
         v1_stop_vm,
         v1_restart_vm,
-        v1_terminal_proxy,
         v1_patch_vm
     ]
 }
 
 type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 struct ApiData<T: Serialize> {
     pub data: T,
 }
@@ -53,7 +62,7 @@ impl<T: Serialize> ApiData<T> {
     }
 }
 
-#[derive(Responder)]
+#[derive(Serialize, Deserialize, JsonSchema, Responder)]
 #[response(status = 500)]
 struct ApiError {
     pub error: String,
@@ -67,25 +76,14 @@ impl<T: ToString> From<T> for ApiError {
     }
 }
 
-#[derive(Serialize)]
-struct ApiVmStatus {
-    #[serde(flatten)]
-    pub vm: Vm,
-    pub status: VmState,
+impl OpenApiResponderInner for ApiError {
+    fn responses(_gen: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
+        Ok(Responses::default())
+    }
 }
 
-#[derive(Serialize, Deserialize)]
-struct VMPatchRequest {
-    pub ssh_key_id: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AccountPatchRequest {
-    pub email: Option<String>,
-    pub contact_nip17: bool,
-    pub contact_email: bool,
-}
-
+/// Update user account
+#[openapi(tag = "Account")]
 #[patch("/api/v1/account", format = "json", data = "<req>")]
 async fn v1_patch_account(
     auth: Nip98Auth,
@@ -104,6 +102,8 @@ async fn v1_patch_account(
     ApiData::ok(())
 }
 
+/// Get user account detail
+#[openapi(tag = "Account")]
 #[get("/api/v1/account")]
 async fn v1_get_account(
     auth: Nip98Auth,
@@ -111,7 +111,7 @@ async fn v1_get_account(
 ) -> ApiResult<AccountPatchRequest> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
-    let mut user = db.get_user(uid).await?;
+    let user = db.get_user(uid).await?;
 
     ApiData::ok(AccountPatchRequest {
         email: user.email,
@@ -120,6 +120,49 @@ async fn v1_get_account(
     })
 }
 
+async fn vm_to_status(
+    db: &Box<dyn LNVpsDb>,
+    vm: lnvps_db::Vm,
+    state: Option<VmState>,
+) -> Result<ApiVmStatus> {
+    let image = db.get_os_image(vm.image_id).await?;
+    let template = db.get_vm_template(vm.template_id).await?;
+    let region = db.get_host_region(template.region_id).await?;
+    let cost_plan = db.get_cost_plan(template.cost_plan_id).await?;
+    let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+    let ips = db.list_vm_ip_assignments(vm.id).await?;
+    let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
+    let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
+    let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|i| (i.id, i))
+        .collect();
+
+    Ok(ApiVmStatus {
+        id: vm.id,
+        created: vm.created,
+        expires: vm.expires,
+        mac_address: vm.mac_address,
+        image: image.into(),
+        template: ApiVmTemplate::from(template, cost_plan, region),
+        ssh_key: ssh_key.into(),
+        status: state.unwrap_or_default(),
+        ip_assignments: ips
+            .into_iter()
+            .map(|i| {
+                let range = ip_ranges
+                    .get(&i.ip_range_id)
+                    .expect("ip range id not found");
+                ApiVmIpAssignment::from(i, range)
+            })
+            .collect(),
+    })
+}
+
+/// List VMs belonging to user
+#[openapi(tag = "VM")]
 #[get("/api/v1/vm")]
 async fn v1_list_vms(
     auth: Nip98Auth,
@@ -130,23 +173,16 @@ async fn v1_list_vms(
     let uid = db.upsert_user(&pubkey).await?;
     let vms = db.list_user_vms(uid).await?;
     let mut ret = vec![];
-    for mut vm in vms {
-        vm.hydrate_up(db.inner()).await?;
-        vm.hydrate_down(db.inner()).await?;
-        if let Some(t) = &mut vm.template {
-            t.hydrate_up(db.inner()).await?;
-        }
-
-        let state = vm_state.get_state(vm.id).await;
-        ret.push(ApiVmStatus {
-            vm,
-            status: state.unwrap_or_default(),
-        });
+    for vm in vms {
+        let vm_id = vm.id;
+        ret.push(vm_to_status(db, vm, vm_state.get_state(vm_id).await).await?);
     }
 
     ApiData::ok(ret)
 }
 
+/// Get status of a VM
+#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>")]
 async fn v1_get_vm(
     auth: Nip98Auth,
@@ -156,22 +192,15 @@ async fn v1_get_vm(
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
-    let mut vm = db.get_vm(id).await?;
+    let vm = db.get_vm(id).await?;
     if vm.user_id != uid {
         return ApiData::err("VM doesnt belong to you");
     }
-    vm.hydrate_up(db.inner()).await?;
-    vm.hydrate_down(db.inner()).await?;
-    if let Some(t) = &mut vm.template {
-        t.hydrate_up(db.inner()).await?;
-    }
-    let state = vm_state.get_state(vm.id).await;
-    ApiData::ok(ApiVmStatus {
-        vm,
-        status: state.unwrap_or_default(),
-    })
+    ApiData::ok(vm_to_status(db, vm, vm_state.get_state(id).await).await?)
 }
 
+/// Update a VM config
+#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>", data = "<data>", format = "json")]
 async fn v1_patch_vm(
     auth: Nip98Auth,
@@ -201,39 +230,88 @@ async fn v1_patch_vm(
     ApiData::ok(())
 }
 
+/// List available VM OS images
+#[openapi(tag = "Image")]
 #[get("/api/v1/image")]
-async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmOsImage>> {
-    let vms = db.list_os_image().await?;
-    let vms: Vec<VmOsImage> = vms.into_iter().filter(|i| i.enabled).collect();
-    ApiData::ok(vms)
-}
-
-#[get("/api/v1/vm/templates")]
-async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<VmTemplate>> {
-    let mut vms = db.list_vm_templates().await?;
-    for vm in &mut vms {
-        vm.hydrate_up(db.inner()).await?;
-    }
-    let ret: Vec<VmTemplate> = vms.into_iter().filter(|v| v.enabled).collect();
+async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmOsImage>> {
+    let images = db.list_os_image().await?;
+    let ret = images
+        .into_iter()
+        .filter(|i| i.enabled)
+        .map(|i| i.into())
+        .collect();
     ApiData::ok(ret)
 }
 
+/// List available VM templates (Offers)
+#[openapi(tag = "Template")]
+#[get("/api/v1/vm/templates")]
+async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmTemplate>> {
+    let templates = db.list_vm_templates().await?;
+
+    let cost_plans: HashSet<u64> = templates.iter().map(|t| t.cost_plan_id).collect();
+    let regions: HashSet<u64> = templates.iter().map(|t| t.region_id).collect();
+
+    let cost_plans: Vec<_> = cost_plans
+        .into_iter()
+        .map(|i| db.get_cost_plan(i))
+        .collect();
+    let regions: Vec<_> = regions.into_iter().map(|r| db.get_host_region(r)).collect();
+
+    let cost_plans: HashMap<u64, lnvps_db::VmCostPlan> = join_all(cost_plans)
+        .await
+        .into_iter()
+        .filter_map(|c| {
+            let c = c.ok()?;
+            Some((c.id, c))
+        })
+        .collect();
+    let regions: HashMap<u64, lnvps_db::VmHostRegion> = join_all(regions)
+        .await
+        .into_iter()
+        .filter_map(|c| {
+            let c = c.ok()?;
+            Some((c.id, c))
+        })
+        .collect();
+
+    let ret = templates
+        .into_iter()
+        .filter(|v| v.enabled)
+        .filter_map(|i| {
+            let cp = cost_plans.get(&i.cost_plan_id)?;
+            let hr = regions.get(&i.region_id)?;
+            Some(ApiVmTemplate::from(i, cp.clone(), hr.clone()))
+        })
+        .collect();
+    ApiData::ok(ret)
+}
+
+/// List user SSH keys
+#[openapi(tag = "Account")]
 #[get("/api/v1/ssh-key")]
 async fn v1_list_ssh_keys(
     auth: Nip98Auth,
     db: &State<Box<dyn LNVpsDb>>,
-) -> ApiResult<Vec<UserSshKey>> {
+) -> ApiResult<Vec<ApiUserSshKey>> {
     let uid = db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
-    let keys = db.list_user_ssh_key(uid).await?;
-    ApiData::ok(keys)
+    let ret = db
+        .list_user_ssh_key(uid)
+        .await?
+        .into_iter()
+        .map(|i| i.into())
+        .collect();
+    ApiData::ok(ret)
 }
 
+/// Add new SSH key to account
+#[openapi(tag = "Account")]
 #[post("/api/v1/ssh-key", data = "<req>", format = "json")]
 async fn v1_add_ssh_key(
     auth: Nip98Auth,
     db: &State<Box<dyn LNVpsDb>>,
     req: Json<CreateSshKey>,
-) -> ApiResult<UserSshKey> {
+) -> ApiResult<ApiUserSshKey> {
     let uid = db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
 
     let pk: PublicKey = req.key_data.parse()?;
@@ -242,7 +320,7 @@ async fn v1_add_ssh_key(
     } else {
         pk.comment()
     };
-    let mut new_key = UserSshKey {
+    let mut new_key = lnvps_db::UserSshKey {
         name: key_name.to_string(),
         user_id: uid,
         key_data: pk.to_openssh()?,
@@ -251,35 +329,42 @@ async fn v1_add_ssh_key(
     let key_id = db.insert_user_ssh_key(&new_key).await?;
     new_key.id = key_id;
 
-    ApiData::ok(new_key)
+    ApiData::ok(new_key.into())
 }
 
+/// Create a new VM order
+///
+/// After order is created please use /api/v1/vm/{id}/renew to pay for VM,
+/// VM's are initially created in "expired" state
+///
+/// Unpaid VM orders will be deleted after 24hrs
+#[openapi(tag = "VM")]
 #[post("/api/v1/vm", data = "<req>", format = "json")]
 async fn v1_create_vm_order(
     auth: Nip98Auth,
     db: &State<Box<dyn LNVpsDb>>,
     provisioner: &State<Box<dyn Provisioner>>,
     req: Json<CreateVmRequest>,
-) -> ApiResult<Vm> {
+) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
 
     let req = req.0;
-    let mut rsp = provisioner
+    let rsp = provisioner
         .provision(uid, req.template_id, req.image_id, req.ssh_key_id)
         .await?;
-    rsp.hydrate_up(db.inner()).await?;
-
-    ApiData::ok(rsp)
+    ApiData::ok(vm_to_status(db, rsp, None).await?)
 }
 
+/// Renew(Extend) a VM
+#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>/renew")]
 async fn v1_renew_vm(
     auth: Nip98Auth,
     db: &State<Box<dyn LNVpsDb>>,
     provisioner: &State<Box<dyn Provisioner>>,
     id: u64,
-) -> ApiResult<VmPayment> {
+) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
     let vm = db.get_vm(id).await?;
@@ -288,9 +373,11 @@ async fn v1_renew_vm(
     }
 
     let rsp = provisioner.renew(id).await?;
-    ApiData::ok(rsp)
+    ApiData::ok(rsp.into())
 }
 
+/// Start a VM
+#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/start")]
 async fn v1_start_vm(
     auth: Nip98Auth,
@@ -311,6 +398,8 @@ async fn v1_start_vm(
     ApiData::ok(())
 }
 
+/// Stop a VM
+#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/stop")]
 async fn v1_stop_vm(
     auth: Nip98Auth,
@@ -331,6 +420,8 @@ async fn v1_stop_vm(
     ApiData::ok(())
 }
 
+/// Restart a VM
+#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/restart")]
 async fn v1_restart_vm(
     auth: Nip98Auth,
@@ -351,12 +442,14 @@ async fn v1_restart_vm(
     ApiData::ok(())
 }
 
+/// Get payment status (for polling)
+#[openapi(tag = "Payment")]
 #[get("/api/v1/payment/<id>")]
 async fn v1_get_payment(
     auth: Nip98Auth,
     db: &State<Box<dyn LNVpsDb>>,
     id: &str,
-) -> ApiResult<VmPayment> {
+) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
     let id = if let Ok(i) = hex::decode(id) {
@@ -370,7 +463,7 @@ async fn v1_get_payment(
         return ApiData::err("VM does not belong to you");
     }
 
-    ApiData::ok(payment)
+    ApiData::ok(payment.into())
 }
 
 #[get("/api/v1/console/<id>?<auth>")]
@@ -477,26 +570,4 @@ async fn v1_terminal_proxy(
             Ok(())
         })
     }))
-}
-
-#[derive(Deserialize)]
-struct CreateVmRequest {
-    template_id: u64,
-    image_id: u64,
-    ssh_key_id: u64,
-}
-
-impl From<CreateVmRequest> for VmTemplate {
-    fn from(val: CreateVmRequest) -> Self {
-        VmTemplate {
-            id: val.template_id,
-            ..Default::default()
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct CreateSshKey {
-    name: String,
-    key_data: String,
 }

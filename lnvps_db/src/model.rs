@@ -1,61 +1,49 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use sqlx::FromRow;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use url::Url;
 
-#[serde_as]
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 /// Users who buy VM's
 pub struct User {
     /// Unique ID of this user (database generated)
     pub id: u64,
-
     /// The nostr public key for this user
-    #[serde_as(as = "serde_with::hex::Hex")]
     pub pubkey: Vec<u8>,
-
     /// When this user first started using the service (first login)
     pub created: DateTime<Utc>,
-
     pub email: Option<String>,
     pub contact_nip4: bool,
     pub contact_nip17: bool,
     pub contact_email: bool,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct UserSshKey {
     pub id: u64,
     pub name: String,
     pub user_id: u64,
     pub created: DateTime<Utc>,
-    #[serde(skip_serializing)]
     pub key_data: String,
-
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vms: Option<Vec<Vm>>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type)]
+#[derive(Clone, Debug, sqlx::Type)]
 #[repr(u16)]
 /// The type of VM host
 pub enum VmHostKind {
     Proxmox = 0,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 pub struct VmHostRegion {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 /// A VM host
 pub struct VmHost {
     /// Unique id of this host
@@ -78,7 +66,7 @@ pub struct VmHost {
     pub api_token: String,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 pub struct VmHostDisk {
     pub id: u64,
     pub host_id: u64,
@@ -89,8 +77,7 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, sqlx::Type, Default)]
 #[repr(u16)]
 pub enum DiskType {
     #[default]
@@ -98,8 +85,7 @@ pub enum DiskType {
     SSD = 1,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, sqlx::Type, Default)]
 #[repr(u16)]
 pub enum DiskInterface {
     #[default]
@@ -108,7 +94,7 @@ pub enum DiskInterface {
     PCIe = 2,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type, Default)]
+#[derive(Clone, Debug, sqlx::Type, Default)]
 #[repr(u16)]
 pub enum OsDistribution {
     #[default]
@@ -124,7 +110,7 @@ pub enum OsDistribution {
 
 /// OS Images are templates which are used as a basis for
 /// provisioning new vms
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 pub struct VmOsImage {
     pub id: u64,
     pub distribution: OsDistribution,
@@ -132,8 +118,6 @@ pub struct VmOsImage {
     pub version: String,
     pub enabled: bool,
     pub release_date: DateTime<Utc>,
-
-    #[serde(skip_serializing)]
     /// URL location of cloud image
     pub url: String,
 }
@@ -158,7 +142,7 @@ impl Display for VmOsImage {
     }
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 pub struct IpRange {
     pub id: u64,
     pub cidr: String,
@@ -167,8 +151,7 @@ pub struct IpRange {
     pub region_id: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::Type)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, sqlx::Type)]
 #[repr(u16)]
 pub enum VmCostPlanIntervalType {
     Day = 0,
@@ -176,7 +159,7 @@ pub enum VmCostPlanIntervalType {
     Year = 2,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug)]
 pub struct VmCostPlan {
     pub id: u64,
     pub name: String,
@@ -189,13 +172,12 @@ pub struct VmCostPlan {
 
 /// Offers.
 /// These are the same as the offers visible to customers
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct VmTemplate {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
     pub created: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<DateTime<Utc>>,
     pub cpu: u16,
     pub memory: u64,
@@ -204,16 +186,9 @@ pub struct VmTemplate {
     pub disk_interface: DiskInterface,
     pub cost_plan_id: u64,
     pub region_id: u64,
-
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_plan: Option<VmCostPlan>,
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub region: Option<VmHostRegion>,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct Vm {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
@@ -237,35 +212,14 @@ pub struct Vm {
     pub mac_address: String,
     /// Is the VM deleted
     pub deleted: bool,
-
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<VmOsImage>,
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub template: Option<VmTemplate>,
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_key: Option<UserSshKey>,
-
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payments: Option<Vec<VmPayment>>,
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip_assignments: Option<Vec<VmIpAssignment>>,
 }
 
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct VmIpAssignment {
     pub id: u64,
     pub vm_id: u64,
     pub ip_range_id: u64,
     pub ip: String,
-
-    #[sqlx(skip)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip_range: Option<IpRange>,
 }
 
 impl Display for VmIpAssignment {
@@ -274,11 +228,9 @@ impl Display for VmIpAssignment {
     }
 }
 
-#[serde_as]
-#[derive(Serialize, Deserialize, FromRow, Clone, Debug, Default)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct VmPayment {
     /// Payment hash
-    #[serde_as(as = "serde_with::hex::Hex")]
     pub id: Vec<u8>,
     pub vm_id: u64,
     pub created: DateTime<Utc>,
@@ -288,11 +240,7 @@ pub struct VmPayment {
     pub is_paid: bool,
     /// Exchange rate
     pub rate: f32,
-
     /// Number of seconds this payment will add to vm expiry
-    #[serde(skip_serializing)]
     pub time_value: u64,
-
-    #[serde(skip_serializing)]
     pub settle_index: Option<u64>,
 }

@@ -14,6 +14,7 @@ use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
 use nostr::Keys;
 use nostr_sdk::Client;
+use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -156,6 +157,13 @@ async fn main() -> Result<(), Error> {
         .manage(exchange)
         .manage(sender)
         .mount("/", api::routes())
+        .mount(
+            "/swagger",
+            make_swagger_ui(&SwaggerUIConfig {
+                url: "../openapi.json".to_owned(),
+                ..Default::default()
+            }),
+        )
         .launch()
         .await
     {

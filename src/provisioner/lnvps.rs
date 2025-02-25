@@ -14,13 +14,13 @@ use fedimint_tonic_lnd::lnrpc::Invoice;
 use fedimint_tonic_lnd::tonic::async_trait;
 use fedimint_tonic_lnd::Client;
 use ipnetwork::IpNetwork;
-use lnvps_db::hydrate::Hydrate;
 use lnvps_db::{DiskType, IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
 use log::{debug, info, warn};
 use nostr::util::hex;
 use rand::random;
 use rand::seq::IteratorRandom;
 use reqwest::Url;
+use rocket::futures::future::join_all;
 use rocket::futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -81,10 +81,17 @@ impl LNVpsProvisioner {
             ips = self.allocate_ips(vm.id).await?;
         }
 
-        // load ranges
-        for ip in &mut ips {
-            ip.hydrate_up(&self.db).await?;
-        }
+        let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
+        let ip_ranges: Vec<_> = ip_range_ids
+            .iter()
+            .map(|i| self.db.get_ip_range(*i))
+            .collect();
+        let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|i| (i.id, i))
+            .collect();
 
         let mut ip_config = ips
             .iter()
@@ -92,11 +99,8 @@ impl LNVpsProvisioner {
                 if let Ok(net) = ip.ip.parse::<IpNetwork>() {
                     Some(match net {
                         IpNetwork::V4(addr) => {
-                            format!(
-                                "ip={},gw={}",
-                                addr,
-                                ip.ip_range.as_ref().map(|r| &r.gateway).unwrap()
-                            )
+                            let range = ip_ranges.get(&ip.ip_range_id)?;
+                            format!("ip={},gw={}", addr, range.gateway)
                         }
                         IpNetwork::V6(addr) => format!("ip6={}", addr),
                     })
@@ -122,11 +126,7 @@ impl LNVpsProvisioner {
             bail!("No host drive found!")
         };
 
-        let template = if let Some(t) = &vm.template {
-            t
-        } else {
-            &self.db.get_vm_template(vm.template_id).await?
-        };
+        let template = self.db.get_vm_template(vm.template_id).await?;
 
         Ok(VmConfig {
             cpu: Some(self.config.cpu.clone()),
@@ -302,18 +302,18 @@ impl Provisioner for LNVpsProvisioner {
     }
 
     async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        let mut vm = self.db.get_vm(vm_id).await?;
+        let vm = self.db.get_vm(vm_id).await?;
+        let template = self.db.get_vm_template(vm.template_id).await?;
         let ips = self.db.list_vm_ip_assignments(vm.id).await?;
 
         if !ips.is_empty() {
             bail!("IP resources are already assigned");
         }
 
-        vm.hydrate_up(&self.db).await?;
         let ip_ranges = self.db.list_ip_range().await?;
         let ip_ranges: Vec<IpRange> = ip_ranges
             .into_iter()
-            .filter(|i| i.region_id == vm.template.as_ref().unwrap().region_id && i.enabled)
+            .filter(|i| i.region_id == template.region_id && i.enabled)
             .collect();
 
         if ip_ranges.is_empty() {

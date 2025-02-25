@@ -73,6 +73,7 @@ pub struct SmtpConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ProvisionerConfig {
     Proxmox {
         /// Readonly mode, don't spawn any VM's
@@ -147,7 +148,7 @@ impl RouterConfig {
                 username,
                 password,
                 arp_interface,
-            } => MikrotikRouter::new(&url, &username, &password, &arp_interface),
+            } => MikrotikRouter::new(url, username, password, arp_interface),
         }
     }
 }

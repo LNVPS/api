@@ -2,9 +2,11 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use rocket::serde::Deserialize;
+use schemars::JsonSchema;
 use tokio::sync::RwLock;
 
-#[derive(Clone, Serialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum VmRunningState {
     Running,
@@ -14,7 +16,7 @@ pub enum VmRunningState {
     Deleting,
 }
 
-#[derive(Clone, Serialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct VmState {
     pub timestamp: u64,
     pub state: VmRunningState,
