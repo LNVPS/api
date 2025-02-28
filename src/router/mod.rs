@@ -13,7 +13,13 @@ use std::net::IpAddr;
 #[async_trait]
 pub trait Router: Send + Sync {
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>>;
-    async fn add_arp_entry(&self, ip: IpAddr, mac: &str, comment: Option<&str>) -> Result<()>;
+    async fn add_arp_entry(
+        &self,
+        ip: IpAddr,
+        mac: &str,
+        interface: &str,
+        comment: Option<&str>,
+    ) -> Result<()>;
     async fn remove_arp_entry(&self, id: &str) -> Result<()>;
 }
 
@@ -35,3 +41,12 @@ pub struct ArpEntry {
 mod mikrotik;
 #[cfg(feature = "mikrotik")]
 pub use mikrotik::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::NetworkPolicy;
+
+    #[test]
+    fn provision_ips_with_arp() {}
+}

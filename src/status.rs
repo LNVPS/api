@@ -1,9 +1,9 @@
 use anyhow::Result;
+use rocket::serde::Deserialize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use rocket::serde::Deserialize;
-use schemars::JsonSchema;
 use tokio::sync::RwLock;
 
 #[derive(Clone, Serialize, Deserialize, Default, JsonSchema)]

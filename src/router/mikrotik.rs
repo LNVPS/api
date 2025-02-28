@@ -14,11 +14,10 @@ pub struct MikrotikRouter {
     username: String,
     password: String,
     client: Client,
-    arp_interface: String,
 }
 
 impl MikrotikRouter {
-    pub fn new(url: &str, username: &str, password: &str, arp_interface: &str) -> Self {
+    pub fn new(url: &str, username: &str, password: &str) -> Self {
         Self {
             url: url.parse().unwrap(),
             username: username.to_string(),
@@ -27,7 +26,6 @@ impl MikrotikRouter {
                 .danger_accept_invalid_certs(true)
                 .build()
                 .unwrap(),
-            arp_interface: arp_interface.to_string(),
         }
     }
 
@@ -73,7 +71,13 @@ impl Router for MikrotikRouter {
         Ok(rsp)
     }
 
-    async fn add_arp_entry(&self, ip: IpAddr, mac: &str, comment: Option<&str>) -> Result<()> {
+    async fn add_arp_entry(
+        &self,
+        ip: IpAddr,
+        mac: &str,
+        arp_interface: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
         let _rsp: ArpEntry = self
             .req(
                 Method::PUT,
@@ -81,7 +85,7 @@ impl Router for MikrotikRouter {
                 ArpEntry {
                     address: ip.to_string(),
                     mac_address: Some(mac.to_string()),
-                    interface: self.arp_interface.to_string(),
+                    interface: arp_interface.to_string(),
                     comment: comment.map(|c| c.to_string()),
                     ..Default::default()
                 },

@@ -1,9 +1,12 @@
-use nostr::util::hex;
 use crate::status::VmState;
 use chrono::{DateTime, Utc};
+use ipnetwork::IpNetwork;
 use lnvps_db::VmHostRegion;
+use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
+use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiVmStatus {
@@ -48,15 +51,20 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
 pub struct ApiVmIpAssignment {
     pub id: u64,
     pub ip: String,
-    pub range: String,
+    pub gateway: String,
 }
 
 impl ApiVmIpAssignment {
-    pub fn from(ip: lnvps_db::VmIpAssignment, range: &lnvps_db::IpRange) -> Self {
+    pub fn from(ip: &lnvps_db::VmIpAssignment, range: &lnvps_db::IpRange) -> Self {
         ApiVmIpAssignment {
             id: ip.id,
-            ip: ip.ip,
-            range: range.cidr.clone(),
+            ip: IpNetwork::new(
+                IpNetwork::from_str(&ip.ip).unwrap().ip(),
+                IpNetwork::from_str(&range.cidr).unwrap().prefix(),
+            )
+            .unwrap()
+            .to_string(),
+            gateway: range.gateway.to_string(),
         }
     }
 }

@@ -21,19 +21,19 @@ lnd:
   macaroon: "$HOME/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
   
 # Number of days after a VM expires to delete
-delete_after: 3
+delete-after: 3
 
 # Provisioner is the main process which handles creating/deleting VM's
 # Currently supports: Proxmox
 provisioner:
   proxmox:
     # Read-only mode prevents spawning VM's
-    read_only: false
+    read-only: false
     # Proxmox (QEMU) settings used for spawning VM's
     qemu:
       bios: "ovmf"
       machine: "q35"
-      os_type: "l26"
+      os-type: "l26"
       bridge: "vmbr0"
       cpu: "kvm64"
       vlan: 100
@@ -89,6 +89,12 @@ router:
     url: "https://my-router.net"
     username: "admin"
     password: "admin"
-    # Interface where the static ARP entry is added
-    arp_interface: "bridge1"
+network-policy:
+  # How packets get to the VM 
+  # (default "auto", nothing to do, packets will always arrive)
+  access:
+    # Static ARP entries are added to the router for each provisioned IP
+    static-arp:
+      # Interface where the static ARP entry is added
+      interface: "bridge1"
 ```

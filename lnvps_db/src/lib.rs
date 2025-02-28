@@ -1,6 +1,4 @@
 use anyhow::Result;
-use async_trait::async_trait;
-
 mod model;
 #[cfg(feature = "mysql")]
 mod mysql;
@@ -8,6 +6,8 @@ mod mysql;
 pub use model::*;
 #[cfg(feature = "mysql")]
 pub use mysql::*;
+
+pub use async_trait::async_trait;
 
 #[async_trait]
 pub trait LNVpsDb: Sync + Send {
@@ -64,6 +64,9 @@ pub trait LNVpsDb: Sync + Send {
 
     /// List available IP Ranges
     async fn list_ip_range(&self) -> Result<Vec<IpRange>>;
+
+    /// List available IP Ranges in a given region
+    async fn list_ip_range_in_region(&self, region_id: u64) -> Result<Vec<IpRange>>;
 
     /// Get a VM cost plan by id
     async fn get_cost_plan(&self, id: u64) -> Result<VmCostPlan>;

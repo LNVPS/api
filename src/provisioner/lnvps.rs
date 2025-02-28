@@ -4,9 +4,9 @@ use crate::host::proxmox::{
     ConfigureVm, CreateVm, DownloadUrlRequest, ProxmoxClient, ResizeDiskRequest, StorageContent,
     VmBios, VmConfig,
 };
-use crate::provisioner::Provisioner;
+use crate::provisioner::{NetworkProvisioner, Provisioner, ProvisionerMethod};
 use crate::router::Router;
-use crate::settings::{QemuConfig, SshConfig};
+use crate::settings::{NetworkAccessPolicy, NetworkPolicy, QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
@@ -25,18 +25,21 @@ use rocket::futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::ops::Add;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 pub struct LNVpsProvisioner {
-    db: Box<dyn LNVpsDb>,
+    db: Arc<dyn LNVpsDb>,
     router: Option<Box<dyn Router>>,
     lnd: Client,
     rates: ExchangeRateCache,
     read_only: bool,
     config: QemuConfig,
+    network_policy: NetworkPolicy,
     ssh: Option<SshConfig>,
 }
 
@@ -44,6 +47,7 @@ impl LNVpsProvisioner {
     pub fn new(
         read_only: bool,
         config: QemuConfig,
+        network_policy: NetworkPolicy,
         ssh: Option<SshConfig>,
         db: impl LNVpsDb + 'static,
         router: Option<impl Router + 'static>,
@@ -51,9 +55,10 @@ impl LNVpsProvisioner {
         rates: ExchangeRateCache,
     ) -> Self {
         Self {
-            db: Box::new(db),
+            db: Arc::new(db),
             router: router.map(|r| Box::new(r) as Box<dyn Router>),
             lnd,
+            network_policy,
             rates,
             config,
             read_only,
@@ -73,13 +78,8 @@ impl LNVpsProvisioner {
         }
     }
 
-    async fn get_vm_config(&self, vm: &Vm) -> Result<VmConfig> {
+    async fn get_vm_config(&self, vm: &Vm, ips: &Vec<VmIpAssignment>) -> Result<VmConfig> {
         let ssh_key = self.db.get_user_ssh_key(vm.ssh_key_id).await?;
-
-        let mut ips = self.db.list_vm_ip_assignments(vm.id).await?;
-        if ips.is_empty() {
-            ips = self.allocate_ips(vm.id).await?;
-        }
 
         let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
         let ip_ranges: Vec<_> = ip_range_ids
@@ -147,6 +147,30 @@ impl LNVpsProvisioner {
             efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
             ..Default::default()
         })
+    }
+
+    async fn save_ip_assignment(&self, vm: &Vm, assignment: &VmIpAssignment) -> Result<()> {
+        // apply network policy
+        match &self.network_policy.access {
+            NetworkAccessPolicy::StaticArp { interface } => {
+                if let Some(r) = self.router.as_ref() {
+                    r.add_arp_entry(
+                        IpAddr::from_str(&assignment.ip)?,
+                        &vm.mac_address,
+                        interface,
+                        Some(&format!("VM{}", vm.id)),
+                    )
+                    .await?;
+                } else {
+                    bail!("No router found to apply static arp entry!")
+                }
+            }
+            _ => {}
+        }
+
+        // save to db
+        self.db.insert_vm_ip_assignment(&assignment).await?;
+        Ok(())
     }
 }
 
@@ -303,69 +327,29 @@ impl Provisioner for LNVpsProvisioner {
 
     async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
         let vm = self.db.get_vm(vm_id).await?;
+        let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
+        if !existing_ips.is_empty() {
+            return Ok(existing_ips);
+        }
+
         let template = self.db.get_vm_template(vm.template_id).await?;
-        let ips = self.db.list_vm_ip_assignments(vm.id).await?;
+        let prov = NetworkProvisioner::new(
+            ProvisionerMethod::Random,
+            self.network_policy.clone(),
+            self.db.clone(),
+        );
 
-        if !ips.is_empty() {
-            bail!("IP resources are already assigned");
-        }
+        let ip = prov.pick_ip_for_region(template.region_id).await?;
+        let assignment = VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id: ip.range_id,
+            ip: ip.ip.to_string(),
+            deleted: false,
+        };
 
-        let ip_ranges = self.db.list_ip_range().await?;
-        let ip_ranges: Vec<IpRange> = ip_ranges
-            .into_iter()
-            .filter(|i| i.region_id == template.region_id && i.enabled)
-            .collect();
-
-        if ip_ranges.is_empty() {
-            bail!("No ip range found in this region");
-        }
-
-        let mut ret = vec![];
-        // Try all ranges
-        // TODO: pick round-robin ranges
-        // TODO: pick one of each type
-        'ranges: for range in ip_ranges {
-            let range_cidr: IpNetwork = range.cidr.parse()?;
-            let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
-            let ips: HashSet<IpNetwork> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
-
-            // pick an IP at random
-            let cidr: Vec<IpAddr> = {
-                let mut rng = rand::thread_rng();
-                range_cidr.iter().choose(&mut rng).into_iter().collect()
-            };
-
-            for ip in cidr {
-                let ip_net = IpNetwork::new(ip, range_cidr.prefix())?;
-                if !ips.contains(&ip_net) {
-                    info!("Attempting to allocate IP for {vm_id} to {ip}");
-                    let mut assignment = VmIpAssignment {
-                        id: 0,
-                        vm_id,
-                        ip_range_id: range.id,
-                        ip: ip_net.to_string(),
-                        ..Default::default()
-                    };
-
-                    // add arp entry for router
-                    if let Some(r) = self.router.as_ref() {
-                        r.add_arp_entry(ip, &vm.mac_address, Some(&format!("VM{}", vm.id)))
-                            .await?;
-                    }
-                    let id = self.db.insert_vm_ip_assignment(&assignment).await?;
-                    assignment.id = id;
-
-                    ret.push(assignment);
-                    break 'ranges;
-                }
-            }
-        }
-
-        if ret.is_empty() {
-            bail!("No ip ranges found in this region");
-        }
-
-        Ok(ret)
+        self.save_ip_assignment(&vm, &assignment).await?;
+        Ok(vec![assignment])
     }
 
     async fn spawn_vm(&self, vm_id: u64) -> Result<()> {
@@ -378,16 +362,21 @@ impl Provisioner for LNVpsProvisioner {
         let client = get_host_client(&host)?;
         let vm_id = 100 + vm.id as i32;
 
+        // setup network by allocating some IP space
+        let ips = self.allocate_ips(vm.id).await?;
+
         // create VM
+        let config = self.get_vm_config(&vm, &ips).await?;
         let t_create = client
             .create_vm(CreateVm {
                 node: host.name.clone(),
                 vm_id,
-                config: self.get_vm_config(&vm).await?,
+                config,
             })
             .await?;
         client.wait_for_task(&t_create).await?;
 
+        // save
         // import the disk
         // TODO: find a way to avoid using SSH
         if let Some(ssh_config) = &self.ssh {
@@ -451,8 +440,10 @@ impl Provisioner for LNVpsProvisioner {
             .await?;
         client.wait_for_task(&j_resize).await?;
 
-        let j_start = client.start_vm(&host.name, vm_id as u64).await?;
-        client.wait_for_task(&j_start).await?;
+        // try start, otherwise ignore error (maybe its already running)
+        if let Ok(j_start) = client.start_vm(&host.name, vm_id as u64).await {
+            client.wait_for_task(&j_start).await?;
+        }
 
         Ok(())
     }
@@ -549,6 +540,7 @@ impl Provisioner for LNVpsProvisioner {
     async fn patch_vm(&self, vm_id: u64) -> Result<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
+        let ips = self.db.list_vm_ip_assignments(vm.id).await?;
         let client = get_host_client(&host)?;
         let host_vm_id = vm.id + 100;
 
@@ -562,7 +554,7 @@ impl Provisioner for LNVpsProvisioner {
                     scsi_0: None,
                     scsi_1: None,
                     efi_disk_0: None,
-                    ..self.get_vm_config(&vm).await?
+                    ..self.get_vm_config(&vm, &ips).await?
                 },
             })
             .await?;

@@ -155,7 +155,7 @@ async fn vm_to_status(
                 let range = ip_ranges
                     .get(&i.ip_range_id)
                     .expect("ip range id not found");
-                ApiVmIpAssignment::from(i, range)
+                ApiVmIpAssignment::from(&i, range)
             })
             .collect(),
     })
@@ -457,6 +457,7 @@ async fn v1_get_payment(
     } else {
         return ApiData::err("Invalid payment id");
     };
+
     let payment = db.get_vm_payment(&id).await?;
     let vm = db.get_vm(payment.vm_id).await?;
     if vm.user_id != uid {

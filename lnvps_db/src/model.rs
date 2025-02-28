@@ -220,6 +220,7 @@ pub struct VmIpAssignment {
     pub vm_id: u64,
     pub ip_range_id: u64,
     pub ip: String,
+    pub deleted: bool,
 }
 
 impl Display for VmIpAssignment {

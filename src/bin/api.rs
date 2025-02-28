@@ -64,12 +64,10 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
-    let router = settings.router.as_ref().map(|r| r.get_router());
+    let router = settings.get_router()?;
     let status = VmStateCache::new();
     let worker_provisioner =
-        settings
-            .provisioner
-            .get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
+        settings.get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
     worker_provisioner.init().await?;
 
     let mut worker = Worker::new(
@@ -82,11 +80,11 @@ async fn main() -> Result<(), Error> {
     let sender = worker.sender();
 
     // send a startup notification
-    if let Some(admin) = &settings.smtp.and_then(|s| s.admin) {
+    if let Some(admin) = settings.smtp.as_ref().and_then(|s| s.admin) {
         sender.send(WorkJob::SendNotification {
             title: Some("Startup".to_string()),
             message: "System is starting!".to_string(),
-            user_id: *admin,
+            user_id: admin,
         })?;
     }
 
@@ -132,11 +130,8 @@ async fn main() -> Result<(), Error> {
         }
     });
 
-    let router = settings.router.as_ref().map(|r| r.get_router());
-    let provisioner =
-        settings
-            .provisioner
-            .get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
+    let router = settings.get_router()?;
+    let provisioner = settings.get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
 
     let db: Box<dyn LNVpsDb> = Box::new(db.clone());
     let pv: Box<dyn Provisioner> = Box::new(provisioner);

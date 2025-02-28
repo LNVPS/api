@@ -171,7 +171,15 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_ip_range(&self) -> Result<Vec<IpRange>> {
-        sqlx::query_as("select * from ip_range")
+        sqlx::query_as("select * from ip_range where enabled = 1")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_ip_range_in_region(&self, region_id: u64) -> Result<Vec<IpRange>> {
+        sqlx::query_as("select * from ip_range where region_id = ? and enabled = 1")
+            .bind(region_id)
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)

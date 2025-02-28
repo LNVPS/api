@@ -327,12 +327,7 @@ impl Worker {
                     if let Err(e) = self.check_vm(*vm_id).await {
                         error!("Failed to check VM {}: {}", vm_id, e);
                         self.queue_admin_notification(
-                            format!(
-                                "Failed to check VM {}:\n{:?}\n{}",
-                                vm_id,
-                                &job,
-                                e
-                            ),
+                            format!("Failed to check VM {}:\n{:?}\n{}", vm_id, &job, e),
                             Some("Job Failed".to_string()),
                         )?
                     }
@@ -348,11 +343,7 @@ impl Worker {
                     {
                         error!("Failed to send notification {}: {}", user_id, e);
                         self.queue_admin_notification(
-                            format!(
-                                "Failed to send notification:\n{:?}\n{}",
-                                &job,
-                                e
-                            ),
+                            format!("Failed to send notification:\n{:?}\n{}", &job, e),
                             Some("Job Failed".to_string()),
                         )?
                     }

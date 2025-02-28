@@ -10,3 +10,6 @@ pub mod settings;
 pub mod ssh_client;
 pub mod status;
 pub mod worker;
+
+#[cfg(test)]
+pub mod mocks;
