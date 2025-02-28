@@ -103,9 +103,15 @@ mod tests {
             db.clone(),
         );
 
+        let first = IpAddr::from_str("10.0.0.1").unwrap();
+        let second = IpAddr::from_str("10.0.0.2").unwrap();
         let ip = mgr.pick_ip_for_region(1).await.expect("No ip found in db");
         assert_eq!(1, ip.region_id);
-        assert_eq!(IpAddr::from_str("10.0.0.1").unwrap(), ip.ip);
+        assert_eq!(first, ip.ip);
+
+        let ip = mgr.pick_ip_for_region(1).await.expect("No ip found in db");
+        assert_eq!(1, ip.region_id);
+        assert_eq!(first, ip.ip);
         db.insert_vm_ip_assignment(&VmIpAssignment {
             id: 0,
             vm_id: 0,
@@ -116,7 +122,7 @@ mod tests {
         .await
         .expect("Could not insert vm ip");
         let ip = mgr.pick_ip_for_region(1).await.expect("No ip found in db");
-        assert_eq!(IpAddr::from_str("10.0.0.2").unwrap(), ip.ip);
+        assert_eq!(second, ip.ip);
     }
 
     #[tokio::test]
