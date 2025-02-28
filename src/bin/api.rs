@@ -1,12 +1,10 @@
 use anyhow::Error;
 use clap::Parser;
 use config::{Config, File};
-use fedimint_tonic_lnd::connect;
 use lnvps::api;
 use lnvps::cors::CORS;
-use lnvps::exchange::ExchangeRateCache;
+use lnvps::exchange::{DefaultRateCache, ExchangeRateService};
 use lnvps::invoice::InvoiceHandler;
-use lnvps::provisioner::Provisioner;
 use lnvps::settings::Settings;
 use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
@@ -16,8 +14,10 @@ use nostr::Keys;
 use nostr_sdk::Client;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use lnvps::lightning::get_node;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -38,16 +38,8 @@ async fn main() -> Result<(), Error> {
         .build()?
         .try_deserialize()?;
 
-    let db = LNVpsDbMysql::new(&settings.db).await?;
+    let db = Arc::new(LNVpsDbMysql::new(&settings.db).await?);
     db.migrate().await?;
-
-    let exchange = ExchangeRateCache::new();
-    let lnd = connect(
-        settings.lnd.url.clone(),
-        settings.lnd.cert.clone(),
-        settings.lnd.macaroon.clone(),
-    )
-    .await?;
     #[cfg(debug_assertions)]
     {
         let setup_script = include_str!("../../dev_setup.sql");
@@ -64,15 +56,18 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
-    let router = settings.get_router()?;
+
+    let exchange: Arc<dyn ExchangeRateService> = Arc::new(DefaultRateCache::default());
+    let node = get_node(&settings).await?;
+
     let status = VmStateCache::new();
-    let worker_provisioner =
-        settings.get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
-    worker_provisioner.init().await?;
+    let provisioner =
+        settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
+    provisioner.init().await?;
 
     let mut worker = Worker::new(
         db.clone(),
-        worker_provisioner,
+        provisioner.clone(),
         &settings,
         status.clone(),
         nostr_client.clone(),
@@ -95,7 +90,7 @@ async fn main() -> Result<(), Error> {
             }
         }
     });
-    let mut handler = InvoiceHandler::new(lnd.clone(), db.clone(), sender.clone());
+    let mut handler = InvoiceHandler::new(node.clone(), db.clone(), sender.clone());
     tokio::spawn(async move {
         loop {
             if let Err(e) = handler.listen().await {
@@ -130,12 +125,6 @@ async fn main() -> Result<(), Error> {
         }
     });
 
-    let router = settings.get_router()?;
-    let provisioner = settings.get_provisioner(db.clone(), router, lnd.clone(), exchange.clone());
-
-    let db: Box<dyn LNVpsDb> = Box::new(db.clone());
-    let pv: Box<dyn Provisioner> = Box::new(provisioner);
-
     let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
@@ -147,7 +136,7 @@ async fn main() -> Result<(), Error> {
     if let Err(e) = rocket::Rocket::custom(config)
         .attach(CORS)
         .manage(db)
-        .manage(pv)
+        .manage(provisioner)
         .manage(status)
         .manage(exchange)
         .manage(sender)

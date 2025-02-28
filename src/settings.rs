@@ -1,12 +1,13 @@
-use crate::exchange::ExchangeRateCache;
+use crate::exchange::ExchangeRateService;
+use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
 use crate::provisioner::Provisioner;
 use crate::router::{MikrotikRouter, Router};
 use anyhow::{bail, Result};
-use fedimint_tonic_lnd::Client;
 use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -14,6 +15,9 @@ pub struct Settings {
     pub listen: Option<String>,
     pub db: String,
     pub lnd: LndConfig,
+
+    /// Readonly mode, don't spawn any VM's
+    pub read_only: bool,
 
     /// Provisioning profiles
     pub provisioner: ProvisionerConfig,
@@ -60,6 +64,7 @@ pub enum RouterConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DnsServerConfig {
+    #[serde(rename_all = "kebab-case")]
     Cloudflare { api: ApiConfig, zone_id: String },
 }
 
@@ -124,8 +129,6 @@ pub struct SmtpConfig {
 pub enum ProvisionerConfig {
     #[serde(rename_all = "kebab-case")]
     Proxmox {
-        /// Readonly mode, don't spawn any VM's
-        read_only: bool,
         /// Generic VM configuration
         qemu: QemuConfig,
         /// SSH config for issuing commands via CLI
@@ -161,34 +164,19 @@ pub struct QemuConfig {
 impl Settings {
     pub fn get_provisioner(
         &self,
-        db: impl LNVpsDb + 'static,
-        router: Option<impl Router + 'static>,
-        lnd: Client,
-        exchange: ExchangeRateCache,
-    ) -> impl Provisioner + 'static {
-        match &self.provisioner {
-            ProvisionerConfig::Proxmox {
-                qemu,
-                ssh,
-                read_only,
-            } => LNVpsProvisioner::new(
-                *read_only,
-                qemu.clone(),
-                self.network_policy.clone(),
-                ssh.clone(),
-                db,
-                router,
-                lnd,
-                exchange,
-            ),
-        }
+        db: Arc<dyn LNVpsDb>,
+        node: Arc<dyn LightningNode>,
+        exchange: Arc<dyn ExchangeRateService>,
+    ) -> Arc<dyn Provisioner> {
+        Arc::new(LNVpsProvisioner::new(self.clone(), db, node, exchange))
     }
-    pub fn get_router<'a>(&'a self) -> Result<Option<impl Router + 'static>> {
+
+    pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
         match &self.router {
             Some(RouterConfig::Mikrotik(api)) => match &api.credentials {
-                Credentials::UsernamePassword { username, password } => {
-                    Ok(Some(MikrotikRouter::new(&api.url, username, password)))
-                }
+                Credentials::UsernamePassword { username, password } => Ok(Some(Arc::new(
+                    MikrotikRouter::new(&api.url, username, password),
+                ))),
                 _ => bail!("Only username/password is supported for Mikrotik routers"),
             },
             _ => Ok(None),

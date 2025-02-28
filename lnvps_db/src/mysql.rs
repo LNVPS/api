@@ -209,7 +209,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_vms(&self) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm ")
+        sqlx::query_as("select * from vm where deleted = 0")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)

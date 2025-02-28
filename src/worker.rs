@@ -1,7 +1,7 @@
 use crate::host::get_host_client;
 use crate::host::proxmox::{VmInfo, VmStatus};
 use crate::provisioner::Provisioner;
-use crate::settings::{Settings, SmtpConfig};
+use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Days, Utc};
@@ -14,6 +14,7 @@ use log::{debug, error, info};
 use nostr::{EventBuilder, PublicKey, ToBech32};
 use nostr_sdk::Client;
 use std::ops::{Add, Sub};
+use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug)]
@@ -34,18 +35,21 @@ pub enum WorkJob {
 
 pub struct Worker {
     settings: WorkerSettings,
-    db: Box<dyn LNVpsDb>,
-    provisioner: Box<dyn Provisioner>,
+
+    db: Arc<dyn LNVpsDb>,
+    provisioner: Arc<dyn Provisioner>,
+    nostr: Option<Client>,
+
     vm_state_cache: VmStateCache,
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
-    client: Option<Client>,
     last_check_vms: DateTime<Utc>,
 }
 
 pub struct WorkerSettings {
     pub delete_after: u16,
     pub smtp: Option<SmtpConfig>,
+    pub provisioner_config: ProvisionerConfig,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -53,27 +57,28 @@ impl From<&Settings> for WorkerSettings {
         WorkerSettings {
             delete_after: val.delete_after,
             smtp: val.smtp.clone(),
+            provisioner_config: val.provisioner.clone(),
         }
     }
 }
 
 impl Worker {
-    pub fn new<D: LNVpsDb + Clone + 'static, P: Provisioner + 'static>(
-        db: D,
-        provisioner: P,
+    pub fn new(
+        db: Arc<dyn LNVpsDb>,
+        provisioner: Arc<dyn Provisioner>,
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
-        client: Option<Client>,
+        nostr: Option<Client>,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
         Self {
-            db: Box::new(db),
-            provisioner: Box::new(provisioner),
+            db,
+            provisioner,
             vm_state_cache,
+            nostr,
             settings: settings.into(),
             tx,
             rx,
-            client,
             last_check_vms: Utc::now(),
         }
     }
@@ -159,7 +164,7 @@ impl Worker {
         debug!("Checking VM: {}", vm_id);
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host)?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
 
         match client.get_vm_status(&host.name, (vm.id + 100) as i32).await {
             Ok(s) => self.handle_vm_info(s).await?,
@@ -196,7 +201,7 @@ impl Worker {
     pub async fn check_vms(&mut self) -> Result<()> {
         let hosts = self.db.list_hosts().await?;
         for host in hosts {
-            let client = get_host_client(&host)?;
+            let client = get_host_client(&host, &self.settings.provisioner_config)?;
 
             for node in client.list_nodes().await? {
                 debug!("Checking vms for {}", node.name);
@@ -233,7 +238,7 @@ impl Worker {
             }
 
             // delete vm if not paid (in new state)
-            if !vm.deleted && vm.expires < Utc::now().sub(Days::new(1)) && state.is_none() {
+            if vm.expires < Utc::now().sub(Days::new(1)) && state.is_none() {
                 info!("Deleting unpaid VM {}", vm.id);
                 self.provisioner.delete_vm(vm.id).await?;
             }
@@ -281,10 +286,10 @@ impl Worker {
             }
         }
         if user.contact_nip4 {
-            // send dm
+            // TODO: send nip4 dm
         }
         if user.contact_nip17 {
-            if let Some(c) = self.client.as_ref() {
+            if let Some(c) = self.nostr.as_ref() {
                 let sig = c.signer().await?;
                 let ev = EventBuilder::private_msg(
                     &sig,

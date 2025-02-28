@@ -5,7 +5,6 @@ use lnvps_db::VmHostRegion;
 use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, JsonSchema)]

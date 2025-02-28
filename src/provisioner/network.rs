@@ -20,18 +20,17 @@ pub struct AvailableIp {
     pub region_id: u64,
 }
 
+/// Handles picking available IPs
 #[derive(Clone)]
 pub struct NetworkProvisioner {
     method: ProvisionerMethod,
-    settings: NetworkPolicy,
     db: Arc<dyn LNVpsDb>,
 }
 
 impl NetworkProvisioner {
-    pub fn new(method: ProvisionerMethod, settings: NetworkPolicy, db: Arc<dyn LNVpsDb>) -> Self {
+    pub fn new(method: ProvisionerMethod, db: Arc<dyn LNVpsDb>) -> Self {
         Self {
             method,
-            settings,
             db,
         }
     }
@@ -97,9 +96,6 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
         let mgr = NetworkProvisioner::new(
             ProvisionerMethod::Sequential,
-            NetworkPolicy {
-                access: NetworkAccessPolicy::Auto,
-            },
             db.clone(),
         );
 
@@ -130,9 +126,6 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
         let mgr = NetworkProvisioner::new(
             ProvisionerMethod::Random,
-            NetworkPolicy {
-                access: NetworkAccessPolicy::Auto,
-            },
             db,
         );
 

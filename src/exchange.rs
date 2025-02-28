@@ -1,4 +1,5 @@
 use anyhow::{Error, Result};
+use lnvps_db::async_trait;
 use log::info;
 use rocket::serde::Deserialize;
 use std::collections::HashMap;
@@ -56,33 +57,21 @@ impl Display for Ticker {
 #[derive(Debug, PartialEq)]
 pub struct TickerRate(pub Ticker, pub f32);
 
-#[derive(Clone)]
-pub struct ExchangeRateCache {
+#[async_trait]
+pub trait ExchangeRateService: Send + Sync {
+    async fn fetch_rates(&self) -> Result<Vec<TickerRate>>;
+    async fn set_rate(&self, ticker: Ticker, amount: f32);
+    async fn get_rate(&self, ticker: Ticker) -> Option<f32>;
+}
+
+#[derive(Clone, Default)]
+pub struct DefaultRateCache {
     cache: Arc<RwLock<HashMap<Ticker, f32>>>,
 }
 
-#[derive(Deserialize)]
-struct MempoolRates {
-    #[serde(rename = "USD")]
-    pub usd: Option<f32>,
-    #[serde(rename = "EUR")]
-    pub eur: Option<f32>,
-}
-
-impl Default for ExchangeRateCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ExchangeRateCache {
-    pub fn new() -> Self {
-        Self {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    pub async fn fetch_rates(&self) -> Result<Vec<TickerRate>> {
+#[async_trait]
+impl ExchangeRateService for DefaultRateCache {
+    async fn fetch_rates(&self) -> Result<Vec<TickerRate>> {
         let rsp = reqwest::get("https://mempool.space/api/v1/prices")
             .await?
             .text()
@@ -100,14 +89,22 @@ impl ExchangeRateCache {
         Ok(ret)
     }
 
-    pub async fn set_rate(&self, ticker: Ticker, amount: f32) {
+    async fn set_rate(&self, ticker: Ticker, amount: f32) {
         let mut cache = self.cache.write().await;
         info!("{}: {}", &ticker, amount);
         cache.insert(ticker, amount);
     }
 
-    pub async fn get_rate(&self, ticker: Ticker) -> Option<f32> {
+    async fn get_rate(&self, ticker: Ticker) -> Option<f32> {
         let cache = self.cache.read().await;
         cache.get(&ticker).cloned()
     }
+}
+
+#[derive(Deserialize)]
+struct MempoolRates {
+    #[serde(rename = "USD")]
+    pub usd: Option<f32>,
+    #[serde(rename = "EUR")]
+    pub eur: Option<f32>,
 }

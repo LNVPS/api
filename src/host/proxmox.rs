@@ -1,10 +1,17 @@
+use crate::settings::{QemuConfig, SshConfig};
+use crate::ssh_client::SshClient;
 use anyhow::{anyhow, bail, Result};
-use log::debug;
+use ipnetwork::IpNetwork;
+use lnvps_db::{IpRange, LNVpsDb, Vm, VmIpAssignment};
+use log::{debug, info};
+use nostr_sdk::async_utility::futures_util::future::join_all;
 use reqwest::{ClientBuilder, Method, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -15,10 +22,12 @@ pub struct ProxmoxClient {
     base: Url,
     token: String,
     client: reqwest::Client,
+    config: QemuConfig,
+    ssh: Option<SshConfig>,
 }
 
 impl ProxmoxClient {
-    pub fn new(base: Url) -> Self {
+    pub fn new(base: Url, config: QemuConfig, ssh: Option<SshConfig>) -> Self {
         let client = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
             .build()
@@ -28,7 +37,82 @@ impl ProxmoxClient {
             base,
             token: String::new(),
             client,
+            config,
+            ssh,
         }
+    }
+
+    /// Create [VmConfig] for a given VM and list of IPs
+    pub async fn make_vm_config(
+        &self,
+        db: &Arc<dyn LNVpsDb>,
+        vm: &Vm,
+        ips: &Vec<VmIpAssignment>,
+    ) -> Result<VmConfig> {
+        let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+
+        let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
+        let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
+        let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|i| (i.id, i))
+            .collect();
+
+        let mut ip_config = ips
+            .iter()
+            .map_while(|ip| {
+                if let Ok(net) = ip.ip.parse::<IpNetwork>() {
+                    Some(match net {
+                        IpNetwork::V4(addr) => {
+                            let range = ip_ranges.get(&ip.ip_range_id)?;
+                            format!("ip={},gw={}", addr, range.gateway)
+                        }
+                        IpNetwork::V6(addr) => format!("ip6={}", addr),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        ip_config.push("ip6=auto".to_string());
+
+        let mut net = vec![
+            format!("virtio={}", vm.mac_address),
+            format!("bridge={}", self.config.bridge),
+        ];
+        if let Some(t) = self.config.vlan {
+            net.push(format!("tag={}", t));
+        }
+
+        let drives = db.list_host_disks(vm.host_id).await?;
+        let drive = if let Some(d) = drives.iter().find(|d| d.enabled) {
+            d
+        } else {
+            bail!("No host drive found!")
+        };
+
+        let template = db.get_vm_template(vm.template_id).await?;
+        Ok(VmConfig {
+            cpu: Some(self.config.cpu.clone()),
+            kvm: Some(self.config.kvm),
+            ip_config: Some(ip_config.join(",")),
+            machine: Some(self.config.machine.clone()),
+            net: Some(net.join(",")),
+            os_type: Some(self.config.os_type.clone()),
+            on_boot: Some(true),
+            bios: Some(VmBios::OVMF),
+            boot: Some("order=scsi0".to_string()),
+            cores: Some(template.cpu as i32),
+            memory: Some((template.memory / 1024 / 1024).to_string()),
+            scsi_hw: Some("virtio-scsi-pci".to_string()),
+            serial_0: Some("socket".to_string()),
+            scsi_1: Some(format!("{}:cloudinit", &drive.name)),
+            ssh_keys: Some(urlencoding::encode(&ssh_key.key_data).to_string()),
+            efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
+            ..Default::default()
+        })
     }
 
     pub fn with_api_token(mut self, token: &str) -> Self {
@@ -183,6 +267,54 @@ impl ProxmoxClient {
             id: rsp.data,
             node: req.node,
         })
+    }
+
+    pub async fn import_disk_image(&self, req: ImportDiskImageRequest) -> Result<()> {
+        // import the disk
+        // TODO: find a way to avoid using SSH
+        if let Some(ssh_config) = &self.ssh {
+            let mut ses = SshClient::new()?;
+            ses.connect(
+                (self.base.host().unwrap().to_string(), 22),
+                &ssh_config.user,
+                &ssh_config.key,
+            )
+            .await?;
+
+            // Disk import args
+            let mut disk_args: HashMap<&str, String> = HashMap::new();
+            disk_args.insert(
+                "import-from",
+                format!("/var/lib/vz/template/iso/{}", req.image),
+            );
+
+            // If disk is SSD, enable discard + ssd options
+            if req.is_ssd {
+                disk_args.insert("discard", "on".to_string());
+                disk_args.insert("ssd", "1".to_string());
+            }
+
+            let cmd = format!(
+                "/usr/sbin/qm set {} --{} {}:0,{}",
+                req.vm_id,
+                &req.disk,
+                &req.storage,
+                disk_args
+                    .into_iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let (code, rsp) = ses.execute(cmd.as_str()).await?;
+            info!("{}", rsp);
+
+            if code != 0 {
+                bail!("Failed to import disk, exit-code {}, {}", code, rsp);
+            }
+            Ok(())
+        } else {
+            bail!("Cannot complete, no method available to import disk, consider configuring ssh")
+        }
     }
 
     /// Resize a disk on a VM
@@ -569,6 +701,22 @@ pub struct ResizeDiskRequest {
     /// With the `+` sign the value is added to the actual size of the volume and without it,
     /// the value is taken as an absolute one. Shrinking disk size is not supported.
     pub size: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ImportDiskImageRequest {
+    /// VM id
+    pub vm_id: i32,
+    /// Node name
+    pub node: String,
+    /// Storage pool to import disk to
+    pub storage: String,
+    /// Disk name (scsi0 etc)
+    pub disk: String,
+    /// Image filename on disk inside the disk storage dir
+    pub image: String,
+    /// If the disk is an SSD and discard should be enabled
+    pub is_ssd: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

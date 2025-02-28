@@ -1,6 +1,6 @@
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use chrono::Utc;
 use lnvps_db::{
     async_trait, IpRange, LNVpsDb, User, UserSshKey, Vm, VmCostPlan, VmHost, VmHostDisk,
@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
+use crate::lightning::LightningNode;
 
 #[derive(Debug, Clone)]
 pub struct MockDb {
@@ -313,12 +315,14 @@ impl LNVpsDb for MockDb {
 
 struct MockRouter {
     pub policy: NetworkPolicy,
+    pub arp: Arc<Mutex<HashMap<String, ArpEntry>>>,
 }
 
 #[async_trait]
 impl Router for MockRouter {
     async fn list_arp_entry(&self) -> anyhow::Result<Vec<ArpEntry>> {
-        todo!()
+        let arp = self.arp.lock().await;
+        Ok(arp.values().cloned().collect())
     }
 
     async fn add_arp_entry(
@@ -328,10 +332,34 @@ impl Router for MockRouter {
         interface: &str,
         comment: Option<&str>,
     ) -> anyhow::Result<()> {
-        todo!()
+        let mut arp = self.arp.lock().await;
+        if arp.iter().any(|(k, v)| v.address == ip.to_string()) {
+            bail!("Address is already in use");
+        }
+        arp.insert(
+            mac.to_string(),
+            ArpEntry {
+                id: Some(mac.to_string()),
+                address: ip.to_string(),
+                mac_address: None,
+                interface: interface.to_string(),
+                comment: comment.map(|s| s.to_string()),
+            },
+        );
+        Ok(())
     }
 
     async fn remove_arp_entry(&self, id: &str) -> anyhow::Result<()> {
-        todo!()
+        let mut arp = self.arp.lock().await;
+        arp.remove(id);
+        Ok(())
     }
 }
+
+#[derive(Clone, Debug, Default)]
+pub struct MockNode {
+
+}
+
+#[async_trait]
+impl LightningNode for MockNode {}
