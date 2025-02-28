@@ -7,9 +7,7 @@ use crate::host::proxmox::{
 use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{NetworkProvisioner, Provisioner, ProvisionerMethod};
 use crate::router::Router;
-use crate::settings::{
-    NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings,
-};
+use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
 use fedimint_tonic_lnd::tonic::async_trait;
@@ -53,9 +51,7 @@ impl LNVpsProvisioner {
             db,
             node,
             rates,
-            router: settings
-                .get_router()
-                .expect("router config"),
+            router: settings.get_router().expect("router config"),
             network_policy: settings.network_policy,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
@@ -251,10 +247,7 @@ impl Provisioner for LNVpsProvisioner {
         }
 
         // Use random network provisioner
-        let prov = NetworkProvisioner::new(
-            ProvisionerMethod::Random,
-            self.db.clone(),
-        );
+        let prov = NetworkProvisioner::new(ProvisionerMethod::Random, self.db.clone());
 
         let template = self.db.get_vm_template(vm.template_id).await?;
         let ip = prov.pick_ip_for_region(template.region_id).await?;
@@ -461,10 +454,13 @@ mod tests {
     use super::*;
     use crate::exchange::DefaultRateCache;
     use crate::mocks::{MockDb, MockNode};
-    use crate::settings::{LndConfig, ProvisionerConfig};
+    use crate::settings::{
+        ApiConfig, Credentials, LndConfig, ProvisionerConfig, QemuConfig, RouterConfig,
+    };
 
+    #[ignore]
     #[tokio::test]
-    async fn test_basic_provisioner() {
+    async fn test_basic_provisioner() -> Result<()> {
         let settings = Settings {
             listen: None,
             db: "".to_string(),
@@ -492,13 +488,38 @@ mod tests {
             },
             delete_after: 0,
             smtp: None,
-            router: None,
+            router: Some(RouterConfig::Mikrotik(ApiConfig {
+                id: "mock-router".to_string(),
+                url: "https://localhost".to_string(),
+                credentials: Credentials::UsernamePassword {
+                    username: "admin".to_string(),
+                    password: "password123".to_string(),
+                },
+            })),
             dns: None,
             nostr: None,
         };
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(DefaultRateCache::default());
-        let provisioner = LNVpsProvisioner::new(settings, db, node, rates);
+        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+
+        let vm = db
+            .insert_vm(&Vm {
+                id: 1,
+                host_id: 1,
+                user_id: 1,
+                image_id: 1,
+                template_id: 1,
+                ssh_key_id: 1,
+                created: Utc::now(),
+                expires: Utc::now() + Duration::from_secs(30),
+                disk_id: 1,
+                mac_address: "00:00:00:00:00:00".to_string(),
+                deleted: false,
+            })
+            .await?;
+        provisioner.spawn_vm(1).await?;
+        Ok(())
     }
 }

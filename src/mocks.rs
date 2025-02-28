@@ -1,23 +1,28 @@
+use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
 use anyhow::{anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
 use lnvps_db::{
-    async_trait, IpRange, LNVpsDb, User, UserSshKey, Vm, VmCostPlan, VmHost, VmHostDisk,
-    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    async_trait, DiskInterface, DiskType, IpRange, LNVpsDb, OsDistribution, User, UserSshKey, Vm,
+    VmCostPlan, VmCostPlanIntervalType, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
-use crate::lightning::LightningNode;
 
 #[derive(Debug, Clone)]
 pub struct MockDb {
     pub regions: Arc<Mutex<HashMap<u64, VmHostRegion>>>,
     pub hosts: Arc<Mutex<HashMap<u64, VmHost>>>,
     pub users: Arc<Mutex<HashMap<u64, User>>>,
+    pub cost_plans: Arc<Mutex<HashMap<u64, VmCostPlan>>>,
+    pub os_images: Arc<Mutex<HashMap<u64, VmOsImage>>>,
+    pub templates: Arc<Mutex<HashMap<u64, VmTemplate>>>,
     pub vms: Arc<Mutex<HashMap<u64, Vm>>>,
     pub ip_range: Arc<Mutex<HashMap<u64, IpRange>>>,
     pub ip_assignments: Arc<Mutex<HashMap<u64, VmIpAssignment>>>,
@@ -68,10 +73,57 @@ impl Default for MockDb {
                 api_token: "".to_string(),
             },
         );
+        let mut cost_plans = HashMap::new();
+        cost_plans.insert(
+            1,
+            VmCostPlan {
+                id: 1,
+                name: "mock".to_string(),
+                created: Utc::now(),
+                amount: 1,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: VmCostPlanIntervalType::Month,
+            },
+        );
+        let mut templates = HashMap::new();
+        templates.insert(
+            1,
+            VmTemplate {
+                id: 1,
+                name: "mock".to_string(),
+                enabled: true,
+                created: Utc::now(),
+                expires: None,
+                cpu: 2,
+                memory: 1024 * 1024 * 1024 * 2,
+                disk_size: 1024 * 1024 * 1024 * 64,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                cost_plan_id: 1,
+                region_id: 1,
+            },
+        );
+        let mut os_images = HashMap::new();
+        os_images.insert(
+            1,
+            VmOsImage {
+                id: 1,
+                distribution: OsDistribution::Debian,
+                flavour: "server".to_string(),
+                version: "12".to_string(),
+                enabled: true,
+                release_date: Utc::now(),
+                url: "https://example.com/debian_12.img".to_string(),
+            },
+        );
         Self {
             regions: Arc::new(Mutex::new(regions)),
             ip_range: Arc::new(Mutex::new(ip_ranges)),
             hosts: Arc::new(Mutex::new(hosts)),
+            cost_plans: Arc::new(Mutex::new(cost_plans)),
+            templates: Arc::new(Mutex::new(templates)),
+            os_images: Arc::new(Mutex::new(os_images)),
             users: Arc::new(Default::default()),
             vms: Arc::new(Default::default()),
             ip_assignments: Arc::new(Default::default()),
@@ -108,7 +160,7 @@ impl LNVpsDb for MockDb {
     }
 
     async fn get_user(&self, id: u64) -> anyhow::Result<User> {
-        let mut users = self.users.lock().await;
+        let users = self.users.lock().await;
         Ok(users.get(&id).ok_or(anyhow!("no user"))?.clone())
     }
 
@@ -116,9 +168,9 @@ impl LNVpsDb for MockDb {
         let mut users = self.users.lock().await;
         if let Some(u) = users.get_mut(&user.id) {
             u.email = user.email.clone();
-            u.contact_email = user.contact_email.clone();
-            u.contact_nip17 = user.contact_nip17.clone();
-            u.contact_nip4 = user.contact_nip4.clone();
+            u.contact_email = user.contact_email;
+            u.contact_nip17 = user.contact_nip17;
+            u.contact_nip4 = user.contact_nip4;
         }
         Ok(())
     }
@@ -175,11 +227,13 @@ impl LNVpsDb for MockDb {
     }
 
     async fn get_os_image(&self, id: u64) -> anyhow::Result<VmOsImage> {
-        todo!()
+        let os_images = self.os_images.lock().await;
+        Ok(os_images.get(&id).ok_or(anyhow!("no image"))?.clone())
     }
 
     async fn list_os_image(&self) -> anyhow::Result<Vec<VmOsImage>> {
-        todo!()
+        let os_images = self.os_images.lock().await;
+        Ok(os_images.values().filter(|i| i.enabled).cloned().collect())
     }
 
     async fn get_ip_range(&self, id: u64) -> anyhow::Result<IpRange> {
@@ -202,43 +256,71 @@ impl LNVpsDb for MockDb {
     }
 
     async fn get_cost_plan(&self, id: u64) -> anyhow::Result<VmCostPlan> {
-        todo!()
+        let cost_plans = self.cost_plans.lock().await;
+        Ok(cost_plans.get(&id).ok_or(anyhow!("no cost plan"))?.clone())
     }
 
     async fn get_vm_template(&self, id: u64) -> anyhow::Result<VmTemplate> {
-        todo!()
+        let templates = self.templates.lock().await;
+        Ok(templates.get(&id).ok_or(anyhow!("no template"))?.clone())
     }
 
     async fn list_vm_templates(&self) -> anyhow::Result<Vec<VmTemplate>> {
-        todo!()
+        let templates = self.templates.lock().await;
+        Ok(templates
+            .values()
+            .filter(|t| t.enabled && t.expires.as_ref().map(|e| *e > Utc::now()).unwrap_or(true))
+            .cloned()
+            .collect())
     }
 
     async fn list_vms(&self) -> anyhow::Result<Vec<Vm>> {
-        todo!()
+        let vms = self.vms.lock().await;
+        Ok(vms.values().filter(|v| !v.deleted).cloned().collect())
     }
 
     async fn list_expired_vms(&self) -> anyhow::Result<Vec<Vm>> {
-        todo!()
+        let vms = self.vms.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| !v.deleted && v.expires >= Utc::now())
+            .cloned()
+            .collect())
     }
 
     async fn list_user_vms(&self, id: u64) -> anyhow::Result<Vec<Vm>> {
-        todo!()
+        let vms = self.vms.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| !v.deleted && v.user_id == id)
+            .cloned()
+            .collect())
     }
 
     async fn get_vm(&self, vm_id: u64) -> anyhow::Result<Vm> {
-        todo!()
+        let vms = self.vms.lock().await;
+        Ok(vms.get(&vm_id).ok_or(anyhow!("no vm"))?.clone())
     }
 
     async fn insert_vm(&self, vm: &Vm) -> anyhow::Result<u64> {
-        todo!()
+        let mut vms = self.vms.lock().await;
+        let max_id = *vms.keys().max().unwrap_or(&0);
+        vms.insert(max_id + 1, vm.clone());
+        Ok(max_id + 1)
     }
 
     async fn delete_vm(&self, vm_id: u64) -> anyhow::Result<()> {
-        todo!()
+        let mut vms = self.vms.lock().await;
+        vms.remove(&vm_id);
+        Ok(())
     }
 
     async fn update_vm(&self, vm: &Vm) -> anyhow::Result<()> {
-        todo!()
+        let mut vms = self.vms.lock().await;
+        if let Some(v) = vms.get_mut(&vm.id) {
+            v.ssh_key_id = vm.ssh_key_id;
+        }
+        Ok(())
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> anyhow::Result<u64> {
@@ -313,7 +395,8 @@ impl LNVpsDb for MockDb {
     }
 }
 
-struct MockRouter {
+#[derive(Debug, Clone)]
+pub struct MockRouter {
     pub policy: NetworkPolicy,
     pub arp: Arc<Mutex<HashMap<String, ArpEntry>>>,
 }
@@ -358,8 +441,26 @@ impl Router for MockRouter {
 
 #[derive(Clone, Debug, Default)]
 pub struct MockNode {
+    invoices: Arc<Mutex<HashMap<String, MockInvoice>>>,
+}
 
+#[derive(Debug, Clone)]
+struct MockInvoice {
+    pr: String,
+    expiry: DateTime<Utc>,
+    settle_index: u64,
 }
 
 #[async_trait]
-impl LightningNode for MockNode {}
+impl LightningNode for MockNode {
+    async fn add_invoice(&self, req: AddInvoiceRequest) -> anyhow::Result<AddInvoiceResult> {
+        todo!()
+    }
+
+    async fn subscribe_invoices(
+        &self,
+        from_payment_hash: Option<Vec<u8>>,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = InvoiceUpdate> + Send>>> {
+        todo!()
+    }
+}

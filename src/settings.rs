@@ -171,6 +171,7 @@ impl Settings {
         Arc::new(LNVpsProvisioner::new(self.clone(), db, node, exchange))
     }
 
+    #[cfg(not(test))]
     pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
         match &self.router {
             Some(RouterConfig::Mikrotik(api)) => match &api.credentials {
@@ -180,6 +181,19 @@ impl Settings {
                 _ => bail!("Only username/password is supported for Mikrotik routers"),
             },
             _ => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
+        if self.router.is_some() {
+            let router = crate::mocks::MockRouter {
+                policy: self.network_policy.clone(),
+                arp: Arc::new(Default::default()),
+            };
+            Ok(Some(Arc::new(router)))
+        } else {
+            Ok(None)
         }
     }
 }

@@ -1,4 +1,3 @@
-use crate::settings::NetworkPolicy;
 use anyhow::{bail, Result};
 use ipnetwork::IpNetwork;
 use lnvps_db::LNVpsDb;
@@ -87,7 +86,7 @@ impl NetworkProvisioner {
 mod tests {
     use super::*;
     use crate::mocks::*;
-    use crate::settings::NetworkAccessPolicy;
+    
     use lnvps_db::VmIpAssignment;
     use std::str::FromStr;
 

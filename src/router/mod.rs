@@ -41,12 +41,3 @@ pub struct ArpEntry {
 mod mikrotik;
 #[cfg(feature = "mikrotik")]
 pub use mikrotik::*;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::settings::NetworkPolicy;
-
-    #[test]
-    fn provision_ips_with_arp() {}
-}

@@ -11,6 +11,7 @@ pub trait VmHostClient {
 
 }
 
+#[cfg(not(test))]
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<ProxmoxClient> {
     Ok(match (host.kind.clone(), &cfg) {
         (VmHostKind::Proxmox, ProvisionerConfig::Proxmox { qemu, ssh, .. }) => {
@@ -19,4 +20,9 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Proxmox
         }
         _ => bail!("Unsupported host type"),
     })
+}
+
+#[cfg(test)]
+pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<ProxmoxClient> {
+    todo!()
 }
