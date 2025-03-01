@@ -1854,7 +1854,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "ipnetwork"
 version = "0.21.1"
-source = "git+https://github.com/v0l/ipnetwork.git?rev=51b4816358f255ecbcff90b739fbbd4b1cbc2d6a#51b4816358f255ecbcff90b739fbbd4b1cbc2d6a"
+source = "git+https://git.v0l.io/Kieran/ipnetwork.git?rev=35977adc8103cfc232bc95fbc32f4e34f2b6a6d7#35977adc8103cfc232bc95fbc32f4e34f2b6a6d7"
 
 [[package]]
 name = "is-terminal"
