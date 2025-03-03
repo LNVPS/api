@@ -1,15 +1,21 @@
+use crate::host::{CreateVmRequest, VmHostClient};
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
-use anyhow::{anyhow, bail, Result};
+use crate::status::{VmRunningState, VmState};
+use anyhow::{anyhow, bail, ensure, Result};
+use chrono::Utc;
+use futures::future::join_all;
 use ipnetwork::IpNetwork;
-use lnvps_db::{IpRange, LNVpsDb, Vm, VmIpAssignment};
+use lnvps_db::{async_trait, DiskType, IpRange, LNVpsDb, Vm, VmIpAssignment, VmOsImage};
 use log::{debug, info};
-use nostr_sdk::async_utility::futures_util::future::join_all;
+use rand::random;
 use reqwest::{ClientBuilder, Method, Url};
+use serde::de::value::I32Deserializer;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter};
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,10 +30,18 @@ pub struct ProxmoxClient {
     client: reqwest::Client,
     config: QemuConfig,
     ssh: Option<SshConfig>,
+    mac_prefix: String,
+    node: String,
 }
 
 impl ProxmoxClient {
-    pub fn new(base: Url, config: QemuConfig, ssh: Option<SshConfig>) -> Self {
+    pub fn new(
+        base: Url,
+        node: &str,
+        mac_prefix: Option<String>,
+        config: QemuConfig,
+        ssh: Option<SshConfig>,
+    ) -> Self {
         let client = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
             .build()
@@ -39,84 +53,12 @@ impl ProxmoxClient {
             client,
             config,
             ssh,
+            node: node.to_string(),
+            mac_prefix: mac_prefix.unwrap_or("bc:24:11".to_string()),
         }
-    }
-
-    /// Create [VmConfig] for a given VM and list of IPs
-    pub async fn make_vm_config(
-        &self,
-        db: &Arc<dyn LNVpsDb>,
-        vm: &Vm,
-        ips: &Vec<VmIpAssignment>,
-    ) -> Result<VmConfig> {
-        let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
-
-        let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
-        let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
-        let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-            .map(|i| (i.id, i))
-            .collect();
-
-        let mut ip_config = ips
-            .iter()
-            .map_while(|ip| {
-                if let Ok(net) = ip.ip.parse::<IpNetwork>() {
-                    Some(match net {
-                        IpNetwork::V4(addr) => {
-                            let range = ip_ranges.get(&ip.ip_range_id)?;
-                            format!("ip={},gw={}", addr, range.gateway)
-                        }
-                        IpNetwork::V6(addr) => format!("ip6={}", addr),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        ip_config.push("ip6=auto".to_string());
-
-        let mut net = vec![
-            format!("virtio={}", vm.mac_address),
-            format!("bridge={}", self.config.bridge),
-        ];
-        if let Some(t) = self.config.vlan {
-            net.push(format!("tag={}", t));
-        }
-
-        let drives = db.list_host_disks(vm.host_id).await?;
-        let drive = if let Some(d) = drives.iter().find(|d| d.enabled) {
-            d
-        } else {
-            bail!("No host drive found!")
-        };
-
-        let template = db.get_vm_template(vm.template_id).await?;
-        Ok(VmConfig {
-            cpu: Some(self.config.cpu.clone()),
-            kvm: Some(self.config.kvm),
-            ip_config: Some(ip_config.join(",")),
-            machine: Some(self.config.machine.clone()),
-            net: Some(net.join(",")),
-            os_type: Some(self.config.os_type.clone()),
-            on_boot: Some(true),
-            bios: Some(VmBios::OVMF),
-            boot: Some("order=scsi0".to_string()),
-            cores: Some(template.cpu as i32),
-            memory: Some((template.memory / 1024 / 1024).to_string()),
-            scsi_hw: Some("virtio-scsi-pci".to_string()),
-            serial_0: Some("socket".to_string()),
-            scsi_1: Some(format!("{}:cloudinit", &drive.name)),
-            ssh_keys: Some(urlencoding::encode(&ssh_key.key_data).to_string()),
-            efi_disk_0: Some(format!("{}:0,efitype=4m", &drive.name)),
-            ..Default::default()
-        })
     }
 
     pub fn with_api_token(mut self, token: &str) -> Self {
-        // PVEAPIToken=USER@REALM!TOKENID=UUID
         self.token = token.to_string();
         self
     }
@@ -133,7 +75,7 @@ impl ProxmoxClient {
         Ok(rsp.data)
     }
 
-    pub async fn get_vm_status(&self, node: &str, vm_id: i32) -> Result<VmInfo> {
+    pub async fn get_vm_status(&self, node: &str, vm_id: ProxmoxVmId) -> Result<VmInfo> {
         let rsp: ResponseBase<VmInfo> = self
             .get(&format!(
                 "/api2/json/nodes/{node}/qemu/{vm_id}/status/current"
@@ -203,7 +145,7 @@ impl ProxmoxClient {
     /// Delete VM
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
-    pub async fn delete_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+    pub async fn delete_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<Option<String>> = self
             .req(
                 Method::DELETE,
@@ -249,6 +191,18 @@ impl ProxmoxClient {
                 }
             }
             sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn get_iso_storage(&self, node: &str) -> Result<String> {
+        let storages = self.list_storage(node).await?;
+        if let Some(s) = storages
+            .iter()
+            .find(|s| s.contents().contains(&StorageContent::ISO))
+        {
+            Ok(s.storage.clone())
+        } else {
+            bail!("No image storage found");
         }
     }
 
@@ -333,7 +287,7 @@ impl ProxmoxClient {
     }
 
     /// Start a VM
-    pub async fn start_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+    pub async fn start_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/start", node, vm),
@@ -347,7 +301,7 @@ impl ProxmoxClient {
     }
 
     /// Stop a VM
-    pub async fn stop_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+    pub async fn stop_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/stop", node, vm),
@@ -361,7 +315,7 @@ impl ProxmoxClient {
     }
 
     /// Stop a VM
-    pub async fn shutdown_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+    pub async fn shutdown_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/shutdown", node, vm),
@@ -375,7 +329,7 @@ impl ProxmoxClient {
     }
 
     /// Stop a VM
-    pub async fn reset_vm(&self, node: &str, vm: u64) -> Result<TaskId> {
+    pub async fn reset_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/reset", node, vm),
@@ -389,7 +343,7 @@ impl ProxmoxClient {
     }
 
     /// Create terminal proxy session
-    pub async fn terminal_proxy(&self, node: &str, vm: u64) -> Result<TerminalProxyTicket> {
+    pub async fn terminal_proxy(&self, node: &str, vm: ProxmoxVmId) -> Result<TerminalProxyTicket> {
         let rsp: ResponseBase<TerminalProxyTicket> = self
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/termproxy", node, vm),
@@ -403,7 +357,7 @@ impl ProxmoxClient {
     pub async fn open_terminal_proxy(
         &self,
         node: &str,
-        vm: u64,
+        vm: ProxmoxVmId,
         req: TerminalProxyTicket,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         self.get_task_status(&TaskId {
@@ -497,6 +451,241 @@ impl ProxmoxClient {
         } else {
             bail!("{} {}: {}: {}", method, path, status, &text);
         }
+    }
+}
+
+impl ProxmoxClient {
+    fn make_config(&self, value: &CreateVmRequest) -> Result<VmConfig> {
+        let mut ip_config = value
+            .ips
+            .iter()
+            .map_while(|ip| {
+                if let Ok(net) = ip.ip.parse::<IpAddr>() {
+                    Some(match net {
+                        IpAddr::V4(addr) => {
+                            let range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
+                            let range: IpNetwork = range.gateway.parse().ok()?;
+                            format!(
+                                "ip={},gw={}",
+                                IpNetwork::new(addr.into(), range.prefix()).ok()?,
+                                range.ip()
+                            )
+                        }
+                        IpAddr::V6(addr) => format!("ip6={}", addr),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // TODO: make this configurable
+        ip_config.push("ip6=auto".to_string());
+
+        let mut net = vec![
+            format!("virtio={}", value.vm.mac_address),
+            format!("bridge={}", self.config.bridge),
+        ];
+        if let Some(t) = self.config.vlan {
+            net.push(format!("tag={}", t));
+        }
+
+        Ok(VmConfig {
+            cpu: Some(self.config.cpu.clone()),
+            kvm: Some(self.config.kvm),
+            ip_config: Some(ip_config.join(",")),
+            machine: Some(self.config.machine.clone()),
+            net: Some(net.join(",")),
+            os_type: Some(self.config.os_type.clone()),
+            on_boot: Some(true),
+            bios: Some(VmBios::OVMF),
+            boot: Some("order=scsi0".to_string()),
+            cores: Some(value.template.cpu as i32),
+            memory: Some((value.template.memory / 1024 / 1024).to_string()),
+            scsi_hw: Some("virtio-scsi-pci".to_string()),
+            serial_0: Some("socket".to_string()),
+            scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
+            ssh_keys: Some(urlencoding::encode(&value.ssh_key.key_data).to_string()),
+            efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
+            ..Default::default()
+        })
+    }
+}
+#[async_trait]
+impl VmHostClient for ProxmoxClient {
+    async fn download_os_image(&self, image: &VmOsImage) -> Result<()> {
+        let iso_storage = self.get_iso_storage(&self.node).await?;
+        let files = self.list_storage_files(&self.node, &iso_storage).await?;
+
+        info!("Downloading image {} on {}", image.url, &self.node);
+        let i_name = image.filename()?;
+        if files
+            .iter()
+            .any(|v| v.vol_id.ends_with(&format!("iso/{i_name}")))
+        {
+            info!("Already downloaded, skipping");
+            return Ok(());
+        }
+        let t_download = self
+            .download_image(DownloadUrlRequest {
+                content: StorageContent::ISO,
+                node: self.node.clone(),
+                storage: iso_storage.clone(),
+                url: image.url.clone(),
+                filename: i_name,
+            })
+            .await?;
+        self.wait_for_task(&t_download).await?;
+        Ok(())
+    }
+
+    async fn generate_mac(&self, _vm: &Vm) -> Result<String> {
+        ensure!(self.mac_prefix.len() == 8, "Invalid mac prefix");
+        ensure!(self.mac_prefix.contains(":"), "Invalid mac prefix");
+
+        Ok(format!(
+            "{}:{}:{}:{}",
+            self.mac_prefix,
+            hex::encode([random::<u8>()]),
+            hex::encode([random::<u8>()]),
+            hex::encode([random::<u8>()])
+        ))
+    }
+
+    async fn start_vm(&self, vm: &Vm) -> Result<()> {
+        let task = self.start_vm(&self.node, vm.id.into()).await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
+    async fn stop_vm(&self, vm: &Vm) -> Result<()> {
+        let task = self.stop_vm(&self.node, vm.id.into()).await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
+    async fn reset_vm(&self, vm: &Vm) -> Result<()> {
+        let task = self.reset_vm(&self.node, vm.id.into()).await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
+    async fn create_vm(&self, req: &CreateVmRequest) -> Result<()> {
+        let config = self.make_config(&req)?;
+        let vm_id = req.vm.id.into();
+        let t_create = self
+            .create_vm(CreateVm {
+                node: self.node.clone(),
+                vm_id,
+                config,
+            })
+            .await?;
+        self.wait_for_task(&t_create).await?;
+
+        // import primary disk from image (scsi0)
+        if let Err(e) = self
+            .import_disk_image(ImportDiskImageRequest {
+                vm_id,
+                node: self.node.clone(),
+                storage: req.disk.name.clone(),
+                disk: "scsi0".to_string(),
+                image: req.image.filename()?,
+                is_ssd: matches!(req.disk.kind, DiskType::SSD),
+            })
+            .await
+        {
+            // TODO: rollback
+            return Err(e);
+        }
+
+        // resize disk to match template
+        let j_resize = self
+            .resize_disk(ResizeDiskRequest {
+                node: self.node.clone(),
+                vm_id,
+                disk: "scsi0".to_string(),
+                size: req.template.disk_size.to_string(),
+            })
+            .await?;
+        self.wait_for_task(&j_resize).await?;
+
+        // try start, otherwise ignore error (maybe its already running)
+        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
+            self.wait_for_task(&j_start).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_vm_state(&self, vm: &Vm) -> Result<VmState> {
+        let s = self.get_vm_status(&self.node, vm.id.into()).await?;
+        Ok(VmState {
+            timestamp: Utc::now().timestamp() as u64,
+            state: match s.status {
+                VmStatus::Stopped => VmRunningState::Stopped,
+                VmStatus::Running => VmRunningState::Running,
+            },
+            cpu_usage: s.cpu.unwrap_or(0.0),
+            mem_usage: s.mem.unwrap_or(0) as f32 / s.max_mem.unwrap_or(1) as f32,
+            uptime: s.uptime.unwrap_or(0),
+            net_in: s.net_in.unwrap_or(0),
+            net_out: s.net_out.unwrap_or(0),
+            disk_write: s.disk_write.unwrap_or(0),
+            disk_read: s.disk_read.unwrap_or(0),
+        })
+    }
+
+    async fn configure_vm(&self, vm: &Vm) -> Result<()> {
+        todo!()
+    }
+}
+
+/// Wrap a database vm id
+#[derive(Debug, Copy, Clone, Default)]
+pub struct ProxmoxVmId(u64);
+
+impl Into<i32> for ProxmoxVmId {
+    fn into(self) -> i32 {
+        self.0 as i32 + 100
+    }
+}
+
+impl From<u64> for ProxmoxVmId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<i32> for ProxmoxVmId {
+    fn from(value: i32) -> Self {
+        Self(value as u64 - 100)
+    }
+}
+
+impl Display for ProxmoxVmId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let id: i32 = (*self).into();
+        write!(f, "{}", id)
+    }
+}
+
+impl Serialize for ProxmoxVmId {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let id: i32 = (*self).into();
+        serializer.serialize_i32(id)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProxmoxVmId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let id = i32::deserialize(deserializer)?;
+        Ok(id.into())
     }
 }
 
@@ -694,7 +883,7 @@ pub struct StorageContentEntry {
 pub struct ResizeDiskRequest {
     pub node: String,
     #[serde(rename = "vmid")]
-    pub vm_id: i32,
+    pub vm_id: ProxmoxVmId,
     pub disk: String,
     /// The new size.
     ///
@@ -706,7 +895,7 @@ pub struct ResizeDiskRequest {
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ImportDiskImageRequest {
     /// VM id
-    pub vm_id: i32,
+    pub vm_id: ProxmoxVmId,
     /// Node name
     pub node: String,
     /// Storage pool to import disk to
@@ -730,7 +919,7 @@ pub enum VmBios {
 pub struct CreateVm {
     pub node: String,
     #[serde(rename = "vmid")]
-    pub vm_id: i32,
+    pub vm_id: ProxmoxVmId,
     #[serde(flatten)]
     pub config: VmConfig,
 }
@@ -739,7 +928,7 @@ pub struct CreateVm {
 pub struct ConfigureVm {
     pub node: String,
     #[serde(rename = "vmid")]
-    pub vm_id: i32,
+    pub vm_id: ProxmoxVmId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

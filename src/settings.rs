@@ -1,7 +1,6 @@
 use crate::exchange::ExchangeRateService;
 use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
-use crate::provisioner::Provisioner;
 use crate::router::{MikrotikRouter, Router};
 use anyhow::{bail, Result};
 use lnvps_db::LNVpsDb;
@@ -103,7 +102,11 @@ pub enum NetworkAccessPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct NetworkPolicy {
+    /// Policy that determines how packets arrive at the VM
     pub access: NetworkAccessPolicy,
+
+    /// Use SLAAC for IPv6 allocation
+    pub ip6_slaac: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -133,6 +136,8 @@ pub enum ProvisionerConfig {
         qemu: QemuConfig,
         /// SSH config for issuing commands via CLI
         ssh: Option<SshConfig>,
+        /// MAC address prefix for NIC (eg. bc:24:11)
+        mac_prefix: Option<String>,
     },
 }
 
@@ -167,7 +172,7 @@ impl Settings {
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
         exchange: Arc<dyn ExchangeRateService>,
-    ) -> Arc<dyn Provisioner> {
+    ) -> Arc<LNVpsProvisioner> {
         Arc::new(LNVpsProvisioner::new(self.clone(), db, node, exchange))
     }
 
@@ -187,10 +192,7 @@ impl Settings {
     #[cfg(test)]
     pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
         if self.router.is_some() {
-            let router = crate::mocks::MockRouter {
-                policy: self.network_policy.clone(),
-                arp: Arc::new(Default::default()),
-            };
+            let router = crate::mocks::MockRouter::new(self.network_policy.clone());
             Ok(Some(Arc::new(router)))
         } else {
             Ok(None)

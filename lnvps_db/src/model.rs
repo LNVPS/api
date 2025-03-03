@@ -34,6 +34,16 @@ pub struct UserSshKey {
 /// The type of VM host
 pub enum VmHostKind {
     Proxmox = 0,
+    LibVirt = 1,
+}
+
+impl Display for VmHostKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmHostKind::Proxmox => write!(f, "proxmox"),
+            VmHostKind::LibVirt => write!(f, "libvirt"),
+        }
+    }
 }
 
 #[derive(FromRow, Clone, Debug)]

@@ -5,6 +5,7 @@ use lnvps::api;
 use lnvps::cors::CORS;
 use lnvps::exchange::{DefaultRateCache, ExchangeRateService};
 use lnvps::invoice::InvoiceHandler;
+use lnvps::lightning::get_node;
 use lnvps::settings::Settings;
 use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
@@ -17,7 +18,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use lnvps::lightning::get_node;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -38,13 +38,15 @@ async fn main() -> Result<(), Error> {
         .build()?
         .try_deserialize()?;
 
-    let db = Arc::new(LNVpsDbMysql::new(&settings.db).await?);
+    // Connect database and migrate
+    let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
     #[cfg(debug_assertions)]
     {
         let setup_script = include_str!("../../dev_setup.sql");
         db.execute(setup_script).await?;
     }
+    let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
@@ -61,8 +63,7 @@ async fn main() -> Result<(), Error> {
     let node = get_node(&settings).await?;
 
     let status = VmStateCache::new();
-    let provisioner =
-        settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
+    let provisioner = settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
     provisioner.init().await?;
 
     let mut worker = Worker::new(
@@ -121,7 +122,7 @@ async fn main() -> Result<(), Error> {
                 }
                 Err(e) => error!("Failed to fetch rates: {}", e),
             }
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(120)).await;
         }
     });
 
@@ -135,10 +136,11 @@ async fn main() -> Result<(), Error> {
 
     if let Err(e) = rocket::Rocket::custom(config)
         .attach(CORS)
-        .manage(db)
-        .manage(provisioner)
-        .manage(status)
-        .manage(exchange)
+        .manage(db.clone())
+        .manage(provisioner.clone())
+        .manage(status.clone())
+        .manage(exchange.clone())
+        .manage(settings.clone())
         .manage(sender)
         .mount("/", api::routes())
         .mount(

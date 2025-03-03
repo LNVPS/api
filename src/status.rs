@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[derive(Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, Default, JsonSchema, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum VmRunningState {
     Running,

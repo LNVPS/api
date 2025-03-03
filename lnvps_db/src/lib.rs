@@ -50,8 +50,11 @@ pub trait LNVpsDb: Sync + Send {
     /// Update host resources (usually from [auto_discover])
     async fn update_host(&self, host: &VmHost) -> Result<()>;
 
-    /// List VM's owned by a specific user
+    /// List enabled storage disks on the host
     async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>>;
+
+    /// Get a specific host disk
+    async fn get_host_disk(&self, disk_id: u64) -> Result<VmHostDisk>;
 
     /// Get OS image by id
     async fn get_os_image(&self, id: u64) -> Result<VmOsImage>;

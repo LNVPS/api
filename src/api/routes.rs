@@ -2,15 +2,17 @@ use crate::api::model::{
     AccountPatchRequest, ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
     ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
 };
+use crate::host::get_host_client;
 use crate::nip98::Nip98Auth;
-use crate::provisioner::Provisioner;
+use crate::provisioner::LNVpsProvisioner;
+use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
 use anyhow::{bail, Result};
+use futures::future::join_all;
 use lnvps_db::{IpRange, LNVpsDb};
 use log::{debug, error};
 use nostr::util::hex;
-use nostr_sdk::async_utility::futures_util::future::join_all;
 use rocket::futures::{Sink, SinkExt, StreamExt};
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, Responder, Route, State};
@@ -23,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use ws::Message;
 
@@ -87,7 +90,7 @@ impl OpenApiResponderInner for ApiError {
 #[patch("/api/v1/account", format = "json", data = "<req>")]
 async fn v1_patch_account(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
     req: Json<AccountPatchRequest>,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -107,7 +110,7 @@ async fn v1_patch_account(
 #[get("/api/v1/account")]
 async fn v1_get_account(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
 ) -> ApiResult<AccountPatchRequest> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
@@ -121,7 +124,7 @@ async fn v1_get_account(
 }
 
 async fn vm_to_status(
-    db: &Box<dyn LNVpsDb>,
+    db: &Arc<dyn LNVpsDb>,
     vm: lnvps_db::Vm,
     state: Option<VmState>,
 ) -> Result<ApiVmStatus> {
@@ -166,7 +169,7 @@ async fn vm_to_status(
 #[get("/api/v1/vm")]
 async fn v1_list_vms(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
     vm_state: &State<VmStateCache>,
 ) -> ApiResult<Vec<ApiVmStatus>> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -186,7 +189,7 @@ async fn v1_list_vms(
 #[get("/api/v1/vm/<id>")]
 async fn v1_get_vm(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
     vm_state: &State<VmStateCache>,
     id: u64,
 ) -> ApiResult<ApiVmStatus> {
@@ -204,8 +207,8 @@ async fn v1_get_vm(
 #[patch("/api/v1/vm/<id>", data = "<data>", format = "json")]
 async fn v1_patch_vm(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
     id: u64,
     data: Json<VMPatchRequest>,
 ) -> ApiResult<()> {
@@ -225,7 +228,10 @@ async fn v1_patch_vm(
     }
 
     db.update_vm(&vm).await?;
-    provisioner.patch_vm(vm.id).await?;
+
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, &settings.provisioner)?;
+    client.configure_vm(&vm).await?;
 
     ApiData::ok(())
 }
@@ -233,7 +239,7 @@ async fn v1_patch_vm(
 /// List available VM OS images
 #[openapi(tag = "Image")]
 #[get("/api/v1/image")]
-async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmOsImage>> {
+async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmOsImage>> {
     let images = db.list_os_image().await?;
     let ret = images
         .into_iter()
@@ -246,7 +252,7 @@ async fn v1_list_vm_images(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
 /// List available VM templates (Offers)
 #[openapi(tag = "Template")]
 #[get("/api/v1/vm/templates")]
-async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmTemplate>> {
+async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmTemplate>> {
     let templates = db.list_vm_templates().await?;
 
     let cost_plans: HashSet<u64> = templates.iter().map(|t| t.cost_plan_id).collect();
@@ -292,7 +298,7 @@ async fn v1_list_vm_templates(db: &State<Box<dyn LNVpsDb>>) -> ApiResult<Vec<Api
 #[get("/api/v1/ssh-key")]
 async fn v1_list_ssh_keys(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
 ) -> ApiResult<Vec<ApiUserSshKey>> {
     let uid = db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
     let ret = db
@@ -309,7 +315,7 @@ async fn v1_list_ssh_keys(
 #[post("/api/v1/ssh-key", data = "<req>", format = "json")]
 async fn v1_add_ssh_key(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
     req: Json<CreateSshKey>,
 ) -> ApiResult<ApiUserSshKey> {
     let uid = db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
@@ -342,8 +348,8 @@ async fn v1_add_ssh_key(
 #[post("/api/v1/vm", data = "<req>", format = "json")]
 async fn v1_create_vm_order(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    provisioner: &State<Arc<LNVpsProvisioner>>,
     req: Json<CreateVmRequest>,
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -361,8 +367,8 @@ async fn v1_create_vm_order(
 #[get("/api/v1/vm/<id>/renew")]
 async fn v1_renew_vm(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    provisioner: &State<Arc<LNVpsProvisioner>>,
     id: u64,
 ) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -381,8 +387,8 @@ async fn v1_renew_vm(
 #[patch("/api/v1/vm/<id>/start")]
 async fn v1_start_vm(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
     id: u64,
 ) -> ApiResult<()> {
@@ -392,8 +398,10 @@ async fn v1_start_vm(
     if uid != vm.user_id {
         return ApiData::err("VM does not belong to you");
     }
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, &settings.provisioner)?;
+    client.start_vm(&vm).await?;
 
-    provisioner.start_vm(id).await?;
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
 }
@@ -403,8 +411,8 @@ async fn v1_start_vm(
 #[patch("/api/v1/vm/<id>/stop")]
 async fn v1_stop_vm(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
     id: u64,
 ) -> ApiResult<()> {
@@ -415,7 +423,10 @@ async fn v1_stop_vm(
         return ApiData::err("VM does not belong to you");
     }
 
-    provisioner.stop_vm(id).await?;
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, &settings.provisioner)?;
+    client.stop_vm(&vm).await?;
+
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
 }
@@ -425,8 +436,8 @@ async fn v1_stop_vm(
 #[patch("/api/v1/vm/<id>/restart")]
 async fn v1_restart_vm(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
     id: u64,
 ) -> ApiResult<()> {
@@ -437,7 +448,10 @@ async fn v1_restart_vm(
         return ApiData::err("VM does not belong to you");
     }
 
-    provisioner.restart_vm(id).await?;
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, &settings.provisioner)?;
+    client.stop_vm(&vm).await?;
+
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
 }
@@ -447,7 +461,7 @@ async fn v1_restart_vm(
 #[get("/api/v1/payment/<id>")]
 async fn v1_get_payment(
     auth: Nip98Auth,
-    db: &State<Box<dyn LNVpsDb>>,
+    db: &State<Arc<dyn LNVpsDb>>,
     id: &str,
 ) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -470,10 +484,10 @@ async fn v1_get_payment(
 #[get("/api/v1/console/<id>?<auth>")]
 async fn v1_terminal_proxy(
     auth: &str,
-    db: &State<Box<dyn LNVpsDb>>,
-    provisioner: &State<Box<dyn Provisioner>>,
+    db: &State<Arc<dyn LNVpsDb>>,
+    _provisioner: &State<Arc<LNVpsProvisioner>>,
     id: u64,
-    ws: ws::WebSocket,
+    _ws: ws::WebSocket,
 ) -> Result<ws::Channel<'static>, &'static str> {
     let auth = Nip98Auth::from_base64(auth).map_err(|_| "Missing or invalid auth param")?;
     if auth.check(&format!("/api/v1/console/{id}"), "GET").is_err() {
@@ -486,89 +500,5 @@ async fn v1_terminal_proxy(
         return Err("VM does not belong to you");
     }
 
-    let ws_upstream = provisioner.terminal_proxy(vm.id).await.map_err(|e| {
-        error!("Failed to start terminal proxy: {}", e);
-        "Failed to open terminal proxy"
-    })?;
-    let ws = ws.config(Default::default());
-    Ok(ws.channel(move |stream| {
-        Box::pin(async move {
-            let (mut tx_upstream, mut rx_upstream) = ws_upstream.split();
-            let (mut tx_client, mut rx_client) = stream.split();
-
-            async fn process_client<S, E>(
-                msg: Result<Message, E>,
-                tx_upstream: &mut S,
-            ) -> Result<()>
-            where
-                S: SinkExt<Message> + Unpin,
-                <S as Sink<Message>>::Error: Display,
-                E: Display,
-            {
-                match msg {
-                    Ok(m) => {
-                        let m_up = match m {
-                            Message::Text(t) => Message::Text(format!("0:{}:{}", t.len(), t)),
-                            _ => panic!("todo"),
-                        };
-                        debug!("Sending data to upstream: {:?}", m_up);
-                        if let Err(e) = tx_upstream.send(m_up).await {
-                            bail!("Failed to send msg to upstream: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        bail!("Failed to read from client: {}", e);
-                    }
-                }
-                Ok(())
-            }
-
-            async fn process_upstream<S, E>(
-                msg: Result<Message, E>,
-                tx_client: &mut S,
-            ) -> Result<()>
-            where
-                S: SinkExt<Message> + Unpin,
-                <S as Sink<Message>>::Error: Display,
-                E: Display,
-            {
-                match msg {
-                    Ok(m) => {
-                        let m_down = match m {
-                            Message::Binary(data) => {
-                                Message::Text(String::from_utf8_lossy(&data).to_string())
-                            }
-                            _ => panic!("todo"),
-                        };
-                        debug!("Sending data to downstream: {:?}", m_down);
-                        if let Err(e) = tx_client.send(m_down).await {
-                            bail!("Failed to msg to client: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        bail!("Failed to read from upstream: {}", e);
-                    }
-                }
-                Ok(())
-            }
-
-            loop {
-                tokio::select! {
-                    Some(msg) = rx_client.next() => {
-                        if let Err(e) = process_client(msg, &mut tx_upstream).await {
-                            error!("{}", e);
-                            break;
-                        }
-                    },
-                    Some(msg) = rx_upstream.next() => {
-                        if let Err(e) = process_upstream(msg, &mut tx_client).await {
-                            error!("{}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-    }))
+    Err("Not implemented")
 }

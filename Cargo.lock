@@ -2027,6 +2027,7 @@ dependencies = [
  "nostr-sdk",
  "pretty_env_logger",
  "rand 0.9.0",
+ "regex",
  "reqwest",
  "rocket",
  "rocket_okapi",
@@ -2039,6 +2040,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.21.0",
  "urlencoding",
+ "virt",
 ]
 
 [[package]]
@@ -4620,6 +4622,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "uuid"
+version = "1.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0f540e3240398cce6128b64ba83fdbdd86129c16a3aa1a3a252efd66eb3d587"
+
+[[package]]
 name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4636,6 +4644,27 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virt"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77a05f77c836efa9be343b5419663cf829d75203b813579993cdd9c44f51767e"
+dependencies = [
+ "libc",
+ "uuid",
+ "virt-sys",
+]
+
+[[package]]
+name = "virt-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c504e459878f09177f41bf2f8bb3e9a8af4fca7a09e73152fee02535d501601c"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "want"

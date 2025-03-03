@@ -1,6 +1,8 @@
+use crate::host::{CreateVmRequest, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
+use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
@@ -12,14 +14,16 @@ use lnvps_db::{
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct MockDb {
     pub regions: Arc<Mutex<HashMap<u64, VmHostRegion>>>,
     pub hosts: Arc<Mutex<HashMap<u64, VmHost>>>,
+    pub host_disks: Arc<Mutex<HashMap<u64, VmHostDisk>>>,
     pub users: Arc<Mutex<HashMap<u64, User>>>,
+    pub user_ssh_keys: Arc<Mutex<HashMap<u64, UserSshKey>>>,
     pub cost_plans: Arc<Mutex<HashMap<u64, VmCostPlan>>>,
     pub os_images: Arc<Mutex<HashMap<u64, VmOsImage>>>,
     pub templates: Arc<Mutex<HashMap<u64, VmTemplate>>>,
@@ -38,6 +42,9 @@ impl MockDb {
 
 impl Default for MockDb {
     fn default() -> Self {
+        const GB: u64 = 1024 * 1024 * 1024;
+        const TB: u64 = GB * 1024;
+
         let mut regions = HashMap::new();
         regions.insert(
             1,
@@ -52,8 +59,8 @@ impl Default for MockDb {
             1,
             IpRange {
                 id: 1,
-                cidr: "10.0.0.0/8".to_string(),
-                gateway: "10.0.0.1".to_string(),
+                cidr: "10.0.0.0/24".to_string(),
+                gateway: "10.0.0.1/8".to_string(),
                 enabled: true,
                 region_id: 1,
             },
@@ -71,6 +78,19 @@ impl Default for MockDb {
                 memory: 8192,
                 enabled: true,
                 api_token: "".to_string(),
+            },
+        );
+        let mut host_disks = HashMap::new();
+        host_disks.insert(
+            1,
+            VmHostDisk {
+                id: 1,
+                host_id: 1,
+                name: "mock-disk".to_string(),
+                size: TB * 10,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                enabled: true,
             },
         );
         let mut cost_plans = HashMap::new();
@@ -96,8 +116,8 @@ impl Default for MockDb {
                 created: Utc::now(),
                 expires: None,
                 cpu: 2,
-                memory: 1024 * 1024 * 1024 * 2,
-                disk_size: 1024 * 1024 * 1024 * 64,
+                memory: GB * 2,
+                disk_size: GB * 64,
                 disk_type: DiskType::SSD,
                 disk_interface: DiskInterface::PCIe,
                 cost_plan_id: 1,
@@ -121,12 +141,14 @@ impl Default for MockDb {
             regions: Arc::new(Mutex::new(regions)),
             ip_range: Arc::new(Mutex::new(ip_ranges)),
             hosts: Arc::new(Mutex::new(hosts)),
+            host_disks: Arc::new(Mutex::new(host_disks)),
             cost_plans: Arc::new(Mutex::new(cost_plans)),
             templates: Arc::new(Mutex::new(templates)),
             os_images: Arc::new(Mutex::new(os_images)),
             users: Arc::new(Default::default()),
             vms: Arc::new(Default::default()),
             ip_assignments: Arc::new(Default::default()),
+            user_ssh_keys: Arc::new(Mutex::new(Default::default())),
         }
     }
 }
@@ -182,19 +204,39 @@ impl LNVpsDb for MockDb {
     }
 
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> anyhow::Result<u64> {
-        todo!()
+        let mut ssh_keys = self.user_ssh_keys.lock().await;
+        let max_keys = *ssh_keys.keys().max().unwrap_or(&0);
+        ssh_keys.insert(
+            max_keys + 1,
+            UserSshKey {
+                id: max_keys + 1,
+                name: new_key.name.clone(),
+                user_id: new_key.user_id,
+                created: Utc::now(),
+                key_data: new_key.key_data.clone(),
+            },
+        );
+        Ok(max_keys + 1)
     }
 
     async fn get_user_ssh_key(&self, id: u64) -> anyhow::Result<UserSshKey> {
-        todo!()
+        let keys = self.user_ssh_keys.lock().await;
+        Ok(keys.get(&id).ok_or(anyhow!("no key"))?.clone())
     }
 
     async fn delete_user_ssh_key(&self, id: u64) -> anyhow::Result<()> {
-        todo!()
+        let mut keys = self.user_ssh_keys.lock().await;
+        keys.remove(&id);
+        Ok(())
     }
 
     async fn list_user_ssh_key(&self, user_id: u64) -> anyhow::Result<Vec<UserSshKey>> {
-        todo!()
+        let keys = self.user_ssh_keys.lock().await;
+        Ok(keys
+            .values()
+            .filter(|u| u.user_id == user_id)
+            .cloned()
+            .collect())
     }
 
     async fn get_host_region(&self, id: u64) -> anyhow::Result<VmHostRegion> {
@@ -223,7 +265,13 @@ impl LNVpsDb for MockDb {
     }
 
     async fn list_host_disks(&self, host_id: u64) -> anyhow::Result<Vec<VmHostDisk>> {
-        todo!()
+        let disks = self.host_disks.lock().await;
+        Ok(disks.values().filter(|d| d.enabled).cloned().collect())
+    }
+
+    async fn get_host_disk(&self, disk_id: u64) -> anyhow::Result<VmHostDisk> {
+        let disks = self.host_disks.lock().await;
+        Ok(disks.get(&disk_id).ok_or(anyhow!("no disk"))?.clone())
     }
 
     async fn get_os_image(&self, id: u64) -> anyhow::Result<VmOsImage> {
@@ -305,7 +353,31 @@ impl LNVpsDb for MockDb {
     async fn insert_vm(&self, vm: &Vm) -> anyhow::Result<u64> {
         let mut vms = self.vms.lock().await;
         let max_id = *vms.keys().max().unwrap_or(&0);
-        vms.insert(max_id + 1, vm.clone());
+
+        // lazy test FK
+        self.get_host(vm.host_id).await?;
+        self.get_user(vm.user_id).await?;
+        self.get_os_image(vm.image_id).await?;
+        self.get_vm_template(vm.template_id).await?;
+        self.get_user_ssh_key(vm.ssh_key_id).await?;
+        self.get_host_disk(vm.disk_id).await?;
+
+        vms.insert(
+            max_id + 1,
+            Vm {
+                id: max_id + 1,
+                host_id: vm.host_id,
+                user_id: vm.user_id,
+                image_id: vm.image_id,
+                template_id: vm.template_id,
+                ssh_key_id: vm.ssh_key_id,
+                created: Utc::now(),
+                expires: Utc::now(),
+                disk_id: vm.disk_id,
+                mac_address: vm.mac_address.clone(),
+                deleted: false,
+            },
+        );
         Ok(max_id + 1)
     }
 
@@ -398,9 +470,20 @@ impl LNVpsDb for MockDb {
 #[derive(Debug, Clone)]
 pub struct MockRouter {
     pub policy: NetworkPolicy,
-    pub arp: Arc<Mutex<HashMap<String, ArpEntry>>>,
+    arp: Arc<Mutex<HashMap<u64, ArpEntry>>>,
 }
 
+impl MockRouter {
+    pub fn new(policy: NetworkPolicy) -> Self {
+        static ARP: LazyLock<Arc<Mutex<HashMap<u64, ArpEntry>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+        Self {
+            policy,
+            arp: ARP.clone(),
+        }
+    }
+}
 #[async_trait]
 impl Router for MockRouter {
     async fn list_arp_entry(&self) -> anyhow::Result<Vec<ArpEntry>> {
@@ -419,12 +502,13 @@ impl Router for MockRouter {
         if arp.iter().any(|(k, v)| v.address == ip.to_string()) {
             bail!("Address is already in use");
         }
+        let max_id = *arp.keys().max().unwrap_or(&0);
         arp.insert(
-            mac.to_string(),
+            max_id + 1,
             ArpEntry {
-                id: Some(mac.to_string()),
+                id: Some((max_id + 1).to_string()),
                 address: ip.to_string(),
-                mac_address: None,
+                mac_address: Some(mac.to_string()),
                 interface: interface.to_string(),
                 comment: comment.map(|s| s.to_string()),
             },
@@ -434,7 +518,7 @@ impl Router for MockRouter {
 
     async fn remove_arp_entry(&self, id: &str) -> anyhow::Result<()> {
         let mut arp = self.arp.lock().await;
-        arp.remove(id);
+        arp.remove(&id.parse::<u64>()?);
         Ok(())
     }
 }
@@ -462,5 +546,90 @@ impl LightningNode for MockNode {
         from_payment_hash: Option<Vec<u8>>,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = InvoiceUpdate> + Send>>> {
         todo!()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MockVmHost {
+    vms: Arc<Mutex<HashMap<u64, MockVm>>>,
+}
+
+#[derive(Debug, Clone)]
+struct MockVm {
+    pub state: VmRunningState,
+}
+
+#[async_trait]
+impl VmHostClient for MockVmHost {
+    async fn download_os_image(&self, image: &VmOsImage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn generate_mac(&self, vm: &Vm) -> anyhow::Result<String> {
+        Ok(format!(
+            "ff:ff:ff:{}:{}:{}",
+            hex::encode([rand::random::<u8>()]),
+            hex::encode([rand::random::<u8>()]),
+            hex::encode([rand::random::<u8>()]),
+        ))
+    }
+
+    async fn start_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(mut vm) = vms.get_mut(&vm.id) {
+            vm.state = VmRunningState::Running;
+        }
+        Ok(())
+    }
+
+    async fn stop_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(mut vm) = vms.get_mut(&vm.id) {
+            vm.state = VmRunningState::Stopped;
+        }
+        Ok(())
+    }
+
+    async fn reset_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(mut vm) = vms.get_mut(&vm.id) {
+            vm.state = VmRunningState::Running;
+        }
+        Ok(())
+    }
+
+    async fn create_vm(&self, cfg: &CreateVmRequest) -> anyhow::Result<()> {
+        let mut vms = self.vms.lock().await;
+        let max_id = *vms.keys().max().unwrap_or(&0);
+        vms.insert(
+            max_id + 1,
+            MockVm {
+                state: VmRunningState::Stopped,
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmState> {
+        let vms = self.vms.lock().await;
+        if let Some(vm) = vms.get(&vm.id) {
+            Ok(VmState {
+                timestamp: Utc::now().timestamp() as u64,
+                state: vm.state.clone(),
+                cpu_usage: 69.0,
+                mem_usage: 69.0,
+                uptime: 100,
+                net_in: 69,
+                net_out: 69,
+                disk_write: 69,
+                disk_read: 69,
+            })
+        } else {
+            bail!("No vm with id {}", vm.id)
+        }
+    }
+
+    async fn configure_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+        Ok(())
     }
 }

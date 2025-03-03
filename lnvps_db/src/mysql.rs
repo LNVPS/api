@@ -140,9 +140,17 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>> {
-        sqlx::query_as("select * from vm_host_disk where host_id = ?")
+        sqlx::query_as("select * from vm_host_disk where host_id = ? and enabled = 1")
             .bind(host_id)
             .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_host_disk(&self, disk_id: u64) -> Result<VmHostDisk> {
+        sqlx::query_as("select * from vm_host_disk where id = ?")
+            .bind(disk_id)
+            .fetch_one(&self.db)
             .await
             .map_err(Error::new)
     }

@@ -1,29 +1,25 @@
 use crate::exchange::{ExchangeRateService, Ticker};
-use crate::host::get_host_client;
-use crate::host::proxmox::{
-    ConfigureVm, CreateVm, DownloadUrlRequest, ImportDiskImageRequest, ProxmoxClient,
-    ResizeDiskRequest, StorageContent, VmConfig,
-};
+use crate::host::{get_host_client, CreateVmRequest, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{NetworkProvisioner, Provisioner, ProvisionerMethod};
+use crate::provisioner::{NetworkProvisioner, ProvisionerMethod};
 use crate::router::Router;
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
 use fedimint_tonic_lnd::tonic::async_trait;
-use lnvps_db::{DiskType, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
+use futures::future::join_all;
+use lnvps_db::{DiskType, IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
 use log::{debug, info, warn};
 use nostr::util::hex;
 use rand::random;
 use rocket::futures::{SinkExt, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Main provisioner class for LNVPS
 ///
@@ -58,16 +54,24 @@ impl LNVpsProvisioner {
         }
     }
 
-    async fn get_iso_storage(node: &str, client: &ProxmoxClient) -> Result<String> {
-        let storages = client.list_storage(node).await?;
-        if let Some(s) = storages
-            .iter()
-            .find(|s| s.contents().contains(&StorageContent::ISO))
-        {
-            Ok(s.storage.clone())
-        } else {
-            bail!("No image storage found");
+    async fn delete_ip_assignment(&self, vm: &Vm) -> Result<()> {
+        if let NetworkAccessPolicy::StaticArp { .. } = &self.network_policy.access {
+            if let Some(r) = self.router.as_ref() {
+                let ent = r.list_arp_entry().await?;
+                if let Some(ent) = ent.iter().find(|e| {
+                    e.mac_address
+                        .as_ref()
+                        .map(|m| m.eq_ignore_ascii_case(&vm.mac_address))
+                        .unwrap_or(false)
+                }) {
+                    r.remove_arp_entry(ent.id.as_ref().unwrap().as_str())
+                        .await?;
+                } else {
+                    warn!("ARP entry not found, skipping")
+                }
+            }
         }
+        Ok(())
     }
 
     async fn save_ip_assignment(&self, vm: &Vm, assignment: &VmIpAssignment) -> Result<()> {
@@ -90,44 +94,55 @@ impl LNVpsProvisioner {
         self.db.insert_vm_ip_assignment(assignment).await?;
         Ok(())
     }
-}
 
-#[async_trait]
-impl Provisioner for LNVpsProvisioner {
-    async fn init(&self) -> Result<()> {
-        // tell hosts to download images
+    async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
+        if !existing_ips.is_empty() {
+            return Ok(existing_ips);
+        }
+
+        // Use random network provisioner
+        let network = NetworkProvisioner::new(ProvisionerMethod::Random, self.db.clone());
+
+        let template = self.db.get_vm_template(vm.template_id).await?;
+        let ip = network.pick_ip_for_region(template.region_id).await?;
+        let assignment = VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id: ip.range_id,
+            ip: ip.ip.to_string(),
+            deleted: false,
+        };
+
+        self.save_ip_assignment(&vm, &assignment).await?;
+        Ok(vec![assignment])
+    }
+
+    /// Do any necessary initialization
+    pub async fn init(&self) -> Result<()> {
         let hosts = self.db.list_hosts().await?;
+        let images = self.db.list_os_image().await?;
         for host in hosts {
             let client = get_host_client(&host, &self.provisioner_config)?;
-            let iso_storage = Self::get_iso_storage(&host.name, &client).await?;
-            let files = client.list_storage_files(&host.name, &iso_storage).await?;
-
-            for image in self.db.list_os_image().await? {
-                info!("Downloading image {} on {}", image.url, host.name);
-                let i_name = image.filename()?;
-                if files
-                    .iter()
-                    .any(|v| v.vol_id.ends_with(&format!("iso/{i_name}")))
-                {
-                    info!("Already downloaded, skipping");
-                    continue;
+            for image in &images {
+                if let Err(e) = client.download_os_image(image).await {
+                    warn!(
+                        "Error downloading image {} on {}: {}",
+                        image.url, host.name, e
+                    );
                 }
-                let t_download = client
-                    .download_image(DownloadUrlRequest {
-                        content: StorageContent::ISO,
-                        node: host.name.clone(),
-                        storage: iso_storage.clone(),
-                        url: image.url.clone(),
-                        filename: i_name,
-                    })
-                    .await?;
-                client.wait_for_task(&t_download).await?;
             }
         }
         Ok(())
     }
 
-    async fn provision(
+    /// Provision a new VM for a user on the database
+    ///
+    /// Note:
+    /// 1. Does not create a VM on the host machine
+    /// 2. Does not assign any IP resources
+    pub async fn provision(
         &self,
         user_id: u64,
         template_id: u64,
@@ -146,6 +161,7 @@ impl Provisioner for LNVpsProvisioner {
         } else {
             bail!("No host found")
         };
+        // TODO: impl resource usage based provisioning (disk)
         let host_disks = self.db.list_host_disks(pick_host.id).await?;
         let pick_disk = if let Some(hd) = host_disks.first() {
             hd
@@ -153,6 +169,7 @@ impl Provisioner for LNVpsProvisioner {
             bail!("No host disk found")
         };
 
+        let client = get_host_client(&pick_host, &self.provisioner_config)?;
         let mut new_vm = Vm {
             host_id: pick_host.id,
             user_id: user.id,
@@ -162,21 +179,19 @@ impl Provisioner for LNVpsProvisioner {
             created: Utc::now(),
             expires: Utc::now(),
             disk_id: pick_disk.id,
-            mac_address: format!(
-                "bc:24:11:{}:{}:{}",
-                hex::encode([random::<u8>()]),
-                hex::encode([random::<u8>()]),
-                hex::encode([random::<u8>()])
-            ),
             ..Default::default()
         };
+
+        // ask host client to generate the mac address
+        new_vm.mac_address = client.generate_mac(&new_vm).await?;
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
         Ok(new_vm)
     }
 
-    async fn renew(&self, vm_id: u64) -> Result<VmPayment> {
+    /// Create a renewal payment
+    pub async fn renew(&self, vm_id: u64) -> Result<VmPayment> {
         let vm = self.db.get_vm(vm_id).await?;
         let template = self.db.get_vm_template(vm.template_id).await?;
         let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
@@ -239,212 +254,70 @@ impl Provisioner for LNVpsProvisioner {
         Ok(vm_payment)
     }
 
-    async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        let vm = self.db.get_vm(vm_id).await?;
-        let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
-        if !existing_ips.is_empty() {
-            return Ok(existing_ips);
-        }
-
-        // Use random network provisioner
-        let prov = NetworkProvisioner::new(ProvisionerMethod::Random, self.db.clone());
-
-        let template = self.db.get_vm_template(vm.template_id).await?;
-        let ip = prov.pick_ip_for_region(template.region_id).await?;
-        let assignment = VmIpAssignment {
-            id: 0,
-            vm_id,
-            ip_range_id: ip.range_id,
-            ip: ip.ip.to_string(),
-            deleted: false,
-        };
-
-        self.save_ip_assignment(&vm, &assignment).await?;
-        Ok(vec![assignment])
-    }
-
     /// Create a vm on the host as configured by the template
-    async fn spawn_vm(&self, vm_id: u64) -> Result<()> {
+    pub async fn spawn_vm(&self, vm_id: u64) -> Result<()> {
         if self.read_only {
             bail!("Cant spawn VM's in read-only mode")
         }
         let vm = self.db.get_vm(vm_id).await?;
         let template = self.db.get_vm_template(vm.template_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, &self.provisioner_config)?;
         let image = self.db.get_os_image(vm.image_id).await?;
+        let disk = self.db.get_host_disk(vm.disk_id).await?;
+        let ssh_key = self.db.get_user_ssh_key(vm.ssh_key_id).await?;
 
-        // TODO: remove +100 nonsense (proxmox specific)
-        let vm_id = 100 + vm.id as i32;
+        let client = get_host_client(&host, &self.provisioner_config)?;
 
         // setup network by allocating some IP space
         let ips = self.allocate_ips(vm.id).await?;
 
+        let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
+        let ip_ranges: Vec<_> = ip_range_ids
+            .iter()
+            .map(|i| self.db.get_ip_range(*i))
+            .collect();
+        let ranges: Vec<IpRange> = join_all(ip_ranges)
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect();
+
         // create VM
-        let config = client.make_vm_config(&self.db, &vm, &ips).await?;
-        let t_create = client
-            .create_vm(CreateVm {
-                node: host.name.clone(),
-                vm_id,
-                config,
-            })
-            .await?;
-        client.wait_for_task(&t_create).await?;
-
-        // TODO: pick disk based on available space
-        // TODO: build external module to manage picking disks
-        // pick disk
-        let drives = self.db.list_host_disks(vm.host_id).await?;
-        let drive = if let Some(d) = drives.iter().find(|d| d.enabled) {
-            d
-        } else {
-            bail!("No host drive found!")
+        let req = CreateVmRequest {
+            vm,
+            template,
+            image,
+            ips,
+            disk,
+            ranges,
+            ssh_key,
         };
-
-        // TODO: remove scsi0 terms (proxmox specific)
-        // import primary disk from image (scsi0)?
-        client
-            .import_disk_image(ImportDiskImageRequest {
-                vm_id,
-                node: host.name.clone(),
-                storage: drive.name.clone(),
-                disk: "scsi0".to_string(),
-                image: image.filename()?,
-                is_ssd: matches!(drive.kind, DiskType::SSD),
-            })
-            .await?;
-
-        // TODO: remove scsi0 terms (proxmox specific)
-        // resize disk to match template
-        let j_resize = client
-            .resize_disk(ResizeDiskRequest {
-                node: host.name.clone(),
-                vm_id,
-                disk: "scsi0".to_string(),
-                size: template.disk_size.to_string(),
-            })
-            .await?;
-        client.wait_for_task(&j_resize).await?;
-
-        // try start, otherwise ignore error (maybe its already running)
-        if let Ok(j_start) = client.start_vm(&host.name, vm_id as u64).await {
-            client.wait_for_task(&j_start).await?;
-        }
+        client.create_vm(&req).await?;
 
         Ok(())
     }
 
-    async fn start_vm(&self, vm_id: u64) -> Result<()> {
+    /// Delete a VM and its associated resources
+    pub async fn delete_vm(&self, vm_id: u64) -> Result<()> {
         let vm = self.db.get_vm(vm_id).await?;
-        let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
-        let j_start = client.start_vm(&host.name, vm.id + 100).await?;
-        client.wait_for_task(&j_start).await?;
-        Ok(())
-    }
+        // host client currently doesn't support delete (proxmox)
+        // VM should already be stopped by [Worker]
 
-    async fn stop_vm(&self, vm_id: u64) -> Result<()> {
-        let vm = self.db.get_vm(vm_id).await?;
-        let host = self.db.get_host(vm.host_id).await?;
-
-        let client = get_host_client(&host, &self.provisioner_config)?;
-        let j_start = client.shutdown_vm(&host.name, vm.id + 100).await?;
-        client.wait_for_task(&j_start).await?;
-
-        Ok(())
-    }
-
-    async fn restart_vm(&self, vm_id: u64) -> Result<()> {
-        let vm = self.db.get_vm(vm_id).await?;
-        let host = self.db.get_host(vm.host_id).await?;
-
-        let client = get_host_client(&host, &self.provisioner_config)?;
-        let j_start = client.reset_vm(&host.name, vm.id + 100).await?;
-        client.wait_for_task(&j_start).await?;
-
-        Ok(())
-    }
-
-    async fn delete_vm(&self, vm_id: u64) -> Result<()> {
-        let vm = self.db.get_vm(vm_id).await?;
-        //let host = self.db.get_host(vm.host_id).await?;
-
-        // TODO: delete not implemented, stop only
-        //let client = get_host_client(&host)?;
-        //let j_start = client.delete_vm(&host.name, vm.id + 100).await?;
-        //let j_stop = client.stop_vm(&host.name, vm.id + 100).await?;
-        //client.wait_for_task(&j_stop).await?;
-
-        if let Some(r) = self.router.as_ref() {
-            let ent = r.list_arp_entry().await?;
-            if let Some(ent) = ent.iter().find(|e| {
-                e.mac_address
-                    .as_ref()
-                    .map(|m| m.eq_ignore_ascii_case(&vm.mac_address))
-                    .unwrap_or(false)
-            }) {
-                r.remove_arp_entry(ent.id.as_ref().unwrap().as_str())
-                    .await?;
-            } else {
-                warn!("ARP entry not found, skipping")
-            }
-        }
-
+        self.delete_ip_assignment(&vm).await?;
         self.db.delete_vm_ip_assignment(vm.id).await?;
         self.db.delete_vm(vm.id).await?;
 
         Ok(())
     }
 
-    async fn terminal_proxy(
-        &self,
-        vm_id: u64,
-    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    /// Stop a running VM
+    pub async fn stop_vm(&self, vm_id: u64) -> Result<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
+
         let client = get_host_client(&host, &self.provisioner_config)?;
-
-        let host_vm_id = vm.id + 100;
-        let term = client.terminal_proxy(&host.name, host_vm_id).await?;
-
-        let login_msg = format!("{}:{}\n", term.user, term.ticket);
-        let mut ws = client
-            .open_terminal_proxy(&host.name, host_vm_id, term)
-            .await?;
-        debug!("Sending login msg: {}", login_msg);
-        ws.send(Message::Text(login_msg)).await?;
-        if let Some(n) = ws.next().await {
-            debug!("{:?}", n);
-        } else {
-            bail!("No response from terminal_proxy");
-        }
-        ws.send(Message::Text("1:86:24:".to_string())).await?;
-        Ok(ws)
-    }
-
-    async fn patch_vm(&self, vm_id: u64) -> Result<()> {
-        let vm = self.db.get_vm(vm_id).await?;
-        let host = self.db.get_host(vm.host_id).await?;
-        let ips = self.db.list_vm_ip_assignments(vm.id).await?;
-        let client = get_host_client(&host, &self.provisioner_config)?;
-        let host_vm_id = vm.id + 100;
-
-        let t = client
-            .configure_vm(ConfigureVm {
-                node: host.name.clone(),
-                vm_id: host_vm_id as i32,
-                current: None,
-                snapshot: None,
-                config: VmConfig {
-                    scsi_0: None,
-                    scsi_1: None,
-                    efi_disk_0: None,
-                    ..client.make_vm_config(&self.db, &vm, &ips).await?
-                },
-            })
-            .await?;
-        client.wait_for_task(&t).await?;
+        client.stop_vm(&vm).await?;
         Ok(())
     }
 }
@@ -457,10 +330,12 @@ mod tests {
     use crate::settings::{
         ApiConfig, Credentials, LndConfig, ProvisionerConfig, QemuConfig, RouterConfig,
     };
+    use lnvps_db::UserSshKey;
 
-    #[ignore]
     #[tokio::test]
     async fn test_basic_provisioner() -> Result<()> {
+        const ROUTER_BRIDGE: &str = "bridge1";
+
         let settings = Settings {
             listen: None,
             db: "".to_string(),
@@ -473,18 +348,20 @@ mod tests {
             provisioner: ProvisionerConfig::Proxmox {
                 qemu: QemuConfig {
                     machine: "q35".to_string(),
-                    os_type: "linux26".to_string(),
+                    os_type: "l26".to_string(),
                     bridge: "vmbr1".to_string(),
                     cpu: "kvm64".to_string(),
                     vlan: None,
                     kvm: false,
                 },
                 ssh: None,
+                mac_prefix: Some("ff:ff:ff".to_string()),
             },
             network_policy: NetworkPolicy {
                 access: NetworkAccessPolicy::StaticArp {
-                    interface: "bridge1".to_string(),
+                    interface: ROUTER_BRIDGE.to_string(),
                 },
+                ip6_slaac: None,
             },
             delete_after: 0,
             smtp: None,
@@ -502,24 +379,45 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(DefaultRateCache::default());
+        let router = settings.get_router().expect("router").unwrap();
         let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
 
-        let vm = db
-            .insert_vm(&Vm {
-                id: 1,
-                host_id: 1,
-                user_id: 1,
-                image_id: 1,
-                template_id: 1,
-                ssh_key_id: 1,
-                created: Utc::now(),
-                expires: Utc::now() + Duration::from_secs(30),
-                disk_id: 1,
-                mac_address: "00:00:00:00:00:00".to_string(),
-                deleted: false,
-            })
-            .await?;
-        provisioner.spawn_vm(1).await?;
+        let pubkey: [u8; 32] = random();
+
+        let user_id = db.upsert_user(&pubkey).await?;
+        let new_key = UserSshKey {
+            id: 0,
+            name: "test-key".to_string(),
+            user_id,
+            created: Default::default(),
+            key_data: "ssh-rsa AAA==".to_string(),
+        };
+        let ssh_key = db.insert_user_ssh_key(&new_key).await?;
+
+        let vm = provisioner.provision(user_id, 1, 1, ssh_key).await?;
+        println!("{:?}", vm);
+        provisioner.spawn_vm(vm.id).await?;
+
+        // check resources
+        let arp = router.list_arp_entry().await?;
+        assert_eq!(1, arp.len());
+        let arp = arp.first().unwrap();
+        assert_eq!(&vm.mac_address, arp.mac_address.as_ref().unwrap());
+        assert_eq!(ROUTER_BRIDGE, &arp.interface);
+        println!("{:?}", arp);
+
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        assert_eq!(1, ips.len());
+        let ip = ips.first().unwrap();
+        assert_eq!(ip.ip, arp.address);
+        assert_eq!(ip.ip_range_id, 1);
+        assert_eq!(ip.vm_id, vm.id);
+
+        // assert IP address is not CIDR
+        assert!(IpAddr::from_str(&ip.ip).is_ok());
+        assert!(!ip.ip.ends_with("/8"));
+        assert!(!ip.ip.ends_with("/24"));
+
         Ok(())
     }
 }
