@@ -1,4 +1,5 @@
 use crate::host::{CreateVmRequest, VmHostClient};
+use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use crate::status::{VmRunningState, VmState};
@@ -9,6 +10,7 @@ use ipnetwork::IpNetwork;
 use lnvps_db::{async_trait, DiskType, IpRange, LNVpsDb, Vm, VmIpAssignment, VmOsImage};
 use log::{debug, info};
 use rand::random;
+use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::{ClientBuilder, Method, Url};
 use serde::de::value::I32Deserializer;
 use serde::de::DeserializeOwned;
@@ -25,9 +27,7 @@ use tokio_tungstenite::tungstenite::handshake::client::{generate_key, Request};
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 pub struct ProxmoxClient {
-    base: Url,
-    token: String,
-    client: reqwest::Client,
+    api: JsonApi,
     config: QemuConfig,
     ssh: Option<SshConfig>,
     mac_prefix: String,
@@ -38,19 +38,24 @@ impl ProxmoxClient {
     pub fn new(
         base: Url,
         node: &str,
+        token: &str,
         mac_prefix: Option<String>,
         config: QemuConfig,
         ssh: Option<SshConfig>,
     ) -> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("PVEAPIToken={}", token).parse().unwrap(),
+        );
         let client = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
+            .default_headers(headers)
             .build()
             .expect("Failed to build client");
 
         Self {
-            base,
-            token: String::new(),
-            client,
+            api: JsonApi { base, client },
             config,
             ssh,
             node: node.to_string(),
@@ -58,25 +63,21 @@ impl ProxmoxClient {
         }
     }
 
-    pub fn with_api_token(mut self, token: &str) -> Self {
-        self.token = token.to_string();
-        self
-    }
-
     /// Get version info
     pub async fn version(&self) -> Result<VersionResponse> {
-        let rsp: ResponseBase<VersionResponse> = self.get("/api2/json/version").await?;
+        let rsp: ResponseBase<VersionResponse> = self.api.get("/api2/json/version").await?;
         Ok(rsp.data)
     }
 
     /// List nodes
     pub async fn list_nodes(&self) -> Result<Vec<NodeResponse>> {
-        let rsp: ResponseBase<Vec<NodeResponse>> = self.get("/api2/json/nodes").await?;
+        let rsp: ResponseBase<Vec<NodeResponse>> = self.api.get("/api2/json/nodes").await?;
         Ok(rsp.data)
     }
 
     pub async fn get_vm_status(&self, node: &str, vm_id: ProxmoxVmId) -> Result<VmInfo> {
         let rsp: ResponseBase<VmInfo> = self
+            .api
             .get(&format!(
                 "/api2/json/nodes/{node}/qemu/{vm_id}/status/current"
             ))
@@ -85,13 +86,16 @@ impl ProxmoxClient {
     }
 
     pub async fn list_vms(&self, node: &str) -> Result<Vec<VmInfo>> {
-        let rsp: ResponseBase<Vec<VmInfo>> =
-            self.get(&format!("/api2/json/nodes/{node}/qemu")).await?;
+        let rsp: ResponseBase<Vec<VmInfo>> = self
+            .api
+            .get(&format!("/api2/json/nodes/{node}/qemu"))
+            .await?;
         Ok(rsp.data)
     }
 
     pub async fn list_storage(&self, node: &str) -> Result<Vec<NodeStorage>> {
         let rsp: ResponseBase<Vec<NodeStorage>> = self
+            .api
             .get(&format!("/api2/json/nodes/{node}/storage"))
             .await?;
         Ok(rsp.data)
@@ -104,6 +108,7 @@ impl ProxmoxClient {
         storage: &str,
     ) -> Result<Vec<StorageContentEntry>> {
         let rsp: ResponseBase<Vec<StorageContentEntry>> = self
+            .api
             .get(&format!(
                 "/api2/json/nodes/{node}/storage/{storage}/content"
             ))
@@ -116,6 +121,7 @@ impl ProxmoxClient {
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
     pub async fn create_vm(&self, req: CreateVm) -> Result<TaskId> {
         let rsp: ResponseBase<Option<String>> = self
+            .api
             .post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
             .await?;
         if let Some(id) = rsp.data {
@@ -130,6 +136,7 @@ impl ProxmoxClient {
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
     pub async fn configure_vm(&self, req: ConfigureVm) -> Result<TaskId> {
         let rsp: ResponseBase<Option<String>> = self
+            .api
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/config", req.node, req.vm_id),
                 &req,
@@ -147,6 +154,7 @@ impl ProxmoxClient {
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
     pub async fn delete_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<Option<String>> = self
+            .api
             .req(
                 Method::DELETE,
                 &format!("/api2/json/nodes/{node}/qemu/{vm}"),
@@ -168,6 +176,7 @@ impl ProxmoxClient {
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/tasks/{upid}/status
     pub async fn get_task_status(&self, task: &TaskId) -> Result<TaskStatus> {
         let rsp: ResponseBase<TaskStatus> = self
+            .api
             .get(&format!(
                 "/api2/json/nodes/{}/tasks/{}/status",
                 task.node, task.id
@@ -209,6 +218,7 @@ impl ProxmoxClient {
     /// Download an image to the host disk
     pub async fn download_image(&self, req: DownloadUrlRequest) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
+            .api
             .post(
                 &format!(
                     "/api2/json/nodes/{}/storage/{}/download-url",
@@ -229,7 +239,7 @@ impl ProxmoxClient {
         if let Some(ssh_config) = &self.ssh {
             let mut ses = SshClient::new()?;
             ses.connect(
-                (self.base.host().unwrap().to_string(), 22),
+                (self.api.base.host().unwrap().to_string(), 22),
                 &ssh_config.user,
                 &ssh_config.key,
             )
@@ -274,6 +284,7 @@ impl ProxmoxClient {
     /// Resize a disk on a VM
     pub async fn resize_disk(&self, req: ResizeDiskRequest) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
+            .api
             .req(
                 Method::PUT,
                 &format!("/api2/json/nodes/{}/qemu/{}/resize", &req.node, &req.vm_id),
@@ -289,6 +300,7 @@ impl ProxmoxClient {
     /// Start a VM
     pub async fn start_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
+            .api
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/start", node, vm),
                 (),
@@ -303,6 +315,7 @@ impl ProxmoxClient {
     /// Stop a VM
     pub async fn stop_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
+            .api
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/stop", node, vm),
                 (),
@@ -317,6 +330,7 @@ impl ProxmoxClient {
     /// Stop a VM
     pub async fn shutdown_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
+            .api
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/shutdown", node, vm),
                 (),
@@ -331,6 +345,7 @@ impl ProxmoxClient {
     /// Stop a VM
     pub async fn reset_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<String> = self
+            .api
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/reset", node, vm),
                 (),
@@ -340,117 +355,6 @@ impl ProxmoxClient {
             id: rsp.data,
             node: node.to_string(),
         })
-    }
-
-    /// Create terminal proxy session
-    pub async fn terminal_proxy(&self, node: &str, vm: ProxmoxVmId) -> Result<TerminalProxyTicket> {
-        let rsp: ResponseBase<TerminalProxyTicket> = self
-            .post(
-                &format!("/api2/json/nodes/{}/qemu/{}/termproxy", node, vm),
-                (),
-            )
-            .await?;
-        Ok(rsp.data)
-    }
-
-    /// Open websocket connection to terminal proxy
-    pub async fn open_terminal_proxy(
-        &self,
-        node: &str,
-        vm: ProxmoxVmId,
-        req: TerminalProxyTicket,
-    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        self.get_task_status(&TaskId {
-            id: req.upid,
-            node: node.to_string(),
-        })
-        .await?;
-
-        let mut url: Url = self.base.join(&format!(
-            "/api2/json/nodes/{}/qemu/{}/vncwebsocket",
-            node, vm
-        ))?;
-        url.set_scheme("wss").unwrap();
-        url.query_pairs_mut().append_pair("port", &req.port);
-        url.query_pairs_mut().append_pair("vncticket", &req.ticket);
-
-        let r = Request::builder()
-            .method("GET")
-            .header("Host", url.host().unwrap().to_string())
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", generate_key())
-            .header("Sec-WebSocket-Protocol", "binary")
-            .header("Authorization", format!("PVEAPIToken={}", self.token))
-            .uri(url.as_str())
-            .body(())?;
-
-        debug!("Connecting terminal proxy: {:?}", &r);
-        let (ws, _rsp) = tokio_tungstenite::connect_async_tls_with_config(
-            r,
-            None,
-            false,
-            Some(Connector::NativeTls(
-                native_tls::TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .build()?,
-            )),
-        )
-        .await?;
-
-        Ok(ws)
-    }
-
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        debug!(">> GET {}", path);
-        let rsp = self
-            .client
-            .get(self.base.join(path)?)
-            .header("Authorization", format!("PVEAPIToken={}", self.token))
-            .send()
-            .await?;
-        let status = rsp.status();
-        let text = rsp.text().await?;
-        #[cfg(debug_assertions)]
-        debug!("<< {}", text);
-        if status.is_success() {
-            Ok(serde_json::from_str(&text)?)
-        } else {
-            bail!("{}", status);
-        }
-    }
-
-    async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
-        self.req(Method::POST, path, body).await
-    }
-
-    async fn req<T: DeserializeOwned, R: Serialize>(
-        &self,
-        method: Method,
-        path: &str,
-        body: R,
-    ) -> Result<T> {
-        let body = serde_json::to_string(&body)?;
-        debug!(">> {} {}: {}", method.clone(), path, &body);
-        let rsp = self
-            .client
-            .request(method.clone(), self.base.join(path)?)
-            .header("Authorization", format!("PVEAPIToken={}", self.token))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .body(body)
-            .send()
-            .await?;
-        let status = rsp.status();
-        let text = rsp.text().await?;
-        #[cfg(debug_assertions)]
-        debug!("<< {}", text);
-        if status.is_success() {
-            Ok(serde_json::from_str(&text)?)
-        } else {
-            bail!("{} {}: {}: {}", method, path, status, &text);
-        }
     }
 }
 

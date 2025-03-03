@@ -1,89 +1,24 @@
 use crate::api::WEBHOOK_BRIDGE;
+use crate::json_api::JsonApi;
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use anyhow::bail;
 use futures::{Stream, StreamExt};
 use lnvps_db::async_trait;
-use log::debug;
-use reqwest::header::HeaderMap;
-use reqwest::{Method, Url};
-use rocket::http::ext::IntoCollection;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use tokio_stream::wrappers::BroadcastStream;
 
 pub struct BitvoraNode {
-    base: Url,
-    client: reqwest::Client,
+    api: JsonApi,
     webhook_secret: String,
 }
 
 impl BitvoraNode {
     pub fn new(api_token: &str, webhook_secret: &str) -> Self {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {}", api_token).parse().unwrap(),
-        );
-
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .unwrap();
-
+        let auth = format!("Bearer {}", api_token);
         Self {
-            base: Url::parse("https://api.bitvora.com/").unwrap(),
-            client,
+            api: JsonApi::token("https://api.bitvora.com/", &auth).unwrap(),
             webhook_secret: webhook_secret.to_string(),
-        }
-    }
-
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> anyhow::Result<T> {
-        debug!(">> GET {}", path);
-        let rsp = self.client.get(self.base.join(path)?).send().await?;
-        let status = rsp.status();
-        let text = rsp.text().await?;
-        #[cfg(debug_assertions)]
-        debug!("<< {}", text);
-        if status.is_success() {
-            Ok(serde_json::from_str(&text)?)
-        } else {
-            bail!("{}", status);
-        }
-    }
-
-    async fn post<T: DeserializeOwned, R: Serialize>(
-        &self,
-        path: &str,
-        body: R,
-    ) -> anyhow::Result<T> {
-        self.req(Method::POST, path, body).await
-    }
-
-    async fn req<T: DeserializeOwned, R: Serialize>(
-        &self,
-        method: Method,
-        path: &str,
-        body: R,
-    ) -> anyhow::Result<T> {
-        let body = serde_json::to_string(&body)?;
-        debug!(">> {} {}: {}", method.clone(), path, &body);
-        let rsp = self
-            .client
-            .request(method.clone(), self.base.join(path)?)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .body(body)
-            .send()
-            .await?;
-        let status = rsp.status();
-        let text = rsp.text().await?;
-        #[cfg(debug_assertions)]
-        debug!("<< {}", text);
-        if status.is_success() {
-            Ok(serde_json::from_str(&text)?)
-        } else {
-            bail!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 }
@@ -98,7 +33,8 @@ impl LightningNode for BitvoraNode {
             expiry_seconds: req.expire.unwrap_or(3600) as u64,
         };
         let rsp: BitvoraResponse<CreateInvoiceResponse> = self
-            .req(Method::POST, "/v1/bitcoin/deposit/lightning-invoice", req)
+            .api
+            .post("/v1/bitcoin/deposit/lightning-invoice", req)
             .await?;
         if rsp.status >= 400 {
             bail!(

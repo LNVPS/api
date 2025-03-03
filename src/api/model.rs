@@ -51,6 +51,8 @@ pub struct ApiVmIpAssignment {
     pub id: u64,
     pub ip: String,
     pub gateway: String,
+    pub forward_dns: Option<String>,
+    pub reverse_dns: Option<String>,
 }
 
 impl ApiVmIpAssignment {
@@ -64,6 +66,8 @@ impl ApiVmIpAssignment {
             .unwrap()
             .to_string(),
             gateway: range.gateway.to_string(),
+            forward_dns: ip.dns_forward.clone(),
+            reverse_dns: ip.dns_reverse.clone(),
         }
     }
 }

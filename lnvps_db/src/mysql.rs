@@ -290,15 +290,36 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64> {
         Ok(sqlx::query(
-            "insert into vm_ip_assignment(vm_id,ip_range_id,ip) values(?, ?, ?) returning id",
+            "insert into vm_ip_assignment(vm_id,ip_range_id,ip,arp_ref,dns_forward,dns_forward_ref,dns_reverse,dns_reverse_ref) values(?,?,?,?,?,?,?,?) returning id",
         )
         .bind(ip_assignment.vm_id)
         .bind(ip_assignment.ip_range_id)
         .bind(&ip_assignment.ip)
+        .bind(&ip_assignment.arp_ref)
+        .bind(&ip_assignment.dns_forward)
+        .bind(&ip_assignment.dns_forward_ref)
+        .bind(&ip_assignment.dns_reverse)
+        .bind(&ip_assignment.dns_reverse_ref)
         .fetch_one(&self.db)
         .await
         .map_err(Error::new)?
         .try_get(0)?)
+    }
+
+    async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<()> {
+        sqlx::query(
+            "update vm_ip_assignment set arp_ref = ?, dns_forward = ?, dns_forward_ref = ?, dns_reverse = ?, dns_reverse_ref = ? where id = ?",
+        )
+            .bind(&ip_assignment.arp_ref)
+            .bind(&ip_assignment.dns_forward)
+            .bind(&ip_assignment.dns_forward_ref)
+            .bind(&ip_assignment.dns_reverse)
+            .bind(&ip_assignment.dns_reverse_ref)
+            .bind(&ip_assignment.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
     }
 
     async fn list_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {

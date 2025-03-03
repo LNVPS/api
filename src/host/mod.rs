@@ -43,7 +43,7 @@ pub trait VmHostClient: Send + Sync {
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
     #[cfg(test)]
     {
-        Ok(Arc::new(crate::mocks::MockVmHost::default()))
+        Ok(Arc::new(crate::mocks::MockVmHost::new()))
     }
     #[cfg(not(test))]
     {
@@ -56,16 +56,14 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
                     ssh,
                     mac_prefix,
                 },
-            ) => Arc::new(
-                proxmox::ProxmoxClient::new(
-                    host.ip.parse()?,
-                    &host.name,
-                    mac_prefix.clone(),
-                    qemu.clone(),
-                    ssh.clone(),
-                )
-                .with_api_token(&host.api_token),
-            ),
+            ) => Arc::new(proxmox::ProxmoxClient::new(
+                host.ip.parse()?,
+                &host.name,
+                &host.api_token,
+                mac_prefix.clone(),
+                qemu.clone(),
+                ssh.clone(),
+            )),
             _ => bail!("Unknown host config: {}", host.kind),
         })
     }

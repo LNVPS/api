@@ -1,3 +1,4 @@
+use crate::dns::{BasicRecord, DnsServer};
 use crate::host::{CreateVmRequest, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
@@ -406,9 +407,26 @@ impl LNVpsDb for MockDb {
                 ip_range_id: ip_assignment.ip_range_id,
                 ip: ip_assignment.ip.clone(),
                 deleted: false,
+                arp_ref: ip_assignment.arp_ref.clone(),
+                dns_forward: ip_assignment.dns_forward.clone(),
+                dns_forward_ref: ip_assignment.dns_forward_ref.clone(),
+                dns_reverse: ip_assignment.dns_reverse.clone(),
+                dns_reverse_ref: ip_assignment.dns_reverse_ref.clone(),
             },
         );
         Ok(max + 1)
+    }
+
+    async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> anyhow::Result<()> {
+        let mut ip_assignments = self.ip_assignments.lock().await;
+        if let Some(i) = ip_assignments.get_mut(&ip_assignment.vm_id) {
+            i.arp_ref = ip_assignment.arp_ref.clone();
+            i.dns_forward = ip_assignment.dns_forward.clone();
+            i.dns_reverse = ip_assignment.dns_reverse.clone();
+            i.dns_reverse_ref = ip_assignment.dns_reverse_ref.clone();
+            i.dns_forward_ref = ip_assignment.dns_forward_ref.clone();
+        }
+        Ok(())
     }
 
     async fn list_vm_ip_assignments(&self, vm_id: u64) -> anyhow::Result<Vec<VmIpAssignment>> {
@@ -475,12 +493,12 @@ pub struct MockRouter {
 
 impl MockRouter {
     pub fn new(policy: NetworkPolicy) -> Self {
-        static ARP: LazyLock<Arc<Mutex<HashMap<u64, ArpEntry>>>> =
+        static LAZY_ARP: LazyLock<Arc<Mutex<HashMap<u64, ArpEntry>>>> =
             LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
         Self {
             policy,
-            arp: ARP.clone(),
+            arp: LAZY_ARP.clone(),
         }
     }
 }
@@ -535,6 +553,16 @@ struct MockInvoice {
     settle_index: u64,
 }
 
+impl MockNode {
+    pub fn new() -> Self {
+        static LAZY_INVOICES: LazyLock<Arc<Mutex<HashMap<String, MockInvoice>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        Self {
+            invoices: LAZY_INVOICES.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl LightningNode for MockNode {
     async fn add_invoice(&self, req: AddInvoiceRequest) -> anyhow::Result<AddInvoiceResult> {
@@ -549,7 +577,7 @@ impl LightningNode for MockNode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MockVmHost {
     vms: Arc<Mutex<HashMap<u64, MockVm>>>,
 }
@@ -557,6 +585,16 @@ pub struct MockVmHost {
 #[derive(Debug, Clone)]
 struct MockVm {
     pub state: VmRunningState,
+}
+
+impl MockVmHost {
+    pub fn new() -> Self {
+        static LAZY_VMS: LazyLock<Arc<Mutex<HashMap<u64, MockVm>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        Self {
+            vms: LAZY_VMS.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -631,5 +669,88 @@ impl VmHostClient for MockVmHost {
 
     async fn configure_vm(&self, vm: &Vm) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+pub struct MockDnsServer {
+    pub forward: Arc<Mutex<HashMap<String, MockDnsEntry>>>,
+    pub reverse: Arc<Mutex<HashMap<String, MockDnsEntry>>>,
+}
+
+pub struct MockDnsEntry {
+    pub name: String,
+    pub value: String,
+    pub kind: String,
+}
+
+impl MockDnsServer {
+    pub fn new() -> Self {
+        static LAZY_FWD: LazyLock<Arc<Mutex<HashMap<String, MockDnsEntry>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        static LAZY_REV: LazyLock<Arc<Mutex<HashMap<String, MockDnsEntry>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        Self {
+            forward: LAZY_FWD.clone(),
+            reverse: LAZY_REV.clone(),
+        }
+    }
+}
+#[async_trait]
+impl DnsServer for MockDnsServer {
+    async fn add_ptr_record(&self, key: &str, value: &str) -> anyhow::Result<BasicRecord> {
+        let mut rev = self.reverse.lock().await;
+
+        if rev.values().any(|v| v.name == key) {
+            bail!("Duplicate record with name {}", key);
+        }
+
+        let rnd_id: [u8; 12] = rand::random();
+        let id = hex::encode(rnd_id);
+        rev.insert(
+            id.clone(),
+            MockDnsEntry {
+                name: key.to_string(),
+                value: value.to_string(),
+                kind: "PTR".to_string(),
+            },
+        );
+        Ok(BasicRecord {
+            name: format!("{}.X.Y.Z.in-addr.arpa", key),
+            value: value.to_string(),
+            id,
+        })
+    }
+
+    async fn delete_ptr_record(&self, key: &str) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn add_a_record(&self, name: &str, ip: IpAddr) -> anyhow::Result<BasicRecord> {
+        let mut rev = self.forward.lock().await;
+
+        if rev.values().any(|v| v.name == name) {
+            bail!("Duplicate record with name {}", name);
+        }
+
+        let fqdn = format!("{}.lnvps.mock", name);
+        let rnd_id: [u8; 12] = rand::random();
+        let id = hex::encode(rnd_id);
+        rev.insert(
+            id.clone(),
+            MockDnsEntry {
+                name: fqdn.clone(),
+                value: ip.to_string(),
+                kind: "A".to_string(),
+            },
+        );
+        Ok(BasicRecord {
+            name: fqdn,
+            value: ip.to_string(),
+            id,
+        })
+    }
+
+    async fn delete_a_record(&self, name: &str) -> anyhow::Result<()> {
+        todo!()
     }
 }

@@ -1,3 +1,4 @@
+use crate::dns::DnsServer;
 use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, CreateVmRequest, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
@@ -13,6 +14,7 @@ use nostr::util::hex;
 use rand::random;
 use rocket::futures::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::fmt::format;
 use std::net::IpAddr;
 use std::ops::Add;
 use std::str::FromStr;
@@ -31,6 +33,8 @@ pub struct LNVpsProvisioner {
     rates: Arc<dyn ExchangeRateService>,
 
     router: Option<Arc<dyn Router>>,
+    dns: Option<Arc<dyn DnsServer>>,
+
     network_policy: NetworkPolicy,
     provisioner_config: ProvisionerConfig,
 }
@@ -47,6 +51,7 @@ impl LNVpsProvisioner {
             node,
             rates,
             router: settings.get_router().expect("router config"),
+            dns: settings.get_dns().expect("dns config"),
             network_policy: settings.network_policy,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
@@ -73,12 +78,14 @@ impl LNVpsProvisioner {
         Ok(())
     }
 
-    async fn save_ip_assignment(&self, vm: &Vm, assignment: &VmIpAssignment) -> Result<()> {
+    async fn save_ip_assignment(&self, vm: &Vm, assignment: &mut VmIpAssignment) -> Result<()> {
+        let ip = IpAddr::from_str(&assignment.ip)?;
+
         // apply network policy
         if let NetworkAccessPolicy::StaticArp { interface } = &self.network_policy.access {
             if let Some(r) = self.router.as_ref() {
                 r.add_arp_entry(
-                    IpAddr::from_str(&assignment.ip)?,
+                    ip.clone(),
                     &vm.mac_address,
                     interface,
                     Some(&format!("VM{}", vm.id)),
@@ -89,8 +96,28 @@ impl LNVpsProvisioner {
             }
         }
 
+        // Add DNS records
+        if let Some(dns) = &self.dns {
+            let sub_name = format!("vm-{}", vm.id);
+            let fwd = dns.add_a_record(&sub_name, ip.clone()).await?;
+            assignment.dns_forward = Some(fwd.name.clone());
+            assignment.dns_forward_ref = Some(fwd.id);
+
+            match ip {
+                IpAddr::V4(ip) => {
+                    let last_octet = ip.octets()[3].to_string();
+                    let rev = dns.add_ptr_record(&last_octet, &fwd.name).await?;
+                    assignment.dns_reverse = Some(fwd.name.clone());
+                    assignment.dns_reverse_ref = Some(rev.id);
+                }
+                IpAddr::V6(_) => {
+                    warn!("IPv6 forward DNS not supported yet")
+                }
+            }
+        }
+
         // save to db
-        self.db.insert_vm_ip_assignment(assignment).await?;
+        self.db.insert_vm_ip_assignment(&assignment).await?;
         Ok(())
     }
 
@@ -106,15 +133,20 @@ impl LNVpsProvisioner {
 
         let template = self.db.get_vm_template(vm.template_id).await?;
         let ip = network.pick_ip_for_region(template.region_id).await?;
-        let assignment = VmIpAssignment {
+        let mut assignment = VmIpAssignment {
             id: 0,
             vm_id,
             ip_range_id: ip.range_id,
             ip: ip.ip.to_string(),
             deleted: false,
+            arp_ref: None,
+            dns_forward: None,
+            dns_forward_ref: None,
+            dns_reverse: None,
+            dns_reverse_ref: None,
         };
 
-        self.save_ip_assignment(&vm, &assignment).await?;
+        self.save_ip_assignment(&vm, &mut assignment).await?;
         Ok(vec![assignment])
     }
 
@@ -326,9 +358,7 @@ mod tests {
     use super::*;
     use crate::exchange::DefaultRateCache;
     use crate::mocks::{MockDb, MockNode};
-    use crate::settings::{
-        ApiConfig, Credentials, LndConfig, ProvisionerConfig, QemuConfig, RouterConfig,
-    };
+    use crate::settings::{DnsServerConfig, LightningConfig, QemuConfig, RouterConfig};
     use lnvps_db::UserSshKey;
 
     #[tokio::test]
@@ -338,7 +368,7 @@ mod tests {
         let settings = Settings {
             listen: None,
             db: "".to_string(),
-            lnd: LndConfig {
+            lightning: LightningConfig::LND {
                 url: "".to_string(),
                 cert: Default::default(),
                 macaroon: Default::default(),
@@ -364,21 +394,23 @@ mod tests {
             },
             delete_after: 0,
             smtp: None,
-            router: Some(RouterConfig::Mikrotik(ApiConfig {
-                id: "mock-router".to_string(),
+            router: Some(RouterConfig::Mikrotik {
                 url: "https://localhost".to_string(),
-                credentials: Credentials::UsernamePassword {
-                    username: "admin".to_string(),
-                    password: "password123".to_string(),
-                },
-            })),
-            dns: None,
+                username: "admin".to_string(),
+                password: "password123".to_string(),
+            }),
+            dns: Some(DnsServerConfig::Cloudflare {
+                token: "abc".to_string(),
+                forward_zone_id: "123".to_string(),
+                reverse_zone_id: "456".to_string(),
+            }),
             nostr: None,
         };
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(DefaultRateCache::default());
         let router = settings.get_router().expect("router").unwrap();
+        let dns = settings.get_dns().expect("dns").unwrap();
         let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
 
         let pubkey: [u8; 32] = random();
@@ -408,9 +440,15 @@ mod tests {
         let ips = db.list_vm_ip_assignments(vm.id).await?;
         assert_eq!(1, ips.len());
         let ip = ips.first().unwrap();
+        println!("{:?}", ip);
         assert_eq!(ip.ip, arp.address);
         assert_eq!(ip.ip_range_id, 1);
         assert_eq!(ip.vm_id, vm.id);
+        assert!(ip.dns_forward.is_some());
+        assert!(ip.dns_reverse.is_some());
+        assert!(ip.dns_reverse_ref.is_some());
+        assert!(ip.dns_forward.is_some());
+        assert_eq!(ip.dns_reverse, ip.dns_forward);
 
         // assert IP address is not CIDR
         assert!(IpAddr::from_str(&ip.ip).is_ok());

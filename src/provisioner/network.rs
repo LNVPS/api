@@ -116,7 +116,7 @@ mod tests {
             vm_id: 0,
             ip_range_id: ip.range_id,
             ip: ip.ip.to_string(),
-            deleted: false,
+            ..Default::default()
         })
         .await
         .expect("Could not insert vm ip");

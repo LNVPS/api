@@ -113,3 +113,18 @@ network-policy:
       # Interface where the static ARP entry is added
       interface: "bridge1"
 ```
+
+### DNS (PTR/A/AAAA)
+
+To create PTR records automatically use the following config:
+```yaml
+dns:
+  cloudflare:
+    # The zone containing the reverse domain (eg. X.Y.Z.in-addr.arpa)
+    reverse-zone-id: "my-reverse-zone-id"
+    # The zone where forward (A/AAAA) entries are added (eg. lnvps.cloud zone)
+    # We create forward entries with the format vm-<vmid>.lnvps.cloud
+    forward-zone-id: "my-forward-zone-id"
+    # API token to add/remove DNS records to this zone
+    token: "my-api-token"
+```

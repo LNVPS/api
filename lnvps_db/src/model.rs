@@ -226,11 +226,26 @@ pub struct Vm {
 
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VmIpAssignment {
+    /// Unique id of this assignment
     pub id: u64,
+    /// VM id this IP is assigned to
     pub vm_id: u64,
+    /// IP range id
     pub ip_range_id: u64,
+    /// The IP address (v4/v6)
     pub ip: String,
+    /// If this record was freed
     pub deleted: bool,
+    /// External ID pointing to a static arp entry on the router
+    pub arp_ref: Option<String>,
+    /// Forward DNS FQDN
+    pub dns_forward: Option<String>,
+    /// External ID pointing to the forward DNS entry for this IP
+    pub dns_forward_ref: Option<String>,
+    /// Reverse DNS FQDN
+    pub dns_reverse: Option<String>,
+    /// External ID pointing to the reverse DNS entry for this IP
+    pub dns_reverse_ref: Option<String>,
 }
 
 impl Display for VmIpAssignment {

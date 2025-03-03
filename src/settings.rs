@@ -1,8 +1,9 @@
+use crate::dns::DnsServer;
 use crate::exchange::ExchangeRateService;
 use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
-use crate::router::{MikrotikRouter, Router};
-use anyhow::{bail, Result};
+use crate::router::Router;
+use anyhow::Result;
 use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -56,7 +57,7 @@ pub enum LightningConfig {
     Bitvora {
         token: String,
         webhook_secret: String,
-    }
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -68,32 +69,22 @@ pub struct NostrConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouterConfig {
-    Mikrotik(ApiConfig),
+    Mikrotik {
+        url: String,
+        username: String,
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DnsServerConfig {
     #[serde(rename_all = "kebab-case")]
-    Cloudflare { api: ApiConfig, zone_id: String },
-}
-
-/// Generic remote API credentials
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ApiConfig {
-    /// unique ID of this router, used in references
-    pub id: String,
-    /// http://<my-router>
-    pub url: String,
-    /// Login credentials used for this router
-    pub credentials: Credentials,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Credentials {
-    UsernamePassword { username: String, password: String },
-    ApiToken { token: String },
+    Cloudflare {
+        token: String,
+        forward_zone_id: String,
+        reverse_zone_id: String,
+    },
 }
 
 /// Policy that determines how packets arrive at the VM
@@ -187,26 +178,52 @@ impl Settings {
         Arc::new(LNVpsProvisioner::new(self.clone(), db, node, exchange))
     }
 
-    #[cfg(not(test))]
     pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
-        match &self.router {
-            Some(RouterConfig::Mikrotik(api)) => match &api.credentials {
-                Credentials::UsernamePassword { username, password } => Ok(Some(Arc::new(
-                    MikrotikRouter::new(&api.url, username, password),
-                ))),
-                _ => bail!("Only username/password is supported for Mikrotik routers"),
-            },
-            _ => Ok(None),
+        #[cfg(test)]
+        {
+            if let Some(router) = &self.router {
+                let router = crate::mocks::MockRouter::new(self.network_policy.clone());
+                Ok(Some(Arc::new(router)))
+            } else {
+                Ok(None)
+            }
+        }
+        #[cfg(not(test))]
+        {
+            match &self.router {
+                #[cfg(feature = "mikrotik")]
+                Some(RouterConfig::Mikrotik {
+                    url,
+                    username,
+                    password,
+                }) => Ok(Some(Arc::new(crate::router::MikrotikRouter::new(
+                    url, username, password,
+                )))),
+                _ => Ok(None),
+            }
         }
     }
 
-    #[cfg(test)]
-    pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
-        if self.router.is_some() {
-            let router = crate::mocks::MockRouter::new(self.network_policy.clone());
-            Ok(Some(Arc::new(router)))
-        } else {
-            Ok(None)
+    pub fn get_dns(&self) -> Result<Option<Arc<dyn DnsServer>>> {
+        #[cfg(test)]
+        {
+            Ok(Some(Arc::new(crate::mocks::MockDnsServer::new())))
+        }
+        #[cfg(not(test))]
+        {
+            match &self.dns {
+                None => Ok(None),
+                #[cfg(feature = "cloudflare")]
+                Some(DnsServerConfig::Cloudflare {
+                    token,
+                    forward_zone_id,
+                    reverse_zone_id,
+                }) => Ok(Some(Arc::new(crate::dns::Cloudflare::new(
+                    token,
+                    reverse_zone_id,
+                    forward_zone_id,
+                )))),
+            }
         }
     }
 }

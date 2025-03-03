@@ -74,16 +74,6 @@ async fn main() -> Result<(), Error> {
         nostr_client.clone(),
     );
     let sender = worker.sender();
-
-    // send a startup notification
-    if let Some(admin) = settings.smtp.as_ref().and_then(|s| s.admin) {
-        sender.send(WorkJob::SendNotification {
-            title: Some("Startup".to_string()),
-            message: "System is starting!".to_string(),
-            user_id: admin,
-        })?;
-    }
-
     tokio::spawn(async move {
         loop {
             if let Err(e) = worker.handle().await {
