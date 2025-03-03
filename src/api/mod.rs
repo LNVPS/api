@@ -1,4 +1,13 @@
+use rocket::{routes, Route};
+
 mod model;
 mod routes;
+mod webhook;
 
-pub use routes::routes;
+pub fn routes() -> Vec<Route> {
+    let mut r = routes::routes();
+    r.append(&mut webhook::routes());
+    r
+}
+
+pub use webhook::WEBHOOK_BRIDGE;

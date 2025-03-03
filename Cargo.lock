@@ -2037,6 +2037,7 @@ dependencies = [
  "ssh-key",
  "ssh2",
  "tokio",
+ "tokio-stream",
  "tokio-tungstenite 0.21.0",
  "urlencoding",
  "virt",
@@ -4210,6 +4211,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

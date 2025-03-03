@@ -1,6 +1,5 @@
 use std::path::Path;
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
-use crate::settings::LndConfig;
 use anyhow::Result;
 use fedimint_tonic_lnd::invoicesrpc::lookup_invoice_msg::InvoiceRef;
 use fedimint_tonic_lnd::invoicesrpc::LookupInvoiceMsg;

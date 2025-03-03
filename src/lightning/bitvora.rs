@@ -1,21 +1,25 @@
+use crate::api::WEBHOOK_BRIDGE;
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use anyhow::bail;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use lnvps_db::async_trait;
 use log::debug;
 use reqwest::header::HeaderMap;
 use reqwest::{Method, Url};
+use rocket::http::ext::IntoCollection;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use tokio_stream::wrappers::BroadcastStream;
 
 pub struct BitvoraNode {
     base: Url,
     client: reqwest::Client,
+    webhook_secret: String,
 }
 
 impl BitvoraNode {
-    pub fn new(api_token: &str) -> Self {
+    pub fn new(api_token: &str, webhook_secret: &str) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(
             "Authorization",
@@ -30,6 +34,7 @@ impl BitvoraNode {
         Self {
             base: Url::parse("https://api.bitvora.com/").unwrap(),
             client,
+            webhook_secret: webhook_secret.to_string(),
         }
     }
 
@@ -95,6 +100,13 @@ impl LightningNode for BitvoraNode {
         let rsp: BitvoraResponse<CreateInvoiceResponse> = self
             .req(Method::POST, "/v1/bitcoin/deposit/lightning-invoice", req)
             .await?;
+        if rsp.status >= 400 {
+            bail!(
+                "API error: {} {}",
+                rsp.status,
+                rsp.message.unwrap_or_default()
+            );
+        }
         Ok(AddInvoiceResult {
             pr: rsp.data.payment_request,
             payment_hash: rsp.data.r_hash,
@@ -103,9 +115,11 @@ impl LightningNode for BitvoraNode {
 
     async fn subscribe_invoices(
         &self,
-        from_payment_hash: Option<Vec<u8>>,
+        _from_payment_hash: Option<Vec<u8>>,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = InvoiceUpdate> + Send>>> {
-        todo!()
+        let rx = BroadcastStream::new(WEBHOOK_BRIDGE.listen());
+        let mapped = rx.then(|r| async move { InvoiceUpdate::Unknown });
+        Ok(Box::pin(mapped))
     }
 }
 
@@ -118,8 +132,7 @@ struct CreateInvoiceRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct BitvoraResponse<T>
-{
+struct BitvoraResponse<T> {
     pub status: isize,
     pub message: Option<String>,
     pub data: T,

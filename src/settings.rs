@@ -52,8 +52,10 @@ pub enum LightningConfig {
         cert: PathBuf,
         macaroon: PathBuf,
     },
+    #[serde(rename_all = "kebab-case")]
     Bitvora {
         token: String,
+        webhook_secret: String,
     }
 }
 

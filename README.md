@@ -5,7 +5,9 @@ A bitcoin powered VPS system.
 ## Requirements
 
 - MySql database
-- LND node
+- Lightning node:
+    - LND
+    - [Bitvora](https://bitvora.com?r=lnvps)
 - Proxmox server
 
 ## Required Config
@@ -14,22 +16,26 @@ A bitcoin powered VPS system.
 # MySql database connection string
 db: "mysql://root:root@localhost:3376/lnvps"
 
-# LND node connection details
+# LN node connection details (Only 1 allowed)
 lightning:
   lnd:
     url: "https://127.0.0.1:10003"
     cert: "$HOME/.lnd/tls.cert"
     macaroon: "$HOME/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
-  
+  #bitvora:
+  #  token: "my-api-token"
+  #  webhook-secret: "my-webhook-secret"
+    
 # Number of days after a VM expires to delete
 delete-after: 3
+  
+# Read-only mode prevents spawning VM's
+read-only: false
 
 # Provisioner is the main process which handles creating/deleting VM's
 # Currently supports: Proxmox
 provisioner:
   proxmox:
-    # Read-only mode prevents spawning VM's
-    read-only: false
     # Proxmox (QEMU) settings used for spawning VM's
     qemu:
       bios: "ovmf"
@@ -39,9 +45,17 @@ provisioner:
       cpu: "kvm64"
       vlan: 100
       kvm: false
+
+# Networking policy
+network-policy:
+  # Configure network equipment on provisioning IP resources
+  access: "auto"
+  # Use SLAAC to auto-configure VM ipv6 addresses
+  ip6-slaac: true
 ```
 
 ### Email notifications
+
 Email notifications can be enabled, this is primarily intended for admin notifications.
 
 ```yaml
@@ -75,7 +89,7 @@ nostr:
 
 ### Network Setup (Advanced)
 
-When ARP is disabled (reply-only) on your router you may need to create static ARP entries when allocating 
+When ARP is disabled (reply-only) on your router you may need to create static ARP entries when allocating
 IPs, we support managing ARP entries on routers directly as part of the provisioning process.
 
 ```yaml
