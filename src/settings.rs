@@ -13,7 +13,9 @@ use std::sync::Arc;
 pub struct Settings {
     pub listen: Option<String>,
     pub db: String,
-    pub lnd: LndConfig,
+
+    /// Lightning node config for creating LN payments
+    pub lightning: LightningConfig,
 
     /// Readonly mode, don't spawn any VM's
     pub read_only: bool,
@@ -42,10 +44,17 @@ pub struct Settings {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct LndConfig {
-    pub url: String,
-    pub cert: PathBuf,
-    pub macaroon: PathBuf,
+#[serde(rename_all = "kebab-case")]
+pub enum LightningConfig {
+    #[serde(rename = "lnd")]
+    LND {
+        url: String,
+        cert: PathBuf,
+        macaroon: PathBuf,
+    },
+    Bitvora {
+        token: String,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

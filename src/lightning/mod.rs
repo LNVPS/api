@@ -1,11 +1,13 @@
-use crate::lightning::lnd::LndNode;
-use crate::settings::Settings;
+use crate::settings::{LightningConfig, Settings};
 use anyhow::Result;
 use futures::Stream;
 use lnvps_db::async_trait;
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(feature = "bitvora")]
+mod bitvora;
+#[cfg(feature = "lnd")]
 mod lnd;
 
 /// Generic lightning node for creating payments
@@ -43,5 +45,15 @@ pub enum InvoiceUpdate {
 }
 
 pub async fn get_node(settings: &Settings) -> Result<Arc<dyn LightningNode>> {
-    Ok(Arc::new(LndNode::new(&settings.lnd).await?))
+    match &settings.lightning {
+        #[cfg(feature = "lnd")]
+        LightningConfig::LND {
+            url,
+            cert,
+            macaroon,
+        } => Ok(Arc::new(lnd::LndNode::new(url, cert, macaroon).await?)),
+        #[cfg(feature = "bitvora")]
+        LightningConfig::Bitvora { token } => Ok(Arc::new(bitvora::BitvoraNode::new(token))),
+        _ => anyhow::bail!("Unsupported lightning config!"),
+    }
 }

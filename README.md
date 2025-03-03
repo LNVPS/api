@@ -15,10 +15,11 @@ A bitcoin powered VPS system.
 db: "mysql://root:root@localhost:3376/lnvps"
 
 # LND node connection details
-lnd:
-  url: "https://127.0.0.1:10003"
-  cert: "$HOME/.lnd/tls.cert"
-  macaroon: "$HOME/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+lightning:
+  lnd:
+    url: "https://127.0.0.1:10003"
+    cert: "$HOME/.lnd/tls.cert"
+    macaroon: "$HOME/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
   
 # Number of days after a VM expires to delete
 delete-after: 3

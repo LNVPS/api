@@ -1,3 +1,4 @@
+use std::path::Path;
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::settings::LndConfig;
 use anyhow::Result;
@@ -16,13 +17,8 @@ pub struct LndNode {
 }
 
 impl LndNode {
-    pub async fn new(settings: &LndConfig) -> Result<Self> {
-        let lnd = connect(
-            settings.url.clone(),
-            settings.cert.clone(),
-            settings.macaroon.clone(),
-        )
-        .await?;
+    pub async fn new(url: &str, cert: &Path, macaroon: &Path) -> Result<Self> {
+        let lnd = connect(url.to_string(), cert, macaroon).await?;
         Ok(Self { client: lnd })
     }
 }

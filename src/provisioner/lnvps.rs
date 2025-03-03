@@ -6,7 +6,6 @@ use crate::router::Router;
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
-use fedimint_tonic_lnd::tonic::async_trait;
 use futures::future::join_all;
 use lnvps_db::{DiskType, IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
 use log::{debug, info, warn};
