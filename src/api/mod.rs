@@ -1,4 +1,4 @@
-use rocket::{routes, Route};
+use rocket::Route;
 
 mod model;
 mod routes;

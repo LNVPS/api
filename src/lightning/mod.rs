@@ -53,7 +53,10 @@ pub async fn get_node(settings: &Settings) -> Result<Arc<dyn LightningNode>> {
             macaroon,
         } => Ok(Arc::new(lnd::LndNode::new(url, cert, macaroon).await?)),
         #[cfg(feature = "bitvora")]
-        LightningConfig::Bitvora { token, webhook_secret } => Ok(Arc::new(bitvora::BitvoraNode::new(token, webhook_secret))),
+        LightningConfig::Bitvora {
+            token,
+            webhook_secret,
+        } => Ok(Arc::new(bitvora::BitvoraNode::new(token, webhook_secret))),
         _ => anyhow::bail!("Unsupported lightning config!"),
     }
 }

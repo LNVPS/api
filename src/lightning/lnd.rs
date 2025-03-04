@@ -1,4 +1,3 @@
-use std::path::Path;
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use anyhow::Result;
 use fedimint_tonic_lnd::invoicesrpc::lookup_invoice_msg::InvoiceRef;
@@ -9,6 +8,7 @@ use fedimint_tonic_lnd::{connect, Client};
 use futures::StreamExt;
 use lnvps_db::async_trait;
 use nostr_sdk::async_utility::futures_util::Stream;
+use std::path::Path;
 use std::pin::Pin;
 
 pub struct LndNode {

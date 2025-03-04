@@ -68,7 +68,7 @@ impl LNVpsDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn delete_user(&self, id: u64) -> Result<()> {
+    async fn delete_user(&self, _id: u64) -> Result<()> {
         todo!()
     }
 
@@ -93,7 +93,7 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn delete_user_ssh_key(&self, id: u64) -> Result<()> {
+    async fn delete_user_ssh_key(&self, _id: u64) -> Result<()> {
         todo!()
     }
 

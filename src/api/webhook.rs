@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use lettre::message::header::Headers;
 use log::warn;
 use reqwest::header::HeaderMap;

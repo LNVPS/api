@@ -1,5 +1,6 @@
 use anyhow::Result;
 use lnvps_db::async_trait;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 #[cfg(feature = "cloudflare")]
@@ -22,9 +23,17 @@ pub trait DnsServer: Send + Sync {
     async fn delete_a_record(&self, name: &str) -> Result<()>;
 }
 
+#[derive(Clone, Debug)]
+pub enum RecordType {
+    A,
+    AAAA,
+    PTR,
+}
+
 #[derive(Debug, Clone)]
 pub struct BasicRecord {
     pub name: String,
     pub value: String,
-    pub id: String,
+    pub id: Option<String>,
+    pub kind: RecordType,
 }

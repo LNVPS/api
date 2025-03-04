@@ -1,5 +1,6 @@
-use crate::dns::{BasicRecord, DnsServer};
-use crate::host::{CreateVmRequest, VmHostClient};
+#![allow(unused)]
+use crate::dns::{BasicRecord, DnsServer, RecordType};
+use crate::host::{FullVmInfo, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
@@ -515,23 +516,21 @@ impl Router for MockRouter {
         mac: &str,
         interface: &str,
         comment: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<ArpEntry> {
         let mut arp = self.arp.lock().await;
         if arp.iter().any(|(k, v)| v.address == ip.to_string()) {
             bail!("Address is already in use");
         }
         let max_id = *arp.keys().max().unwrap_or(&0);
-        arp.insert(
-            max_id + 1,
-            ArpEntry {
-                id: Some((max_id + 1).to_string()),
-                address: ip.to_string(),
-                mac_address: Some(mac.to_string()),
-                interface: interface.to_string(),
-                comment: comment.map(|s| s.to_string()),
-            },
-        );
-        Ok(())
+        let e = ArpEntry {
+            id: (max_id + 1).to_string(),
+            address: ip.to_string(),
+            mac_address: mac.to_string(),
+            interface: Some(interface.to_string()),
+            comment: comment.map(|s| s.to_string()),
+        };
+        arp.insert(max_id + 1, e.clone());
+        Ok(e)
     }
 
     async fn remove_arp_entry(&self, id: &str) -> anyhow::Result<()> {
@@ -636,7 +635,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn create_vm(&self, cfg: &CreateVmRequest) -> anyhow::Result<()> {
+    async fn create_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
         let mut vms = self.vms.lock().await;
         let max_id = *vms.keys().max().unwrap_or(&0);
         vms.insert(
@@ -717,7 +716,8 @@ impl DnsServer for MockDnsServer {
         Ok(BasicRecord {
             name: format!("{}.X.Y.Z.in-addr.arpa", key),
             value: value.to_string(),
-            id,
+            id: Some(id),
+            kind: RecordType::PTR,
         })
     }
 
@@ -746,7 +746,8 @@ impl DnsServer for MockDnsServer {
         Ok(BasicRecord {
             name: fqdn,
             value: ip.to_string(),
-            id,
+            id: Some(id),
+            kind: RecordType::A,
         })
     }
 

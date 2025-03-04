@@ -2,18 +2,17 @@ use crate::api::model::{
     AccountPatchRequest, ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
     ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
 };
-use crate::host::get_host_client;
+use crate::host::{get_host_client, FullVmInfo};
 use crate::nip98::Nip98Auth;
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use futures::future::join_all;
 use lnvps_db::{IpRange, LNVpsDb};
-use log::{debug, error};
 use nostr::util::hex;
-use rocket::futures::{Sink, SinkExt, StreamExt};
+use rocket::futures::{SinkExt, StreamExt};
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;
@@ -24,10 +23,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Display;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
-use ws::Message;
 
 pub fn routes() -> Vec<Route> {
     openapi_get_routes![
@@ -229,9 +226,10 @@ async fn v1_patch_vm(
 
     db.update_vm(&vm).await?;
 
+    let info = FullVmInfo::load(vm.id, (*db).clone()).await?;
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
-    client.configure_vm(&vm).await?;
+    client.configure_vm(&info).await?;
 
     ApiData::ok(())
 }
@@ -479,26 +477,4 @@ async fn v1_get_payment(
     }
 
     ApiData::ok(payment.into())
-}
-
-#[get("/api/v1/console/<id>?<auth>")]
-async fn v1_terminal_proxy(
-    auth: &str,
-    db: &State<Arc<dyn LNVpsDb>>,
-    _provisioner: &State<Arc<LNVpsProvisioner>>,
-    id: u64,
-    _ws: ws::WebSocket,
-) -> Result<ws::Channel<'static>, &'static str> {
-    let auth = Nip98Auth::from_base64(auth).map_err(|_| "Missing or invalid auth param")?;
-    if auth.check(&format!("/api/v1/console/{id}"), "GET").is_err() {
-        return Err("Invalid auth event");
-    }
-    let pubkey = auth.event.pubkey.to_bytes();
-    let uid = db.upsert_user(&pubkey).await.map_err(|_| "Insert failed")?;
-    let vm = db.get_vm(id).await.map_err(|_| "VM not found")?;
-    if uid != vm.user_id {
-        return Err("VM does not belong to you");
-    }
-
-    Err("Not implemented")
 }

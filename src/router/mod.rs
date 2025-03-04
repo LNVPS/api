@@ -1,6 +1,5 @@
 use anyhow::Result;
 use rocket::async_trait;
-use rocket::serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 /// Router defines a network device used to access the hosts
@@ -19,21 +18,16 @@ pub trait Router: Send + Sync {
         mac: &str,
         interface: &str,
         comment: Option<&str>,
-    ) -> Result<()>;
+    ) -> Result<ArpEntry>;
     async fn remove_arp_entry(&self, id: &str) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone)]
 pub struct ArpEntry {
-    #[serde(rename = ".id")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub id: String,
     pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "mac-address")]
-    pub mac_address: Option<String>,
-    pub interface: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac_address: String,
+    pub interface: Option<String>,
     pub comment: Option<String>,
 }
 

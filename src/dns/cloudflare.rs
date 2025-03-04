@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsServer};
+use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::json_api::JsonApi;
 use lnvps_db::async_trait;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,8 @@ impl DnsServer for Cloudflare {
         Ok(BasicRecord {
             name: id_response.result.name,
             value: value.to_string(),
-            id: id_response.result.id.unwrap(),
+            id: id_response.result.id,
+            kind: RecordType::PTR,
         })
     }
 
@@ -67,7 +68,8 @@ impl DnsServer for Cloudflare {
         Ok(BasicRecord {
             name: id_response.result.name,
             value: ip.to_string(),
-            id: id_response.result.id.unwrap(),
+            id: id_response.result.id,
+            kind: RecordType::A,
         })
     }
 

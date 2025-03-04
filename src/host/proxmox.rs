@@ -1,4 +1,4 @@
-use crate::host::{CreateVmRequest, VmHostClient};
+use crate::host::{FullVmInfo, VmHostClient};
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
@@ -8,23 +8,17 @@ use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{async_trait, DiskType, IpRange, LNVpsDb, Vm, VmIpAssignment, VmOsImage};
-use log::{debug, info};
+use log::{info, warn};
 use rand::random;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::{ClientBuilder, Method, Url};
-use serde::de::value::I32Deserializer;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::handshake::client::{generate_key, Request};
-use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 pub struct ProxmoxClient {
     api: JsonApi,
@@ -359,7 +353,7 @@ impl ProxmoxClient {
 }
 
 impl ProxmoxClient {
-    fn make_config(&self, value: &CreateVmRequest) -> Result<VmConfig> {
+    fn make_config(&self, value: &FullVmInfo) -> Result<VmConfig> {
         let mut ip_config = value
             .ips
             .iter()
@@ -474,7 +468,7 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
-    async fn create_vm(&self, req: &CreateVmRequest) -> Result<()> {
+    async fn create_vm(&self, req: &FullVmInfo) -> Result<()> {
         let config = self.make_config(&req)?;
         let vm_id = req.vm.id.into();
         let t_create = self
@@ -511,11 +505,14 @@ impl VmHostClient for ProxmoxClient {
                 size: req.template.disk_size.to_string(),
             })
             .await?;
+        // TODO: rollback
         self.wait_for_task(&j_resize).await?;
 
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
-            self.wait_for_task(&j_start).await?;
+            if let Err(e) = self.wait_for_task(&j_start).await {
+                warn!("Failed to start vm: {}", e);
+            }
         }
 
         Ok(())
@@ -539,8 +536,23 @@ impl VmHostClient for ProxmoxClient {
         })
     }
 
-    async fn configure_vm(&self, vm: &Vm) -> Result<()> {
-        todo!()
+    async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()> {
+        let mut config = self.make_config(&cfg)?;
+
+        // dont re-create the disks
+        config.scsi_0 = None;
+        config.scsi_1 = None;
+        config.efi_disk_0 = None;
+
+        self.configure_vm(ConfigureVm {
+            node: self.node.clone(),
+            vm_id: cfg.vm.id.into(),
+            current: None,
+            snapshot: None,
+            config,
+        })
+        .await?;
+        Ok(())
     }
 }
 

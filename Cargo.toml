@@ -7,7 +7,7 @@ edition = "2021"
 name = "api"
 
 [features]
-default = ["mikrotik", "nostr-dm", "proxmox", "lnd", "bitvora", "cloudflare"]
+default = ["mikrotik", "nostr-dm", "proxmox", "lnd", "cloudflare"]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]

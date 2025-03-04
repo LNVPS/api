@@ -1,6 +1,6 @@
 use crate::dns::DnsServer;
 use crate::exchange::{ExchangeRateService, Ticker};
-use crate::host::{get_host_client, CreateVmRequest, VmHostClient};
+use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{NetworkProvisioner, ProvisionerMethod};
 use crate::router::Router;
@@ -8,19 +8,16 @@ use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Set
 use anyhow::{bail, Result};
 use chrono::{Days, Months, Utc};
 use futures::future::join_all;
-use lnvps_db::{DiskType, IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
-use log::{debug, info, warn};
+use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
+use log::{info, warn};
 use nostr::util::hex;
 use rand::random;
-use rocket::futures::{SinkExt, StreamExt};
-use std::collections::{HashMap, HashSet};
-use std::fmt::format;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 /// Main provisioner class for LNVPS
 ///
@@ -62,14 +59,11 @@ impl LNVpsProvisioner {
         if let NetworkAccessPolicy::StaticArp { .. } = &self.network_policy.access {
             if let Some(r) = self.router.as_ref() {
                 let ent = r.list_arp_entry().await?;
-                if let Some(ent) = ent.iter().find(|e| {
-                    e.mac_address
-                        .as_ref()
-                        .map(|m| m.eq_ignore_ascii_case(&vm.mac_address))
-                        .unwrap_or(false)
-                }) {
-                    r.remove_arp_entry(ent.id.as_ref().unwrap().as_str())
-                        .await?;
+                if let Some(ent) = ent
+                    .iter()
+                    .find(|e| e.mac_address.eq_ignore_ascii_case(&vm.mac_address))
+                {
+                    r.remove_arp_entry(&ent.id).await?;
                 } else {
                     warn!("ARP entry not found, skipping")
                 }
@@ -101,14 +95,14 @@ impl LNVpsProvisioner {
             let sub_name = format!("vm-{}", vm.id);
             let fwd = dns.add_a_record(&sub_name, ip.clone()).await?;
             assignment.dns_forward = Some(fwd.name.clone());
-            assignment.dns_forward_ref = Some(fwd.id);
+            assignment.dns_forward_ref = fwd.id;
 
             match ip {
                 IpAddr::V4(ip) => {
                     let last_octet = ip.octets()[3].to_string();
                     let rev = dns.add_ptr_record(&last_octet, &fwd.name).await?;
                     assignment.dns_reverse = Some(fwd.name.clone());
-                    assignment.dns_reverse_ref = Some(rev.id);
+                    assignment.dns_reverse_ref = rev.id;
                 }
                 IpAddr::V6(_) => {
                     warn!("IPv6 forward DNS not supported yet")
@@ -290,40 +284,16 @@ impl LNVpsProvisioner {
         if self.read_only {
             bail!("Cant spawn VM's in read-only mode")
         }
-        let vm = self.db.get_vm(vm_id).await?;
-        let template = self.db.get_vm_template(vm.template_id).await?;
-        let host = self.db.get_host(vm.host_id).await?;
-        let image = self.db.get_os_image(vm.image_id).await?;
-        let disk = self.db.get_host_disk(vm.disk_id).await?;
-        let ssh_key = self.db.get_user_ssh_key(vm.ssh_key_id).await?;
-
-        let client = get_host_client(&host, &self.provisioner_config)?;
-
         // setup network by allocating some IP space
-        let ips = self.allocate_ips(vm.id).await?;
+        self.allocate_ips(vm_id).await?;
 
-        let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
-        let ip_ranges: Vec<_> = ip_range_ids
-            .iter()
-            .map(|i| self.db.get_ip_range(*i))
-            .collect();
-        let ranges: Vec<IpRange> = join_all(ip_ranges)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-            .collect();
+        // load full info
+        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
 
-        // create VM
-        let req = CreateVmRequest {
-            vm,
-            template,
-            image,
-            ips,
-            disk,
-            ranges,
-            ssh_key,
-        };
-        client.create_vm(&req).await?;
+        // load host client
+        let host = self.db.get_host(info.vm.host_id).await?;
+        let client = get_host_client(&host, &self.provisioner_config)?;
+        client.create_vm(&info).await?;
 
         Ok(())
     }
@@ -410,7 +380,6 @@ mod tests {
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(DefaultRateCache::default());
         let router = settings.get_router().expect("router").unwrap();
-        let dns = settings.get_dns().expect("dns").unwrap();
         let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
 
         let pubkey: [u8; 32] = random();
@@ -433,8 +402,8 @@ mod tests {
         let arp = router.list_arp_entry().await?;
         assert_eq!(1, arp.len());
         let arp = arp.first().unwrap();
-        assert_eq!(&vm.mac_address, arp.mac_address.as_ref().unwrap());
-        assert_eq!(ROUTER_BRIDGE, &arp.interface);
+        assert_eq!(&vm.mac_address, &arp.mac_address);
+        assert_eq!(ROUTER_BRIDGE, arp.interface.as_ref().unwrap());
         println!("{:?}", arp);
 
         let ips = db.list_vm_ip_assignments(vm.id).await?;

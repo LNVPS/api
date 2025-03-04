@@ -1,4 +1,4 @@
-use crate::host::{CreateVmRequest, VmHostClient};
+use crate::host::{FullVmInfo, VmHostClient};
 use crate::status::VmState;
 use lnvps_db::{async_trait, Vm, VmOsImage};
 
@@ -26,7 +26,7 @@ impl VmHostClient for LibVirt {
         todo!()
     }
 
-    async fn create_vm(&self, cfg: &CreateVmRequest) -> anyhow::Result<()> {
+    async fn create_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
         todo!()
     }
 

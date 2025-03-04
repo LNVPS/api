@@ -181,7 +181,7 @@ impl Settings {
     pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
         #[cfg(test)]
         {
-            if let Some(router) = &self.router {
+            if let Some(_router) = &self.router {
                 let router = crate::mocks::MockRouter::new(self.network_policy.clone());
                 Ok(Some(Arc::new(router)))
             } else {
