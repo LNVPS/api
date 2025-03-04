@@ -1,4 +1,5 @@
 use anyhow::Error;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use config::{Config, File};
 use lnvps::api;
@@ -10,30 +11,66 @@ use lnvps::settings::Settings;
 use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
-use log::error;
+use log::{error, LevelFilter};
 use nostr::Keys;
 use nostr_sdk::Client;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs::create_dir_all;
 use tokio::time::sleep;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
 struct Args {
+    /// Path to the config file
     #[clap(short, long)]
-    config: Option<String>,
+    config: Option<PathBuf>,
+
+    /// Where to write the log file
+    #[clap(long)]
+    log: Option<PathBuf>,
 }
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    pretty_env_logger::init();
+    let log_level = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "info".to_string()) // Default to "info" if not set
+        .to_lowercase();
+
+    let max_level = match log_level.as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        "off" => LevelFilter::Off,
+        _ => LevelFilter::Info,
+    };
 
     let args = Args::parse();
+    fern::Dispatch::new()
+        .level(max_level)
+        .level_for("rocket", LevelFilter::Error)
+        .chain(fern::log_file(
+            args.log.unwrap_or(PathBuf::from(".")).join("main.log"),
+        )?)
+        .chain(std::io::stdout())
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}] [{}] {}",
+                Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                message
+            ))
+        })
+        .apply()?;
+
     let settings: Settings = Config::builder()
-        .add_source(File::with_name(
-            &args.config.unwrap_or("config.yaml".to_string()),
+        .add_source(File::from(
+            args.config.unwrap_or(PathBuf::from("config.yaml")),
         ))
         .build()?
         .try_deserialize()?;
