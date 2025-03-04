@@ -191,6 +191,8 @@ pub struct ApiVmHostRegion {
 pub struct VMPatchRequest {
     /// SSH key assigned to vm
     pub ssh_key_id: Option<u64>,
+    /// Reverse DNS PTR domain
+    pub reverse_dns: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

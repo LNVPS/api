@@ -1,8 +1,9 @@
 use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::json_api::JsonApi;
+use anyhow::Context;
 use lnvps_db::async_trait;
+use log::info;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 
 pub struct Cloudflare {
     api: JsonApi,
@@ -23,58 +24,89 @@ impl Cloudflare {
 
 #[async_trait]
 impl DnsServer for Cloudflare {
-    async fn add_ptr_record(&self, key: &str, value: &str) -> anyhow::Result<BasicRecord> {
+    async fn add_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+        let zone_id = match &record.kind {
+            RecordType::PTR => &self.reverse_zone_id,
+            _ => &self.forward_zone_id,
+        };
+        info!(
+            "Adding record: [{}] {} => {}",
+            record.kind, record.name, record.value
+        );
         let id_response: CfResult<CfRecord> = self
             .api
             .post(
-                &format!("/client/v4/zones/{}/dns_records", self.reverse_zone_id),
+                &format!("/client/v4/zones/{zone_id}/dns_records"),
                 CfRecord {
-                    content: value.to_string(),
-                    name: key.to_string(),
-                    r_type: "PTR".to_string(),
+                    content: record.value.to_string(),
+                    name: record.name.to_string(),
+                    r_type: Some(record.kind.to_string()),
                     id: None,
                 },
             )
             .await?;
         Ok(BasicRecord {
             name: id_response.result.name,
-            value: value.to_string(),
+            value: id_response.result.content,
             id: id_response.result.id,
-            kind: RecordType::PTR,
+            kind: record.kind.clone(),
         })
     }
 
-    async fn delete_ptr_record(&self, key: &str) -> anyhow::Result<()> {
-        todo!()
+    async fn delete_record(&self, record: &BasicRecord) -> anyhow::Result<()> {
+        let zone_id = match &record.kind {
+            RecordType::PTR => &self.reverse_zone_id,
+            _ => &self.forward_zone_id,
+        };
+        let record_id = record.id.as_ref().context("record id missing")?;
+        info!(
+            "Deleting record: [{}] {} => {}",
+            record.kind, record.name, record.value
+        );
+        self.api
+            .req(
+                reqwest::Method::DELETE,
+                &format!("/client/v4/zones/{}/dns_records/{}", zone_id, record_id),
+                CfRecord {
+                    content: record.value.to_string(),
+                    name: record.name.to_string(),
+                    r_type: None,
+                    id: None,
+                },
+            )
+            .await?;
+        Ok(())
     }
 
-    async fn add_a_record(&self, name: &str, ip: IpAddr) -> anyhow::Result<BasicRecord> {
+    async fn update_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+        let zone_id = match &record.kind {
+            RecordType::PTR => &self.reverse_zone_id,
+            _ => &self.forward_zone_id,
+        };
+        info!(
+            "Updating record: [{}] {} => {}",
+            record.kind, record.name, record.value
+        );
+        let record_id = record.id.as_ref().context("record id missing")?;
         let id_response: CfResult<CfRecord> = self
             .api
-            .post(
-                &format!("/client/v4/zones/{}/dns_records", self.forward_zone_id),
+            .req(
+                reqwest::Method::PATCH,
+                &format!("/client/v4/zones/{}/dns_records/{}", zone_id, record_id),
                 CfRecord {
-                    content: ip.to_string(),
-                    name: name.to_string(),
-                    r_type: if ip.is_ipv4() {
-                        "A".to_string()
-                    } else {
-                        "AAAA".to_string()
-                    },
-                    id: None,
+                    content: record.value.to_string(),
+                    name: record.name.to_string(),
+                    r_type: Some(record.kind.to_string()),
+                    id: Some(record_id.to_string()),
                 },
             )
             .await?;
         Ok(BasicRecord {
             name: id_response.result.name,
-            value: ip.to_string(),
+            value: id_response.result.content,
             id: id_response.result.id,
-            kind: RecordType::A,
+            kind: record.kind.clone(),
         })
-    }
-
-    async fn delete_a_record(&self, name: &str) -> anyhow::Result<()> {
-        todo!()
     }
 }
 
@@ -82,8 +114,11 @@ impl DnsServer for Cloudflare {
 struct CfRecord {
     pub content: String,
     pub name: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "type")]
-    pub r_type: String,
+    pub r_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
 

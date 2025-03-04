@@ -1,11 +1,11 @@
-use crate::dns::DnsServer;
+use crate::dns::{BasicRecord, DnsServer};
 use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{NetworkProvisioner, ProvisionerMethod};
 use crate::router::Router;
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{Days, Months, Utc};
 use futures::future::join_all;
 use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
@@ -55,7 +55,8 @@ impl LNVpsProvisioner {
         }
     }
 
-    async fn delete_ip_assignment(&self, vm: &Vm) -> Result<()> {
+    pub async fn delete_ip_assignment(&self, vm: &Vm) -> Result<()> {
+        // Delete access policy
         if let NetworkAccessPolicy::StaticArp { .. } = &self.network_policy.access {
             if let Some(r) = self.router.as_ref() {
                 let ent = r.list_arp_entry().await?;
@@ -67,6 +68,45 @@ impl LNVpsProvisioner {
                 } else {
                     warn!("ARP entry not found, skipping")
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+        if let Some(dns) = &self.dns {
+            let fwd = BasicRecord::forward(assignment)?;
+            let ret_fwd = if fwd.id.is_some() {
+                dns.update_record(&fwd).await?
+            } else {
+                dns.add_record(&fwd).await?
+            };
+            assignment.dns_forward = Some(ret_fwd.name);
+            assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
+
+            // save to db
+            if assignment.id != 0 {
+                self.db.update_vm_ip_assignment(assignment).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+        if let Some(dns) = &self.dns {
+            let ret_rev = if assignment.dns_reverse_ref.is_some() {
+                dns.update_record(&BasicRecord::reverse(assignment)?)
+                    .await?
+            } else {
+                dns.add_record(&BasicRecord::reverse_to_fwd(assignment)?)
+                    .await?
+            };
+            assignment.dns_reverse = Some(ret_rev.value);
+            assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
+
+            // save to db
+            if assignment.id != 0 {
+                self.db.update_vm_ip_assignment(assignment).await?;
             }
         }
         Ok(())
@@ -91,27 +131,11 @@ impl LNVpsProvisioner {
         }
 
         // Add DNS records
-        if let Some(dns) = &self.dns {
-            let sub_name = format!("vm-{}", vm.id);
-            let fwd = dns.add_a_record(&sub_name, ip.clone()).await?;
-            assignment.dns_forward = Some(fwd.name.clone());
-            assignment.dns_forward_ref = fwd.id;
-
-            match ip {
-                IpAddr::V4(ip) => {
-                    let last_octet = ip.octets()[3].to_string();
-                    let rev = dns.add_ptr_record(&last_octet, &fwd.name).await?;
-                    assignment.dns_reverse = Some(fwd.name.clone());
-                    assignment.dns_reverse_ref = rev.id;
-                }
-                IpAddr::V6(_) => {
-                    warn!("IPv6 forward DNS not supported yet")
-                }
-            }
-        }
+        self.update_forward_ip_dns(assignment).await?;
+        self.update_reverse_ip_dns(assignment).await?;
 
         // save to db
-        self.db.insert_vm_ip_assignment(&assignment).await?;
+        self.db.insert_vm_ip_assignment(assignment).await?;
         Ok(())
     }
 
@@ -416,7 +440,7 @@ mod tests {
         assert!(ip.dns_forward.is_some());
         assert!(ip.dns_reverse.is_some());
         assert!(ip.dns_reverse_ref.is_some());
-        assert!(ip.dns_forward.is_some());
+        assert!(ip.dns_forward_ref.is_some());
         assert_eq!(ip.dns_reverse, ip.dns_forward);
 
         // assert IP address is not CIDR

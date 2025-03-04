@@ -666,7 +666,7 @@ impl VmHostClient for MockVmHost {
         }
     }
 
-    async fn configure_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -696,62 +696,42 @@ impl MockDnsServer {
 }
 #[async_trait]
 impl DnsServer for MockDnsServer {
-    async fn add_ptr_record(&self, key: &str, value: &str) -> anyhow::Result<BasicRecord> {
-        let mut rev = self.reverse.lock().await;
+    async fn add_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+        let mut table = match record.kind {
+            RecordType::PTR => self.reverse.lock().await,
+            _ => self.forward.lock().await,
+        };
 
-        if rev.values().any(|v| v.name == key) {
-            bail!("Duplicate record with name {}", key);
+        if table.values().any(|v| v.name == record.name) {
+            bail!("Duplicate record with name {}", record.name);
         }
 
         let rnd_id: [u8; 12] = rand::random();
         let id = hex::encode(rnd_id);
-        rev.insert(
+        table.insert(
             id.clone(),
             MockDnsEntry {
-                name: key.to_string(),
-                value: value.to_string(),
-                kind: "PTR".to_string(),
+                name: record.name.to_string(),
+                value: record.value.to_string(),
+                kind: record.kind.to_string(),
             },
         );
         Ok(BasicRecord {
-            name: format!("{}.X.Y.Z.in-addr.arpa", key),
-            value: value.to_string(),
+            name: match record.kind {
+                RecordType::PTR => format!("{}.X.Y.Z.addr.in-arpa", record.name),
+                _ => format!("{}.lnvps.mock", record.name),
+            },
+            value: record.value.clone(),
             id: Some(id),
-            kind: RecordType::PTR,
+            kind: record.kind.clone(),
         })
     }
 
-    async fn delete_ptr_record(&self, key: &str) -> anyhow::Result<()> {
+    async fn delete_record(&self, record: &BasicRecord) -> anyhow::Result<()> {
         todo!()
     }
 
-    async fn add_a_record(&self, name: &str, ip: IpAddr) -> anyhow::Result<BasicRecord> {
-        let mut rev = self.forward.lock().await;
-
-        if rev.values().any(|v| v.name == name) {
-            bail!("Duplicate record with name {}", name);
-        }
-
-        let fqdn = format!("{}.lnvps.mock", name);
-        let rnd_id: [u8; 12] = rand::random();
-        let id = hex::encode(rnd_id);
-        rev.insert(
-            id.clone(),
-            MockDnsEntry {
-                name: fqdn.clone(),
-                value: ip.to_string(),
-                kind: "A".to_string(),
-            },
-        );
-        Ok(BasicRecord {
-            name: fqdn,
-            value: ip.to_string(),
-            id: Some(id),
-            kind: RecordType::A,
-        })
-    }
-
-    async fn delete_a_record(&self, name: &str) -> anyhow::Result<()> {
+    async fn update_record(&self, name: &BasicRecord) -> anyhow::Result<BasicRecord> {
         todo!()
     }
 }

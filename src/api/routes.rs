@@ -205,6 +205,7 @@ async fn v1_get_vm(
 async fn v1_patch_vm(
     auth: Nip98Auth,
     db: &State<Arc<dyn LNVpsDb>>,
+    provisioner: &State<Arc<LNVpsProvisioner>>,
     settings: &State<Settings>,
     id: u64,
     data: Json<VMPatchRequest>,
@@ -216,20 +217,31 @@ async fn v1_patch_vm(
         return ApiData::err("VM doesnt belong to you");
     }
 
+    let mut vm_config = false;
     if let Some(k) = data.ssh_key_id {
         let ssh_key = db.get_user_ssh_key(k).await?;
         if ssh_key.user_id != uid {
             return ApiData::err("SSH key doesnt belong to you");
         }
         vm.ssh_key_id = ssh_key.id;
+        vm_config = true;
     }
 
-    db.update_vm(&vm).await?;
+    if let Some(ptr) = &data.reverse_dns {
+        let mut ips = db.list_vm_ip_assignments(vm.id).await?;
+        for mut ip in ips.iter_mut() {
+            ip.dns_reverse = Some(ptr.to_string());
+            provisioner.update_reverse_ip_dns(&mut ip).await?;
+        }
+    }
 
-    let info = FullVmInfo::load(vm.id, (*db).clone()).await?;
-    let host = db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &settings.provisioner)?;
-    client.configure_vm(&info).await?;
+    if vm_config {
+        db.update_vm(&vm).await?;
+        let info = FullVmInfo::load(vm.id, (*db).clone()).await?;
+        let host = db.get_host(vm.host_id).await?;
+        let client = get_host_client(&host, &settings.provisioner)?;
+        client.configure_vm(&info).await?;
+    }
 
     ApiData::ok(())
 }
