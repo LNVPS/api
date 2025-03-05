@@ -223,6 +223,14 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn list_vms_on_host(&self, host_id: u64) -> Result<Vec<Vm>> {
+        sqlx::query_as("select * from vm where deleted = 0 and host_id = ?")
+            .bind(host_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn list_expired_vms(&self) -> Result<Vec<Vm>> {
         sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
             .fetch_all(&self.db)

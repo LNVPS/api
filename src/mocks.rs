@@ -326,6 +326,15 @@ impl LNVpsDb for MockDb {
         Ok(vms.values().filter(|v| !v.deleted).cloned().collect())
     }
 
+    async fn list_vms_on_host(&self, host_id: u64) -> anyhow::Result<Vec<Vm>> {
+        let vms = self.vms.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| !v.deleted && v.host_id == host_id)
+            .cloned()
+            .collect())
+    }
+
     async fn list_expired_vms(&self) -> anyhow::Result<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms
