@@ -69,7 +69,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn delete_user(&self, _id: u64) -> Result<()> {
-        todo!()
+        bail!("Deleting users is not supported")
     }
 
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> Result<u64> {
@@ -247,7 +247,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,disk_id,mac_address) values(?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
@@ -257,6 +257,7 @@ impl LNVpsDb for LNVpsDbMysql {
             .bind(vm.expires)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
+            .bind(&vm.ref_code)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)?

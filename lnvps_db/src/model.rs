@@ -14,9 +14,11 @@ pub struct User {
     pub pubkey: Vec<u8>,
     /// When this user first started using the service (first login)
     pub created: DateTime<Utc>,
+    /// Users email address for notifications
     pub email: Option<String>,
-    pub contact_nip4: bool,
+    /// If user should be contacted via NIP-17 for notifications
     pub contact_nip17: bool,
+    /// If user should be contacted via email for notifications
     pub contact_email: bool,
 }
 
@@ -222,6 +224,8 @@ pub struct Vm {
     pub mac_address: String,
     /// Is the VM deleted
     pub deleted: bool,
+    /// Referral code (recorded during ordering)
+    pub ref_code: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

@@ -249,6 +249,7 @@ impl LNVpsProvisioner {
         template_id: u64,
         image_id: u64,
         ssh_key_id: u64,
+        ref_code: Option<String>,
     ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
         let template = self.db.get_vm_template(template_id).await?;
@@ -272,6 +273,7 @@ impl LNVpsProvisioner {
 
         let client = get_host_client(&pick_host, &self.provisioner_config)?;
         let mut new_vm = Vm {
+            id: 0,
             host_id: pick_host.id,
             user_id: user.id,
             image_id: image.id,
@@ -280,7 +282,9 @@ impl LNVpsProvisioner {
             created: Utc::now(),
             expires: Utc::now(),
             disk_id: pick_disk.id,
-            ..Default::default()
+            mac_address: "NOT FILLED YET".to_string(),
+            deleted: false,
+            ref_code,
         };
 
         // ask host client to generate the mac address
@@ -468,7 +472,9 @@ mod tests {
         };
         let ssh_key = db.insert_user_ssh_key(&new_key).await?;
 
-        let vm = provisioner.provision(user_id, 1, 1, ssh_key).await?;
+        let vm = provisioner
+            .provision(user_id, 1, 1, ssh_key, Some("mock-ref".to_string()))
+            .await?;
         println!("{:?}", vm);
         provisioner.spawn_vm(vm.id).await?;
 
@@ -477,6 +483,7 @@ mod tests {
         assert_eq!(1, arp.len());
         let arp = arp.first().unwrap();
         assert_eq!(&vm.mac_address, &arp.mac_address);
+        assert_eq!(vm.ref_code, Some("mock-ref".to_string()));
         assert_eq!(ROUTER_BRIDGE, arp.interface.as_ref().unwrap());
         println!("{:?}", arp);
 

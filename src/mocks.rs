@@ -173,7 +173,6 @@ impl LNVpsDb for MockDb {
                     pubkey: pubkey.to_vec(),
                     created: Utc::now(),
                     email: None,
-                    contact_nip4: false,
                     contact_nip17: false,
                     contact_email: false,
                 },
@@ -193,7 +192,6 @@ impl LNVpsDb for MockDb {
             u.email = user.email.clone();
             u.contact_email = user.contact_email;
             u.contact_nip17 = user.contact_nip17;
-            u.contact_nip4 = user.contact_nip4;
         }
         Ok(())
     }
@@ -377,6 +375,7 @@ impl LNVpsDb for MockDb {
                 disk_id: vm.disk_id,
                 mac_address: vm.mac_address.clone(),
                 deleted: false,
+                ref_code: vm.ref_code.clone(),
             },
         );
         Ok(max_id + 1)

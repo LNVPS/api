@@ -361,14 +361,20 @@ async fn v1_create_vm_order(
     auth: Nip98Auth,
     db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
-    req: Json<CreateVmRequest>,
+    req: Json<CreateVmRequest>
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
 
     let req = req.0;
     let rsp = provisioner
-        .provision(uid, req.template_id, req.image_id, req.ssh_key_id)
+        .provision(
+            uid,
+            req.template_id,
+            req.image_id,
+            req.ssh_key_id,
+            req.ref_code,
+        )
         .await?;
     ApiData::ok(vm_to_status(db, rsp, None).await?)
 }

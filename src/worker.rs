@@ -241,9 +241,6 @@ impl Worker {
                 sender.send(msg).await?;
             }
         }
-        if user.contact_nip4 {
-            // TODO: send nip4 dm
-        }
         if user.contact_nip17 {
             if let Some(c) = self.nostr.as_ref() {
                 let sig = c.signer().await?;
