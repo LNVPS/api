@@ -2,9 +2,7 @@ use crate::dns::{BasicRecord, DnsServer};
 use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{
-    HostCapacityService, NetworkProvisioner, ProvisionerMethod,
-};
+use crate::provisioner::{HostCapacityService, NetworkProvisioner, ProvisionerMethod};
 use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
@@ -399,6 +397,8 @@ mod tests {
     use crate::mocks::{MockDb, MockDnsServer, MockNode, MockRouter};
     use crate::settings::{DnsServerConfig, LightningConfig, QemuConfig, RouterConfig};
     use lnvps_db::{DiskInterface, DiskType, User, UserSshKey, VmTemplate};
+    use std::net::IpAddr;
+    use std::str::FromStr;
 
     const ROUTER_BRIDGE: &str = "bridge1";
     const GB: u64 = 1024 * 1024 * 1024;
@@ -449,7 +449,7 @@ mod tests {
     }
 
     async fn add_user(db: &Arc<MockDb>) -> Result<(User, UserSshKey)> {
-        let pubkey: [u8; 32] = random();
+        let pubkey: [u8; 32] = rand::random();
 
         let user_id = db.upsert_user(&pubkey).await?;
         let mut new_key = UserSshKey {
