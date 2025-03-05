@@ -179,7 +179,7 @@ pub struct VmCostPlan {
     pub id: u64,
     pub name: String,
     pub created: DateTime<Utc>,
-    pub amount: u64,
+    pub amount: f32,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: VmCostPlanIntervalType,

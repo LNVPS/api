@@ -321,7 +321,7 @@ impl LNVpsProvisioner {
             bail!("No exchange rate found")
         };
 
-        let cost_btc = cost_plan.amount as f32 / rate;
+        let cost_btc = cost_plan.amount / rate;
         let cost_msat = (cost_btc as f64 * BTC_SATS) as u64 * 1000;
         info!("Creating invoice for {vm_id} for {} sats", cost_msat / 1000);
         let invoice = self

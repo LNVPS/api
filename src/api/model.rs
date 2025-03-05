@@ -175,7 +175,7 @@ impl From<lnvps_db::VmCostPlanIntervalType> for ApiVmCostPlanIntervalType {
 pub struct ApiVmCostPlan {
     pub id: u64,
     pub name: String,
-    pub amount: u64,
+    pub amount: f32,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,

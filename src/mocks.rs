@@ -102,7 +102,7 @@ impl Default for MockDb {
                 id: 1,
                 name: "mock".to_string(),
                 created: Utc::now(),
-                amount: 1,
+                amount: 1f32,
                 currency: "EUR".to_string(),
                 interval_amount: 1,
                 interval_type: VmCostPlanIntervalType::Month,
