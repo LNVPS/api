@@ -114,7 +114,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_hosts(&self) -> Result<Vec<VmHost>> {
-        sqlx::query_as("select * from vm_host")
+        sqlx::query_as("select * from vm_host where enabled = 1")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
@@ -214,6 +214,25 @@ impl LNVpsDb for LNVpsDbMysql {
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
+    }
+
+    async fn insert_vm_template(&self, template: &VmTemplate) -> Result<u64> {
+        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(?,?,?,?,?,?,?,?,?,?,?) returning id")
+            .bind(&template.name)
+            .bind(&template.enabled)
+            .bind(&template.created)
+            .bind(&template.expires)
+            .bind(template.cpu)
+            .bind(template.memory)
+            .bind(template.disk_size)
+            .bind(&template.disk_type)
+            .bind(&template.disk_interface)
+            .bind(template.cost_plan_id)
+            .bind(template.region_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
     }
 
     async fn list_vms(&self) -> Result<Vec<Vm>> {

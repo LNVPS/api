@@ -31,10 +31,11 @@ pub struct UserSshKey {
     pub key_data: String,
 }
 
-#[derive(Clone, Debug, sqlx::Type)]
+#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 /// The type of VM host
 pub enum VmHostKind {
+    #[default]
     Proxmox = 0,
     LibVirt = 1,
 }
@@ -55,7 +56,7 @@ pub struct VmHostRegion {
     pub enabled: bool,
 }
 
-#[derive(FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug, Default)]
 /// A VM host
 pub struct VmHost {
     /// Unique id of this host
@@ -76,9 +77,11 @@ pub struct VmHost {
     pub enabled: bool,
     /// API token used to control this host via [ip]
     pub api_token: String,
+    /// Load factor for provisioning
+    pub load_factor: f32,
 }
 
-#[derive(FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct VmHostDisk {
     pub id: u64,
     pub host_id: u64,
@@ -89,7 +92,7 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, sqlx::Type, Default)]
+#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DiskType {
     #[default]
@@ -97,7 +100,7 @@ pub enum DiskType {
     SSD = 1,
 }
 
-#[derive(Clone, Debug, sqlx::Type, Default)]
+#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DiskInterface {
     #[default]
@@ -106,7 +109,7 @@ pub enum DiskInterface {
     PCIe = 2,
 }
 
-#[derive(Clone, Debug, sqlx::Type, Default)]
+#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum OsDistribution {
     #[default]

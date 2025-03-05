@@ -76,9 +76,10 @@ impl Default for MockDb {
                 name: "mock-host".to_string(),
                 ip: "https://localhost".to_string(),
                 cpu: 4,
-                memory: 8192,
+                memory: 8 * GB,
                 enabled: true,
                 api_token: "".to_string(),
+                load_factor: 1.5,
             },
         );
         let mut host_disks = HashMap::new();
@@ -209,10 +210,7 @@ impl LNVpsDb for MockDb {
             max_keys + 1,
             UserSshKey {
                 id: max_keys + 1,
-                name: new_key.name.clone(),
-                user_id: new_key.user_id,
-                created: Utc::now(),
-                key_data: new_key.key_data.clone(),
+                ..new_key.clone()
             },
         );
         Ok(max_keys + 1)
@@ -321,6 +319,19 @@ impl LNVpsDb for MockDb {
             .collect())
     }
 
+    async fn insert_vm_template(&self, template: &VmTemplate) -> anyhow::Result<u64> {
+        let mut templates = self.templates.lock().await;
+        let max_id = *templates.keys().max().unwrap_or(&0);
+        templates.insert(
+            max_id + 1,
+            VmTemplate {
+                id: max_id + 1,
+                ..template.clone()
+            },
+        );
+        Ok(max_id + 1)
+    }
+
     async fn list_vms(&self) -> anyhow::Result<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms.values().filter(|v| !v.deleted).cloned().collect())
@@ -374,17 +385,7 @@ impl LNVpsDb for MockDb {
             max_id + 1,
             Vm {
                 id: max_id + 1,
-                host_id: vm.host_id,
-                user_id: vm.user_id,
-                image_id: vm.image_id,
-                template_id: vm.template_id,
-                ssh_key_id: vm.ssh_key_id,
-                created: Utc::now(),
-                expires: Utc::now(),
-                disk_id: vm.disk_id,
-                mac_address: vm.mac_address.clone(),
-                deleted: false,
-                ref_code: vm.ref_code.clone(),
+                ..vm.clone()
             },
         );
         Ok(max_id + 1)
@@ -411,15 +412,7 @@ impl LNVpsDb for MockDb {
             max + 1,
             VmIpAssignment {
                 id: max + 1,
-                vm_id: ip_assignment.vm_id,
-                ip_range_id: ip_assignment.ip_range_id,
-                ip: ip_assignment.ip.clone(),
-                deleted: false,
-                arp_ref: ip_assignment.arp_ref.clone(),
-                dns_forward: ip_assignment.dns_forward.clone(),
-                dns_forward_ref: ip_assignment.dns_forward_ref.clone(),
-                dns_reverse: ip_assignment.dns_reverse.clone(),
-                dns_reverse_ref: ip_assignment.dns_reverse_ref.clone(),
+                ..ip_assignment.clone()
             },
         );
         Ok(max + 1)

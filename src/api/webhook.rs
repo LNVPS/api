@@ -1,11 +1,7 @@
-use lettre::message::header::Headers;
 use log::warn;
 use reqwest::header::HeaderMap;
-use reqwest::Request;
-use rocket::data::{ByteUnit, FromData, ToByteUnit};
+use rocket::data::{FromData, ToByteUnit};
 use rocket::http::Status;
-use rocket::outcome::IntoOutcome;
-use rocket::request::{FromRequest, Outcome};
 use rocket::{post, routes, Data, Route};
 use std::collections::HashMap;
 use std::sync::LazyLock;

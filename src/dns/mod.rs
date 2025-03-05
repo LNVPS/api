@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use lnvps_db::{async_trait, VmIpAssignment};
-use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;

@@ -2,7 +2,9 @@ use crate::dns::{BasicRecord, DnsServer};
 use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{NetworkProvisioner, ProvisionerMethod};
+use crate::provisioner::{
+    HostCapacity, HostCapacityService, NetworkProvisioner, ProvisionerMethod,
+};
 use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
@@ -255,33 +257,28 @@ impl LNVpsProvisioner {
         let template = self.db.get_vm_template(template_id).await?;
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
-        let hosts = self.db.list_hosts().await?;
 
-        // TODO: impl resource usage based provisioning
-        let pick_host = if let Some(h) = hosts.first() {
-            h
-        } else {
-            bail!("No host found")
-        };
-        // TODO: impl resource usage based provisioning (disk)
-        let host_disks = self.db.list_host_disks(pick_host.id).await?;
-        let pick_disk = if let Some(hd) = host_disks.first() {
+        // TODO: cache capacity somewhere
+        let cap = HostCapacityService::new(self.db.clone());
+        let host = cap.get_host_for_template(&template).await?;
+
+        let pick_disk = if let Some(hd) = host.disks.first() {
             hd
         } else {
             bail!("No host disk found")
         };
 
-        let client = get_host_client(&pick_host, &self.provisioner_config)?;
+        let client = get_host_client(&host.host, &self.provisioner_config)?;
         let mut new_vm = Vm {
             id: 0,
-            host_id: pick_host.id,
+            host_id: host.host.id,
             user_id: user.id,
             image_id: image.id,
             template_id: template.id,
             ssh_key_id: ssh_key.id,
             created: Utc::now(),
             expires: Utc::now(),
-            disk_id: pick_disk.id,
+            disk_id: pick_disk.disk.id,
             mac_address: "NOT FILLED YET".to_string(),
             deleted: false,
             ref_code,
@@ -406,13 +403,14 @@ mod tests {
     use crate::exchange::DefaultRateCache;
     use crate::mocks::{MockDb, MockDnsServer, MockNode, MockRouter};
     use crate::settings::{DnsServerConfig, LightningConfig, QemuConfig, RouterConfig};
-    use lnvps_db::UserSshKey;
+    use lnvps_db::{DiskInterface, DiskType, User, UserSshKey, VmTemplate};
 
-    #[tokio::test]
-    async fn test_basic_provisioner() -> Result<()> {
-        const ROUTER_BRIDGE: &str = "bridge1";
+    const ROUTER_BRIDGE: &str = "bridge1";
+    const GB: u64 = 1024 * 1024 * 1024;
+    const TB: u64 = GB * 1024;
 
-        let settings = Settings {
+    fn settings() -> Settings {
+        Settings {
             listen: None,
             db: "".to_string(),
             lightning: LightningConfig::LND {
@@ -452,18 +450,14 @@ mod tests {
                 reverse_zone_id: "456".to_string(),
             }),
             nostr: None,
-        };
-        let db = Arc::new(MockDb::default());
-        let node = Arc::new(MockNode::default());
-        let rates = Arc::new(DefaultRateCache::default());
-        let router = MockRouter::new(settings.network_policy.clone());
-        let dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        }
+    }
 
+    async fn add_user(db: &Arc<MockDb>) -> Result<(User, UserSshKey)> {
         let pubkey: [u8; 32] = random();
 
         let user_id = db.upsert_user(&pubkey).await?;
-        let new_key = UserSshKey {
+        let mut new_key = UserSshKey {
             id: 0,
             name: "test-key".to_string(),
             user_id,
@@ -471,9 +465,23 @@ mod tests {
             key_data: "ssh-rsa AAA==".to_string(),
         };
         let ssh_key = db.insert_user_ssh_key(&new_key).await?;
+        new_key.id = ssh_key;
+        Ok((db.get_user(user_id).await?, new_key))
+    }
 
+    #[tokio::test]
+    async fn basic() -> Result<()> {
+        let settings = settings();
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(DefaultRateCache::default());
+        let router = MockRouter::new(settings.network_policy.clone());
+        let dns = MockDnsServer::new();
+        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+
+        let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user_id, 1, 1, ssh_key, Some("mock-ref".to_string()))
+            .provision(user.id, 1, 1, ssh_key.id, Some("mock-ref".to_string()))
             .await?;
         println!("{:?}", vm);
         provisioner.spawn_vm(vm.id).await?;
@@ -525,6 +533,41 @@ mod tests {
         assert!(ip.deleted);
         println!("{:?}", ip);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_capacity() -> Result<()> {
+        let settings = settings();
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(DefaultRateCache::default());
+        let prov = LNVpsProvisioner::new(settings.clone(), db.clone(), node.clone(), rates.clone());
+
+        let large_template = VmTemplate {
+            id: 0,
+            name: "mock-large-template".to_string(),
+            enabled: true,
+            created: Default::default(),
+            expires: None,
+            cpu: 64,
+            memory: 512 * GB,
+            disk_size: 20 * TB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            cost_plan_id: 1,
+            region_id: 1,
+        };
+        let id = db.insert_vm_template(&large_template).await?;
+
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let prov = prov.provision(user.id, id, 1, ssh_key.id, None).await;
+        assert!(prov.is_err());
+        if let Err(e) = prov {
+            println!("{}", e);
+            assert!(e.to_string().to_lowercase().contains("no available host"))
+        }
         Ok(())
     }
 }

@@ -80,6 +80,9 @@ pub trait LNVpsDb: Sync + Send {
     /// List VM templates
     async fn list_vm_templates(&self) -> Result<Vec<VmTemplate>>;
 
+    /// Insert a new VM template
+    async fn insert_vm_template(&self, template: &VmTemplate) -> Result<u64>;
+
     /// List all VM's
     async fn list_vms(&self) -> Result<Vec<Vm>>;
 
