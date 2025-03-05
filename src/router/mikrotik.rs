@@ -1,6 +1,6 @@
 use crate::json_api::JsonApi;
 use crate::router::{ArpEntry, Router};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use log::debug;
@@ -32,27 +32,9 @@ impl Router for MikrotikRouter {
         Ok(rsp.into_iter().map(|e| e.into()).collect())
     }
 
-    async fn add_arp_entry(
-        &self,
-        ip: IpAddr,
-        mac: &str,
-        arp_interface: &str,
-        comment: Option<&str>,
-    ) -> Result<ArpEntry> {
-        let rsp: MikrotikArpEntry = self
-            .api
-            .req(
-                Method::PUT,
-                "/rest/ip/arp",
-                MikrotikArpEntry {
-                    id: None,
-                    address: ip.to_string(),
-                    mac_address: Some(mac.to_string()),
-                    interface: arp_interface.to_string(),
-                    comment: comment.map(|c| c.to_string()),
-                },
-            )
-            .await?;
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+        let req: MikrotikArpEntry = entry.clone().into();
+        let rsp: MikrotikArpEntry = self.api.req(Method::PUT, "/rest/ip/arp", req).await?;
         debug!("{:?}", rsp);
         Ok(rsp.into())
     }
@@ -60,10 +42,25 @@ impl Router for MikrotikRouter {
     async fn remove_arp_entry(&self, id: &str) -> Result<()> {
         let rsp: MikrotikArpEntry = self
             .api
-            .req(Method::DELETE, &format!("/rest/ip/arp/{id}"), ())
+            .req(Method::DELETE, &format!("/rest/ip/arp/{}", id), ())
             .await?;
         debug!("{:?}", rsp);
         Ok(())
+    }
+
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+        ensure!(entry.id.is_some(), "Cannot update an arp entry without ID");
+        let req: MikrotikArpEntry = entry.clone().into();
+        let rsp: MikrotikArpEntry = self
+            .api
+            .req(
+                Method::PATCH,
+                &format!("/rest/ip/arp/{}", entry.id.as_ref().unwrap()),
+                req,
+            )
+            .await?;
+        debug!("{:?}", rsp);
+        Ok(rsp.into())
     }
 }
 
@@ -84,10 +81,22 @@ pub struct MikrotikArpEntry {
 impl Into<ArpEntry> for MikrotikArpEntry {
     fn into(self) -> ArpEntry {
         ArpEntry {
-            id: self.id.unwrap(),
+            id: self.id,
             address: self.address,
             mac_address: self.mac_address.unwrap(),
             interface: Some(self.interface),
+            comment: self.comment,
+        }
+    }
+}
+
+impl Into<MikrotikArpEntry> for ArpEntry {
+    fn into(self) -> MikrotikArpEntry {
+        MikrotikArpEntry {
+            id: self.id,
+            address: self.address,
+            mac_address: Some(self.mac_address),
+            interface: self.interface.unwrap(),
             comment: self.comment,
         }
     }

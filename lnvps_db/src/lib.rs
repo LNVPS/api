@@ -104,7 +104,7 @@ pub trait LNVpsDb: Sync + Send {
     /// List VM ip assignments
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64>;
 
-    /// Update VM ip assignments
+    /// Update VM ip assignments (arp/dns refs)
     async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<()>;
 
     /// List VM ip assignments

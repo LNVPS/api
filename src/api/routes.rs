@@ -232,6 +232,7 @@ async fn v1_patch_vm(
         for mut ip in ips.iter_mut() {
             ip.dns_reverse = Some(ptr.to_string());
             provisioner.update_reverse_ip_dns(&mut ip).await?;
+            db.update_vm_ip_assignment(&ip).await?;
         }
     }
 

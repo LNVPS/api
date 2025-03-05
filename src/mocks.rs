@@ -5,7 +5,7 @@ use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, Light
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
 use crate::status::{VmRunningState, VmState};
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
 use lnvps_db::{
@@ -14,7 +14,6 @@ use lnvps_db::{
     VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
@@ -510,24 +509,15 @@ impl Router for MockRouter {
         Ok(arp.values().cloned().collect())
     }
 
-    async fn add_arp_entry(
-        &self,
-        ip: IpAddr,
-        mac: &str,
-        interface: &str,
-        comment: Option<&str>,
-    ) -> anyhow::Result<ArpEntry> {
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> anyhow::Result<ArpEntry> {
         let mut arp = self.arp.lock().await;
-        if arp.iter().any(|(k, v)| v.address == ip.to_string()) {
+        if arp.iter().any(|(k, v)| v.address == entry.address) {
             bail!("Address is already in use");
         }
         let max_id = *arp.keys().max().unwrap_or(&0);
         let e = ArpEntry {
-            id: (max_id + 1).to_string(),
-            address: ip.to_string(),
-            mac_address: mac.to_string(),
-            interface: Some(interface.to_string()),
-            comment: comment.map(|s| s.to_string()),
+            id: Some((max_id + 1).to_string()),
+            ..entry.clone()
         };
         arp.insert(max_id + 1, e.clone());
         Ok(e)
@@ -537,6 +527,18 @@ impl Router for MockRouter {
         let mut arp = self.arp.lock().await;
         arp.remove(&id.parse::<u64>()?);
         Ok(())
+    }
+
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> anyhow::Result<ArpEntry> {
+        ensure!(entry.id.is_some(), "id is missing");
+        let mut arp = self.arp.lock().await;
+        if let Some(mut a) = arp.get_mut(&entry.id.as_ref().unwrap().parse::<u64>()?) {
+            a.mac_address = entry.mac_address.clone();
+            a.address = entry.address.clone();
+            a.interface = entry.interface.clone();
+            a.comment = entry.comment.clone();
+        }
+        Ok(entry.clone())
     }
 }
 
@@ -728,10 +730,26 @@ impl DnsServer for MockDnsServer {
     }
 
     async fn delete_record(&self, record: &BasicRecord) -> anyhow::Result<()> {
-        todo!()
+        let mut table = match record.kind {
+            RecordType::PTR => self.reverse.lock().await,
+            _ => self.forward.lock().await,
+        };
+        ensure!(record.id.is_some(), "Id is missing");
+        table.remove(record.id.as_ref().unwrap());
+        Ok(())
     }
 
-    async fn update_record(&self, name: &BasicRecord) -> anyhow::Result<BasicRecord> {
-        todo!()
+    async fn update_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+        let mut table = match record.kind {
+            RecordType::PTR => self.reverse.lock().await,
+            _ => self.forward.lock().await,
+        };
+        ensure!(record.id.is_some(), "Id is missing");
+        if let Some(mut r) = table.get_mut(record.id.as_ref().unwrap()) {
+            r.name = record.name.clone();
+            r.value = record.value.clone();
+            r.kind = record.kind.to_string();
+        }
+        Ok(record.clone())
     }
 }

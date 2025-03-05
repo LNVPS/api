@@ -3,9 +3,9 @@ use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{NetworkProvisioner, ProvisionerMethod};
-use crate::router::Router;
+use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chrono::{Days, Months, Utc};
 use futures::future::join_all;
 use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
@@ -55,24 +55,78 @@ impl LNVpsProvisioner {
         }
     }
 
-    pub async fn delete_ip_assignment(&self, vm: &Vm) -> Result<()> {
-        // Delete access policy
-        if let NetworkAccessPolicy::StaticArp { .. } = &self.network_policy.access {
+    /// Create or Update access policy for a given ip assignment, does not save to database!
+    pub async fn update_access_policy(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+        // apply network policy
+        if let NetworkAccessPolicy::StaticArp { interface } = &self.network_policy.access {
             if let Some(r) = self.router.as_ref() {
-                let ent = r.list_arp_entry().await?;
-                if let Some(ent) = ent
-                    .iter()
-                    .find(|e| e.mac_address.eq_ignore_ascii_case(&vm.mac_address))
-                {
-                    r.remove_arp_entry(&ent.id).await?;
+                let vm = self.db.get_vm(assignment.vm_id).await?;
+                let entry = ArpEntry::new(&vm, &assignment, Some(interface.clone()))?;
+                let arp = if let Some(_id) = &assignment.arp_ref {
+                    r.update_arp_entry(&entry).await?
                 } else {
-                    warn!("ARP entry not found, skipping")
-                }
+                    r.add_arp_entry(&entry).await?
+                };
+                ensure!(arp.id.is_some(), "ARP id was empty");
+                assignment.arp_ref = arp.id;
+            } else {
+                bail!("No router found to apply static arp entry!")
             }
         }
         Ok(())
     }
 
+    /// Remove an access policy for a given ip assignment, does not save to database!
+    pub async fn remove_access_policy(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+        // Delete access policy
+        if let NetworkAccessPolicy::StaticArp { .. } = &self.network_policy.access {
+            if let Some(r) = self.router.as_ref() {
+                let id = if let Some(id) = &assignment.arp_ref {
+                    Some(id.clone())
+                } else {
+                    warn!("ARP REF not found, using arp list");
+
+                    let ent = r.list_arp_entry().await?;
+                    if let Some(ent) = ent.iter().find(|e| e.address == assignment.ip) {
+                        ent.id.clone()
+                    } else {
+                        warn!("ARP entry not found, skipping");
+                        None
+                    }
+                };
+
+                if let Some(id) = id {
+                    if let Err(e) = r.remove_arp_entry(&id).await {
+                        warn!("Failed to remove arp entry, skipping: {}", e);
+                    }
+                }
+                assignment.arp_ref = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete DNS on the dns server, does not save to database!
+    pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+        // Delete forward/reverse dns
+        if let Some(dns) = &self.dns {
+            if let Some(_r) = &assignment.dns_reverse_ref {
+                let rev = BasicRecord::reverse(assignment)?;
+                dns.delete_record(&rev).await?;
+                assignment.dns_reverse_ref = None;
+                assignment.dns_reverse = None;
+            }
+            if let Some(_r) = &assignment.dns_forward_ref {
+                let rev = BasicRecord::forward(assignment)?;
+                dns.delete_record(&rev).await?;
+                assignment.dns_forward_ref = None;
+                assignment.dns_forward = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update DNS on the dns server, does not save to database!
     pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
         if let Some(dns) = &self.dns {
             let fwd = BasicRecord::forward(assignment)?;
@@ -83,15 +137,11 @@ impl LNVpsProvisioner {
             };
             assignment.dns_forward = Some(ret_fwd.name);
             assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
-
-            // save to db
-            if assignment.id != 0 {
-                self.db.update_vm_ip_assignment(assignment).await?;
-            }
         }
         Ok(())
     }
 
+    /// Update DNS on the dns server, does not save to database!
     pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
         if let Some(dns) = &self.dns {
             let ret_rev = if assignment.dns_reverse_ref.is_some() {
@@ -103,32 +153,30 @@ impl LNVpsProvisioner {
             };
             assignment.dns_reverse = Some(ret_rev.value);
             assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
-
-            // save to db
-            if assignment.id != 0 {
-                self.db.update_vm_ip_assignment(assignment).await?;
-            }
         }
         Ok(())
     }
 
-    async fn save_ip_assignment(&self, vm: &Vm, assignment: &mut VmIpAssignment) -> Result<()> {
-        let ip = IpAddr::from_str(&assignment.ip)?;
-
-        // apply network policy
-        if let NetworkAccessPolicy::StaticArp { interface } = &self.network_policy.access {
-            if let Some(r) = self.router.as_ref() {
-                r.add_arp_entry(
-                    ip.clone(),
-                    &vm.mac_address,
-                    interface,
-                    Some(&format!("VM{}", vm.id)),
-                )
-                .await?;
-            } else {
-                bail!("No router found to apply static arp entry!")
-            }
+    /// Delete all ip assignments for a given vm
+    pub async fn delete_ip_assignments(&self, vm_id: u64) -> Result<()> {
+        let ips = self.db.list_vm_ip_assignments(vm_id).await?;
+        for mut ip in ips {
+            // remove access policy
+            self.remove_access_policy(&mut ip).await?;
+            // remove dns
+            self.remove_ip_dns(&mut ip).await?;
+            // save arp/dns changes
+            self.db.update_vm_ip_assignment(&ip).await?;
         }
+        // mark as deleted
+        self.db.delete_vm_ip_assignment(vm_id).await?;
+
+        Ok(())
+    }
+
+    async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+        // apply access policy
+        self.update_access_policy(assignment).await?;
 
         // Add DNS records
         self.update_forward_ip_dns(assignment).await?;
@@ -164,7 +212,7 @@ impl LNVpsProvisioner {
             dns_reverse_ref: None,
         };
 
-        self.save_ip_assignment(&vm, &mut assignment).await?;
+        self.save_ip_assignment(&mut assignment).await?;
         Ok(vec![assignment])
     }
 
@@ -324,14 +372,11 @@ impl LNVpsProvisioner {
 
     /// Delete a VM and its associated resources
     pub async fn delete_vm(&self, vm_id: u64) -> Result<()> {
-        let vm = self.db.get_vm(vm_id).await?;
-
         // host client currently doesn't support delete (proxmox)
         // VM should already be stopped by [Worker]
 
-        self.delete_ip_assignment(&vm).await?;
-        self.db.delete_vm_ip_assignment(vm.id).await?;
-        self.db.delete_vm(vm.id).await?;
+        self.delete_ip_assignments(vm_id).await?;
+        self.db.delete_vm(vm_id).await?;
 
         Ok(())
     }
@@ -351,7 +396,7 @@ impl LNVpsProvisioner {
 mod tests {
     use super::*;
     use crate::exchange::DefaultRateCache;
-    use crate::mocks::{MockDb, MockNode};
+    use crate::mocks::{MockDb, MockDnsServer, MockNode, MockRouter};
     use crate::settings::{DnsServerConfig, LightningConfig, QemuConfig, RouterConfig};
     use lnvps_db::UserSshKey;
 
@@ -403,7 +448,8 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(DefaultRateCache::default());
-        let router = settings.get_router().expect("router").unwrap();
+        let router = MockRouter::new(settings.network_policy.clone());
+        let dns = MockDnsServer::new();
         let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
 
         let pubkey: [u8; 32] = random();
@@ -447,6 +493,26 @@ mod tests {
         assert!(IpAddr::from_str(&ip.ip).is_ok());
         assert!(!ip.ip.ends_with("/8"));
         assert!(!ip.ip.ends_with("/24"));
+
+        // now expire
+        provisioner.delete_vm(vm.id).await?;
+
+        // test arp/dns is removed
+        let arp = router.list_arp_entry().await?;
+        assert!(arp.is_empty());
+        assert_eq!(dns.forward.lock().await.len(), 0);
+        assert_eq!(dns.reverse.lock().await.len(), 0);
+
+        // ensure IPS are deleted
+        let ips = db.ip_assignments.lock().await;
+        let ip = ips.values().next().unwrap();
+        assert!(ip.arp_ref.is_none());
+        assert!(ip.dns_forward.is_none());
+        assert!(ip.dns_reverse.is_none());
+        assert!(ip.dns_reverse_ref.is_none());
+        assert!(ip.dns_forward_ref.is_none());
+        assert!(ip.deleted);
+        println!("{:?}", ip);
 
         Ok(())
     }

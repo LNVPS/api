@@ -1,6 +1,6 @@
 use anyhow::Result;
+use lnvps_db::{Vm, VmIpAssignment};
 use rocket::async_trait;
-use std::net::IpAddr;
 
 /// Router defines a network device used to access the hosts
 ///
@@ -12,23 +12,30 @@ use std::net::IpAddr;
 #[async_trait]
 pub trait Router: Send + Sync {
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>>;
-    async fn add_arp_entry(
-        &self,
-        ip: IpAddr,
-        mac: &str,
-        interface: &str,
-        comment: Option<&str>,
-    ) -> Result<ArpEntry>;
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
     async fn remove_arp_entry(&self, id: &str) -> Result<()>;
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
 }
 
 #[derive(Debug, Clone)]
 pub struct ArpEntry {
-    pub id: String,
+    pub id: Option<String>,
     pub address: String,
     pub mac_address: String,
     pub interface: Option<String>,
     pub comment: Option<String>,
+}
+
+impl ArpEntry {
+    pub fn new(vm: &Vm, ip: &VmIpAssignment, interface: Option<String>) -> Result<Self> {
+        Ok(Self {
+            id: ip.arp_ref.clone(),
+            address: ip.ip.clone(),
+            mac_address: vm.mac_address.clone(),
+            interface,
+            comment: Some(format!("VM{}", vm.id)),
+        })
+    }
 }
 
 #[cfg(feature = "mikrotik")]
