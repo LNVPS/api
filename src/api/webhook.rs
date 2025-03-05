@@ -1,15 +1,13 @@
 use log::warn;
-use reqwest::header::HeaderMap;
 use rocket::data::{FromData, ToByteUnit};
 use rocket::http::Status;
 use rocket::{post, routes, Data, Route};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 
 /// Messaging bridge for webhooks to other parts of the system (bitvora)
-pub static WEBHOOK_BRIDGE: LazyLock<WebhookBridge> = LazyLock::new(|| WebhookBridge::new());
+pub static WEBHOOK_BRIDGE: LazyLock<WebhookBridge> = LazyLock::new(WebhookBridge::new);
 
 pub fn routes() -> Vec<Route> {
     if cfg!(feature = "bitvora") {
@@ -59,6 +57,12 @@ impl<'r> FromData<'r> for WebhookMessage {
 #[derive(Debug)]
 pub struct WebhookBridge {
     tx: broadcast::Sender<WebhookMessage>,
+}
+
+impl Default for WebhookBridge {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WebhookBridge {

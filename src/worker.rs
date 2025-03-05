@@ -146,9 +146,9 @@ impl Worker {
         let host = self.db.get_host(vm.host_id).await?;
         let client = get_host_client(&host, &self.settings.provisioner_config)?;
 
-        match client.get_vm_state(&vm).await {
+        match client.get_vm_state(vm).await {
             Ok(s) => {
-                self.handle_vm_state(&vm, &s).await?;
+                self.handle_vm_state(vm, &s).await?;
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
             Err(_) => {
@@ -191,7 +191,7 @@ impl Worker {
         let db_vms = self.db.list_vms().await?;
         for vm in &db_vms {
             // Refresh VM status if active
-            self.check_vm(&vm).await?;
+            self.check_vm(vm).await?;
 
             // delete vm if not paid (in new state)
             if vm.expires < Utc::now().sub(Days::new(1)) {

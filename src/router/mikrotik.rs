@@ -7,7 +7,6 @@ use log::debug;
 use reqwest::Method;
 use rocket::async_trait;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 
 pub struct MikrotikRouter {
     api: JsonApi,
@@ -78,26 +77,26 @@ pub struct MikrotikArpEntry {
     pub comment: Option<String>,
 }
 
-impl Into<ArpEntry> for MikrotikArpEntry {
-    fn into(self) -> ArpEntry {
+impl From<MikrotikArpEntry> for ArpEntry {
+    fn from(val: MikrotikArpEntry) -> Self {
         ArpEntry {
-            id: self.id,
-            address: self.address,
-            mac_address: self.mac_address.unwrap(),
-            interface: Some(self.interface),
-            comment: self.comment,
+            id: val.id,
+            address: val.address,
+            mac_address: val.mac_address.unwrap(),
+            interface: Some(val.interface),
+            comment: val.comment,
         }
     }
 }
 
-impl Into<MikrotikArpEntry> for ArpEntry {
-    fn into(self) -> MikrotikArpEntry {
+impl From<ArpEntry> for MikrotikArpEntry {
+    fn from(val: ArpEntry) -> Self {
         MikrotikArpEntry {
-            id: self.id,
-            address: self.address,
-            mac_address: Some(self.mac_address),
-            interface: self.interface.unwrap(),
-            comment: self.comment,
+            id: val.id,
+            address: val.address,
+            mac_address: Some(val.mac_address),
+            interface: val.interface.unwrap(),
+            comment: val.comment,
         }
     }
 }

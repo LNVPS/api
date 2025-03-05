@@ -4,7 +4,7 @@ use lnvps_db::{DiskType, LNVpsDb, VmHost, VmHostDisk, VmTemplate};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Simple capacity reporting per node
+/// Simple capacity management
 #[derive(Clone)]
 pub struct HostCapacityService {
     /// Database
@@ -14,6 +14,27 @@ pub struct HostCapacityService {
 impl HostCapacityService {
     pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
         Self { db }
+    }
+
+    /// List templates which can be sold, based on available capacity
+    pub async fn list_available_vm_templates(&self) -> Result<Vec<VmTemplate>> {
+        let templates = self.db.list_vm_templates().await?;
+
+        // TODO: list hosts in regions where templates are active?
+        // use all hosts since we dont expect there to be many
+        let hosts = self.db.list_hosts().await?;
+        let caps: Vec<Result<HostCapacity>> =
+            join_all(hosts.iter().map(|h| self.get_host_capacity(h, None))).await;
+        let caps: Vec<HostCapacity> = caps.into_iter().filter_map(Result::ok).collect();
+
+        Ok(templates
+            .into_iter()
+            .filter(|t| {
+                caps.iter()
+                    .filter(|c| c.host.region_id == t.region_id)
+                    .any(|c| c.can_accommodate(t))
+            })
+            .collect())
     }
 
     /// Pick a host for the purposes of provisioning a new VM
@@ -30,13 +51,7 @@ impl HostCapacityService {
         let mut host_cap: Vec<HostCapacity> = caps
             .into_iter()
             .filter_map(|v| v.ok())
-            .filter(|v| {
-                v.available_cpu() >= template.cpu
-                    && v.available_memory() >= template.memory
-                    && v.disks
-                        .iter()
-                        .any(|d| d.available_capacity() >= template.disk_size)
-            })
+            .filter(|v| v.can_accommodate(template))
             .collect();
 
         host_cap.sort_by(|a, b| a.load().partial_cmp(&b.load()).unwrap());
@@ -65,8 +80,7 @@ impl HostCapacityService {
             .filter_map(|v| {
                 templates
                     .iter()
-                    .find(|t| t.id == v.template_id)
-                    .and_then(|t| Some((v.id, t)))
+                    .find(|t| t.id == v.template_id).map(|t| (v.id, t))
             })
             .collect();
 
@@ -146,6 +160,16 @@ impl HostCapacity {
     /// Disk usage as a percentage (average over all disks)
     pub fn disk_load(&self) -> f32 {
         self.disks.iter().fold(0.0, |acc, disk| acc + disk.load()) / self.disks.len() as f32
+    }
+
+    /// Can this host and its available capacity accommodate the given template
+    pub fn can_accommodate(&self, template: &VmTemplate) -> bool {
+        self.available_cpu() >= template.cpu
+            && self.available_memory() >= template.memory
+            && self
+                .disks
+                .iter()
+                .any(|d| d.available_capacity() >= template.disk_size)
     }
 }
 
@@ -229,6 +253,10 @@ mod tests {
         let template = db.get_vm_template(1).await?;
         let host = hc.get_host_for_template(&template).await?;
         assert_eq!(host.host.id, 1);
+
+        // all templates should be available
+        let templates = hc.list_available_vm_templates().await?;
+        assert_eq!(templates.len(), db.list_vm_templates().await?.len());
 
         Ok(())
     }

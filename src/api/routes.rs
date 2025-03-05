@@ -4,7 +4,7 @@ use crate::api::model::{
 };
 use crate::host::{get_host_client, FullVmInfo};
 use crate::nip98::Nip98Auth;
-use crate::provisioner::LNVpsProvisioner;
+use crate::provisioner::{HostCapacityService, LNVpsProvisioner};
 use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
@@ -231,8 +231,8 @@ async fn v1_patch_vm(
         let mut ips = db.list_vm_ip_assignments(vm.id).await?;
         for mut ip in ips.iter_mut() {
             ip.dns_reverse = Some(ptr.to_string());
-            provisioner.update_reverse_ip_dns(&mut ip).await?;
-            db.update_vm_ip_assignment(&ip).await?;
+            provisioner.update_reverse_ip_dns(ip).await?;
+            db.update_vm_ip_assignment(ip).await?;
         }
     }
 
@@ -264,7 +264,8 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
 #[openapi(tag = "Template")]
 #[get("/api/v1/vm/templates")]
 async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmTemplate>> {
-    let templates = db.list_vm_templates().await?;
+    let hc = HostCapacityService::new((*db).clone());
+    let templates = hc.list_available_vm_templates().await?;
 
     let cost_plans: HashSet<u64> = templates.iter().map(|t| t.cost_plan_id).collect();
     let regions: HashSet<u64> = templates.iter().map(|t| t.region_id).collect();
@@ -294,7 +295,6 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<Api
 
     let ret = templates
         .into_iter()
-        .filter(|v| v.enabled)
         .filter_map(|i| {
             let cp = cost_plans.get(&i.cost_plan_id)?;
             let hr = regions.get(&i.region_id)?;
@@ -361,7 +361,7 @@ async fn v1_create_vm_order(
     auth: Nip98Auth,
     db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
-    req: Json<CreateVmRequest>
+    req: Json<CreateVmRequest>,
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;

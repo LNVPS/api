@@ -3,21 +3,16 @@ use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{
-    HostCapacity, HostCapacityService, NetworkProvisioner, ProvisionerMethod,
+    HostCapacityService, NetworkProvisioner, ProvisionerMethod,
 };
 use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{Days, Months, Utc};
-use futures::future::join_all;
-use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
+use lnvps_db::{LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
 use log::{info, warn};
 use nostr::util::hex;
-use rand::random;
-use std::collections::HashSet;
-use std::net::IpAddr;
 use std::ops::Add;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,7 +58,7 @@ impl LNVpsProvisioner {
         if let NetworkAccessPolicy::StaticArp { interface } = &self.network_policy.access {
             if let Some(r) = self.router.as_ref() {
                 let vm = self.db.get_vm(assignment.vm_id).await?;
-                let entry = ArpEntry::new(&vm, &assignment, Some(interface.clone()))?;
+                let entry = ArpEntry::new(&vm, assignment, Some(interface.clone()))?;
                 let arp = if let Some(_id) = &assignment.arp_ref {
                     r.update_arp_entry(&entry).await?
                 } else {

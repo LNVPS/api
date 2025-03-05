@@ -5,9 +5,8 @@ use crate::ssh_client::SshClient;
 use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Result};
 use chrono::Utc;
-use futures::future::join_all;
 use ipnetwork::IpNetwork;
-use lnvps_db::{async_trait, DiskType, IpRange, LNVpsDb, Vm, VmIpAssignment, VmOsImage};
+use lnvps_db::{async_trait, DiskType, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
@@ -469,7 +468,7 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn create_vm(&self, req: &FullVmInfo) -> Result<()> {
-        let config = self.make_config(&req)?;
+        let config = self.make_config(req)?;
         let vm_id = req.vm.id.into();
         let t_create = self
             .create_vm(CreateVm {
@@ -481,7 +480,7 @@ impl VmHostClient for ProxmoxClient {
         self.wait_for_task(&t_create).await?;
 
         // import primary disk from image (scsi0)
-        if let Err(e) = self
+        self
             .import_disk_image(ImportDiskImageRequest {
                 vm_id,
                 node: self.node.clone(),
@@ -490,11 +489,7 @@ impl VmHostClient for ProxmoxClient {
                 image: req.image.filename()?,
                 is_ssd: matches!(req.disk.kind, DiskType::SSD),
             })
-            .await
-        {
-            // TODO: rollback
-            return Err(e);
-        }
+            .await?;
 
         // resize disk to match template
         let j_resize = self
@@ -537,7 +532,7 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()> {
-        let mut config = self.make_config(&cfg)?;
+        let mut config = self.make_config(cfg)?;
 
         // dont re-create the disks
         config.scsi_0 = None;
@@ -560,9 +555,9 @@ impl VmHostClient for ProxmoxClient {
 #[derive(Debug, Copy, Clone, Default)]
 pub struct ProxmoxVmId(u64);
 
-impl Into<i32> for ProxmoxVmId {
-    fn into(self) -> i32 {
-        self.0 as i32 + 100
+impl From<ProxmoxVmId> for i32 {
+    fn from(val: ProxmoxVmId) -> Self {
+        val.0 as i32 + 100
     }
 }
 
