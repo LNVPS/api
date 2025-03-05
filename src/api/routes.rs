@@ -2,7 +2,7 @@ use crate::api::model::{
     AccountPatchRequest, ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
     ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
 };
-use crate::host::{get_host_client, FullVmInfo};
+use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::nip98::Nip98Auth;
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner};
 use crate::settings::Settings;
@@ -42,7 +42,8 @@ pub fn routes() -> Vec<Route> {
         v1_start_vm,
         v1_stop_vm,
         v1_restart_vm,
-        v1_patch_vm
+        v1_patch_vm,
+        v1_time_series
     ]
 }
 
@@ -229,7 +230,7 @@ async fn v1_patch_vm(
 
     if let Some(ptr) = &data.reverse_dns {
         let mut ips = db.list_vm_ip_assignments(vm.id).await?;
-        for mut ip in ips.iter_mut() {
+        for ip in ips.iter_mut() {
             ip.dns_reverse = Some(ptr.to_string());
             provisioner.update_reverse_ip_dns(ip).await?;
             db.update_vm_ip_assignment(ip).await?;
@@ -471,6 +472,26 @@ async fn v1_restart_vm(
 
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
+}
+
+#[openapi(tag = "VM")]
+#[get("/api/v1/vm/<id>/time-series")]
+async fn v1_time_series(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
+    id: u64,
+) -> ApiResult<Vec<TimeSeriesData>> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if uid != vm.user_id {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, &settings.provisioner)?;
+    ApiData::ok(client.get_time_series_data(&vm, TimeSeries::Hourly).await?)
 }
 
 /// Get payment status (for polling)

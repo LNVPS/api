@@ -80,7 +80,8 @@ impl HostCapacityService {
             .filter_map(|v| {
                 templates
                     .iter()
-                    .find(|t| t.id == v.template_id).map(|t| (v.id, t))
+                    .find(|t| t.id == v.template_id)
+                    .map(|t| (v.id, t))
             })
             .collect();
 

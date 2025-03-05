@@ -27,7 +27,11 @@ impl Cloudflare {
                 "Error updating record: {:?}",
                 rsp.errors
                     .as_ref()
-                    .map(|e| e.iter().map(|i| i.message.clone()).collect::<Vec<String>>().join(", "))
+                    .map(|e| e
+                        .iter()
+                        .map(|i| i.message.clone())
+                        .collect::<Vec<String>>()
+                        .join(", "))
                     .unwrap_or_default()
             );
         }

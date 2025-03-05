@@ -6,6 +6,8 @@ use lnvps_db::{
     async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
     VmOsImage, VmTemplate,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -40,6 +42,13 @@ pub trait VmHostClient: Send + Sync {
 
     /// Apply vm configuration (patch)
     async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()>;
+
+    /// Get resource usage data
+    async fn get_time_series_data(
+        &self,
+        vm: &Vm,
+        series: TimeSeries,
+    ) -> Result<Vec<TimeSeriesData>>;
 }
 
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
@@ -117,4 +126,25 @@ impl FullVmInfo {
             ssh_key,
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TimeSeriesData {
+    pub timestamp: u64,
+    pub cpu: f32,
+    pub memory: f32,
+    pub memory_size: u64,
+    pub net_in: f32,
+    pub net_out: f32,
+    pub disk_write: f32,
+    pub disk_read: f32,
+}
+
+#[derive(Debug, Clone)]
+pub enum TimeSeries {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
 }

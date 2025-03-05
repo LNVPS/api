@@ -207,7 +207,7 @@ pub struct CreateVmRequest {
     pub template_id: u64,
     pub image_id: u64,
     pub ssh_key_id: u64,
-    pub ref_code: Option<String>
+    pub ref_code: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

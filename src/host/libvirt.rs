@@ -1,4 +1,4 @@
-use crate::host::{FullVmInfo, VmHostClient};
+use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::status::VmState;
 use lnvps_db::{async_trait, Vm, VmOsImage};
 
@@ -35,6 +35,14 @@ impl VmHostClient for LibVirt {
     }
 
     async fn configure_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn get_time_series_data(
+        &self,
+        vm: &Vm,
+        series: TimeSeries,
+    ) -> anyhow::Result<Vec<TimeSeriesData>> {
         todo!()
     }
 }

@@ -1,4 +1,4 @@
-use crate::host::{FullVmInfo, VmHostClient};
+use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
@@ -162,6 +162,22 @@ impl ProxmoxClient {
         } else {
             Err(anyhow!("Failed to configure VM"))
         }
+    }
+
+    pub async fn get_vm_rrd_data(
+        &self,
+        id: ProxmoxVmId,
+        timeframe: &str,
+    ) -> Result<Vec<RrdDataPoint>> {
+        let data: ResponseBase<Vec<_>> = self
+            .api
+            .get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/rrddata?timeframe={}",
+                &self.node, id, timeframe
+            ))
+            .await?;
+
+        Ok(data.data)
     }
 
     /// Get the current status of a running task
@@ -480,16 +496,15 @@ impl VmHostClient for ProxmoxClient {
         self.wait_for_task(&t_create).await?;
 
         // import primary disk from image (scsi0)
-        self
-            .import_disk_image(ImportDiskImageRequest {
-                vm_id,
-                node: self.node.clone(),
-                storage: req.disk.name.clone(),
-                disk: "scsi0".to_string(),
-                image: req.image.filename()?,
-                is_ssd: matches!(req.disk.kind, DiskType::SSD),
-            })
-            .await?;
+        self.import_disk_image(ImportDiskImageRequest {
+            vm_id,
+            node: self.node.clone(),
+            storage: req.disk.name.clone(),
+            disk: "scsi0".to_string(),
+            image: req.image.filename()?,
+            is_ssd: matches!(req.disk.kind, DiskType::SSD),
+        })
+        .await?;
 
         // resize disk to match template
         let j_resize = self
@@ -548,6 +563,26 @@ impl VmHostClient for ProxmoxClient {
         })
         .await?;
         Ok(())
+    }
+
+    async fn get_time_series_data(
+        &self,
+        vm: &Vm,
+        series: TimeSeries,
+    ) -> Result<Vec<TimeSeriesData>> {
+        let r = self
+            .get_vm_rrd_data(
+                vm.id.into(),
+                match series {
+                    TimeSeries::Hourly => "hour",
+                    TimeSeries::Daily => "day",
+                    TimeSeries::Weekly => "week",
+                    TimeSeries::Monthly => "month",
+                    TimeSeries::Yearly => "year",
+                },
+            )
+            .await?;
+        Ok(r.into_iter().map(TimeSeriesData::from).collect())
     }
 }
 
@@ -900,4 +935,44 @@ pub struct VmConfig {
     #[serde(rename = "serial0")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial_0: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RrdDataPoint {
+    pub time: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f32>,
+    #[serde(rename = "mem")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<f32>,
+    #[serde(rename = "maxmem")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_size: Option<u64>,
+    #[serde(rename = "netin")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_in: Option<f32>,
+    #[serde(rename = "netout")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_out: Option<f32>,
+    #[serde(rename = "diskwrite")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write: Option<f32>,
+    #[serde(rename = "diskread")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_read: Option<f32>,
+}
+
+impl From<RrdDataPoint> for TimeSeriesData {
+    fn from(value: RrdDataPoint) -> Self {
+        Self {
+            timestamp: value.time,
+            cpu: value.cpu.unwrap_or(0.0),
+            memory: value.memory.unwrap_or(0.0),
+            memory_size: value.memory_size.unwrap_or(0),
+            net_in: value.net_in.unwrap_or(0.0),
+            net_out: value.net_out.unwrap_or(0.0),
+            disk_write: value.disk_write.unwrap_or(0.0),
+            disk_read: value.disk_read.unwrap_or(0.0),
+        }
+    }
 }
