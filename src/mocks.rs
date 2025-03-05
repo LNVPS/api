@@ -1,6 +1,6 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
-use crate::host::{FullVmInfo, VmHostClient};
+use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
@@ -671,6 +671,10 @@ impl VmHostClient for MockVmHost {
 
     async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn get_time_series_data(&self, vm: &Vm, series: TimeSeries) -> anyhow::Result<Vec<TimeSeriesData>> {
+        Ok(vec![])
     }
 }
 
