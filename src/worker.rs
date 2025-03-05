@@ -160,14 +160,18 @@ impl Worker {
                     let user = self.db.get_user(vm.user_id).await?;
 
                     let msg = format!(
-                        "VM #{} been created!\n\nOS: {}\nIPs: {}\n\nNPUB: {}",
+                        "VM #{} been created!\n\nOS: {}\n{}\n\nNPUB: {}",
                         vm.id,
                         image,
                         vm_ips
                             .iter()
-                            .map(|i| i.to_string())
+                            .map(|i| if let Some(fwd) = &i.dns_forward {
+                                format!("IP: {} ({})", i.ip, fwd)
+                            } else {
+                                format!("IP: {}", i.ip)
+                            })
                             .collect::<Vec<String>>()
-                            .join(", "),
+                            .join("\n "),
                         PublicKey::from_slice(&user.pubkey)?.to_bech32()?
                     );
                     self.tx.send(WorkJob::SendNotification {
