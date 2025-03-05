@@ -262,7 +262,7 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
 }
 
 /// List available VM templates (Offers)
-#[openapi(tag = "Template")]
+#[openapi(tag = "VM")]
 #[get("/api/v1/vm/templates")]
 async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmTemplate>> {
     let hc = HostCapacityService::new((*db).clone());
