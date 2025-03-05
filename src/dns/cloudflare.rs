@@ -20,6 +20,19 @@ impl Cloudflare {
             forward_zone_id: forward_zone_id.to_owned(),
         }
     }
+
+    fn bail_error<T>(rsp: &CfResult<T>) -> anyhow::Result<()> {
+        if !rsp.success {
+            anyhow::bail!(
+                "Error updating record: {:?}",
+                rsp.errors
+                    .as_ref()
+                    .map(|e| e.iter().map(|i| i.message.clone()).collect::<Vec<String>>().join(", "))
+                    .unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -45,6 +58,7 @@ impl DnsServer for Cloudflare {
                 },
             )
             .await?;
+        Self::bail_error(&id_response)?;
         Ok(BasicRecord {
             name: id_response.result.name,
             value: id_response.result.content,
@@ -63,7 +77,8 @@ impl DnsServer for Cloudflare {
             "Deleting record: [{}] {} => {}",
             record.kind, record.name, record.value
         );
-        self.api
+        let res: CfResult<IdResult> = self
+            .api
             .req(
                 reqwest::Method::DELETE,
                 &format!("/client/v4/zones/{}/dns_records/{}", zone_id, record_id),
@@ -75,6 +90,7 @@ impl DnsServer for Cloudflare {
                 },
             )
             .await?;
+        Self::bail_error(&res)?;
         Ok(())
     }
 
@@ -101,6 +117,7 @@ impl DnsServer for Cloudflare {
                 },
             )
             .await?;
+        Self::bail_error(&id_response)?;
         Ok(BasicRecord {
             name: id_response.result.name,
             value: id_response.result.content,
@@ -123,7 +140,19 @@ struct CfRecord {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct IdResult {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct CfResult<T> {
     pub success: bool,
+    pub errors: Option<Vec<CfError>>,
     pub result: T,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CfError {
+    pub code: i32,
+    pub message: String,
 }

@@ -112,13 +112,17 @@ impl LNVpsProvisioner {
         if let Some(dns) = &self.dns {
             if let Some(_r) = &assignment.dns_reverse_ref {
                 let rev = BasicRecord::reverse(assignment)?;
-                dns.delete_record(&rev).await?;
+                if let Err(e) = dns.delete_record(&rev).await {
+                    warn!("Failed to delete reverse record: {}", e);
+                }
                 assignment.dns_reverse_ref = None;
                 assignment.dns_reverse = None;
             }
             if let Some(_r) = &assignment.dns_forward_ref {
                 let rev = BasicRecord::forward(assignment)?;
-                dns.delete_record(&rev).await?;
+                if let Err(e) = dns.delete_record(&rev).await {
+                    warn!("Failed to delete forward record: {}", e);
+                }
                 assignment.dns_forward_ref = None;
                 assignment.dns_forward = None;
             }

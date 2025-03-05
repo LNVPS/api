@@ -1,5 +1,5 @@
 use anyhow::Error;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::Parser;
 use config::{Config, File};
 use lnvps::api;
