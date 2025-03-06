@@ -1,16 +1,18 @@
 use crate::api::model::{
-    AccountPatchRequest, ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
-    ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
+    AccountPatchRequest, ApiCustomPrice, ApiCustomTemplateDiskParam, ApiCustomTemplateParams,
+    ApiCustomVmOrder, ApiCustomVmRequest, ApiTemplatesResponse, ApiUserSshKey, ApiVmHostRegion,
+    ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
+    CreateVmRequest, VMPatchRequest,
 };
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::nip98::Nip98Auth;
-use crate::provisioner::{HostCapacityService, LNVpsProvisioner};
+use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::future::join_all;
-use lnvps_db::{IpRange, LNVpsDb};
+use lnvps_db::{IpRange, LNVpsDb, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
 use nostr::util::hex;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::serde::json::Json;
@@ -43,7 +45,9 @@ pub fn routes() -> Vec<Route> {
         v1_stop_vm,
         v1_restart_vm,
         v1_patch_vm,
-        v1_time_series
+        v1_time_series,
+        v1_custom_template_calc,
+        v1_create_custom_vm_order
     ]
 }
 
@@ -127,9 +131,6 @@ async fn vm_to_status(
     state: Option<VmState>,
 ) -> Result<ApiVmStatus> {
     let image = db.get_os_image(vm.image_id).await?;
-    let template = db.get_vm_template(vm.template_id).await?;
-    let region = db.get_host_region(template.region_id).await?;
-    let cost_plan = db.get_cost_plan(template.cost_plan_id).await?;
     let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
     let ips = db.list_vm_ip_assignments(vm.id).await?;
     let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
@@ -141,13 +142,14 @@ async fn vm_to_status(
         .map(|i| (i.id, i))
         .collect();
 
+    let template = ApiVmTemplate::from_vm(&db, &vm).await?;
     Ok(ApiVmStatus {
         id: vm.id,
         created: vm.created,
         expires: vm.expires,
         mac_address: vm.mac_address,
         image: image.into(),
-        template: ApiVmTemplate::from(template, cost_plan, region),
+        template,
         ssh_key: ssh_key.into(),
         status: state.unwrap_or_default(),
         ip_assignments: ips
@@ -264,7 +266,7 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
 /// List available VM templates (Offers)
 #[openapi(tag = "VM")]
 #[get("/api/v1/vm/templates")]
-async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmTemplate>> {
+async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemplatesResponse> {
     let hc = HostCapacityService::new((*db).clone());
     let templates = hc.list_available_vm_templates().await?;
 
@@ -295,14 +297,117 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<Api
         .collect();
 
     let ret = templates
-        .into_iter()
+        .iter()
         .filter_map(|i| {
             let cp = cost_plans.get(&i.cost_plan_id)?;
             let hr = regions.get(&i.region_id)?;
-            Some(ApiVmTemplate::from(i, cp.clone(), hr.clone()))
+            Some(ApiVmTemplate::from_standard_data(i, cp, hr))
         })
         .collect();
-    ApiData::ok(ret)
+    let custom_templates: Vec<VmCustomPricing> =
+        join_all(regions.iter().map(|(k, _)| db.list_custom_pricing(*k)))
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .flatten()
+            .collect();
+    let custom_template_disks: Vec<VmCustomPricingDisk> = join_all(
+        custom_templates
+            .iter()
+            .map(|t| db.list_custom_pricing_disk(t.id)),
+    )
+    .await
+    .into_iter()
+    .filter_map(|r| r.ok())
+    .flatten()
+    .collect();
+
+    ApiData::ok(ApiTemplatesResponse {
+        templates: ret,
+        custom_template: if custom_templates.is_empty() {
+            None
+        } else {
+            const GB: u64 = 1024 * 1024 * 1024;
+            Some(
+                custom_templates
+                    .into_iter()
+                    .map(|t| ApiCustomTemplateParams {
+                        id: t.id,
+                        name: t.name,
+                        region: regions
+                            .get(&t.region_id)
+                            .map(|r| ApiVmHostRegion {
+                                id: r.id,
+                                name: r.name.clone(),
+                            })
+                            .context("Region information missing in custom template")
+                            .unwrap(),
+                        max_cpu: templates.iter().map(|t| t.cpu).max().unwrap_or(8),
+                        min_cpu: 1,
+                        min_memory: GB,
+                        max_memory: templates.iter().map(|t| t.memory).max().unwrap_or(GB * 2),
+                        min_disk: GB * 5,
+                        max_disk: templates
+                            .iter()
+                            .map(|t| t.disk_size)
+                            .max()
+                            .unwrap_or(GB * 5),
+                        disks: custom_template_disks
+                            .iter()
+                            .filter(|d| d.pricing_id == t.id)
+                            .map(|d| ApiCustomTemplateDiskParam {
+                                disk_type: d.kind.into(),
+                                disk_interface: d.interface.into(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            )
+        },
+    })
+}
+
+/// Get a price for a custom order
+#[openapi(tag = "VM")]
+#[post("/api/v1/vm/custom-template/price", data = "<req>", format = "json")]
+async fn v1_custom_template_calc(
+    db: &State<Arc<dyn LNVpsDb>>,
+    req: Json<ApiCustomVmRequest>,
+) -> ApiResult<ApiCustomPrice> {
+    // create a fake template from the request to generate the price
+    let template: VmCustomTemplate = req.0.into();
+
+    let price = PricingEngine::get_custom_vm_cost_amount(db, 0, &template).await?;
+    ApiData::ok(ApiCustomPrice {
+        currency: price.currency.clone(),
+        amount: price.total(),
+    })
+}
+
+/// Create a new VM order
+///
+/// After order is created please use /api/v1/vm/{id}/renew to pay for VM,
+/// VM's are initially created in "expired" state
+///
+/// Unpaid VM orders will be deleted after 24hrs
+#[openapi(tag = "VM")]
+#[post("/api/v1/vm/custom-template", data = "<req>", format = "json")]
+async fn v1_create_custom_vm_order(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    provisioner: &State<Arc<LNVpsProvisioner>>,
+    req: Json<ApiCustomVmOrder>,
+) -> ApiResult<ApiVmStatus> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+
+    // create a fake template from the request to generate the order
+    let template = req.0.spec.clone().into();
+
+    let rsp = provisioner
+        .provision_custom(uid, template, req.image_id, req.ssh_key_id, req.0.ref_code)
+        .await?;
+    ApiData::ok(vm_to_status(db, rsp, None).await?)
 }
 
 /// List user SSH keys

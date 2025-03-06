@@ -3,8 +3,8 @@ use crate::status::VmState;
 use anyhow::{bail, Result};
 use futures::future::join_all;
 use lnvps_db::{
-    async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmOsImage, VmTemplate,
+    async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
+    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -87,7 +87,9 @@ pub struct FullVmInfo {
     /// Disk where this VM will be saved on the host
     pub disk: VmHostDisk,
     /// VM template resources
-    pub template: VmTemplate,
+    pub template: Option<VmTemplate>,
+    /// VM custom template resources
+    pub custom_template: Option<VmCustomTemplate>,
     /// The OS image used to create the VM
     pub image: VmOsImage,
     /// List of IP resources assigned to this VM
@@ -101,7 +103,6 @@ pub struct FullVmInfo {
 impl FullVmInfo {
     pub async fn load(vm_id: u64, db: Arc<dyn LNVpsDb>) -> Result<Self> {
         let vm = db.get_vm(vm_id).await?;
-        let template = db.get_vm_template(vm.template_id).await?;
         let image = db.get_os_image(vm.image_id).await?;
         let disk = db.get_host_disk(vm.disk_id).await?;
         let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
@@ -115,10 +116,21 @@ impl FullVmInfo {
             .filter_map(Result::ok)
             .collect();
 
+        let template = if let Some(t) = vm.template_id {
+            Some(db.get_vm_template(t).await?)
+        } else {
+            None
+        };
+        let custom_template = if let Some(t) = vm.custom_template_id {
+            Some(db.get_custom_vm_template(t).await?)
+        } else {
+            None
+        };
         // create VM
         Ok(FullVmInfo {
             vm,
             template,
+            custom_template,
             image,
             ips,
             disk,
@@ -126,6 +138,32 @@ impl FullVmInfo {
             ssh_key,
         })
     }
+
+    /// CPU cores
+    pub fn resources(&self) -> Result<VmResources> {
+        if let Some(t) = &self.template {
+            Ok(VmResources {
+                cpu: t.cpu,
+                memory: t.memory,
+                disk_size: t.disk_size,
+            })
+        } else if let Some(t) = &self.custom_template {
+            Ok(VmResources {
+                cpu: t.cpu,
+                memory: t.memory,
+                disk_size: t.disk_size,
+            })
+        } else {
+            bail!("Invalid VM config, no template");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct VmResources {
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

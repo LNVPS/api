@@ -1,6 +1,7 @@
 use crate::{
-    IpRange, LNVpsDb, User, UserSshKey, Vm, VmCostPlan, VmHost, VmHostDisk, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    IpRange, LNVpsDb, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmTemplate,
 };
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
@@ -27,7 +28,9 @@ impl LNVpsDbMysql {
 #[async_trait]
 impl LNVpsDb for LNVpsDbMysql {
     async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!().run(&self.db).await.map_err(Error::new)
+        let migrator = sqlx::migrate!();
+        migrator.run(&self.db).await.map_err(Error::new)?;
+        Ok(())
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> Result<u64> {
@@ -210,7 +213,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_vm_templates(&self) -> Result<Vec<VmTemplate>> {
-        sqlx::query_as("select * from vm_template")
+        sqlx::query_as("select * from vm_template where enabled = 1")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
@@ -219,14 +222,14 @@ impl LNVpsDb for LNVpsDbMysql {
     async fn insert_vm_template(&self, template: &VmTemplate) -> Result<u64> {
         Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(&template.name)
-            .bind(&template.enabled)
-            .bind(&template.created)
-            .bind(&template.expires)
+            .bind(template.enabled)
+            .bind(template.created)
+            .bind(template.expires)
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
-            .bind(&template.disk_type)
-            .bind(&template.disk_interface)
+            .bind(template.disk_type)
+            .bind(template.disk_interface)
             .bind(template.cost_plan_id)
             .bind(template.region_id)
             .fetch_one(&self.db)
@@ -274,11 +277,12 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
             .bind(vm.template_id)
+            .bind(vm.custom_template_id)
             .bind(vm.ssh_key_id)
             .bind(vm.created)
             .bind(vm.expires)
@@ -343,7 +347,7 @@ impl LNVpsDb for LNVpsDbMysql {
             .bind(&ip_assignment.dns_forward_ref)
             .bind(&ip_assignment.dns_reverse)
             .bind(&ip_assignment.dns_reverse_ref)
-            .bind(&ip_assignment.id)
+            .bind(ip_assignment.id)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
@@ -368,7 +372,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn delete_vm_ip_assignment(&self, vm_id: u64) -> Result<()> {
         sqlx::query("update vm_ip_assignment set deleted = 1 where vm_id = ?")
-            .bind(&vm_id)
+            .bind(vm_id)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -447,5 +451,51 @@ impl LNVpsDb for LNVpsDbMysql {
         .fetch_optional(&self.db)
         .await
         .map_err(Error::new)
+    }
+
+    async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>> {
+        sqlx::query_as("select * from vm_custom_pricing where region_id = ? and enabled = 1")
+            .bind(region_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_custom_pricing(&self, id: u64) -> Result<VmCustomPricing> {
+        sqlx::query_as("select * from vm_custom_pricing where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_custom_vm_template(&self, id: u64) -> Result<VmCustomTemplate> {
+        sqlx::query_as("select * from vm_custom_template where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<u64> {
+        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id) values(?,?,?,?,?,?) returning id")
+            .bind(template.cpu)
+            .bind(template.memory)
+            .bind(template.disk_size)
+            .bind(template.disk_type)
+            .bind(template.disk_interface)
+            .bind(template.pricing_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
+    }
+
+    async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>> {
+        sqlx::query_as("select * from vm_custom_pricing_disk where pricing_id=?")
+            .bind(pricing_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
     }
 }

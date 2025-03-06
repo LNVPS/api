@@ -2,12 +2,14 @@ use crate::dns::{BasicRecord, DnsServer};
 use crate::exchange::{ExchangeRateService, Ticker};
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{HostCapacityService, NetworkProvisioner, ProvisionerMethod};
+use crate::provisioner::{
+    CostResult, HostCapacityService, NetworkProvisioner, PricingEngine, ProvisionerMethod,
+};
 use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{Days, Months, Utc};
-use lnvps_db::{LNVpsDb, Vm, VmCostPlanIntervalType, VmIpAssignment, VmPayment};
+use lnvps_db::{DiskType, LNVpsDb, Vm, VmCostPlanIntervalType, VmCustomTemplate, VmIpAssignment, VmPayment};
 use log::{info, warn};
 use nostr::util::hex;
 use std::ops::Add;
@@ -196,8 +198,8 @@ impl LNVpsProvisioner {
         // Use random network provisioner
         let network = NetworkProvisioner::new(ProvisionerMethod::Random, self.db.clone());
 
-        let template = self.db.get_vm_template(vm.template_id).await?;
-        let ip = network.pick_ip_for_region(template.region_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        let ip = network.pick_ip_for_region(host.region_id).await?;
         let mut assignment = VmIpAssignment {
             id: 0,
             vm_id,
@@ -253,7 +255,7 @@ impl LNVpsProvisioner {
 
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
-        let host = cap.get_host_for_template(&template).await?;
+        let host = cap.get_host_for_template(template.region_id, &template).await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
             hd
@@ -267,7 +269,64 @@ impl LNVpsProvisioner {
             host_id: host.host.id,
             user_id: user.id,
             image_id: image.id,
-            template_id: template.id,
+            template_id: Some(template.id),
+            custom_template_id: None,
+            ssh_key_id: ssh_key.id,
+            created: Utc::now(),
+            expires: Utc::now(),
+            disk_id: pick_disk.disk.id,
+            mac_address: "NOT FILLED YET".to_string(),
+            deleted: false,
+            ref_code,
+        };
+
+        // ask host client to generate the mac address
+        new_vm.mac_address = client.generate_mac(&new_vm).await?;
+
+        let new_id = self.db.insert_vm(&new_vm).await?;
+        new_vm.id = new_id;
+        Ok(new_vm)
+    }
+
+    /// Provision a new VM for a user on the database
+    ///
+    /// Note:
+    /// 1. Does not create a VM on the host machine
+    /// 2. Does not assign any IP resources
+    pub async fn provision_custom(
+        &self,
+        user_id: u64,
+        template: VmCustomTemplate,
+        image_id: u64,
+        ssh_key_id: u64,
+        ref_code: Option<String>,
+    ) -> Result<Vm> {
+        let user = self.db.get_user(user_id).await?;
+        let pricing = self.db.get_vm_template(template.pricing_id).await?;
+        let image = self.db.get_os_image(image_id).await?;
+        let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
+
+        // TODO: cache capacity somewhere
+        let cap = HostCapacityService::new(self.db.clone());
+        let host = cap.get_host_for_template(pricing.region_id, &template).await?;
+
+        let pick_disk = if let Some(hd) = host.disks.first() {
+            hd
+        } else {
+            bail!("No host disk found")
+        };
+
+        // insert custom templates
+        let template_id = self.db.insert_custom_vm_template(&template).await?;
+
+        let client = get_host_client(&host.host, &self.provisioner_config)?;
+        let mut new_vm = Vm {
+            id: 0,
+            host_id: host.host.id,
+            user_id: user.id,
+            image_id: image.id,
+            template_id: None,
+            custom_template_id: Some(template_id),
             ssh_key_id: ssh_key.id,
             created: Utc::now(),
             expires: Utc::now(),
@@ -287,66 +346,44 @@ impl LNVpsProvisioner {
 
     /// Create a renewal payment
     pub async fn renew(&self, vm_id: u64) -> Result<VmPayment> {
-        let vm = self.db.get_vm(vm_id).await?;
-        let template = self.db.get_vm_template(vm.template_id).await?;
-        let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
+        let pe = PricingEngine::new(self.db.clone(), self.rates.clone());
 
-        // Reuse existing payment until expired
-        let payments = self.db.list_vm_payment(vm.id).await?;
-        if let Some(px) = payments
-            .into_iter()
-            .find(|p| p.expires > Utc::now() && !p.is_paid)
-        {
-            return Ok(px);
+        let price = pe.get_vm_cost(vm_id).await?;
+        match price {
+            CostResult::Existing(p) => Ok(p),
+            CostResult::New {
+                msats,
+                time_value,
+                new_expiry,
+                rate,
+            } => {
+                const INVOICE_EXPIRE: u64 = 600;
+                info!("Creating invoice for {vm_id} for {} sats", msats / 1000);
+                let invoice = self
+                    .node
+                    .add_invoice(AddInvoiceRequest {
+                        memo: Some(format!("VM renewal {vm_id} to {new_expiry}")),
+                        amount: msats,
+                        expire: Some(INVOICE_EXPIRE as u32),
+                    })
+                    .await?;
+                let vm_payment = VmPayment {
+                    id: hex::decode(invoice.payment_hash)?,
+                    vm_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
+                    amount: msats,
+                    invoice: invoice.pr,
+                    time_value,
+                    is_paid: false,
+                    rate,
+                    settle_index: None,
+                };
+                self.db.insert_vm_payment(&vm_payment).await?;
+
+                Ok(vm_payment)
+            }
         }
-
-        // push the expiration forward by cost plan interval amount
-        let new_expire = match cost_plan.interval_type {
-            VmCostPlanIntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
-            VmCostPlanIntervalType::Month => vm
-                .expires
-                .add(Months::new(cost_plan.interval_amount as u32)),
-            VmCostPlanIntervalType::Year => vm
-                .expires
-                .add(Months::new((12 * cost_plan.interval_amount) as u32)),
-        };
-
-        const BTC_SATS: f64 = 100_000_000.0;
-        const INVOICE_EXPIRE: u32 = 3600;
-
-        let ticker = Ticker::btc_rate(cost_plan.currency.as_str())?;
-        let rate = if let Some(r) = self.rates.get_rate(ticker).await {
-            r
-        } else {
-            bail!("No exchange rate found")
-        };
-
-        let cost_btc = cost_plan.amount / rate;
-        let cost_msat = (cost_btc as f64 * BTC_SATS) as u64 * 1000;
-        info!("Creating invoice for {vm_id} for {} sats", cost_msat / 1000);
-        let invoice = self
-            .node
-            .add_invoice(AddInvoiceRequest {
-                memo: Some(format!("VM renewal {vm_id} to {new_expire}")),
-                amount: cost_msat,
-                expire: Some(INVOICE_EXPIRE),
-            })
-            .await?;
-        let vm_payment = VmPayment {
-            id: hex::decode(invoice.payment_hash)?,
-            vm_id,
-            created: Utc::now(),
-            expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE as u64)),
-            amount: cost_msat,
-            invoice: invoice.pr,
-            time_value: (new_expire - vm.expires).num_seconds() as u64,
-            is_paid: false,
-            rate,
-            ..Default::default()
-        };
-        self.db.insert_vm_payment(&vm_payment).await?;
-
-        Ok(vm_payment)
     }
 
     /// Create a vm on the host as configured by the template
@@ -401,8 +438,6 @@ mod tests {
     use std::str::FromStr;
 
     const ROUTER_BRIDGE: &str = "bridge1";
-    const GB: u64 = 1024 * 1024 * 1024;
-    const TB: u64 = GB * 1024;
 
     fn settings() -> Settings {
         Settings {
@@ -546,8 +581,8 @@ mod tests {
             created: Default::default(),
             expires: None,
             cpu: 64,
-            memory: 512 * GB,
-            disk_size: 20 * TB,
+            memory: 512 * MockDb::GB,
+            disk_size: 20 * MockDb::TB,
             disk_type: DiskType::SSD,
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,

@@ -139,4 +139,19 @@ pub trait LNVpsDb: Sync + Send {
 
     /// Return the most recently settled invoice
     async fn last_paid_invoice(&self) -> Result<Option<VmPayment>>;
+
+    /// Return the list of active custom pricing models for a given region
+    async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>>;
+
+    /// Get a custom pricing model
+    async fn get_custom_pricing(&self, id: u64) -> Result<VmCustomPricing>;
+
+    /// Get a custom pricing model
+    async fn get_custom_vm_template(&self, id: u64) -> Result<VmCustomTemplate>;
+
+    /// Insert custom vm template
+    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<u64>;
+
+    /// Return the list of disk prices for a given custom pricing model
+    async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>>;
 }

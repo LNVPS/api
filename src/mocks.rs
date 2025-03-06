@@ -1,19 +1,21 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
+use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
 use crate::status::{VmRunningState, VmState};
-use anyhow::{anyhow, bail, ensure};
-use chrono::{DateTime, Utc};
+use anyhow::{anyhow, bail, ensure, Context};
+use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
 use lnvps_db::{
     async_trait, DiskInterface, DiskType, IpRange, LNVpsDb, OsDistribution, User, UserSshKey, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
+use std::ops::Add;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
@@ -31,21 +33,75 @@ pub struct MockDb {
     pub vms: Arc<Mutex<HashMap<u64, Vm>>>,
     pub ip_range: Arc<Mutex<HashMap<u64, IpRange>>>,
     pub ip_assignments: Arc<Mutex<HashMap<u64, VmIpAssignment>>>,
+    pub custom_pricing: Arc<Mutex<HashMap<u64, VmCustomPricing>>>,
+    pub custom_pricing_disk: Arc<Mutex<HashMap<u64, VmCustomPricingDisk>>>,
+    pub custom_template: Arc<Mutex<HashMap<u64, VmCustomTemplate>>>,
+    pub payments: Arc<Mutex<Vec<VmPayment>>>,
 }
 
 impl MockDb {
+    pub const KB: u64 = 1024;
+    pub const MB: u64 = Self::KB * 1024;
+    pub const GB: u64 = Self::MB * 1024;
+    pub const TB: u64 = Self::GB * 1024;
+
     pub fn empty() -> MockDb {
         Self {
             ..Default::default()
+        }
+    }
+
+    pub fn mock_cost_plan() -> VmCostPlan {
+        VmCostPlan {
+            id: 1,
+            name: "mock".to_string(),
+            created: Utc::now(),
+            amount: 1.32,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: VmCostPlanIntervalType::Month,
+        }
+    }
+
+    pub fn mock_template() -> VmTemplate {
+        VmTemplate {
+            id: 1,
+            name: "mock".to_string(),
+            enabled: true,
+            created: Utc::now(),
+            expires: None,
+            cpu: 2,
+            memory: Self::GB * 2,
+            disk_size: Self::GB * 64,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            cost_plan_id: 1,
+            region_id: 1,
+        }
+    }
+
+    pub fn mock_vm() ->Vm {
+        let template = Self::mock_template();
+        Vm {
+            id: 1,
+            host_id: 1,
+            user_id: 1,
+            image_id: 1,
+            template_id: Some(template.id),
+            custom_template_id: None,
+            ssh_key_id: 1,
+            created: Utc::now(),
+            expires: Default::default(),
+            disk_id: 1,
+            mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            deleted: false,
+            ref_code: None,
         }
     }
 }
 
 impl Default for MockDb {
     fn default() -> Self {
-        const GB: u64 = 1024 * 1024 * 1024;
-        const TB: u64 = GB * 1024;
-
         let mut regions = HashMap::new();
         regions.insert(
             1,
@@ -76,7 +132,7 @@ impl Default for MockDb {
                 name: "mock-host".to_string(),
                 ip: "https://localhost".to_string(),
                 cpu: 4,
-                memory: 8 * GB,
+                memory: 8 * Self::GB,
                 enabled: true,
                 api_token: "".to_string(),
                 load_factor: 1.5,
@@ -89,43 +145,16 @@ impl Default for MockDb {
                 id: 1,
                 host_id: 1,
                 name: "mock-disk".to_string(),
-                size: TB * 10,
+                size: Self::TB * 10,
                 kind: DiskType::SSD,
                 interface: DiskInterface::PCIe,
                 enabled: true,
             },
         );
         let mut cost_plans = HashMap::new();
-        cost_plans.insert(
-            1,
-            VmCostPlan {
-                id: 1,
-                name: "mock".to_string(),
-                created: Utc::now(),
-                amount: 1f32,
-                currency: "EUR".to_string(),
-                interval_amount: 1,
-                interval_type: VmCostPlanIntervalType::Month,
-            },
-        );
+        cost_plans.insert(1, Self::mock_cost_plan());
         let mut templates = HashMap::new();
-        templates.insert(
-            1,
-            VmTemplate {
-                id: 1,
-                name: "mock".to_string(),
-                enabled: true,
-                created: Utc::now(),
-                expires: None,
-                cpu: 2,
-                memory: GB * 2,
-                disk_size: GB * 64,
-                disk_type: DiskType::SSD,
-                disk_interface: DiskInterface::PCIe,
-                cost_plan_id: 1,
-                region_id: 1,
-            },
-        );
+        templates.insert(1, Self::mock_template());
         let mut os_images = HashMap::new();
         os_images.insert(
             1,
@@ -150,7 +179,11 @@ impl Default for MockDb {
             users: Arc::new(Default::default()),
             vms: Arc::new(Default::default()),
             ip_assignments: Arc::new(Default::default()),
+            custom_pricing: Arc::new(Default::default()),
+            custom_pricing_disk: Arc::new(Default::default()),
             user_ssh_keys: Arc::new(Mutex::new(Default::default())),
+            custom_template: Arc::new(Default::default()),
+            payments: Arc::new(Default::default()),
         }
     }
 }
@@ -377,7 +410,12 @@ impl LNVpsDb for MockDb {
         self.get_host(vm.host_id).await?;
         self.get_user(vm.user_id).await?;
         self.get_os_image(vm.image_id).await?;
-        self.get_vm_template(vm.template_id).await?;
+        if let Some(t) = vm.template_id {
+            self.get_vm_template(t).await?;
+        }
+        if let Some(t) = vm.custom_template_id {
+            self.get_custom_vm_template(t).await?;
+        }
         self.get_user_ssh_key(vm.ssh_key_id).await?;
         self.get_host_disk(vm.disk_id).await?;
 
@@ -462,27 +500,86 @@ impl LNVpsDb for MockDb {
     }
 
     async fn list_vm_payment(&self, vm_id: u64) -> anyhow::Result<Vec<VmPayment>> {
-        todo!()
+        let p = self.payments.lock().await;
+        Ok(p.iter().filter(|p| p.vm_id == vm_id).cloned().collect())
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
-        todo!()
+        let mut p = self.payments.lock().await;
+        p.push(vm_payment.clone());
+        Ok(())
     }
 
     async fn get_vm_payment(&self, id: &Vec<u8>) -> anyhow::Result<VmPayment> {
-        todo!()
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .find(|p| p.id == *id)
+            .context("no vm_payment")?
+            .clone())
     }
 
     async fn update_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
-        todo!()
+        let mut p = self.payments.lock().await;
+        if let Some(p) = p.iter_mut().find(|p| p.id == *vm_payment.id) {
+            p.is_paid = vm_payment.is_paid.clone();
+            p.settle_index = vm_payment.settle_index.clone();
+        }
+        Ok(())
     }
 
-    async fn vm_payment_paid(&self, id: &VmPayment) -> anyhow::Result<()> {
-        todo!()
+    async fn vm_payment_paid(&self, p: &VmPayment) -> anyhow::Result<()> {
+        let mut v = self.vms.lock().await;
+        self.update_vm_payment(p).await?;
+        if let Some(v) = v.get_mut(&p.vm_id) {
+            v.expires = v.expires.add(TimeDelta::seconds(p.time_value as i64));
+        }
+        Ok(())
     }
 
     async fn last_paid_invoice(&self) -> anyhow::Result<Option<VmPayment>> {
-        todo!()
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .max_by(|a, b| a.settle_index.cmp(&b.settle_index))
+            .map(|v| v.clone()))
+    }
+
+    async fn list_custom_pricing(&self, region_id: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
+        let p = self.custom_pricing.lock().await;
+        Ok(p.values().filter(|p| p.enabled).cloned().collect())
+    }
+
+    async fn get_custom_pricing(&self, id: u64) -> anyhow::Result<VmCustomPricing> {
+        let p = self.custom_pricing.lock().await;
+        Ok(p.get(&id).cloned().context("no custom pricing")?)
+    }
+
+    async fn get_custom_vm_template(&self, id: u64) -> anyhow::Result<VmCustomTemplate> {
+        let t = self.custom_template.lock().await;
+        Ok(t.get(&id).cloned().context("no custom template")?)
+    }
+
+    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> anyhow::Result<u64> {
+        let mut t = self.custom_template.lock().await;
+        let max_id = *t.keys().max().unwrap_or(&0);
+        t.insert(
+            max_id + 1,
+            VmCustomTemplate {
+                id: max_id + 1,
+                ..template.clone()
+            },
+        );
+        Ok(max_id + 1)
+    }
+
+    async fn list_custom_pricing_disk(
+        &self,
+        pricing_id: u64,
+    ) -> anyhow::Result<Vec<VmCustomPricingDisk>> {
+        let d = self.custom_pricing_disk.lock().await;
+        Ok(d.values()
+            .filter(|d| d.pricing_id == pricing_id)
+            .cloned()
+            .collect())
     }
 }
 
@@ -673,7 +770,11 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn get_time_series_data(&self, vm: &Vm, series: TimeSeries) -> anyhow::Result<Vec<TimeSeriesData>> {
+    async fn get_time_series_data(
+        &self,
+        vm: &Vm,
+        series: TimeSeries,
+    ) -> anyhow::Result<Vec<TimeSeriesData>> {
         Ok(vec![])
     }
 }
@@ -756,5 +857,35 @@ impl DnsServer for MockDnsServer {
             r.kind = record.kind.to_string();
         }
         Ok(record.clone())
+    }
+}
+
+pub struct MockExchangeRate {
+    pub rate: Arc<Mutex<f32>>,
+}
+
+impl MockExchangeRate {
+    pub fn new(rate: f32) -> Self {
+        Self {
+            rate: Arc::new(Mutex::new(rate)),
+        }
+    }
+}
+
+#[async_trait]
+impl ExchangeRateService for MockExchangeRate {
+    async fn fetch_rates(&self) -> anyhow::Result<Vec<TickerRate>> {
+        let r = self.rate.lock().await;
+        Ok(vec![TickerRate(Ticker::btc_rate("EUR")?, *r)])
+    }
+
+    async fn set_rate(&self, ticker: Ticker, amount: f32) {
+        let mut r = self.rate.lock().await;
+        *r = amount;
+    }
+
+    async fn get_rate(&self, ticker: Ticker) -> Option<f32> {
+        let r = self.rate.lock().await;
+        Some(*r)
     }
 }

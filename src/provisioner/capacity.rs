@@ -1,6 +1,10 @@
+use crate::provisioner::Template;
 use anyhow::{bail, Result};
+use chrono::Utc;
 use futures::future::join_all;
-use lnvps_db::{DiskType, LNVpsDb, VmHost, VmHostDisk, VmTemplate};
+use lnvps_db::{
+    DiskInterface, DiskType, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk, VmTemplate,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,7 +28,7 @@ impl HostCapacityService {
         // use all hosts since we dont expect there to be many
         let hosts = self.db.list_hosts().await?;
         let caps: Vec<Result<HostCapacity>> =
-            join_all(hosts.iter().map(|h| self.get_host_capacity(h, None))).await;
+            join_all(hosts.iter().map(|h| self.get_host_capacity(h, None, None))).await;
         let caps: Vec<HostCapacity> = caps.into_iter().filter_map(Result::ok).collect();
 
         Ok(templates
@@ -38,16 +42,21 @@ impl HostCapacityService {
     }
 
     /// Pick a host for the purposes of provisioning a new VM
-    pub async fn get_host_for_template(&self, template: &VmTemplate) -> Result<HostCapacity> {
+    pub async fn get_host_for_template(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+    ) -> Result<HostCapacity> {
         let hosts = self.db.list_hosts().await?;
-        let caps: Vec<Result<HostCapacity>> = join_all(
-            hosts
-                .iter()
-                .filter(|h| h.region_id == template.region_id)
-                // TODO: filter disk interface?
-                .map(|h| self.get_host_capacity(h, Some(template.disk_type.clone()))),
-        )
-        .await;
+        let caps: Vec<Result<HostCapacity>> =
+            join_all(hosts.iter().filter(|h| h.region_id == region_id).map(|h| {
+                self.get_host_capacity(
+                    h,
+                    Some(template.disk_type()),
+                    Some(template.disk_interface()),
+                )
+            }))
+            .await;
         let mut host_cap: Vec<HostCapacity> = caps
             .into_iter()
             .filter_map(|v| v.ok())
@@ -68,31 +77,76 @@ impl HostCapacityService {
         &self,
         host: &VmHost,
         disk_type: Option<DiskType>,
+        disk_interface: Option<DiskInterface>,
     ) -> Result<HostCapacity> {
         let vms = self.db.list_vms_on_host(host.id).await?;
         // TODO: filter disks from DB? Should be very few disks anyway
         let storage = self.db.list_host_disks(host.id).await?;
         let templates = self.db.list_vm_templates().await?;
+        let custom_templates: Vec<Result<VmCustomTemplate>> = join_all(
+            vms.iter()
+                .filter(|v| v.custom_template_id.is_some() && v.expires > Utc::now())
+                .map(|v| {
+                    self.db
+                        .get_custom_vm_template(v.custom_template_id.unwrap())
+                }),
+        )
+        .await;
+        let custom_templates: HashMap<u64, VmCustomTemplate> = custom_templates
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .map(|v| (v.id, v))
+            .collect();
 
-        // a mapping between vm_id and template
-        let vm_template: HashMap<u64, &VmTemplate> = vms
+        struct VmResources {
+            vm_id: u64,
+            cpu: u16,
+            memory: u64,
+            disk: u64,
+            disk_id: u64,
+        }
+        // a mapping between vm_id and resources
+        let vm_resources: HashMap<u64, VmResources> = vms
             .iter()
+            .filter(|v| v.expires > Utc::now())
             .filter_map(|v| {
-                templates
-                    .iter()
-                    .find(|t| t.id == v.template_id)
-                    .map(|t| (v.id, t))
+                if let Some(x) = v.template_id {
+                    templates.iter().find(|t| t.id == x).map(|t| VmResources {
+                        vm_id: v.id,
+                        cpu: t.cpu,
+                        memory: t.memory,
+                        disk: t.disk_size,
+                        disk_id: v.disk_id,
+                    })
+                } else if let Some(x) = v.custom_template_id {
+                    custom_templates.get(&x).map(|t| VmResources {
+                        vm_id: v.id,
+                        cpu: t.cpu,
+                        memory: t.memory,
+                        disk: t.disk_size,
+                        disk_id: v.disk_id,
+                    })
+                } else {
+                    None
+                }
             })
+            .map(|m| (m.vm_id, m))
             .collect();
 
         let mut storage_disks: Vec<DiskCapacity> = storage
             .iter()
-            .filter(|d| disk_type.as_ref().map(|t| d.kind == *t).unwrap_or(true))
+            .filter(|d| {
+                disk_type.as_ref().map(|t| d.kind == *t).unwrap_or(true)
+                    && disk_interface
+                        .as_ref()
+                        .map(|i| d.interface == *i)
+                        .unwrap_or(true)
+            })
             .map(|s| {
-                let usage = vm_template
+                let usage = vm_resources
                     .iter()
-                    .filter(|(k, v)| v.id == s.id)
-                    .fold(0, |acc, (k, v)| acc + v.disk_size);
+                    .filter(|(k, v)| s.id == v.disk_id)
+                    .fold(0, |acc, (k, v)| acc + v.disk);
                 DiskCapacity {
                     load_factor: host.load_factor,
                     disk: s.clone(),
@@ -103,8 +157,8 @@ impl HostCapacityService {
 
         storage_disks.sort_by(|a, b| a.load_factor.partial_cmp(&b.load_factor).unwrap());
 
-        let cpu_consumed = vm_template.values().fold(0, |acc, vm| acc + vm.cpu);
-        let memory_consumed = vm_template.values().fold(0, |acc, vm| acc + vm.memory);
+        let cpu_consumed = vm_resources.values().fold(0, |acc, vm| acc + vm.cpu);
+        let memory_consumed = vm_resources.values().fold(0, |acc, vm| acc + vm.memory);
 
         Ok(HostCapacity {
             load_factor: host.load_factor,
@@ -164,13 +218,13 @@ impl HostCapacity {
     }
 
     /// Can this host and its available capacity accommodate the given template
-    pub fn can_accommodate(&self, template: &VmTemplate) -> bool {
-        self.available_cpu() >= template.cpu
-            && self.available_memory() >= template.memory
+    pub fn can_accommodate(&self, template: &impl Template) -> bool {
+        self.available_cpu() >= template.cpu()
+            && self.available_memory() >= template.memory()
             && self
                 .disks
                 .iter()
-                .any(|d| d.available_capacity() >= template.disk_size)
+                .any(|d| d.available_capacity() >= template.disk_size())
     }
 }
 
@@ -239,7 +293,7 @@ mod tests {
 
         let hc = HostCapacityService::new(db.clone());
         let host = db.get_host(1).await?;
-        let cap = hc.get_host_capacity(&host, None).await?;
+        let cap = hc.get_host_capacity(&host, None, None).await?;
         let disks = db.list_host_disks(1).await?;
         /// check all resources are available
         assert_eq!(cap.cpu, 0);
@@ -252,13 +306,37 @@ mod tests {
         }
 
         let template = db.get_vm_template(1).await?;
-        let host = hc.get_host_for_template(&template).await?;
+        let host = hc
+            .get_host_for_template(template.region_id, &template)
+            .await?;
         assert_eq!(host.host.id, 1);
 
         // all templates should be available
         let templates = hc.list_available_vm_templates().await?;
         assert_eq!(templates.len(), db.list_vm_templates().await?.len());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_doesnt_count() -> Result<()> {
+        let db = MockDb::default();
+        {
+            let mut v = db.vms.lock().await;
+            v.insert(1, MockDb::mock_vm());
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let hc = HostCapacityService::new(db.clone());
+        let host = db.get_host(1).await?;
+        let cap = hc.get_host_capacity(&host, None, None).await?;
+
+        assert_eq!(cap.load(), 0.0);
+        assert_eq!(cap.cpu, 0);
+        assert_eq!(cap.memory, 0);
+        for disk in cap.disks {
+            assert_eq!(0, disk.usage);
+        }
         Ok(())
     }
 }

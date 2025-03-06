@@ -2,13 +2,14 @@ use anyhow::{Error, Result};
 use lnvps_db::async_trait;
 use log::info;
 use rocket::serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone)]
 pub enum Currency {
     EUR,
     BTC,

@@ -92,7 +92,7 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DiskType {
     #[default]
@@ -100,7 +100,7 @@ pub enum DiskType {
     SSD = 1,
 }
 
-#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DiskInterface {
     #[default]
@@ -109,7 +109,7 @@ pub enum DiskInterface {
     PCIe = 2,
 }
 
-#[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum OsDistribution {
     #[default]
@@ -203,6 +203,50 @@ pub struct VmTemplate {
     pub region_id: u64,
 }
 
+/// A custom pricing template, used for billing calculation of a specific VM
+/// This mostly just stores the number of resources assigned and the specific pricing used
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VmCustomTemplate {
+    pub id: u64,
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk_size: u64,
+    pub disk_type: DiskType,
+    pub disk_interface: DiskInterface,
+    pub pricing_id: u64,
+}
+
+/// Custom pricing template, usually 1 per region
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VmCustomPricing {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub region_id: u64,
+    pub currency: String,
+    /// Cost per CPU core
+    pub cpu_cost: f32,
+    /// Cost per GB ram
+    pub memory_cost: f32,
+    /// Cost per IPv4 address
+    pub ip4_cost: f32,
+    /// Cost per IPv6 address
+    pub ip6_cost: f32,
+}
+
+/// Pricing per GB on a disk type (SSD/HDD)
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VmCustomPricingDisk {
+    pub id: u64,
+    pub pricing_id: u64,
+    pub kind: DiskType,
+    pub interface: DiskInterface,
+    /// Cost as per the currency of the [VmCustomPricing::currency]
+    pub cost: f32,
+}
+
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct Vm {
     /// Unique VM ID (Same in proxmox)
@@ -213,8 +257,10 @@ pub struct Vm {
     pub user_id: u64,
     /// The base image of this VM
     pub image_id: u64,
-    /// The base image of this VM
-    pub template_id: u64,
+    /// The base image of this VM [VmTemplate]
+    pub template_id: Option<u64>,
+    /// Custom pricing specification used for this vm [VmCustomTemplate]
+    pub custom_template_id: Option<u64>,
     /// Users ssh-key assigned to this VM
     pub ssh_key_id: u64,
     /// When the VM was created

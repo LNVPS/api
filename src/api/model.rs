@@ -1,11 +1,15 @@
+use crate::exchange::Currency;
+use crate::provisioner::PricingEngine;
 use crate::status::VmState;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
-use lnvps_db::VmHostRegion;
+use lnvps_db::{LNVpsDb, Vm, VmCostPlan, VmCustomTemplate, VmHost, VmHostRegion, VmTemplate};
 use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiVmStatus {
@@ -72,7 +76,7 @@ impl ApiVmIpAssignment {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskType {
     HDD = 0,
@@ -88,7 +92,16 @@ impl From<lnvps_db::DiskType> for DiskType {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+impl Into<lnvps_db::DiskType> for DiskType {
+    fn into(self) -> lnvps_db::DiskType {
+        match self {
+            DiskType::HDD => lnvps_db::DiskType::HDD,
+            DiskType::SSD => lnvps_db::DiskType::SSD,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskInterface {
     SATA = 0,
@@ -104,6 +117,82 @@ impl From<lnvps_db::DiskInterface> for DiskInterface {
             lnvps_db::DiskInterface::PCIe => Self::PCIe,
         }
     }
+}
+
+impl From<DiskInterface> for lnvps_db::DiskInterface {
+    fn from(value: DiskInterface) -> Self {
+        match value {
+            DiskInterface::SATA => Self::SATA,
+            DiskInterface::SCSI => Self::SCSI,
+            DiskInterface::PCIe => Self::PCIe,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiTemplatesResponse {
+    pub templates: Vec<ApiVmTemplate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_template: Option<Vec<ApiCustomTemplateParams>>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiCustomTemplateParams {
+    pub id: u64,
+    pub name: String,
+    pub region: ApiVmHostRegion,
+    pub max_cpu: u16,
+    pub min_cpu: u16,
+    pub min_memory: u64,
+    pub max_memory: u64,
+    pub min_disk: u64,
+    pub max_disk: u64,
+    pub disks: Vec<ApiCustomTemplateDiskParam>,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApiCustomTemplateDiskParam {
+    pub disk_type: DiskType,
+    pub disk_interface: DiskInterface,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApiCustomVmRequest {
+    pub pricing_id: u64,
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk: u64,
+    pub disk_type: DiskType,
+    pub disk_interface: DiskInterface,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiCustomVmOrder {
+    #[serde(flatten)]
+    pub spec: ApiCustomVmRequest,
+    pub image_id: u64,
+    pub ssh_key_id: u64,
+    pub ref_code: Option<String>,
+}
+
+impl From<ApiCustomVmRequest> for VmCustomTemplate {
+    fn from(value: ApiCustomVmRequest) -> Self {
+        VmCustomTemplate {
+            id: 0,
+            cpu: value.cpu,
+            memory: value.memory,
+            disk_size: value.disk,
+            disk_type: value.disk_type.into(),
+            disk_interface: value.disk_interface.into(),
+            pricing_id: value.pricing_id,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiCustomPrice {
+    pub currency: String,
+    pub amount: f32,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -123,32 +212,79 @@ pub struct ApiVmTemplate {
 }
 
 impl ApiVmTemplate {
-    pub fn from(
-        template: lnvps_db::VmTemplate,
-        cost_plan: lnvps_db::VmCostPlan,
-        region: VmHostRegion,
-    ) -> Self {
-        Self {
+    pub async fn from_standard(db: &Arc<dyn LNVpsDb>, template_id: u64) -> Result<Self> {
+        let template = db.get_vm_template(template_id).await?;
+        let cost_plan = db.get_cost_plan(template.cost_plan_id).await?;
+        let region = db.get_host_region(template.region_id).await?;
+        Ok(Self::from_standard_data(&template, &cost_plan, &region))
+    }
+
+    pub async fn from_custom(db: &Arc<dyn LNVpsDb>, vm_id: u64, template_id: u64) -> Result<Self> {
+        let template = db.get_custom_vm_template(template_id).await?;
+        let pricing = db.get_custom_pricing(template.pricing_id).await?;
+        let region = db.get_host_region(pricing.region_id).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(db, vm_id, &template).await?;
+        Ok(Self {
             id: template.id,
-            name: template.name,
-            created: template.created,
-            expires: template.expires,
+            name: "Custom".to_string(),
+            created: pricing.created,
+            expires: pricing.expires,
             cpu: template.cpu,
             memory: template.memory,
             disk_size: template.disk_size,
             disk_type: template.disk_type.into(),
             disk_interface: template.disk_interface.into(),
             cost_plan: ApiVmCostPlan {
-                id: cost_plan.id,
-                name: cost_plan.name,
-                amount: cost_plan.amount,
-                currency: cost_plan.currency,
-                interval_amount: cost_plan.interval_amount,
-                interval_type: cost_plan.interval_type.into(),
+                id: pricing.id,
+                name: pricing.name,
+                amount: price.total(),
+                currency: price.currency,
+                interval_amount: 1,
+                interval_type: ApiVmCostPlanIntervalType::Month,
             },
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name,
+            },
+        })
+    }
+
+    pub async fn from_vm(db: &Arc<dyn LNVpsDb>, vm: &Vm) -> Result<Self> {
+        if let Some(t) = vm.template_id {
+            return Self::from_standard(db, t).await;
+        }
+        if let Some(t) = vm.custom_template_id {
+            return Self::from_custom(db, vm.id, t).await;
+        }
+        bail!("Invalid VM config, no template or custom template")
+    }
+
+    pub fn from_standard_data(
+        template: &VmTemplate,
+        cost_plan: &VmCostPlan,
+        region: &VmHostRegion,
+    ) -> Self {
+        Self {
+            id: template.id,
+            name: template.name.clone(),
+            created: template.created,
+            expires: template.expires,
+            cpu: template.cpu,
+            memory: template.memory,
+            disk_size: template.disk_size,
+            disk_type: template.disk_type.clone().into(),
+            disk_interface: template.disk_interface.clone().into(),
+            cost_plan: ApiVmCostPlan {
+                id: cost_plan.id,
+                name: cost_plan.name.clone(),
+                amount: cost_plan.amount,
+                currency: cost_plan.currency.clone(),
+                interval_amount: cost_plan.interval_amount,
+                interval_type: cost_plan.interval_type.clone().into(),
+            },
+            region: ApiVmHostRegion {
+                id: region.id,
+                name: region.name.clone(),
             },
         }
     }
