@@ -19,7 +19,7 @@ impl MikrotikRouter {
             STANDARD.encode(format!("{}:{}", username, password))
         );
         Self {
-            api: JsonApi::token(url, &auth).unwrap(),
+            api: JsonApi::token(url, &auth, true).unwrap(),
         }
     }
 }

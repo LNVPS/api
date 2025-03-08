@@ -11,11 +11,14 @@ pub struct JsonApi {
 }
 
 impl JsonApi {
-    pub fn token(base: &str, token: &str) -> anyhow::Result<Self> {
+    pub fn token(base: &str, token: &str, allow_invalid_certs: bool) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, token.parse()?);
 
-        let client = Client::builder().default_headers(headers).build()?;
+        let client = Client::builder()
+            .danger_accept_invalid_certs(allow_invalid_certs)
+            .default_headers(headers)
+            .build()?;
         Ok(Self {
             client,
             base: base.parse()?,
