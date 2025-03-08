@@ -80,7 +80,7 @@ impl MockDb {
         }
     }
 
-    pub fn mock_vm() ->Vm {
+    pub fn mock_vm() -> Vm {
         let template = Self::mock_template();
         Vm {
             id: 1,
@@ -861,13 +861,13 @@ impl DnsServer for MockDnsServer {
 }
 
 pub struct MockExchangeRate {
-    pub rate: Arc<Mutex<f32>>,
+    pub rate: Arc<Mutex<HashMap<Ticker, f32>>>,
 }
 
 impl MockExchangeRate {
-    pub fn new(rate: f32) -> Self {
+    pub fn new() -> Self {
         Self {
-            rate: Arc::new(Mutex::new(rate)),
+            rate: Arc::new(Mutex::new(Default::default())),
         }
     }
 }
@@ -876,16 +876,24 @@ impl MockExchangeRate {
 impl ExchangeRateService for MockExchangeRate {
     async fn fetch_rates(&self) -> anyhow::Result<Vec<TickerRate>> {
         let r = self.rate.lock().await;
-        Ok(vec![TickerRate(Ticker::btc_rate("EUR")?, *r)])
+        Ok(r.iter().map(|(k, v)| TickerRate(k.clone(), *v)).collect())
     }
 
     async fn set_rate(&self, ticker: Ticker, amount: f32) {
         let mut r = self.rate.lock().await;
-        *r = amount;
+        if let Some(v) = r.get_mut(&ticker) {
+            *v += amount;
+        } else {
+            r.insert(ticker, amount);
+        }
     }
 
     async fn get_rate(&self, ticker: Ticker) -> Option<f32> {
         let r = self.rate.lock().await;
-        Some(*r)
+        r.get(&ticker).cloned()
+    }
+
+    async fn list_rates(&self) -> anyhow::Result<Vec<TickerRate>> {
+        self.fetch_rates().await
     }
 }

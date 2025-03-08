@@ -1,5 +1,5 @@
 use crate::api::model::{
-    AccountPatchRequest, ApiCustomPrice, ApiCustomTemplateDiskParam, ApiCustomTemplateParams,
+    AccountPatchRequest, ApiPrice, ApiCustomTemplateDiskParam, ApiCustomTemplateParams,
     ApiCustomVmOrder, ApiCustomVmRequest, ApiTemplatesResponse, ApiUserSshKey, ApiVmHostRegion,
     ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
     CreateVmRequest, VMPatchRequest,
@@ -301,7 +301,7 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemp
         .filter_map(|i| {
             let cp = cost_plans.get(&i.cost_plan_id)?;
             let hr = regions.get(&i.region_id)?;
-            Some(ApiVmTemplate::from_standard_data(i, cp, hr))
+            ApiVmTemplate::from_standard_data(i, cp, hr).ok()
         })
         .collect();
     let custom_templates: Vec<VmCustomPricing> =
@@ -373,12 +373,12 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemp
 async fn v1_custom_template_calc(
     db: &State<Arc<dyn LNVpsDb>>,
     req: Json<ApiCustomVmRequest>,
-) -> ApiResult<ApiCustomPrice> {
+) -> ApiResult<ApiPrice> {
     // create a fake template from the request to generate the price
     let template: VmCustomTemplate = req.0.into();
 
     let price = PricingEngine::get_custom_vm_cost_amount(db, 0, &template).await?;
-    ApiData::ok(ApiCustomPrice {
+    ApiData::ok(ApiPrice {
         currency: price.currency.clone(),
         amount: price.total(),
     })

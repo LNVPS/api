@@ -1,7 +1,7 @@
-use crate::exchange::Currency;
-use crate::provisioner::PricingEngine;
+use crate::exchange::{alt_prices, Currency, CurrencyAmount, ExchangeRateService};
+use crate::provisioner::{PricingData, PricingEngine};
 use crate::status::VmState;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, Vm, VmCostPlan, VmCustomTemplate, VmHost, VmHostRegion, VmTemplate};
@@ -136,6 +136,26 @@ pub struct ApiTemplatesResponse {
     pub custom_template: Option<Vec<ApiCustomTemplateParams>>,
 }
 
+impl ApiTemplatesResponse {
+    pub async fn expand_pricing(&mut self, rates: &Arc<dyn ExchangeRateService>) -> Result<()> {
+        let rates = rates.list_rates().await?;
+
+        for mut template in &mut self.templates {
+            if let Some(list_price) = template.cost_plan.price.first() {
+                for alt_price in alt_prices(
+                    &rates,
+                    CurrencyAmount(list_price.currency, list_price.amount),
+                ) {
+                    template.cost_plan.price.push(ApiPrice {
+                        currency: alt_price.0,
+                        amount: alt_price.1,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomTemplateParams {
     pub id: u64,
@@ -189,9 +209,9 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
-pub struct ApiCustomPrice {
-    pub currency: String,
+#[derive(Copy, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApiPrice {
+    pub currency: Currency,
     pub amount: f32,
 }
 
@@ -216,7 +236,7 @@ impl ApiVmTemplate {
         let template = db.get_vm_template(template_id).await?;
         let cost_plan = db.get_cost_plan(template.cost_plan_id).await?;
         let region = db.get_host_region(template.region_id).await?;
-        Ok(Self::from_standard_data(&template, &cost_plan, &region))
+        Self::from_standard_data(&template, &cost_plan, &region)
     }
 
     pub async fn from_custom(db: &Arc<dyn LNVpsDb>, vm_id: u64, template_id: u64) -> Result<Self> {
@@ -239,6 +259,7 @@ impl ApiVmTemplate {
                 name: pricing.name,
                 amount: price.total(),
                 currency: price.currency,
+                other_price: vec![], // filled externally
                 interval_amount: 1,
                 interval_type: ApiVmCostPlanIntervalType::Month,
             },
@@ -263,8 +284,8 @@ impl ApiVmTemplate {
         template: &VmTemplate,
         cost_plan: &VmCostPlan,
         region: &VmHostRegion,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             id: template.id,
             name: template.name.clone(),
             created: template.created,
@@ -278,7 +299,9 @@ impl ApiVmTemplate {
                 id: cost_plan.id,
                 name: cost_plan.name.clone(),
                 amount: cost_plan.amount,
-                currency: cost_plan.currency.clone(),
+                currency: Currency::from_str(&cost_plan.currency)
+                    .map_err(|_| anyhow!("Invalid currency: {}", &cost_plan.currency))?,
+                other_price: vec![], //filled externally
                 interval_amount: cost_plan.interval_amount,
                 interval_type: cost_plan.interval_type.clone().into(),
             },
@@ -286,7 +309,7 @@ impl ApiVmTemplate {
                 id: region.id,
                 name: region.name.clone(),
             },
-        }
+        })
     }
 }
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -311,8 +334,9 @@ impl From<lnvps_db::VmCostPlanIntervalType> for ApiVmCostPlanIntervalType {
 pub struct ApiVmCostPlan {
     pub id: u64,
     pub name: String,
+    pub currency: Currency,
     pub amount: f32,
-    pub currency: String,
+    pub other_price: Vec<ApiPrice>,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,
 }

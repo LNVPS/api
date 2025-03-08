@@ -1,5 +1,5 @@
-use crate::exchange::{ExchangeRateService, Ticker};
-use anyhow::{bail, Result};
+use crate::exchange::{Currency, ExchangeRateService, Ticker};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomTemplate, VmPayment};
@@ -86,8 +86,13 @@ impl PricingEngine {
         let ip4_cost = pricing.ip4_cost * v4s as f32;
         let ip6_cost = pricing.ip6_cost * v6s as f32;
 
+        let currency: Currency = if let Ok(p) = pricing.currency.parse() {
+            p
+        } else {
+            bail!("Invalid currency")
+        };
         Ok(PricingData {
-            currency: pricing.currency,
+            currency,
             cpu_cost,
             memory_cost,
             ip6_cost,
@@ -109,9 +114,7 @@ impl PricingEngine {
 
         // custom templates are always 1-month intervals
         let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
-        let (cost_msats, rate) = self
-            .get_msats_amount(&price.currency, price.total())
-            .await?;
+        let (cost_msats, rate) = self.get_msats_amount(price.currency, price.total()).await?;
         Ok(CostResult::New {
             msats: cost_msats,
             rate,
@@ -120,8 +123,8 @@ impl PricingEngine {
         })
     }
 
-    async fn get_msats_amount(&self, currency: &str, amount: f32) -> Result<(u64, f32)> {
-        let ticker = Ticker::btc_rate(&currency)?;
+    async fn get_msats_amount(&self, currency: Currency, amount: f32) -> Result<(u64, f32)> {
+        let ticker = Ticker(Currency::BTC, currency);
         let rate = if let Some(r) = self.rates.get_rate(ticker).await {
             r
         } else {
@@ -157,7 +160,10 @@ impl PricingEngine {
         let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
 
         let (cost_msats, rate) = self
-            .get_msats_amount(cost_plan.currency.as_str(), cost_plan.amount)
+            .get_msats_amount(
+                cost_plan.currency.parse().expect("Invalid currency"),
+                cost_plan.amount,
+            )
             .await?;
         let time_value = Self::next_template_expire(&vm, &cost_plan);
         Ok(CostResult::New {
@@ -188,7 +194,7 @@ pub enum CostResult {
 
 #[derive(Clone, Debug)]
 pub struct PricingData {
-    pub currency: String,
+    pub currency: Currency,
     pub cpu_cost: f32,
     pub memory_cost: f32,
     pub ip4_cost: f32,
@@ -274,7 +280,9 @@ mod tests {
     #[tokio::test]
     async fn standard_pricing() -> Result<()> {
         let db = MockDb::default();
-        let rates = Arc::new(MockExchangeRate::new(MOCK_RATE));
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
         // add basic vm
         {
             let mut v = db.vms.lock().await;
