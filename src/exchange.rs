@@ -4,7 +4,7 @@ use log::info;
 use rocket::serde::Deserialize;
 use schemars::JsonSchema;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -91,11 +91,23 @@ pub trait ExchangeRateService: Send + Sync {
 
 /// Get alternative prices based on a source price
 pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<CurrencyAmount> {
-    // TODO: return all alt prices by cross-converting all currencies
-    rates
+    let mut ret: Vec<CurrencyAmount> = rates
         .iter()
         .filter_map(|r| r.convert(source).ok())
-        .collect()
+        .collect();
+
+    let mut ret2 = vec![];
+    for y in rates.iter() {
+        for x in ret.iter() {
+            if let Ok(r1) = y.convert(x.clone()) {
+                if r1.0 != source.0 {
+                    ret2.push(r1);
+                }
+            }
+        }
+    }
+    ret.append(&mut ret2);
+    ret
 }
 
 #[derive(Clone, Default)]

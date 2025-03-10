@@ -4,7 +4,10 @@ use crate::status::VmState;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
-use lnvps_db::{LNVpsDb, Vm, VmCostPlan, VmCustomTemplate, VmHost, VmHostRegion, VmTemplate};
+use lnvps_db::{
+    LNVpsDb, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost,
+    VmHostRegion, VmTemplate,
+};
 use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -141,16 +144,12 @@ impl ApiTemplatesResponse {
         let rates = rates.list_rates().await?;
 
         for mut template in &mut self.templates {
-            if let Some(list_price) = template.cost_plan.price.first() {
-                for alt_price in alt_prices(
-                    &rates,
-                    CurrencyAmount(list_price.currency, list_price.amount),
-                ) {
-                    template.cost_plan.price.push(ApiPrice {
-                        currency: alt_price.0,
-                        amount: alt_price.1,
-                    });
-                }
+            let list_price = CurrencyAmount(template.cost_plan.currency, template.cost_plan.amount);
+            for alt_price in alt_prices(&rates, list_price) {
+                template.cost_plan.other_price.push(ApiPrice {
+                    currency: alt_price.0,
+                    amount: alt_price.1,
+                });
             }
         }
         Ok(())
@@ -170,6 +169,40 @@ pub struct ApiCustomTemplateParams {
     pub disks: Vec<ApiCustomTemplateDiskParam>,
 }
 
+impl ApiCustomTemplateParams {
+    pub fn from(
+        pricing: &VmCustomPricing,
+        disks: &Vec<VmCustomPricingDisk>,
+        region: &VmHostRegion,
+        max_cpu: u16,
+        max_memory: u64,
+        max_disk: u64,
+    ) -> Result<Self> {
+        const GB: u64 = 1024 * 1024 * 1024;
+        Ok(ApiCustomTemplateParams {
+            id: pricing.id,
+            name: pricing.name.clone(),
+            region: ApiVmHostRegion {
+                id: region.id,
+                name: region.name.clone(),
+            },
+            max_cpu,
+            min_cpu: 1,
+            min_memory: GB,
+            max_memory,
+            min_disk: GB * 5,
+            max_disk,
+            disks: disks
+                .iter()
+                .filter(|d| d.pricing_id == pricing.id)
+                .map(|d| ApiCustomTemplateDiskParam {
+                    disk_type: d.kind.into(),
+                    disk_interface: d.interface.into(),
+                })
+                .collect(),
+        })
+    }
+}
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomTemplateDiskParam {
     pub disk_type: DiskType,
@@ -213,6 +246,15 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
 pub struct ApiPrice {
     pub currency: Currency,
     pub amount: f32,
+}
+
+impl From<CurrencyAmount> for ApiPrice {
+    fn from(value: CurrencyAmount) -> Self {
+        Self {
+            currency: value.0,
+            amount: value.1,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
