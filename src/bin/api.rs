@@ -4,6 +4,7 @@ use clap::Parser;
 use config::{Config, File};
 use lnvps::api;
 use lnvps::cors::CORS;
+use lnvps::data_migration::run_data_migrations;
 use lnvps::exchange::{DefaultRateCache, ExchangeRateService};
 use lnvps::invoice::InvoiceHandler;
 use lnvps::lightning::get_node;
@@ -83,6 +84,9 @@ async fn main() -> Result<(), Error> {
         db.execute(setup_script).await?;
     }
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+    // run data migrations
+    run_data_migrations(db.clone(), &settings).await?;
 
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();

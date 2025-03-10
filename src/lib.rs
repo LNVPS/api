@@ -14,6 +14,6 @@ pub mod settings;
 pub mod ssh_client;
 pub mod status;
 pub mod worker;
-
+pub mod data_migration;
 #[cfg(test)]
 pub mod mocks;
