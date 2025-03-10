@@ -40,7 +40,7 @@ impl DataMigration for DnsDataMigration {
                     if ip.dns_reverse.is_none() {
                         let rec = BasicRecord::reverse_to_fwd(&ip)?;
                         let r = dns.add_record(&rec).await?;
-                        ip.dns_reverse = Some(r.name);
+                        ip.dns_reverse = Some(r.value);
                         ip.dns_reverse_ref = r.id;
                         did_change = true;
                     }
