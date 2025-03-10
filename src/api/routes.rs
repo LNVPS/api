@@ -1,9 +1,10 @@
 use crate::api::model::{
-    AccountPatchRequest, ApiCustomPrice, ApiCustomTemplateDiskParam, ApiCustomTemplateParams,
-    ApiCustomVmOrder, ApiCustomVmRequest, ApiTemplatesResponse, ApiUserSshKey, ApiVmHostRegion,
+    AccountPatchRequest, ApiCustomTemplateDiskParam, ApiCustomTemplateParams, ApiCustomVmOrder,
+    ApiCustomVmRequest, ApiPrice, ApiTemplatesResponse, ApiUserSshKey, ApiVmHostRegion,
     ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
     CreateVmRequest, VMPatchRequest,
 };
+use crate::exchange::ExchangeRateService;
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::nip98::Nip98Auth;
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
@@ -266,7 +267,10 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
 /// List available VM templates (Offers)
 #[openapi(tag = "VM")]
 #[get("/api/v1/vm/templates")]
-async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemplatesResponse> {
+async fn v1_list_vm_templates(
+    db: &State<Arc<dyn LNVpsDb>>,
+    rates: &State<Arc<dyn ExchangeRateService>>,
+) -> ApiResult<ApiTemplatesResponse> {
     let hc = HostCapacityService::new((*db).clone());
     let templates = hc.list_available_vm_templates().await?;
 
@@ -301,7 +305,7 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemp
         .filter_map(|i| {
             let cp = cost_plans.get(&i.cost_plan_id)?;
             let hr = regions.get(&i.region_id)?;
-            Some(ApiVmTemplate::from_standard_data(i, cp, hr))
+            ApiVmTemplate::from_standard_data(i, cp, hr).ok()
         })
         .collect();
     let custom_templates: Vec<VmCustomPricing> =
@@ -322,49 +326,42 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemp
     .flatten()
     .collect();
 
-    ApiData::ok(ApiTemplatesResponse {
+    let mut rsp = ApiTemplatesResponse {
         templates: ret,
         custom_template: if custom_templates.is_empty() {
             None
         } else {
             const GB: u64 = 1024 * 1024 * 1024;
+            let max_cpu = templates.iter().map(|t| t.cpu).max().unwrap_or(8);
+            let max_memory = templates.iter().map(|t| t.memory).max().unwrap_or(GB * 2);
+            let max_disk = templates
+                .iter()
+                .map(|t| t.disk_size)
+                .max()
+                .unwrap_or(GB * 5);
             Some(
                 custom_templates
                     .into_iter()
-                    .map(|t| ApiCustomTemplateParams {
-                        id: t.id,
-                        name: t.name,
-                        region: regions
-                            .get(&t.region_id)
-                            .map(|r| ApiVmHostRegion {
-                                id: r.id,
-                                name: r.name.clone(),
-                            })
-                            .context("Region information missing in custom template")
-                            .unwrap(),
-                        max_cpu: templates.iter().map(|t| t.cpu).max().unwrap_or(8),
-                        min_cpu: 1,
-                        min_memory: GB,
-                        max_memory: templates.iter().map(|t| t.memory).max().unwrap_or(GB * 2),
-                        min_disk: GB * 5,
-                        max_disk: templates
-                            .iter()
-                            .map(|t| t.disk_size)
-                            .max()
-                            .unwrap_or(GB * 5),
-                        disks: custom_template_disks
-                            .iter()
-                            .filter(|d| d.pricing_id == t.id)
-                            .map(|d| ApiCustomTemplateDiskParam {
-                                disk_type: d.kind.into(),
-                                disk_interface: d.interface.into(),
-                            })
-                            .collect(),
+                    .filter_map(|t| {
+                        let region = regions.get(&t.region_id)?;
+                        Some(
+                            ApiCustomTemplateParams::from(
+                                &t,
+                                &custom_template_disks,
+                                region,
+                                max_cpu,
+                                max_memory,
+                                max_disk,
+                            )
+                            .ok()?,
+                        )
                     })
                     .collect(),
             )
         },
-    })
+    };
+    rsp.expand_pricing(rates).await?;
+    ApiData::ok(rsp)
 }
 
 /// Get a price for a custom order
@@ -373,12 +370,12 @@ async fn v1_list_vm_templates(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<ApiTemp
 async fn v1_custom_template_calc(
     db: &State<Arc<dyn LNVpsDb>>,
     req: Json<ApiCustomVmRequest>,
-) -> ApiResult<ApiCustomPrice> {
+) -> ApiResult<ApiPrice> {
     // create a fake template from the request to generate the price
     let template: VmCustomTemplate = req.0.into();
 
     let price = PricingEngine::get_custom_vm_cost_amount(db, 0, &template).await?;
-    ApiData::ok(ApiCustomPrice {
+    ApiData::ok(ApiPrice {
         currency: price.currency.clone(),
         amount: price.total(),
     })
