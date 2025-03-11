@@ -1,10 +1,10 @@
-use anyhow::{anyhow, ensure, Context, Error, Result};
+use anyhow::{anyhow, ensure, Result};
 use lnvps_db::async_trait;
 use log::info;
 use rocket::serde::Deserialize;
 use schemars::JsonSchema;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -62,6 +62,12 @@ pub struct TickerRate(pub Ticker, pub f32);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CurrencyAmount(pub Currency, pub f32);
 
+impl CurrencyAmount {
+    pub fn from_u64(currency: Currency, amount: u64) -> Self {
+        CurrencyAmount(currency, amount as f32 / 100.0)
+    }
+}
+
 impl TickerRate {
     pub fn can_convert(&self, currency: Currency) -> bool {
         currency == self.0 .0 || currency == self.0 .1
@@ -99,7 +105,7 @@ pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<Curren
     let mut ret2 = vec![];
     for y in rates.iter() {
         for x in ret.iter() {
-            if let Ok(r1) = y.convert(x.clone()) {
+            if let Ok(r1) = y.convert(*x) {
                 if r1.0 != source.0 {
                     ret2.push(r1);
                 }

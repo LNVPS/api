@@ -387,16 +387,19 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,invoice,time_value,is_paid,rate) values(?,?,?,?,?,?,?,?,?)")
+        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,currency,payment_method,time_value,is_paid,rate,external_id,external_data) values(?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
             .bind(vm_payment.vm_id)
             .bind(vm_payment.created)
             .bind(vm_payment.expires)
             .bind(vm_payment.amount)
-            .bind(&vm_payment.invoice)
+            .bind(&vm_payment.currency)
+            .bind(&vm_payment.payment_method)
             .bind(vm_payment.time_value)
             .bind(vm_payment.is_paid)
             .bind(vm_payment.rate)
+            .bind(&vm_payment.external_id)
+            .bind(&vm_payment.external_data)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
@@ -405,6 +408,14 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn get_vm_payment(&self, id: &Vec<u8>) -> Result<VmPayment> {
         sqlx::query_as("select * from vm_payment where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_vm_payment_by_ext_id(&self, id: &str) -> Result<VmPayment> {
+        sqlx::query_as("select * from vm_payment where external_id=?")
             .bind(id)
             .fetch_one(&self.db)
             .await
@@ -428,8 +439,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
         let mut tx = self.db.begin().await?;
 
-        sqlx::query("update vm_payment set is_paid = true, settle_index = ? where id = ?")
-            .bind(vm_payment.settle_index)
+        sqlx::query("update vm_payment set is_paid = true where id = ?")
             .bind(&vm_payment.id)
             .execute(&mut *tx)
             .await?;
@@ -446,7 +456,7 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn last_paid_invoice(&self) -> Result<Option<VmPayment>> {
         sqlx::query_as(
-            "select * from vm_payment where is_paid = true order by settle_index desc limit 1",
+            "select * from vm_payment where is_paid = true order by created desc limit 1",
         )
         .fetch_optional(&self.db)
         .await

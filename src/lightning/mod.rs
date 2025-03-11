@@ -40,7 +40,6 @@ pub enum InvoiceUpdate {
     Error(String),
     Settled {
         payment_hash: String,
-        settle_index: u64,
     },
 }
 

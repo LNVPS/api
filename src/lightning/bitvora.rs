@@ -17,7 +17,7 @@ impl BitvoraNode {
     pub fn new(api_token: &str, webhook_secret: &str) -> Self {
         let auth = format!("Bearer {}", api_token);
         Self {
-            api: JsonApi::token("https://api.bitvora.com/", &auth).unwrap(),
+            api: JsonApi::token("https://api.bitvora.com/", &auth, false).unwrap(),
             webhook_secret: webhook_secret.to_string(),
         }
     }

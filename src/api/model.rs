@@ -1,16 +1,16 @@
 use crate::exchange::{alt_prices, Currency, CurrencyAmount, ExchangeRateService};
-use crate::provisioner::{PricingData, PricingEngine};
+use crate::provisioner::PricingEngine;
 use crate::status::VmState;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
 use lnvps_db::{
-    LNVpsDb, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost,
-    VmHostRegion, VmTemplate,
+    LNVpsDb, PaymentMethod, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion, VmTemplate,
 };
 use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -95,9 +95,9 @@ impl From<lnvps_db::DiskType> for DiskType {
     }
 }
 
-impl Into<lnvps_db::DiskType> for DiskType {
-    fn into(self) -> lnvps_db::DiskType {
-        match self {
+impl From<DiskType> for lnvps_db::DiskType {
+    fn from(val: DiskType) -> Self {
+        match val {
             DiskType::HDD => lnvps_db::DiskType::HDD,
             DiskType::SSD => lnvps_db::DiskType::SSD,
         }
@@ -143,7 +143,7 @@ impl ApiTemplatesResponse {
     pub async fn expand_pricing(&mut self, rates: &Arc<dyn ExchangeRateService>) -> Result<()> {
         let rates = rates.list_rates().await?;
 
-        for mut template in &mut self.templates {
+        for template in &mut self.templates {
             let list_price = CurrencyAmount(template.cost_plan.currency, template.cost_plan.amount);
             for alt_price in alt_prices(&rates, list_price) {
                 template.cost_plan.other_price.push(ApiPrice {
@@ -335,8 +335,8 @@ impl ApiVmTemplate {
             cpu: template.cpu,
             memory: template.memory,
             disk_size: template.disk_size,
-            disk_type: template.disk_type.clone().into(),
-            disk_interface: template.disk_interface.clone().into(),
+            disk_type: template.disk_type.into(),
+            disk_interface: template.disk_interface.into(),
             cost_plan: ApiVmCostPlan {
                 id: cost_plan.id,
                 name: cost_plan.name.clone(),
@@ -468,14 +468,14 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiVmPayment {
-    /// Payment hash hex
     pub id: String,
     pub vm_id: u64,
     pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
     pub amount: u64,
-    pub invoice: String,
+    pub currency: String,
     pub is_paid: bool,
+    pub data: ApiPaymentData,
 }
 
 impl From<lnvps_db::VmPayment> for ApiVmPayment {
@@ -486,8 +486,64 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             created: value.created,
             expires: value.expires,
             amount: value.amount,
-            invoice: value.invoice,
+            currency: value.currency,
             is_paid: value.is_paid,
+            data: match &value.payment_method {
+                PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data),
+                PaymentMethod::Revolut => {
+                    #[derive(Deserialize)]
+                    struct RevolutData {
+                        pub token: String,
+                    }
+                    let data: RevolutData = serde_json::from_str(&value.external_data).unwrap();
+                    ApiPaymentData::Revolut { token: data.token }
+                }
+                PaymentMethod::Paypal => {
+                    todo!()
+                }
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiPaymentInfo {
+    pub name: ApiPaymentMethod,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+
+    pub currencies: Vec<Currency>,
+}
+
+/// Payment data related to the payment method
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiPaymentData {
+    /// Just an LN invoice
+    Lightning(String),
+    /// Revolut order data
+    Revolut {
+        /// Order token
+        token: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiPaymentMethod {
+    #[default]
+    Lightning,
+    Revolut,
+    Paypal,
+}
+
+impl From<PaymentMethod> for ApiPaymentMethod {
+    fn from(value: PaymentMethod) -> Self {
+        match value {
+            PaymentMethod::Lightning => ApiPaymentMethod::Lightning,
+            PaymentMethod::Revolut => ApiPaymentMethod::Revolut,
+            PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
         }
     }
 }

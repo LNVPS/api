@@ -131,6 +131,9 @@ pub trait LNVpsDb: Sync + Send {
     /// Get VM payment by payment id
     async fn get_vm_payment(&self, id: &Vec<u8>) -> Result<VmPayment>;
 
+    /// Get VM payment by payment id
+    async fn get_vm_payment_by_ext_id(&self, id: &str) -> Result<VmPayment>;
+
     /// Update a VM payment record
     async fn update_vm_payment(&self, vm_payment: &VmPayment) -> Result<()>;
 

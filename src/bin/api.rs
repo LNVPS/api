@@ -6,8 +6,8 @@ use lnvps::api;
 use lnvps::cors::CORS;
 use lnvps::data_migration::run_data_migrations;
 use lnvps::exchange::{DefaultRateCache, ExchangeRateService};
-use lnvps::invoice::InvoiceHandler;
 use lnvps::lightning::get_node;
+use lnvps::payments::listen_all_payments;
 use lnvps::settings::Settings;
 use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
@@ -20,7 +20,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -37,7 +36,7 @@ struct Args {
 #[rocket::main]
 async fn main() -> Result<(), Error> {
     let log_level = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "info".to_string()) // Default to "info" if not set
+        .unwrap_or_else(|_| "info".to_string())
         .to_lowercase();
 
     let max_level = match log_level.as_str() {
@@ -47,7 +46,7 @@ async fn main() -> Result<(), Error> {
         "warn" => LevelFilter::Warn,
         "error" => LevelFilter::Error,
         "off" => LevelFilter::Off,
-        _ => LevelFilter::Info,
+        _ => LevelFilter::Debug,
     };
 
     let args = Args::parse();
@@ -121,15 +120,10 @@ async fn main() -> Result<(), Error> {
             }
         }
     });
-    let mut handler = InvoiceHandler::new(node.clone(), db.clone(), sender.clone());
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = handler.listen().await {
-                error!("invoice-error: {}", e);
-            }
-            sleep(Duration::from_secs(5)).await;
-        }
-    });
+
+    // setup payment handlers
+    listen_all_payments(&settings, node.clone(), db.clone(), sender.clone())?;
+
     // request work every 30s to check vm status
     let sender_clone = sender.clone();
     tokio::spawn(async move {

@@ -1,5 +1,6 @@
 use crate::dns::DnsServer;
 use crate::exchange::ExchangeRateService;
+use crate::fiat::FiatPaymentService;
 use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
 use crate::router::Router;
@@ -12,8 +13,14 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Settings {
+    /// Listen address for http server
     pub listen: Option<String>,
+
+    /// MYSQL connection string
     pub db: String,
+
+    /// Public URL mapping to this service
+    pub public_url: String,
 
     /// Lightning node config for creating LN payments
     pub lightning: LightningConfig,
@@ -42,6 +49,9 @@ pub struct Settings {
 
     /// Nostr config for sending DMs
     pub nostr: Option<NostrConfig>,
+
+    /// Config for accepting revolut payments
+    pub revolut: Option<RevolutConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -168,6 +178,15 @@ pub struct QemuConfig {
     pub kvm: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RevolutConfig {
+    pub url: Option<String>,
+    pub api_version: String,
+    pub token: String,
+    pub public_key: String,
+}
+
 impl Settings {
     pub fn get_provisioner(
         &self,
@@ -224,6 +243,14 @@ impl Settings {
                     forward_zone_id,
                 )))),
             }
+        }
+    }
+
+    pub fn get_revolut(&self) -> Result<Option<Arc<dyn FiatPaymentService>>> {
+        match &self.revolut {
+            #[cfg(feature = "revolut")]
+            Some(c) => Ok(Some(Arc::new(crate::fiat::RevolutApi::new(c.clone())?))),
+            _ => Ok(None),
         }
     }
 }

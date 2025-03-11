@@ -1,8 +1,10 @@
-use crate::exchange::{Currency, ExchangeRateService, Ticker};
-use anyhow::{bail, Context, Result};
+use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
-use lnvps_db::{LNVpsDb, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomTemplate, VmPayment};
+use lnvps_db::{
+    LNVpsDb, PaymentMethod, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomTemplate, VmPayment,
+};
 use log::info;
 use std::ops::Add;
 use std::str::FromStr;
@@ -28,22 +30,22 @@ impl PricingEngine {
     }
 
     /// Get VM cost (for renewal)
-    pub async fn get_vm_cost(&self, vm_id: u64) -> Result<CostResult> {
+    pub async fn get_vm_cost(&self, vm_id: u64, method: PaymentMethod) -> Result<CostResult> {
         let vm = self.db.get_vm(vm_id).await?;
 
         // Reuse existing payment until expired
         let payments = self.db.list_vm_payment(vm.id).await?;
         if let Some(px) = payments
             .into_iter()
-            .find(|p| p.expires > Utc::now() && !p.is_paid)
+            .find(|p| p.expires > Utc::now() && !p.is_paid && p.payment_method == method)
         {
             return Ok(CostResult::Existing(px));
         }
 
         if vm.template_id.is_some() {
-            Ok(self.get_template_vm_cost(&vm).await?)
+            Ok(self.get_template_vm_cost(&vm, method).await?)
         } else {
-            Ok(self.get_custom_vm_cost(&vm).await?)
+            Ok(self.get_custom_vm_cost(&vm, method).await?)
         }
     }
 
@@ -101,7 +103,7 @@ impl PricingEngine {
         })
     }
 
-    async fn get_custom_vm_cost(&self, vm: &Vm) -> Result<CostResult> {
+    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<CostResult> {
         let template_id = if let Some(i) = vm.custom_template_id {
             i
         } else {
@@ -114,26 +116,32 @@ impl PricingEngine {
 
         // custom templates are always 1-month intervals
         let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
-        let (cost_msats, rate) = self.get_msats_amount(price.currency, price.total()).await?;
+        let (currency, amount, rate) = self
+            .get_amount_and_rate(CurrencyAmount(price.currency, price.total()), method)
+            .await?;
         Ok(CostResult::New {
-            msats: cost_msats,
+            amount,
+            currency,
             rate,
             time_value,
             new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
         })
     }
 
-    async fn get_msats_amount(&self, currency: Currency, amount: f32) -> Result<(u64, f32)> {
+    async fn get_ticker(&self, currency: Currency) -> Result<TickerRate> {
         let ticker = Ticker(Currency::BTC, currency);
-        let rate = if let Some(r) = self.rates.get_rate(ticker).await {
-            r
+        if let Some(r) = self.rates.get_rate(ticker).await {
+            Ok(TickerRate(ticker, r))
         } else {
             bail!("No exchange rate found")
-        };
+        }
+    }
 
-        let cost_btc = amount / rate;
+    async fn get_msats_amount(&self, amount: CurrencyAmount) -> Result<(u64, f32)> {
+        let rate = self.get_ticker(amount.0).await?;
+        let cost_btc = amount.1 / rate.1;
         let cost_msats = (cost_btc as f64 * Self::BTC_SATS) as u64 * 1000;
-        Ok((cost_msats, rate))
+        Ok((cost_msats, rate.1))
     }
 
     fn next_template_expire(vm: &Vm, cost_plan: &VmCostPlan) -> u64 {
@@ -150,7 +158,7 @@ impl PricingEngine {
         (next_expire - vm.expires).num_seconds() as u64
     }
 
-    async fn get_template_vm_cost(&self, vm: &Vm) -> Result<CostResult> {
+    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<CostResult> {
         let template_id = if let Some(i) = vm.template_id {
             i
         } else {
@@ -159,18 +167,34 @@ impl PricingEngine {
         let template = self.db.get_vm_template(template_id).await?;
         let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
 
-        let (cost_msats, rate) = self
-            .get_msats_amount(
-                cost_plan.currency.parse().expect("Invalid currency"),
-                cost_plan.amount,
-            )
+        let currency = cost_plan.currency.parse().expect("Invalid currency");
+        let (currency, amount, rate) = self
+            .get_amount_and_rate(CurrencyAmount(currency, cost_plan.amount), method)
             .await?;
-        let time_value = Self::next_template_expire(&vm, &cost_plan);
+        let time_value = Self::next_template_expire(vm, &cost_plan);
         Ok(CostResult::New {
-            msats: cost_msats,
+            amount,
+            currency,
             rate,
             time_value,
             new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
+        })
+    }
+
+    async fn get_amount_and_rate(
+        &self,
+        list_price: CurrencyAmount,
+        method: PaymentMethod,
+    ) -> Result<(Currency, u64, f32)> {
+        Ok(match (list_price.0, method) {
+            (c, PaymentMethod::Lightning) if c != Currency::BTC => {
+                let new_price = self.get_msats_amount(list_price).await?;
+                (Currency::BTC, new_price.0, new_price.1)
+            }
+            (cur, PaymentMethod::Revolut) if cur != Currency::BTC => {
+                (cur, (list_price.1 * 100.0).ceil() as u64, 1.0)
+            }
+            (c, m) => bail!("Cannot create payment for method {} and currency {}", m, c),
         })
     }
 }
@@ -181,8 +205,10 @@ pub enum CostResult {
     Existing(VmPayment),
     /// A new payment can be created with the specified amount
     New {
-        /// The cost in milli-sats
-        msats: u64,
+        /// The cost
+        amount: u64,
+        /// Currency
+        currency: Currency,
         /// The exchange rate used to calculate the price
         rate: f32,
         /// The time to extend the vm expiry in seconds
@@ -292,14 +318,14 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
         let pe = PricingEngine::new(db.clone(), rates);
-        let price = pe.get_vm_cost(1).await?;
+        let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
         let plan = MockDb::mock_cost_plan();
         match price {
-            CostResult::Existing(_) => bail!("??"),
-            CostResult::New { msats, .. } => {
+            CostResult::New { amount, .. } => {
                 let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
-                assert_eq!(expect_price, msats);
+                assert_eq!(expect_price, amount);
             }
+            _ => bail!("??"),
         }
 
         Ok(())

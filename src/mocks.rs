@@ -518,11 +518,18 @@ impl LNVpsDb for MockDb {
             .clone())
     }
 
+    async fn get_vm_payment_by_ext_id(&self, id: &str) -> anyhow::Result<VmPayment> {
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .find(|p| p.external_id == Some(id.to_string()))
+            .context("no vm_payment")?
+            .clone())
+    }
+
     async fn update_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
         let mut p = self.payments.lock().await;
         if let Some(p) = p.iter_mut().find(|p| p.id == *vm_payment.id) {
             p.is_paid = vm_payment.is_paid.clone();
-            p.settle_index = vm_payment.settle_index.clone();
         }
         Ok(())
     }
@@ -539,7 +546,8 @@ impl LNVpsDb for MockDb {
     async fn last_paid_invoice(&self) -> anyhow::Result<Option<VmPayment>> {
         let p = self.payments.lock().await;
         Ok(p.iter()
-            .max_by(|a, b| a.settle_index.cmp(&b.settle_index))
+            .filter(|p| p.is_paid)
+            .max_by(|a, b| a.created.cmp(&b.created))
             .map(|v| v.clone()))
     }
 

@@ -98,7 +98,7 @@ impl<'r> FromRequest<'r> for Nip98Auth {
             }
             let auth = Nip98Auth::from_base64(&auth[6..]).unwrap();
             match auth.check(
-                request.uri().to_string().as_str(),
+                request.uri().path().to_string().as_str(),
                 request.method().as_str(),
             ) {
                 Ok(_) => Outcome::Success(auth),

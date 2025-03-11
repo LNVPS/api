@@ -1,5 +1,6 @@
 use crate::dns::{BasicRecord, DnsServer};
-use crate::exchange::{ExchangeRateService, Ticker};
+use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService};
+use crate::fiat::FiatPaymentService;
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{
@@ -8,8 +9,11 @@ use crate::provisioner::{
 use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
-use chrono::{Days, Months, Utc};
-use lnvps_db::{DiskType, LNVpsDb, Vm, VmCostPlanIntervalType, VmCustomTemplate, VmIpAssignment, VmPayment};
+use chrono::Utc;
+use lnvps_db::{
+    LNVpsDb, PaymentMethod, Vm, VmCustomTemplate, VmIpAssignment,
+    VmPayment,
+};
 use log::{info, warn};
 use nostr::util::hex;
 use std::ops::Add;
@@ -28,6 +32,7 @@ pub struct LNVpsProvisioner {
 
     router: Option<Arc<dyn Router>>,
     dns: Option<Arc<dyn DnsServer>>,
+    revolut: Option<Arc<dyn FiatPaymentService>>,
 
     network_policy: NetworkPolicy,
     provisioner_config: ProvisionerConfig,
@@ -46,6 +51,7 @@ impl LNVpsProvisioner {
             rates,
             router: settings.get_router().expect("router config"),
             dns: settings.get_dns().expect("dns config"),
+            revolut: settings.get_revolut().expect("revolut config"),
             network_policy: settings.network_policy,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
@@ -255,7 +261,9 @@ impl LNVpsProvisioner {
 
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
-        let host = cap.get_host_for_template(template.region_id, &template).await?;
+        let host = cap
+            .get_host_for_template(template.region_id, &template)
+            .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
             hd
@@ -308,7 +316,9 @@ impl LNVpsProvisioner {
 
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
-        let host = cap.get_host_for_template(pricing.region_id, &template).await?;
+        let host = cap
+            .get_host_for_template(pricing.region_id, &template)
+            .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
             hd
@@ -345,40 +355,83 @@ impl LNVpsProvisioner {
     }
 
     /// Create a renewal payment
-    pub async fn renew(&self, vm_id: u64) -> Result<VmPayment> {
+    pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
         let pe = PricingEngine::new(self.db.clone(), self.rates.clone());
 
-        let price = pe.get_vm_cost(vm_id).await?;
+        let price = pe.get_vm_cost(vm_id, method).await?;
         match price {
             CostResult::Existing(p) => Ok(p),
             CostResult::New {
-                msats,
+                amount,
+                currency,
                 time_value,
                 new_expiry,
                 rate,
             } => {
-                const INVOICE_EXPIRE: u64 = 600;
-                info!("Creating invoice for {vm_id} for {} sats", msats / 1000);
-                let invoice = self
-                    .node
-                    .add_invoice(AddInvoiceRequest {
-                        memo: Some(format!("VM renewal {vm_id} to {new_expiry}")),
-                        amount: msats,
-                        expire: Some(INVOICE_EXPIRE as u32),
-                    })
-                    .await?;
-                let vm_payment = VmPayment {
-                    id: hex::decode(invoice.payment_hash)?,
-                    vm_id,
-                    created: Utc::now(),
-                    expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
-                    amount: msats,
-                    invoice: invoice.pr,
-                    time_value,
-                    is_paid: false,
-                    rate,
-                    settle_index: None,
+                let desc = format!("VM renewal {vm_id} to {new_expiry}");
+                let vm_payment = match method {
+                    PaymentMethod::Lightning => {
+                        ensure!(
+                            currency == Currency::BTC,
+                            "Cannot create invoices for non-BTC currency"
+                        );
+                        const INVOICE_EXPIRE: u64 = 600;
+                        info!("Creating invoice for {vm_id} for {} sats", amount / 1000);
+                        let invoice = self
+                            .node
+                            .add_invoice(AddInvoiceRequest {
+                                memo: Some(desc),
+                                amount,
+                                expire: Some(INVOICE_EXPIRE as u32),
+                            })
+                            .await?;
+                        VmPayment {
+                            id: hex::decode(invoice.payment_hash)?,
+                            vm_id,
+                            created: Utc::now(),
+                            expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
+                            amount,
+                            currency: currency.to_string(),
+                            payment_method: method,
+                            time_value,
+                            is_paid: false,
+                            rate,
+                            external_data: invoice.pr,
+                            external_id: None,
+                        }
+                    }
+                    PaymentMethod::Revolut => {
+                        let rev = if let Some(r) = &self.revolut {
+                            r
+                        } else {
+                            bail!("Revolut not configured")
+                        };
+                        ensure!(
+                            currency != Currency::BTC,
+                            "Cannot create revolut orders for BTC currency"
+                        );
+                        let order = rev
+                            .create_order(&desc, CurrencyAmount::from_u64(currency, amount))
+                            .await?;
+                        let new_id: [u8; 32] = rand::random();
+                        VmPayment {
+                            id: new_id.to_vec(),
+                            vm_id,
+                            created: Utc::now(),
+                            expires: Utc::now().add(Duration::from_secs(3600)),
+                            amount,
+                            currency: currency.to_string(),
+                            payment_method: method,
+                            time_value,
+                            is_paid: false,
+                            rate,
+                            external_data: order.raw_data,
+                            external_id: Some(order.external_id),
+                        }
+                    }
+                    PaymentMethod::Paypal => todo!(),
                 };
+
                 self.db.insert_vm_payment(&vm_payment).await?;
 
                 Ok(vm_payment)
@@ -443,6 +496,7 @@ mod tests {
         Settings {
             listen: None,
             db: "".to_string(),
+            public_url: "http://localhost:8000".to_string(),
             lightning: LightningConfig::LND {
                 url: "".to_string(),
                 cert: Default::default(),
@@ -480,6 +534,7 @@ mod tests {
                 reverse_zone_id: "456".to_string(),
             }),
             nostr: None,
+            revolut: None,
         }
     }
 

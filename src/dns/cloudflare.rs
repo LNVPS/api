@@ -14,8 +14,12 @@ pub struct Cloudflare {
 impl Cloudflare {
     pub fn new(token: &str, reverse_zone_id: &str, forward_zone_id: &str) -> Cloudflare {
         Self {
-            api: JsonApi::token("https://api.cloudflare.com", &format!("Bearer {}", token), false)
-                .unwrap(),
+            api: JsonApi::token(
+                "https://api.cloudflare.com",
+                &format!("Bearer {}", token),
+                false,
+            )
+            .unwrap(),
             reverse_zone_id: reverse_zone_id.to_owned(),
             forward_zone_id: forward_zone_id.to_owned(),
         }

@@ -5,6 +5,7 @@ lightning:
     cert: "/home/kieran/.polar/networks/2/volumes/lnd/alice/tls.cert"
     macaroon: "/home/kieran/.polar/networks/2/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
 delete-after: 3
+public-url: "https://api.lnvps.net"
 provisioner:
   proxmox:
     read-only: false

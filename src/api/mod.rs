@@ -10,4 +10,5 @@ pub fn routes() -> Vec<Route> {
     r
 }
 
+pub use webhook::WebhookMessage;
 pub use webhook::WEBHOOK_BRIDGE;

@@ -34,7 +34,7 @@ impl VmHostClient for LibVirt {
         todo!()
     }
 
-    async fn configure_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {
         todo!()
     }
 

@@ -8,13 +8,13 @@ use rocket::futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
-pub struct InvoiceHandler {
+pub struct NodeInvoiceHandler {
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
     tx: UnboundedSender<WorkJob>,
 }
 
-impl InvoiceHandler {
+impl NodeInvoiceHandler {
     pub fn new(
         node: Arc<dyn LightningNode>,
         db: Arc<dyn LNVpsDb>,
@@ -23,9 +23,8 @@ impl InvoiceHandler {
         Self { node, tx, db }
     }
 
-    async fn mark_paid(&self, settle_index: u64, id: &Vec<u8>) -> Result<()> {
-        let mut p = self.db.get_vm_payment(id).await?;
-        p.settle_index = Some(settle_index);
+    async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
+        let p = self.db.get_vm_payment(id).await?;
         self.db.vm_payment_paid(&p).await?;
 
         info!("VM payment {} for {}, paid", hex::encode(p.id), p.vm_id);
@@ -47,12 +46,9 @@ impl InvoiceHandler {
         let mut handler = self.node.subscribe_invoices(from_ph).await?;
         while let Some(msg) = handler.next().await {
             match msg {
-                InvoiceUpdate::Settled {
-                    payment_hash,
-                    settle_index,
-                } => {
+                InvoiceUpdate::Settled { payment_hash } => {
                     let r_hash = hex::decode(payment_hash)?;
-                    if let Err(e) = self.mark_paid(settle_index, &r_hash).await {
+                    if let Err(e) = self.mark_paid(&r_hash).await {
                         error!("{}", e);
                     }
                 }

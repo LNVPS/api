@@ -1,10 +1,11 @@
 use anyhow::bail;
 use log::debug;
-use reqwest::header::{HeaderMap, AUTHORIZATION};
+use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION};
 use reqwest::{Client, Method, Url};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+#[derive(Clone)]
 pub struct JsonApi {
     pub client: Client,
     pub base: Url,
@@ -14,6 +15,7 @@ impl JsonApi {
     pub fn token(base: &str, token: &str, allow_invalid_certs: bool) -> anyhow::Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, token.parse()?);
+        headers.insert(ACCEPT, "application/json".parse()?);
 
         let client = Client::builder()
             .danger_accept_invalid_certs(allow_invalid_certs)
@@ -59,7 +61,6 @@ impl JsonApi {
             .client
             .request(method.clone(), self.base.join(path)?)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
             .body(body)
             .send()
             .await?;
@@ -69,6 +70,33 @@ impl JsonApi {
         debug!("<< {}", text);
         if status.is_success() {
             Ok(serde_json::from_str(&text)?)
+        } else {
+            bail!("{} {}: {}: {}", method, path, status, &text);
+        }
+    }
+
+    /// Make a request and only return the status code
+    pub async fn req_status<R: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: R,
+    ) -> anyhow::Result<u16> {
+        let body = serde_json::to_string(&body)?;
+        debug!(">> {} {}: {}", method.clone(), path, &body);
+        let rsp = self
+            .client
+            .request(method.clone(), self.base.join(path)?)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+        let status = rsp.status();
+        let text = rsp.text().await?;
+        #[cfg(debug_assertions)]
+        debug!("<< {}", text);
+        if status.is_success() {
+            Ok(status.as_u16())
         } else {
             bail!("{} {}: {}: {}", method, path, status, &text);
         }

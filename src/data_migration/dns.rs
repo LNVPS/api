@@ -28,17 +28,17 @@ impl DataMigration for DnsDataMigration {
 
             for vm in vms {
                 let mut ips = db.list_vm_ip_assignments(vm.id).await?;
-                for mut ip in &mut ips {
+                for ip in &mut ips {
                     let mut did_change = false;
                     if ip.dns_forward.is_none() {
-                        let rec = BasicRecord::forward(&ip)?;
+                        let rec = BasicRecord::forward(ip)?;
                         let r = dns.add_record(&rec).await?;
                         ip.dns_forward = Some(r.name);
                         ip.dns_forward_ref = r.id;
                         did_change = true;
                     }
                     if ip.dns_reverse.is_none() {
-                        let rec = BasicRecord::reverse_to_fwd(&ip)?;
+                        let rec = BasicRecord::reverse_to_fwd(ip)?;
                         let r = dns.add_record(&rec).await?;
                         ip.dns_reverse = Some(r.value);
                         ip.dns_reverse_ref = r.id;

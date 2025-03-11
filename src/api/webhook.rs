@@ -6,19 +6,31 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use tokio::sync::broadcast;
 
-/// Messaging bridge for webhooks to other parts of the system (bitvora)
+/// Messaging bridge for webhooks to other parts of the system (bitvora/revout)
 pub static WEBHOOK_BRIDGE: LazyLock<WebhookBridge> = LazyLock::new(WebhookBridge::new);
 
 pub fn routes() -> Vec<Route> {
-    if cfg!(feature = "bitvora") {
-        routes![bitvora_webhook]
-    } else {
-        routes![]
-    }
+    let mut routes = vec![];
+
+    #[cfg(feature = "bitvora")]
+    routes.append(&mut routes![bitvora_webhook]);
+
+    #[cfg(feature = "revolut")]
+    routes.append(&mut routes![revolut_webhook]);
+
+    routes
 }
 
+#[cfg(feature = "bitvora")]
 #[post("/api/v1/webhook/bitvora", data = "<req>")]
 async fn bitvora_webhook(req: WebhookMessage) -> Status {
+    WEBHOOK_BRIDGE.send(req);
+    Status::Ok
+}
+
+#[cfg(feature = "revolut")]
+#[post("/api/v1/webhook/revolut", data = "<req>")]
+async fn revolut_webhook(req: WebhookMessage) -> Status {
     WEBHOOK_BRIDGE.send(req);
     Status::Ok
 }

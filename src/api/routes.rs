@@ -1,19 +1,21 @@
 use crate::api::model::{
-    AccountPatchRequest, ApiCustomTemplateDiskParam, ApiCustomTemplateParams, ApiCustomVmOrder,
-    ApiCustomVmRequest, ApiPrice, ApiTemplatesResponse, ApiUserSshKey, ApiVmHostRegion,
-    ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
-    CreateVmRequest, VMPatchRequest,
+    AccountPatchRequest, ApiCustomTemplateParams, ApiCustomVmOrder,
+    ApiCustomVmRequest, ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse,
+    ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
+    ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
 };
-use crate::exchange::ExchangeRateService;
+use crate::exchange::{Currency, ExchangeRateService};
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::nip98::Nip98Auth;
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::future::join_all;
-use lnvps_db::{IpRange, LNVpsDb, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
+use lnvps_db::{
+    IpRange, LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+};
 use nostr::util::hex;
 use rocket::futures::{SinkExt, StreamExt};
 use rocket::serde::json::Json;
@@ -26,6 +28,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -48,7 +51,8 @@ pub fn routes() -> Vec<Route> {
         v1_patch_vm,
         v1_time_series,
         v1_custom_template_calc,
-        v1_create_custom_vm_order
+        v1_create_custom_vm_order,
+        v1_get_payment_methods
     ]
 }
 
@@ -143,7 +147,7 @@ async fn vm_to_status(
         .map(|i| (i.id, i))
         .collect();
 
-    let template = ApiVmTemplate::from_vm(&db, &vm).await?;
+    let template = ApiVmTemplate::from_vm(db, &vm).await?;
     Ok(ApiVmStatus {
         id: vm.id,
         created: vm.created,
@@ -309,7 +313,7 @@ async fn v1_list_vm_templates(
         })
         .collect();
     let custom_templates: Vec<VmCustomPricing> =
-        join_all(regions.iter().map(|(k, _)| db.list_custom_pricing(*k)))
+        join_all(regions.keys().map(|k| db.list_custom_pricing(*k)))
             .await
             .into_iter()
             .filter_map(|r| r.ok())
@@ -344,8 +348,7 @@ async fn v1_list_vm_templates(
                     .into_iter()
                     .filter_map(|t| {
                         let region = regions.get(&t.region_id)?;
-                        Some(
-                            ApiCustomTemplateParams::from(
+                        ApiCustomTemplateParams::from(
                                 &t,
                                 &custom_template_disks,
                                 region,
@@ -353,8 +356,7 @@ async fn v1_list_vm_templates(
                                 max_memory,
                                 max_disk,
                             )
-                            .ok()?,
-                        )
+                            .ok()
                     })
                     .collect(),
             )
@@ -376,7 +378,7 @@ async fn v1_custom_template_calc(
 
     let price = PricingEngine::get_custom_vm_cost_amount(db, 0, &template).await?;
     ApiData::ok(ApiPrice {
-        currency: price.currency.clone(),
+        currency: price.currency,
         amount: price.total(),
     })
 }
@@ -484,12 +486,13 @@ async fn v1_create_vm_order(
 
 /// Renew(Extend) a VM
 #[openapi(tag = "VM")]
-#[get("/api/v1/vm/<id>/renew")]
+#[get("/api/v1/vm/<id>/renew?<method>")]
 async fn v1_renew_vm(
     auth: Nip98Auth,
     db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
     id: u64,
+    method: Option<&str>,
 ) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
@@ -498,7 +501,14 @@ async fn v1_renew_vm(
         return ApiData::err("VM does not belong to you");
     }
 
-    let rsp = provisioner.renew(id).await?;
+    let rsp = provisioner
+        .renew(
+            id,
+            method
+                .and_then(|m| PaymentMethod::from_str(m).ok())
+                .unwrap_or(PaymentMethod::Lightning),
+        )
+        .await?;
     ApiData::ok(rsp.into())
 }
 
@@ -594,6 +604,26 @@ async fn v1_time_series(
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
     ApiData::ok(client.get_time_series_data(&vm, TimeSeries::Hourly).await?)
+}
+
+#[openapi(tag = "Payment")]
+#[get("/api/v1/payment/methods")]
+async fn v1_get_payment_methods(settings: &State<Settings>) -> ApiResult<Vec<ApiPaymentInfo>> {
+    let mut ret = vec![ApiPaymentInfo {
+        name: ApiPaymentMethod::Lightning,
+        metadata: HashMap::new(),
+        currencies: vec![Currency::BTC],
+    }];
+    #[cfg(feature = "revolut")]
+    if let Some(r) = &settings.revolut {
+        ret.push(ApiPaymentInfo {
+            name: ApiPaymentMethod::Revolut,
+            metadata: HashMap::from([("pubkey".to_string(), r.public_key.to_string())]),
+            currencies: vec![Currency::EUR, Currency::USD],
+        })
+    }
+
+    ApiData::ok(ret)
 }
 
 /// Get payment status (for polling)

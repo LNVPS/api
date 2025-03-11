@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
-use sqlx::FromRow;
+use sqlx::{FromRow, Type};
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use std::str::FromStr;
 use url::Url;
 
 #[derive(FromRow, Clone, Debug)]
@@ -309,17 +310,53 @@ impl Display for VmIpAssignment {
 
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VmPayment {
-    /// Payment hash
     pub id: Vec<u8>,
     pub vm_id: u64,
     pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
     pub amount: u64,
-    pub invoice: String,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    /// External data (invoice / json)
+    pub external_data: String,
+    /// External id on other system
+    pub external_id: Option<String>,
     pub is_paid: bool,
-    /// Exchange rate
+    /// TODO: handle other base currencies
+    /// Exchange rate back to base currency (EUR)
     pub rate: f32,
     /// Number of seconds this payment will add to vm expiry
     pub time_value: u64,
-    pub settle_index: Option<u64>,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(u16)]
+pub enum PaymentMethod {
+    #[default]
+    Lightning,
+    Revolut,
+    Paypal,
+}
+
+impl Display for PaymentMethod {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaymentMethod::Lightning => write!(f, "Lightning"),
+            PaymentMethod::Revolut => write!(f, "Revolut"),
+            PaymentMethod::Paypal => write!(f, "PayPal"),
+        }
+    }
+}
+
+impl FromStr for PaymentMethod {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "lightning" => Ok(PaymentMethod::Lightning),
+            "revolut" => Ok(PaymentMethod::Revolut),
+            "paypal" => Ok(PaymentMethod::Paypal),
+            _ => bail!("Unknown payment method: {}", s),
+        }
+    }
 }

@@ -78,7 +78,6 @@ impl LightningNode for LndNode {
             Ok(m) => {
                 if m.state == InvoiceState::Settled as i32 {
                     InvoiceUpdate::Settled {
-                        settle_index: m.settle_index,
                         payment_hash: hex::encode(m.r_hash),
                     }
                 } else {
