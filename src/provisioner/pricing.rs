@@ -192,7 +192,7 @@ impl PricingEngine {
                 (Currency::BTC, new_price.0, new_price.1)
             }
             (cur, PaymentMethod::Revolut) if cur != Currency::BTC => {
-                (cur, (list_price.1 * 100.0).ceil() as u64, 1.0)
+                (cur, (list_price.1 * 100.0).ceil() as u64, 0.01)
             }
             (c, m) => bail!("Cannot create payment for method {} and currency {}", m, c),
         })
