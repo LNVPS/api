@@ -40,11 +40,6 @@ pub struct MockDb {
 }
 
 impl MockDb {
-    pub const KB: u64 = 1024;
-    pub const MB: u64 = Self::KB * 1024;
-    pub const GB: u64 = Self::MB * 1024;
-    pub const TB: u64 = Self::GB * 1024;
-
     pub fn empty() -> MockDb {
         Self {
             ..Default::default()
@@ -71,8 +66,8 @@ impl MockDb {
             created: Utc::now(),
             expires: None,
             cpu: 2,
-            memory: Self::GB * 2,
-            disk_size: Self::GB * 64,
+            memory: crate::GB * 2,
+            disk_size: crate::GB * 64,
             disk_type: DiskType::SSD,
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,
@@ -132,7 +127,7 @@ impl Default for MockDb {
                 name: "mock-host".to_string(),
                 ip: "https://localhost".to_string(),
                 cpu: 4,
-                memory: 8 * Self::GB,
+                memory: 8 * crate::GB,
                 enabled: true,
                 api_token: "".to_string(),
                 load_factor: 1.5,
@@ -145,7 +140,7 @@ impl Default for MockDb {
                 id: 1,
                 host_id: 1,
                 name: "mock-disk".to_string(),
-                size: Self::TB * 10,
+                size: crate::TB * 10,
                 kind: DiskType::SSD,
                 interface: DiskInterface::PCIe,
                 enabled: true,
@@ -209,6 +204,7 @@ impl LNVpsDb for MockDb {
                     email: None,
                     contact_nip17: false,
                     contact_email: false,
+                    country_code: "USA".to_string(),
                 },
             );
             Ok(max + 1)
@@ -650,14 +646,15 @@ impl Router for MockRouter {
 
 #[derive(Clone, Debug, Default)]
 pub struct MockNode {
-    invoices: Arc<Mutex<HashMap<String, MockInvoice>>>,
+    pub invoices: Arc<Mutex<HashMap<String, MockInvoice>>>,
 }
 
 #[derive(Debug, Clone)]
-struct MockInvoice {
-    pr: String,
-    expiry: DateTime<Utc>,
-    settle_index: u64,
+pub struct MockInvoice {
+    pub pr: String,
+    pub amount: u64,
+    pub expiry: DateTime<Utc>,
+    pub is_paid: bool,
 }
 
 impl MockNode {
@@ -673,7 +670,22 @@ impl MockNode {
 #[async_trait]
 impl LightningNode for MockNode {
     async fn add_invoice(&self, req: AddInvoiceRequest) -> anyhow::Result<AddInvoiceResult> {
-        todo!()
+        let mut invoices = self.invoices.lock().await;
+        let id: [u8; 32] = rand::random();
+        let hex_id = hex::encode(id);
+        invoices.insert(
+            hex_id.clone(),
+            MockInvoice {
+                pr: format!("lnrt1{}", hex_id),
+                amount: req.amount,
+                expiry: Utc::now().add(TimeDelta::seconds(req.expire.unwrap_or(3600) as i64)),
+                is_paid: false,
+            },
+        );
+        Ok(AddInvoiceResult {
+            pr: format!("lnrt1{}", hex_id),
+            payment_hash: hex_id.clone(),
+        })
     }
 
     async fn subscribe_invoices(

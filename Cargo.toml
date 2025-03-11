@@ -41,6 +41,7 @@ ws = { package = "rocket_ws", version = "0.1.0" }
 native-tls = "0.2.12"
 hex = "0.4.3"
 futures = "0.3.31"
+isocountry = "0.3.2"
 
 #nostr-dm
 nostr = { version = "0.39.0", default-features = false, features = ["std"] }

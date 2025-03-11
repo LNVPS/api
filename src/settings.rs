@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::dns::DnsServer;
 use crate::exchange::ExchangeRateService;
 use crate::fiat::FiatPaymentService;
@@ -9,6 +10,7 @@ use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use isocountry::CountryCode;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,8 +33,8 @@ pub struct Settings {
     /// Provisioning profiles
     pub provisioner: ProvisionerConfig,
 
-    /// Network policy
     #[serde(default)]
+    /// Network policy
     pub network_policy: NetworkPolicy,
 
     /// Number of days after an expired VM is deleted
@@ -52,6 +54,10 @@ pub struct Settings {
 
     /// Config for accepting revolut payments
     pub revolut: Option<RevolutConfig>,
+
+    #[serde(default)]
+    /// Tax rates to change per country as a percent of the amount
+    pub tax_rate: HashMap<CountryCode, f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -21,6 +21,8 @@ pub struct User {
     pub contact_nip17: bool,
     /// If user should be contacted via email for notifications
     pub contact_email: bool,
+    /// Users country
+    pub country_code: String,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -327,6 +329,8 @@ pub struct VmPayment {
     pub rate: f32,
     /// Number of seconds this payment will add to vm expiry
     pub time_value: u64,
+    /// Taxes to charge on payment
+    pub tax: u64,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]

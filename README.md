@@ -128,3 +128,13 @@ dns:
     # API token to add/remove DNS records to this zone
     token: "my-api-token"
 ```
+
+### Taxes
+To charge taxes add the following config, the values are percentage whole numbers:
+```yaml
+tax-rate:
+  IE: 23
+  US: 15
+```
+
+Taxes are charged based on the users specified country

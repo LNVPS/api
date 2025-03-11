@@ -10,12 +10,11 @@ use crate::router::{ArpEntry, Router};
 use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
-use lnvps_db::{
-    LNVpsDb, PaymentMethod, Vm, VmCustomTemplate, VmIpAssignment,
-    VmPayment,
-};
+use isocountry::CountryCode;
+use lnvps_db::{LNVpsDb, PaymentMethod, Vm, VmCustomTemplate, VmIpAssignment, VmPayment};
 use log::{info, warn};
 use nostr::util::hex;
+use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +28,7 @@ pub struct LNVpsProvisioner {
     db: Arc<dyn LNVpsDb>,
     node: Arc<dyn LightningNode>,
     rates: Arc<dyn ExchangeRateService>,
+    tax_rates: HashMap<CountryCode, f32>,
 
     router: Option<Arc<dyn Router>>,
     dns: Option<Arc<dyn DnsServer>>,
@@ -52,6 +52,7 @@ impl LNVpsProvisioner {
             router: settings.get_router().expect("router config"),
             dns: settings.get_dns().expect("dns config"),
             revolut: settings.get_revolut().expect("revolut config"),
+            tax_rates: settings.tax_rate,
             network_policy: settings.network_policy,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
@@ -356,7 +357,7 @@ impl LNVpsProvisioner {
 
     /// Create a renewal payment
     pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
-        let pe = PricingEngine::new(self.db.clone(), self.rates.clone());
+        let pe = PricingEngine::new(self.db.clone(), self.rates.clone(), self.tax_rates.clone());
 
         let price = pe.get_vm_cost(vm_id, method).await?;
         match price {
@@ -367,6 +368,7 @@ impl LNVpsProvisioner {
                 time_value,
                 new_expiry,
                 rate,
+                tax,
             } => {
                 let desc = format!("VM renewal {vm_id} to {new_expiry}");
                 let vm_payment = match method {
@@ -376,12 +378,16 @@ impl LNVpsProvisioner {
                             "Cannot create invoices for non-BTC currency"
                         );
                         const INVOICE_EXPIRE: u64 = 600;
-                        info!("Creating invoice for {vm_id} for {} sats", amount / 1000);
+                        let total_amount = amount + tax;
+                        info!(
+                            "Creating invoice for {vm_id} for {} sats",
+                            total_amount / 1000
+                        );
                         let invoice = self
                             .node
                             .add_invoice(AddInvoiceRequest {
                                 memo: Some(desc),
-                                amount,
+                                amount: total_amount,
                                 expire: Some(INVOICE_EXPIRE as u32),
                             })
                             .await?;
@@ -391,6 +397,7 @@ impl LNVpsProvisioner {
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
                             amount,
+                            tax,
                             currency: currency.to_string(),
                             payment_method: method,
                             time_value,
@@ -411,7 +418,7 @@ impl LNVpsProvisioner {
                             "Cannot create revolut orders for BTC currency"
                         );
                         let order = rev
-                            .create_order(&desc, CurrencyAmount::from_u64(currency, amount))
+                            .create_order(&desc, CurrencyAmount::from_u64(currency, amount + tax))
                             .await?;
                         let new_id: [u8; 32] = rand::random();
                         VmPayment {
@@ -420,6 +427,7 @@ impl LNVpsProvisioner {
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(3600)),
                             amount,
+                            tax,
                             currency: currency.to_string(),
                             payment_method: method,
                             time_value,
@@ -483,8 +491,8 @@ impl LNVpsProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::DefaultRateCache;
-    use crate::mocks::{MockDb, MockDnsServer, MockNode, MockRouter};
+    use crate::exchange::{DefaultRateCache, Ticker};
+    use crate::mocks::{MockDb, MockDnsServer, MockExchangeRate, MockNode, MockRouter};
     use crate::settings::{DnsServerConfig, LightningConfig, QemuConfig, RouterConfig};
     use lnvps_db::{DiskInterface, DiskType, User, UserSshKey, VmTemplate};
     use std::net::IpAddr;
@@ -535,6 +543,7 @@ mod tests {
             }),
             nostr: None,
             revolut: None,
+            tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
         }
     }
 
@@ -559,7 +568,10 @@ mod tests {
         let settings = settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
-        let rates = Arc::new(DefaultRateCache::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        const MOCK_RATE: f32 = 69_420.0;
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
         let router = MockRouter::new(settings.network_policy.clone());
         let dns = MockDnsServer::new();
         let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
@@ -569,6 +581,21 @@ mod tests {
             .provision(user.id, 1, 1, ssh_key.id, Some("mock-ref".to_string()))
             .await?;
         println!("{:?}", vm);
+
+        // renew vm
+        let payment = provisioner.renew(vm.id, PaymentMethod::Lightning).await?;
+        assert_eq!(vm.id, payment.vm_id);
+        assert_eq!(payment.tax, (payment.amount as f64 * 0.01).floor() as u64);
+
+        // check invoice amount matches amount+tax
+        let inv = node.invoices.lock().await;
+        if let Some(i) = inv.get(&hex::encode(payment.id)) {
+            assert_eq!(i.amount, payment.amount + payment.tax);
+        } else {
+            bail!("Invoice doesnt exist");
+        }
+
+        // spawn vm
         provisioner.spawn_vm(vm.id).await?;
 
         // check resources
@@ -636,8 +663,8 @@ mod tests {
             created: Default::default(),
             expires: None,
             cpu: 64,
-            memory: 512 * MockDb::GB,
-            disk_size: 20 * MockDb::TB,
+            memory: 512 * crate::GB,
+            disk_size: 20 * crate::TB,
             disk_type: DiskType::SSD,
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,

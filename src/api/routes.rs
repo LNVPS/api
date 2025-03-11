@@ -1,8 +1,8 @@
 use crate::api::model::{
-    AccountPatchRequest, ApiCustomTemplateParams, ApiCustomVmOrder,
-    ApiCustomVmRequest, ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse,
-    ApiUserSshKey, ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus,
-    ApiVmTemplate, CreateSshKey, CreateVmRequest, VMPatchRequest,
+    AccountPatchRequest, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
+    ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse, ApiUserSshKey,
+    ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
+    CreateVmRequest, VMPatchRequest,
 };
 use crate::exchange::{Currency, ExchangeRateService};
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
@@ -13,6 +13,7 @@ use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
 use anyhow::Result;
 use futures::future::join_all;
+use isocountry::CountryCode;
 use lnvps_db::{
     IpRange, LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
 };
@@ -107,6 +108,9 @@ async fn v1_patch_account(
     user.email = req.email.clone();
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
+    user.country_code = CountryCode::for_alpha3(&req.country_code)?
+        .alpha3()
+        .to_owned();
 
     db.update_user(&user).await?;
     ApiData::ok(())
@@ -127,6 +131,7 @@ async fn v1_get_account(
         email: user.email,
         contact_nip17: user.contact_nip17,
         contact_email: user.contact_email,
+        country_code: user.country_code,
     })
 }
 
@@ -349,14 +354,14 @@ async fn v1_list_vm_templates(
                     .filter_map(|t| {
                         let region = regions.get(&t.region_id)?;
                         ApiCustomTemplateParams::from(
-                                &t,
-                                &custom_template_disks,
-                                region,
-                                max_cpu,
-                                max_memory,
-                                max_disk,
-                            )
-                            .ok()
+                            &t,
+                            &custom_template_disks,
+                            region,
+                            max_cpu,
+                            max_memory,
+                            max_disk,
+                        )
+                        .ok()
                     })
                     .collect(),
             )

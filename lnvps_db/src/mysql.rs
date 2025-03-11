@@ -60,11 +60,12 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn update_user(&self, user: &User) -> Result<()> {
         sqlx::query(
-            "update users set email = ?, contact_nip17 = ?, contact_email = ? where id = ?",
+            "update users set email=?, contact_nip17=?, contact_email=?, country_code=? where id = ?",
         )
         .bind(&user.email)
         .bind(user.contact_nip17)
         .bind(user.contact_email)
+            .bind(&user.country_code)
         .bind(user.id)
         .execute(&self.db)
         .await?;
@@ -387,12 +388,13 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,currency,payment_method,time_value,is_paid,rate,external_id,external_data) values(?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,currency,payment_method,time_value,is_paid,rate,external_id,external_data) values(?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
             .bind(vm_payment.vm_id)
             .bind(vm_payment.created)
             .bind(vm_payment.expires)
             .bind(vm_payment.amount)
+            .bind(vm_payment.tax)
             .bind(&vm_payment.currency)
             .bind(&vm_payment.payment_method)
             .bind(vm_payment.time_value)

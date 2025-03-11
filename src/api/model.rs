@@ -402,6 +402,7 @@ pub struct AccountPatchRequest {
     pub email: Option<String>,
     pub contact_nip17: bool,
     pub contact_email: bool,
+    pub country_code: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -473,6 +474,7 @@ pub struct ApiVmPayment {
     pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
     pub amount: u64,
+    pub tax: u64,
     pub currency: String,
     pub is_paid: bool,
     pub data: ApiPaymentData,
@@ -486,6 +488,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             created: value.created,
             expires: value.expires,
             amount: value.amount,
+            tax: value.tax,
             currency: value.currency,
             is_paid: value.is_paid,
             data: match &value.payment_method {

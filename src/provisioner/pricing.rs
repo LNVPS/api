@@ -1,11 +1,13 @@
 use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
+use isocountry::CountryCode;
 use lnvps_db::{
     LNVpsDb, PaymentMethod, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomTemplate, VmPayment,
 };
 use log::info;
+use std::collections::HashMap;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -16,17 +18,20 @@ use std::sync::Arc;
 pub struct PricingEngine {
     db: Arc<dyn LNVpsDb>,
     rates: Arc<dyn ExchangeRateService>,
+    tax_rates: HashMap<CountryCode, f32>,
 }
 
 impl PricingEngine {
-    /// SATS per BTC
-    const BTC_SATS: f64 = 100_000_000.0;
-    const KB: u64 = 1024;
-    const MB: u64 = Self::KB * 1024;
-    const GB: u64 = Self::MB * 1024;
-
-    pub fn new(db: Arc<dyn LNVpsDb>, rates: Arc<dyn ExchangeRateService>) -> Self {
-        Self { db, rates }
+    pub fn new(
+        db: Arc<dyn LNVpsDb>,
+        rates: Arc<dyn ExchangeRateService>,
+        tax_rates: HashMap<CountryCode, f32>,
+    ) -> Self {
+        Self {
+            db,
+            rates,
+            tax_rates,
+        }
     }
 
     /// Get VM cost (for renewal)
@@ -82,9 +87,9 @@ impl PricingEngine {
             } else {
                 bail!("No disk price found")
             };
-        let disk_cost = (template.disk_size / Self::GB) as f32 * disk_pricing.cost;
+        let disk_cost = (template.disk_size / crate::GB) as f32 * disk_pricing.cost;
         let cpu_cost = pricing.cpu_cost * template.cpu as f32;
-        let memory_cost = pricing.memory_cost * (template.memory / Self::GB) as f32;
+        let memory_cost = pricing.memory_cost * (template.memory / crate::GB) as f32;
         let ip4_cost = pricing.ip4_cost * v4s as f32;
         let ip6_cost = pricing.ip6_cost * v6s as f32;
 
@@ -121,11 +126,22 @@ impl PricingEngine {
             .await?;
         Ok(CostResult::New {
             amount,
+            tax: self.get_tax_for_user(vm.user_id, amount).await?,
             currency,
             rate,
             time_value,
             new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
         })
+    }
+
+    async fn get_tax_for_user(&self, user_id: u64, amount: u64) -> Result<u64> {
+        let user = self.db.get_user(user_id).await?;
+        let cc = CountryCode::for_alpha3(&user.country_code).context("Invalid country code")?;
+        if let Some(c) = self.tax_rates.get(&cc) {
+            Ok((amount as f64 * (*c as f64 / 100f64)).floor() as u64)
+        } else {
+            Ok(0)
+        }
     }
 
     async fn get_ticker(&self, currency: Currency) -> Result<TickerRate> {
@@ -140,7 +156,7 @@ impl PricingEngine {
     async fn get_msats_amount(&self, amount: CurrencyAmount) -> Result<(u64, f32)> {
         let rate = self.get_ticker(amount.0).await?;
         let cost_btc = amount.1 / rate.1;
-        let cost_msats = (cost_btc as f64 * Self::BTC_SATS) as u64 * 1000;
+        let cost_msats = (cost_btc as f64 * crate::BTC_SATS) as u64 * 1000;
         Ok((cost_msats, rate.1))
     }
 
@@ -174,6 +190,7 @@ impl PricingEngine {
         let time_value = Self::next_template_expire(vm, &cost_plan);
         Ok(CostResult::New {
             amount,
+            tax: self.get_tax_for_user(vm.user_id, amount).await?,
             currency,
             rate,
             time_value,
@@ -215,6 +232,8 @@ pub enum CostResult {
         time_value: u64,
         /// The absolute expiry time of the vm if renewed
         new_expiry: DateTime<Utc>,
+        /// Taxes to charge
+        tax: u64,
     },
 }
 
@@ -238,8 +257,7 @@ impl PricingData {
 mod tests {
     use super::*;
     use crate::mocks::{MockDb, MockExchangeRate};
-    use lnvps_db::{DiskType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
-    const GB: u64 = 1024 * 1024 * 1024;
+    use lnvps_db::{DiskType, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
     const MOCK_RATE: f32 = 100_000.0;
 
     async fn add_custom_pricing(db: &MockDb) {
@@ -266,8 +284,8 @@ mod tests {
             VmCustomTemplate {
                 id: 1,
                 cpu: 2,
-                memory: 2 * GB,
-                disk_size: 80 * GB,
+                memory: 2 * crate::GB,
+                disk_size: 80 * crate::GB,
                 disk_type: DiskType::SSD,
                 disk_interface: Default::default(),
                 pricing_id: 1,
@@ -313,17 +331,65 @@ mod tests {
         {
             let mut v = db.vms.lock().await;
             v.insert(1, MockDb::mock_vm());
+            v.insert(
+                2,
+                Vm {
+                    user_id: 2,
+                    ..MockDb::mock_vm()
+                },
+            );
+
+            let mut u = db.users.lock().await;
+            u.insert(
+                1,
+                User {
+                    id: 1,
+                    pubkey: vec![],
+                    created: Default::default(),
+                    email: None,
+                    contact_nip17: false,
+                    contact_email: false,
+                    country_code: "USA".to_string(),
+                },
+            );
+            u.insert(
+                2,
+                User {
+                    id: 2,
+                    pubkey: vec![],
+                    created: Default::default(),
+                    email: None,
+                    contact_nip17: false,
+                    contact_email: false,
+                    country_code: "IRL".to_string(),
+                },
+            );
         }
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
-        let pe = PricingEngine::new(db.clone(), rates);
-        let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
+        let taxes = HashMap::from([(CountryCode::IRL, 23.0)]);
+
+        let pe = PricingEngine::new(db.clone(), rates, taxes);
         let plan = MockDb::mock_cost_plan();
+
+        let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
         match price {
-            CostResult::New { amount, .. } => {
+            CostResult::New { amount, tax, .. } => {
                 let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
                 assert_eq!(expect_price, amount);
+                assert_eq!(0, tax);
+            }
+            _ => bail!("??"),
+        }
+
+        // with taxes
+        let price = pe.get_vm_cost(2, PaymentMethod::Lightning).await?;
+        match price {
+            CostResult::New { amount, tax, .. } => {
+                let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+                assert_eq!(expect_price, amount);
+                assert_eq!((expect_price as f64 * 0.23).floor() as u64, tax);
             }
             _ => bail!("??"),
         }
