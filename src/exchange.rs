@@ -60,11 +60,35 @@ impl Display for Ticker {
 pub struct TickerRate(pub Ticker, pub f32);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CurrencyAmount(pub Currency, pub f32);
+pub struct CurrencyAmount(pub Currency, u64);
 
 impl CurrencyAmount {
+    const MILLI_SATS: f64 = 1.0e11;
+
     pub fn from_u64(currency: Currency, amount: u64) -> Self {
-        CurrencyAmount(currency, amount as f32 / 100.0)
+        CurrencyAmount(currency, amount)
+    }
+    pub fn from_f32(currency: Currency, amount: f32) -> Self {
+        CurrencyAmount(
+            currency,
+            match currency {
+                Currency::EUR => (amount * 100.0) as u64, // cents
+                Currency::BTC => (amount as f64 * Self::MILLI_SATS) as u64, // milli-sats
+                Currency::USD => (amount * 100.0) as u64, // cents
+            },
+        )
+    }
+
+    pub fn value(&self) -> u64 {
+        self.1
+    }
+
+    pub fn value_f32(&self) -> f32 {
+        match self.0 {
+            Currency::EUR => self.1 as f32 / 100.0,
+            Currency::BTC => (self.1 as f64 / Self::MILLI_SATS) as f32,
+            Currency::USD => self.1 as f32 / 100.0,
+        }
     }
 }
 
@@ -80,9 +104,15 @@ impl TickerRate {
             "Cant convert, currency doesnt match"
         );
         if source.0 == self.0 .0 {
-            Ok(CurrencyAmount(self.0 .1, source.1 * self.1))
+            Ok(CurrencyAmount::from_f32(
+                self.0 .1,
+                source.value_f32() * self.1,
+            ))
         } else {
-            Ok(CurrencyAmount(self.0 .0, source.1 / self.1))
+            Ok(CurrencyAmount::from_f32(
+                self.0 .0,
+                source.value_f32() / self.1,
+            ))
         }
     }
 }
@@ -177,12 +207,14 @@ mod tests {
         let f = TickerRate(ticker, RATE);
 
         assert_eq!(
-            f.convert(CurrencyAmount(Currency::EUR, 5.0)).unwrap(),
-            CurrencyAmount(Currency::BTC, 5.0 / RATE)
+            f.convert(CurrencyAmount::from_f32(Currency::EUR, 5.0))
+                .unwrap(),
+            CurrencyAmount::from_f32(Currency::BTC, 5.0 / RATE)
         );
         assert_eq!(
-            f.convert(CurrencyAmount(Currency::BTC, 0.001)).unwrap(),
-            CurrencyAmount(Currency::EUR, RATE * 0.001)
+            f.convert(CurrencyAmount::from_f32(Currency::BTC, 0.001))
+                .unwrap(),
+            CurrencyAmount::from_f32(Currency::EUR, RATE * 0.001)
         );
         assert!(!f.can_convert(Currency::USD));
         assert!(f.can_convert(Currency::EUR));

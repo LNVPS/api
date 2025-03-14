@@ -108,9 +108,11 @@ async fn v1_patch_account(
     user.email = req.email.clone();
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
-    user.country_code = CountryCode::for_alpha3(&req.country_code)?
-        .alpha3()
-        .to_owned();
+    user.country_code = req
+        .country_code
+        .as_ref()
+        .and_then(|c| CountryCode::for_alpha3(c).ok())
+        .map(|c| c.alpha3().to_string());
 
     db.update_user(&user).await?;
     ApiData::ok(())

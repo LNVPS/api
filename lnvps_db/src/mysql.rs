@@ -441,7 +441,8 @@ impl LNVpsDb for LNVpsDbMysql {
 
         let mut tx = self.db.begin().await?;
 
-        sqlx::query("update vm_payment set is_paid = true where id = ?")
+        sqlx::query("update vm_payment set is_paid = true, external_data = ? where id = ?")
+            .bind(&vm_payment.external_data)
             .bind(&vm_payment.id)
             .execute(&mut *tx)
             .await?;

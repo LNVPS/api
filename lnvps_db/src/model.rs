@@ -22,7 +22,7 @@ pub struct User {
     /// If user should be contacted via email for notifications
     pub contact_email: bool,
     /// Users country
-    pub country_code: String,
+    pub country_code: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

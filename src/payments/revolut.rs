@@ -4,6 +4,7 @@ use crate::settings::RevolutConfig;
 use crate::worker::WorkJob;
 use anyhow::{anyhow, bail, Context, Result};
 use hmac::{Hmac, Mac};
+use isocountry::CountryCode;
 use lnvps_db::LNVpsDb;
 use log::{error, info, warn};
 use reqwest::Url;
@@ -73,7 +74,30 @@ impl RevolutPaymentHandler {
     }
 
     async fn try_complete_payment(&self, ext_id: &str) -> Result<()> {
-        let p = self.db.get_vm_payment_by_ext_id(ext_id).await?;
+        let mut p = self.db.get_vm_payment_by_ext_id(ext_id).await?;
+
+        // save payment state json into external_data
+        // TODO: encrypt payment_data
+        let order = self.api.get_order(ext_id).await?;
+        p.external_data = serde_json::to_string(&order)?;
+
+        // check user country matches card country
+        if let Some(cc) = order
+            .payments
+            .and_then(|p| p.first().cloned())
+            .and_then(|p| p.payment_method)
+            .and_then(|p| p.card_country_code)
+            .and_then(|c| CountryCode::for_alpha2(&c).ok())
+        {
+            let vm = self.db.get_vm(p.vm_id).await?;
+            let mut user = self.db.get_user(vm.user_id).await?;
+            if user.country_code.is_none() {
+                // update user country code to match card country
+                user.country_code = Some(cc.alpha3().to_string());
+                self.db.update_user(&user).await?;
+            }
+        }
+
         self.db.vm_payment_paid(&p).await?;
         self.sender.send(WorkJob::CheckVm { vm_id: p.vm_id })?;
         info!("VM payment {} for {}, paid", hex::encode(p.id), p.vm_id);

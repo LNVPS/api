@@ -5,7 +5,8 @@ use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
 use lnvps_db::{
-    LNVpsDb, PaymentMethod, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion, VmTemplate,
+    LNVpsDb, PaymentMethod, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHostRegion, VmTemplate,
 };
 use nostr::util::hex;
 use schemars::JsonSchema;
@@ -144,11 +145,12 @@ impl ApiTemplatesResponse {
         let rates = rates.list_rates().await?;
 
         for template in &mut self.templates {
-            let list_price = CurrencyAmount(template.cost_plan.currency, template.cost_plan.amount);
+            let list_price =
+                CurrencyAmount::from_f32(template.cost_plan.currency, template.cost_plan.amount);
             for alt_price in alt_prices(&rates, list_price) {
                 template.cost_plan.other_price.push(ApiPrice {
                     currency: alt_price.0,
-                    amount: alt_price.1,
+                    amount: alt_price.value_f32(),
                 });
             }
         }
@@ -252,7 +254,7 @@ impl From<CurrencyAmount> for ApiPrice {
     fn from(value: CurrencyAmount) -> Self {
         Self {
             currency: value.0,
-            amount: value.1,
+            amount: value.value_f32(),
         }
     }
 }
@@ -402,7 +404,7 @@ pub struct AccountPatchRequest {
     pub email: Option<String>,
     pub contact_nip17: bool,
     pub contact_email: bool,
-    pub country_code: String,
+    pub country_code: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

@@ -122,7 +122,10 @@ impl PricingEngine {
         // custom templates are always 1-month intervals
         let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
         let (currency, amount, rate) = self
-            .get_amount_and_rate(CurrencyAmount(price.currency, price.total()), method)
+            .get_amount_and_rate(
+                CurrencyAmount::from_f32(price.currency, price.total()),
+                method,
+            )
             .await?;
         Ok(CostResult::New {
             amount,
@@ -136,12 +139,15 @@ impl PricingEngine {
 
     async fn get_tax_for_user(&self, user_id: u64, amount: u64) -> Result<u64> {
         let user = self.db.get_user(user_id).await?;
-        let cc = CountryCode::for_alpha3(&user.country_code).context("Invalid country code")?;
-        if let Some(c) = self.tax_rates.get(&cc) {
-            Ok((amount as f64 * (*c as f64 / 100f64)).floor() as u64)
-        } else {
-            Ok(0)
+        if let Some(cc) = user
+            .country_code
+            .and_then(|c| CountryCode::for_alpha3(&c).ok())
+        {
+            if let Some(c) = self.tax_rates.get(&cc) {
+                return Ok((amount as f64 * (*c as f64 / 100f64)).floor() as u64);
+            }
         }
+        Ok(0)
     }
 
     async fn get_ticker(&self, currency: Currency) -> Result<TickerRate> {
@@ -155,7 +161,7 @@ impl PricingEngine {
 
     async fn get_msats_amount(&self, amount: CurrencyAmount) -> Result<(u64, f32)> {
         let rate = self.get_ticker(amount.0).await?;
-        let cost_btc = amount.1 / rate.1;
+        let cost_btc = amount.value_f32() / rate.1;
         let cost_msats = (cost_btc as f64 * crate::BTC_SATS) as u64 * 1000;
         Ok((cost_msats, rate.1))
     }
@@ -185,7 +191,7 @@ impl PricingEngine {
 
         let currency = cost_plan.currency.parse().expect("Invalid currency");
         let (currency, amount, rate) = self
-            .get_amount_and_rate(CurrencyAmount(currency, cost_plan.amount), method)
+            .get_amount_and_rate(CurrencyAmount::from_f32(currency, cost_plan.amount), method)
             .await?;
         let time_value = Self::next_template_expire(vm, &cost_plan);
         Ok(CostResult::New {
@@ -209,7 +215,7 @@ impl PricingEngine {
                 (Currency::BTC, new_price.0, new_price.1)
             }
             (cur, PaymentMethod::Revolut) if cur != Currency::BTC => {
-                (cur, (list_price.1 * 100.0).ceil() as u64, 0.01)
+                (cur, list_price.value(), 0.01)
             }
             (c, m) => bail!("Cannot create payment for method {} and currency {}", m, c),
         })
@@ -349,7 +355,7 @@ mod tests {
                     email: None,
                     contact_nip17: false,
                     contact_email: false,
-                    country_code: "USA".to_string(),
+                    country_code: Some("USA".to_string()),
                 },
             );
             u.insert(
@@ -361,7 +367,7 @@ mod tests {
                     email: None,
                     contact_nip17: false,
                     contact_email: false,
-                    country_code: "IRL".to_string(),
+                    country_code: Some("IRL".to_string()),
                 },
             );
         }
