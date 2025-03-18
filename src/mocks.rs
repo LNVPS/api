@@ -685,6 +685,7 @@ impl LightningNode for MockNode {
         Ok(AddInvoiceResult {
             pr: format!("lnrt1{}", hex_id),
             payment_hash: hex_id.clone(),
+            external_id: None,
         })
     }
 
