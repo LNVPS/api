@@ -18,7 +18,6 @@ use lnvps_db::{
     IpRange, LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
 };
 use nostr::util::hex;
-use rocket::futures::{SinkExt, StreamExt};
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;

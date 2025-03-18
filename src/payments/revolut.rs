@@ -57,6 +57,9 @@ impl RevolutPaymentHandler {
         // listen to events
         let mut listenr = WEBHOOK_BRIDGE.listen();
         while let Ok(m) = listenr.recv().await {
+            if m.endpoint != "/api/v1/webhook/revolut" {
+                continue;
+            }
             let body: RevolutWebhook = serde_json::from_slice(m.body.as_slice())?;
             info!("Received webhook {:?}", body);
             if let Err(e) = verify_webhook(&secret, &m) {

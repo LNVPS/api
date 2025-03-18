@@ -1,5 +1,5 @@
 use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;

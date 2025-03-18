@@ -32,7 +32,6 @@ pub fn listen_all_payments(
 
     #[cfg(feature = "revolut")]
     {
-        
         use crate::payments::revolut::RevolutPaymentHandler;
         if let Some(r) = &settings.revolut {
             let mut handler = RevolutPaymentHandler::new(

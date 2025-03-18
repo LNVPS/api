@@ -37,6 +37,7 @@ async fn revolut_webhook(req: WebhookMessage) -> Status {
 
 #[derive(Debug, Clone)]
 pub struct WebhookMessage {
+    pub endpoint: String,
     pub body: Vec<u8>,
     pub headers: HashMap<String, String>,
 }
@@ -60,6 +61,7 @@ impl<'r> FromData<'r> for WebhookMessage {
             return rocket::data::Outcome::Error((Status::BadRequest, ()));
         };
         let msg = WebhookMessage {
+            endpoint: req.uri().path().to_string(),
             headers: header,
             body: body.value.to_vec(),
         };

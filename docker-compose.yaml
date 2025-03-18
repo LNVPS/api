@@ -2,7 +2,7 @@ volumes:
   db:
 services:
   db:
-    image: mariadb
+    image: docker.io/mariadb
     restart: unless-stopped
     environment:
       - "MARIADB_ROOT_PASSWORD=root"

@@ -40,6 +40,7 @@ impl LightningNode for LndNode {
         Ok(AddInvoiceResult {
             pr: inner.payment_request,
             payment_hash: hex::encode(inner.r_hash),
+            external_id: None,
         })
     }
 
@@ -78,7 +79,8 @@ impl LightningNode for LndNode {
             Ok(m) => {
                 if m.state == InvoiceState::Settled as i32 {
                     InvoiceUpdate::Settled {
-                        payment_hash: hex::encode(m.r_hash),
+                        payment_hash: Some(hex::encode(m.r_hash)),
+                        external_id: None,
                     }
                 } else {
                     InvoiceUpdate::Unknown

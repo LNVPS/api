@@ -1,7 +1,7 @@
 use crate::lightning::{InvoiceUpdate, LightningNode};
 use crate::worker::WorkJob;
 use anyhow::Result;
-use lnvps_db::LNVpsDb;
+use lnvps_db::{LNVpsDb, VmPayment};
 use log::{error, info, warn};
 use nostr::util::hex;
 use rocket::futures::StreamExt;
@@ -25,10 +25,19 @@ impl NodeInvoiceHandler {
 
     async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
         let p = self.db.get_vm_payment(id).await?;
-        self.db.vm_payment_paid(&p).await?;
+        self.mark_payment_paid(&p).await
+    }
 
-        info!("VM payment {} for {}, paid", hex::encode(p.id), p.vm_id);
-        self.tx.send(WorkJob::CheckVm { vm_id: p.vm_id })?;
+    async fn mark_paid_ext_id(&self, external_id: &str) -> Result<()> {
+        let p = self.db.get_vm_payment_by_ext_id(external_id).await?;
+        self.mark_payment_paid(&p).await
+    }
+
+    async fn mark_payment_paid(&self, payment: &VmPayment) -> Result<()> {
+        self.db.vm_payment_paid(&payment).await?;
+
+        info!("VM payment {} for {}, paid", hex::encode(&payment.id), payment.vm_id);
+        self.tx.send(WorkJob::CheckVm { vm_id: payment.vm_id })?;
 
         Ok(())
     }
@@ -46,10 +55,22 @@ impl NodeInvoiceHandler {
         let mut handler = self.node.subscribe_invoices(from_ph).await?;
         while let Some(msg) = handler.next().await {
             match msg {
-                InvoiceUpdate::Settled { payment_hash } => {
-                    let r_hash = hex::decode(payment_hash)?;
-                    if let Err(e) = self.mark_paid(&r_hash).await {
-                        error!("{}", e);
+                InvoiceUpdate::Settled {
+                    payment_hash,
+                    external_id,
+                } => {
+                    if let Some(h) = payment_hash {
+                        let r_hash = hex::decode(h)?;
+                        if let Err(e) = self.mark_paid(&r_hash).await {
+                            error!("{}", e);
+                        }
+                        continue;
+                    }
+                    if let Some(e) = external_id {
+                        if let Err(e) = self.mark_paid_ext_id(&e).await {
+                            error!("{}", e);
+                        }
+                        continue;
                     }
                 }
                 v => warn!("Unknown invoice update: {:?}", v),

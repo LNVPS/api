@@ -404,7 +404,7 @@ impl LNVpsProvisioner {
                             is_paid: false,
                             rate,
                             external_data: invoice.pr,
-                            external_id: None,
+                            external_id: invoice.external_id,
                         }
                     }
                     PaymentMethod::Revolut => {

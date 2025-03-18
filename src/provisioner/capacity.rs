@@ -145,8 +145,8 @@ impl HostCapacityService {
             .map(|s| {
                 let usage = vm_resources
                     .iter()
-                    .filter(|(k, v)| s.id == v.disk_id)
-                    .fold(0, |acc, (k, v)| acc + v.disk);
+                    .filter(|(_k, v)| s.id == v.disk_id)
+                    .fold(0, |acc, (_k, v)| acc + v.disk);
                 DiskCapacity {
                     load_factor: host.load_factor,
                     disk: s.clone(),

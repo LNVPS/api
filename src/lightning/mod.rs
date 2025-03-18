@@ -31,6 +31,7 @@ pub struct AddInvoiceRequest {
 pub struct AddInvoiceResult {
     pub pr: String,
     pub payment_hash: String,
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +40,8 @@ pub enum InvoiceUpdate {
     Unknown,
     Error(String),
     Settled {
-        payment_hash: String,
+        payment_hash: Option<String>,
+        external_id: Option<String>,
     },
 }
 
