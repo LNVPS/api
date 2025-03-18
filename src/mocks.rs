@@ -204,7 +204,7 @@ impl LNVpsDb for MockDb {
                     email: None,
                     contact_nip17: false,
                     contact_email: false,
-                    country_code: "USA".to_string(),
+                    country_code: Some("USA".to_string()),
                 },
             );
             Ok(max + 1)
