@@ -4,11 +4,15 @@ A bitcoin powered VPS system.
 
 ## Requirements
 
-- MySql database
-- Lightning node:
-    - LND
-    - [Bitvora](https://bitvora.com?r=lnvps)
-- Proxmox server
+- MySQL database
+- Payments:
+  - Bitcoin:
+      - LND
+      - [Bitvora](https://bitvora.com?r=lnvps)
+  - Fiat:
+    - [RevolutPay](https://www.revolut.com/business/revolut-pay/)
+- VM Backend:
+  - Proxmox
 
 ## Required Config
 
