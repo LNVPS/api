@@ -30,6 +30,10 @@ impl VmHostClient for LibVirt {
         todo!()
     }
 
+    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+        todo!()
+    }
+
     async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmState> {
         todo!()
     }

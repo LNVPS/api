@@ -768,6 +768,10 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
+    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+        todo!()
+    }
+
     async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmState> {
         let vms = self.vms.lock().await;
         if let Some(vm) = vms.get(&vm.id) {
