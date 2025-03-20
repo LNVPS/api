@@ -418,7 +418,7 @@ impl ProxmoxClient {
             bios: Some(VmBios::OVMF),
             boot: Some("order=scsi0".to_string()),
             cores: Some(vm_resources.cpu as i32),
-            memory: Some((vm_resources.memory / 1024 / 1024).to_string()),
+            memory: Some((vm_resources.memory / crate::GB).to_string()),
             scsi_hw: Some("virtio-scsi-pci".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
