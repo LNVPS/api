@@ -66,13 +66,14 @@ impl LightningNode for BitvoraNode {
                         if r.endpoint != "/api/v1/webhook/bitvora" {
                             return InvoiceUpdate::Unknown;
                         }
-                        let body: BitvoraWebhookPayload<BitvoraWebhook> =
-                            match serde_json::from_slice(r.body.as_slice()) {
+                        let r_body = r.body.as_slice();
+                        info!("Received webhook {}", String::from_utf8_lossy(r_body));
+                        let body: BitvoraWebhook =
+                            match serde_json::from_slice(r_body) {
                                 Ok(b) => b,
                                 Err(e) => return InvoiceUpdate::Error(e.to_string()),
                             };
-                        info!("Received webhook {:?}", body);
-                        let body = body.payload;
+
                         if let Err(e) = verify_webhook(&secret, &r) {
                             return InvoiceUpdate::Error(e.to_string());
                         }
@@ -120,11 +121,6 @@ struct CreateInvoiceResponse {
     pub id: String,
     pub r_hash: String,
     pub payment_request: String,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct BitvoraWebhookPayload<T> {
-    pub payload: T,
 }
 
 #[derive(Deserialize, Debug, Clone)]
