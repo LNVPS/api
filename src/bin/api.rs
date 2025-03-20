@@ -20,6 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use rocket::http::Method;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -159,7 +160,6 @@ async fn main() -> Result<(), Error> {
     config.port = ip.port();
 
     if let Err(e) = rocket::Rocket::custom(config)
-        .attach(CORS)
         .manage(db.clone())
         .manage(provisioner.clone())
         .manage(status.clone())
@@ -174,6 +174,15 @@ async fn main() -> Result<(), Error> {
                 ..Default::default()
             }),
         )
+        .attach(CORS)
+        .mount("/", vec![
+            rocket::Route::ranked(
+            isize::MAX,
+            Method::Options,
+            "/<catch_all_options_route..>",
+            CORS,
+        )
+        ])
         .launch()
         .await
     {

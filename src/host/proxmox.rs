@@ -365,6 +365,30 @@ impl ProxmoxClient {
             node: node.to_string(),
         })
     }
+
+    /// Delete disks from VM
+    pub async fn unlink_disk(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        disks: Vec<String>,
+        force: bool,
+    ) -> Result<()> {
+        self.api
+            .req_status(
+                Method::PUT,
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/unlink?idlist={}&force={}",
+                    node,
+                    vm,
+                    disks.join(","),
+                    if force { "1" } else { "0" }
+                ),
+                (),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl ProxmoxClient {
@@ -418,7 +442,7 @@ impl ProxmoxClient {
             bios: Some(VmBios::OVMF),
             boot: Some("order=scsi0".to_string()),
             cores: Some(vm_resources.cpu as i32),
-            memory: Some((vm_resources.memory / crate::GB).to_string()),
+            memory: Some((vm_resources.memory / crate::MB).to_string()),
             scsi_hw: Some("virtio-scsi-pci".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
@@ -427,7 +451,38 @@ impl ProxmoxClient {
             ..Default::default()
         })
     }
+
+    /// Import main disk image from the template
+    async fn import_template_disk(&self, req: &FullVmInfo) -> Result<()> {
+        let vm_id = req.vm.id.into();
+
+        // import primary disk from image (scsi0)
+        self.import_disk_image(ImportDiskImageRequest {
+            vm_id,
+            node: self.node.clone(),
+            storage: req.disk.name.clone(),
+            disk: "scsi0".to_string(),
+            image: req.image.filename()?,
+            is_ssd: matches!(req.disk.kind, DiskType::SSD),
+        })
+        .await?;
+
+        // resize disk to match template
+        let j_resize = self
+            .resize_disk(ResizeDiskRequest {
+                node: self.node.clone(),
+                vm_id,
+                disk: "scsi0".to_string(),
+                size: req.resources()?.disk_size.to_string(),
+            })
+            .await?;
+        // TODO: rollback
+        self.wait_for_task(&j_resize).await?;
+
+        Ok(())
+    }
 }
+
 #[async_trait]
 impl VmHostClient for ProxmoxClient {
     async fn download_os_image(&self, image: &VmOsImage) -> Result<()> {
@@ -499,28 +554,35 @@ impl VmHostClient for ProxmoxClient {
             .await?;
         self.wait_for_task(&t_create).await?;
 
-        // import primary disk from image (scsi0)
-        self.import_disk_image(ImportDiskImageRequest {
-            vm_id,
-            node: self.node.clone(),
-            storage: req.disk.name.clone(),
-            disk: "scsi0".to_string(),
-            image: req.image.filename()?,
-            is_ssd: matches!(req.disk.kind, DiskType::SSD),
-        })
-        .await?;
+        // import template image
+        self.import_template_disk(&req).await?;
 
-        // resize disk to match template
-        let j_resize = self
-            .resize_disk(ResizeDiskRequest {
-                node: self.node.clone(),
-                vm_id,
-                disk: "scsi0".to_string(),
-                size: req.resources()?.disk_size.to_string(),
-            })
+        // try start, otherwise ignore error (maybe its already running)
+        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
+            if let Err(e) = self.wait_for_task(&j_start).await {
+                warn!("Failed to start vm: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn reinstall_vm(&self, req: &FullVmInfo) -> Result<()> {
+        let vm_id = req.vm.id.into();
+
+        // try stop, otherwise ignore error (maybe its already running)
+        if let Ok(j_stop) = self.stop_vm(&self.node, vm_id).await {
+            if let Err(e) = self.wait_for_task(&j_stop).await {
+                warn!("Failed to stop vm: {}", e);
+            }
+        }
+
+        // unlink the existing main disk
+        self.unlink_disk(&self.node, vm_id, vec!["scsi0".to_string()], true)
             .await?;
-        // TODO: rollback
-        self.wait_for_task(&j_resize).await?;
+
+        // import disk from template again
+        self.import_template_disk(&req).await?;
 
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
@@ -1092,7 +1154,10 @@ mod tests {
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
         assert_eq!(vm.on_boot, Some(true));
-        assert_eq!(vm.ip_config, Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".to_string()));
+        assert_eq!(
+            vm.ip_config,
+            Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".to_string())
+        );
         Ok(())
     }
 }

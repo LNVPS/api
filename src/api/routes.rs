@@ -48,6 +48,7 @@ pub fn routes() -> Vec<Route> {
         v1_start_vm,
         v1_stop_vm,
         v1_restart_vm,
+        v1_reinstall_vm,
         v1_patch_vm,
         v1_time_series,
         v1_custom_template_calc,
@@ -587,6 +588,32 @@ async fn v1_restart_vm(
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
     client.stop_vm(&vm).await?;
+
+    worker.send(WorkJob::CheckVm { vm_id: id })?;
+    ApiData::ok(())
+}
+
+/// Re-install a VM
+#[openapi(tag = "VM")]
+#[patch("/api/v1/vm/<id>/re-install")]
+async fn v1_reinstall_vm(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
+    worker: &State<UnboundedSender<WorkJob>>,
+    id: u64,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if uid != vm.user_id {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, &settings.provisioner)?;
+    let info = FullVmInfo::load(vm.id, (*db).clone()).await?;
+    client.reinstall_vm(&info).await?;
 
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
