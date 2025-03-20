@@ -376,12 +376,15 @@ impl ProxmoxClient {
                 if let Ok(net) = ip.ip.parse::<IpAddr>() {
                     Some(match net {
                         IpAddr::V4(addr) => {
-                            let range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
-                            let range: IpNetwork = range.gateway.parse().ok()?;
+                            let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
+                            let range: IpNetwork = ip_range.cidr.parse().ok()?;
+                            let range_gw: IpNetwork = ip_range.gateway.parse().ok()?;
+                            // take the largest (smallest prefix number) of the network prefixes
+                            let max_net = range.prefix().min(range_gw.prefix());
                             format!(
                                 "ip={},gw={}",
-                                IpNetwork::new(addr.into(), range.prefix()).ok()?,
-                                range.ip()
+                                IpNetwork::new(addr.into(), max_net).ok()?,
+                                range_gw.ip()
                             )
                         }
                         IpAddr::V6(addr) => format!("ip6={}", addr),
@@ -975,5 +978,121 @@ impl From<RrdDataPoint> for TimeSeriesData {
             disk_write: value.disk_write.unwrap_or(0.0),
             disk_read: value.disk_read.unwrap_or(0.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GB, MB, TB};
+    use lnvps_db::{
+        DiskInterface, IpRange, OsDistribution, UserSshKey, VmHostDisk, VmIpAssignment, VmTemplate,
+    };
+
+    #[test]
+    fn test_config() -> Result<()> {
+        let template = VmTemplate {
+            id: 1,
+            name: "example".to_string(),
+            enabled: true,
+            created: Default::default(),
+            expires: None,
+            cpu: 2,
+            memory: 2 * GB,
+            disk_size: 100 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            cost_plan_id: 1,
+            region_id: 1,
+        };
+        let cfg = FullVmInfo {
+            vm: Vm {
+                id: 1,
+                host_id: 1,
+                user_id: 1,
+                image_id: 1,
+                template_id: Some(template.id),
+                custom_template_id: None,
+                ssh_key_id: 1,
+                created: Default::default(),
+                expires: Default::default(),
+                disk_id: 1,
+                mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
+                deleted: false,
+                ref_code: None,
+            },
+            disk: VmHostDisk {
+                id: 1,
+                host_id: 1,
+                name: "ssd".to_string(),
+                size: TB * 20,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                enabled: true,
+            },
+            template: Some(template.clone()),
+            custom_template: None,
+            image: VmOsImage {
+                id: 1,
+                distribution: OsDistribution::Ubuntu,
+                flavour: "Server".to_string(),
+                version: "24.04.03".to_string(),
+                enabled: true,
+                release_date: Utc::now(),
+                url: "http://localhost.com/ubuntu_server_24.04.img".to_string(),
+            },
+            ips: vec![VmIpAssignment {
+                id: 1,
+                vm_id: 1,
+                ip_range_id: 1,
+                ip: "192.168.1.2".to_string(),
+                deleted: false,
+                arp_ref: None,
+                dns_forward: None,
+                dns_forward_ref: None,
+                dns_reverse: None,
+                dns_reverse_ref: None,
+            }],
+            ranges: vec![IpRange {
+                id: 1,
+                cidr: "192.168.1.0/24".to_string(),
+                gateway: "192.168.1.1/16".to_string(),
+                enabled: true,
+                region_id: 1,
+            }],
+            ssh_key: UserSshKey {
+                id: 1,
+                name: "test".to_string(),
+                user_id: 1,
+                created: Default::default(),
+                key_data: "ssh-ed25519 AAA=".to_string(),
+            },
+        };
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            vlan: Some(100),
+            kvm: true,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg.clone(),
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        assert_eq!(vm.cpu, Some(q_cfg.cpu));
+        assert_eq!(vm.cores, Some(template.cpu as i32));
+        assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
+        assert_eq!(vm.on_boot, Some(true));
+        assert_eq!(vm.ip_config, Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".to_string()));
+        Ok(())
     }
 }
