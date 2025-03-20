@@ -82,7 +82,7 @@ impl LightningNode for BitvoraNode {
                             BitvoraWebhookEvent::DepositLightningComplete => {
                                 InvoiceUpdate::Settled {
                                     payment_hash: None,
-                                    external_id: Some(body.data.id),
+                                    external_id: Some(body.data.lightning_invoice_id),
                                 }
                             }
                             BitvoraWebhookEvent::DepositLightningFailed => {
@@ -140,6 +140,7 @@ enum BitvoraWebhookEvent {
 #[derive(Deserialize, Debug, Clone)]
 struct BitvoraPayment {
     pub id: String,
+    pub lightning_invoice_id: String,
 }
 
 type HmacSha256 = Hmac<sha2::Sha256>;
