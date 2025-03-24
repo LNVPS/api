@@ -59,8 +59,8 @@ impl DVMHandler for LnvpsDvm {
             let ssh_key_name = request.params.get("ssh_key_name");
             let os_image = request
                 .params
-                .get("os_image")
-                .context("missing os_image parameter")?;
+                .get("os")
+                .context("missing os parameter")?;
             let os_version = request
                 .params
                 .get("os_version")
