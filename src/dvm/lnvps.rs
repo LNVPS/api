@@ -87,8 +87,8 @@ impl DVMHandler for LnvpsDvm {
             let template = VmCustomTemplate {
                 id: 0,
                 cpu: cpu.parse()?,
-                memory: memory.parse()? * MB,
-                disk_size: disk.parse()? * GB,
+                memory: MB * memory.parse::<u64>()?,
+                disk_size: GB * disk.parse::<u64>()?,
                 disk_type: DiskType::from_str(disk_type)?,
                 disk_interface: DiskInterface::from_str(disk_interface)?,
                 pricing_id: pricing.id,
