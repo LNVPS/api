@@ -1,23 +1,35 @@
-use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, VmHostClient};
+use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Result};
 use chrono::Utc;
+use futures::{Stream, StreamExt};
 use ipnetwork::IpNetwork;
 use lnvps_db::{async_trait, DiskType, Vm, VmOsImage};
-use log::{info, warn};
+use log::{error, info, warn};
 use rand::random;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::{ClientBuilder, Method, Url};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::{Read, Write};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc::channel;
+use tokio::sync::Semaphore;
+use tokio::time;
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::WebSocketStream;
+use ws::stream::DuplexStream;
 
 pub struct ProxmoxClient {
     api: JsonApi,
@@ -649,6 +661,70 @@ impl VmHostClient for ProxmoxClient {
             )
             .await?;
         Ok(r.into_iter().map(TimeSeriesData::from).collect())
+    }
+
+    async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream> {
+        // the proxmox api for terminal connection is weird and doesn't work
+        // when I tested it, using ssh instead to run qm terminal command
+
+        if let Some(ssh_config) = &self.ssh {
+            let mut ses = SshClient::new()?;
+            ses.connect(
+                (self.api.base.host().unwrap().to_string(), 22),
+                &ssh_config.user,
+                &ssh_config.key,
+            )
+            .await?;
+
+            let vm_id: ProxmoxVmId = vm.id.into();
+            let sock_path = PathBuf::from(&format!("/var/run/qemu-server/{}.serial0", vm_id));
+            let mut chan = ses.tunnel_unix_socket(&sock_path)?;
+
+            let (mut client_tx, client_rx) = channel::<Vec<u8>>(1024);
+            let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shut_chan = shutdown.clone();
+            tokio::spawn(async move {
+                let mut w_buf = vec![0; 4096];
+
+                // fire calls to read every 100ms
+                let mut chan_timer = time::interval(Duration::from_millis(100));
+                loop {
+                    tokio::select! {
+                        Some(buf) = server_rx.recv() => {
+                            if let Err(e) = chan.write_all(&buf) {
+                                error!("Failed to send data: {}", e);
+                            }
+                        }
+                        _ = chan_timer.tick() => {
+                            if chan.eof() {
+                                info!("SSH connection terminated!");
+                                shut_chan.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            let r_window = chan.read_window();
+
+                            let mut stream = chan.stream(0);
+                            if let Ok(r) = stream.read(w_buf.as_mut_slice()) {
+                                if r > 0 {
+                                    if let Err(e) = client_tx.send(w_buf[..r].to_vec()).await {
+                                        error!("Failed to write data: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                info!("SSH connection terminated!");
+            });
+            return Ok(TerminalStream{
+                shutdown,
+                rx: client_rx,
+                tx: server_tx,
+            });
+        }
+        bail!("Cannot use terminal proxy without ssh")
     }
 }
 

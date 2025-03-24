@@ -7,9 +7,10 @@ edition = "2021"
 name = "api"
 
 [features]
-default = ["mikrotik", "nostr-dm", "proxmox", "lnd", "cloudflare", "revolut", "bitvora"]
+default = ["mikrotik", "nostr-dm", "nostr-dvm", "proxmox", "lnd", "cloudflare", "revolut", "bitvora"]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk"]
+nostr-dvm = ["dep:nostr-sdk"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt"]
 lnd = ["dep:fedimint-tonic-lnd"]
@@ -19,7 +20,7 @@ revolut = ["dep:reqwest", "dep:sha2", "dep:hmac"]
 
 [dependencies]
 lnvps_db = { path = "lnvps_db" }
-tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util"] }
 anyhow = "1.0.83"
 config = { version = "0.15.8", features = ["yaml"] }
 log = "0.4.21"
@@ -37,15 +38,15 @@ rand = "0.9.0"
 clap = { version = "4.5.21", features = ["derive"] }
 ssh-key = "0.6.7"
 lettre = { version = "0.11.10", features = ["tokio1-native-tls"] }
-ws = { package = "rocket_ws", version = "0.1.0" }
+ws = { package = "rocket_ws", version = "0.1.1" }
 native-tls = "0.2.12"
 hex = "0.4.3"
 futures = "0.3.31"
 isocountry = "0.3.2"
 
 #nostr-dm
-nostr = { version = "0.39.0", default-features = false, features = ["std"] }
-nostr-sdk = { version = "0.39.0", optional = true, default-features = false, features = ["nip44", "nip59"] }
+nostr = { version = "0.40.0", default-features = false, features = ["std"] }
+nostr-sdk = { version = "0.40.0", optional = true, default-features = false, features = ["nip44", "nip59"] }
 
 #proxmox
 tokio-tungstenite = { version = "^0.21", features = ["native-tls"], optional = true }

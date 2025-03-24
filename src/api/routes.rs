@@ -11,15 +11,17 @@ use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use futures::future::join_all;
+use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnvps_db::{
     IpRange, LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
 };
+use log::{error, info};
 use nostr::util::hex;
 use rocket::serde::json::Json;
-use rocket::{get, patch, post, Responder, Route, State};
+use rocket::{get, patch, post, routes, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;
 use rocket_okapi::okapi::openapi3::Responses;
 use rocket_okapi::response::OpenApiResponderInner;
@@ -28,12 +30,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 
 pub fn routes() -> Vec<Route> {
-    openapi_get_routes![
+    let mut routes = vec![];
+
+    routes.append(&mut openapi_get_routes![
         v1_get_account,
         v1_patch_account,
         v1_list_vms,
@@ -54,7 +59,11 @@ pub fn routes() -> Vec<Route> {
         v1_custom_template_calc,
         v1_create_custom_vm_order,
         v1_get_payment_methods
-    ]
+    ]);
+
+    routes.append(&mut routes![v1_terminal_proxy]);
+
+    routes
 }
 
 type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
@@ -637,6 +646,117 @@ async fn v1_time_series(
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
     ApiData::ok(client.get_time_series_data(&vm, TimeSeries::Hourly).await?)
+}
+
+#[get("/api/v1/vm/<id>/console?<auth>")]
+async fn v1_terminal_proxy(
+    auth: &str,
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
+    id: u64,
+    ws: ws::WebSocket,
+) -> Result<ws::Channel<'static>, &'static str> {
+    let auth = Nip98Auth::from_base64(auth).map_err(|e| "Missing or invalid auth param")?;
+    if auth
+        .check(&format!("/api/v1/vm/{id}/console"), "GET")
+        .is_err()
+    {
+        return Err("Invalid auth event");
+    }
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await.map_err(|_| "Insert failed")?;
+    let vm = db.get_vm(id).await.map_err(|_| "VM not found")?;
+    if uid != vm.user_id {
+        return Err("VM does not belong to you");
+    }
+
+    let host = db
+        .get_host(vm.host_id)
+        .await
+        .map_err(|_| "VM host not found")?;
+    let client =
+        get_host_client(&host, &settings.provisioner).map_err(|_| "Failed to get host client")?;
+
+    let mut ws_upstream = client.connect_terminal(&vm).await.map_err(|e| {
+        error!("Failed to start terminal proxy: {}", e);
+        "Failed to open terminal proxy"
+    })?;
+    let ws = ws.config(Default::default());
+    Ok(ws.channel(move |mut stream| {
+        use ws::*;
+
+        Box::pin(async move {
+            async fn process_client<E>(
+                msg: Result<Message, E>,
+                ws_upstream: &mut Sender<Vec<u8>>,
+            ) -> Result<()>
+            where
+                E: Display,
+            {
+                match msg {
+                    Ok(m) => {
+                        let m_up = match m {
+                            Message::Text(t) => {
+                                info!("Got msg: {}", t);
+                                t.as_bytes().to_vec()
+                            }
+                            _ => panic!("todo"),
+                        };
+                        if let Err(e) = ws_upstream.send(m_up).await {
+                            bail!("Failed to send msg to upstream: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        bail!("Failed to read from client: {}", e);
+                    }
+                }
+                Ok(())
+            }
+
+            async fn process_upstream<E>(
+                msg: Result<Vec<u8>, E>,
+                tx_client: &mut stream::DuplexStream,
+            ) -> Result<()>
+            where
+                E: Display,
+            {
+                match msg {
+                    Ok(m) => {
+                        let down = String::from_utf8_lossy(&m).into_owned();
+                        info!("Got down msg: {}", &down);
+                        let m_down = Message::Text(down);
+                        if let Err(e) = tx_client.send(m_down).await {
+                            bail!("Failed to msg to client: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        bail!("Failed to read from upstream: {}", e);
+                    }
+                }
+                Ok(())
+            }
+
+            loop {
+                tokio::select! {
+                    Some(msg) = stream.next() => {
+                        if let Err(e) = process_client(msg, &mut ws_upstream.tx).await {
+                            error!("{}", e);
+                            break;
+                        }
+                    },
+                    Some(r) = ws_upstream.rx.recv() => {
+                        let msg: Result<Vec<u8>, anyhow::Error> = Ok(r);
+                        if let Err(e) = process_upstream(msg, &mut stream).await {
+                            error!("{}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("Websocket closed");
+            Ok(())
+        })
+    }))
 }
 
 #[openapi(tag = "Payment")]

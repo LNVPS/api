@@ -251,7 +251,7 @@ impl Worker {
                     None,
                 )
                 .await?;
-                c.send_event(ev).await?;
+                c.send_event(&ev).await?;
             }
         }
         Ok(())

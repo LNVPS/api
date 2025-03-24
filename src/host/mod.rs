@@ -2,6 +2,7 @@ use crate::settings::ProvisionerConfig;
 use crate::status::VmState;
 use anyhow::{bail, Result};
 use futures::future::join_all;
+use futures::{Sink, Stream};
 use lnvps_db::{
     async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
     VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
@@ -9,12 +10,23 @@ use lnvps_db::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Semaphore;
 
-#[cfg(feature = "libvirt")]
-mod libvirt;
+//#[cfg(feature = "libvirt")]
+//mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
+
+pub struct TerminalStream {
+    pub shutdown: Arc<AtomicBool>,
+    pub rx: Receiver<Vec<u8>>,
+    pub tx: Sender<Vec<u8>>,
+}
 
 /// Generic type for creating VM's
 #[async_trait]
@@ -52,6 +64,9 @@ pub trait VmHostClient: Send + Sync {
         vm: &Vm,
         series: TimeSeries,
     ) -> Result<Vec<TimeSeriesData>>;
+
+    /// Connect to terminal serial port
+    async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream>;
 }
 
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
