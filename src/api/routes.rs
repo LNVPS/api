@@ -696,10 +696,7 @@ async fn v1_terminal_proxy(
                 match msg {
                     Ok(m) => {
                         let m_up = match m {
-                            Message::Text(t) => {
-                                info!("Got msg: {}", t);
-                                t.as_bytes().to_vec()
-                            }
+                            Message::Text(t) => t.as_bytes().to_vec(),
                             _ => panic!("todo"),
                         };
                         if let Err(e) = ws_upstream.send(m_up).await {
@@ -723,7 +720,6 @@ async fn v1_terminal_proxy(
                 match msg {
                     Ok(m) => {
                         let down = String::from_utf8_lossy(&m).into_owned();
-                        info!("Got down msg: {}", &down);
                         let m_down = Message::Text(down);
                         if let Err(e) = tx_client.send(m_down).await {
                             bail!("Failed to msg to client: {}", e);

@@ -19,8 +19,8 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::channel;
@@ -664,67 +664,30 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream> {
-        // the proxmox api for terminal connection is weird and doesn't work
-        // when I tested it, using ssh instead to run qm terminal command
+        let vm_id: ProxmoxVmId = vm.id.into();
 
-        if let Some(ssh_config) = &self.ssh {
-            let mut ses = SshClient::new()?;
-            ses.connect(
-                (self.api.base.host().unwrap().to_string(), 22),
-                &ssh_config.user,
-                &ssh_config.key,
-            )
-            .await?;
-
-            let vm_id: ProxmoxVmId = vm.id.into();
-            let sock_path = PathBuf::from(&format!("/var/run/qemu-server/{}.serial0", vm_id));
-            let mut chan = ses.tunnel_unix_socket(&sock_path)?;
-
-            let (mut client_tx, client_rx) = channel::<Vec<u8>>(1024);
-            let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shut_chan = shutdown.clone();
-            tokio::spawn(async move {
-                let mut w_buf = vec![0; 4096];
-
-                // fire calls to read every 100ms
-                let mut chan_timer = time::interval(Duration::from_millis(100));
-                loop {
-                    tokio::select! {
-                        Some(buf) = server_rx.recv() => {
-                            if let Err(e) = chan.write_all(&buf) {
-                                error!("Failed to send data: {}", e);
-                            }
-                        }
-                        _ = chan_timer.tick() => {
-                            if chan.eof() {
-                                info!("SSH connection terminated!");
-                                shut_chan.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                            let r_window = chan.read_window();
-
-                            let mut stream = chan.stream(0);
-                            if let Ok(r) = stream.read(w_buf.as_mut_slice()) {
-                                if r > 0 {
-                                    if let Err(e) = client_tx.send(w_buf[..r].to_vec()).await {
-                                        error!("Failed to write data: {}", e);
-                                    }
-                                }
-                            }
-                        }
+        let (mut client_tx, client_rx) = channel::<Vec<u8>>(1024);
+        let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            // fire calls to read every 100ms
+            loop {
+                tokio::select! {
+                    Some(buf) = server_rx.recv() => {
+                        // echo
+                        client_tx.send(buf).await?;
                     }
-                }
 
-                info!("SSH connection terminated!");
-            });
-            return Ok(TerminalStream{
-                shutdown,
-                rx: client_rx,
-                tx: server_tx,
-            });
-        }
-        bail!("Cannot use terminal proxy without ssh")
+                }
+            }
+            info!("SSH connection terminated!");
+            Ok::<(), anyhow::Error>(())
+        });
+        Ok(TerminalStream {
+            shutdown,
+            rx: client_rx,
+            tx: server_tx,
+        })
     }
 }
 
