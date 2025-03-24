@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
@@ -23,7 +22,6 @@ use tokio::sync::Semaphore;
 mod proxmox;
 
 pub struct TerminalStream {
-    pub shutdown: Arc<AtomicBool>,
     pub rx: Receiver<Vec<u8>>,
     pub tx: Sender<Vec<u8>>,
 }

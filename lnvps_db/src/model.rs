@@ -80,8 +80,12 @@ pub struct VmHost {
     pub enabled: bool,
     /// API token used to control this host via [ip]
     pub api_token: String,
-    /// Load factor for provisioning
-    pub load_factor: f32,
+    /// CPU load factor for provisioning
+    pub load_cpu: f32,
+    /// Memory load factor
+    pub load_memory: f32,
+    /// Disk load factor
+    pub load_disk:f32,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

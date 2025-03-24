@@ -130,7 +130,9 @@ impl Default for MockDb {
                 memory: 8 * crate::GB,
                 enabled: true,
                 api_token: "".to_string(),
-                load_factor: 1.5,
+                load_cpu: 1.5,
+                load_memory: 2.0,
+                load_disk: 3.0,
             },
         );
         let mut host_disks = HashMap::new();

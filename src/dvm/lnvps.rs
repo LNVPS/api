@@ -1,5 +1,6 @@
 use crate::dvm::{build_status_for_job, DVMHandler, DVMJobRequest};
 use crate::provisioner::LNVpsProvisioner;
+use crate::{GB, MB};
 use anyhow::Context;
 use lnvps_db::{
     DiskInterface, DiskType, LNVpsDb, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
@@ -12,7 +13,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use crate::{GB, MB};
 
 pub struct LnvpsDvm {
     client: Client,
@@ -57,10 +57,7 @@ impl DVMHandler for LnvpsDvm {
                 .get("ssh_key")
                 .context("missing ssh_key parameter")?;
             let ssh_key_name = request.params.get("ssh_key_name");
-            let os_image = request
-                .params
-                .get("os")
-                .context("missing os parameter")?;
+            let os_image = request.params.get("os").context("missing os parameter")?;
             let os_version = request
                 .params
                 .get("os_version")

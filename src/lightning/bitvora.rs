@@ -68,11 +68,10 @@ impl LightningNode for BitvoraNode {
                         }
                         let r_body = r.body.as_slice();
                         info!("Received webhook {}", String::from_utf8_lossy(r_body));
-                        let body: BitvoraWebhook =
-                            match serde_json::from_slice(r_body) {
-                                Ok(b) => b,
-                                Err(e) => return InvoiceUpdate::Error(e.to_string()),
-                            };
+                        let body: BitvoraWebhook = match serde_json::from_slice(r_body) {
+                            Ok(b) => b,
+                            Err(e) => return InvoiceUpdate::Error(e.to_string()),
+                        };
 
                         if let Err(e) = verify_webhook(&secret, &r) {
                             return InvoiceUpdate::Error(e.to_string());

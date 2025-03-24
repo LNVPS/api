@@ -36,10 +36,7 @@ impl SshClient {
 
     pub fn tunnel_unix_socket(&mut self, remote_path: &Path) -> Result<Channel> {
         self.session
-            .channel_direct_streamlocal(
-                remote_path.to_str().unwrap(),
-                None,
-            )
+            .channel_direct_streamlocal(remote_path.to_str().unwrap(), None)
             .map_err(|e| anyhow!(e))
     }
 

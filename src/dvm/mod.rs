@@ -247,10 +247,7 @@ fn parse_job_request(event: &Event) -> Result<DVMJobRequest> {
     })
 }
 
-pub fn start_dvms(
-    client: Client,
-    provisioner: Arc<LNVpsProvisioner>,
-) -> JoinHandle<()> {
+pub fn start_dvms(client: Client, provisioner: Arc<LNVpsProvisioner>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let dvm = LnvpsDvm::new(provisioner, client.clone());
         if let Err(e) = listen_for_jobs(client, Kind::from_u16(5999), Box::new(dvm)).await {

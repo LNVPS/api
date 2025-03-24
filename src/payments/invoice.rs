@@ -36,8 +36,14 @@ impl NodeInvoiceHandler {
     async fn mark_payment_paid(&self, payment: &VmPayment) -> Result<()> {
         self.db.vm_payment_paid(&payment).await?;
 
-        info!("VM payment {} for {}, paid", hex::encode(&payment.id), payment.vm_id);
-        self.tx.send(WorkJob::CheckVm { vm_id: payment.vm_id })?;
+        info!(
+            "VM payment {} for {}, paid",
+            hex::encode(&payment.id),
+            payment.vm_id
+        );
+        self.tx.send(WorkJob::CheckVm {
+            vm_id: payment.vm_id,
+        })?;
 
         Ok(())
     }

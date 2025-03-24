@@ -668,7 +668,6 @@ impl VmHostClient for ProxmoxClient {
 
         let (mut client_tx, client_rx) = channel::<Vec<u8>>(1024);
         let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);
-        let shutdown = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             // fire calls to read every 100ms
             loop {
@@ -684,7 +683,6 @@ impl VmHostClient for ProxmoxClient {
             Ok::<(), anyhow::Error>(())
         });
         Ok(TerminalStream {
-            shutdown,
             rx: client_rx,
             tx: server_tx,
         })

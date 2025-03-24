@@ -159,7 +159,7 @@ pub struct RevolutOrderPayment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing_address: Option<RevolutBillingAddress>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk_level: Option<RevolutRiskLevel>
+    pub risk_level: Option<RevolutRiskLevel>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -198,7 +198,7 @@ pub enum RevolutPaymentMethodType {
 #[serde(rename_all = "snake_case")]
 pub enum RevolutRiskLevel {
     High,
-    Low
+    Low,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
