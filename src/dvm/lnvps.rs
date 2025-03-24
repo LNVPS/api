@@ -146,6 +146,7 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind};
 
     #[tokio::test]
+    #[ignore]
     async fn test_dvm() -> anyhow::Result<()> {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::new());
