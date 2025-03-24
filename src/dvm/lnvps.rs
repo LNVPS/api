@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use crate::{GB, MB};
 
 pub struct LnvpsDvm {
     client: Client,
@@ -86,8 +87,8 @@ impl DVMHandler for LnvpsDvm {
             let template = VmCustomTemplate {
                 id: 0,
                 cpu: cpu.parse()?,
-                memory: memory.parse()?,
-                disk_size: disk.parse()?,
+                memory: memory.parse()? * MB,
+                disk_size: disk.parse()? * GB,
                 disk_type: DiskType::from_str(disk_type)?,
                 disk_interface: DiskInterface::from_str(disk_interface)?,
                 pricing_id: pricing.id,
