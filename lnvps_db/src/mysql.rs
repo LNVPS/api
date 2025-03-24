@@ -133,7 +133,7 @@ impl LNVpsDb for LNVpsDbMysql {
     }
 
     async fn list_hosts(&self) -> Result<Vec<VmHost>> {
-        sqlx::query_as("select * from vm_host where enabled = 1")
+        sqlx::query_as("select h.* from vm_host h,vm_host_region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
