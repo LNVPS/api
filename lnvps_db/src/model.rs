@@ -151,6 +151,24 @@ pub enum OsDistribution {
     RedHatEnterprise = 7,
 }
 
+impl FromStr for OsDistribution {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ubuntu" => Ok(OsDistribution::Ubuntu),
+            "debian" => Ok(OsDistribution::Debian),
+            "centos" => Ok(OsDistribution::CentOS),
+            "fedora" => Ok(OsDistribution::Fedora),
+            "freebsd" => Ok(OsDistribution::FreeBSD),
+            "opensuse" => Ok(OsDistribution::OpenSUSE),
+            "archlinux" => Ok(OsDistribution::ArchLinux),
+            "redhatenterprise" => Ok(OsDistribution::RedHatEnterprise),
+            _ => Err(anyhow!("unknown distribution {}", s)),
+        }
+    }
+}
+
 /// OS Images are templates which are used as a basis for
 /// provisioning new vms
 #[derive(FromRow, Clone, Debug)]

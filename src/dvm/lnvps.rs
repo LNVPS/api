@@ -1,7 +1,9 @@
 use crate::dvm::{build_status_for_job, DVMHandler, DVMJobRequest};
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Context;
-use lnvps_db::{DiskInterface, DiskType, LNVpsDb, PaymentMethod, UserSshKey, VmCustomTemplate};
+use lnvps_db::{
+    DiskInterface, DiskType, LNVpsDb, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
+};
 use nostr::prelude::DataVendingMachineStatus;
 use nostr::Tag;
 use nostr_sdk::Client;
@@ -54,6 +56,14 @@ impl DVMHandler for LnvpsDvm {
                 .get("ssh_key")
                 .context("missing ssh_key parameter")?;
             let ssh_key_name = request.params.get("ssh_key_name");
+            let os_image = request
+                .params
+                .get("os_image")
+                .context("missing os_image parameter")?;
+            let os_version = request
+                .params
+                .get("os_version")
+                .context("missing os_version parameter")?;
             let region = request.params.get("region");
 
             let db = provisioner.get_db();
@@ -112,8 +122,16 @@ impl DVMHandler for LnvpsDvm {
                 db.insert_user_ssh_key(&new_key).await?
             };
 
+            let image = OsDistribution::from_str(os_image)?;
+            let image = db
+                .list_os_image()
+                .await?
+                .into_iter()
+                .find(|i| i.distribution == image && i.version == *os_version)
+                .context("no os image found")?;
+
             let vm = provisioner
-                .provision_custom(uid, template, 0, ssh_key_id, None)
+                .provision_custom(uid, template, image.id, ssh_key_id, None)
                 .await?;
             let invoice = provisioner.renew(vm.id, PaymentMethod::Lightning).await?;
 
