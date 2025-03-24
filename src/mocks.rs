@@ -1,7 +1,7 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
-use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, VmHostClient};
+use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::settings::NetworkPolicy;
@@ -265,9 +265,24 @@ impl LNVpsDb for MockDb {
             .collect())
     }
 
+    async fn list_host_region(&self) -> anyhow::Result<Vec<VmHostRegion>> {
+        let regions = self.regions.lock().await;
+        Ok(regions.values().filter(|r| r.enabled).cloned().collect())
+    }
+
     async fn get_host_region(&self, id: u64) -> anyhow::Result<VmHostRegion> {
         let regions = self.regions.lock().await;
         Ok(regions.get(&id).ok_or(anyhow!("no region"))?.clone())
+    }
+
+    async fn get_host_region_by_name(&self, name: &str) -> anyhow::Result<VmHostRegion> {
+        let regions = self.regions.lock().await;
+        Ok(regions
+            .iter()
+            .find(|(_, v)| v.name == name)
+            .ok_or(anyhow!("no region"))?
+            .1
+            .clone())
     }
 
     async fn list_hosts(&self) -> anyhow::Result<Vec<VmHost>> {
@@ -801,6 +816,10 @@ impl VmHostClient for MockVmHost {
         series: TimeSeries,
     ) -> anyhow::Result<Vec<TimeSeriesData>> {
         Ok(vec![])
+    }
+
+    async fn connect_terminal(&self, vm: &Vm) -> anyhow::Result<TerminalStream> {
+        todo!()
     }
 }
 

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use crate::dns::DnsServer;
 use crate::exchange::ExchangeRateService;
 use crate::fiat::FiatPaymentService;
@@ -6,11 +5,12 @@ use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
 use crate::router::Router;
 use anyhow::Result;
+use isocountry::CountryCode;
 use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use isocountry::CountryCode;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -258,5 +258,51 @@ impl Settings {
             Some(c) => Ok(Some(Arc::new(crate::fiat::RevolutApi::new(c.clone())?))),
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+pub fn mock_settings() -> Settings {
+    Settings {
+        listen: None,
+        db: "".to_string(),
+        public_url: "http://localhost:8000".to_string(),
+        lightning: LightningConfig::LND {
+            url: "".to_string(),
+            cert: Default::default(),
+            macaroon: Default::default(),
+        },
+        read_only: false,
+        provisioner: ProvisionerConfig::Proxmox {
+            qemu: QemuConfig {
+                machine: "q35".to_string(),
+                os_type: "l26".to_string(),
+                bridge: "vmbr1".to_string(),
+                cpu: "kvm64".to_string(),
+                vlan: None,
+                kvm: false,
+            },
+            ssh: None,
+            mac_prefix: Some("ff:ff:ff".to_string()),
+        },
+        network_policy: NetworkPolicy {
+            access: NetworkAccessPolicy::Auto,
+            ip6_slaac: None,
+        },
+        delete_after: 0,
+        smtp: None,
+        router: Some(RouterConfig::Mikrotik {
+            url: "https://localhost".to_string(),
+            username: "admin".to_string(),
+            password: "password123".to_string(),
+        }),
+        dns: Some(DnsServerConfig::Cloudflare {
+            token: "abc".to_string(),
+            forward_zone_id: "123".to_string(),
+            reverse_zone_id: "456".to_string(),
+        }),
+        nostr: None,
+        revolut: None,
+        tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
     }
 }

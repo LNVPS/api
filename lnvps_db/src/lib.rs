@@ -38,8 +38,14 @@ pub trait LNVpsDb: Sync + Send {
     /// List a users ssh keys
     async fn list_user_ssh_key(&self, user_id: u64) -> Result<Vec<UserSshKey>>;
 
+    /// Get VM host regions
+    async fn list_host_region(&self) -> Result<Vec<VmHostRegion>>;
+
     /// Get VM host region by id
     async fn get_host_region(&self, id: u64) -> Result<VmHostRegion>;
+
+    /// Get VM host region by name
+    async fn get_host_region_by_name(&self, name: &str) -> Result<VmHostRegion>;
 
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> Result<Vec<VmHost>>;

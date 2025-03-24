@@ -20,6 +20,8 @@ pub mod worker;
 #[cfg(test)]
 pub mod mocks;
 
+#[cfg(feature = "nostr-dvm")]
+pub mod dvm;
 
 /// SATS per BTC
 pub const BTC_SATS: f64 = 100_000_000.0;

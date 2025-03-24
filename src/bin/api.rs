@@ -5,6 +5,7 @@ use config::{Config, File};
 use lnvps::api;
 use lnvps::cors::CORS;
 use lnvps::data_migration::run_data_migrations;
+use lnvps::dvm::start_dvms;
 use lnvps::exchange::{DefaultRateCache, ExchangeRateService};
 use lnvps::lightning::get_node;
 use lnvps::payments::listen_all_payments;
@@ -15,12 +16,12 @@ use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::{error, LevelFilter};
 use nostr::Keys;
 use nostr_sdk::Client;
+use rocket::http::Method;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use rocket::http::Method;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -151,6 +152,12 @@ async fn main() -> Result<(), Error> {
         }
     });
 
+    #[cfg(feature = "nostr-dvm")]
+    {
+        let nostr_client = nostr_client.unwrap();
+        start_dvms(nostr_client.clone(), provisioner.clone());
+    }
+
     let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
@@ -175,14 +182,15 @@ async fn main() -> Result<(), Error> {
             }),
         )
         .attach(CORS)
-        .mount("/", vec![
-            rocket::Route::ranked(
-            isize::MAX,
-            Method::Options,
-            "/<catch_all_options_route..>",
-            CORS,
+        .mount(
+            "/",
+            vec![rocket::Route::ranked(
+                isize::MAX,
+                Method::Options,
+                "/<catch_all_options_route..>",
+                CORS,
+            )],
         )
-        ])
         .launch()
         .await
     {

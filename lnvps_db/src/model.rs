@@ -103,6 +103,18 @@ pub enum DiskType {
     SSD = 1,
 }
 
+impl FromStr for DiskType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "hdd" => Ok(DiskType::HDD),
+            "ssd" => Ok(DiskType::SSD),
+            _ => Err(anyhow!("unknown disk type {}", s)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DiskInterface {
@@ -110,6 +122,19 @@ pub enum DiskInterface {
     SATA = 0,
     SCSI = 1,
     PCIe = 2,
+}
+
+impl FromStr for DiskInterface {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sata" => Ok(DiskInterface::SATA),
+            "scsi" => Ok(DiskInterface::SCSI),
+            "pcie" => Ok(DiskInterface::PCIe),
+            _ => Err(anyhow!("unknown disk interface {}", s)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]

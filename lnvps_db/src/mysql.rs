@@ -109,9 +109,24 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn list_host_region(&self) -> Result<Vec<VmHostRegion>> {
+        sqlx::query_as("select * from vm_host_region where enabled=1")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn get_host_region(&self, id: u64) -> Result<VmHostRegion> {
         sqlx::query_as("select * from vm_host_region where id=?")
             .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_host_region_by_name(&self, name: &str) -> Result<VmHostRegion> {
+        sqlx::query_as("select * from vm_host_region where name like ?")
+            .bind(name)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
