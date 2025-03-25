@@ -6,12 +6,15 @@ use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{
     CostResult, HostCapacityService, NetworkProvisioner, PricingEngine, ProvisionerMethod,
 };
-use crate::router::{ArpEntry, Router};
-use crate::settings::{NetworkAccessPolicy, NetworkPolicy, ProvisionerConfig, Settings};
+use crate::router::{ArpEntry, MikrotikRouter, Router};
+use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
 use isocountry::CountryCode;
-use lnvps_db::{LNVpsDb, PaymentMethod, User, Vm, VmCustomTemplate, VmIpAssignment, VmPayment};
+use lnvps_db::{
+    AccessPolicy, LNVpsDb, NetworkAccessPolicy, PaymentMethod, RouterKind, Vm, VmCustomTemplate,
+    VmIpAssignment, VmPayment,
+};
 use log::{info, warn};
 use nostr::util::hex;
 use std::collections::HashMap;
@@ -30,11 +33,9 @@ pub struct LNVpsProvisioner {
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
 
-    router: Option<Arc<dyn Router>>,
     dns: Option<Arc<dyn DnsServer>>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
 
-    network_policy: NetworkPolicy,
     provisioner_config: ProvisionerConfig,
 }
 
@@ -49,63 +50,104 @@ impl LNVpsProvisioner {
             db,
             node,
             rates,
-            router: settings.get_router().expect("router config"),
             dns: settings.get_dns().expect("dns config"),
             revolut: settings.get_revolut().expect("revolut config"),
             tax_rates: settings.tax_rate,
-            network_policy: settings.network_policy,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
         }
     }
 
-    /// Create or Update access policy for a given ip assignment, does not save to database!
-    pub async fn update_access_policy(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        // apply network policy
-        if let NetworkAccessPolicy::StaticArp { interface } = &self.network_policy.access {
-            if let Some(r) = self.router.as_ref() {
-                let vm = self.db.get_vm(assignment.vm_id).await?;
-                let entry = ArpEntry::new(&vm, assignment, Some(interface.clone()))?;
-                let arp = if let Some(_id) = &assignment.arp_ref {
-                    r.update_arp_entry(&entry).await?
-                } else {
-                    r.add_arp_entry(&entry).await?
-                };
-                ensure!(arp.id.is_some(), "ARP id was empty");
-                assignment.arp_ref = arp.id;
-            } else {
-                bail!("No router found to apply static arp entry!")
+    async fn get_router(&self, router_id: u64) -> Result<Arc<dyn Router>> {
+        #[cfg(test)]
+        return Ok(Arc::new(crate::mocks::MockRouter::new()));
+
+        let cfg = self.db.get_router(router_id).await?;
+        match cfg.kind {
+            RouterKind::Mikrotik => {
+                let mut t_split = cfg.token.split(":");
+                let (username, password) = (
+                    t_split.next().context("Invalid username:password")?,
+                    t_split.next().context("Invalid username:password")?,
+                );
+                Ok(Arc::new(MikrotikRouter::new(&cfg.url, username, password)))
             }
+        }
+    }
+
+    /// Create or Update access policy for a given ip assignment, does not save to database!
+    pub async fn update_access_policy(
+        &self,
+        assignment: &mut VmIpAssignment,
+        policy: &AccessPolicy,
+    ) -> Result<()> {
+        // apply network policy
+        if let NetworkAccessPolicy::StaticArp = policy.kind {
+            let router = self
+                .get_router(
+                    policy
+                        .router_id
+                        .context("Cannot apply static arp policy with no router")?,
+                )
+                .await?;
+            let vm = self.db.get_vm(assignment.vm_id).await?;
+            let entry = ArpEntry::new(
+                &vm,
+                assignment,
+                Some(
+                    policy
+                        .interface
+                        .as_ref()
+                        .context("Cannot apply static arp entry without an interface name")?
+                        .clone(),
+                ),
+            )?;
+            let arp = if let Some(_id) = &assignment.arp_ref {
+                router.update_arp_entry(&entry).await?
+            } else {
+                router.add_arp_entry(&entry).await?
+            };
+            ensure!(arp.id.is_some(), "ARP id was empty");
+            assignment.arp_ref = arp.id;
         }
         Ok(())
     }
 
     /// Remove an access policy for a given ip assignment, does not save to database!
-    pub async fn remove_access_policy(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+    pub async fn remove_access_policy(
+        &self,
+        assignment: &mut VmIpAssignment,
+        policy: &AccessPolicy,
+    ) -> Result<()> {
         // Delete access policy
-        if let NetworkAccessPolicy::StaticArp { .. } = &self.network_policy.access {
-            if let Some(r) = self.router.as_ref() {
-                let id = if let Some(id) = &assignment.arp_ref {
-                    Some(id.clone())
+        if let NetworkAccessPolicy::StaticArp = &policy.kind {
+            let router = self
+                .get_router(
+                    policy
+                        .router_id
+                        .context("Cannot apply static arp policy with no router")?,
+                )
+                .await?;
+            let id = if let Some(id) = &assignment.arp_ref {
+                Some(id.clone())
+            } else {
+                warn!("ARP REF not found, using arp list");
+
+                let ent = router.list_arp_entry().await?;
+                if let Some(ent) = ent.iter().find(|e| e.address == assignment.ip) {
+                    ent.id.clone()
                 } else {
-                    warn!("ARP REF not found, using arp list");
-
-                    let ent = r.list_arp_entry().await?;
-                    if let Some(ent) = ent.iter().find(|e| e.address == assignment.ip) {
-                        ent.id.clone()
-                    } else {
-                        warn!("ARP entry not found, skipping");
-                        None
-                    }
-                };
-
-                if let Some(id) = id {
-                    if let Err(e) = r.remove_arp_entry(&id).await {
-                        warn!("Failed to remove arp entry, skipping: {}", e);
-                    }
+                    warn!("ARP entry not found, skipping");
+                    None
                 }
-                assignment.arp_ref = None;
+            };
+
+            if let Some(id) = id {
+                if let Err(e) = router.remove_arp_entry(&id).await {
+                    warn!("Failed to remove arp entry, skipping: {}", e);
+                }
             }
+            assignment.arp_ref = None;
         }
         Ok(())
     }
@@ -169,8 +211,13 @@ impl LNVpsProvisioner {
     pub async fn delete_ip_assignments(&self, vm_id: u64) -> Result<()> {
         let ips = self.db.list_vm_ip_assignments(vm_id).await?;
         for mut ip in ips {
-            // remove access policy
-            self.remove_access_policy(&mut ip).await?;
+            // load range info to check access policy
+            let range = self.db.get_ip_range(ip.ip_range_id).await?;
+            if let Some(ap) = range.access_policy_id {
+                let ap = self.db.get_access_policy(ap).await?;
+                // remove access policy
+                self.remove_access_policy(&mut ip, &ap).await?;
+            }
             // remove dns
             self.remove_ip_dns(&mut ip).await?;
             // save arp/dns changes
@@ -183,8 +230,13 @@ impl LNVpsProvisioner {
     }
 
     async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        // apply access policy
-        self.update_access_policy(assignment).await?;
+        // load range info to check access policy
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+        if let Some(ap) = range.access_policy_id {
+            let ap = self.db.get_access_policy(ap).await?;
+            // apply access policy
+            self.update_access_policy(assignment, &ap).await?;
+        }
 
         // Add DNS records
         self.update_forward_ip_dns(assignment).await?;
@@ -498,9 +550,7 @@ mod tests {
     use super::*;
     use crate::exchange::{DefaultRateCache, Ticker};
     use crate::mocks::{MockDb, MockDnsServer, MockExchangeRate, MockNode, MockRouter};
-    use crate::settings::{
-        mock_settings, DnsServerConfig, LightningConfig, QemuConfig, RouterConfig,
-    };
+    use crate::settings::mock_settings;
     use lnvps_db::{DiskInterface, DiskType, User, UserSshKey, VmTemplate};
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -509,9 +559,6 @@ mod tests {
 
     pub fn settings() -> Settings {
         let mut settings = mock_settings();
-        settings.network_policy.access = NetworkAccessPolicy::StaticArp {
-            interface: ROUTER_BRIDGE.to_string(),
-        };
         settings
     }
 
@@ -540,7 +587,36 @@ mod tests {
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
-        let router = MockRouter::new(settings.network_policy.clone());
+        // add static arp policy
+        {
+            let mut r = db.router.lock().await;
+            r.insert(
+                1,
+                lnvps_db::Router {
+                    id: 1,
+                    name: "mock-router".to_string(),
+                    enabled: true,
+                    kind: RouterKind::Mikrotik,
+                    url: "https://localhost".to_string(),
+                    token: "username:password".to_string(),
+                },
+            );
+            let mut p = db.access_policy.lock().await;
+            p.insert(
+                1,
+                AccessPolicy {
+                    id: 1,
+                    name: "static-arp".to_string(),
+                    kind: NetworkAccessPolicy::StaticArp,
+                    router_id: Some(1),
+                    interface: Some(ROUTER_BRIDGE.to_string()),
+                },
+            );
+            let mut i = db.ip_range.lock().await;
+            let r = i.get_mut(&1).unwrap();
+            r.access_policy_id = Some(1);
+        }
+
         let dns = MockDnsServer::new();
         let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
 
@@ -567,6 +643,7 @@ mod tests {
         provisioner.spawn_vm(vm.id).await?;
 
         // check resources
+        let router = MockRouter::new();
         let arp = router.list_arp_entry().await?;
         assert_eq!(1, arp.len());
         let arp = arp.first().unwrap();

@@ -4,15 +4,15 @@ use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
 use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
-use crate::settings::NetworkPolicy;
 use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
 use lnvps_db::{
-    async_trait, DiskInterface, DiskType, IpRange, LNVpsDb, OsDistribution, User, UserSshKey, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, LNVpsDb, OsDistribution, User,
+    UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage,
+    VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
 use std::ops::Add;
@@ -37,6 +37,8 @@ pub struct MockDb {
     pub custom_pricing_disk: Arc<Mutex<HashMap<u64, VmCustomPricingDisk>>>,
     pub custom_template: Arc<Mutex<HashMap<u64, VmCustomTemplate>>>,
     pub payments: Arc<Mutex<Vec<VmPayment>>>,
+    pub router: Arc<Mutex<HashMap<u64, lnvps_db::Router>>>,
+    pub access_policy: Arc<Mutex<HashMap<u64, AccessPolicy>>>,
 }
 
 impl MockDb {
@@ -115,6 +117,8 @@ impl Default for MockDb {
                 gateway: "10.0.0.1/8".to_string(),
                 enabled: true,
                 region_id: 1,
+                reverse_zone_id: None,
+                access_policy_id: None,
             },
         );
         let mut hosts = HashMap::new();
@@ -181,6 +185,8 @@ impl Default for MockDb {
             user_ssh_keys: Arc::new(Mutex::new(Default::default())),
             custom_template: Arc::new(Default::default()),
             payments: Arc::new(Default::default()),
+            router: Arc::new(Default::default()),
+            access_policy: Arc::new(Default::default()),
         }
     }
 }
@@ -602,21 +608,31 @@ impl LNVpsDb for MockDb {
             .cloned()
             .collect())
     }
+
+    async fn get_router(&self, router_id: u64) -> anyhow::Result<lnvps_db::Router> {
+        let r = self.router.lock().await;
+        Ok(r.get(&router_id).cloned().context("no router")?)
+    }
+
+    async fn get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> {
+        let p = self.access_policy.lock().await;
+        Ok(p.get(&access_policy_id)
+            .cloned()
+            .context("no access policy")?)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct MockRouter {
-    pub policy: NetworkPolicy,
     arp: Arc<Mutex<HashMap<u64, ArpEntry>>>,
 }
 
 impl MockRouter {
-    pub fn new(policy: NetworkPolicy) -> Self {
+    pub fn new() -> Self {
         static LAZY_ARP: LazyLock<Arc<Mutex<HashMap<u64, ArpEntry>>>> =
             LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
         Self {
-            policy,
             arp: LAZY_ARP.clone(),
         }
     }

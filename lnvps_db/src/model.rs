@@ -85,7 +85,7 @@ pub struct VmHost {
     /// Memory load factor
     pub load_memory: f32,
     /// Disk load factor
-    pub load_disk:f32,
+    pub load_disk: f32,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -208,12 +208,49 @@ impl Display for VmOsImage {
 }
 
 #[derive(FromRow, Clone, Debug)]
+pub struct Router {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: RouterKind,
+    pub url: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, sqlx::Type)]
+#[repr(u16)]
+pub enum RouterKind {
+    Mikrotik = 0,
+}
+
+#[derive(FromRow, Clone, Debug)]
 pub struct IpRange {
     pub id: u64,
     pub cidr: String,
     pub gateway: String,
     pub enabled: bool,
     pub region_id: u64,
+    pub reverse_zone_id: Option<String>,
+    pub access_policy_id: Option<u64>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct AccessPolicy {
+    pub id: u64,
+    pub name: String,
+    pub kind: NetworkAccessPolicy,
+    /// Router used to apply this network access policy
+    pub router_id: Option<u64>,
+    /// Interface name used to apply this policy
+    pub interface: Option<String>,
+}
+
+/// Policy that determines how packets arrive at the VM
+#[derive(Debug, Clone, sqlx::Type)]
+#[repr(u16)]
+pub enum NetworkAccessPolicy {
+    /// ARP entries are added statically on the access router
+    StaticArp = 0,
 }
 
 #[derive(Clone, Debug, sqlx::Type)]

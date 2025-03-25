@@ -163,4 +163,10 @@ pub trait LNVpsDb: Sync + Send {
 
     /// Return the list of disk prices for a given custom pricing model
     async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>>;
+
+    /// Get router config
+    async fn get_router(&self, router_id: u64) -> Result<Router>;
+
+    /// Get access policy
+    async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy>;
 }

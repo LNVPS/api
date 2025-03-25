@@ -2,7 +2,6 @@ use crate::settings::ProvisionerConfig;
 use crate::status::VmState;
 use anyhow::{bail, Result};
 use futures::future::join_all;
-use futures::{Sink, Stream};
 use lnvps_db::{
     async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
     VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
@@ -10,11 +9,8 @@ use lnvps_db::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::Semaphore;
 
 //#[cfg(feature = "libvirt")]
 //mod libvirt;

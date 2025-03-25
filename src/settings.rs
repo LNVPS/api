@@ -3,7 +3,6 @@ use crate::exchange::ExchangeRateService;
 use crate::fiat::FiatPaymentService;
 use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
-use crate::router::Router;
 use anyhow::Result;
 use isocountry::CountryCode;
 use lnvps_db::LNVpsDb;
@@ -33,18 +32,11 @@ pub struct Settings {
     /// Provisioning profiles
     pub provisioner: ProvisionerConfig,
 
-    #[serde(default)]
-    /// Network policy
-    pub network_policy: NetworkPolicy,
-
     /// Number of days after an expired VM is deleted
     pub delete_after: u16,
 
     /// SMTP settings for sending emails
     pub smtp: Option<SmtpConfig>,
-
-    /// Network router config
-    pub router: Option<RouterConfig>,
 
     /// DNS configurations for PTR records
     pub dns: Option<DnsServerConfig>,
@@ -84,16 +76,6 @@ pub struct NostrConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum RouterConfig {
-    Mikrotik {
-        url: String,
-        username: String,
-        password: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum DnsServerConfig {
     #[serde(rename_all = "kebab-case")]
     Cloudflare {
@@ -101,30 +83,6 @@ pub enum DnsServerConfig {
         forward_zone_id: String,
         reverse_zone_id: String,
     },
-}
-
-/// Policy that determines how packets arrive at the VM
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkAccessPolicy {
-    /// No special procedure required for packets to arrive
-    #[default]
-    Auto,
-    /// ARP entries are added statically on the access router
-    StaticArp {
-        /// Interface used to add arp entries
-        interface: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct NetworkPolicy {
-    /// Policy that determines how packets arrive at the VM
-    pub access: NetworkAccessPolicy,
-
-    /// Use SLAAC for IPv6 allocation
-    pub ip6_slaac: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -203,32 +161,6 @@ impl Settings {
         Arc::new(LNVpsProvisioner::new(self.clone(), db, node, exchange))
     }
 
-    pub fn get_router(&self) -> Result<Option<Arc<dyn Router>>> {
-        #[cfg(test)]
-        {
-            if let Some(_router) = &self.router {
-                let router = crate::mocks::MockRouter::new(self.network_policy.clone());
-                Ok(Some(Arc::new(router)))
-            } else {
-                Ok(None)
-            }
-        }
-        #[cfg(not(test))]
-        {
-            match &self.router {
-                #[cfg(feature = "mikrotik")]
-                Some(RouterConfig::Mikrotik {
-                    url,
-                    username,
-                    password,
-                }) => Ok(Some(Arc::new(crate::router::MikrotikRouter::new(
-                    url, username, password,
-                )))),
-                _ => Ok(None),
-            }
-        }
-    }
-
     pub fn get_dns(&self) -> Result<Option<Arc<dyn DnsServer>>> {
         #[cfg(test)]
         {
@@ -285,17 +217,8 @@ pub fn mock_settings() -> Settings {
             ssh: None,
             mac_prefix: Some("ff:ff:ff".to_string()),
         },
-        network_policy: NetworkPolicy {
-            access: NetworkAccessPolicy::Auto,
-            ip6_slaac: None,
-        },
         delete_after: 0,
         smtp: None,
-        router: Some(RouterConfig::Mikrotik {
-            url: "https://localhost".to_string(),
-            username: "admin".to_string(),
-            password: "password123".to_string(),
-        }),
         dns: Some(DnsServerConfig::Cloudflare {
             token: "abc".to_string(),
             forward_zone_id: "123".to_string(),

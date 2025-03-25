@@ -5,31 +5,22 @@ use crate::ssh_client::SshClient;
 use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Result};
 use chrono::Utc;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use ipnetwork::IpNetwork;
 use lnvps_db::{async_trait, DiskType, Vm, VmOsImage};
-use log::{error, info, warn};
+use log::{info, warn};
 use rand::random;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::{ClientBuilder, Method, Url};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::channel;
-use tokio::sync::Semaphore;
-use tokio::time;
 use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::protocol::Role;
-use tokio_tungstenite::WebSocketStream;
-use ws::stream::DuplexStream;
 
 pub struct ProxmoxClient {
     api: JsonApi,
@@ -1140,25 +1131,52 @@ mod tests {
                 release_date: Utc::now(),
                 url: "http://localhost.com/ubuntu_server_24.04.img".to_string(),
             },
-            ips: vec![VmIpAssignment {
-                id: 1,
-                vm_id: 1,
-                ip_range_id: 1,
-                ip: "192.168.1.2".to_string(),
-                deleted: false,
-                arp_ref: None,
-                dns_forward: None,
-                dns_forward_ref: None,
-                dns_reverse: None,
-                dns_reverse_ref: None,
-            }],
-            ranges: vec![IpRange {
-                id: 1,
-                cidr: "192.168.1.0/24".to_string(),
-                gateway: "192.168.1.1/16".to_string(),
-                enabled: true,
-                region_id: 1,
-            }],
+            ips: vec![
+                VmIpAssignment {
+                    id: 1,
+                    vm_id: 1,
+                    ip_range_id: 1,
+                    ip: "192.168.1.2".to_string(),
+                    deleted: false,
+                    arp_ref: None,
+                    dns_forward: None,
+                    dns_forward_ref: None,
+                    dns_reverse: None,
+                    dns_reverse_ref: None,
+                },
+                VmIpAssignment {
+                    id: 2,
+                    vm_id: 1,
+                    ip_range_id: 2,
+                    ip: "192.168.2.2".to_string(),
+                    deleted: false,
+                    arp_ref: None,
+                    dns_forward: None,
+                    dns_forward_ref: None,
+                    dns_reverse: None,
+                    dns_reverse_ref: None,
+                },
+            ],
+            ranges: vec![
+                IpRange {
+                    id: 1,
+                    cidr: "192.168.1.0/24".to_string(),
+                    gateway: "192.168.1.1/16".to_string(),
+                    enabled: true,
+                    region_id: 1,
+                    reverse_zone_id: None,
+                    access_policy_id: None,
+                },
+                IpRange {
+                    id: 2,
+                    cidr: "192.168.2.0/24".to_string(),
+                    gateway: "10.10.10.10".to_string(),
+                    enabled: true,
+                    region_id: 2,
+                    reverse_zone_id: None,
+                    access_policy_id: None,
+                },
+            ],
             ssh_key: UserSshKey {
                 id: 1,
                 name: "test".to_string(),
@@ -1193,7 +1211,10 @@ mod tests {
         assert_eq!(vm.on_boot, Some(true));
         assert_eq!(
             vm.ip_config,
-            Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".to_string())
+            Some(
+                "ip=192.168.1.2/16,gw=192.168.1.1,ip=192.168.2.2/24,gw=10.10.10.10,ip6=auto"
+                    .to_string()
+            )
         );
         Ok(())
     }

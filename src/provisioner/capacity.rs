@@ -354,6 +354,8 @@ mod tests {
                     gateway: "10.0.0.1".to_string(),
                     enabled: true,
                     region_id: 1,
+                    reverse_zone_id: None,
+                    access_policy_id: None,
                 },
                 usage: 69,
             }],
