@@ -11,6 +11,8 @@ use rocket::async_trait;
 /// It also prevents people from re-assigning their IP to another in the range,
 #[async_trait]
 pub trait Router: Send + Sync {
+    /// Generate mac address for a given IP address
+    async fn generate_mac(&self, ip: &str, comment: &str) -> Result<Option<ArpEntry>>;
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>>;
     async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
     async fn remove_arp_entry(&self, id: &str) -> Result<()>;
@@ -40,5 +42,9 @@ impl ArpEntry {
 
 #[cfg(feature = "mikrotik")]
 mod mikrotik;
+mod ovh;
+
 #[cfg(feature = "mikrotik")]
-pub use mikrotik::*;
+pub use mikrotik::MikrotikRouter;
+pub use ovh::OvhDedicatedServerVMacRouter;
+

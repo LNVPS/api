@@ -96,6 +96,8 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
 pub struct FullVmInfo {
     /// Instance to create
     pub vm: Vm,
+    /// Host where the VM will be spawned
+    pub host: VmHost,
     /// Disk where this VM will be saved on the host
     pub disk: VmHostDisk,
     /// VM template resources
@@ -115,6 +117,7 @@ pub struct FullVmInfo {
 impl FullVmInfo {
     pub async fn load(vm_id: u64, db: Arc<dyn LNVpsDb>) -> Result<Self> {
         let vm = db.get_vm(vm_id).await?;
+        let host = db.get_host(vm.host_id).await?;
         let image = db.get_os_image(vm.image_id).await?;
         let disk = db.get_host_disk(vm.disk_id).await?;
         let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
@@ -141,6 +144,7 @@ impl FullVmInfo {
         // create VM
         Ok(FullVmInfo {
             vm,
+            host,
             template,
             custom_template,
             image,

@@ -39,19 +39,8 @@ impl ProxmoxClient {
         config: QemuConfig,
         ssh: Option<SshConfig>,
     ) -> Self {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            format!("PVEAPIToken={}", token).parse().unwrap(),
-        );
-        let client = ClientBuilder::new()
-            .danger_accept_invalid_certs(true)
-            .default_headers(headers)
-            .build()
-            .expect("Failed to build client");
-
         Self {
-            api: JsonApi { base, client },
+            api: JsonApi::token(base.as_str(), &format!("PVEAPIToken={}", token), true).unwrap(),
             config,
             ssh,
             node: node.to_string(),
@@ -251,7 +240,7 @@ impl ProxmoxClient {
         if let Some(ssh_config) = &self.ssh {
             let mut ses = SshClient::new()?;
             ses.connect(
-                (self.api.base.host().unwrap().to_string(), 22),
+                (self.api.base().host().unwrap().to_string(), 22),
                 &ssh_config.user,
                 &ssh_config.key,
             )
@@ -429,7 +418,7 @@ impl ProxmoxClient {
             format!("virtio={}", value.vm.mac_address),
             format!("bridge={}", self.config.bridge),
         ];
-        if let Some(t) = self.config.vlan {
+        if let Some(t) = value.host.vlan_id {
             net.push(format!("tag={}", t));
         }
 
@@ -864,6 +853,7 @@ pub enum StorageContent {
     ISO,
     VZTmpL,
     Import,
+    Snippets,
 }
 
 impl FromStr for StorageContent {
@@ -877,6 +867,7 @@ impl FromStr for StorageContent {
             "iso" => Ok(StorageContent::ISO),
             "vztmpl" => Ok(StorageContent::VZTmpL),
             "import" => Ok(StorageContent::Import),
+            "snippets" => Ok(StorageContent::Snippets),
             _ => Err(()),
         }
     }
@@ -896,7 +887,7 @@ impl NodeStorage {
     pub fn contents(&self) -> Vec<StorageContent> {
         self.content
             .split(",")
-            .map_while(|s| s.parse().ok())
+            .map_while(|s| StorageContent::from_str(&s).ok())
             .collect()
     }
 }
@@ -1076,7 +1067,8 @@ mod tests {
     use super::*;
     use crate::{GB, MB, TB};
     use lnvps_db::{
-        DiskInterface, IpRange, OsDistribution, UserSshKey, VmHostDisk, VmIpAssignment, VmTemplate,
+        DiskInterface, IpRange, OsDistribution, UserSshKey, VmHost, VmHostDisk, VmIpAssignment,
+        VmTemplate,
     };
 
     #[test]
@@ -1110,6 +1102,21 @@ mod tests {
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 deleted: false,
                 ref_code: None,
+            },
+            host: VmHost {
+                id: 1,
+                kind: Default::default(),
+                region_id: 1,
+                name: "mock".to_string(),
+                ip: "https://localhost:8006".to_string(),
+                cpu: 20,
+                memory: 128 * GB,
+                enabled: true,
+                api_token: "mock".to_string(),
+                load_cpu: 1.0,
+                load_memory: 1.0,
+                load_disk: 1.0,
+                vlan_id: Some(100),
             },
             disk: VmHostDisk {
                 id: 1,
@@ -1191,7 +1198,6 @@ mod tests {
             os_type: "l26".to_string(),
             bridge: "vmbr1".to_string(),
             cpu: "kvm64".to_string(),
-            vlan: Some(100),
             kvm: true,
         };
 
@@ -1209,6 +1215,7 @@ mod tests {
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
         assert_eq!(vm.on_boot, Some(true));
+        assert!(vm.net.unwrap().contains("tag=100"));
         assert_eq!(
             vm.ip_config,
             Some(

@@ -136,8 +136,6 @@ pub struct QemuConfig {
     pub bridge: String,
     /// CPU type
     pub cpu: String,
-    /// VLAN tag all spawned VM's
-    pub vlan: Option<u16>,
     /// Enable virtualization inside VM
     pub kvm: bool,
 }
@@ -211,7 +209,6 @@ pub fn mock_settings() -> Settings {
                 os_type: "l26".to_string(),
                 bridge: "vmbr1".to_string(),
                 cpu: "kvm64".to_string(),
-                vlan: None,
                 kvm: false,
             },
             ssh: None,

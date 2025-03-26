@@ -137,6 +137,7 @@ impl Default for MockDb {
                 load_cpu: 1.5,
                 load_memory: 2.0,
                 load_disk: 3.0,
+                vlan_id: Some(100)
             },
         );
         let mut host_disks = HashMap::new();
@@ -639,6 +640,10 @@ impl MockRouter {
 }
 #[async_trait]
 impl Router for MockRouter {
+    async fn generate_mac(&self, ip: &str, comment: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     async fn list_arp_entry(&self) -> anyhow::Result<Vec<ArpEntry>> {
         let arp = self.arp.lock().await;
         Ok(arp.values().cloned().collect())

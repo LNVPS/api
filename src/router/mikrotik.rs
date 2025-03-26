@@ -26,6 +26,11 @@ impl MikrotikRouter {
 
 #[async_trait]
 impl Router for MikrotikRouter {
+    async fn generate_mac(&self, _ip: &str, _comment: &str) -> Result<Option<ArpEntry>> {
+        // Mikrotik router doesn't care what MAC address you use
+        Ok(None)
+    }
+
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
         let rsp: Vec<MikrotikArpEntry> = self.api.req(Method::GET, "/rest/ip/arp", ()).await?;
         Ok(rsp.into_iter().map(|e| e.into()).collect())
@@ -64,7 +69,7 @@ impl Router for MikrotikRouter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MikrotikArpEntry {
+struct MikrotikArpEntry {
     #[serde(rename = ".id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,

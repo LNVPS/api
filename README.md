@@ -13,6 +13,9 @@ A bitcoin powered VPS system.
     - [RevolutPay](https://www.revolut.com/business/revolut-pay/)
 - VM Backend:
   - Proxmox
+- Router:
+  - Mikrotik
+  - OVH dedicated server virtual mac
 
 ## Required Config
 
@@ -47,15 +50,7 @@ provisioner:
       os-type: "l26"
       bridge: "vmbr0"
       cpu: "kvm64"
-      vlan: 100
       kvm: false
-
-# Networking policy
-network-policy:
-  # Configure network equipment on provisioning IP resources
-  access: "auto"
-  # Use SLAAC to auto-configure VM ipv6 addresses
-  ip6-slaac: true
 ```
 
 ### Email notifications
@@ -93,30 +88,7 @@ nostr:
 
 ### Network Setup (Advanced)
 
-When ARP is disabled (reply-only) on your router you may need to create static ARP entries when allocating
-IPs, we support managing ARP entries on routers directly as part of the provisioning process.
-
-```yaml
-# (Optional) 
-# When allocating IPs for VM's it may be necessary to create static ARP entries on 
-# your router, at least one router can be configured
-#
-# Currently supports: Mikrotik
-router:
-  mikrotik:
-    # !! MAKE SURE TO USE HTTPS !!
-    url: "https://my-router.net"
-    username: "admin"
-    password: "admin"
-network-policy:
-  # How packets get to the VM 
-  # (default "auto", nothing to do, packets will always arrive)
-  access:
-    # Static ARP entries are added to the router for each provisioned IP
-    static-arp:
-      # Interface where the static ARP entry is added
-      interface: "bridge1"
-```
+**TODO:** AccessPolicy is now managed in the database
 
 ### DNS (PTR/A/AAAA)
 
@@ -124,8 +96,6 @@ To create PTR records automatically use the following config:
 ```yaml
 dns:
   cloudflare:
-    # The zone containing the reverse domain (eg. X.Y.Z.in-addr.arpa)
-    reverse-zone-id: "my-reverse-zone-id"
     # The zone where forward (A/AAAA) entries are added (eg. lnvps.cloud zone)
     # We create forward entries with the format vm-<vmid>.lnvps.cloud
     forward-zone-id: "my-forward-zone-id"

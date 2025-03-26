@@ -6,14 +6,14 @@ use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::provisioner::{
     CostResult, HostCapacityService, NetworkProvisioner, PricingEngine, ProvisionerMethod,
 };
-use crate::router::{ArpEntry, MikrotikRouter, Router};
+use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
 use isocountry::CountryCode;
 use lnvps_db::{
     AccessPolicy, LNVpsDb, NetworkAccessPolicy, PaymentMethod, RouterKind, Vm, VmCustomTemplate,
-    VmIpAssignment, VmPayment,
+    VmHost, VmIpAssignment, VmPayment,
 };
 use log::{info, warn};
 use nostr::util::hex;
@@ -72,6 +72,9 @@ impl LNVpsProvisioner {
                 );
                 Ok(Arc::new(MikrotikRouter::new(&cfg.url, username, password)))
             }
+            RouterKind::OvhAdditionalIp => Ok(Arc::new(
+                OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, &cfg.token).await?,
+            )),
         }
     }
 
@@ -91,17 +94,7 @@ impl LNVpsProvisioner {
                 )
                 .await?;
             let vm = self.db.get_vm(assignment.vm_id).await?;
-            let entry = ArpEntry::new(
-                &vm,
-                assignment,
-                Some(
-                    policy
-                        .interface
-                        .as_ref()
-                        .context("Cannot apply static arp entry without an interface name")?
-                        .clone(),
-                ),
-            )?;
+            let entry = ArpEntry::new(&vm, assignment, policy.interface.clone())?;
             let arp = if let Some(_id) = &assignment.arp_ref {
                 router.update_arp_entry(&entry).await?
             } else {
@@ -247,8 +240,43 @@ impl LNVpsProvisioner {
         Ok(())
     }
 
+    async fn get_mac_for_assignment(
+        &self,
+        host: &VmHost,
+        vm: &Vm,
+        assignment: &VmIpAssignment,
+    ) -> Result<ArpEntry> {
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+
+        // ask router first if it wants to set the MAC
+        if let Some(ap) = range.access_policy_id {
+            let ap = self.db.get_access_policy(ap).await?;
+            if let Some(rid) = ap.router_id {
+                let router = self.get_router(rid).await?;
+
+                if let Some(mac) = router
+                    .generate_mac(&assignment.ip, &format!("VM{}", assignment.vm_id))
+                    .await?
+                {
+                    return Ok(mac);
+                }
+            }
+        }
+
+        // ask the host next to generate the mac
+        let client = get_host_client(host, &self.provisioner_config)?;
+        let mac = client.generate_mac(vm).await?;
+        Ok(ArpEntry {
+            id: None,
+            address: assignment.ip.clone(),
+            mac_address: mac,
+            interface: None,
+            comment: None,
+        })
+    }
+
     async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        let vm = self.db.get_vm(vm_id).await?;
+        let mut vm = self.db.get_vm(vm_id).await?;
         let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
         if !existing_ips.is_empty() {
             return Ok(existing_ips);
@@ -260,19 +288,20 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
         let ip = network.pick_ip_for_region(host.region_id).await?;
         let mut assignment = VmIpAssignment {
-            id: 0,
             vm_id,
             ip_range_id: ip.range_id,
             ip: ip.ip.to_string(),
-            deleted: false,
-            arp_ref: None,
-            dns_forward: None,
-            dns_forward_ref: None,
-            dns_reverse: None,
-            dns_reverse_ref: None,
+            ..Default::default()
         };
 
+        //generate mac address from ip assignment
+        let mac = self.get_mac_for_assignment(&host, &vm, &assignment).await?;
+        vm.mac_address = mac.mac_address;
+        assignment.arp_ref = mac.id; // store ref if we got one
+        self.db.update_vm(&vm).await?;
+
         self.save_ip_assignment(&mut assignment).await?;
+
         Ok(vec![assignment])
     }
 
@@ -329,7 +358,6 @@ impl LNVpsProvisioner {
             bail!("No host disk found")
         };
 
-        let client = get_host_client(&host.host, &self.provisioner_config)?;
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -341,13 +369,10 @@ impl LNVpsProvisioner {
             created: Utc::now(),
             expires: Utc::now(),
             disk_id: pick_disk.disk.id,
-            mac_address: "NOT FILLED YET".to_string(),
+            mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code,
         };
-
-        // ask host client to generate the mac address
-        new_vm.mac_address = client.generate_mac(&new_vm).await?;
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
@@ -387,7 +412,6 @@ impl LNVpsProvisioner {
         // insert custom templates
         let template_id = self.db.insert_custom_vm_template(&template).await?;
 
-        let client = get_host_client(&host.host, &self.provisioner_config)?;
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -399,13 +423,10 @@ impl LNVpsProvisioner {
             created: Utc::now(),
             expires: Utc::now(),
             disk_id: pick_disk.disk.id,
-            mac_address: "NOT FILLED YET".to_string(),
+            mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code,
         };
-
-        // ask host client to generate the mac address
-        new_vm.mac_address = client.generate_mac(&new_vm).await?;
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;

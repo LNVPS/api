@@ -1,4 +1,8 @@
-use crate::{AccessPolicy, IpRange, LNVpsDb, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
+use crate::{
+    AccessPolicy, IpRange, LNVpsDb, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment,
+    VmOsImage, VmPayment, VmTemplate,
+};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, Row};
@@ -318,13 +322,14 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> Result<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=? where id=?",
+            "update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=? where id=?",
         )
         .bind(vm.image_id)
         .bind(vm.template_id)
         .bind(vm.ssh_key_id)
         .bind(vm.expires)
         .bind(vm.disk_id)
+        .bind(&vm.mac_address)
         .bind(vm.id)
         .execute(&self.db)
         .await

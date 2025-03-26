@@ -1,11 +1,12 @@
 use crate::exchange::{Currency, CurrencyAmount};
 use crate::fiat::{FiatPaymentInfo, FiatPaymentService};
-use crate::json_api::JsonApi;
+use crate::json_api::{JsonApi, TokenGen};
 use crate::settings::RevolutConfig;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
+use nostr::Url;
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION};
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -15,22 +16,36 @@ pub struct RevolutApi {
     api: JsonApi,
 }
 
+#[derive(Clone)]
+struct RevolutTokenGen {
+    pub token: String,
+    pub api_version: String,
+}
+
+impl TokenGen for RevolutTokenGen {
+    fn generate_token(
+        &self,
+        _method: Method,
+        _url: &Url,
+        _body: Option<&str>,
+        req: RequestBuilder,
+    ) -> Result<RequestBuilder> {
+        Ok(req
+            .header(AUTHORIZATION, format!("Bearer {}", &self.token))
+            .header("Revolut-Api-Version", &self.api_version))
+    }
+}
+
 impl RevolutApi {
     pub fn new(config: RevolutConfig) -> Result<Self> {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, format!("Bearer {}", config.token).parse()?);
-        headers.insert(ACCEPT, "application/json".parse()?);
-        headers.insert("Revolut-Api-Version", config.api_version.parse()?);
+        let gen = RevolutTokenGen {
+            token: config.token,
+            api_version: config.api_version,
+        };
+        const DEFAULT_URL: &str = "https://merchant.revolut.com";
 
-        let client = Client::builder().default_headers(headers).build()?;
         Ok(Self {
-            api: JsonApi {
-                client,
-                base: config
-                    .url
-                    .unwrap_or("https://merchant.revolut.com".to_string())
-                    .parse()?,
-            },
+            api: JsonApi::token_gen(&config.url.unwrap_or(DEFAULT_URL.to_string()), false, gen)?,
         })
     }
 

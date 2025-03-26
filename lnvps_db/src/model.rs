@@ -86,6 +86,8 @@ pub struct VmHost {
     pub load_memory: f32,
     /// Disk load factor
     pub load_disk: f32,
+    /// VLAN id assigned to all vms on the host
+    pub vlan_id: Option<u64>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -220,7 +222,10 @@ pub struct Router {
 #[derive(Debug, Clone, sqlx::Type)]
 #[repr(u16)]
 pub enum RouterKind {
+    /// Mikrotik router (JSON-Api)
     Mikrotik = 0,
+    /// A pseudo-router which allows adding virtual mac addresses to a dedicated server
+    OvhAdditionalIp = 1,
 }
 
 #[derive(FromRow, Clone, Debug)]
