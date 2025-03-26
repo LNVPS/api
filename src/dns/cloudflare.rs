@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsServer, RecordType};
+use crate::dns::{BasicRecord, DnsServer};
 use crate::json_api::JsonApi;
 use anyhow::Context;
 use lnvps_db::async_trait;
@@ -7,12 +7,10 @@ use serde::{Deserialize, Serialize};
 
 pub struct Cloudflare {
     api: JsonApi,
-    reverse_zone_id: String,
-    forward_zone_id: String,
 }
 
 impl Cloudflare {
-    pub fn new(token: &str, reverse_zone_id: &str, forward_zone_id: &str) -> Cloudflare {
+    pub fn new(token: &str) -> Cloudflare {
         Self {
             api: JsonApi::token(
                 "https://api.cloudflare.com",
@@ -20,8 +18,6 @@ impl Cloudflare {
                 false,
             )
             .unwrap(),
-            reverse_zone_id: reverse_zone_id.to_owned(),
-            forward_zone_id: forward_zone_id.to_owned(),
         }
     }
 
@@ -45,11 +41,7 @@ impl Cloudflare {
 
 #[async_trait]
 impl DnsServer for Cloudflare {
-    async fn add_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
-        let zone_id = match &record.kind {
-            RecordType::PTR => &self.reverse_zone_id,
-            _ => &self.forward_zone_id,
-        };
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
         info!(
             "Adding record: [{}] {} => {}",
             record.kind, record.name, record.value
@@ -75,11 +67,7 @@ impl DnsServer for Cloudflare {
         })
     }
 
-    async fn delete_record(&self, record: &BasicRecord) -> anyhow::Result<()> {
-        let zone_id = match &record.kind {
-            RecordType::PTR => &self.reverse_zone_id,
-            _ => &self.forward_zone_id,
-        };
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<()> {
         let record_id = record.id.as_ref().context("record id missing")?;
         info!(
             "Deleting record: [{}] {} => {}",
@@ -102,11 +90,11 @@ impl DnsServer for Cloudflare {
         Ok(())
     }
 
-    async fn update_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
-        let zone_id = match &record.kind {
-            RecordType::PTR => &self.reverse_zone_id,
-            _ => &self.forward_zone_id,
-        };
+    async fn update_record(
+        &self,
+        zone_id: &str,
+        record: &BasicRecord,
+    ) -> anyhow::Result<BasicRecord> {
         info!(
             "Updating record: [{}] {} => {}",
             record.kind, record.name, record.value

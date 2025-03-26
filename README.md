@@ -95,12 +95,13 @@ nostr:
 To create PTR records automatically use the following config:
 ```yaml
 dns:
-  cloudflare:
-    # The zone where forward (A/AAAA) entries are added (eg. lnvps.cloud zone)
-    # We create forward entries with the format vm-<vmid>.lnvps.cloud
-    forward-zone-id: "my-forward-zone-id"
-    # API token to add/remove DNS records to this zone
-    token: "my-api-token"
+  # The zone where forward (A/AAAA) entries are added (eg. lnvps.cloud zone)
+  # We create forward entries with the format vm-<vmid>.lnvps.cloud
+  forward-zone-id: "my-forward-zone-id"
+  api:
+    cloudflare:
+      # API token to add/remove DNS records to this zone
+      token: "my-api-token"
 ```
 
 ### Taxes

@@ -137,7 +137,7 @@ impl Default for MockDb {
                 load_cpu: 1.5,
                 load_memory: 2.0,
                 load_disk: 3.0,
-                vlan_id: Some(100)
+                vlan_id: Some(100),
             },
         );
         let mut host_disks = HashMap::new();
@@ -847,8 +847,7 @@ impl VmHostClient for MockVmHost {
 }
 
 pub struct MockDnsServer {
-    pub forward: Arc<Mutex<HashMap<String, MockDnsEntry>>>,
-    pub reverse: Arc<Mutex<HashMap<String, MockDnsEntry>>>,
+    pub zones: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>,
 }
 
 pub struct MockDnsEntry {
@@ -859,22 +858,22 @@ pub struct MockDnsEntry {
 
 impl MockDnsServer {
     pub fn new() -> Self {
-        static LAZY_FWD: LazyLock<Arc<Mutex<HashMap<String, MockDnsEntry>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-        static LAZY_REV: LazyLock<Arc<Mutex<HashMap<String, MockDnsEntry>>>> =
+        static LAZY_ZONES: LazyLock<Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>> =
             LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
         Self {
-            forward: LAZY_FWD.clone(),
-            reverse: LAZY_REV.clone(),
+            zones: LAZY_ZONES.clone(),
         }
     }
 }
 #[async_trait]
 impl DnsServer for MockDnsServer {
-    async fn add_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
-        let mut table = match record.kind {
-            RecordType::PTR => self.reverse.lock().await,
-            _ => self.forward.lock().await,
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+        let mut zones = self.zones.lock().await;
+        let table = if let Some(t) = zones.get_mut(zone_id) {
+            t
+        } else {
+            zones.insert(zone_id.to_string(), HashMap::new());
+            zones.get_mut(zone_id).unwrap()
         };
 
         if table.values().any(|v| v.name == record.name) {
@@ -902,20 +901,30 @@ impl DnsServer for MockDnsServer {
         })
     }
 
-    async fn delete_record(&self, record: &BasicRecord) -> anyhow::Result<()> {
-        let mut table = match record.kind {
-            RecordType::PTR => self.reverse.lock().await,
-            _ => self.forward.lock().await,
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<()> {
+        let mut zones = self.zones.lock().await;
+        let table = if let Some(t) = zones.get_mut(zone_id) {
+            t
+        } else {
+            zones.insert(zone_id.to_string(), HashMap::new());
+            zones.get_mut(zone_id).unwrap()
         };
         ensure!(record.id.is_some(), "Id is missing");
         table.remove(record.id.as_ref().unwrap());
         Ok(())
     }
 
-    async fn update_record(&self, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
-        let mut table = match record.kind {
-            RecordType::PTR => self.reverse.lock().await,
-            _ => self.forward.lock().await,
+    async fn update_record(
+        &self,
+        zone_id: &str,
+        record: &BasicRecord,
+    ) -> anyhow::Result<BasicRecord> {
+        let mut zones = self.zones.lock().await;
+        let table = if let Some(t) = zones.get_mut(zone_id) {
+            t
+        } else {
+            zones.insert(zone_id.to_string(), HashMap::new());
+            zones.get_mut(zone_id).unwrap()
         };
         ensure!(record.id.is_some(), "Id is missing");
         if let Some(mut r) = table.get_mut(record.id.as_ref().unwrap()) {

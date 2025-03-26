@@ -12,13 +12,13 @@ pub use cloudflare::*;
 #[async_trait]
 pub trait DnsServer: Send + Sync {
     /// Add PTR record to the reverse zone
-    async fn add_record(&self, record: &BasicRecord) -> Result<BasicRecord>;
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> Result<BasicRecord>;
 
     /// Delete PTR record from the reverse zone
-    async fn delete_record(&self, record: &BasicRecord) -> Result<()>;
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> Result<()>;
 
     /// Update a record
-    async fn update_record(&self, record: &BasicRecord) -> Result<BasicRecord>;
+    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> Result<BasicRecord>;
 }
 
 #[derive(Clone, Debug)]

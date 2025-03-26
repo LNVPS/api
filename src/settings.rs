@@ -76,29 +76,28 @@ pub struct NostrConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum DnsServerConfig {
+pub struct DnsServerConfig {
+    pub forward_zone_id: String,
+    pub api: DnsServerApi,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DnsServerApi {
     #[serde(rename_all = "kebab-case")]
-    Cloudflare {
-        token: String,
-        forward_zone_id: String,
-        reverse_zone_id: String,
-    },
+    Cloudflare { token: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SmtpConfig {
     /// Admin user id, for sending system notifications
     pub admin: Option<u64>,
-
     /// Email server host:port
     pub server: String,
-
     /// From header to use, otherwise empty
     pub from: Option<String>,
-
     /// Username for SMTP connection
     pub username: String,
-
     /// Password for SMTP connection
     pub password: String,
 }
@@ -168,16 +167,12 @@ impl Settings {
         {
             match &self.dns {
                 None => Ok(None),
-                #[cfg(feature = "cloudflare")]
-                Some(DnsServerConfig::Cloudflare {
-                    token,
-                    forward_zone_id,
-                    reverse_zone_id,
-                }) => Ok(Some(Arc::new(crate::dns::Cloudflare::new(
-                    token,
-                    reverse_zone_id,
-                    forward_zone_id,
-                )))),
+                Some(c) => match &c.api {
+                    #[cfg(feature = "cloudflare")]
+                    DnsServerApi::Cloudflare { token } => {
+                        Ok(Some(Arc::new(crate::dns::Cloudflare::new(token))))
+                    }
+                },
             }
         }
     }
@@ -216,10 +211,11 @@ pub fn mock_settings() -> Settings {
         },
         delete_after: 0,
         smtp: None,
-        dns: Some(DnsServerConfig::Cloudflare {
-            token: "abc".to_string(),
-            forward_zone_id: "123".to_string(),
-            reverse_zone_id: "456".to_string(),
+        dns: Some(DnsServerConfig {
+            forward_zone_id: "mock-forward-zone-id".to_string(),
+            api: DnsServerApi::Cloudflare {
+                token: "abc".to_string(),
+            },
         }),
         nostr: None,
         revolut: None,

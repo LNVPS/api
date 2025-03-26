@@ -36,6 +36,9 @@ pub struct LNVpsProvisioner {
     dns: Option<Arc<dyn DnsServer>>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
 
+    /// Forward zone ID used for all VM's
+    /// passed to the DNSServer type
+    forward_zone_id: Option<String>,
     provisioner_config: ProvisionerConfig,
 }
 
@@ -55,6 +58,7 @@ impl LNVpsProvisioner {
             tax_rates: settings.tax_rate,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
+            forward_zone_id: settings.dns.map(|z| z.forward_zone_id),
         }
     }
 
@@ -149,17 +153,19 @@ impl LNVpsProvisioner {
     pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
         // Delete forward/reverse dns
         if let Some(dns) = &self.dns {
-            if let Some(_r) = &assignment.dns_reverse_ref {
+            let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+
+            if let (Some(z), Some(_ref)) = (&range.reverse_zone_id, &assignment.dns_reverse_ref) {
                 let rev = BasicRecord::reverse(assignment)?;
-                if let Err(e) = dns.delete_record(&rev).await {
+                if let Err(e) = dns.delete_record(z, &rev).await {
                     warn!("Failed to delete reverse record: {}", e);
                 }
                 assignment.dns_reverse_ref = None;
                 assignment.dns_reverse = None;
             }
-            if let Some(_r) = &assignment.dns_forward_ref {
+            if let (Some(z), Some(_ref)) = (&self.forward_zone_id, &assignment.dns_forward_ref) {
                 let rev = BasicRecord::forward(assignment)?;
-                if let Err(e) = dns.delete_record(&rev).await {
+                if let Err(e) = dns.delete_record(z, &rev).await {
                     warn!("Failed to delete forward record: {}", e);
                 }
                 assignment.dns_forward_ref = None;
@@ -171,12 +177,12 @@ impl LNVpsProvisioner {
 
     /// Update DNS on the dns server, does not save to database!
     pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        if let Some(dns) = &self.dns {
+        if let (Some(z), Some(dns)) = (&self.forward_zone_id, &self.dns) {
             let fwd = BasicRecord::forward(assignment)?;
             let ret_fwd = if fwd.id.is_some() {
-                dns.update_record(&fwd).await?
+                dns.update_record(z, &fwd).await?
             } else {
-                dns.add_record(&fwd).await?
+                dns.add_record(z, &fwd).await?
             };
             assignment.dns_forward = Some(ret_fwd.name);
             assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
@@ -187,15 +193,18 @@ impl LNVpsProvisioner {
     /// Update DNS on the dns server, does not save to database!
     pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
         if let Some(dns) = &self.dns {
-            let ret_rev = if assignment.dns_reverse_ref.is_some() {
-                dns.update_record(&BasicRecord::reverse(assignment)?)
-                    .await?
-            } else {
-                dns.add_record(&BasicRecord::reverse_to_fwd(assignment)?)
-                    .await?
-            };
-            assignment.dns_reverse = Some(ret_rev.value);
-            assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
+            let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+            if let Some(z) = &range.reverse_zone_id {
+                let ret_rev = if assignment.dns_reverse_ref.is_some() {
+                    dns.update_record(z, &BasicRecord::reverse(assignment)?)
+                        .await?
+                } else {
+                    dns.add_record(z, &BasicRecord::reverse_to_fwd(assignment)?)
+                        .await?
+                };
+                assignment.dns_reverse = Some(ret_rev.value);
+                assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
+            }
         }
         Ok(())
     }
@@ -636,6 +645,7 @@ mod tests {
             let mut i = db.ip_range.lock().await;
             let r = i.get_mut(&1).unwrap();
             r.access_policy_id = Some(1);
+            r.reverse_zone_id = Some("mock-rev-zone-id".to_string());
         }
 
         let dns = MockDnsServer::new();
@@ -691,14 +701,26 @@ mod tests {
         assert!(!ip.ip.ends_with("/8"));
         assert!(!ip.ip.ends_with("/24"));
 
+        // test zones have dns entries
+        {
+            let zones = dns.zones.lock().await;
+            assert_eq!(zones.get("mock-rev-zone-id").unwrap().len(), 1);
+            assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 1);
+        }
+
         // now expire
         provisioner.delete_vm(vm.id).await?;
 
         // test arp/dns is removed
         let arp = router.list_arp_entry().await?;
         assert!(arp.is_empty());
-        assert_eq!(dns.forward.lock().await.len(), 0);
-        assert_eq!(dns.reverse.lock().await.len(), 0);
+
+        // test dns entries are deleted
+        {
+            let zones = dns.zones.lock().await;
+            assert_eq!(zones.get("mock-rev-zone-id").unwrap().len(), 0);
+            assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 0);
+        }
 
         // ensure IPS are deleted
         let ips = db.ip_assignments.lock().await;
