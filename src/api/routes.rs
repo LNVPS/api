@@ -656,6 +656,7 @@ async fn v1_terminal_proxy(
     id: u64,
     ws: ws::WebSocket,
 ) -> Result<ws::Channel<'static>, &'static str> {
+    return Err("Disabled");
     let auth = Nip98Auth::from_base64(auth).map_err(|e| "Missing or invalid auth param")?;
     if auth
         .check(&format!("/api/v1/vm/{id}/console"), "GET")
