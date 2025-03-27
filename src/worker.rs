@@ -285,6 +285,7 @@ impl Worker {
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
                 for mut host in &mut hosts {
+                    info!("Patching host {}", host.name);
                     let client = match get_host_client(host, &self.settings.provisioner_config) {
                         Ok(h) => h,
                         Err(e) => {

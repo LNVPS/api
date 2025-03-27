@@ -37,37 +37,9 @@ struct Args {
 
 #[rocket::main]
 async fn main() -> Result<(), Error> {
-    let log_level = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "info".to_string())
-        .to_lowercase();
-
-    let max_level = match log_level.as_str() {
-        "trace" => LevelFilter::Trace,
-        "debug" => LevelFilter::Debug,
-        "info" => LevelFilter::Info,
-        "warn" => LevelFilter::Warn,
-        "error" => LevelFilter::Error,
-        "off" => LevelFilter::Off,
-        _ => LevelFilter::Debug,
-    };
+    env_logger::init();
 
     let args = Args::parse();
-    fern::Dispatch::new()
-        .level(max_level)
-        .level_for("rocket", LevelFilter::Error)
-        .chain(fern::log_file(
-            args.log.unwrap_or(PathBuf::from(".")).join("main.log"),
-        )?)
-        .chain(std::io::stdout())
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{}] [{}] {}",
-                Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                message
-            ))
-        })
-        .apply()?;
 
     let settings: Settings = Config::builder()
         .add_source(File::from(
