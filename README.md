@@ -2,7 +2,7 @@
 
 A bitcoin powered VPS system.
 
-## Requirements
+## Features
 
 - MySQL database
 - Payments:
@@ -13,9 +13,11 @@ A bitcoin powered VPS system.
     - [RevolutPay](https://www.revolut.com/business/revolut-pay/)
 - VM Backend:
   - Proxmox
-- Router:
-  - Mikrotik
-  - OVH dedicated server virtual mac
+- Network Resources:
+  - Mikrotik JSON-API
+  - OVH API (dedicated server virtual mac)
+- DNS Resources:
+  - Cloudflare API 
 
 ## Required Config
 
