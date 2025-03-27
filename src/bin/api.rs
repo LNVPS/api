@@ -158,6 +158,9 @@ async fn main() -> Result<(), Error> {
         start_dvms(nostr_client.clone(), provisioner.clone());
     }
 
+    // request for host info to be patched
+    sender.send(WorkJob::PatchHosts)?;
+
     let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,

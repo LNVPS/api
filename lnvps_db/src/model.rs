@@ -121,6 +121,15 @@ impl FromStr for DiskType {
     }
 }
 
+impl Display for DiskType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskType::HDD => write!(f, "hdd"),
+            DiskType::SSD => write!(f, "ssd"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DiskInterface {
@@ -139,6 +148,16 @@ impl FromStr for DiskInterface {
             "scsi" => Ok(DiskInterface::SCSI),
             "pcie" => Ok(DiskInterface::PCIe),
             _ => Err(anyhow!("unknown disk interface {}", s)),
+        }
+    }
+}
+
+impl Display for DiskInterface {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskInterface::SATA => write!(f, "sata"),
+            DiskInterface::SCSI => write!(f, "scsi"),
+            DiskInterface::PCIe => write!(f, "pcie"),
         }
     }
 }

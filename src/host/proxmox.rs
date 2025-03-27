@@ -1,4 +1,7 @@
-use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient};
+use crate::host::{
+    FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
+    VmHostInfo,
+};
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
@@ -82,6 +85,14 @@ impl ProxmoxClient {
         let rsp: ResponseBase<Vec<NodeStorage>> = self
             .api
             .get(&format!("/api2/json/nodes/{node}/storage"))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    pub async fn list_disks(&self, node: &str) -> Result<Vec<NodeDisk>> {
+        let rsp: ResponseBase<Vec<NodeDisk>> = self
+            .api
+            .get(&format!("/api2/json/nodes/{node}/disks/list"))
             .await?;
         Ok(rsp.data)
     }
@@ -477,6 +488,29 @@ impl ProxmoxClient {
 
 #[async_trait]
 impl VmHostClient for ProxmoxClient {
+    async fn get_info(&self) -> Result<VmHostInfo> {
+        let nodes = self.list_nodes().await?;
+        if let Some(n) = nodes.iter().find(|n| n.name == self.node) {
+            let storages = self.list_storage(&n.name).await?;
+            let info = VmHostInfo {
+                cpu: n.max_cpu.unwrap_or(0),
+                memory: n.max_mem.unwrap_or(0),
+                disks: storages
+                    .into_iter()
+                    .map(|s| VmHostDiskInfo {
+                        name: s.storage,
+                        size: s.total.unwrap_or(0),
+                        used: s.used.unwrap_or(0),
+                    })
+                    .collect(),
+            };
+
+            Ok(info)
+        } else {
+            bail!("Could not find node {}", self.node);
+        }
+    }
+
     async fn download_os_image(&self, image: &VmOsImage) -> Result<()> {
         let iso_storage = self.get_iso_storage(&self.node).await?;
         let files = self.list_storage_files(&self.node, &iso_storage).await?;
@@ -878,9 +912,14 @@ pub struct NodeStorage {
     pub content: String,
     pub storage: String,
     #[serde(rename = "type")]
-    pub kind: Option<StorageType>,
-    #[serde(rename = "thinpool")]
-    pub thin_pool: Option<String>,
+    pub kind: StorageType,
+    /// Available storage space in bytes
+    #[serde(rename = "avial")]
+    pub available: Option<u64>,
+    /// Total storage space in bytes
+    pub total: Option<u64>,
+    /// Used storage space in bytes
+    pub used: Option<u64>,
 }
 
 impl NodeStorage {
@@ -891,6 +930,11 @@ impl NodeStorage {
             .collect()
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct NodeDisk {
+}
+
 #[derive(Debug, Serialize)]
 pub struct DownloadUrlRequest {
     pub content: StorageContent,

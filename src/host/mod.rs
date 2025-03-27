@@ -25,6 +25,8 @@ pub struct TerminalStream {
 /// Generic type for creating VM's
 #[async_trait]
 pub trait VmHostClient: Send + Sync {
+    async fn get_info(&self) -> Result<VmHostInfo>;
+
     /// Download OS image to the host
     async fn download_os_image(&self, image: &VmOsImage) -> Result<()>;
 
@@ -201,4 +203,18 @@ pub enum TimeSeries {
     Weekly,
     Monthly,
     Yearly,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmHostInfo {
+    pub cpu: u16,
+    pub memory: u64,
+    pub disks: Vec<VmHostDiskInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmHostDiskInfo {
+    pub name: String,
+    pub size: u64,
+    pub used: u64,
 }

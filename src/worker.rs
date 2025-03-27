@@ -18,6 +18,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug)]
 pub enum WorkJob {
+    /// Sync resources from hosts to database
+    PatchHosts,
     /// Check all running VMS
     CheckVms,
     /// Check the VM status matches database state
@@ -278,44 +280,90 @@ impl Worker {
         Ok(())
     }
 
+    async fn try_job(&mut self, job: &WorkJob) -> Result<()> {
+        match job {
+            WorkJob::PatchHosts => {
+                let mut hosts = self.db.list_hosts().await?;
+                for mut host in &mut hosts {
+                    let client = match get_host_client(host, &self.settings.provisioner_config) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!("Failed to get host client: {} {}", host.name, e);
+                            continue;
+                        }
+                    };
+                    let info = client.get_info().await?;
+                    let needs_update = info.cpu != host.cpu || info.memory != host.memory;
+                    if needs_update {
+                        host.cpu = info.cpu;
+                        host.memory = info.memory;
+                        self.db.update_host(host).await?;
+                        info!(
+                            "Updated host {}: cpu={}, memory={}",
+                            host.name, host.cpu, host.memory
+                        );
+                    }
+
+                    let mut host_disks = self.db.list_host_disks(host.id).await?;
+                    for disk in &info.disks {
+                        if let Some(mut hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
+                            if hd.size != disk.size {
+                                hd.size = disk.size;
+                                self.db.update_host_disk(hd).await?;
+                                info!(
+                                    "Updated host disk {}: size={},type={},interface={}",
+                                    hd.name, hd.size, hd.kind, hd.interface
+                                );
+                            }
+                        } else {
+                            warn!("Un-mapped host disk {}", disk.name);
+                        }
+                    }
+                }
+            }
+            WorkJob::CheckVm { vm_id } => {
+                let vm = self.db.get_vm(*vm_id).await?;
+                if let Err(e) = self.check_vm(&vm).await {
+                    error!("Failed to check VM {}: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to check VM {}:\n{:?}\n{}", vm_id, &job, e),
+                        Some("Job Failed".to_string()),
+                    )?
+                }
+            }
+            WorkJob::SendNotification {
+                user_id,
+                message,
+                title,
+            } => {
+                if let Err(e) = self
+                    .send_notification(*user_id, message.clone(), title.clone())
+                    .await
+                {
+                    error!("Failed to send notification {}: {}", user_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to send notification:\n{:?}\n{}", &job, e),
+                        Some("Job Failed".to_string()),
+                    )?
+                }
+            }
+            WorkJob::CheckVms => {
+                if let Err(e) = self.check_vms().await {
+                    error!("Failed to check VMs: {}", e);
+                    self.queue_admin_notification(
+                        format!("Failed to check VM's:\n{:?}\n{}", &job, e),
+                        Some("Job Failed".to_string()),
+                    )?
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn handle(&mut self) -> Result<()> {
         while let Some(job) = self.rx.recv().await {
-            match &job {
-                WorkJob::CheckVm { vm_id } => {
-                    let vm = self.db.get_vm(*vm_id).await?;
-                    if let Err(e) = self.check_vm(&vm).await {
-                        error!("Failed to check VM {}: {}", vm_id, e);
-                        self.queue_admin_notification(
-                            format!("Failed to check VM {}:\n{:?}\n{}", vm_id, &job, e),
-                            Some("Job Failed".to_string()),
-                        )?
-                    }
-                }
-                WorkJob::SendNotification {
-                    user_id,
-                    message,
-                    title,
-                } => {
-                    if let Err(e) = self
-                        .send_notification(*user_id, message.clone(), title.clone())
-                        .await
-                    {
-                        error!("Failed to send notification {}: {}", user_id, e);
-                        self.queue_admin_notification(
-                            format!("Failed to send notification:\n{:?}\n{}", &job, e),
-                            Some("Job Failed".to_string()),
-                        )?
-                    }
-                }
-                WorkJob::CheckVms => {
-                    if let Err(e) = self.check_vms().await {
-                        error!("Failed to check VMs: {}", e);
-                        self.queue_admin_notification(
-                            format!("Failed to check VM's:\n{:?}\n{}", &job, e),
-                            Some("Job Failed".to_string()),
-                        )?
-                    }
-                }
+            if let Err(e) = self.try_job(&job).await {
+                error!("Job failed to execute: {:?} {}", job, e);
             }
         }
         Ok(())

@@ -62,13 +62,13 @@ impl LNVpsDb for LNVpsDbMysql {
         sqlx::query(
             "update users set email=?, contact_nip17=?, contact_email=?, country_code=? where id = ?",
         )
-        .bind(&user.email)
-        .bind(user.contact_nip17)
-        .bind(user.contact_email)
+            .bind(&user.email)
+            .bind(user.contact_nip17)
+            .bind(user.contact_email)
             .bind(&user.country_code)
-        .bind(user.id)
-        .execute(&self.db)
-        .await?;
+            .bind(user.id)
+            .execute(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -80,13 +80,13 @@ impl LNVpsDb for LNVpsDbMysql {
         Ok(sqlx::query(
             "insert into user_ssh_key(name,user_id,key_data) values(?, ?, ?) returning id",
         )
-        .bind(&new_key.name)
-        .bind(new_key.user_id)
-        .bind(&new_key.key_data)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?
-        .try_get(0)?)
+            .bind(&new_key.name)
+            .bind(new_key.user_id)
+            .bind(&new_key.key_data)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
     }
 
     async fn get_user_ssh_key(&self, id: u64) -> Result<UserSshKey> {
@@ -172,6 +172,18 @@ impl LNVpsDb for LNVpsDbMysql {
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
+    }
+
+    async fn update_host_disk(&self, disk: &VmHostDisk) -> Result<()> {
+        sqlx::query("update vm_host_disk set size=?,kind=?,interface=? where id=?")
+            .bind(disk.size)
+            .bind(disk.kind)
+            .bind(disk.interface)
+            .bind(disk.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
     }
 
     async fn get_os_image(&self, id: u64) -> Result<VmOsImage> {
@@ -324,16 +336,16 @@ impl LNVpsDb for LNVpsDbMysql {
         sqlx::query(
             "update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=? where id=?",
         )
-        .bind(vm.image_id)
-        .bind(vm.template_id)
-        .bind(vm.ssh_key_id)
-        .bind(vm.expires)
-        .bind(vm.disk_id)
-        .bind(&vm.mac_address)
-        .bind(vm.id)
-        .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+            .bind(vm.image_id)
+            .bind(vm.template_id)
+            .bind(vm.ssh_key_id)
+            .bind(vm.expires)
+            .bind(vm.disk_id)
+            .bind(&vm.mac_address)
+            .bind(vm.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
         Ok(())
     }
 
@@ -341,18 +353,18 @@ impl LNVpsDb for LNVpsDbMysql {
         Ok(sqlx::query(
             "insert into vm_ip_assignment(vm_id,ip_range_id,ip,arp_ref,dns_forward,dns_forward_ref,dns_reverse,dns_reverse_ref) values(?,?,?,?,?,?,?,?) returning id",
         )
-        .bind(ip_assignment.vm_id)
-        .bind(ip_assignment.ip_range_id)
-        .bind(&ip_assignment.ip)
-        .bind(&ip_assignment.arp_ref)
-        .bind(&ip_assignment.dns_forward)
-        .bind(&ip_assignment.dns_forward_ref)
-        .bind(&ip_assignment.dns_reverse)
-        .bind(&ip_assignment.dns_reverse_ref)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?
-        .try_get(0)?)
+            .bind(ip_assignment.vm_id)
+            .bind(ip_assignment.ip_range_id)
+            .bind(&ip_assignment.ip)
+            .bind(&ip_assignment.arp_ref)
+            .bind(&ip_assignment.dns_forward)
+            .bind(&ip_assignment.dns_forward_ref)
+            .bind(&ip_assignment.dns_reverse)
+            .bind(&ip_assignment.dns_reverse_ref)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
     }
 
     async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<()> {
@@ -477,9 +489,9 @@ impl LNVpsDb for LNVpsDbMysql {
         sqlx::query_as(
             "select * from vm_payment where is_paid = true order by created desc limit 1",
         )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(Error::new)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(Error::new)
     }
 
     async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>> {
