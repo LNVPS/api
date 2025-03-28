@@ -163,6 +163,18 @@ impl NetworkProvisioner {
     pub fn parse_mac(mac: &str) -> Result<[u8; 6]> {
         Ok(hex::decode(mac.replace(":", ""))?.as_slice().try_into()?)
     }
+
+    pub fn ipv6_to_ptr(addr: &Ipv6Addr) -> Result<String> {
+        let octets = addr.octets();
+        let mut nibbles = Vec::new();
+        for byte in octets.iter().rev() {
+            let high_nibble = (byte >> 4) & 0x0Fu8;
+            let low_nibble = byte & 0x0F;
+            nibbles.push(format!("{:x}", low_nibble));
+            nibbles.push(format!("{:x}", high_nibble));
+        }
+        Ok(format!("{}.ip6.arpa", nibbles.join(".")))
+    }
 }
 
 #[cfg(test)]

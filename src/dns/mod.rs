@@ -8,6 +8,7 @@ use std::str::FromStr;
 mod cloudflare;
 #[cfg(feature = "cloudflare")]
 pub use cloudflare::*;
+use crate::provisioner::NetworkProvisioner;
 
 #[async_trait]
 pub trait DnsServer: Send + Sync {
@@ -77,7 +78,7 @@ impl BasicRecord {
         Ok(Self {
             name: match addr {
                 IpAddr::V4(i) => i.octets()[3].to_string(),
-                IpAddr::V6(_) => bail!("IPv6 PTR not supported"),
+                IpAddr::V6(i) => NetworkProvisioner::ipv6_to_ptr(&i)?,
             },
             value: fwd,
             id: ip.dns_reverse_ref.clone(),
@@ -98,7 +99,7 @@ impl BasicRecord {
         Ok(Self {
             name: match addr {
                 IpAddr::V4(i) => i.octets()[3].to_string(),
-                IpAddr::V6(_) => bail!("IPv6 PTR not supported"),
+                IpAddr::V6(i) => NetworkProvisioner::ipv6_to_ptr(&i)?,
             },
             value: rev,
             id: ip.dns_reverse_ref.clone(),

@@ -694,6 +694,8 @@ mod tests {
             let r = i.get_mut(&1).unwrap();
             r.access_policy_id = Some(1);
             r.reverse_zone_id = Some("mock-rev-zone-id".to_string());
+            let r = i.get_mut(&2).unwrap();
+            r.reverse_zone_id = Some("mock-v6-rev-zone-id".to_string());
         }
 
         let dns = MockDnsServer::new();
@@ -751,11 +753,27 @@ mod tests {
         assert!(!v4.ip.ends_with("/8"));
         assert!(!v4.ip.ends_with("/24"));
 
+        // lookup v6 ip
+        let v6 = ips.iter().find(|r| r.ip_range_id == 2).unwrap();
+        println!("{:?}", v6);
+        assert_eq!(v6.ip_range_id, 2);
+        assert_eq!(v6.vm_id, vm.id);
+        assert!(v6.dns_forward.is_some());
+        assert!(v6.dns_reverse.is_some());
+        assert!(v6.dns_reverse_ref.is_some());
+        assert!(v6.dns_forward_ref.is_some());
+        assert_eq!(v6.dns_reverse, v6.dns_forward);
+
         // test zones have dns entries
         {
             let zones = dns.zones.lock().await;
             assert_eq!(zones.get("mock-rev-zone-id").unwrap().len(), 1);
+            assert_eq!(zones.get("mock-v6-rev-zone-id").unwrap().len(), 1);
             assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 2);
+
+            let v6 = zones.get("mock-v6-rev-zone-id").unwrap().iter().next().unwrap();
+            assert_eq!(v6.1.kind, "PTR");
+            assert!(v6.1.name.ends_with("0.0.d.f.ip6.arpa"));
         }
 
         // now expire
