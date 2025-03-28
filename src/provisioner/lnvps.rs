@@ -3,7 +3,9 @@ use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService};
 use crate::fiat::FiatPaymentService;
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{CostResult, HostCapacityService, NetworkProvisioner, PricingEngine};
+use crate::provisioner::{
+    AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, PricingEngine,
+};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
@@ -284,6 +286,47 @@ impl LNVpsProvisioner {
         })
     }
 
+    pub async fn assign_available_v4_to_vm(
+        &self,
+        vm: &Vm,
+        v4: &AvailableIp,
+    ) -> Result<VmIpAssignment> {
+        let mut assignment = VmIpAssignment {
+            vm_id: vm.id,
+            ip_range_id: v4.range_id,
+            ip: v4.ip.ip().to_string(),
+            ..Default::default()
+        };
+
+        self.save_ip_assignment(&mut assignment).await?;
+        Ok(assignment)
+    }
+
+    pub async fn assign_available_v6_to_vm(
+        &self,
+        vm: &Vm,
+        v6: &mut AvailableIp,
+    ) -> Result<VmIpAssignment> {
+        match v6.mode {
+            // it's a bit awkward, but we need to update the IP AFTER its been picked
+            // simply because sometimes we don't know the MAC of the NIC yet
+            IpRangeAllocationMode::SlaacEui64 => {
+                let mac = NetworkProvisioner::parse_mac(&vm.mac_address)?;
+                let addr = NetworkProvisioner::calculate_eui64(&mac, &v6.ip)?;
+                v6.ip = IpNetwork::new(addr, v6.ip.prefix())?;
+            }
+            _ => {}
+        }
+        let mut assignment = VmIpAssignment {
+            vm_id: vm.id,
+            ip_range_id: v6.range_id,
+            ip: v6.ip.ip().to_string(),
+            ..Default::default()
+        };
+        self.save_ip_assignment(&mut assignment).await?;
+        Ok(assignment)
+    }
+
     async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
         let mut vm = self.db.get_vm(vm_id).await?;
         let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
@@ -299,12 +342,7 @@ impl LNVpsProvisioner {
         let mut assignments = vec![];
         match ip.ip4 {
             Some(v4) => {
-                let mut assignment = VmIpAssignment {
-                    vm_id,
-                    ip_range_id: v4.range_id,
-                    ip: v4.ip.ip().to_string(),
-                    ..Default::default()
-                };
+                let mut assignment = self.assign_available_v4_to_vm(&vm, &v4).await?;
 
                 //generate mac address from ip assignment
                 let mac = self.get_mac_for_assignment(&host, &vm, &assignment).await?;
@@ -312,33 +350,13 @@ impl LNVpsProvisioner {
                 assignment.arp_ref = mac.id; // store ref if we got one
                 self.db.update_vm(&vm).await?;
 
-                self.save_ip_assignment(&mut assignment).await?;
                 assignments.push(assignment);
             }
+            /// TODO: add expected number of IPS per templates
             None => bail!("Cannot provision VM without an IPv4 address"),
         }
-        match ip.ip6 {
-            Some(mut v6) => {
-                match v6.mode {
-                    // it's a bit awkward but we need to update the IP AFTER its been picked
-                    // simply because sometimes we dont know the MAC of the NIC yet
-                    IpRangeAllocationMode::SlaacEui64 => {
-                        let mac = NetworkProvisioner::parse_mac(&vm.mac_address)?;
-                        let addr = NetworkProvisioner::calculate_eui64(&mac, &v6.ip)?;
-                        v6.ip = IpNetwork::new(addr, v6.ip.prefix())?;
-                    }
-                    _ => {}
-                }
-                let mut assignment = VmIpAssignment {
-                    vm_id,
-                    ip_range_id: v6.range_id,
-                    ip: v6.ip.ip().to_string(),
-                    ..Default::default()
-                };
-                self.save_ip_assignment(&mut assignment).await?;
-                assignments.push(assignment);
-            }
-            None => {}
+        if let Some(mut v6) = ip.ip6 {
+            assignments.push(self.assign_available_v6_to_vm(&vm, &mut v6).await?);
         }
 
         Ok(assignments)

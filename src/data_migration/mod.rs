@@ -6,18 +6,23 @@ use log::{error, info};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use crate::data_migration::ip6_init::Ip6InitDataMigration;
+use crate::provisioner::LNVpsProvisioner;
 
 mod dns;
+mod ip6_init;
 
 /// Basic data migration to run at startup
 pub trait DataMigration: Send + Sync {
     fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 }
 
-pub async fn run_data_migrations(db: Arc<dyn LNVpsDb>, settings: &Settings) -> Result<()> {
-    let mut migrations: Vec<Arc<dyn DataMigration>> = vec![];
+pub async fn run_data_migrations(db: Arc<dyn LNVpsDb>, lnvps: Arc<LNVpsProvisioner>, settings: &Settings) -> Result<()> {
+    let mut migrations: Vec<Box<dyn DataMigration>> = vec![];
+    migrations.push(Box::new(Ip6InitDataMigration::new(db.clone(), lnvps.clone())));
+
     if let Some(d) = DnsDataMigration::new(db.clone(), settings) {
-        migrations.push(Arc::new(d));
+        migrations.push(Box::new(d));
     }
 
     info!("Running {} data migrations", migrations.len());

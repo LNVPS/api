@@ -57,9 +57,6 @@ async fn main() -> Result<(), Error> {
     }
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
-    // run data migrations
-    run_data_migrations(db.clone(), &settings).await?;
-
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
         for r in &c.relays {
@@ -77,6 +74,9 @@ async fn main() -> Result<(), Error> {
     let status = VmStateCache::new();
     let provisioner = settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
     provisioner.init().await?;
+
+    // run data migrations
+    run_data_migrations(db.clone(), provisioner.clone(), &settings).await?;
 
     let mut worker = Worker::new(
         db.clone(),
