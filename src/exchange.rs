@@ -15,6 +15,11 @@ pub enum Currency {
     EUR,
     BTC,
     USD,
+    GBP,
+    CAD,
+    CHF,
+    AUD,
+    JPY,
 }
 
 impl Display for Currency {
@@ -23,6 +28,11 @@ impl Display for Currency {
             Currency::EUR => write!(f, "EUR"),
             Currency::BTC => write!(f, "BTC"),
             Currency::USD => write!(f, "USD"),
+            Currency::GBP => write!(f, "GBP"),
+            Currency::CAD => write!(f, "CAD"),
+            Currency::CHF => write!(f, "CHF"),
+            Currency::AUD => write!(f, "AUD"),
+            Currency::JPY => write!(f, "JPY"),
         }
     }
 }
@@ -35,6 +45,11 @@ impl FromStr for Currency {
             "eur" => Ok(Currency::EUR),
             "usd" => Ok(Currency::USD),
             "btc" => Ok(Currency::BTC),
+            "gbp" => Ok(Currency::GBP),
+            "cad" => Ok(Currency::CAD),
+            "chf" => Ok(Currency::CHF),
+            "aud" => Ok(Currency::AUD),
+            "jpy" => Ok(Currency::JPY),
             _ => Err(()),
         }
     }
@@ -72,9 +87,8 @@ impl CurrencyAmount {
         CurrencyAmount(
             currency,
             match currency {
-                Currency::EUR => (amount * 100.0) as u64, // cents
                 Currency::BTC => (amount as f64 * Self::MILLI_SATS) as u64, // milli-sats
-                Currency::USD => (amount * 100.0) as u64, // cents
+                _ => (amount * 100.0) as u64,                               // cents
             },
         )
     }
@@ -85,9 +99,8 @@ impl CurrencyAmount {
 
     pub fn value_f32(&self) -> f32 {
         match self.0 {
-            Currency::EUR => self.1 as f32 / 100.0,
             Currency::BTC => (self.1 as f64 / Self::MILLI_SATS) as f32,
-            Currency::USD => self.1 as f32 / 100.0,
+            _ => self.1 as f32 / 100.0,
         }
     }
 }
@@ -167,6 +180,21 @@ impl ExchangeRateService for DefaultRateCache {
         if let Some(eur) = rates.eur {
             ret.push(TickerRate(Ticker(Currency::BTC, Currency::EUR), eur));
         }
+        if let Some(gbp) = rates.gbp {
+            ret.push(TickerRate(Ticker(Currency::BTC, Currency::GBP), gbp));
+        }
+        if let Some(cad) = rates.cad {
+            ret.push(TickerRate(Ticker(Currency::BTC, Currency::CAD), cad));
+        }
+        if let Some(chf) = rates.chf {
+            ret.push(TickerRate(Ticker(Currency::BTC, Currency::CHF), chf));
+        }
+        if let Some(aud) = rates.aud {
+            ret.push(TickerRate(Ticker(Currency::BTC, Currency::AUD), aud));
+        }
+        if let Some(jpy) = rates.jpy {
+            ret.push(TickerRate(Ticker(Currency::BTC, Currency::JPY), jpy));
+        }
 
         Ok(ret)
     }
@@ -194,6 +222,16 @@ struct MempoolRates {
     pub usd: Option<f32>,
     #[serde(rename = "EUR")]
     pub eur: Option<f32>,
+    #[serde(rename = "CAD")]
+    pub cad: Option<f32>,
+    #[serde(rename = "GBP")]
+    pub gbp: Option<f32>,
+    #[serde(rename = "CHF")]
+    pub chf: Option<f32>,
+    #[serde(rename = "AUD")]
+    pub aud: Option<f32>,
+    #[serde(rename = "JPY")]
+    pub jpy: Option<f32>,
 }
 
 #[cfg(test)]

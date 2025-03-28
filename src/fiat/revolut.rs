@@ -92,8 +92,7 @@ impl RevolutApi {
                     currency: amount.0.to_string(),
                     amount: match amount.0 {
                         Currency::BTC => bail!("Bitcoin amount not allowed for fiat payments"),
-                        Currency::EUR => amount.value(),
-                        Currency::USD => amount.value(),
+                        _ => amount.value(),
                     },
                     description,
                 },
