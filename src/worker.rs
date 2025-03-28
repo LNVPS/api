@@ -2,13 +2,13 @@ use crate::host::get_host_client;
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
-use lnvps_db::{LNVpsDb, Vm};
+use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};
 use nostr::{EventBuilder, PublicKey, ToBech32};
 use nostr_sdk::Client;
@@ -280,45 +280,49 @@ impl Worker {
         Ok(())
     }
 
+    async fn patch_host(&self, host: &mut VmHost) -> Result<()> {
+        let client = match get_host_client(host, &self.settings.provisioner_config) {
+            Ok(h) => h,
+            Err(e) => bail!("Failed to get host client: {} {}", host.name, e),
+        };
+        let info = client.get_info().await?;
+        let needs_update = info.cpu != host.cpu || info.memory != host.memory;
+        if needs_update {
+            host.cpu = info.cpu;
+            host.memory = info.memory;
+            self.db.update_host(host).await?;
+            info!(
+                "Updated host {}: cpu={}, memory={}",
+                host.name, host.cpu, host.memory
+            );
+        }
+
+        let mut host_disks = self.db.list_host_disks(host.id).await?;
+        for disk in &info.disks {
+            if let Some(mut hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
+                if hd.size != disk.size {
+                    hd.size = disk.size;
+                    self.db.update_host_disk(hd).await?;
+                    info!(
+                        "Updated host disk {}: size={},type={},interface={}",
+                        hd.name, hd.size, hd.kind, hd.interface
+                    );
+                }
+            } else {
+                warn!("Un-mapped host disk {}", disk.name);
+            }
+        }
+        Ok(())
+    }
+
     async fn try_job(&mut self, job: &WorkJob) -> Result<()> {
         match job {
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
                 for mut host in &mut hosts {
                     info!("Patching host {}", host.name);
-                    let client = match get_host_client(host, &self.settings.provisioner_config) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            warn!("Failed to get host client: {} {}", host.name, e);
-                            continue;
-                        }
-                    };
-                    let info = client.get_info().await?;
-                    let needs_update = info.cpu != host.cpu || info.memory != host.memory;
-                    if needs_update {
-                        host.cpu = info.cpu;
-                        host.memory = info.memory;
-                        self.db.update_host(host).await?;
-                        info!(
-                            "Updated host {}: cpu={}, memory={}",
-                            host.name, host.cpu, host.memory
-                        );
-                    }
-
-                    let mut host_disks = self.db.list_host_disks(host.id).await?;
-                    for disk in &info.disks {
-                        if let Some(mut hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
-                            if hd.size != disk.size {
-                                hd.size = disk.size;
-                                self.db.update_host_disk(hd).await?;
-                                info!(
-                                    "Updated host disk {}: size={},type={},interface={}",
-                                    hd.name, hd.size, hd.kind, hd.interface
-                                );
-                            }
-                        } else {
-                            warn!("Un-mapped host disk {}", disk.name);
-                        }
+                    if let Err(e) = self.patch_host(&mut host).await {
+                        error!("Failed to patch host {}: {}", host.name, e);
                     }
                 }
             }

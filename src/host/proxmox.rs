@@ -6,7 +6,7 @@ use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use crate::status::{VmRunningState, VmState};
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use ipnetwork::IpNetwork;
@@ -500,14 +500,25 @@ impl VmHostClient for ProxmoxClient {
         if let Some(n) = nodes.iter().find(|n| n.name == self.node) {
             let storages = self.list_storage(&n.name).await?;
             let info = VmHostInfo {
-                cpu: n.max_cpu.unwrap_or(0),
-                memory: n.max_mem.unwrap_or(0),
+                cpu: n.max_cpu
+                    .context("Missing cpu count, please make sure you have Sys.Audit permission")?,
+                memory: n.max_mem
+                    .context("Missing memory size, please make sure you have Sys.Audit permission")?,
                 disks: storages
                     .into_iter()
-                    .map(|s| VmHostDiskInfo {
-                        name: s.storage,
-                        size: s.total.unwrap_or(0),
-                        used: s.used.unwrap_or(0),
+                    .filter_map(|s| {
+                        let size = s.total
+                            .context("Missing disk size, please make sure you have Datastore.Audit permission")
+                            .ok()?;
+                        let used = s.used
+                            .context("Missing used disk, please make sure you have Datastore.Audit permission")
+                            .ok()?;
+
+                        Some(VmHostDiskInfo {
+                            name: s.storage,
+                            size,
+                            used,
+                        })
                     })
                     .collect(),
             };
