@@ -1,6 +1,6 @@
 use crate::json_api::JsonApi;
 use crate::router::{ArpEntry, Router};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use log::debug;
@@ -33,14 +33,14 @@ impl Router for MikrotikRouter {
 
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
         let rsp: Vec<MikrotikArpEntry> = self.api.req(Method::GET, "/rest/ip/arp", ()).await?;
-        Ok(rsp.into_iter().map(|e| e.into()).collect())
+        Ok(rsp.into_iter().map(|e| e.try_into().unwrap()).collect())
     }
 
     async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
         let req: MikrotikArpEntry = entry.clone().into();
         let rsp: MikrotikArpEntry = self.api.req(Method::PUT, "/rest/ip/arp", req).await?;
         debug!("{:?}", rsp);
-        Ok(rsp.into())
+        Ok(rsp.try_into()?)
     }
 
     async fn remove_arp_entry(&self, id: &str) -> Result<()> {
@@ -64,7 +64,7 @@ impl Router for MikrotikRouter {
             )
             .await?;
         debug!("{:?}", rsp);
-        Ok(rsp.into())
+        Ok(rsp.try_into()?)
     }
 }
 
@@ -82,15 +82,17 @@ struct MikrotikArpEntry {
     pub comment: Option<String>,
 }
 
-impl From<MikrotikArpEntry> for ArpEntry {
-    fn from(val: MikrotikArpEntry) -> Self {
-        ArpEntry {
-            id: val.id,
-            address: val.address,
-            mac_address: val.mac_address.unwrap(),
-            interface: Some(val.interface),
-            comment: val.comment,
-        }
+impl TryFrom<MikrotikArpEntry> for ArpEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(value: MikrotikArpEntry) -> std::result::Result<Self, Self::Error> {
+        Ok(ArpEntry {
+            id: value.id,
+            address: value.address,
+            mac_address: value.mac_address.context("Mac address is empty")?,
+            interface: Some(value.interface),
+            comment: value.comment,
+        })
     }
 }
 
