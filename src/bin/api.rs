@@ -1,5 +1,4 @@
 use anyhow::Error;
-use chrono::Utc;
 use clap::Parser;
 use config::{Config, File};
 use lnvps::api;
@@ -13,7 +12,7 @@ use lnvps::settings::Settings;
 use lnvps::status::VmStateCache;
 use lnvps::worker::{WorkJob, Worker};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
-use log::{error, LevelFilter};
+use log::error;
 use nostr::Keys;
 use nostr_sdk::Client;
 use rocket::http::Method;

@@ -1,19 +1,14 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
-use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient};
+use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
-use lnvps_db::{
-    async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, LNVpsDb, OsDistribution, User,
-    UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage,
-    VmPayment, VmTemplate,
-};
+use lnvps_db::{async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb, OsDistribution, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
@@ -117,8 +112,19 @@ impl Default for MockDb {
                 gateway: "10.0.0.1/8".to_string(),
                 enabled: true,
                 region_id: 1,
-                reverse_zone_id: None,
-                access_policy_id: None,
+                ..Default::default()
+            },
+        );
+        ip_ranges.insert(
+            2,
+            IpRange {
+                id: 2,
+                cidr: "fd00::/64".to_string(),
+                gateway: "fd00::1".to_string(),
+                enabled: true,
+                region_id: 1,
+                allocation_mode: IpRangeAllocationMode::SlaacEui64,
+                ..Default::default()
             },
         );
         let mut hosts = HashMap::new();
@@ -324,6 +330,16 @@ impl LNVpsDb for MockDb {
         Ok(disks.get(&disk_id).ok_or(anyhow!("no disk"))?.clone())
     }
 
+    async fn update_host_disk(&self, disk: &VmHostDisk) -> anyhow::Result<()> {
+        let mut disks = self.host_disks.lock().await;
+        if let Some(d) = disks.get_mut(&disk.id) {
+            d.size = disk.size;
+            d.kind = disk.kind;
+            d.interface = disk.interface;
+        }
+        Ok(())
+    }
+
     async fn get_os_image(&self, id: u64) -> anyhow::Result<VmOsImage> {
         let os_images = self.os_images.lock().await;
         Ok(os_images.get(&id).ok_or(anyhow!("no image"))?.clone())
@@ -478,7 +494,7 @@ impl LNVpsDb for MockDb {
 
     async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> anyhow::Result<()> {
         let mut ip_assignments = self.ip_assignments.lock().await;
-        if let Some(i) = ip_assignments.get_mut(&ip_assignment.vm_id) {
+        if let Some(i) = ip_assignments.get_mut(&ip_assignment.id) {
             i.arp_ref = ip_assignment.arp_ref.clone();
             i.dns_forward = ip_assignment.dns_forward.clone();
             i.dns_reverse = ip_assignment.dns_reverse.clone();
@@ -757,6 +773,10 @@ impl MockVmHost {
 
 #[async_trait]
 impl VmHostClient for MockVmHost {
+    async fn get_info(&self) -> anyhow::Result<VmHostInfo> {
+        todo!()
+    }
+
     async fn download_os_image(&self, image: &VmOsImage) -> anyhow::Result<()> {
         Ok(())
     }
@@ -876,7 +896,7 @@ impl DnsServer for MockDnsServer {
             zones.get_mut(zone_id).unwrap()
         };
 
-        if table.values().any(|v| v.name == record.name) {
+        if table.values().any(|v| v.name == record.name && v.kind == record.kind.to_string()) {
             bail!("Duplicate record with name {}", record.name);
         }
 

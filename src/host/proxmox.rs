@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, ensure, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use ipnetwork::IpNetwork;
-use lnvps_db::{async_trait, DiskType, Vm, VmOsImage};
+use lnvps_db::{async_trait, DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
@@ -414,16 +414,23 @@ impl ProxmoxClient {
                                 range_gw.ip()
                             )
                         }
-                        IpAddr::V6(addr) => format!("ip6={}", addr),
+                        IpAddr::V6(addr) => {
+                            let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
+                            if matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64)
+                            {
+                                // just ignore what's in the db and use whatever the host wants
+                                // what's in the db is purely informational
+                                "ip6=auto".to_string()
+                            } else {
+                                format!("ip6={}", addr)
+                            }
+                        }
                     })
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
-
-        // TODO: make this configurable
-        ip_config.push("ip6=auto".to_string());
 
         let mut net = vec![
             format!("virtio={}", value.vm.mac_address),
@@ -932,8 +939,7 @@ impl NodeStorage {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct NodeDisk {
-}
+pub struct NodeDisk {}
 
 #[derive(Debug, Serialize)]
 pub struct DownloadUrlRequest {
@@ -1111,8 +1117,8 @@ mod tests {
     use super::*;
     use crate::{GB, MB, TB};
     use lnvps_db::{
-        DiskInterface, IpRange, OsDistribution, UserSshKey, VmHost, VmHostDisk, VmIpAssignment,
-        VmTemplate,
+        DiskInterface, IpRange, IpRangeAllocationMode, OsDistribution, UserSshKey, VmHost,
+        VmHostDisk, VmIpAssignment, VmTemplate,
     };
 
     #[test]
@@ -1207,6 +1213,18 @@ mod tests {
                     dns_reverse: None,
                     dns_reverse_ref: None,
                 },
+                VmIpAssignment {
+                    id: 3,
+                    vm_id: 1,
+                    ip_range_id: 3,
+                    ip: "fd00::ff:ff:ff:ff:ff".to_string(),
+                    deleted: false,
+                    arp_ref: None,
+                    dns_forward: None,
+                    dns_forward_ref: None,
+                    dns_reverse: None,
+                    dns_reverse_ref: None,
+                },
             ],
             ranges: vec![
                 IpRange {
@@ -1215,8 +1233,7 @@ mod tests {
                     gateway: "192.168.1.1/16".to_string(),
                     enabled: true,
                     region_id: 1,
-                    reverse_zone_id: None,
-                    access_policy_id: None,
+                    ..Default::default()
                 },
                 IpRange {
                     id: 2,
@@ -1224,8 +1241,16 @@ mod tests {
                     gateway: "10.10.10.10".to_string(),
                     enabled: true,
                     region_id: 2,
-                    reverse_zone_id: None,
-                    access_policy_id: None,
+                    ..Default::default()
+                },
+                IpRange {
+                    id: 3,
+                    cidr: "fd00::/64".to_string(),
+                    gateway: "fd00::1".to_string(),
+                    enabled: true,
+                    region_id: 1,
+                    allocation_mode: IpRangeAllocationMode::SlaacEui64,
+                    ..Default::default()
                 },
             ],
             ssh_key: UserSshKey {

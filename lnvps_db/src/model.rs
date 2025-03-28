@@ -247,7 +247,7 @@ pub enum RouterKind {
     OvhAdditionalIp = 1,
 }
 
-#[derive(FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct IpRange {
     pub id: u64,
     pub cidr: String,
@@ -256,6 +256,22 @@ pub struct IpRange {
     pub region_id: u64,
     pub reverse_zone_id: Option<String>,
     pub access_policy_id: Option<u64>,
+    pub allocation_mode: IpRangeAllocationMode,
+    /// Use all IPs in the range, including first and last
+    pub use_full_range: bool,
+}
+
+#[derive(Debug, Clone, sqlx::Type, Default)]
+#[repr(u16)]
+/// How ips are allocated from this range
+pub enum IpRangeAllocationMode {
+    /// IPs are assigned in a random order
+    Random = 0,
+    #[default]
+    /// IPs are assigned in sequential order
+    Sequential = 1,
+    /// IP(v6) assignment uses SLAAC EUI-64
+    SlaacEui64 = 2,
 }
 
 #[derive(FromRow, Clone, Debug)]

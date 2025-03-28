@@ -3,22 +3,22 @@ use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService};
 use crate::fiat::FiatPaymentService;
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{
-    CostResult, HostCapacityService, NetworkProvisioner, PricingEngine, ProvisionerMethod,
-};
+use crate::provisioner::{CostResult, HostCapacityService, NetworkProvisioner, PricingEngine};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
+use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
-    AccessPolicy, LNVpsDb, NetworkAccessPolicy, PaymentMethod, RouterKind, Vm, VmCustomTemplate,
-    VmHost, VmIpAssignment, VmPayment,
+    AccessPolicy, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, RouterKind,
+    Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment,
 };
 use log::{info, warn};
 use nostr::util::hex;
 use std::collections::HashMap;
 use std::ops::Add;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,8 +88,8 @@ impl LNVpsProvisioner {
         assignment: &mut VmIpAssignment,
         policy: &AccessPolicy,
     ) -> Result<()> {
-        // apply network policy
-        if let NetworkAccessPolicy::StaticArp = policy.kind {
+        let ip = IpNetwork::from_str(&assignment.ip)?;
+        if matches!(policy.kind, NetworkAccessPolicy::StaticArp) && ip.is_ipv4() {
             let router = self
                 .get_router(
                     policy
@@ -116,8 +116,8 @@ impl LNVpsProvisioner {
         assignment: &mut VmIpAssignment,
         policy: &AccessPolicy,
     ) -> Result<()> {
-        // Delete access policy
-        if let NetworkAccessPolicy::StaticArp = &policy.kind {
+        let ip = IpNetwork::from_str(&assignment.ip)?;
+        if matches!(policy.kind, NetworkAccessPolicy::StaticArp) && ip.is_ipv4() {
             let router = self
                 .get_router(
                     policy
@@ -292,26 +292,56 @@ impl LNVpsProvisioner {
         }
 
         // Use random network provisioner
-        let network = NetworkProvisioner::new(ProvisionerMethod::Random, self.db.clone());
+        let network = NetworkProvisioner::new(self.db.clone());
 
         let host = self.db.get_host(vm.host_id).await?;
         let ip = network.pick_ip_for_region(host.region_id).await?;
-        let mut assignment = VmIpAssignment {
-            vm_id,
-            ip_range_id: ip.range_id,
-            ip: ip.ip.to_string(),
-            ..Default::default()
-        };
+        let mut assignments = vec![];
+        match ip.ip4 {
+            Some(v4) => {
+                let mut assignment = VmIpAssignment {
+                    vm_id,
+                    ip_range_id: v4.range_id,
+                    ip: v4.ip.ip().to_string(),
+                    ..Default::default()
+                };
 
-        //generate mac address from ip assignment
-        let mac = self.get_mac_for_assignment(&host, &vm, &assignment).await?;
-        vm.mac_address = mac.mac_address;
-        assignment.arp_ref = mac.id; // store ref if we got one
-        self.db.update_vm(&vm).await?;
+                //generate mac address from ip assignment
+                let mac = self.get_mac_for_assignment(&host, &vm, &assignment).await?;
+                vm.mac_address = mac.mac_address;
+                assignment.arp_ref = mac.id; // store ref if we got one
+                self.db.update_vm(&vm).await?;
 
-        self.save_ip_assignment(&mut assignment).await?;
+                self.save_ip_assignment(&mut assignment).await?;
+                assignments.push(assignment);
+            }
+            None => bail!("Cannot provision VM without an IPv4 address"),
+        }
+        match ip.ip6 {
+            Some(mut v6) => {
+                match v6.mode {
+                    // it's a bit awkward but we need to update the IP AFTER its been picked
+                    // simply because sometimes we dont know the MAC of the NIC yet
+                    IpRangeAllocationMode::SlaacEui64 => {
+                        let mac = NetworkProvisioner::parse_mac(&vm.mac_address)?;
+                        let addr = NetworkProvisioner::calculate_eui64(&mac, &v6.ip)?;
+                        v6.ip = IpNetwork::new(addr, v6.ip.prefix())?;
+                    }
+                    _ => {}
+                }
+                let mut assignment = VmIpAssignment {
+                    vm_id,
+                    ip_range_id: v6.range_id,
+                    ip: v6.ip.ip().to_string(),
+                    ..Default::default()
+                };
+                self.save_ip_assignment(&mut assignment).await?;
+                assignments.push(assignment);
+            }
+            None => {}
+        }
 
-        Ok(vec![assignment])
+        Ok(assignments)
     }
 
     /// Do any necessary initialization
@@ -684,28 +714,30 @@ mod tests {
         println!("{:?}", arp);
 
         let ips = db.list_vm_ip_assignments(vm.id).await?;
-        assert_eq!(1, ips.len());
-        let ip = ips.first().unwrap();
-        println!("{:?}", ip);
-        assert_eq!(ip.ip, arp.address);
-        assert_eq!(ip.ip_range_id, 1);
-        assert_eq!(ip.vm_id, vm.id);
-        assert!(ip.dns_forward.is_some());
-        assert!(ip.dns_reverse.is_some());
-        assert!(ip.dns_reverse_ref.is_some());
-        assert!(ip.dns_forward_ref.is_some());
-        assert_eq!(ip.dns_reverse, ip.dns_forward);
+        assert_eq!(2, ips.len());
+
+        // lookup v4 ip
+        let v4 = ips.iter().find(|r| r.ip_range_id == 1).unwrap();
+        println!("{:?}", v4);
+        assert_eq!(v4.ip, arp.address);
+        assert_eq!(v4.ip_range_id, 1);
+        assert_eq!(v4.vm_id, vm.id);
+        assert!(v4.dns_forward.is_some());
+        assert!(v4.dns_reverse.is_some());
+        assert!(v4.dns_reverse_ref.is_some());
+        assert!(v4.dns_forward_ref.is_some());
+        assert_eq!(v4.dns_reverse, v4.dns_forward);
 
         // assert IP address is not CIDR
-        assert!(IpAddr::from_str(&ip.ip).is_ok());
-        assert!(!ip.ip.ends_with("/8"));
-        assert!(!ip.ip.ends_with("/24"));
+        assert!(IpAddr::from_str(&v4.ip).is_ok());
+        assert!(!v4.ip.ends_with("/8"));
+        assert!(!v4.ip.ends_with("/24"));
 
         // test zones have dns entries
         {
             let zones = dns.zones.lock().await;
             assert_eq!(zones.get("mock-rev-zone-id").unwrap().len(), 1);
-            assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 1);
+            assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 2);
         }
 
         // now expire
@@ -723,15 +755,16 @@ mod tests {
         }
 
         // ensure IPS are deleted
-        let ips = db.ip_assignments.lock().await;
-        let ip = ips.values().next().unwrap();
-        assert!(ip.arp_ref.is_none());
-        assert!(ip.dns_forward.is_none());
-        assert!(ip.dns_reverse.is_none());
-        assert!(ip.dns_reverse_ref.is_none());
-        assert!(ip.dns_forward_ref.is_none());
-        assert!(ip.deleted);
-        println!("{:?}", ip);
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        for ip in ips {
+            println!("{:?}", ip);
+            assert!(ip.arp_ref.is_none());
+            assert!(ip.dns_forward.is_none());
+            assert!(ip.dns_reverse.is_none());
+            assert!(ip.dns_reverse_ref.is_none());
+            assert!(ip.dns_forward_ref.is_none());
+            assert!(ip.deleted);
+        }
 
         Ok(())
     }

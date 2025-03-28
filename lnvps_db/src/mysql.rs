@@ -80,13 +80,13 @@ impl LNVpsDb for LNVpsDbMysql {
         Ok(sqlx::query(
             "insert into user_ssh_key(name,user_id,key_data) values(?, ?, ?) returning id",
         )
-            .bind(&new_key.name)
-            .bind(new_key.user_id)
-            .bind(&new_key.key_data)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
-            .try_get(0)?)
+        .bind(&new_key.name)
+        .bind(new_key.user_id)
+        .bind(&new_key.key_data)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::new)?
+        .try_get(0)?)
     }
 
     async fn get_user_ssh_key(&self, id: u64) -> Result<UserSshKey> {
@@ -489,9 +489,9 @@ impl LNVpsDb for LNVpsDbMysql {
         sqlx::query_as(
             "select * from vm_payment where is_paid = true order by created desc limit 1",
         )
-            .fetch_optional(&self.db)
-            .await
-            .map_err(Error::new)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::new)
     }
 
     async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>> {

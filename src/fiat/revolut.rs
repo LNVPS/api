@@ -5,7 +5,7 @@ use crate::settings::RevolutConfig;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use nostr::Url;
-use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION};
+use reqwest::header::AUTHORIZATION;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
