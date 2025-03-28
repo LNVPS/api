@@ -33,7 +33,7 @@ impl Router for MikrotikRouter {
 
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
         let rsp: Vec<MikrotikArpEntry> = self.api.req(Method::GET, "/rest/ip/arp", ()).await?;
-        Ok(rsp.into_iter().map(|e| e.try_into().unwrap()).collect())
+        Ok(rsp.into_iter().filter_map(|e| e.try_into().ok()).collect())
     }
 
     async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
