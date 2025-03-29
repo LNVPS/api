@@ -713,6 +713,7 @@ mod tests {
         // spawn vm
         provisioner.spawn_vm(vm.id).await?;
 
+        let vm = db.get_vm(vm.id).await?;
         // check resources
         let router = MockRouter::new();
         let arp = router.list_arp_entry().await?;

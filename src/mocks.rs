@@ -174,6 +174,7 @@ impl Default for MockDb {
                 enabled: true,
                 release_date: Utc::now(),
                 url: "https://example.com/debian_12.img".to_string(),
+                default_username: None
             },
         );
         Self {
@@ -475,6 +476,7 @@ impl LNVpsDb for MockDb {
         let mut vms = self.vms.lock().await;
         if let Some(v) = vms.get_mut(&vm.id) {
             v.ssh_key_id = vm.ssh_key_id;
+            v.mac_address = vm.mac_address.clone();
         }
         Ok(())
     }
