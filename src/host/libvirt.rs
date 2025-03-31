@@ -75,6 +75,10 @@ impl VmHostClient for LibVirtHost {
         Ok(())
     }
 
+    async fn delete_vm(&self, vm: &Vm) -> Result<()> {
+        todo!()
+    }
+
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()> {
         todo!()
     }
