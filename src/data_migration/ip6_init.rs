@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use chrono::Utc;
 use log::info;
 
 pub struct Ip6InitDataMigration {
@@ -27,6 +28,9 @@ impl DataMigration for Ip6InitDataMigration {
             let net = NetworkProvisioner::new(db.clone());
             let vms = db.list_vms().await?;
             for vm in vms {
+                if vm.expires < Utc::now() {
+                    continue;
+                }
                 let host = db.get_host(vm.host_id).await?;
                 let ips = db.list_vm_ip_assignments(vm.id).await?;
                 // if no ipv6 address is picked already pick one
