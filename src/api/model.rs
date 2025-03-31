@@ -455,6 +455,7 @@ pub struct ApiVmOsImage {
     pub flavour: String,
     pub version: String,
     pub release_date: DateTime<Utc>,
+    pub default_username: Option<String>,
 }
 
 impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
@@ -465,6 +466,7 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
             flavour: image.flavour,
             version: image.version,
             release_date: image.release_date,
+            default_username: image.default_username,
         }
     }
 }

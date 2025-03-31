@@ -12,8 +12,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-//#[cfg(feature = "libvirt")]
-//mod libvirt;
+#[cfg(feature = "libvirt")]
+mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
 
@@ -67,31 +67,28 @@ pub trait VmHostClient: Send + Sync {
 
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
     #[cfg(test)]
-    {
-        Ok(Arc::new(crate::mocks::MockVmHost::new()))
-    }
-    #[cfg(not(test))]
-    {
-        Ok(match (host.kind.clone(), &cfg) {
-            #[cfg(feature = "proxmox")]
-            (
-                VmHostKind::Proxmox,
-                ProvisionerConfig::Proxmox {
-                    qemu,
-                    ssh,
-                    mac_prefix,
-                },
-            ) => Arc::new(proxmox::ProxmoxClient::new(
+    return Ok(Arc::new(crate::mocks::MockVmHost::new()));
+
+    Ok(match host.kind.clone() {
+        #[cfg(feature = "proxmox")]
+        VmHostKind::Proxmox if cfg.proxmox.is_some() => {
+            let cfg = cfg.proxmox.clone().unwrap();
+            Arc::new(proxmox::ProxmoxClient::new(
                 host.ip.parse()?,
                 &host.name,
                 &host.api_token,
-                mac_prefix.clone(),
-                qemu.clone(),
-                ssh.clone(),
-            )),
-            _ => bail!("Unknown host config: {}", host.kind),
-        })
-    }
+                cfg.mac_prefix,
+                cfg.qemu,
+                cfg.ssh,
+            ))
+        }
+        #[cfg(feature = "libvirt")]
+        VmHostKind::LibVirt if cfg.libvirt.is_some() => {
+            let cfg = cfg.libvirt.clone().unwrap();
+            Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg.qemu)?)
+        }
+        _ => bail!("Unknown host config: {}", host.kind),
+    })
 }
 
 /// All VM info necessary to provision a VM and its associated resources

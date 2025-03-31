@@ -4691,8 +4691,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "virt"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a05f77c836efa9be343b5419663cf829d75203b813579993cdd9c44f51767e"
+source = "git+https://gitlab.com/libvirt/libvirt-rust.git#70394aad4d9597c9ff87c0ada6711ed4f9528991"
 dependencies = [
  "libc",
  "uuid",
@@ -4702,8 +4701,7 @@ dependencies = [
 [[package]]
 name = "virt-sys"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c504e459878f09177f41bf2f8bb3e9a8af4fca7a09e73152fee02535d501601c"
+source = "git+https://gitlab.com/libvirt/libvirt-rust.git#70394aad4d9597c9ff87c0ada6711ed4f9528991"
 dependencies = [
  "libc",
  "pkg-config",

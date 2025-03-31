@@ -7,7 +7,17 @@ edition = "2021"
 name = "api"
 
 [features]
-default = ["mikrotik", "nostr-dm", "nostr-dvm", "proxmox", "lnd", "cloudflare", "revolut", "bitvora"]
+default = [
+    "mikrotik",
+    "nostr-dm",
+    "nostr-dvm",
+    "proxmox",
+    "lnd",
+    "cloudflare",
+    "revolut",
+    "bitvora",
+    "libvirt"
+]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk"]
 nostr-dvm = ["dep:nostr-sdk"]
@@ -53,7 +63,7 @@ ssh2 = { version = "0.9.4", optional = true }
 reqwest = { version = "0.12.8", optional = true }
 
 #libvirt
-virt = { version = "0.4.2", optional = true }
+virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
 
 #lnd
 fedimint-tonic-lnd = { version = "0.2.0", default-features = false, features = ["invoicesrpc"], optional = true }

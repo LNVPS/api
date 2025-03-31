@@ -104,16 +104,27 @@ pub struct SmtpConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ProvisionerConfig {
-    #[serde(rename_all = "kebab-case")]
-    Proxmox {
-        /// Generic VM configuration
-        qemu: QemuConfig,
-        /// SSH config for issuing commands via CLI
-        ssh: Option<SshConfig>,
-        /// MAC address prefix for NIC (eg. bc:24:11)
-        mac_prefix: Option<String>,
-    },
+pub struct ProvisionerConfig {
+    pub proxmox: Option<ProxmoxConfig>,
+    pub libvirt: Option<LibVirtConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ProxmoxConfig {
+    /// Generic VM configuration
+    pub qemu: QemuConfig,
+    /// SSH config for issuing commands via CLI
+    pub ssh: Option<SshConfig>,
+    /// MAC address prefix for NIC (eg. bc:24:11)
+    pub mac_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LibVirtConfig {
+    /// Generic VM configuration
+    pub qemu: QemuConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -198,16 +209,19 @@ pub fn mock_settings() -> Settings {
             macaroon: Default::default(),
         },
         read_only: false,
-        provisioner: ProvisionerConfig::Proxmox {
-            qemu: QemuConfig {
-                machine: "q35".to_string(),
-                os_type: "l26".to_string(),
-                bridge: "vmbr1".to_string(),
-                cpu: "kvm64".to_string(),
-                kvm: false,
-            },
-            ssh: None,
-            mac_prefix: Some("ff:ff:ff".to_string()),
+        provisioner: ProvisionerConfig {
+            proxmox: Some(ProxmoxConfig {
+                qemu: QemuConfig {
+                    machine: "q35".to_string(),
+                    os_type: "l26".to_string(),
+                    bridge: "vmbr1".to_string(),
+                    cpu: "kvm64".to_string(),
+                    kvm: false,
+                },
+                ssh: None,
+                mac_prefix: Some("ff:ff:ff".to_string()),
+            }),
+            libvirt: None,
         },
         delete_after: 0,
         smtp: None,

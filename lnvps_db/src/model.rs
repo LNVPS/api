@@ -206,6 +206,7 @@ pub struct VmOsImage {
     pub release_date: DateTime<Utc>,
     /// URL location of cloud image
     pub url: String,
+    pub default_username: Option<String>,
 }
 
 impl VmOsImage {

@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use nostr::Url;
 use reqwest::header::AUTHORIZATION;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Method, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
