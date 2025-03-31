@@ -593,8 +593,13 @@ impl LNVpsProvisioner {
 
     /// Delete a VM and its associated resources
     pub async fn delete_vm(&self, vm_id: u64) -> Result<()> {
-        // host client currently doesn't support delete (proxmox)
-        // VM should already be stopped by [Worker]
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+
+        let client = get_host_client(&host, &self.provisioner_config)?;
+        if let Err(e) = client.delete_vm(&vm).await {
+            warn!("Failed to delete VM: {}", e);
+        }
 
         self.delete_ip_assignments(vm_id).await?;
         self.db.delete_vm(vm_id).await?;
@@ -762,7 +767,12 @@ mod tests {
             assert_eq!(zones.get("mock-v6-rev-zone-id").unwrap().len(), 1);
             assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 2);
 
-            let v6 = zones.get("mock-v6-rev-zone-id").unwrap().iter().next().unwrap();
+            let v6 = zones
+                .get("mock-v6-rev-zone-id")
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap();
             assert_eq!(v6.1.kind, "PTR");
             assert!(v6.1.name.ends_with("0.0.d.f.ip6.arpa"));
         }

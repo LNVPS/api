@@ -611,6 +611,32 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
+    async fn delete_vm(&self, vm: &Vm) -> Result<()> {
+        let vm_id: ProxmoxVmId = vm.id.into();
+
+        // NOT IMPLEMENTED
+        //let t = self.delete_vm(&self.node, vm_id).await?;
+        //self.wait_for_task(&t).await?;
+
+        if let Some(ssh) = &self.ssh {
+            let mut ses = SshClient::new()?;
+            ses.connect(
+                (self.api.base().host().unwrap().to_string(), 22),
+                &ssh.user,
+                &ssh.key,
+            )
+            .await?;
+
+            let cmd = format!("/usr/sbin/qm destroy {}", vm_id,);
+            let (code, rsp) = ses.execute(cmd.as_str()).await?;
+            info!("{}", rsp);
+            if code != 0 {
+                bail!("Failed to destroy vm, exit-code {}, {}", code, rsp);
+            }
+        }
+        Ok(())
+    }
+
     async fn reinstall_vm(&self, req: &FullVmInfo) -> Result<()> {
         let vm_id = req.vm.id.into();
 
@@ -1198,7 +1224,7 @@ mod tests {
                 enabled: true,
                 release_date: Utc::now(),
                 url: "http://localhost.com/ubuntu_server_24.04.img".to_string(),
-                default_username: None
+                default_username: None,
             },
             ips: vec![
                 VmIpAssignment {

@@ -45,6 +45,9 @@ pub trait VmHostClient: Send + Sync {
     /// Spawn a VM
     async fn create_vm(&self, cfg: &FullVmInfo) -> Result<()>;
 
+    /// Delete a VM
+    async fn delete_vm(&self, vm: &Vm) -> Result<()>;
+
     /// Re-install a vm OS
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()>;
 

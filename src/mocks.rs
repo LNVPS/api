@@ -1,14 +1,21 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::exchange::{ExchangeRateService, Ticker, TickerRate};
-use crate::host::{FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo};
+use crate::host::{
+    FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
+};
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
 use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
-use lnvps_db::{async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb, OsDistribution, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
+use lnvps_db::{
+    async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
+    OsDistribution, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
@@ -174,7 +181,7 @@ impl Default for MockDb {
                 enabled: true,
                 release_date: Utc::now(),
                 url: "https://example.com/debian_12.img".to_string(),
-                default_username: None
+                default_username: None,
             },
         );
         Self {
@@ -828,6 +835,12 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
+    async fn delete_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+        let mut vms = self.vms.lock().await;
+        vms.remove(&vm.id);
+        Ok(())
+    }
+
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
         todo!()
     }
@@ -898,7 +911,10 @@ impl DnsServer for MockDnsServer {
             zones.get_mut(zone_id).unwrap()
         };
 
-        if table.values().any(|v| v.name == record.name && v.kind == record.kind.to_string()) {
+        if table
+            .values()
+            .any(|v| v.name == record.name && v.kind == record.kind.to_string())
+        {
             bail!("Duplicate record with name {}", record.name);
         }
 
