@@ -148,6 +148,8 @@ pub struct QemuConfig {
     pub cpu: String,
     /// Enable virtualization inside VM
     pub kvm: bool,
+    /// CPU architecture
+    pub arch: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -217,6 +219,7 @@ pub fn mock_settings() -> Settings {
                     bridge: "vmbr1".to_string(),
                     cpu: "kvm64".to_string(),
                     kvm: false,
+                    arch: "x86_64".to_string(),
                 },
                 ssh: None,
                 mac_prefix: Some("ff:ff:ff".to_string()),

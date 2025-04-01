@@ -13,6 +13,7 @@ A bitcoin powered VPS system.
     - [RevolutPay](https://www.revolut.com/business/revolut-pay/)
 - VM Backend:
   - Proxmox
+  - LibVirt (WIP)
 - Network Resources:
   - Mikrotik JSON-API
   - OVH API (dedicated server virtual mac)
@@ -42,10 +43,18 @@ delete-after: 3
 read-only: false
 
 # Provisioner is the main process which handles creating/deleting VM's
-# Currently supports: Proxmox
 provisioner:
   proxmox:
-    # Proxmox (QEMU) settings used for spawning VM's
+    # QEMU settings used for spawning VM's
+    qemu:
+      bios: "ovmf"
+      machine: "q35"
+      os-type: "l26"
+      bridge: "vmbr0"
+      cpu: "kvm64"
+      kvm: false
+  libvirt:
+    # QEMU settings used for spawning VM's
     qemu:
       bios: "ovmf"
       machine: "q35"

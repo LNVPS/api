@@ -15,14 +15,13 @@ default = [
     "lnd",
     "cloudflare",
     "revolut",
-    "bitvora",
-    "libvirt"
+    "bitvora"
 ]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk"]
 nostr-dvm = ["dep:nostr-sdk"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
-libvirt = ["dep:virt"]
+libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["dep:fedimint-tonic-lnd"]
 bitvora = ["dep:reqwest", "dep:tokio-stream"]
 cloudflare = ["dep:reqwest"]
@@ -34,6 +33,7 @@ tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros", "sy
 anyhow = "1.0.83"
 config = { version = "0.15.8", features = ["yaml"] }
 log = "0.4.21"
+env_logger = "0.11.7"
 serde = { version = "1.0.213", features = ["derive"] }
 serde_json = "1.0.132"
 rocket = { version = "0.5.1", features = ["json"] }
@@ -64,6 +64,9 @@ reqwest = { version = "0.12.8", optional = true }
 
 #libvirt
 virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
+#virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}
+uuid = { version = "1.16.0", features = ["v4", "serde"], optional = true }
+quick-xml = { version = "0.37.3", features = ["serde", "serialize"], optional = true }
 
 #lnd
 fedimint-tonic-lnd = { version = "0.2.0", default-features = false, features = ["invoicesrpc"], optional = true }
@@ -74,4 +77,3 @@ tokio-stream = { version = "0.1.17", features = ["sync"], optional = true }
 #revolut
 sha2 = { version = "0.10.8", optional = true }
 hmac = { version = "0.12.1", optional = true }
-env_logger = "0.11.7"

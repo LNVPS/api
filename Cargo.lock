@@ -2058,6 +2058,7 @@ dependencies = [
  "native-tls",
  "nostr",
  "nostr-sdk",
+ "quick-xml",
  "rand 0.9.0",
  "reqwest",
  "rocket",
@@ -2073,6 +2074,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.21.0",
  "urlencoding",
+ "uuid",
  "virt",
 ]
 
@@ -2865,6 +2867,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f58e5423e24c18cc840e1c98370b3993c6649cd1678b4d24318bcf0a083cbe88"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf763ab1c7a3aa408be466efc86efe35ed1bd3dd74173ed39d6b0d0a6f0ba148"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -4669,6 +4681,10 @@ name = "uuid"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "458f7a779bf54acc9f347480ac654f68407d3aab21269a6e3c9f922acd9e2da9"
+dependencies = [
+ "getrandom 0.3.2",
+ "serde",
+]
 
 [[package]]
 name = "valuable"

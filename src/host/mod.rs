@@ -218,3 +218,153 @@ pub struct VmHostDiskInfo {
     pub size: u64,
     pub used: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use lnvps_db::{DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution, UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate};
+    use crate::{GB, TB};
+    use crate::host::FullVmInfo;
+
+    pub fn mock_full_vm() -> FullVmInfo {
+        let template = VmTemplate {
+            id: 1,
+            name: "example".to_string(),
+            enabled: true,
+            created: Default::default(),
+            expires: None,
+            cpu: 2,
+            memory: 2 * GB,
+            disk_size: 100 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            cost_plan_id: 1,
+            region_id: 1,
+        };
+        FullVmInfo {
+            vm: Vm {
+                id: 1,
+                host_id: 1,
+                user_id: 1,
+                image_id: 1,
+                template_id: Some(template.id),
+                custom_template_id: None,
+                ssh_key_id: 1,
+                created: Default::default(),
+                expires: Default::default(),
+                disk_id: 1,
+                mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
+                deleted: false,
+                ref_code: None,
+            },
+            host: VmHost {
+                id: 1,
+                kind: Default::default(),
+                region_id: 1,
+                name: "mock".to_string(),
+                ip: "https://localhost:8006".to_string(),
+                cpu: 20,
+                memory: 128 * GB,
+                enabled: true,
+                api_token: "mock".to_string(),
+                load_cpu: 1.0,
+                load_memory: 1.0,
+                load_disk: 1.0,
+                vlan_id: Some(100),
+            },
+            disk: VmHostDisk {
+                id: 1,
+                host_id: 1,
+                name: "ssd".to_string(),
+                size: TB * 20,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                enabled: true,
+            },
+            template: Some(template.clone()),
+            custom_template: None,
+            image: VmOsImage {
+                id: 1,
+                distribution: OsDistribution::Ubuntu,
+                flavour: "Server".to_string(),
+                version: "24.04.03".to_string(),
+                enabled: true,
+                release_date: Utc::now(),
+                url: "http://localhost.com/ubuntu_server_24.04.img".to_string(),
+                default_username: None,
+            },
+            ips: vec![
+                VmIpAssignment {
+                    id: 1,
+                    vm_id: 1,
+                    ip_range_id: 1,
+                    ip: "192.168.1.2".to_string(),
+                    deleted: false,
+                    arp_ref: None,
+                    dns_forward: None,
+                    dns_forward_ref: None,
+                    dns_reverse: None,
+                    dns_reverse_ref: None,
+                },
+                VmIpAssignment {
+                    id: 2,
+                    vm_id: 1,
+                    ip_range_id: 2,
+                    ip: "192.168.2.2".to_string(),
+                    deleted: false,
+                    arp_ref: None,
+                    dns_forward: None,
+                    dns_forward_ref: None,
+                    dns_reverse: None,
+                    dns_reverse_ref: None,
+                },
+                VmIpAssignment {
+                    id: 3,
+                    vm_id: 1,
+                    ip_range_id: 3,
+                    ip: "fd00::ff:ff:ff:ff:ff".to_string(),
+                    deleted: false,
+                    arp_ref: None,
+                    dns_forward: None,
+                    dns_forward_ref: None,
+                    dns_reverse: None,
+                    dns_reverse_ref: None,
+                },
+            ],
+            ranges: vec![
+                IpRange {
+                    id: 1,
+                    cidr: "192.168.1.0/24".to_string(),
+                    gateway: "192.168.1.1/16".to_string(),
+                    enabled: true,
+                    region_id: 1,
+                    ..Default::default()
+                },
+                IpRange {
+                    id: 2,
+                    cidr: "192.168.2.0/24".to_string(),
+                    gateway: "10.10.10.10".to_string(),
+                    enabled: true,
+                    region_id: 2,
+                    ..Default::default()
+                },
+                IpRange {
+                    id: 3,
+                    cidr: "fd00::/64".to_string(),
+                    gateway: "fd00::1".to_string(),
+                    enabled: true,
+                    region_id: 1,
+                    allocation_mode: IpRangeAllocationMode::SlaacEui64,
+                    ..Default::default()
+                },
+            ],
+            ssh_key: UserSshKey {
+                id: 1,
+                name: "test".to_string(),
+                user_id: 1,
+                created: Default::default(),
+                key_data: "ssh-ed25519 AAA=".to_string(),
+            },
+        }
+    }
+}
