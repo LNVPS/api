@@ -80,7 +80,7 @@ impl ApiVmIpAssignment {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskType {
     HDD = 0,
@@ -105,7 +105,7 @@ impl From<DiskType> for lnvps_db::DiskType {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskInterface {
     SATA = 0,
@@ -166,8 +166,6 @@ pub struct ApiCustomTemplateParams {
     pub min_cpu: u16,
     pub min_memory: u64,
     pub max_memory: u64,
-    pub min_disk: u64,
-    pub max_disk: u64,
     pub disks: Vec<ApiCustomTemplateDiskParam>,
 }
 
@@ -178,7 +176,7 @@ impl ApiCustomTemplateParams {
         region: &VmHostRegion,
         max_cpu: u16,
         max_memory: u64,
-        max_disk: u64,
+        max_disk: &HashMap<(DiskType, DiskInterface), u64>,
     ) -> Result<Self> {
         const GB: u64 = 1024 * 1024 * 1024;
         Ok(ApiCustomTemplateParams {
@@ -192,14 +190,17 @@ impl ApiCustomTemplateParams {
             min_cpu: 1,
             min_memory: GB,
             max_memory,
-            min_disk: GB * 5,
-            max_disk,
             disks: disks
                 .iter()
                 .filter(|d| d.pricing_id == pricing.id)
-                .map(|d| ApiCustomTemplateDiskParam {
-                    disk_type: d.kind.into(),
-                    disk_interface: d.interface.into(),
+                .filter_map(|d| {
+                    Some(ApiCustomTemplateDiskParam {
+                        min_disk: GB * 5,
+                        max_disk: *max_disk
+                            .get(&(d.kind.into(), d.interface.into()))?,
+                        disk_type: d.kind.into(),
+                        disk_interface: d.interface.into(),
+                    })
                 })
                 .collect(),
         })
@@ -207,6 +208,8 @@ impl ApiCustomTemplateParams {
 }
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomTemplateDiskParam {
+    pub min_disk: u64,
+    pub max_disk: u64,
     pub disk_type: DiskType,
     pub disk_interface: DiskInterface,
 }

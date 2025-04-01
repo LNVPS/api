@@ -356,9 +356,18 @@ async fn v1_list_vm_templates(
             let max_memory = templates.iter().map(|t| t.memory).max().unwrap_or(GB * 2);
             let max_disk = templates
                 .iter()
-                .map(|t| t.disk_size)
-                .max()
-                .unwrap_or(GB * 5);
+                .map(|t| (t.disk_type, t.disk_interface, t.disk_size))
+                .fold(HashMap::new(), |mut acc, v| {
+                    let k = (v.0.into(), v.1.into());
+                    if let Some(mut x) = acc.get_mut(&k) {
+                        if *x < v.2 {
+                            *x = v.2;
+                        }
+                    } else {
+                        acc.insert(k, v.2);
+                    }
+                    return acc;
+                });
             Some(
                 custom_templates
                     .into_iter()
@@ -370,7 +379,7 @@ async fn v1_list_vm_templates(
                             region,
                             max_cpu,
                             max_memory,
-                            max_disk,
+                            &max_disk,
                         )
                         .ok()
                     })
