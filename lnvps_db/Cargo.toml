@@ -8,7 +8,7 @@ default = ["mysql"]
 mysql = ["sqlx/mysql"]
 
 [dependencies]
-anyhow = "1.0.83"
+anyhow.workspace = true
 sqlx = { version = "0.8.2", features = ["chrono", "migrate", "runtime-tokio"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 async-trait = "0.1.83"
