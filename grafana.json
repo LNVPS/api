@@ -162,6 +162,18 @@
                 "value": 205
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "vms"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 63
+              }
+            ]
           }
         ]
       },
@@ -192,7 +204,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT \nh.name,\nh.cpu,\nh.memory / 1024 / 1024 / 1024 gb_memory,\n(select sum(size) from vm_host_disk hd where hd.host_id = h.id and hd.enabled = 1 and hd.kind = 1) / 1024 / 1024 / 1024 gb_ssd,\n(select sum(size) from vm_host_disk hd where hd.host_id = h.id and hd.enabled = 1 and hd.kind = 0) / 1024 / 1024 / 1024 gb_hdd,\n(select sum(case when v.template_id is null then (select cpu from vm_custom_template vct where vct.id = v.custom_template_id) else (select cpu from vm_template vt where vt.id = v.template_id) end) from vm v where v.host_id = h.id and expires > current_timestamp()) sold_cpu,\n(select sum(case when v.template_id is null then (select memory from vm_custom_template vct where vct.id = v.custom_template_id) else (select memory from vm_template vt where vt.id = v.template_id) end) from vm v where v.host_id = h.id and expires > current_timestamp()) / 1024 / 1024 / 1024 sold_gb_memory,\n(select sum(case when v.template_id is null then (select disk_size from vm_custom_template vct where vct.id = v.custom_template_id and vct.disk_type = 1) else (select disk_size from vm_template vt where vt.id = v.template_id and vt.disk_type = 1) end) from vm v where v.host_id = h.id and expires > current_timestamp()) / 1024 / 1024 / 1024 sold_gb_ssd_disk,\n(select sum(case when v.template_id is null then (select disk_size from vm_custom_template vct where vct.id = v.custom_template_id and vct.disk_type = 0) else (select disk_size from vm_template vt where vt.id = v.template_id and vt.disk_type = 0) end) from vm v where v.host_id = h.id and expires > current_timestamp()) / 1024 / 1024 / 1024 sold_gb_hdd_disk,\n(select sum(case when v.template_id is null then 0 else (select (case when cp.currency = 'BTC' then (cp.amount/1e9) else cp.amount end) from vm_template vt,vm_cost_plan cp where vt.id = v.template_id and vt.cost_plan_id = cp.id) end) from vm v where v.host_id = h.id and deleted = 0) income\nfrom vm_host h",
+          "rawSql": "SELECT \nh.name,\nh.cpu,\nh.memory / 1024 / 1024 / 1024 gb_memory,\n(select count(*) from vm where vm.host_id = h.id and vm.expires > current_timestamp and vm.deleted = 0) as vms,\n(select sum(size) from vm_host_disk hd where hd.host_id = h.id and hd.enabled = 1 and hd.kind = 1) / 1024 / 1024 / 1024 gb_ssd,\n(select sum(size) from vm_host_disk hd where hd.host_id = h.id and hd.enabled = 1 and hd.kind = 0) / 1024 / 1024 / 1024 gb_hdd,\n(select sum(case when v.template_id is null then (select cpu from vm_custom_template vct where vct.id = v.custom_template_id) else (select cpu from vm_template vt where vt.id = v.template_id) end) from vm v where v.host_id = h.id and expires > current_timestamp()) sold_cpu,\n(select sum(case when v.template_id is null then (select memory from vm_custom_template vct where vct.id = v.custom_template_id) else (select memory from vm_template vt where vt.id = v.template_id) end) from vm v where v.host_id = h.id and expires > current_timestamp()) / 1024 / 1024 / 1024 sold_gb_memory,\n(select sum(case when v.template_id is null then (select disk_size from vm_custom_template vct where vct.id = v.custom_template_id and vct.disk_type = 1) else (select disk_size from vm_template vt where vt.id = v.template_id and vt.disk_type = 1) end) from vm v where v.host_id = h.id and expires > current_timestamp()) / 1024 / 1024 / 1024 sold_gb_ssd_disk,\n(select sum(case when v.template_id is null then (select disk_size from vm_custom_template vct where vct.id = v.custom_template_id and vct.disk_type = 0) else (select disk_size from vm_template vt where vt.id = v.template_id and vt.disk_type = 0) end) from vm v where v.host_id = h.id and expires > current_timestamp()) / 1024 / 1024 / 1024 sold_gb_hdd_disk,\n(select sum(case when v.template_id is null then 0 else (select (case when cp.currency = 'BTC' then (cp.amount/1e9) else cp.amount end) from vm_template vt,vm_cost_plan cp where vt.id = v.template_id and vt.cost_plan_id = cp.id) end) from vm v where v.host_id = h.id and deleted = 0) income\nfrom vm_host h",
           "refId": "A",
           "sql": {
             "columns": [
@@ -678,6 +690,153 @@
       ],
       "title": "IP Ranges",
       "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "mysql",
+        "uid": "cegjfe9u9181sf"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "amount_sats"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "amount_eur"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyEUR"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "id": 6,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.97,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "orientation": "auto",
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        },
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "dataset": "lnvps",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "select DATE_FORMAT(created, '%Y-%m') as month,\nsum((case when currency = 'BTC' then (amount / 1e3) else amount / 100 end)) amount_sats, \nsum((case when currency = 'BTC' then (amount / 1e11) * rate else amount * rate end)) amount_eur\nfrom vm_payment\nwhere is_paid = 1\ngroup by DATE_FORMAT(created, '%Y-%m')\norder by created asc\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Income",
+      "transformations": [
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "destinationType": "time",
+                "targetField": "month"
+              }
+            ],
+            "fields": {}
+          }
+        }
+      ],
+      "type": "barchart"
     }
   ],
   "preload": false,
@@ -691,10 +850,12 @@
     "from": "now-6h",
     "to": "now"
   },
-  "timepicker": {},
+  "timepicker": {
+    "hidden": true
+  },
   "timezone": "browser",
   "title": "LNVPS",
   "uid": "begjfxfrjwu80e",
-  "version": 23,
+  "version": 26,
   "weekStart": ""
 }
