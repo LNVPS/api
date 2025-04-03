@@ -6,9 +6,10 @@ use rocket::{Request, Route, State, routes};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use rocket::http::ContentType;
 
 pub fn routes() -> Vec<Route> {
-    routes![nostr_address]
+    routes![get_index, nostr_address]
 }
 
 #[derive(Serialize)]
@@ -30,6 +31,12 @@ impl<'r> FromRequest<'r> for HostInfo<'r> {
             host: request.host().map(|h| h.domain().as_str()),
         })
     }
+}
+
+#[rocket::get("/", format = "html")]
+fn get_index() -> (ContentType, &'static str) {
+    const HTML: &str = include_str!("../index.html");
+    (ContentType::HTML, HTML)
 }
 
 #[rocket::get("/.well-known/nostr.json?<name>")]
