@@ -1,5 +1,4 @@
 pub mod api;
-pub mod cors;
 pub mod data_migration;
 pub mod dns;
 pub mod exchange;

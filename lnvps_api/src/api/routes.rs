@@ -25,7 +25,7 @@ use rocket::{get, patch, post, routes, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;
 use rocket_okapi::okapi::openapi3::Responses;
 use rocket_okapi::response::OpenApiResponderInner;
-use rocket_okapi::{openapi, openapi_get_routes};
+use rocket_okapi::{openapi, openapi_get_routes, openapi_routes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
@@ -38,7 +38,7 @@ use tokio::sync::mpsc::{Sender, UnboundedSender};
 pub fn routes() -> Vec<Route> {
     let mut routes = vec![];
 
-    routes.append(&mut openapi_get_routes![
+    let mut api_routes = openapi_get_routes![
         v1_get_account,
         v1_patch_account,
         v1_list_vms,
@@ -59,17 +59,20 @@ pub fn routes() -> Vec<Route> {
         v1_custom_template_calc,
         v1_create_custom_vm_order,
         v1_get_payment_methods
-    ]);
+    ];
+    #[cfg(feature = "nostr-domain")]
+    api_routes.append(&mut super::nostr_domain::routes());
+    routes.append(&mut api_routes);
 
     routes.append(&mut routes![v1_terminal_proxy]);
 
     routes
 }
 
-type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
+pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-struct ApiData<T: Serialize> {
+pub struct ApiData<T: Serialize> {
     pub data: T,
 }
 
@@ -84,7 +87,7 @@ impl<T: Serialize> ApiData<T> {
 
 #[derive(Serialize, Deserialize, JsonSchema, Responder)]
 #[response(status = 500)]
-struct ApiError {
+pub struct ApiError {
     pub error: String,
 }
 

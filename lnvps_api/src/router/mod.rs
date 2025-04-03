@@ -30,7 +30,10 @@ pub struct ArpEntry {
 
 impl ArpEntry {
     pub fn new(vm: &Vm, ip: &VmIpAssignment, interface: Option<String>) -> Result<Self> {
-        ensure!(vm.mac_address != "ff:ff:ff:ff:ff:ff", "MAC address is invalid because its blank");
+        ensure!(
+            vm.mac_address != "ff:ff:ff:ff:ff:ff",
+            "MAC address is invalid because its blank"
+        );
         Ok(Self {
             id: ip.arp_ref.clone(),
             address: ip.ip.clone(),

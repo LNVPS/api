@@ -50,6 +50,9 @@ pub struct Settings {
     #[serde(default)]
     /// Tax rates to change per country as a percent of the amount
     pub tax_rate: HashMap<CountryCode, f32>,
+
+    /// public host of lnvps_nostr service
+    pub nostr_address_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -237,5 +240,6 @@ pub fn mock_settings() -> Settings {
         nostr: None,
         revolut: None,
         tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
+        nostr_address_host: None,
     }
 }

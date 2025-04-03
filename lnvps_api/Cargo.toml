@@ -1,25 +1,30 @@
 [package]
-name = "lnvps"
+name = "lnvps_api"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "api"
+name = "lnvps_api"
+path = "src/bin/api.rs"
 
 [features]
 default = [
     "mikrotik",
     "nostr-dm",
     "nostr-dvm",
+    "nostr-domain",
     "proxmox",
     "lnd",
     "cloudflare",
     "revolut",
-    "bitvora"
+    "bitvora",
+    "tokio/sync",
+    "tokio/io-util"
 ]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk"]
 nostr-dvm = ["dep:nostr-sdk"]
+nostr-domain = ["lnvps_db/nostr-domain"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["dep:fedimint-tonic-lnd"]
@@ -29,15 +34,16 @@ revolut = ["dep:reqwest", "dep:sha2", "dep:hmac"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
+lnvps_common = { path = "../lnvps_common" }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
-
-tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros", "sync", "io-util"] }
-config = { version = "0.15.8", features = ["yaml"] }
-serde = { version = "1.0.213", features = ["derive"] }
-serde_json = "1.0.132"
-rocket = { version = "0.5.1", features = ["json"] }
+tokio.workspace = true
+config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rocket.workspace = true
+hex.workspace = true
 rocket_okapi = { version = "0.9.0", features = ["swagger"] }
 schemars = { version = "0.8.22", features = ["chrono"] }
 chrono = { version = "0.4.38", features = ["serde"] }
@@ -50,7 +56,7 @@ ssh-key = "0.6.7"
 lettre = { version = "0.11.10", features = ["tokio1-native-tls"] }
 ws = { package = "rocket_ws", version = "0.1.1" }
 native-tls = "0.2.12"
-hex = "0.4.3"
+
 futures = "0.3.31"
 isocountry = "0.3.2"
 

@@ -1,0 +1,5 @@
+# Connection string to lnvps database
+db: "mysql://root:root@localhost:3376/lnvps"
+
+# Listen address for http server
+listen: "127.0.0.1:8001"

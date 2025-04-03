@@ -1,16 +1,16 @@
 use anyhow::Error;
 use clap::Parser;
 use config::{Config, File};
-use lnvps::api;
-use lnvps::cors::CORS;
-use lnvps::data_migration::run_data_migrations;
-use lnvps::dvm::start_dvms;
-use lnvps::exchange::{DefaultRateCache, ExchangeRateService};
-use lnvps::lightning::get_node;
-use lnvps::payments::listen_all_payments;
-use lnvps::settings::Settings;
-use lnvps::status::VmStateCache;
-use lnvps::worker::{WorkJob, Worker};
+use lnvps_api::api;
+use lnvps_api::data_migration::run_data_migrations;
+use lnvps_api::dvm::start_dvms;
+use lnvps_api::exchange::{DefaultRateCache, ExchangeRateService};
+use lnvps_api::lightning::get_node;
+use lnvps_api::payments::listen_all_payments;
+use lnvps_api::settings::Settings;
+use lnvps_api::status::VmStateCache;
+use lnvps_api::worker::{WorkJob, Worker};
+use lnvps_common::CORS;
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::error;
 use nostr::Keys;
@@ -168,7 +168,7 @@ async fn main() -> Result<(), Error> {
         .launch()
         .await
     {
-        error!("{}", e);
+        error!("{:?}", e);
     }
 
     Ok(())

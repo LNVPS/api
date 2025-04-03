@@ -10,7 +10,7 @@ pub use mysql::*;
 pub use async_trait::async_trait;
 
 #[async_trait]
-pub trait LNVpsDb: Sync + Send {
+pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
     /// Migrate database
     async fn migrate(&self) -> Result<()>;
 
@@ -172,4 +172,41 @@ pub trait LNVpsDb: Sync + Send {
 
     /// Get access policy
     async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy>;
+}
+
+#[cfg(feature = "nostr-domain")]
+#[async_trait]
+pub trait LNVPSNostrDb: Sync + Send {
+    /// Get single handle for a domain
+    async fn get_handle(&self, handle_id: u64) -> Result<NostrDomainHandle>;
+
+    /// Get single handle for a domain
+    async fn get_handle_by_name(&self, domain_id: u64, handle: &str) -> Result<NostrDomainHandle>;
+
+    /// Insert a new handle
+    async fn insert_handle(&self, handle: &NostrDomainHandle) -> Result<u64>;
+
+    /// Update an existing domain handle
+    async fn update_handle(&self, handle: &NostrDomainHandle) -> Result<()>;
+
+    /// Delete handle entry
+    async fn delete_handle(&self, handle_id: u64) -> Result<()>;
+
+    /// List handles
+    async fn list_handles(&self, domain_id: u64) -> Result<Vec<NostrDomainHandle>>;
+
+    /// Get domain object by id
+    async fn get_domain(&self, id: u64) -> Result<NostrDomain>;
+
+    /// Get domain object by name
+    async fn get_domain_by_name(&self, name: &str) -> Result<NostrDomain>;
+
+    /// List domains owned by a user
+    async fn list_domains(&self, owner_id: u64) -> Result<Vec<NostrDomain>>;
+
+    /// Insert a new domain
+    async fn insert_domain(&self, domain: &NostrDomain) -> Result<u64>;
+
+    /// Delete a domain
+    async fn delete_domain(&self, domain_id: u64) -> Result<()>;
 }

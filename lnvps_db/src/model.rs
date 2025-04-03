@@ -489,3 +489,24 @@ impl FromStr for PaymentMethod {
         }
     }
 }
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct NostrDomain {
+    pub id: u64,
+    pub owner_id: u64,
+    pub name: String,
+    pub created: DateTime<Utc>,
+    pub enabled: bool,
+    pub relays: Option<String>,
+    pub handles: i64,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct NostrDomainHandle {
+    pub id: u64,
+    pub domain_id: u64,
+    pub handle: String,
+    pub created: DateTime<Utc>,
+    pub pubkey: Vec<u8>,
+    pub relays: Option<String>,
+}

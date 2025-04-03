@@ -1,13 +1,13 @@
 use crate::data_migration::DataMigration;
 use crate::provisioner::{LNVpsProvisioner, NetworkProvisioner};
+use chrono::Utc;
 use ipnetwork::IpNetwork;
 use lnvps_db::LNVpsDb;
+use log::info;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use chrono::Utc;
-use log::info;
 
 pub struct Ip6InitDataMigration {
     db: Arc<dyn LNVpsDb>,
@@ -35,11 +35,10 @@ impl DataMigration for Ip6InitDataMigration {
                 let ips = db.list_vm_ip_assignments(vm.id).await?;
                 // if no ipv6 address is picked already pick one
                 if ips.iter().all(|i| {
-                        IpNetwork::from_str(&i.ip)
-                            .map(|i| i.is_ipv4())
-                            .unwrap_or(false)
-                    })
-                {
+                    IpNetwork::from_str(&i.ip)
+                        .map(|i| i.is_ipv4())
+                        .unwrap_or(false)
+                }) {
                     let ips_pick = net.pick_ip_for_region(host.region_id).await?;
                     if let Some(mut v6) = ips_pick.ip6 {
                         info!("Assigning ip {} to vm {}", v6.ip, vm.id);

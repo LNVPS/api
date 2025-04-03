@@ -6,9 +6,9 @@ use std::str::FromStr;
 
 #[cfg(feature = "cloudflare")]
 mod cloudflare;
+use crate::provisioner::NetworkProvisioner;
 #[cfg(feature = "cloudflare")]
 pub use cloudflare::*;
-use crate::provisioner::NetworkProvisioner;
 
 #[async_trait]
 pub trait DnsServer: Send + Sync {

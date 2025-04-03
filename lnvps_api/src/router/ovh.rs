@@ -351,5 +351,5 @@ enum OvhTaskFunction {
     MoveVirtualMac,
     VirtualMacAdd,
     VirtualMacDelete,
-    RemoveVirtualMac
+    RemoveVirtualMac,
 }

@@ -221,10 +221,13 @@ pub struct VmHostDiskInfo {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use lnvps_db::{DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution, UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate};
-    use crate::{GB, TB};
     use crate::host::FullVmInfo;
+    use crate::{GB, TB};
+    use chrono::Utc;
+    use lnvps_db::{
+        DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution, UserSshKey, Vm,
+        VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    };
 
     pub fn mock_full_vm() -> FullVmInfo {
         let template = VmTemplate {

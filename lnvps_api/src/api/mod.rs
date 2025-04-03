@@ -1,6 +1,8 @@
 use rocket::Route;
 
 mod model;
+#[cfg(feature = "nostr-domain")]
+mod nostr_domain;
 mod routes;
 mod webhook;
 

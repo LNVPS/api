@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["mysql"]
 mysql = ["sqlx/mysql"]
+nostr-domain = []
 
 [dependencies]
 anyhow.workspace = true

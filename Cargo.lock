@@ -2038,7 +2038,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23fb14cb19457329c82206317a5663005a4d404783dc74f4252769b0d5f42856"
 
 [[package]]
-name = "lnvps"
+name = "lnvps_api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2054,6 +2054,7 @@ dependencies = [
  "ipnetwork",
  "isocountry",
  "lettre",
+ "lnvps_common",
  "lnvps_db",
  "log",
  "native-tls",
@@ -2080,6 +2081,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_common"
+version = "0.1.0"
+dependencies = [
+ "rocket",
+]
+
+[[package]]
 name = "lnvps_db"
 version = "0.1.0"
 dependencies = [
@@ -2094,7 +2102,17 @@ dependencies = [
 name = "lnvps_nostr"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "config",
+ "env_logger",
+ "hex",
+ "lnvps_common",
  "lnvps_db",
+ "log",
+ "rocket",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

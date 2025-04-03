@@ -1,7 +1,7 @@
 use crate::{
-    AccessPolicy, IpRange, LNVpsDb, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment,
-    VmOsImage, VmPayment, VmTemplate,
+    AccessPolicy, IpRange, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, Router, User,
+    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost,
+    VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
@@ -554,5 +554,117 @@ impl LNVpsDb for LNVpsDbMysql {
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
+    }
+}
+
+#[cfg(feature = "nostr-domain")]
+#[async_trait]
+impl LNVPSNostrDb for LNVpsDbMysql {
+    async fn get_handle(&self, handle_id: u64) -> Result<NostrDomainHandle> {
+        sqlx::query_as("select * from nostr_domain_handle where id=?")
+            .bind(handle_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_handle_by_name(&self, domain_id: u64, handle: &str) -> Result<NostrDomainHandle> {
+        sqlx::query_as("select * from nostr_domain_handle where domain_id=? and handle=?")
+            .bind(domain_id)
+            .bind(handle)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_handle(&self, handle: &NostrDomainHandle) -> Result<u64> {
+        Ok(
+            sqlx::query(
+                "insert into nostr_domain_handle(domain_id,handle,pubkey,relays) values(?,?,?,?) returning id",
+            )
+                .bind(handle.domain_id)
+                .bind(&handle.handle)
+                .bind(&handle.pubkey)
+                .bind(&handle.relays)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::new)?
+                .try_get(0)?,
+        )
+    }
+
+    async fn update_handle(&self, handle: &NostrDomainHandle) -> Result<()> {
+        sqlx::query("update nostr_domain_handle set handle=?,pubkey=?,relays=? where id=?")
+            .bind(&handle.handle)
+            .bind(&handle.pubkey)
+            .bind(&handle.relays)
+            .bind(handle.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_handle(&self, handle_id: u64) -> Result<()> {
+        sqlx::query("delete from nostr_domain_handle where id=?")
+            .bind(handle_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_handles(&self, domain_id: u64) -> Result<Vec<NostrDomainHandle>> {
+        sqlx::query_as("select * from nostr_domain_handle where domain_id=?")
+            .bind(domain_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_domain(&self, id: u64) -> Result<NostrDomain> {
+        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_domain_by_name(&self, name: &str) -> Result<NostrDomain> {
+        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where name=?")
+            .bind(name)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_domains(&self, owner_id: u64) -> Result<Vec<NostrDomain>> {
+        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where owner_id=?")
+            .bind(owner_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_domain(&self, domain: &NostrDomain) -> Result<u64> {
+        Ok(
+            sqlx::query(
+                "insert into nostr_domain(owner_id,name,relays) values(?,?,?) returning id",
+            )
+            .bind(domain.owner_id)
+            .bind(&domain.name)
+            .bind(&domain.relays)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?,
+        )
+    }
+
+    async fn delete_domain(&self, domain_id: u64) -> Result<()> {
+        sqlx::query("update nostr_domain set deleted = current_timestamp where id = ?")
+            .bind(domain_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
     }
 }

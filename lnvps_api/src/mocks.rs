@@ -11,10 +11,10 @@ use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
 use lnvps_db::{
-    async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
-    OsDistribution, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
+    LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm,
+    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
 use std::ops::Add;
@@ -203,6 +203,57 @@ impl Default for MockDb {
             router: Arc::new(Default::default()),
             access_policy: Arc::new(Default::default()),
         }
+    }
+}
+
+#[async_trait]
+impl LNVPSNostrDb for MockDb {
+    async fn get_handle(&self, handle_id: u64) -> anyhow::Result<NostrDomainHandle> {
+        todo!()
+    }
+
+    async fn get_handle_by_name(
+        &self,
+        domain_id: u64,
+        handle: &str,
+    ) -> anyhow::Result<NostrDomainHandle> {
+        todo!()
+    }
+
+    async fn insert_handle(&self, handle: &NostrDomainHandle) -> anyhow::Result<u64> {
+        todo!()
+    }
+
+    async fn update_handle(&self, handle: &NostrDomainHandle) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn delete_handle(&self, handle_id: u64) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn list_handles(&self, domain_id: u64) -> anyhow::Result<Vec<NostrDomainHandle>> {
+        todo!()
+    }
+
+    async fn get_domain(&self, id: u64) -> anyhow::Result<NostrDomain> {
+        todo!()
+    }
+
+    async fn get_domain_by_name(&self, name: &str) -> anyhow::Result<NostrDomain> {
+        todo!()
+    }
+
+    async fn list_domains(&self, owner_id: u64) -> anyhow::Result<Vec<NostrDomain>> {
+        todo!()
+    }
+
+    async fn insert_domain(&self, domain: &NostrDomain) -> anyhow::Result<u64> {
+        todo!()
+    }
+
+    async fn delete_domain(&self, domain_id: u64) -> anyhow::Result<()> {
+        todo!()
     }
 }
 

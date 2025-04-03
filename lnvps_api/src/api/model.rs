@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 pub struct ApiVmStatus {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
@@ -37,7 +37,7 @@ pub struct ApiVmStatus {
     pub status: VmState,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 pub struct ApiUserSshKey {
     pub id: u64,
     pub name: String,
@@ -54,7 +54,7 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 pub struct ApiVmIpAssignment {
     pub id: u64,
     pub ip: String,
@@ -133,7 +133,7 @@ impl From<DiskInterface> for lnvps_db::DiskInterface {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 pub struct ApiTemplatesResponse {
     pub templates: Vec<ApiVmTemplate>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,7 +157,7 @@ impl ApiTemplatesResponse {
         Ok(())
     }
 }
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 pub struct ApiCustomTemplateParams {
     pub id: u64,
     pub name: String,
@@ -196,8 +196,7 @@ impl ApiCustomTemplateParams {
                 .filter_map(|d| {
                     Some(ApiCustomTemplateDiskParam {
                         min_disk: GB * 5,
-                        max_disk: *max_disk
-                            .get(&(d.kind.into(), d.interface.into()))?,
+                        max_disk: *max_disk.get(&(d.kind.into(), d.interface.into()))?,
                         disk_type: d.kind.into(),
                         disk_interface: d.interface.into(),
                     })
