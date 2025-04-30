@@ -304,9 +304,6 @@ pub struct IPRangeCapacity {
 }
 
 impl IPRangeCapacity {
-    // first/last/gw
-    const RESERVED: u128 = 3;
-
     /// Total number of IPs free
     pub fn available_capacity(&self) -> u128 {
         let net: IpNetwork = self.range.cidr.parse().unwrap();
@@ -315,7 +312,11 @@ impl IPRangeCapacity {
             NetworkSize::V4(s) => (s as u128).saturating_sub(self.usage),
             NetworkSize::V6(s) => s.saturating_sub(self.usage),
         }
-        .saturating_sub(Self::RESERVED)
+        .saturating_sub(if self.range.use_full_range {
+            1 // gw
+        } else {
+            3 // first/last/gw
+        })
     }
 }
 
