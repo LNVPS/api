@@ -56,6 +56,7 @@ ssh-key = "0.6.7"
 lettre = { version = "0.11.10", features = ["tokio1-native-tls"] }
 ws = { package = "rocket_ws", version = "0.1.1" }
 native-tls = "0.2.12"
+lnurl-rs = { version = "0.9.0", default-features = false }
 
 futures = "0.3.31"
 isocountry = "0.3.2"

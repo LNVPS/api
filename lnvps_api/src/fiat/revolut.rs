@@ -89,8 +89,8 @@ impl RevolutApi {
             .post(
                 "/api/orders",
                 CreateOrderRequest {
-                    currency: amount.0.to_string(),
-                    amount: match amount.0 {
+                    currency: amount.currency().to_string(),
+                    amount: match amount.currency() {
                         Currency::BTC => bail!("Bitcoin amount not allowed for fiat payments"),
                         _ => amount.value(),
                     },

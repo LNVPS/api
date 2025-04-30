@@ -75,14 +75,19 @@ impl Display for Ticker {
 pub struct TickerRate(pub Ticker, pub f32);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CurrencyAmount(pub Currency, u64);
+pub struct CurrencyAmount(Currency, u64);
 
 impl CurrencyAmount {
     const MILLI_SATS: f64 = 1.0e11;
 
+    pub fn millisats(amount: u64) -> Self {
+        CurrencyAmount(Currency::BTC, amount)
+    }
+
     pub fn from_u64(currency: Currency, amount: u64) -> Self {
         CurrencyAmount(currency, amount)
     }
+
     pub fn from_f32(currency: Currency, amount: f32) -> Self {
         CurrencyAmount(
             currency,
@@ -102,6 +107,10 @@ impl CurrencyAmount {
             Currency::BTC => (self.1 as f64 / Self::MILLI_SATS) as f32,
             _ => self.1 as f32 / 100.0,
         }
+    }
+
+    pub fn currency(&self) -> Currency {
+        self.0
     }
 }
 

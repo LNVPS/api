@@ -149,7 +149,7 @@ impl ApiTemplatesResponse {
                 CurrencyAmount::from_f32(template.cost_plan.currency, template.cost_plan.amount);
             for alt_price in alt_prices(&rates, list_price) {
                 template.cost_plan.other_price.push(ApiPrice {
-                    currency: alt_price.0,
+                    currency: alt_price.currency(),
                     amount: alt_price.value_f32(),
                 });
             }
@@ -255,7 +255,7 @@ pub struct ApiPrice {
 impl From<CurrencyAmount> for ApiPrice {
     fn from(value: CurrencyAmount) -> Self {
         Self {
-            currency: value.0,
+            currency: value.currency(),
             amount: value.value_f32(),
         }
     }

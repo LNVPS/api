@@ -4,7 +4,7 @@ use crate::api::model::{
     ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
     CreateVmRequest, VMPatchRequest,
 };
-use crate::exchange::{Currency, ExchangeRateService};
+use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService};
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::nip98::Nip98Auth;
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
@@ -15,11 +15,14 @@ use anyhow::{bail, Result};
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
+use lnurl::pay::{LnURLPayInvoice, PayResponse};
+use lnurl::Tag;
 use lnvps_db::{
     IpRange, LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
 };
 use log::{error, info};
 use nostr::util::hex;
+use nostr::Url;
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, routes, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;
@@ -64,7 +67,11 @@ pub fn routes() -> Vec<Route> {
     api_routes.append(&mut super::nostr_domain::routes());
     routes.append(&mut api_routes);
 
-    routes.append(&mut routes![v1_terminal_proxy]);
+    routes.append(&mut routes![
+        v1_terminal_proxy,
+        v1_lnurlp,
+        v1_renew_vm_lnurlp
+    ]);
 
     routes
 }
@@ -538,6 +545,57 @@ async fn v1_renew_vm(
         )
         .await?;
     ApiData::ok(rsp.into())
+}
+
+/// Extend a VM by LNURL payment
+#[get("/api/v1/vm/<id>/renew-lnurlp?<amount>")]
+async fn v1_renew_vm_lnurlp(
+    provisioner: &State<Arc<LNVpsProvisioner>>,
+    id: u64,
+    amount: u64,
+) -> Result<Json<LnURLPayInvoice>, &'static str> {
+    if amount < 1000 {
+        return Err("Amount must be greater than 1000");
+    }
+
+    let rsp = provisioner
+        .renew_amount(
+            id,
+            CurrencyAmount::millisats(amount),
+            PaymentMethod::Lightning,
+        )
+        .await
+        .map_err(|_| "Error generating invoice")?;
+
+    // external_data is pr for lightning payment method
+    Ok(Json(LnURLPayInvoice::new(rsp.external_data)))
+}
+
+/// LNURL ad-hoc extend vm
+#[get("/.well-known/lnurlp/<id>")]
+async fn v1_lnurlp(
+    db: &State<Arc<dyn LNVpsDb>>,
+    settings: &State<Settings>,
+    id: u64,
+) -> Result<Json<PayResponse>, &'static str> {
+    db.get_vm(id).await.map_err(|_e| "VM not found")?;
+
+    let meta = vec![vec!["text/plain".to_string(), format!("Extend VM {}", id)]];
+    let rsp = PayResponse {
+        callback: Url::parse(&settings.public_url)
+            .map_err(|_| "Invalid public url")?
+            .join(&format!("/api/v1/vm/{}/renew-lnurlp", id))
+            .map_err(|_| "Could not get callback url")?
+            .to_string(),
+        max_sendable: 1_000_000_000,
+        min_sendable: 1_000, // TODO: calc min by using 1s extend time
+        tag: Tag::PayRequest,
+        metadata: serde_json::to_string(&meta).map_err(|_e| "Failed to serialize metadata")?,
+        comment_allowed: None,
+        allows_nostr: None,
+        nostr_pubkey: None,
+    };
+    Ok(Json(rsp))
 }
 
 /// Start a VM

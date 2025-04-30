@@ -1,5 +1,5 @@
 use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate};
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
@@ -31,6 +31,49 @@ impl PricingEngine {
             db,
             rates,
             tax_rates,
+        }
+    }
+
+    /// Get amount of time a certain currency amount will extend a vm in seconds
+    pub async fn get_cost_by_amount(
+        &self,
+        vm_id: u64,
+        input: CurrencyAmount,
+        method: PaymentMethod,
+    ) -> Result<CostResult> {
+        let vm = self.db.get_vm(vm_id).await?;
+
+        let cost = if vm.template_id.is_some() {
+            self.get_template_vm_cost(&vm, method).await?
+        } else {
+            self.get_custom_vm_cost(&vm, method).await?
+        };
+
+        match cost {
+            CostResult::Existing(_) => bail!("Invalid response"),
+            CostResult::New {
+                currency,
+                amount,
+                rate,
+                time_value,
+                ..
+            } => {
+                ensure!(currency == input.currency(), "Invalid currency");
+
+                // scale cost
+                let scale = input.value() as f64 / amount as f64;
+                let new_time = (time_value as f64 * scale).floor() as u64;
+                ensure!(new_time > 0, "Extend time is less than 1 second");
+
+                Ok(CostResult::New {
+                    amount: input.value(),
+                    currency,
+                    time_value: new_time,
+                    new_expiry: vm.expires.add(TimeDelta::seconds(new_time as i64)),
+                    rate,
+                    tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
+                })
+            }
         }
     }
 
@@ -160,13 +203,13 @@ impl PricingEngine {
     }
 
     async fn get_msats_amount(&self, amount: CurrencyAmount) -> Result<(u64, f32)> {
-        let rate = self.get_ticker(amount.0).await?;
+        let rate = self.get_ticker(amount.currency()).await?;
         let cost_btc = amount.value_f32() / rate.1;
         let cost_msats = (cost_btc as f64 * crate::BTC_SATS) as u64 * 1000;
         Ok((cost_msats, rate.1))
     }
 
-    fn next_template_expire(vm: &Vm, cost_plan: &VmCostPlan) -> u64 {
+    pub fn next_template_expire(vm: &Vm, cost_plan: &VmCostPlan) -> u64 {
         let next_expire = match cost_plan.interval_type {
             VmCostPlanIntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
             VmCostPlanIntervalType::Month => vm
@@ -209,7 +252,7 @@ impl PricingEngine {
         list_price: CurrencyAmount,
         method: PaymentMethod,
     ) -> Result<(Currency, u64, f32)> {
-        Ok(match (list_price.0, method) {
+        Ok(match (list_price.currency(), method) {
             (c, PaymentMethod::Lightning) if c != Currency::BTC => {
                 let new_price = self.get_msats_amount(list_price).await?;
                 (Currency::BTC, new_price.0, new_price.1)
@@ -396,6 +439,25 @@ mod tests {
                 let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
                 assert_eq!(expect_price, amount);
                 assert_eq!((expect_price as f64 * 0.23).floor() as u64, tax);
+            }
+            _ => bail!("??"),
+        }
+
+        // from amount
+        let price = pe
+            .get_cost_by_amount(1, CurrencyAmount::millisats(1000), PaymentMethod::Lightning)
+            .await?;
+        // full month price in msats
+        let mo_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+        let time_scale = 1000f64 / mo_price as f64;
+        let vm = db.get_vm(1).await?;
+        let next_expire = PricingEngine::next_template_expire(&vm, &plan);
+        match price {
+            CostResult::New { amount, time_value, tax, .. } => {
+                let expect_time = (next_expire as f64 * time_scale) as u64;
+                assert_eq!(expect_time, time_value);
+                assert_eq!(0, tax);
+                assert_eq!(amount, 1000);
             }
             _ => bail!("??"),
         }
