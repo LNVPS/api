@@ -500,6 +500,7 @@ pub struct ApiVmPayment {
     pub currency: String,
     pub is_paid: bool,
     pub data: ApiPaymentData,
+    pub time: u64,
 }
 
 impl From<lnvps_db::VmPayment> for ApiVmPayment {
@@ -513,6 +514,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             tax: value.tax,
             currency: value.currency,
             is_paid: value.is_paid,
+            time: value.time_value,
             data: match &value.payment_method {
                 PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data),
                 PaymentMethod::Revolut => {
