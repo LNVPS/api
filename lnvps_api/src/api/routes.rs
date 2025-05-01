@@ -61,7 +61,8 @@ pub fn routes() -> Vec<Route> {
         v1_time_series,
         v1_custom_template_calc,
         v1_create_custom_vm_order,
-        v1_get_payment_methods
+        v1_get_payment_methods,
+        v1_payment_history
     ];
     #[cfg(feature = "nostr-domain")]
     api_routes.append(&mut super::nostr_domain::routes());
@@ -869,4 +870,23 @@ async fn v1_get_payment(
     }
 
     ApiData::ok(payment.into())
+}
+
+/// List payment history of a VM
+#[openapi(tag = "VM")]
+#[get("/api/v1/vm/<id>/payments")]
+async fn v1_payment_history(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    id: u64,
+) -> ApiResult<Vec<ApiVmPayment>> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    let payments = db.list_vm_payment(id).await?;
+    ApiData::ok(payments.into_iter().map(|i| i.into()).collect())
 }
