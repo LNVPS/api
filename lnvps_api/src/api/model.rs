@@ -403,10 +403,26 @@ pub struct VMPatchRequest {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct AccountPatchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     pub contact_nip17: bool,
     pub contact_email: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tax_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

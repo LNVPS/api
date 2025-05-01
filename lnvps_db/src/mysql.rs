@@ -60,12 +60,19 @@ impl LNVpsDb for LNVpsDbMysql {
 
     async fn update_user(&self, user: &User) -> Result<()> {
         sqlx::query(
-            "update users set email=?, contact_nip17=?, contact_email=?, country_code=? where id = ?",
+            "update users set email=?, contact_nip17=?, contact_email=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=? where id = ?",
         )
             .bind(&user.email)
             .bind(user.contact_nip17)
             .bind(user.contact_email)
             .bind(&user.country_code)
+            .bind(&user.billing_name)
+            .bind(&user.billing_address_1)
+            .bind(&user.billing_address_2)
+            .bind(&user.billing_city)
+            .bind(&user.billing_state)
+            .bind(&user.billing_postcode)
+            .bind(&user.billing_tax_id)
             .bind(user.id)
             .execute(&self.db)
             .await?;

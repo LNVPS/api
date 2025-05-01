@@ -394,11 +394,8 @@ mod tests {
                 User {
                     id: 1,
                     pubkey: vec![],
-                    created: Default::default(),
-                    email: None,
-                    contact_nip17: false,
-                    contact_email: false,
                     country_code: Some("USA".to_string()),
+                    ..Default::default()
                 },
             );
             u.insert(
@@ -406,11 +403,8 @@ mod tests {
                 User {
                     id: 2,
                     pubkey: vec![],
-                    created: Default::default(),
-                    email: None,
-                    contact_nip17: false,
-                    contact_email: false,
                     country_code: Some("IRL".to_string()),
+                    ..Default::default()
                 },
             );
         }

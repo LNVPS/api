@@ -275,10 +275,8 @@ impl LNVpsDb for MockDb {
                     id: max + 1,
                     pubkey: pubkey.to_vec(),
                     created: Utc::now(),
-                    email: None,
-                    contact_nip17: false,
-                    contact_email: false,
                     country_code: Some("USA".to_string()),
+                    ..Default::default()
                 },
             );
             Ok(max + 1)

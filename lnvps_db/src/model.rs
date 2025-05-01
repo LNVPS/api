@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use url::Url;
 
-#[derive(FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug, Default)]
 /// Users who buy VM's
 pub struct User {
     /// Unique ID of this user (database generated)
@@ -23,6 +23,20 @@ pub struct User {
     pub contact_email: bool,
     /// Users country
     pub country_code: Option<String>,
+    /// Name to show on invoices
+    pub billing_name: Option<String>,
+    /// Billing address line 1
+    pub billing_address_1: Option<String>,
+    /// Billing address line 2
+    pub billing_address_2: Option<String>,
+    /// Billing city
+    pub billing_city: Option<String>,
+    /// Billing state/county
+    pub billing_state: Option<String>,
+    /// Billing postcode/zip
+    pub billing_postcode: Option<String>,
+    /// Billing tax id
+    pub billing_tax_id: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

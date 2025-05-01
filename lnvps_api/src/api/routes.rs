@@ -133,6 +133,13 @@ async fn v1_patch_account(
         .as_ref()
         .and_then(|c| CountryCode::for_alpha3(c).ok())
         .map(|c| c.alpha3().to_string());
+    user.billing_name = req.name.clone();
+    user.billing_address_1 = req.address_1.clone();
+    user.billing_address_2 = req.address_2.clone();
+    user.billing_city = req.city.clone();
+    user.billing_state = req.state.clone();
+    user.billing_postcode = req.postcode.clone();
+    user.billing_tax_id = req.tax_id.clone();
 
     db.update_user(&user).await?;
     ApiData::ok(())
@@ -154,6 +161,13 @@ async fn v1_get_account(
         contact_nip17: user.contact_nip17,
         contact_email: user.contact_email,
         country_code: user.country_code,
+        name: user.billing_name,
+        address_1: user.billing_address_1,
+        address_2: user.billing_address_2,
+        state: user.billing_state,
+        city: user.billing_city,
+        postcode: user.billing_postcode,
+        tax_id: user.billing_tax_id,
     })
 }
 
