@@ -1,5 +1,5 @@
 use crate::api::model::{
-    AccountPatchRequest, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
+    AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
     ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse, ApiUserSshKey,
     ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
     CreateVmRequest, VMPatchRequest,
@@ -12,6 +12,7 @@ use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
 use crate::worker::WorkJob;
 use anyhow::{bail, Result};
+use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
@@ -22,7 +23,8 @@ use lnvps_db::{
 };
 use log::{error, info};
 use nostr::util::hex;
-use nostr::Url;
+use nostr::{ToBech32, Url};
+use rocket::http::ContentType;
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, routes, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;
@@ -34,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::io::{BufWriter, Cursor};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
@@ -71,7 +74,8 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut routes![
         v1_terminal_proxy,
         v1_lnurlp,
-        v1_renew_vm_lnurlp
+        v1_renew_vm_lnurlp,
+        v1_get_payment_invoice
     ]);
 
     routes
@@ -156,19 +160,7 @@ async fn v1_get_account(
     let uid = db.upsert_user(&pubkey).await?;
     let user = db.get_user(uid).await?;
 
-    ApiData::ok(AccountPatchRequest {
-        email: user.email,
-        contact_nip17: user.contact_nip17,
-        contact_email: user.contact_email,
-        country_code: user.country_code,
-        name: user.billing_name,
-        address_1: user.billing_address_1,
-        address_2: user.billing_address_2,
-        state: user.billing_state,
-        city: user.billing_city,
-        postcode: user.billing_postcode,
-        tax_id: user.billing_tax_id,
-    })
+    ApiData::ok(user.into())
 }
 
 async fn vm_to_status(
@@ -892,6 +884,99 @@ async fn v1_get_payment(
     }
 
     ApiData::ok(payment.into())
+}
+
+/// Print payment invoice
+#[get("/api/v1/payment/<id>/invoice?<auth>")]
+async fn v1_get_payment_invoice(
+    db: &State<Arc<dyn LNVpsDb>>,
+    id: &str,
+    auth: &str,
+) -> Result<(ContentType, Vec<u8>), &'static str> {
+    let auth = Nip98Auth::from_base64(auth).map_err(|e| "Missing or invalid auth param")?;
+    if auth
+        .check(&format!("/api/v1/payment/{id}/invoice"), "GET")
+        .is_err()
+    {
+        return Err("Invalid auth event");
+    }
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await.map_err(|_| "Insert failed")?;
+    let id = if let Ok(i) = hex::decode(id) {
+        i
+    } else {
+        return Err("Invalid payment id");
+    };
+
+    let payment = db
+        .get_vm_payment(&id)
+        .await
+        .map_err(|_| "Payment not found")?;
+    let vm = db.get_vm(payment.vm_id).await.map_err(|_| "VM not found")?;
+    if vm.user_id != uid {
+        return Err("VM does not belong to you");
+    }
+
+    if !payment.is_paid {
+        return Err("Payment is not paid, can't generate invoice");
+    }
+
+    #[derive(Serialize)]
+    struct PaymentInfo {
+        year: i32,
+        current_date: DateTime<Utc>,
+        vm: ApiVmStatus,
+        payment: ApiVmPayment,
+        user: AccountPatchRequest,
+        npub: String,
+        total: u64,
+        company: Option<ApiCompany>,
+    }
+
+    let host = db
+        .get_host(vm.host_id)
+        .await
+        .map_err(|_| "Host not found")?;
+    let region = db
+        .get_host_region(host.region_id)
+        .await
+        .map_err(|_| "Region not found")?;
+    let company = if let Some(c) = region.company_id {
+        Some(db.get_company(c).await.map_err(|_| "Company not found")?)
+    } else {
+        None
+    };
+    let user = db.get_user(uid).await.map_err(|_| "User not found")?;
+    #[cfg(debug_assertions)]
+    let template =
+        mustache::compile_path("lnvps_api/invoice.html").map_err(|_| "Invalid template")?;
+    #[cfg(not(debug_assertions))]
+    let template = mustache::compile_str(include_str!("../../invoice.html"))
+        .map_err(|_| "Invalid template")?;
+
+    let now = Utc::now();
+    let mut html = Cursor::new(Vec::new());
+    template
+        .render(
+            &mut html,
+            &PaymentInfo {
+                year: now.year(),
+                current_date: now,
+                vm: vm_to_status(db, vm, None)
+                    .await
+                    .map_err(|_| "Failed to get VM state")?,
+                total: payment.amount + payment.tax,
+                payment: payment.into(),
+                npub: nostr::PublicKey::from_slice(&user.pubkey)
+                    .map_err(|_| "Invalid pubkey")?
+                    .to_bech32()
+                    .unwrap(),
+                user: user.into(),
+                company: company.map(|c| c.into()),
+            },
+        )
+        .map_err(|_| "Failed to generate invoice")?;
+    Ok((ContentType::HTML, html.into_inner()))
 }
 
 /// List payment history of a VM

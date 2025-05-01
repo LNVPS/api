@@ -10,12 +10,7 @@ use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
-use lnvps_db::{
-    async_trait, AccessPolicy, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
-    LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
-};
+use lnvps_db::{async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
@@ -108,6 +103,7 @@ impl Default for MockDb {
                 id: 1,
                 name: "Mock".to_string(),
                 enabled: true,
+                company_id: None,
             },
         );
         let mut ip_ranges = HashMap::new();
@@ -694,6 +690,10 @@ impl LNVpsDb for MockDb {
         Ok(p.get(&access_policy_id)
             .cloned()
             .context("no access policy")?)
+    }
+
+    async fn get_company(&self, company_id: u64) -> anyhow::Result<Company> {
+        todo!()
     }
 }
 

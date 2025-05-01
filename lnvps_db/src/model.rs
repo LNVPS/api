@@ -71,6 +71,7 @@ pub struct VmHostRegion {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
+    pub company_id: Option<u64>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -523,4 +524,20 @@ pub struct NostrDomainHandle {
     pub created: DateTime<Utc>,
     pub pubkey: Vec<u8>,
     pub relays: Option<String>,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct Company {
+    pub id: u64,
+    pub created: DateTime<Utc>,
+    pub name: String,
+    pub address_1: Option<String>,
+    pub address_2: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub country_code: Option<String>,
+    pub tax_id: Option<String>,
+    pub postcode: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
 }

@@ -425,6 +425,24 @@ pub struct AccountPatchRequest {
     pub tax_id: Option<String>,
 }
 
+impl From<lnvps_db::User> for AccountPatchRequest {
+    fn from(user: lnvps_db::User) -> Self {
+        AccountPatchRequest {
+            email: user.email,
+            contact_nip17: user.contact_nip17,
+            contact_email: user.contact_email,
+            country_code: user.country_code,
+            name: user.billing_name,
+            address_1: user.billing_address_1,
+            address_2: user.billing_address_2,
+            state: user.billing_state,
+            city: user.billing_city,
+            postcode: user.billing_postcode,
+            tax_id: user.billing_tax_id,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct CreateVmRequest {
     pub template_id: u64,
@@ -571,6 +589,48 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Lightning => ApiPaymentMethod::Lightning,
             PaymentMethod::Revolut => ApiPaymentMethod::Revolut,
             PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiCompany {
+    pub id: u64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tax_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+}
+
+impl From<lnvps_db::Company> for ApiCompany {
+    fn from(value: lnvps_db::Company) -> Self {
+        Self {
+            email: value.email,
+            country_code: value.country_code,
+            name: value.name,
+            id: value.id,
+            address_1: value.address_1,
+            address_2: value.address_2,
+            state: value.state,
+            city: value.city,
+            postcode: value.postcode,
+            tax_id: value.tax_id,
+            phone: value.phone,
         }
     }
 }

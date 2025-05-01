@@ -1,8 +1,4 @@
-use crate::{
-    AccessPolicy, IpRange, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, Router, User,
-    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost,
-    VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
-};
+use crate::{AccessPolicy, Company, IpRange, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, Row};
@@ -558,6 +554,14 @@ impl LNVpsDb for LNVpsDbMysql {
     async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy> {
         sqlx::query_as("select * from access_policy where id=?")
             .bind(access_policy_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_company(&self, company_id: u64) -> Result<Company> {
+        sqlx::query_as("select * from company where id=?")
+            .bind(company_id)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)

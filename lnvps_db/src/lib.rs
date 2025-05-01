@@ -172,6 +172,9 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
 
     /// Get access policy
     async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy>;
+
+    /// Get company
+    async fn get_company(&self, company_id: u64) -> Result<Company>;
 }
 
 #[cfg(feature = "nostr-domain")]

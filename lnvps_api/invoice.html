@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <title>{{payment.id}}</title>
+    <meta charset="UTF-8"/>
+    <link rel="preconnect" href="https://fonts.googleapis.com"/>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+    <link
+            href="https://fonts.googleapis.com/css2?family=Source+Code+Pro:ital,wght@0,200..900;1,200..900&display=swap"
+            rel="stylesheet"
+    />
+    <style>
+        html, body {
+            margin: 0;
+            font-size: 12px;
+            font-family: "Source Code Pro", monospace;
+        }
+
+        @media screen {
+            .page {
+                margin-left: 4rem;
+                margin-right: 4rem;
+            }
+        }
+
+        .header {
+            display: flex;
+            gap: 2rem;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 3rem;
+            margin: 2rem 0;
+        }
+
+        .billing {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+        }
+
+        .flex-col {
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        td, th {
+            border: 1px solid #ccc;
+            padding: 0.4em 0.1em;
+        }
+
+        .total {
+            text-align: end;
+            font-size: 16px;
+            font-weight: bold;
+            padding: 0.5em 0.2em;
+        }
+    </style>
+</head>
+<body>
+<div class="page">
+    <div class="header">
+        LNVPS
+        <img height="48" width="48" src="https://lnvps.net/logo.jpg" alt="logo"/>
+    </div>
+    <hr/>
+    <h2>Invoice</h2>
+    <div class="flex-col">
+        <div>
+            <b>ID:</b>
+            {{payment.id}}
+        </div>
+        <div>
+            <b>Date:</b>
+            {{payment.created}}
+        </div>
+        <div>
+            <b>Status:</b>
+            {{#payment.is_paid}}Paid{{/payment.is_paid}}
+            {{^payment.is_paid}}Unpaid{{/payment.is_paid}}
+        </div>
+        <div>
+            <b>Nostr Pubkey:</b>
+            {{npub}}
+        </div>
+    </div>
+    <div class="billing">
+        <div class="flex-col">
+            <h2>Bill To:</h2>
+            <div>{{user.name}}</div>
+            <div>{{user.address_1}}</div>
+            <div>{{user.address_2}}</div>
+            <div>{{user.city}}</div>
+            <div>{{user.state}}</div>
+            <div>{{user.postcode}}</div>
+            <div>{{user.country}}</div>
+            <div>{{user.tax_id}}</div>
+        </div>
+        {{#company}}
+        <div class="flex-col">
+            <h2>&nbsp;</h2>
+            <div>{{company.name}}</div>
+            <div>{{company.address_1}}</div>
+            <div>{{company.address_2}}</div>
+            <div>{{company.city}}</div>
+            <div>{{company.state}}</div>
+            <div>{{company.postcode}}</div>
+            <div>{{company.country}}</div>
+            <div>{{company.tax_id}}</div>
+        </div>
+        {{/company}}
+    </div>
+    <hr/>
+    <h2>Details:</h2>
+    <table>
+        <thead>
+        <tr>
+            <th>Description</th>
+            <th>Currency</th>
+            <th>Gross</th>
+            <th>Taxes</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr>
+            <td>
+                VM Renewal #{{vm.id}}
+                - {{vm.template.name}}
+                - {{vm.image.distribution}} {{vm.image.version}}
+                - {{payment.time}} seconds
+            </td>
+            <td>{{payment.currency}}</td>
+            <td>{{payment.amount}}</td>
+            <td>{{payment.tax}}</td>
+        </tr>
+        </tbody>
+        <tbody>
+        <tr>
+            <td colspan="4" class="total">
+                Total: {{total}}
+            </td>
+        </tr>
+        </tbody>
+    </table>
+    <br/>
+    <b>
+        All BTC amounts are in milli-satoshis and all fiat amounts are in cents.
+    </b>
+    <hr/>
+    <small>
+        (c) {{year}} LNVPS.net - Generated at {{current_date}}
+    </small>
+</div>
+</body>
+</html>
