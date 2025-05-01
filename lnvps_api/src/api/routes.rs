@@ -565,10 +565,15 @@ async fn v1_renew_vm(
 /// Extend a VM by LNURL payment
 #[get("/api/v1/vm/<id>/renew-lnurlp?<amount>")]
 async fn v1_renew_vm_lnurlp(
+    db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
     id: u64,
     amount: u64,
 ) -> Result<Json<LnURLPayInvoice>, &'static str> {
+    let vm = db.get_vm(id).await.map_err(|_e| "VM not found")?;
+    if vm.deleted {
+        return Err("VM not found");
+    }
     if amount < 1000 {
         return Err("Amount must be greater than 1000");
     }
@@ -593,7 +598,10 @@ async fn v1_lnurlp(
     settings: &State<Settings>,
     id: u64,
 ) -> Result<Json<PayResponse>, &'static str> {
-    db.get_vm(id).await.map_err(|_e| "VM not found")?;
+    let vm = db.get_vm(id).await.map_err(|_e| "VM not found")?;
+    if vm.deleted {
+        return Err("VM not found");
+    }
 
     let meta = vec![vec!["text/plain".to_string(), format!("Extend VM {}", id)]];
     let rsp = PayResponse {
