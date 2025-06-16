@@ -196,7 +196,8 @@ impl Worker {
             self.check_vm(vm).await?;
 
             // delete vm if not paid (in new state)
-            if vm.expires < Utc::now().sub(Days::new(1)) {
+            if vm.created == vm.expires && !vm.deleted && vm.expires < Utc::now().sub(Days::new(1))
+            {
                 info!("Deleting unpaid VM {}", vm.id);
                 self.provisioner.delete_vm(vm.id).await?;
             }
