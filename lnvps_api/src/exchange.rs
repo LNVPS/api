@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Result};
 use lnvps_db::async_trait;
-use log::info;
+use log::{info, trace};
 use rocket::serde::Deserialize;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -210,7 +210,7 @@ impl ExchangeRateService for DefaultRateCache {
 
     async fn set_rate(&self, ticker: Ticker, amount: f32) {
         let mut cache = self.cache.write().await;
-        info!("{}: {}", &ticker, amount);
+        trace!("{}: {}", &ticker, amount);
         cache.insert(ticker, amount);
     }
 
