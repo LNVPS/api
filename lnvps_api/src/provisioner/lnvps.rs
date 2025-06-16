@@ -459,6 +459,7 @@ impl LNVpsProvisioner {
         // insert custom templates
         let template_id = self.db.insert_custom_vm_template(&template).await?;
 
+        let now = Utc::now();
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -467,8 +468,8 @@ impl LNVpsProvisioner {
             template_id: None,
             custom_template_id: Some(template_id),
             ssh_key_id: ssh_key.id,
-            created: Utc::now(),
-            expires: Utc::now(),
+            created: now,
+            expires: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
