@@ -1,4 +1,4 @@
-use crate::host::get_host_client;
+use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
@@ -300,7 +300,7 @@ impl Worker {
 
         let mut host_disks = self.db.list_host_disks(host.id).await?;
         for disk in &info.disks {
-            if let Some(mut hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
+            if let Some(hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
                 if hd.size != disk.size {
                     hd.size = disk.size;
                     self.db.update_host_disk(hd).await?;
@@ -313,6 +313,25 @@ impl Worker {
                 warn!("Un-mapped host disk {}", disk.name);
             }
         }
+
+        // Patch firewall configuration for all VMs on this host
+        let vms = self.db.list_vms_on_host(host.id).await?;
+        for vm in &vms {
+            if !vm.deleted && vm.expires > Utc::now() {
+                info!("Patching firewall for VM {} on host {}", vm.id, host.name);
+                match FullVmInfo::load(vm.id, self.db.clone()).await {
+                    Ok(vm_config) => {
+                        if let Err(e) = client.patch_firewall(&vm_config).await {
+                            warn!("Failed to patch firewall for VM {}: {}", vm.id, e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to load VM config for VM {}: {}", vm.id, e);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 

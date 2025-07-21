@@ -10,7 +10,12 @@ use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
-use lnvps_db::{async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
+use lnvps_db::{
+    async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
+    LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm,
+    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
@@ -915,6 +920,10 @@ impl VmHostClient for MockVmHost {
 
     async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+        todo!()
     }
 
     async fn get_time_series_data(

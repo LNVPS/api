@@ -1,6 +1,6 @@
 use anyhow::{anyhow, ensure, Result};
 use lnvps_db::async_trait;
-use log::{info, trace};
+use log::trace;
 use rocket::serde::Deserialize;
 use schemars::JsonSchema;
 use serde::Serialize;

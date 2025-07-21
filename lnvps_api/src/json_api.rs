@@ -110,6 +110,10 @@ impl JsonApi {
         self.req(Method::POST, path, body).await
     }
 
+    pub async fn put<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
+        self.req(Method::PUT, path, body).await
+    }
+
     pub async fn req<T: DeserializeOwned, R: Serialize>(
         &self,
         method: Method,
@@ -134,7 +138,12 @@ impl JsonApi {
         #[cfg(debug_assertions)]
         debug!("<< {}", text);
         if status.is_success() {
-            Ok(serde_json::from_str(&text)?)
+            match serde_json::from_str(&text) {
+                Ok(t) => Ok(t),
+                Err(e) => {
+                    bail!("Failed to parse JSON from {}: {} {}", path, text, e);
+                }
+            }
         } else {
             bail!("{} {}: {}: {}", method, url, status, &text);
         }

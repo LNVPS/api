@@ -30,13 +30,13 @@ use rocket::{get, patch, post, routes, Responder, Route, State};
 use rocket_okapi::gen::OpenApiGenerator;
 use rocket_okapi::okapi::openapi3::Responses;
 use rocket_okapi::response::OpenApiResponderInner;
-use rocket_okapi::{openapi, openapi_get_routes, openapi_routes};
+use rocket_okapi::{openapi, openapi_get_routes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-use std::io::{BufWriter, Cursor};
+use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
@@ -376,7 +376,7 @@ async fn v1_list_vm_templates(
                 .map(|t| (t.disk_type, t.disk_interface, t.disk_size))
                 .fold(HashMap::new(), |mut acc, v| {
                     let k = (v.0.into(), v.1.into());
-                    if let Some(mut x) = acc.get_mut(&k) {
+                    if let Some(x) = acc.get_mut(&k) {
                         if *x < v.2 {
                             *x = v.2;
                         }

@@ -153,6 +153,8 @@ pub struct QemuConfig {
     pub kvm: bool,
     /// CPU architecture
     pub arch: String,
+    /// Enable firewall when creating VM's
+    pub firewall: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -223,6 +225,7 @@ pub fn mock_settings() -> Settings {
                     cpu: "kvm64".to_string(),
                     kvm: false,
                     arch: "x86_64".to_string(),
+                    firewall: true,
                 },
                 ssh: None,
                 mac_prefix: Some("ff:ff:ff".to_string()),

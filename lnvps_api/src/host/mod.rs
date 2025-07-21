@@ -57,6 +57,9 @@ pub trait VmHostClient: Send + Sync {
     /// Apply vm configuration (patch)
     async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()>;
 
+    /// Update VM firewall configuration and IPsets
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()>;
+
     /// Get resource usage data
     async fn get_time_series_data(
         &self,

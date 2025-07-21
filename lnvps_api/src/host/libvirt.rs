@@ -207,6 +207,12 @@ impl VmHostClient for LibVirtHost {
         todo!()
     }
 
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()> {
+        // LibVirt doesn't have native firewall/IPset support like Proxmox
+        // This would typically be handled by the host's iptables/firewalld
+        Ok(())
+    }
+
     async fn get_time_series_data(
         &self,
         vm: &Vm,
@@ -617,6 +623,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            firewall: true,
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
         let xml = host.create_domain_xml(&cfg)?;
@@ -647,6 +654,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            firewall: true,
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
         println!("{:?}", host.get_info().await?);

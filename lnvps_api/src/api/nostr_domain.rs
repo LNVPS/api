@@ -6,9 +6,7 @@ use lnvps_db::{LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle};
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
 use rocket::{delete, get, post, routes, Route, State};
-use rocket_okapi::okapi::openapi3::OpenApi;
-use rocket_okapi::settings::OpenApiSettings;
-use rocket_okapi::{openapi, openapi_get_routes, openapi_routes, JsonSchema};
+use rocket_okapi::{openapi, JsonSchema};
 use std::sync::Arc;
 
 pub fn routes() -> Vec<Route> {

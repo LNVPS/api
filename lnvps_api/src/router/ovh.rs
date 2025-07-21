@@ -6,15 +6,10 @@ use lnvps_db::async_trait;
 use log::{info, warn};
 use nostr::hashes::{sha1, Hash};
 use nostr::Url;
-use reqwest::header::{HeaderName, HeaderValue, ACCEPT};
 use reqwest::{Method, RequestBuilder};
-use rocket::form::validate::Contains;
 use rocket::serde::Deserialize;
 use serde::Serialize;
 use std::ops::Sub;
-use std::str::FromStr;
-use std::sync::atomic::AtomicI64;
-use std::sync::Arc;
 
 /// This router is not really a router, but it allows
 /// managing the virtual mac's for additional IPs on OVH dedicated servers

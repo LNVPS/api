@@ -647,7 +647,7 @@ mod tests {
     const ROUTER_BRIDGE: &str = "bridge1";
 
     pub fn settings() -> Settings {
-        let mut settings = mock_settings();
+        let settings = mock_settings();
         settings
     }
 

@@ -13,8 +13,7 @@ use ipnetwork::IpNetwork;
 use lnvps_db::{async_trait, DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
-use reqwest::header::{HeaderMap, AUTHORIZATION};
-use reqwest::{ClientBuilder, Method, Url};
+use reqwest::{Method, Url};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
@@ -392,11 +391,171 @@ impl ProxmoxClient {
             .await?;
         Ok(())
     }
+
+    /// Get VM firewall config
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/options
+    pub async fn get_vm_firewall_config(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+    ) -> Result<VmFirewallConfig> {
+        let rsp: ResponseBase<VmFirewallConfig> = self
+            .api
+            .get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/firewall/options",
+                node, vm_id
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Configure VM firewall
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/options
+    pub async fn configure_vm_firewall(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        req: VmFirewallConfig,
+    ) -> Result<()> {
+        self.api
+            .req_status(
+                Method::PUT,
+                &format!("/api2/json/nodes/{}/qemu/{}/firewall/options", node, vm_id),
+                &req,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// List VM firewall IPsets
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset
+    pub async fn list_vm_ipsets(&self, node: &str, vm_id: ProxmoxVmId) -> Result<Vec<VmIpsetInfo>> {
+        let rsp: ResponseBase<Vec<VmIpsetInfo>> = self
+            .api
+            .get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/firewall/ipset",
+                node, vm_id
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Create VM firewall IPset
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset
+    pub async fn add_vm_ipset(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        req: CreateVmIpsetRequest,
+    ) -> Result<()> {
+        self.api
+            .req_status(
+                Method::POST,
+                &format!("/api2/json/nodes/{}/qemu/{}/firewall/ipset", node, vm_id),
+                &req,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Delete VM firewall IPset
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}
+    pub async fn remove_vm_ipset(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        ipset_name: &str,
+    ) -> Result<()> {
+        self.api
+            .req::<(), _>(
+                Method::DELETE,
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}",
+                    node, vm_id, ipset_name
+                ),
+                (),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// List entries in a VM firewall IPset
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}
+    pub async fn list_vm_ipset_entries(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        ipset_name: &str,
+    ) -> Result<Vec<VmIpsetEntry>> {
+        let rsp: ResponseBase<Vec<VmIpsetEntry>> = self
+            .api
+            .get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}",
+                node, vm_id, ipset_name
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Add entry to VM firewall IPset
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}
+    pub async fn add_vm_ipset_entry(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        ipset_name: &str,
+        req: CreateVmIpsetEntryRequest,
+    ) -> Result<()> {
+        self.api
+            .req_status(
+                Method::POST,
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}",
+                    node, vm_id, ipset_name
+                ),
+                &req,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Remove entry from VM firewall IPset
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}/{cidr}
+    pub async fn remove_vm_ipset_entry(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        ipset_name: &str,
+        cidr: &str,
+    ) -> Result<()> {
+        self.api
+            .req_status(
+                Method::DELETE,
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}/{}",
+                    node,
+                    vm_id,
+                    ipset_name,
+                    urlencoding::encode(cidr)
+                ),
+                (),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl ProxmoxClient {
     fn make_config(&self, value: &FullVmInfo) -> Result<VmConfig> {
-        let mut ip_config = value
+        let ip_config = value
             .ips
             .iter()
             .map_while(|ip| {
@@ -436,6 +595,9 @@ impl ProxmoxClient {
             format!("virtio={}", value.vm.mac_address),
             format!("bridge={}", self.config.bridge),
         ];
+        if self.config.firewall {
+            net.push("firewall=1".to_string());
+        }
         if let Some(t) = value.host.vlan_id {
             net.push(format!("tag={}", t));
         }
@@ -601,6 +763,9 @@ impl VmHostClient for ProxmoxClient {
         // import template image
         self.import_template_disk(&req).await?;
 
+        // apply firewall config and manage IPsets using patch_firewall
+        self.patch_firewall(req).await?;
+
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
             if let Err(e) = self.wait_for_task(&j_start).await {
@@ -701,6 +866,77 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()> {
+        let vm_id = cfg.vm.id.into();
+
+        // Re-apply firewall configuration
+        self.configure_vm_firewall(
+            &self.node,
+            vm_id,
+            VmFirewallConfig {
+                dhcp: Some(true),
+                enable: Some(true),
+                ip_filter: Some(true),
+                mac_filter: Some(true),
+                ndp: None,
+                policy_in: Some(VmFirewallPolicy::ACCEPT),
+                policy_out: Some(VmFirewallPolicy::ACCEPT),
+            },
+        )
+        .await?;
+
+        // Ensure ipfilter-net0 IPset exists
+        if let Err(_) = self
+            .list_vm_ipset_entries(&self.node, vm_id, "ipfilter-net0")
+            .await
+        {
+            self.add_vm_ipset(
+                &self.node,
+                vm_id,
+                CreateVmIpsetRequest {
+                    name: "ipfilter-net0".to_string(),
+                    comment: Some("Allowed IPv4 addresses for net0".to_string()),
+                    digest: None,
+                    rename: None,
+                },
+            )
+            .await?;
+        }
+
+        // Get existing entries to avoid duplicates
+        let existing_entries = self
+            .list_vm_ipset_entries(&self.node, vm_id, "ipfilter-net0")
+            .await?;
+        let existing_cidrs: std::collections::HashSet<String> = existing_entries
+            .iter()
+            .map(|entry| entry.cidr.clone())
+            .collect();
+
+        // Add new IPv4 addresses that don't already exist
+        for ip in &cfg.ips {
+            if let Ok(addr) = ip.ip.parse::<IpAddr>() {
+                if let IpAddr::V4(ipv4_addr) = addr {
+                    let ip_str = ipv4_addr.to_string();
+                    if !existing_cidrs.contains(&ip_str) {
+                        self.add_vm_ipset_entry(
+                            &self.node,
+                            vm_id,
+                            "ipfilter-net0",
+                            CreateVmIpsetEntryRequest {
+                                cidr: ip_str,
+                                comment: Some("VM IPv4 address".to_string()),
+                                nomatch: None,
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn get_time_series_data(
         &self,
         vm: &Vm,
@@ -724,7 +960,7 @@ impl VmHostClient for ProxmoxClient {
     async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream> {
         let vm_id: ProxmoxVmId = vm.id.into();
 
-        let (mut client_tx, client_rx) = channel::<Vec<u8>>(1024);
+        let (client_tx, client_rx) = channel::<Vec<u8>>(1024);
         let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);
         tokio::spawn(async move {
             // fire calls to read every 100ms
@@ -1149,6 +1385,73 @@ impl From<RrdDataPoint> for TimeSeriesData {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmFirewallConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<bool>,
+    #[serde(rename = "ipfilter")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_filter: Option<bool>,
+    #[serde(rename = "macfilter")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac_filter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ndp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_in: Option<VmFirewallPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_out: Option<VmFirewallPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VmFirewallPolicy {
+    ACCEPT,
+    REJECT,
+    DROP,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmIpsetInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmIpsetEntry {
+    pub cidr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nomatch: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateVmIpsetRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rename: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateVmIpsetEntryRequest {
+    pub cidr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nomatch: Option<bool>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,6 +1470,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            firewall: true,
         };
 
         let p = ProxmoxClient::new(
@@ -1183,7 +1487,8 @@ mod tests {
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
         assert_eq!(vm.on_boot, Some(true));
-        assert!(vm.net.unwrap().contains("tag=100"));
+        assert!(vm.net.as_ref().unwrap().contains("tag=100"));
+        assert!(vm.net.as_ref().unwrap().contains("firewall=1"));
         assert_eq!(
             vm.ip_config,
             Some(

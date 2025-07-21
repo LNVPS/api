@@ -1,11 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::builder::TypedValueParser;
-use ipnetwork::{IpNetwork, Ipv6Network};
+use ipnetwork::IpNetwork;
 use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb};
 use log::warn;
 use rand::prelude::IteratorRandom;
 use rocket::form::validate::Contains;
-use rocket::http::ext::IntoCollection;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
