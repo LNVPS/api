@@ -551,6 +551,43 @@ impl ProxmoxClient {
             .await?;
         Ok(())
     }
+
+    /// List VM firewall rules
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/rules
+    pub async fn list_vm_firewall_rules(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+    ) -> Result<Vec<VmFirewallRule>> {
+        let rsp: ResponseBase<Vec<VmFirewallRule>> = self
+            .api
+            .get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/firewall/rules",
+                node, vm_id
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Add VM firewall rule
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/rules
+    pub async fn add_vm_firewall_rule(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        req: VmFirewallRule,
+    ) -> Result<()> {
+        self.api
+            .req_status(
+                Method::POST,
+                &format!("/api2/json/nodes/{}/qemu/{}/firewall/rules", node, vm_id),
+                &req,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl ProxmoxClient {
@@ -879,7 +916,7 @@ impl VmHostClient for ProxmoxClient {
                 ip_filter: Some(true),
                 mac_filter: Some(true),
                 ndp: None,
-                policy_in: Some(VmFirewallPolicy::ACCEPT),
+                policy_in: Some(VmFirewallPolicy::DROP),
                 policy_out: Some(VmFirewallPolicy::ACCEPT),
             },
         )
@@ -912,26 +949,67 @@ impl VmHostClient for ProxmoxClient {
             .map(|entry| entry.cidr.clone())
             .collect();
 
-        // Add new IPv4 addresses that don't already exist
+        // Add new IPv4 and IPv6 addresses that don't already exist
         for ip in &cfg.ips {
             if let Ok(addr) = ip.ip.parse::<IpAddr>() {
-                if let IpAddr::V4(ipv4_addr) = addr {
-                    let ip_str = ipv4_addr.to_string();
-                    if !existing_cidrs.contains(&ip_str) {
-                        self.add_vm_ipset_entry(
-                            &self.node,
-                            vm_id,
-                            "ipfilter-net0",
-                            CreateVmIpsetEntryRequest {
-                                cidr: ip_str,
-                                comment: Some("VM IPv4 address".to_string()),
-                                nomatch: None,
-                            },
-                        )
-                        .await?;
+                match addr {
+                    IpAddr::V4(ipv4_addr) => {
+                        let ip_str = ipv4_addr.to_string();
+                        if !existing_cidrs.contains(&ip_str) {
+                            self.add_vm_ipset_entry(
+                                &self.node,
+                                vm_id,
+                                "ipfilter-net0",
+                                CreateVmIpsetEntryRequest {
+                                    cidr: ip_str,
+                                    comment: Some("VM IPv4 address".to_string()),
+                                    nomatch: None,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    IpAddr::V6(ipv6_addr) => {
+                        let ip_str = ipv6_addr.to_string();
+                        if !existing_cidrs.contains(&ip_str) {
+                            self.add_vm_ipset_entry(
+                                &self.node,
+                                vm_id,
+                                "ipfilter-net0",
+                                CreateVmIpsetEntryRequest {
+                                    cidr: ip_str,
+                                    comment: Some("VM IPv6 address".to_string()),
+                                    nomatch: None,
+                                },
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
+        }
+
+        // Add firewall rule to allow traffic from ipfilter-net0 IPset
+        let allow_rule = VmFirewallRule {
+            action: VmFirewallAction::ACCEPT,
+            dest: Some("+guest/ipfilter-net0".to_string()),
+            rule_type: VmFirewallRuleType::In,
+            enable: Some(1),
+            comment: Some("Allow traffic to ipfilter-net0 IPset".to_string()),
+            ..Default::default()
+        };
+
+        // Check if this rule already exists to avoid duplicates
+        let existing_rules = self.list_vm_firewall_rules(&self.node, vm_id).await?;
+        let rule_exists = existing_rules.iter().any(|rule| {
+            rule.action == VmFirewallAction::ACCEPT
+                && rule.dest.as_deref() == Some("+guest/ipfilter-net0")
+                && rule.rule_type == VmFirewallRuleType::In
+        });
+
+        if !rule_exists {
+            self.add_vm_firewall_rule(&self.node, vm_id, allow_rule)
+                .await?;
         }
 
         Ok(())
@@ -1412,6 +1490,23 @@ pub enum VmFirewallPolicy {
     DROP,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum VmFirewallAction {
+    #[default]
+    ACCEPT,
+    REJECT,
+    DROP,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VmFirewallRuleType {
+    #[default]
+    In,
+    Out,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmIpsetInfo {
     pub name: String,
@@ -1450,6 +1545,38 @@ pub struct CreateVmIpsetEntryRequest {
     pub comment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nomatch: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VmFirewallRule {
+    pub action: VmFirewallAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+    #[serde(rename = "macro")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macro_: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sport: Option<String>,
+    #[serde(rename = "type")]
+    pub rule_type: VmFirewallRuleType,
 }
 
 #[cfg(test)]
