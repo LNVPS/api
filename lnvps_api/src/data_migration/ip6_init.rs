@@ -31,6 +31,10 @@ impl DataMigration for Ip6InitDataMigration {
                 if vm.expires < Utc::now() {
                     continue;
                 }
+                // skip VM with no assigned mac
+                if vm.mac_address == "ff:ff:ff:ff:ff:ff" {
+                    continue;
+                }
                 let host = db.get_host(vm.host_id).await?;
                 let ips = db.list_vm_ip_assignments(vm.id).await?;
                 // if no ipv6 address is picked already pick one
