@@ -3,7 +3,7 @@ use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
 use anyhow::{bail, Result};
-use chrono::{DateTime, Datelike, Days, Utc};
+use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
@@ -47,6 +47,8 @@ pub struct Worker {
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
     last_check_vms: DateTime<Utc>,
+    next_check_vms_allowed: DateTime<Utc>,
+    check_vms_delay_seconds: u64,
 }
 
 pub struct WorkerSettings {
@@ -83,6 +85,8 @@ impl Worker {
             tx,
             rx,
             last_check_vms: Utc::now(),
+            next_check_vms_allowed: Utc::now(),
+            check_vms_delay_seconds: 30,
         }
     }
 
@@ -373,12 +377,35 @@ impl Worker {
                 }
             }
             WorkJob::CheckVms => {
-                if let Err(e) = self.check_vms().await {
-                    error!("Failed to check VMs: {}", e);
-                    self.queue_admin_notification(
-                        format!("Failed to check VM's:\n{:?}\n{}", &job, e),
-                        Some("Job Failed".to_string()),
-                    )?
+                let now = Utc::now();
+                
+                // Skip if too soon based on exponential backoff
+                if now < self.next_check_vms_allowed {
+                    let remaining = self.next_check_vms_allowed.signed_duration_since(now);
+                    debug!("Skipping CheckVms job, next allowed in {}s", remaining.num_seconds());
+                    return Ok(());
+                }
+                
+                match self.check_vms().await {
+                    Ok(_) => {
+                        // Success - reset delay to default
+                        self.check_vms_delay_seconds = 30;
+                        self.next_check_vms_allowed = now + ChronoDuration::seconds(30);
+                        debug!("CheckVms succeeded, next check in 30s");
+                    }
+                    Err(e) => {
+                        // Failure - apply exponential backoff
+                        error!("Failed to check VMs: {}", e);
+                        self.check_vms_delay_seconds = (self.check_vms_delay_seconds * 2).min(600); // Max 10 minutes
+                        self.next_check_vms_allowed = now + ChronoDuration::seconds(self.check_vms_delay_seconds as i64);
+                        
+                        warn!("CheckVms failed, backing off to {}s delay", self.check_vms_delay_seconds);
+                        
+                        self.queue_admin_notification(
+                            format!("Failed to check VM's:\n{:?}\n{}", &job, e),
+                            Some("Job Failed".to_string()),
+                        )?
+                    }
                 }
             }
         }
