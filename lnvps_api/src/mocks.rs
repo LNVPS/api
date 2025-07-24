@@ -690,6 +690,14 @@ impl LNVpsDb for MockDb {
         Ok(r.get(&router_id).cloned().context("no router")?)
     }
 
+    async fn list_routers(&self) -> anyhow::Result<Vec<lnvps_db::Router>> {
+        todo!()
+    }
+
+    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> anyhow::Result<VmIpAssignment> {
+        todo!()
+    }
+
     async fn get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> {
         let p = self.access_policy.lock().await;
         Ok(p.get(&access_policy_id)
