@@ -170,6 +170,12 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
     /// Get router config
     async fn get_router(&self, router_id: u64) -> Result<Router>;
 
+    /// List all routers
+    async fn list_routers(&self) -> Result<Vec<Router>>;
+
+    /// Get VM IP assignment by IP address
+    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> Result<VmIpAssignment>;
+
     /// Get access policy
     async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy>;
 

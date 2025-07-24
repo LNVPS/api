@@ -1,3 +1,4 @@
+use crate::data_migration::arp_ref_fixer::ArpRefFixerDataMigration;
 use crate::data_migration::dns::DnsDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::provisioner::LNVpsProvisioner;
@@ -9,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod arp_ref_fixer;
 mod dns;
 mod ip6_init;
 
@@ -31,6 +33,11 @@ pub async fn run_data_migrations(
     if let Some(d) = DnsDataMigration::new(db.clone(), settings) {
         migrations.push(Box::new(d));
     }
+
+    migrations.push(Box::new(ArpRefFixerDataMigration::new(
+        db.clone(),
+        lnvps.clone(),
+    )));
 
     info!("Running {} data migrations", migrations.len());
     for migration in migrations {

@@ -551,6 +551,21 @@ impl LNVpsDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn list_routers(&self) -> Result<Vec<Router>> {
+        sqlx::query_as("select * from router")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> Result<VmIpAssignment> {
+        sqlx::query_as("select * from vm_ip_assignment where ip=? and deleted=0")
+            .bind(ip)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy> {
         sqlx::query_as("select * from access_policy where id=?")
             .bind(access_policy_id)

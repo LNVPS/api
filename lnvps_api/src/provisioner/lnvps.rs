@@ -64,7 +64,7 @@ impl LNVpsProvisioner {
         }
     }
 
-    async fn get_router(&self, router_id: u64) -> Result<Arc<dyn Router>> {
+    pub async fn get_router(&self, router_id: u64) -> Result<Arc<dyn Router>> {
         #[cfg(test)]
         return Ok(Arc::new(crate::mocks::MockRouter::new()));
 
