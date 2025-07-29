@@ -14,7 +14,7 @@ use lnvps_db::{
     async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
     LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm,
     VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmHistory, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
 use std::ops::Add;
@@ -41,6 +41,7 @@ pub struct MockDb {
     pub payments: Arc<Mutex<Vec<VmPayment>>>,
     pub router: Arc<Mutex<HashMap<u64, lnvps_db::Router>>>,
     pub access_policy: Arc<Mutex<HashMap<u64, AccessPolicy>>>,
+    pub vm_history: Arc<Mutex<HashMap<u64, VmHistory>>>,
 }
 
 impl MockDb {
@@ -203,6 +204,7 @@ impl Default for MockDb {
             payments: Arc::new(Default::default()),
             router: Arc::new(Default::default()),
             access_policy: Arc::new(Default::default()),
+            vm_history: Arc::new(Default::default()),
         }
     }
 }
@@ -707,6 +709,46 @@ impl LNVpsDb for MockDb {
 
     async fn get_company(&self, company_id: u64) -> anyhow::Result<Company> {
         todo!()
+    }
+
+    async fn insert_vm_history(&self, history: &VmHistory) -> anyhow::Result<u64> {
+        let mut vm_history_map = self.vm_history.lock().await;
+        let id = (vm_history_map.len() + 1) as u64;
+        let mut new_history = history.clone();
+        new_history.id = id;
+        vm_history_map.insert(id, new_history);
+        Ok(id)
+    }
+
+    async fn list_vm_history(&self, vm_id: u64) -> anyhow::Result<Vec<VmHistory>> {
+        let vm_history_map = self.vm_history.lock().await;
+        let mut history: Vec<VmHistory> = vm_history_map
+            .values()
+            .filter(|h| h.vm_id == vm_id)
+            .cloned()
+            .collect();
+        // Sort by timestamp descending (newest first)
+        history.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(history)
+    }
+
+    async fn list_vm_history_paginated(&self, vm_id: u64, limit: u64, offset: u64) -> anyhow::Result<Vec<VmHistory>> {
+        let all_history = self.list_vm_history(vm_id).await?;
+        let start = offset as usize;
+        let end = (start + limit as usize).min(all_history.len());
+        if start >= all_history.len() {
+            Ok(vec![])
+        } else {
+            Ok(all_history[start..end].to_vec())
+        }
+    }
+
+    async fn get_vm_history(&self, id: u64) -> anyhow::Result<VmHistory> {
+        let vm_history_map = self.vm_history.lock().await;
+        vm_history_map
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VM history not found: {}", id))
     }
 }
 
