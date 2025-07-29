@@ -634,3 +634,41 @@ impl From<lnvps_db::Company> for ApiCompany {
         }
     }
 }
+
+#[derive(Serialize, JsonSchema)]
+pub struct ApiVmHistory {
+    /// Unique history entry ID
+    pub id: u64,
+    /// VM ID this history entry belongs to
+    pub vm_id: u64,
+    /// Type of action that was performed
+    pub action_type: String,
+    /// When this action occurred
+    pub timestamp: DateTime<Utc>,
+    /// User ID who initiated this action (null for system actions)
+    pub initiated_by_user: Option<u64>,
+    /// Previous VM state/configuration if applicable (JSON)
+    pub previous_state: Option<String>,
+    /// New VM state/configuration if applicable (JSON)
+    pub new_state: Option<String>,
+    /// Additional metadata about the action (JSON)
+    pub metadata: Option<String>,
+    /// Human-readable description of the action
+    pub description: Option<String>,
+}
+
+impl From<lnvps_db::VmHistory> for ApiVmHistory {
+    fn from(value: lnvps_db::VmHistory) -> Self {
+        Self {
+            id: value.id,
+            vm_id: value.vm_id,
+            action_type: value.action_type.to_string(),
+            timestamp: value.timestamp,
+            initiated_by_user: value.initiated_by_user,
+            previous_state: value.previous_state.map(|v| String::from_utf8_lossy(&v).to_string()),
+            new_state: value.new_state.map(|v| String::from_utf8_lossy(&v).to_string()),
+            metadata: value.metadata.map(|v| String::from_utf8_lossy(&v).to_string()),
+            description: value.description,
+        }
+    }
+}

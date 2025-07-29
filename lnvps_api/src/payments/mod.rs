@@ -26,7 +26,7 @@ pub fn listen_all_payments(
             if let Err(e) = handler.listen().await {
                 error!("invoice-error: {}", e);
             }
-            sleep(Duration::from_secs(30)).await;
+            sleep(Duration::from_secs(1)).await;
         }
     });
 

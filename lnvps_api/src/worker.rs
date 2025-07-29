@@ -2,9 +2,10 @@ use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
+use crate::vm_history::VmHistoryLogger;
 use crate::GB;
 use anyhow::{bail, Result};
-use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
@@ -43,13 +44,12 @@ pub struct Worker {
     db: Arc<dyn LNVpsDb>,
     provisioner: Arc<LNVpsProvisioner>,
     nostr: Option<Client>,
+    vm_history_logger: VmHistoryLogger,
 
     vm_state_cache: VmStateCache,
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
     last_check_vms: DateTime<Utc>,
-    next_check_vms_allowed: DateTime<Utc>,
-    check_vms_delay_seconds: u64,
 }
 
 pub struct WorkerSettings {
@@ -77,17 +77,17 @@ impl Worker {
         nostr: Option<Client>,
     ) -> Self {
         let (tx, rx) = unbounded_channel();
+        let vm_history_logger = VmHistoryLogger::new(db.clone());
         Self {
             db,
             provisioner,
             vm_state_cache,
             nostr,
+            vm_history_logger,
             settings: settings.into(),
             tx,
             rx,
             last_check_vms: Utc::now(),
-            next_check_vms_allowed: Utc::now(),
-            check_vms_delay_seconds: 30,
         }
     }
 
@@ -122,6 +122,10 @@ impl Worker {
             info!("Stopping expired VM {}", vm.id);
             if let Err(e) = self.provisioner.stop_vm(vm.id).await {
                 warn!("Failed to stop VM {}: {}", vm.id, e);
+            } else {
+                if let Err(e) = self.vm_history_logger.log_vm_expired(vm.id, None).await {
+                    warn!("Failed to log VM {} expiration: {}", vm.id, e);
+                }
             }
             self.tx.send(WorkJob::SendNotification {
                     user_id: vm.user_id,
@@ -135,6 +139,16 @@ impl Worker {
         {
             info!("Deleting expired VM {}", vm.id);
             self.provisioner.delete_vm(vm.id).await?;
+
+            // Log VM deletion
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_deleted(vm.id, None, Some("expired and exceeded grace period"), None)
+                .await
+            {
+                warn!("Failed to log VM {} deletion: {}", vm.id, e);
+            }
+
             let title = Some(format!("[VM{}] Deleted", vm.id));
             self.tx.send(WorkJob::SendNotification {
                 user_id: vm.user_id,
@@ -171,6 +185,16 @@ impl Worker {
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
         self.provisioner.spawn_vm(vm.id).await?;
+
+        // Log VM created
+        if let Err(e) = self
+            .vm_history_logger
+            .log_vm_started(vm.id, None, None)
+            .await
+        {
+            warn!("Failed to log VM {} creation: {}", vm.id, e);
+        }
+
         let vm_ips = self.db.list_vm_ip_assignments(vm.id).await?;
         let image = self.db.get_os_image(vm.image_id).await?;
         let user = self.db.get_user(vm.user_id).await?;
@@ -207,14 +231,38 @@ impl Worker {
         // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
         for vm in &db_vms {
-            // Refresh VM status if active
-            self.check_vm(vm).await?;
+            let is_new_vm = vm.created == vm.expires;
+
+            // only check spawned vms
+            if !is_new_vm {
+                // Refresh VM status if active
+                if let Err(e) = self.check_vm(vm).await {
+                    error!("Failed to check VM {}: {}", vm.id, e);
+                    if let Err(notification_err) = self.queue_admin_notification(
+                        format!("Failed to check VM {}:\n{}", vm.id, e),
+                        Some(format!("VM {} Check Failed", vm.id)),
+                    ) {
+                        error!("Failed to queue admin notification: {}", notification_err);
+                    }
+                    // Continue with next VM instead of failing the entire check
+                    continue;
+                }
+            }
 
             // delete vm if not paid (in new state)
-            if vm.created == vm.expires && !vm.deleted && vm.expires < Utc::now().sub(Days::new(1))
-            {
+            if is_new_vm && !vm.deleted && vm.expires < Utc::now().sub(Days::new(1)) {
                 info!("Deleting unpaid VM {}", vm.id);
-                self.provisioner.delete_vm(vm.id).await?;
+                if let Err(e) = self.provisioner.delete_vm(vm.id).await {
+                    error!("Failed to delete unpaid VM {}: {}", vm.id, e);
+                    if let Err(notification_err) = self.queue_admin_notification(
+                        format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
+                        Some(format!("VM {} Deletion Failed", vm.id)),
+                    ) {
+                        error!("Failed to queue admin notification: {}", notification_err);
+                    }
+                    // Continue with next VM
+                    continue;
+                }
             }
         }
 
@@ -388,42 +436,12 @@ impl Worker {
                 }
             }
             WorkJob::CheckVms => {
-                let now = Utc::now();
-
-                // Skip if too soon based on exponential backoff
-                if now < self.next_check_vms_allowed {
-                    let remaining = self.next_check_vms_allowed.signed_duration_since(now);
-                    debug!(
-                        "Skipping CheckVms job, next allowed in {}s",
-                        remaining.num_seconds()
-                    );
-                    return Ok(());
-                }
-
-                match self.check_vms().await {
-                    Ok(_) => {
-                        // Success - reset delay to default
-                        self.check_vms_delay_seconds = 30;
-                        self.next_check_vms_allowed = now + ChronoDuration::seconds(30);
-                        debug!("CheckVms succeeded, next check in 30s");
-                    }
-                    Err(e) => {
-                        // Failure - apply exponential backoff
-                        error!("Failed to check VMs: {}", e);
-                        self.check_vms_delay_seconds = (self.check_vms_delay_seconds * 2).min(600); // Max 10 minutes
-                        self.next_check_vms_allowed =
-                            now + ChronoDuration::seconds(self.check_vms_delay_seconds as i64);
-
-                        warn!(
-                            "CheckVms failed, backing off to {}s delay",
-                            self.check_vms_delay_seconds
-                        );
-
-                        self.queue_admin_notification(
-                            format!("Failed to check VM's:\n{:?}\n{}", &job, e),
-                            Some("Job Failed".to_string()),
-                        )?
-                    }
+                if let Err(e) = self.check_vms().await {
+                    error!("Failed to check VMs: {}", e);
+                    self.queue_admin_notification(
+                        format!("Failed to check VMs:\n{:?}\n{}", &job, e),
+                        Some("CheckVms Job Failed".to_string()),
+                    )?
                 }
             }
         }

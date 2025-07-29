@@ -1,6 +1,7 @@
 use crate::api::{WebhookMessage, WEBHOOK_BRIDGE};
 use crate::fiat::{RevolutApi, RevolutWebhookEvent};
 use crate::settings::RevolutConfig;
+use crate::vm_history::VmHistoryLogger;
 use crate::worker::WorkJob;
 use anyhow::{anyhow, bail, Context, Result};
 use hmac::{Hmac, Mac};
@@ -17,6 +18,7 @@ pub struct RevolutPaymentHandler {
     db: Arc<dyn LNVpsDb>,
     sender: UnboundedSender<WorkJob>,
     public_url: String,
+    vm_history_logger: VmHistoryLogger,
 }
 
 impl RevolutPaymentHandler {
@@ -26,11 +28,13 @@ impl RevolutPaymentHandler {
         db: Arc<dyn LNVpsDb>,
         sender: UnboundedSender<WorkJob>,
     ) -> Result<Self> {
+        let vm_history_logger = VmHistoryLogger::new(db.clone());
         Ok(Self {
             api: RevolutApi::new(settings)?,
             public_url: public_url.to_string(),
             db,
             sender,
+            vm_history_logger,
         })
     }
 
@@ -79,6 +83,9 @@ impl RevolutPaymentHandler {
     async fn try_complete_payment(&self, ext_id: &str) -> Result<()> {
         let mut p = self.db.get_vm_payment_by_ext_id(ext_id).await?;
 
+        // Get VM state before payment processing
+        let vm_before = self.db.get_vm(p.vm_id).await?;
+
         // save payment state json into external_data
         // TODO: encrypt payment_data
         let order = self.api.get_order(ext_id).await?;
@@ -102,6 +109,44 @@ impl RevolutPaymentHandler {
         }
 
         self.db.vm_payment_paid(&p).await?;
+        
+        // Get VM state after payment processing
+        let vm_after = self.db.get_vm(p.vm_id).await?;
+
+        // Log payment received in VM history
+        let payment_metadata = serde_json::json!({
+            "external_id": ext_id,
+            "payment_method": "revolut"
+        });
+        
+        if let Err(e) = self.vm_history_logger.log_vm_payment_received(
+            p.vm_id,
+            p.amount,
+            &p.currency,
+            p.time_value,
+            Some(payment_metadata)
+        ).await {
+            warn!("Failed to log payment for VM {}: {}", p.vm_id, e);
+        }
+        
+        // Log VM renewal if this extends the expiration
+        if p.time_value > 0 {
+            if let Err(e) = self.vm_history_logger.log_vm_renewed(
+                p.vm_id,
+                None,
+                vm_before.expires,
+                vm_after.expires,
+                Some(p.amount),
+                Some(&p.currency),
+                Some(serde_json::json!({
+                    "time_added_seconds": p.time_value,
+                    "external_id": ext_id
+                }))
+            ).await {
+                warn!("Failed to log VM {} renewal: {}", p.vm_id, e);
+            }
+        }
+
         self.sender.send(WorkJob::CheckVm { vm_id: p.vm_id })?;
         info!("VM payment {} for {}, paid", hex::encode(p.id), p.vm_id);
         Ok(())

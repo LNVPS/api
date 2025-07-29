@@ -1,6 +1,6 @@
 use crate::api::model::{
     AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse, ApiUserSshKey,
+    ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse, ApiUserSshKey, ApiVmHistory,
     ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
     CreateVmRequest, VMPatchRequest,
 };
@@ -10,6 +10,7 @@ use crate::nip98::Nip98Auth;
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::status::{VmState, VmStateCache};
+use crate::vm_history::VmHistoryLogger;
 use crate::worker::WorkJob;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Utc};
@@ -65,7 +66,8 @@ pub fn routes() -> Vec<Route> {
         v1_custom_template_calc,
         v1_create_custom_vm_order,
         v1_get_payment_methods,
-        v1_payment_history
+        v1_payment_history,
+        v1_get_vm_history,
     ];
     #[cfg(feature = "nostr-domain")]
     api_routes.append(&mut super::nostr_domain::routes());
@@ -248,16 +250,18 @@ async fn v1_patch_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
     settings: &State<Settings>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     id: u64,
     data: Json<VMPatchRequest>,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = db.upsert_user(&pubkey).await?;
-    let mut vm = db.get_vm(id).await?;
-    if vm.user_id != uid {
+    let old_vm = db.get_vm(id).await?;
+    if old_vm.user_id != uid {
         return ApiData::err("VM doesnt belong to you");
     }
 
+    let mut vm = old_vm.clone();
     let mut vm_config = false;
     if let Some(k) = data.ssh_key_id {
         let ssh_key = db.get_user_ssh_key(k).await?;
@@ -283,6 +287,11 @@ async fn v1_patch_vm(
         let host = db.get_host(vm.host_id).await?;
         let client = get_host_client(&host, &settings.provisioner)?;
         client.configure_vm(&info).await?;
+
+        // Log VM configuration change
+        let _ = vm_history
+            .log_vm_configuration_changed(vm.id, Some(uid), &old_vm, &vm, None)
+            .await;
     }
 
     ApiData::ok(())
@@ -437,6 +446,7 @@ async fn v1_create_custom_vm_order(
     auth: Nip98Auth,
     db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     req: Json<ApiCustomVmOrder>,
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -448,6 +458,10 @@ async fn v1_create_custom_vm_order(
     let rsp = provisioner
         .provision_custom(uid, template, req.image_id, req.ssh_key_id, req.0.ref_code)
         .await?;
+
+    // Log VM creation
+    let _ = vm_history.log_vm_created(&rsp, Some(uid), None).await;
+
     ApiData::ok(vm_to_status(db, rsp, None).await?)
 }
 
@@ -508,6 +522,7 @@ async fn v1_create_vm_order(
     auth: Nip98Auth,
     db: &State<Arc<dyn LNVpsDb>>,
     provisioner: &State<Arc<LNVpsProvisioner>>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     req: Json<CreateVmRequest>,
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -523,6 +538,10 @@ async fn v1_create_vm_order(
             req.ref_code,
         )
         .await?;
+
+    // Log VM creation
+    let _ = vm_history.log_vm_created(&rsp, Some(uid), None).await;
+
     ApiData::ok(vm_to_status(db, rsp, None).await?)
 }
 
@@ -621,6 +640,7 @@ async fn v1_start_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     id: u64,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -632,6 +652,9 @@ async fn v1_start_vm(
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
     client.start_vm(&vm).await?;
+
+    // Log VM start
+    let _ = vm_history.log_vm_started(id, Some(uid), None).await;
 
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
@@ -645,6 +668,7 @@ async fn v1_stop_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     id: u64,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -657,6 +681,9 @@ async fn v1_stop_vm(
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
     client.stop_vm(&vm).await?;
+
+    // Log VM stop
+    let _ = vm_history.log_vm_stopped(id, Some(uid), None).await;
 
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
@@ -670,6 +697,7 @@ async fn v1_restart_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     id: u64,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -683,6 +711,9 @@ async fn v1_restart_vm(
     let client = get_host_client(&host, &settings.provisioner)?;
     client.stop_vm(&vm).await?;
 
+    // Log VM restart
+    let _ = vm_history.log_vm_restarted(id, Some(uid), None).await;
+
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
 }
@@ -695,6 +726,7 @@ async fn v1_reinstall_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     settings: &State<Settings>,
     worker: &State<UnboundedSender<WorkJob>>,
+    vm_history: &State<Arc<VmHistoryLogger>>,
     id: u64,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
@@ -704,10 +736,16 @@ async fn v1_reinstall_vm(
         return ApiData::err("VM does not belong to you");
     }
 
+    let old_image_id = vm.image_id;
     let host = db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &settings.provisioner)?;
     let info = FullVmInfo::load(vm.id, (*db).clone()).await?;
     client.reinstall_vm(&info).await?;
+
+    // Log VM reinstall (assuming same image ID for now)
+    let _ = vm_history
+        .log_vm_reinstalled(id, Some(uid), old_image_id, old_image_id, None)
+        .await;
 
     worker.send(WorkJob::CheckVm { vm_id: id })?;
     ApiData::ok(())
@@ -996,4 +1034,29 @@ async fn v1_payment_history(
 
     let payments = db.list_vm_payment(id).await?;
     ApiData::ok(payments.into_iter().map(|i| i.into()).collect())
+}
+
+/// List action history of a VM
+#[openapi(tag = "VM")]
+#[get("/api/v1/vm/<id>/history?<limit>&<offset>")]
+async fn v1_get_vm_history(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    id: u64,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> ApiResult<Vec<ApiVmHistory>> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    let history = match (limit, offset) {
+        (Some(limit), Some(offset)) => db.list_vm_history_paginated(id, limit, offset).await?,
+        _ => db.list_vm_history(id).await?,
+    };
+
+    ApiData::ok(history.into_iter().map(|h| h.into()).collect())
 }

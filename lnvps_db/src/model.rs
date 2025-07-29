@@ -541,3 +541,71 @@ pub struct Company {
     pub phone: Option<String>,
     pub email: Option<String>,
 }
+
+#[derive(Clone, Debug, sqlx::Type)]
+#[repr(u16)]
+pub enum VmHistoryActionType {
+    Created = 0,
+    Started = 1,
+    Stopped = 2,
+    Restarted = 3,
+    Deleted = 4,
+    Expired = 5,
+    Renewed = 6,
+    Reinstalled = 7,
+    StateChanged = 8,
+    PaymentReceived = 9,
+    ConfigurationChanged = 10,
+}
+
+impl Display for VmHistoryActionType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmHistoryActionType::Created => write!(f, "created"),
+            VmHistoryActionType::Started => write!(f, "started"),
+            VmHistoryActionType::Stopped => write!(f, "stopped"),
+            VmHistoryActionType::Restarted => write!(f, "restarted"),
+            VmHistoryActionType::Deleted => write!(f, "deleted"),
+            VmHistoryActionType::Expired => write!(f, "expired"),
+            VmHistoryActionType::Renewed => write!(f, "renewed"),
+            VmHistoryActionType::Reinstalled => write!(f, "reinstalled"),
+            VmHistoryActionType::StateChanged => write!(f, "state_changed"),
+            VmHistoryActionType::PaymentReceived => write!(f, "payment_received"),
+            VmHistoryActionType::ConfigurationChanged => write!(f, "configuration_changed"),
+        }
+    }
+}
+
+impl FromStr for VmHistoryActionType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "created" => Ok(VmHistoryActionType::Created),
+            "started" => Ok(VmHistoryActionType::Started),
+            "stopped" => Ok(VmHistoryActionType::Stopped),
+            "restarted" => Ok(VmHistoryActionType::Restarted),
+            "deleted" => Ok(VmHistoryActionType::Deleted),
+            "expired" => Ok(VmHistoryActionType::Expired),
+            "renewed" => Ok(VmHistoryActionType::Renewed),
+            "reinstalled" => Ok(VmHistoryActionType::Reinstalled),
+            "state_changed" => Ok(VmHistoryActionType::StateChanged),
+            "payment_received" => Ok(VmHistoryActionType::PaymentReceived),
+            "configuration_changed" => Ok(VmHistoryActionType::ConfigurationChanged),
+            _ => Err(anyhow!("unknown VM history action type: {}", s)),
+        }
+    }
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct VmHistory {
+    pub id: u64,
+    pub vm_id: u64,
+    pub action_type: VmHistoryActionType,
+    pub timestamp: DateTime<Utc>,
+    pub initiated_by_user: Option<u64>,
+    pub previous_state: Option<Vec<u8>>,
+    pub new_state: Option<Vec<u8>>,
+    pub metadata: Option<Vec<u8>>,
+    pub description: Option<String>,
+}

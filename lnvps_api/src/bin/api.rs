@@ -9,6 +9,7 @@ use lnvps_api::lightning::get_node;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
 use lnvps_api::status::VmStateCache;
+use lnvps_api::vm_history::VmHistoryLogger;
 use lnvps_api::worker::{WorkJob, Worker};
 use lnvps_common::CORS;
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
@@ -72,6 +73,7 @@ async fn main() -> Result<(), Error> {
     let node = get_node(&settings).await?;
 
     let status = VmStateCache::new();
+    let vm_history = Arc::new(VmHistoryLogger::new(db.clone()));
     let provisioner = settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
     provisioner.init().await?;
 
@@ -146,6 +148,7 @@ async fn main() -> Result<(), Error> {
         .manage(status.clone())
         .manage(exchange.clone())
         .manage(settings.clone())
+        .manage(vm_history.clone())
         .manage(sender)
         .mount("/", api::routes())
         .mount(

@@ -1,4 +1,4 @@
-use crate::{AccessPolicy, Company, IpRange, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
+use crate::{AccessPolicy, Company, IpRange, LNVPSNostrDb, LNVpsDb, NostrDomain, NostrDomainHandle, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, Row};
@@ -577,6 +577,47 @@ impl LNVpsDb for LNVpsDbMysql {
     async fn get_company(&self, company_id: u64) -> Result<Company> {
         sqlx::query_as("select * from company where id=?")
             .bind(company_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_vm_history(&self, history: &VmHistory) -> Result<u64> {
+        Ok(sqlx::query("insert into vm_history(vm_id,action_type,initiated_by_user,previous_state,new_state,metadata,description) values(?,?,?,?,?,?,?) returning id")
+            .bind(history.vm_id)
+            .bind(&history.action_type)
+            .bind(history.initiated_by_user)
+            .bind(&history.previous_state)
+            .bind(&history.new_state)
+            .bind(&history.metadata)
+            .bind(&history.description)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
+    }
+
+    async fn list_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>> {
+        sqlx::query_as("select * from vm_history where vm_id = ? order by timestamp desc")
+            .bind(vm_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_vm_history_paginated(&self, vm_id: u64, limit: u64, offset: u64) -> Result<Vec<VmHistory>> {
+        sqlx::query_as("select * from vm_history where vm_id = ? order by timestamp desc limit ? offset ?")
+            .bind(vm_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_vm_history(&self, id: u64) -> Result<VmHistory> {
+        sqlx::query_as("select * from vm_history where id = ?")
+            .bind(id)
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)

@@ -181,6 +181,18 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
 
     /// Get company
     async fn get_company(&self, company_id: u64) -> Result<Company>;
+
+    /// Insert a new VM history record
+    async fn insert_vm_history(&self, history: &VmHistory) -> Result<u64>;
+
+    /// List VM history for a given VM
+    async fn list_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>>;
+
+    /// List VM history for a given VM with pagination
+    async fn list_vm_history_paginated(&self, vm_id: u64, limit: u64, offset: u64) -> Result<Vec<VmHistory>>;
+
+    /// Get VM history entry by id
+    async fn get_vm_history(&self, id: u64) -> Result<VmHistory>;
 }
 
 #[cfg(feature = "nostr-domain")]
