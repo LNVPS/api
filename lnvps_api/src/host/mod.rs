@@ -178,6 +178,27 @@ impl FullVmInfo {
             bail!("Invalid VM config, no template");
         }
     }
+
+    pub async fn vm_resources(vm_id: u64, db: Arc<dyn LNVpsDb>) -> Result<VmResources> {
+        let vm = db.get_vm(vm_id).await?;
+        if let Some(t) = vm.template_id {
+            let template = db.get_vm_template(t).await?;
+            Ok(VmResources {
+                cpu: template.cpu,
+                memory: template.memory,
+                disk_size: template.disk_size,
+            })
+        } else if let Some(t) = vm.custom_template_id {
+            let custom = db.get_custom_vm_template(t).await?;
+            Ok(VmResources {
+                cpu: custom.cpu,
+                memory: custom.memory,
+                disk_size: custom.disk_size,
+            })
+        } else {
+            bail!("Invalid VM config, no template");
+        }
+    }
 }
 
 #[derive(Clone)]

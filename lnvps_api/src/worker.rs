@@ -2,6 +2,7 @@ use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::status::{VmRunningState, VmState, VmStateCache};
+use crate::GB;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Days, Duration as ChronoDuration, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
@@ -157,38 +158,48 @@ impl Worker {
                 self.handle_vm_state(vm, &s).await?;
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
-            Err(_) => {
-                // spawn VM if doesnt exist
+            Err(e) => {
+                warn!("Failed to get VM{} state {}", vm.id, e);
                 if vm.expires > Utc::now() {
-                    self.provisioner.spawn_vm(vm.id).await?;
-                    let vm_ips = self.db.list_vm_ip_assignments(vm.id).await?;
-                    let image = self.db.get_os_image(vm.image_id).await?;
-                    let user = self.db.get_user(vm.user_id).await?;
-
-                    let msg = format!(
-                        "VM #{} been created!\n\nOS: {}\n{}\n\nNPUB: {}",
-                        vm.id,
-                        image,
-                        vm_ips
-                            .iter()
-                            .map(|i| if let Some(fwd) = &i.dns_forward {
-                                format!("IP: {} ({})", i.ip, fwd)
-                            } else {
-                                format!("IP: {}", i.ip)
-                            })
-                            .collect::<Vec<String>>()
-                            .join("\n "),
-                        PublicKey::from_slice(&user.pubkey)?.to_bech32()?
-                    );
-                    self.tx.send(WorkJob::SendNotification {
-                        user_id: vm.user_id,
-                        title: Some(format!("[VM{}] Created", vm.id)),
-                        message: format!("Your {}", &msg),
-                    })?;
-                    self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))?;
+                    self.spawn_vm_internal(vm).await?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Spawn a VM and send notifications
+    async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
+        self.provisioner.spawn_vm(vm.id).await?;
+        let vm_ips = self.db.list_vm_ip_assignments(vm.id).await?;
+        let image = self.db.get_os_image(vm.image_id).await?;
+        let user = self.db.get_user(vm.user_id).await?;
+        let resources = FullVmInfo::vm_resources(vm.id, self.db.clone()).await?;
+
+        let msg = format!(
+            "VM #{} been created!\n\nOS: {}\nCPU: {}\nRAM: {}GB\nDisk: {}GB\n{}\n\nNPUB: {}",
+            vm.id,
+            image,
+            resources.cpu,
+            resources.memory / GB,
+            resources.disk_size / GB,
+            vm_ips
+                .iter()
+                .map(|i| if let Some(fwd) = &i.dns_forward {
+                    format!("IP: {} ({})", i.ip, fwd)
+                } else {
+                    format!("IP: {}", i.ip)
+                })
+                .collect::<Vec<String>>()
+                .join("\n"),
+            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
+        );
+        self.tx.send(WorkJob::SendNotification {
+            user_id: vm.user_id,
+            title: Some(format!("[VM{}] Created", vm.id)),
+            message: format!("Your {}", &msg),
+        })?;
+        self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))?;
         Ok(())
     }
 
@@ -378,14 +389,17 @@ impl Worker {
             }
             WorkJob::CheckVms => {
                 let now = Utc::now();
-                
+
                 // Skip if too soon based on exponential backoff
                 if now < self.next_check_vms_allowed {
                     let remaining = self.next_check_vms_allowed.signed_duration_since(now);
-                    debug!("Skipping CheckVms job, next allowed in {}s", remaining.num_seconds());
+                    debug!(
+                        "Skipping CheckVms job, next allowed in {}s",
+                        remaining.num_seconds()
+                    );
                     return Ok(());
                 }
-                
+
                 match self.check_vms().await {
                     Ok(_) => {
                         // Success - reset delay to default
@@ -397,10 +411,14 @@ impl Worker {
                         // Failure - apply exponential backoff
                         error!("Failed to check VMs: {}", e);
                         self.check_vms_delay_seconds = (self.check_vms_delay_seconds * 2).min(600); // Max 10 minutes
-                        self.next_check_vms_allowed = now + ChronoDuration::seconds(self.check_vms_delay_seconds as i64);
-                        
-                        warn!("CheckVms failed, backing off to {}s delay", self.check_vms_delay_seconds);
-                        
+                        self.next_check_vms_allowed =
+                            now + ChronoDuration::seconds(self.check_vms_delay_seconds as i64);
+
+                        warn!(
+                            "CheckVms failed, backing off to {}s delay",
+                            self.check_vms_delay_seconds
+                        );
+
                         self.queue_admin_notification(
                             format!("Failed to check VM's:\n{:?}\n{}", &job, e),
                             Some("Job Failed".to_string()),
