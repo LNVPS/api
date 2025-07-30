@@ -116,8 +116,8 @@ impl OvhDedicatedServerVMacRouter {
     pub async fn new(url: &str, name: &str, token: &str) -> Result<Self> {
         // load API time delta
         let time_api = JsonApi::new(url)?;
-        let time = time_api.get::<String>("v1/auth/time").await?;
-        let delta: i64 = Utc::now().timestamp().sub(time.parse::<i64>()?);
+        let time = time_api.get::<i64>("v1/auth/time").await?;
+        let delta: i64 = Utc::now().timestamp().sub(time);
 
         Ok(Self {
             name: name.to_string(),
