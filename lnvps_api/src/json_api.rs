@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use log::{debug, warn};
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
-use reqwest::{Client, Method, RequestBuilder, Url};
+use reqwest::{Client, Method, Request, RequestBuilder, Url};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::error::Error;
@@ -82,66 +82,53 @@ impl JsonApi {
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let text = self.get_raw(path).await?;
-        Ok(serde_json::from_str::<T>(&text)?)
-    }
-
-    /// Get raw string response
-    pub async fn get_raw(&self, path: &str) -> Result<String> {
-        debug!(">> GET {}", path);
-        let url = self.base.join(path)?;
-        let mut req = self.client.request(Method::GET, url.clone());
-        if let Some(gen) = &self.token_gen {
-            req = gen.generate_token(Method::GET, &url, None, req)?;
-        }
-        let req = req.build()?;
-        debug!(">> HEADERS {:?}", req.headers());
-        let rsp = match self.client.execute(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(s) = e.source() {
-                    warn!("Error source: {}", s);
-                }
-                bail!("Error sending request: {:?}", e);
-            }
-        };
-        let status = rsp.status();
-        let text = rsp.text().await?;
-        debug!("<< {}", text);
-        if status.is_success() {
-            Ok(text)
-        } else {
-            bail!("{}", status);
-        }
+        self.req::<T, ()>(Method::GET, path, None).await
     }
 
     pub async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
-        self.req(Method::POST, path, body).await
+        self.req(Method::POST, path, Some(body)).await
     }
 
     pub async fn put<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
-        self.req(Method::PUT, path, body).await
+        self.req(Method::PUT, path, Some(body)).await
+    }
+
+    pub fn build_req(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<impl Serialize>,
+    ) -> Result<Request> {
+        let url = self.base.join(path)?;
+        let mut req = self.client.request(method.clone(), url.clone());
+        let req = if let Some(body) = body {
+            let body = serde_json::to_string(&body)?;
+            if let Some(gen) = self.token_gen.as_ref() {
+                req = gen.generate_token(method.clone(), &url, Some(&body), req)?;
+            }
+            debug!(">> {} {}: {}", method.clone(), path, &body);
+            req.header(CONTENT_TYPE, "application/json; charset=utf-8")
+                .body(body)
+                .build()?
+        } else {
+            if let Some(gen) = self.token_gen.as_ref() {
+                req = gen.generate_token(method.clone(), &url, None, req)?;
+            }
+            req.build()?
+        };
+        debug!(">> HEADERS {:?}", req.headers());
+        Ok(req)
     }
 
     pub async fn req<T: DeserializeOwned, R: Serialize>(
         &self,
         method: Method,
         path: &str,
-        body: R,
+        body: Option<R>,
     ) -> Result<T> {
-        let body = serde_json::to_string(&body)?;
-        debug!(">> {} {}: {}", method.clone(), path, &body);
-        let url = self.base.join(path)?;
-        let mut req = self
-            .client
-            .request(method.clone(), url.clone())
-            .header(CONTENT_TYPE, "application/json; charset=utf-8");
-        if let Some(gen) = self.token_gen.as_ref() {
-            req = gen.generate_token(method.clone(), &url, Some(&body), req)?;
-        }
-        let req = req.body(body).build()?;
-        debug!(">> HEADERS {:?}", req.headers());
+        let req = self.build_req(method.clone(), path, body)?;
         let rsp = self.client.execute(req).await?;
+
         let status = rsp.status();
         let text = rsp.text().await?;
         #[cfg(debug_assertions)]
@@ -154,7 +141,7 @@ impl JsonApi {
                 }
             }
         } else {
-            bail!("{} {}: {}: {}", method, url, status, &text);
+            bail!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 
@@ -163,19 +150,11 @@ impl JsonApi {
         &self,
         method: Method,
         path: &str,
-        body: R,
+        body: Option<R>,
     ) -> Result<u16> {
-        let body = serde_json::to_string(&body)?;
-        debug!(">> {} {}: {}", method.clone(), path, &body);
-        let url = self.base.join(path)?;
-        let mut req = self
-            .client
-            .request(method.clone(), url.clone())
-            .header(CONTENT_TYPE, "application/json; charset=utf-8");
-        if let Some(gen) = &self.token_gen {
-            req = gen.generate_token(method.clone(), &url, Some(&body), req)?;
-        }
-        let rsp = req.body(body).send().await?;
+        let req = self.build_req(method.clone(), path, body)?;
+        let rsp = self.client.execute(req).await?;
+
         let status = rsp.status();
         let text = rsp.text().await?;
         #[cfg(debug_assertions)]
@@ -183,7 +162,7 @@ impl JsonApi {
         if status.is_success() {
             Ok(status.as_u16())
         } else {
-            bail!("{} {}: {}: {}", method, url, status, &text);
+            bail!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 }

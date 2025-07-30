@@ -150,10 +150,10 @@ impl ProxmoxClient {
     pub async fn delete_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let rsp: ResponseBase<Option<String>> = self
             .api
-            .req(
+            .req::<_, ()>(
                 Method::DELETE,
                 &format!("/api2/json/nodes/{node}/qemu/{vm}"),
-                (),
+                None,
             )
             .await?;
         if let Some(id) = rsp.data {
@@ -299,7 +299,7 @@ impl ProxmoxClient {
             .req(
                 Method::PUT,
                 &format!("/api2/json/nodes/{}/qemu/{}/resize", &req.node, &req.vm_id),
-                &req,
+                Some(&req),
             )
             .await?;
         Ok(TaskId {
@@ -377,7 +377,7 @@ impl ProxmoxClient {
         force: bool,
     ) -> Result<()> {
         self.api
-            .req_status(
+            .req_status::<()>(
                 Method::PUT,
                 &format!(
                     "/api2/json/nodes/{}/qemu/{}/unlink?idlist={}&force={}",
@@ -386,7 +386,7 @@ impl ProxmoxClient {
                     disks.join(","),
                     if force { "1" } else { "0" }
                 ),
-                (),
+                None,
             )
             .await?;
         Ok(())
@@ -423,7 +423,7 @@ impl ProxmoxClient {
             .req_status(
                 Method::PUT,
                 &format!("/api2/json/nodes/{}/qemu/{}/firewall/options", node, vm_id),
-                &req,
+                Some(&req),
             )
             .await?;
         Ok(())
@@ -456,7 +456,7 @@ impl ProxmoxClient {
             .req_status(
                 Method::POST,
                 &format!("/api2/json/nodes/{}/qemu/{}/firewall/ipset", node, vm_id),
-                &req,
+                Some(&req),
             )
             .await?;
         Ok(())
@@ -472,13 +472,13 @@ impl ProxmoxClient {
         ipset_name: &str,
     ) -> Result<()> {
         self.api
-            .req::<(), _>(
+            .req_status::<()>(
                 Method::DELETE,
                 &format!(
                     "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}",
                     node, vm_id, ipset_name
                 ),
-                (),
+                None,
             )
             .await?;
         Ok(())
@@ -520,7 +520,7 @@ impl ProxmoxClient {
                     "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}",
                     node, vm_id, ipset_name
                 ),
-                &req,
+                Some(&req),
             )
             .await?;
         Ok(())
@@ -537,7 +537,7 @@ impl ProxmoxClient {
         cidr: &str,
     ) -> Result<()> {
         self.api
-            .req_status(
+            .req_status::<()>(
                 Method::DELETE,
                 &format!(
                     "/api2/json/nodes/{}/qemu/{}/firewall/ipset/{}/{}",
@@ -546,7 +546,7 @@ impl ProxmoxClient {
                     ipset_name,
                     urlencoding::encode(cidr)
                 ),
-                (),
+                None,
             )
             .await?;
         Ok(())
@@ -583,7 +583,7 @@ impl ProxmoxClient {
             .req_status(
                 Method::POST,
                 &format!("/api2/json/nodes/{}/qemu/{}/firewall/rules", node, vm_id),
-                &req,
+                Some(&req),
             )
             .await?;
         Ok(())

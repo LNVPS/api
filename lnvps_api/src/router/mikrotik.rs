@@ -32,13 +32,16 @@ impl Router for MikrotikRouter {
     }
 
     async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
-        let rsp: Vec<MikrotikArpEntry> = self.api.req(Method::GET, "/rest/ip/arp", ()).await?;
+        let rsp: Vec<MikrotikArpEntry> = self
+            .api
+            .req::<_, ()>(Method::GET, "/rest/ip/arp", None)
+            .await?;
         Ok(rsp.into_iter().filter_map(|e| e.try_into().ok()).collect())
     }
 
     async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
         let req: MikrotikArpEntry = entry.clone().into();
-        let rsp: MikrotikArpEntry = self.api.req(Method::PUT, "/rest/ip/arp", req).await?;
+        let rsp: MikrotikArpEntry = self.api.req(Method::PUT, "/rest/ip/arp", Some(req)).await?;
         debug!("{:?}", rsp);
         Ok(rsp.try_into()?)
     }
@@ -46,7 +49,7 @@ impl Router for MikrotikRouter {
     async fn remove_arp_entry(&self, id: &str) -> Result<()> {
         let rsp: MikrotikArpEntry = self
             .api
-            .req(Method::DELETE, &format!("/rest/ip/arp/{}", id), ())
+            .req::<_, ()>(Method::DELETE, &format!("/rest/ip/arp/{}", id), None)
             .await?;
         debug!("{:?}", rsp);
         Ok(())
@@ -60,7 +63,7 @@ impl Router for MikrotikRouter {
             .req(
                 Method::PATCH,
                 &format!("/rest/ip/arp/{}", entry.id.as_ref().unwrap()),
-                req,
+                Some(req),
             )
             .await?;
         debug!("{:?}", rsp);

@@ -55,10 +55,10 @@ impl RevolutApi {
 
     pub async fn delete_webhook(&self, webhook_id: &str) -> Result<()> {
         self.api
-            .req_status(
+            .req_status::<()>(
                 Method::DELETE,
                 &format!("/api/1.0/webhooks/{}", webhook_id),
-                (),
+                None,
             )
             .await?;
         Ok(())

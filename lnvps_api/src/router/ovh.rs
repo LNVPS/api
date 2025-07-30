@@ -116,7 +116,7 @@ impl OvhDedicatedServerVMacRouter {
     pub async fn new(url: &str, name: &str, token: &str) -> Result<Self> {
         // load API time delta
         let time_api = JsonApi::new(url)?;
-        let time = time_api.get_raw("v1/auth/time").await?;
+        let time = time_api.get::<String>("v1/auth/time").await?;
         let delta: i64 = Utc::now().timestamp().sub(time.parse::<i64>()?);
 
         Ok(Self {
@@ -264,13 +264,13 @@ impl Router for OvhDedicatedServerVMacRouter {
             );
             let task: OvhTaskResponse = self
                 .api
-                .req(
+                .req::<_, ()>(
                     Method::DELETE,
                     &format!(
                         "v1/dedicated/server/{}/virtualMac/{}/virtualAddress/{}",
                         self.name, this_entry.mac_address, this_entry.address
                     ),
-                    (),
+                    None,
                 )
                 .await?;
             self.wait_for_task_result(task.task_id).await?;

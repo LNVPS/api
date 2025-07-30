@@ -78,12 +78,12 @@ impl DnsServer for Cloudflare {
             .req(
                 reqwest::Method::DELETE,
                 &format!("/client/v4/zones/{}/dns_records/{}", zone_id, record_id),
-                CfRecord {
+                Some(CfRecord {
                     content: record.value.to_string(),
                     name: record.name.to_string(),
                     r_type: None,
                     id: None,
-                },
+                }),
             )
             .await?;
         Self::bail_error(&res)?;
@@ -105,12 +105,12 @@ impl DnsServer for Cloudflare {
             .req(
                 reqwest::Method::PATCH,
                 &format!("/client/v4/zones/{}/dns_records/{}", zone_id, record_id),
-                CfRecord {
+                Some(CfRecord {
                     content: record.value.to_string(),
                     name: record.name.to_string(),
                     r_type: Some(record.kind.to_string()),
                     id: Some(record_id.to_string()),
-                },
+                }),
             )
             .await?;
         Self::bail_error(&id_response)?;
