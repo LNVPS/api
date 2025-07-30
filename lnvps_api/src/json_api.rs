@@ -127,7 +127,18 @@ impl JsonApi {
         body: Option<R>,
     ) -> Result<T> {
         let req = self.build_req(method.clone(), path, body)?;
-        let rsp = self.client.execute(req).await?;
+        let rsp = match self.client.execute(req).await {
+            Ok(rsp) => rsp,
+            Err(e) => {
+                bail!(
+                    "Failed to send request: {} source={}",
+                    e,
+                    e.source()
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|| "None".to_owned())
+                )
+            }
+        };
 
         let status = rsp.status();
         let text = rsp.text().await?;
