@@ -1,9 +1,10 @@
 use anyhow::{bail, Result};
-use log::debug;
+use log::{debug, warn};
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, Method, RequestBuilder, Url};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::error::Error;
 use std::sync::Arc;
 
 pub trait TokenGen: Send + Sync {
@@ -95,7 +96,15 @@ impl JsonApi {
         }
         let req = req.build()?;
         debug!(">> HEADERS {:?}", req.headers());
-        let rsp = self.client.execute(req).await?;
+        let rsp = match self.client.execute(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(s) = e.source() {
+                    warn!("Error source: {}", s);
+                }
+                bail!("Error sending request: {:?}", e);
+            }
+        };
         let status = rsp.status();
         let text = rsp.text().await?;
         debug!("<< {}", text);

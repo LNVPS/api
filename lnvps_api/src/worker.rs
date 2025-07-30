@@ -173,7 +173,7 @@ impl Worker {
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
             Err(e) => {
-                warn!("Failed to get VM{} state {}", vm.id, e);
+                warn!("Failed to get VM{} state: {}", vm.id, e);
                 if vm.expires > Utc::now() {
                     self.spawn_vm_internal(vm).await?;
                 }
