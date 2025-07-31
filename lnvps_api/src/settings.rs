@@ -153,8 +153,35 @@ pub struct QemuConfig {
     pub kvm: bool,
     /// CPU architecture
     pub arch: String,
-    /// Enable firewall when creating VM's
-    pub firewall: bool,
+    /// Firewall configuration options
+    pub firewall_config: Option<FirewallConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum FirewallPolicy {
+    Accept,
+    Reject,
+    Drop,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FirewallConfig {
+    /// Enable DHCP
+    pub dhcp: Option<bool>,
+    /// Enable firewall
+    pub enable: Option<bool>,
+    /// Enable IP filtering
+    pub ip_filter: Option<bool>,
+    /// Enable MAC filtering
+    pub mac_filter: Option<bool>,
+    /// Enable NDP (Neighbor Discovery Protocol)
+    pub ndp: Option<bool>,
+    /// Input policy (ACCEPT, REJECT, DROP)
+    pub policy_in: Option<FirewallPolicy>,
+    /// Output policy (ACCEPT, REJECT, DROP) 
+    pub policy_out: Option<FirewallPolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -225,7 +252,7 @@ pub fn mock_settings() -> Settings {
                     cpu: "kvm64".to_string(),
                     kvm: false,
                     arch: "x86_64".to_string(),
-                    firewall: true,
+                    firewall_config: None,
                 },
                 ssh: None,
                 mac_prefix: Some("ff:ff:ff".to_string()),

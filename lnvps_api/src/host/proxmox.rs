@@ -200,12 +200,12 @@ impl ProxmoxClient {
     pub async fn wait_for_task(&self, task: &TaskId) -> Result<TaskStatus> {
         let max_wait_time = Duration::from_secs(300); // 5 minutes max
         let start_time = std::time::Instant::now();
-        
+
         loop {
             if start_time.elapsed() > max_wait_time {
                 bail!("Task {} timed out after 5 minutes", task.id);
             }
-            
+
             let s = self.get_task_status(task).await?;
             if s.is_finished() {
                 if s.is_success() {
@@ -598,6 +598,14 @@ impl ProxmoxClient {
 }
 
 impl ProxmoxClient {
+    fn convert_firewall_policy(policy: &crate::settings::FirewallPolicy) -> VmFirewallPolicy {
+        match policy {
+            crate::settings::FirewallPolicy::Accept => VmFirewallPolicy::ACCEPT,
+            crate::settings::FirewallPolicy::Reject => VmFirewallPolicy::REJECT,
+            crate::settings::FirewallPolicy::Drop => VmFirewallPolicy::DROP,
+        }
+    }
+
     fn make_config(&self, value: &FullVmInfo) -> Result<VmConfig> {
         let ip_config = value
             .ips
@@ -638,10 +646,8 @@ impl ProxmoxClient {
         let mut net = vec![
             format!("virtio={}", value.vm.mac_address),
             format!("bridge={}", self.config.bridge),
+            "firewall=1".to_string(), //always enable on interface
         ];
-        if self.config.firewall {
-            net.push("firewall=1".to_string());
-        }
         if let Some(t) = value.host.vlan_id {
             net.push(format!("tag={}", t));
         }
@@ -913,22 +919,49 @@ impl VmHostClient for ProxmoxClient {
     async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()> {
         let vm_id = cfg.vm.id.into();
 
-        // Re-apply firewall configuration
-        self.configure_vm_firewall(
-            &self.node,
-            vm_id,
-            VmFirewallConfig {
-                dhcp: Some(false),
-                enable: Some(true),
-                ip_filter: Some(true),
-                mac_filter: Some(true),
-                ndp: None,
-                policy_in: Some(VmFirewallPolicy::DROP),
-                policy_out: Some(VmFirewallPolicy::ACCEPT),
-            },
-        )
-        .await?;
+        // disable fw if not enabled, otherwise configure fw
+        let fw_enabled = self
+            .config
+            .firewall_config
+            .as_ref()
+            .and_then(|c| c.enable)
+            .unwrap_or(false);
+        if !fw_enabled {
+            self.configure_vm_firewall(
+                &self.node,
+                vm_id,
+                VmFirewallConfig {
+                    enable: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            return Ok(());
+        }
 
+        let fw_cfg = self.config.firewall_config.as_ref().unwrap();
+        // Use configured firewall options or disable firewall if no config
+        let firewall_config = VmFirewallConfig {
+            dhcp: fw_cfg.dhcp,
+            enable: fw_cfg.enable,
+            ip_filter: fw_cfg.ip_filter,
+            mac_filter: fw_cfg.mac_filter,
+            ndp: fw_cfg.ndp,
+            policy_in: fw_cfg
+                .policy_in
+                .as_ref()
+                .map(|p| Self::convert_firewall_policy(p)),
+            policy_out: fw_cfg
+                .policy_out
+                .as_ref()
+                .map(|p| Self::convert_firewall_policy(p)),
+        };
+
+        // Re-apply firewall configuration
+        self.configure_vm_firewall(&self.node, vm_id, firewall_config)
+            .await?;
+
+        // Only manage IPsets and rules if firewall is enabled
         // Ensure ipfilter-net0 IPset exists
         if let Err(_) = self
             .list_vm_ipset_entries(&self.node, vm_id, "ipfilter-net0")
@@ -1470,7 +1503,7 @@ impl From<RrdDataPoint> for TimeSeriesData {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VmFirewallConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dhcp: Option<bool>,
@@ -1604,7 +1637,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
-            firewall: true,
+            firewall_config: None,
         };
 
         let p = ProxmoxClient::new(

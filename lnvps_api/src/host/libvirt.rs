@@ -623,7 +623,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
-            firewall: true,
+            firewall_config: None
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
         let xml = host.create_domain_xml(&cfg)?;
@@ -654,7 +654,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
-            firewall: true,
+            firewall_config: None
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
         println!("{:?}", host.get_info().await?);
