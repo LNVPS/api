@@ -918,7 +918,7 @@ impl VmHostClient for ProxmoxClient {
             &self.node,
             vm_id,
             VmFirewallConfig {
-                dhcp: Some(true),
+                dhcp: Some(false),
                 enable: Some(true),
                 ip_filter: Some(true),
                 mac_filter: Some(true),
