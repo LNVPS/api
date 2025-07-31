@@ -1,10 +1,8 @@
 use anyhow::{bail, Context, Result};
-use clap::builder::TypedValueParser;
 use ipnetwork::IpNetwork;
 use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb};
 use log::warn;
-use rand::prelude::IteratorRandom;
-use rocket::form::validate::Contains;
+use rand::prelude::{IteratorRandom, SliceRandom};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -38,10 +36,13 @@ impl NetworkProvisioner {
     /// Pick an IP from one of the available ip ranges
     /// This method MUST return a free IP which can be used
     pub async fn pick_ip_for_region(&self, region_id: u64) -> Result<AvailableIps> {
-        let ip_ranges = self.db.list_ip_range_in_region(region_id).await?;
+        let mut ip_ranges = self.db.list_ip_range_in_region(region_id).await?;
         if ip_ranges.is_empty() {
             bail!("No ip range found in this region");
         }
+
+        // Randomize the order of IP ranges for even distribution
+        ip_ranges.shuffle(&mut rand::rng());
 
         let mut ret = AvailableIps {
             ip4: None,
