@@ -198,7 +198,14 @@ impl ProxmoxClient {
 
     /// Helper function to wait for a task to complete
     pub async fn wait_for_task(&self, task: &TaskId) -> Result<TaskStatus> {
+        let max_wait_time = Duration::from_secs(300); // 5 minutes max
+        let start_time = std::time::Instant::now();
+        
         loop {
+            if start_time.elapsed() > max_wait_time {
+                bail!("Task {} timed out after 5 minutes", task.id);
+            }
+            
             let s = self.get_task_status(task).await?;
             if s.is_finished() {
                 if s.is_success() {

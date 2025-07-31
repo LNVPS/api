@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub trait TokenGen: Send + Sync {
     fn generate_token(
@@ -31,7 +32,11 @@ impl JsonApi {
         headers.insert(USER_AGENT, "lnvps/1.0".parse()?);
         headers.insert(ACCEPT, "application/json; charset=utf-8".parse()?);
 
-        let client = Client::builder().default_headers(headers).build()?;
+        let client = Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
 
         Ok(Self {
             client,
@@ -49,6 +54,8 @@ impl JsonApi {
         let client = Client::builder()
             .danger_accept_invalid_certs(allow_invalid_certs)
             .default_headers(headers)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()?;
         Ok(Self {
             client,
@@ -69,6 +76,8 @@ impl JsonApi {
         let client = Client::builder()
             .danger_accept_invalid_certs(allow_invalid_certs)
             .default_headers(headers)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()?;
         Ok(Self {
             client,
