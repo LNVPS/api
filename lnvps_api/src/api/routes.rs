@@ -1058,5 +1058,5 @@ async fn v1_get_vm_history(
         _ => db.list_vm_history(id).await?,
     };
 
-    ApiData::ok(history.into_iter().map(|h| h.into()).collect())
+    ApiData::ok(history.into_iter().map(|h| ApiVmHistory::from_with_owner(h, vm.user_id)).collect())
 }

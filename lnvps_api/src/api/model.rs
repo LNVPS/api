@@ -636,6 +636,17 @@ impl From<lnvps_db::Company> for ApiCompany {
 }
 
 #[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiVmHistoryInitiator {
+    /// Action initiated by the VM owner
+    Owner,
+    /// Action initiated by the system
+    System,
+    /// Action initiated by another user
+    Other,
+}
+
+#[derive(Serialize, JsonSchema)]
 pub struct ApiVmHistory {
     /// Unique history entry ID
     pub id: u64,
@@ -645,8 +656,8 @@ pub struct ApiVmHistory {
     pub action_type: String,
     /// When this action occurred
     pub timestamp: DateTime<Utc>,
-    /// User ID who initiated this action (null for system actions)
-    pub initiated_by_user: Option<u64>,
+    /// Who initiated this action
+    pub initiated_by: ApiVmHistoryInitiator,
     /// Previous VM state/configuration if applicable (JSON)
     pub previous_state: Option<String>,
     /// New VM state/configuration if applicable (JSON)
@@ -657,14 +668,20 @@ pub struct ApiVmHistory {
     pub description: Option<String>,
 }
 
-impl From<lnvps_db::VmHistory> for ApiVmHistory {
-    fn from(value: lnvps_db::VmHistory) -> Self {
+impl ApiVmHistory {
+    pub fn from_with_owner(value: lnvps_db::VmHistory, vm_owner_id: u64) -> Self {
+        let initiated_by = match value.initiated_by_user {
+            None => ApiVmHistoryInitiator::System,
+            Some(user_id) if user_id == vm_owner_id => ApiVmHistoryInitiator::Owner,
+            Some(_) => ApiVmHistoryInitiator::Other,
+        };
+
         Self {
             id: value.id,
             vm_id: value.vm_id,
             action_type: value.action_type.to_string(),
             timestamp: value.timestamp,
-            initiated_by_user: value.initiated_by_user,
+            initiated_by,
             previous_state: value.previous_state.map(|v| String::from_utf8_lossy(&v).to_string()),
             new_state: value.new_state.map(|v| String::from_utf8_lossy(&v).to_string()),
             metadata: value.metadata.map(|v| String::from_utf8_lossy(&v).to_string()),

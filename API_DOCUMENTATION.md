@@ -204,7 +204,7 @@ interface VmHistory {
   vm_id: number;
   action_type: string;
   timestamp: string; // ISO 8601 datetime
-  initiated_by_user?: number;
+  initiated_by: 'owner' | 'system' | 'other'; // Who initiated the action
   previous_state?: string; // JSON string
   new_state?: string; // JSON string
   metadata?: string; // JSON string
