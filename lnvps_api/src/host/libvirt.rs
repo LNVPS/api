@@ -3,7 +3,7 @@ use crate::host::{
     VmHostInfo,
 };
 use crate::settings::QemuConfig;
-use crate::status::{VmRunningState, VmState};
+use crate::status::{VmRunningState, VmRunningState};
 use crate::KB;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
@@ -189,8 +189,8 @@ impl VmHostClient for LibVirtHost {
         todo!()
     }
 
-    async fn get_vm_state(&self, vm: &Vm) -> Result<VmState> {
-        Ok(VmState {
+    async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState> {
+        Ok(VmRunningState {
             timestamp: Utc::now().timestamp() as u64,
             state: VmRunningState::Stopped,
             cpu_usage: 0.0,
@@ -201,6 +201,12 @@ impl VmHostClient for LibVirtHost {
             disk_write: 0,
             disk_read: 0,
         })
+    }
+
+    async fn get_all_vm_states(&self) -> Result<Vec<(u64, VmRunningState)>> {
+        // For libvirt, this is a stub implementation
+        // In a real implementation, this would list all VMs and get their states
+        Ok(Vec::new())
     }
 
     async fn configure_vm(&self, vm: &FullVmInfo) -> Result<()> {

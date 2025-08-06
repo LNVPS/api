@@ -1,7 +1,7 @@
 use crate::settings::ProvisionerConfig;
-use crate::status::VmState;
 use anyhow::{bail, Result};
 use futures::future::join_all;
+use lnvps_api_common::{VmRunningState, VmState, VmStateCache};
 use lnvps_db::{
     async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
     VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
@@ -52,7 +52,10 @@ pub trait VmHostClient: Send + Sync {
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()>;
 
     /// Get the running status of a VM
-    async fn get_vm_state(&self, vm: &Vm) -> Result<VmState>;
+    async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState>;
+
+    /// Get the running status of all VMs on this host
+    async fn get_all_vm_states(&self) -> Result<Vec<(u64, VmRunningState)>>;
 
     /// Apply vm configuration (patch)
     async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()>;

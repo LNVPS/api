@@ -6,7 +6,7 @@ use crate::host::{
 };
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
-use crate::status::{VmRunningState, VmState};
+use crate::status::{VmRunningState, VmRunningState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
@@ -233,10 +233,10 @@ impl VmHostClient for MockVmHost {
         todo!()
     }
 
-    async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmState> {
+    async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmRunningState> {
         let vms = self.vms.lock().await;
         if let Some(vm) = vms.get(&vm.id) {
-            Ok(VmState {
+            Ok(VmRunningState {
                 timestamp: Utc::now().timestamp() as u64,
                 state: vm.state.clone(),
                 cpu_usage: 69.0,
@@ -250,6 +250,22 @@ impl VmHostClient for MockVmHost {
         } else {
             bail!("No vm with id {}", vm.id)
         }
+    }
+
+    async fn get_all_vm_states(&self) -> anyhow::Result<Vec<(u64, VmRunningState)>> {
+        let vms = self.vms.lock().await;
+        let states = vms.iter().map(|(vm_id, vm)| (*vm_id, VmRunningState {
+            timestamp: Utc::now().timestamp() as u64,
+            state: vm.state.clone(),
+            cpu_usage: 69.0,
+            mem_usage: 69.0,
+            uptime: 100,
+            net_in: 69,
+            net_out: 69,
+            disk_write: 69,
+            disk_read: 69,
+        })).collect();
+        Ok(states)
     }
 
     async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {

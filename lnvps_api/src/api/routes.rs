@@ -1,12 +1,12 @@
+use crate::api::model::ApiVmStatus;
 use crate::api::model::{
-    AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
-    ApiVmPayment, CreateSshKey, CreateVmRequest, VMPatchRequest, vm_to_status,
+    vm_to_status, AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder,
+    ApiCustomVmRequest, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
+    ApiVmPayment, CreateSshKey, CreateVmRequest, VMPatchRequest,
 };
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
-use crate::status::VmStateCache;
 use crate::vm_history::VmHistoryLogger;
 use crate::worker::WorkJob;
 use crate::{Currency, CurrencyAmount};
@@ -17,11 +17,8 @@ use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::Tag;
-use crate::api::model::ApiVmStatus;
+use lnvps_api_common::{ApiData, ApiResult, ExchangeRateService, Nip98Auth, VmState as CommonVmState, VmStateCache};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
-use lnvps_api_common::{
-    ApiData, ApiResult, ExchangeRateService, Nip98Auth, VmState as CommonVmState,
-};
 use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
 use log::{error, info};
 use nostr::util::hex;
@@ -38,15 +35,6 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
-
-fn convert_vm_state(state: Option<crate::status::VmState>) -> Option<CommonVmState> {
-    state.map(|s| match s.state {
-        crate::status::VmRunningState::Running => CommonVmState::Running,
-        crate::status::VmRunningState::Stopped => CommonVmState::Stopped,
-        crate::status::VmRunningState::Starting => CommonVmState::Pending,
-        crate::status::VmRunningState::Deleting => CommonVmState::Failed,
-    })
-}
 
 pub fn routes() -> Vec<Route> {
     let mut routes = vec![];
@@ -147,7 +135,7 @@ async fn v1_list_vms(
     let mut ret = vec![];
     for vm in vms {
         let vm_id = vm.id;
-        ret.push(vm_to_status(db, vm, convert_vm_state(vm_state.get_state(vm_id).await)).await?);
+        ret.push(vm_to_status(db, vm, vm_state.get_state(vm_id).await).await?);
     }
 
     ApiData::ok(ret)
@@ -168,7 +156,7 @@ async fn v1_get_vm(
     if vm.user_id != uid {
         return ApiData::err("VM doesnt belong to you");
     }
-    ApiData::ok(vm_to_status(db, vm, convert_vm_state(vm_state.get_state(id).await)).await?)
+    ApiData::ok(vm_to_status(db, vm, vm_state.get_state(id).await).await?)
 }
 
 /// Update a VM config

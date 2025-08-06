@@ -5,11 +5,11 @@ use crate::host::{
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
-use crate::status::{VmRunningState, VmState};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
 use ipnetwork::IpNetwork;
+use lnvps_api_common::{VmRunningState, VmRunningStates};
 use lnvps_db::{async_trait, DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
@@ -879,22 +879,21 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
-    async fn get_vm_state(&self, vm: &Vm) -> Result<VmState> {
+    async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState> {
         let s = self.get_vm_status(&self.node, vm.id.into()).await?;
-        Ok(VmState {
-            timestamp: Utc::now().timestamp() as u64,
-            state: match s.status {
-                VmStatus::Stopped => VmRunningState::Stopped,
-                VmStatus::Running => VmRunningState::Running,
-            },
-            cpu_usage: s.cpu.unwrap_or(0.0),
-            mem_usage: s.mem.unwrap_or(0) as f32 / s.max_mem.unwrap_or(1) as f32,
-            uptime: s.uptime.unwrap_or(0),
-            net_in: s.net_in.unwrap_or(0),
-            net_out: s.net_out.unwrap_or(0),
-            disk_write: s.disk_write.unwrap_or(0),
-            disk_read: s.disk_read.unwrap_or(0),
-        })
+        Ok(s.into())
+    }
+
+    async fn get_all_vm_states(&self) -> Result<Vec<(u64, VmRunningState)>> {
+        let vm_list = self.list_vms(&self.node).await?;
+        let mut states = Vec::new();
+
+        for vm in vm_list {
+            let vmid: ProxmoxVmId = vm.vm_id.into();
+            states.push((vmid.0, vm.into()));
+        }
+
+        Ok(states)
     }
 
     async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()> {
@@ -947,10 +946,7 @@ impl VmHostClient for ProxmoxClient {
             ip_filter: fw_cfg.ip_filter,
             mac_filter: fw_cfg.mac_filter,
             ndp: fw_cfg.ndp,
-            policy_in: fw_cfg
-                .policy_in
-                .as_ref()
-                .map(Self::convert_firewall_policy),
+            policy_in: fw_cfg.policy_in.as_ref().map(Self::convert_firewall_policy),
             policy_out: fw_cfg
                 .policy_out
                 .as_ref()
@@ -1266,6 +1262,25 @@ pub struct VmInfo {
     pub disk_write: Option<u64>,
     #[serde(rename = "diskread")]
     pub disk_read: Option<u64>,
+}
+
+impl From<VmInfo> for VmRunningState {
+    fn from(vm: VmInfo) -> Self {
+        Self {
+            timestamp: Utc::now().timestamp() as u64,
+            state: match vm.status {
+                VmStatus::Stopped => VmRunningStates::Stopped,
+                VmStatus::Running => VmRunningStates::Running,
+            },
+            cpu_usage: vm.cpu.unwrap_or(0.0),
+            mem_usage: vm.mem.unwrap_or(0) as f32 / vm.max_mem.unwrap_or(1) as f32,
+            uptime: vm.uptime.unwrap_or(0),
+            net_in: vm.net_in.unwrap_or(0),
+            net_out: vm.net_out.unwrap_or(0),
+            disk_write: vm.disk_write.unwrap_or(0),
+            disk_read: vm.disk_read.unwrap_or(0),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,14 +4,13 @@ use config::{Config, File};
 use lnvps_api::api;
 use lnvps_api::data_migration::run_data_migrations;
 use lnvps_api::dvm::start_dvms;
-use lnvps_api::ExchangeRateService;
-use lnvps_api_common::DefaultRateCache;
 use lnvps_api::lightning::get_node;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
-use lnvps_api::status::VmStateCache;
 use lnvps_api::vm_history::VmHistoryLogger;
 use lnvps_api::worker::{WorkJob, Worker};
+use lnvps_api::ExchangeRateService;
+use lnvps_api_common::{DefaultRateCache, VmStateCache};
 use lnvps_common::CORS;
 use lnvps_db::{LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
 use log::error;
@@ -91,8 +90,9 @@ async fn main() -> Result<(), Error> {
     tokio::spawn(async move {
         loop {
             if let Err(e) = worker.handle().await {
-                error!("worker-error: {}", e);
+                error!("Worker handler failed: {}", e);
             }
+            error!("Worker thread exited!")
         }
     });
 

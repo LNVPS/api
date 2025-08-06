@@ -11,7 +11,6 @@ pub mod router;
 pub mod settings;
 #[cfg(feature = "proxmox")]
 pub mod ssh_client;
-pub mod status;
 pub mod vm_history;
 pub mod worker;
 
@@ -21,8 +20,10 @@ pub mod mocks;
 #[cfg(feature = "nostr-dvm")]
 pub mod dvm;
 
-// Re-export common types  
-pub use lnvps_api_common::{GB, MB, KB, TB, BTC_SATS, Nip98Auth, ExchangeRateService, alt_prices, CurrencyAmount, Currency};
+// Re-export common types
+pub use lnvps_api_common::{
+    alt_prices, Currency, CurrencyAmount, ExchangeRateService, Nip98Auth, BTC_SATS, GB, KB, MB, TB,
+};
 
 pub mod exchange {
     pub use lnvps_api_common::{alt_prices, ExchangeRateService};

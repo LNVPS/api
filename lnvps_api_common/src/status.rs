@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone, Serialize, Deserialize, Default, JsonSchema, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
-pub enum VmRunningState {
+pub enum VmRunningStates {
     Running,
     #[default]
     Stopped,
@@ -17,9 +17,9 @@ pub enum VmRunningState {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, JsonSchema)]
-pub struct VmState {
+pub struct VmRunningState {
     pub timestamp: u64,
-    pub state: VmRunningState,
+    pub state: VmRunningStates,
     pub cpu_usage: f32,
     pub mem_usage: f32,
     pub uptime: u64,
@@ -32,7 +32,7 @@ pub struct VmState {
 /// Stores a cached vm status which is used to serve to api clients
 #[derive(Clone)]
 pub struct VmStateCache {
-    state: Arc<RwLock<HashMap<u64, VmState>>>,
+    state: Arc<RwLock<HashMap<u64, VmRunningState>>>,
 }
 
 impl Default for VmStateCache {
@@ -48,13 +48,13 @@ impl VmStateCache {
         }
     }
 
-    pub async fn set_state(&self, id: u64, state: VmState) -> Result<()> {
+    pub async fn set_state(&self, id: u64, state: VmRunningState) -> Result<()> {
         let mut guard = self.state.write().await;
         guard.insert(id, state);
         Ok(())
     }
 
-    pub async fn get_state(&self, id: u64) -> Option<VmState> {
+    pub async fn get_state(&self, id: u64) -> Option<VmRunningState> {
         let guard = self.state.read().await;
         guard.get(&id).cloned()
     }

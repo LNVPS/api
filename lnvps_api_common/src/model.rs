@@ -1,11 +1,13 @@
 use crate::pricing::PricingEngine;
-use crate::Currency;
+use crate::{Currency, VmRunningState};
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
-use lnvps_db::{LNVpsDb, Vm, VmCostPlan, VmCustomTemplate, VmHostRegion, VmTemplate};
+use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomTemplate, VmHostRegion, VmTemplate};
+use rocket::futures::future::join_all;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -60,7 +62,6 @@ impl Template for VmCustomTemplate {
         self.disk_interface
     }
 }
-
 
 impl ApiVmTemplate {
     pub async fn from_standard(db: &Arc<dyn LNVpsDb>, template_id: u64) -> Result<Self> {
@@ -142,6 +143,69 @@ impl ApiVmTemplate {
             },
         })
     }
+}
+
+// Main API's full ApiVmStatus (moved from common)
+#[derive(Serialize, JsonSchema)]
+pub struct ApiVmStatus {
+    /// Unique VM ID (Same in proxmox)
+    pub id: u64,
+    /// When the VM was created
+    pub created: DateTime<Utc>,
+    /// When the VM expires
+    pub expires: DateTime<Utc>,
+    /// Network MAC address
+    pub mac_address: String,
+    /// OS Image in use
+    pub image: ApiVmOsImage,
+    /// VM template
+    pub template: ApiVmTemplate,
+    /// SSH key attached to this VM
+    pub ssh_key: ApiUserSshKey,
+    /// IPs assigned to this VM
+    pub ip_assignments: Vec<ApiVmIpAssignment>,
+    /// Current running state of the VM
+    pub status: VmRunningState,
+}
+
+// Function to build ApiVmStatus from VM data (moved from common)
+pub async fn vm_to_status(
+    db: &Arc<dyn LNVpsDb>,
+    vm: Vm,
+    state: Option<VmRunningState>,
+) -> Result<ApiVmStatus> {
+    let image = db.get_os_image(vm.image_id).await?;
+    let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+    let ips = db.list_vm_ip_assignments(vm.id).await?;
+    let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
+    let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
+    let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|i| (i.id, i))
+        .collect();
+
+    let template = ApiVmTemplate::from_vm(db, &vm).await?;
+    Ok(ApiVmStatus {
+        id: vm.id,
+        created: vm.created,
+        expires: vm.expires,
+        mac_address: vm.mac_address,
+        image: image.into(),
+        template,
+        ssh_key: ssh_key.into(),
+        status: state.map(|s| s.into()).unwrap_or_default(),
+        ip_assignments: ips
+            .into_iter()
+            .map(|i| {
+                let range = ip_ranges
+                    .get(&i.ip_range_id)
+                    .expect("ip range id not found");
+                ApiVmIpAssignment::from(&i, range)
+            })
+            .collect(),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]

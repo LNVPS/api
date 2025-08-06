@@ -1,19 +1,19 @@
 use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
-use crate::status::{VmRunningState, VmState, VmStateCache};
 use crate::vm_history::VmHistoryLogger;
-use crate::GB;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
+use lnvps_api_common::{VmRunningState, VmRunningStates, VmStateCache};
 use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};
 use nostr::{EventBuilder, PublicKey, ToBech32};
 use nostr_sdk::Client;
+use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,7 +100,7 @@ impl Worker {
     /// 1. Expire VM and send notification
     /// 2. Stop VM if expired and still running
     /// 3. Send notification for expiring soon
-    async fn handle_vm_state(&self, vm: &Vm, state: &VmState) -> Result<()> {
+    async fn handle_vm_state(&self, vm: &Vm, state: &VmRunningState) -> Result<()> {
         const BEFORE_EXPIRE_NOTIFICATION: u64 = 1;
 
         // Send notification of VM expiring soon
@@ -119,7 +119,7 @@ impl Worker {
         }
 
         // Stop VM if expired and is running
-        if vm.expires < Utc::now() && state.state == VmRunningState::Running {
+        if vm.expires < Utc::now() && state.state == VmRunningStates::Running {
             info!("Stopping expired VM {}", vm.id);
             if let Err(e) = self.provisioner.stop_vm(vm.id).await {
                 warn!("Failed to stop VM {}: {}", vm.id, e);
@@ -181,6 +181,32 @@ impl Worker {
         Ok(())
     }
 
+    /// Check multiple VMs on a single host using bulk API
+    async fn check_vms_on_host(&self, host_id: u64, vms: &[&Vm]) -> Result<()> {
+        debug!("Checking {} VMs on host {}", vms.len(), host_id);
+        let host = self.db.get_host(host_id).await?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+
+        let states = client.get_all_vm_states().await?;
+        // Create a map of VM states by VM ID for quick lookup
+        let state_map: HashMap<u64, VmRunningState> = states.into_iter().collect();
+
+        for vm in vms {
+            if let Some(state) = state_map.get(&vm.id) {
+                // Use the bulk-fetched state
+                self.handle_vm_state(vm, state).await?;
+                self.vm_state_cache.set_state(vm.id, state.clone()).await?;
+            } else {
+                // VM not found in bulk response, handle as missing
+                warn!("VM {} not found in bulk response", vm.id);
+                if vm.expires > Utc::now() {
+                    self.spawn_vm_internal(vm).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
         self.provisioner.spawn_vm(vm.id).await?;
@@ -204,8 +230,8 @@ impl Worker {
             vm.id,
             image,
             resources.cpu,
-            resources.memory / GB,
-            resources.disk_size / GB,
+            resources.memory / crate::GB,
+            resources.disk_size / crate::GB,
             vm_ips
                 .iter()
                 .map(|i| if let Some(fwd) = &i.dns_forward {
@@ -229,38 +255,57 @@ impl Worker {
     pub async fn check_vms(&mut self) -> Result<()> {
         // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
+
+        // Group VMs by host for bulk checking
+        let mut vms_by_host: HashMap<u64, Vec<&Vm>> = HashMap::new();
+        let mut vms_to_delete = Vec::new();
+
         for vm in &db_vms {
             let is_new_vm = vm.created == vm.expires;
 
             // only check spawned vms
             if !is_new_vm {
-                // Refresh VM status if active
-                if let Err(e) = self.check_vm(vm).await {
-                    error!("Failed to check VM {}: {}", vm.id, e);
-                    if let Err(notification_err) = self.queue_admin_notification(
-                        format!("Failed to check VM {}:\n{}", vm.id, e),
-                        Some(format!("VM {} Check Failed", vm.id)),
-                    ) {
-                        error!("Failed to queue admin notification: {}", notification_err);
-                    }
-                    // Continue with next VM instead of failing the entire check
-                    continue;
-                }
+                vms_by_host
+                    .entry(vm.host_id)
+                    .or_insert_with(Vec::new)
+                    .push(vm);
             }
 
             // delete vm if not paid (in new state)
             if is_new_vm && !vm.deleted && vm.expires < Utc::now().sub(Days::new(1)) {
-                info!("Deleting unpaid VM {}", vm.id);
-                if let Err(e) = self.provisioner.delete_vm(vm.id).await {
-                    error!("Failed to delete unpaid VM {}: {}", vm.id, e);
-                    if let Err(notification_err) = self.queue_admin_notification(
-                        format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
-                        Some(format!("VM {} Deletion Failed", vm.id)),
-                    ) {
-                        error!("Failed to queue admin notification: {}", notification_err);
+                vms_to_delete.push(vm);
+            }
+        }
+
+        // Process deletions first
+        for vm in vms_to_delete {
+            info!("Deleting unpaid VM {}", vm.id);
+            if let Err(e) = self.provisioner.delete_vm(vm.id).await {
+                error!("Failed to delete unpaid VM {}: {}", vm.id, e);
+                if let Err(notification_err) = self.queue_admin_notification(
+                    format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
+                    Some(format!("VM {} Deletion Failed", vm.id)),
+                ) {
+                    error!("Failed to queue admin notification: {}", notification_err);
+                }
+            }
+        }
+
+        // Now check VMs grouped by host
+        for (host_id, vms) in vms_by_host {
+            if let Err(e) = self.check_vms_on_host(host_id, &vms).await {
+                error!("Failed to check VMs on host {}: {}", host_id, e);
+                // Fall back to individual checking for this host
+                for vm in vms {
+                    if let Err(e) = self.check_vm(vm).await {
+                        error!("Failed to check VM {}: {}", vm.id, e);
+                        if let Err(notification_err) = self.queue_admin_notification(
+                            format!("Failed to check VM {}:\n{}", vm.id, e),
+                            Some(format!("VM {} Check Failed", vm.id)),
+                        ) {
+                            error!("Failed to queue admin notification: {}", notification_err);
+                        }
                     }
-                    // Continue with next VM
-                    continue;
                 }
             }
         }

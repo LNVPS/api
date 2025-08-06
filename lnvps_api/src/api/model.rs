@@ -3,14 +3,14 @@ pub use lnvps_api_common::*;
 
 use crate::exchange::{alt_prices, ExchangeRateService};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use lnvps_api_common::{ApiDiskInterface, ApiDiskType, Currency};
+use lnvps_db::{PaymentMethod, VmCustomTemplate};
+use nostr::util::hex;
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
-use lnvps_db::{PaymentMethod, VmCustomTemplate};
-use lnvps_api_common::{Currency, ApiDiskType, ApiDiskInterface};
-use nostr::util::hex;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomVmOrder {
@@ -168,7 +168,6 @@ pub struct CreateSshKey {
     pub name: String,
     pub key_data: String,
 }
-
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiVmPayment {
@@ -359,7 +358,6 @@ impl ApiVmHistory {
     }
 }
 
-
 // Simplified versions without complex dependencies
 #[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomVmRequest {
@@ -371,7 +369,7 @@ pub struct ApiCustomVmRequest {
     pub disk_interface: ApiDiskInterface,
 }
 
-impl From<ApiCustomVmRequest> for VmCustomTemplate {  
+impl From<ApiCustomVmRequest> for VmCustomTemplate {
     fn from(value: ApiCustomVmRequest) -> Self {
         VmCustomTemplate {
             id: 0,
@@ -383,72 +381,4 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
             pricing_id: value.pricing_id,
         }
     }
-}
-
-// Main API's full ApiVmStatus (moved from common)
-#[derive(Serialize, JsonSchema)]
-pub struct ApiVmStatus {
-    /// Unique VM ID (Same in proxmox)
-    pub id: u64,
-    /// When the VM was created
-    pub created: DateTime<Utc>,
-    /// When the VM expires
-    pub expires: DateTime<Utc>,
-    /// Network MAC address
-    pub mac_address: String,
-    /// OS Image in use
-    pub image: lnvps_api_common::ApiVmOsImage,
-    /// VM template
-    pub template: lnvps_api_common::ApiVmTemplate,
-    /// SSH key attached to this VM
-    pub ssh_key: lnvps_api_common::ApiUserSshKey,
-    /// IPs assigned to this VM
-    pub ip_assignments: Vec<lnvps_api_common::ApiVmIpAssignment>,
-    /// Current running state of the VM
-    pub status: lnvps_api_common::VmState,
-}
-
-// Function to build ApiVmStatus from VM data (moved from common)
-pub async fn vm_to_status(
-    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
-    vm: lnvps_db::Vm,
-    state: Option<lnvps_api_common::VmState>,
-) -> anyhow::Result<ApiVmStatus> {
-    use futures::future::join_all;
-    use lnvps_db::IpRange;
-    use lnvps_api_common::ApiVmIpAssignment;
-    use std::collections::{HashMap, HashSet};
-
-    let image = db.get_os_image(vm.image_id).await?;
-    let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
-    let ips = db.list_vm_ip_assignments(vm.id).await?;
-    let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
-    let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
-    let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
-        .await
-        .into_iter()
-        .filter_map(anyhow::Result::ok)
-        .map(|i| (i.id, i))
-        .collect();
-
-    let template = lnvps_api_common::ApiVmTemplate::from_vm(db, &vm).await?;
-    Ok(ApiVmStatus {
-        id: vm.id,
-        created: vm.created,
-        expires: vm.expires,
-        mac_address: vm.mac_address,
-        image: image.into(),
-        template,
-        ssh_key: ssh_key.into(),
-        status: state.unwrap_or_default(),
-        ip_assignments: ips
-            .into_iter()
-            .map(|i| {
-                let range = ip_ranges
-                    .get(&i.ip_range_id)
-                    .expect("ip range id not found");
-                ApiVmIpAssignment::from(&i, range)
-            })
-            .collect(),
-    })
 }
