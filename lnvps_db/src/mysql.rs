@@ -370,6 +370,50 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn list_cost_plans(&self) -> Result<Vec<VmCostPlan>> {
+        sqlx::query_as("select * from vm_cost_plan order by created desc")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> Result<u64> {
+        Ok(sqlx::query("insert into vm_cost_plan(name,created,amount,currency,interval_amount,interval_type) values(?,?,?,?,?,?) returning id")
+            .bind(&cost_plan.name)
+            .bind(cost_plan.created)
+            .bind(cost_plan.amount)
+            .bind(&cost_plan.currency)
+            .bind(cost_plan.interval_amount)
+            .bind(cost_plan.interval_type)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?
+            .try_get(0)?)
+    }
+
+    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> Result<()> {
+        sqlx::query("update vm_cost_plan set name=?,amount=?,currency=?,interval_amount=?,interval_type=? where id=?")
+            .bind(&cost_plan.name)
+            .bind(cost_plan.amount)
+            .bind(&cost_plan.currency)
+            .bind(cost_plan.interval_amount)
+            .bind(cost_plan.interval_type)
+            .bind(cost_plan.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
+    }
+
+    async fn delete_cost_plan(&self, id: u64) -> Result<()> {
+        sqlx::query("delete from vm_cost_plan where id=?")
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
+    }
+
     async fn get_vm_template(&self, id: u64) -> Result<VmTemplate> {
         sqlx::query_as("select * from vm_template where id=?")
             .bind(id)

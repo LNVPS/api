@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use lnvps_api_common::{VmState, ApiDiskType, ApiDiskInterface, ApiOsDistribution};
+use lnvps_api_common::{VmState, ApiDiskType, ApiDiskInterface, ApiOsDistribution, ApiVmCostPlanIntervalType};
 use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution};
 use rocket_okapi::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -814,8 +814,14 @@ pub struct AdminCreateVmTemplateRequest {
     pub disk_size: u64,
     pub disk_type: ApiDiskType,
     pub disk_interface: ApiDiskInterface,
-    pub cost_plan_id: u64,
+    pub cost_plan_id: Option<u64>, // Optional - if not provided, will auto-create cost plan
     pub region_id: u64,
+    // Cost plan creation fields - used when cost_plan_id is not provided
+    pub cost_plan_name: Option<String>, // Defaults to "{template_name} Cost Plan"
+    pub cost_plan_amount: Option<f32>, // Required if cost_plan_id not provided
+    pub cost_plan_currency: Option<String>, // Defaults to "USD"
+    pub cost_plan_interval_amount: Option<u64>, // Defaults to 1
+    pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -830,6 +836,12 @@ pub struct AdminUpdateVmTemplateRequest {
     pub disk_interface: Option<ApiDiskInterface>,
     pub cost_plan_id: Option<u64>,
     pub region_id: Option<u64>,
+    // Cost plan update fields - will update the associated cost plan for this template
+    pub cost_plan_name: Option<String>,
+    pub cost_plan_amount: Option<f32>,
+    pub cost_plan_currency: Option<String>,
+    pub cost_plan_interval_amount: Option<u64>,
+    pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>,
 }
 
 // Common response structures
@@ -1214,6 +1226,84 @@ impl CreateRouterRequest {
             kind: db_kind,
             url: self.url.trim().to_string(),
             token: self.token.clone(),
+        })
+    }
+}
+
+// Cost Plan Management Models
+#[derive(Serialize, JsonSchema)]
+pub struct AdminCostPlanInfo {
+    pub id: u64,
+    pub name: String,
+    pub created: DateTime<Utc>,
+    pub amount: f32,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiVmCostPlanIntervalType,
+    pub template_count: u64, // Number of VM templates using this cost plan
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AdminCreateCostPlanRequest {
+    pub name: String,
+    pub amount: f32,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiVmCostPlanIntervalType,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AdminUpdateCostPlanRequest {
+    pub name: Option<String>,
+    pub amount: Option<f32>,
+    pub currency: Option<String>,
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiVmCostPlanIntervalType>,
+}
+
+impl From<lnvps_db::VmCostPlan> for AdminCostPlanInfo {
+    fn from(cost_plan: lnvps_db::VmCostPlan) -> Self {
+        Self {
+            id: cost_plan.id,
+            name: cost_plan.name,
+            created: cost_plan.created,
+            amount: cost_plan.amount,
+            currency: cost_plan.currency,
+            interval_amount: cost_plan.interval_amount,
+            interval_type: ApiVmCostPlanIntervalType::from(cost_plan.interval_type),
+            template_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+impl AdminCreateCostPlanRequest {
+    pub fn to_cost_plan(&self) -> anyhow::Result<lnvps_db::VmCostPlan> {
+        use chrono::Utc;
+        
+        if self.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("Cost plan name cannot be empty"));
+        }
+
+        if self.amount < 0.0 {
+            return Err(anyhow::anyhow!("Cost plan amount cannot be negative"));
+        }
+
+        if self.currency.trim().is_empty() {
+            return Err(anyhow::anyhow!("Currency cannot be empty"));
+        }
+
+        if self.interval_amount == 0 {
+            return Err(anyhow::anyhow!("Interval amount cannot be zero"));
+        }
+
+        Ok(lnvps_db::VmCostPlan {
+            id: 0, // Will be set by database
+            name: self.name.trim().to_string(),
+            created: Utc::now(),
+            amount: self.amount,
+            currency: self.currency.trim().to_uppercase(),
+            interval_amount: self.interval_amount,
+            interval_type: self.interval_type.into(),
         })
     }
 }

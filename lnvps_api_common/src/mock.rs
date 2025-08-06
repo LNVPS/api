@@ -432,6 +432,35 @@ impl LNVpsDbBase for MockDb {
         Ok(cost_plans.get(&id).ok_or(anyhow!("no cost plan"))?.clone())
     }
 
+    async fn list_cost_plans(&self) -> anyhow::Result<Vec<VmCostPlan>> {
+        let cost_plans = self.cost_plans.lock().await;
+        Ok(cost_plans.values().cloned().collect())
+    }
+
+    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> anyhow::Result<u64> {
+        let mut cost_plans = self.cost_plans.lock().await;
+        let max = *cost_plans.keys().max().unwrap_or(&0);
+        let id = max + 1;
+        let mut new_cost_plan = cost_plan.clone();
+        new_cost_plan.id = id;
+        cost_plans.insert(id, new_cost_plan);
+        Ok(id)
+    }
+
+    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> anyhow::Result<()> {
+        let mut cost_plans = self.cost_plans.lock().await;
+        if cost_plans.contains_key(&cost_plan.id) {
+            cost_plans.insert(cost_plan.id, cost_plan.clone());
+        }
+        Ok(())
+    }
+
+    async fn delete_cost_plan(&self, id: u64) -> anyhow::Result<()> {
+        let mut cost_plans = self.cost_plans.lock().await;
+        cost_plans.remove(&id);
+        Ok(())
+    }
+
     async fn get_vm_template(&self, id: u64) -> anyhow::Result<VmTemplate> {
         let templates = self.templates.lock().await;
         Ok(templates.get(&id).ok_or(anyhow!("no template"))?.clone())

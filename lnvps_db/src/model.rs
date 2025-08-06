@@ -346,7 +346,7 @@ pub enum NetworkAccessPolicy {
     StaticArp = 0,
 }
 
-#[derive(Clone, Debug, sqlx::Type)]
+#[derive(Clone, Copy, Debug, sqlx::Type)]
 #[repr(u16)]
 pub enum VmCostPlanIntervalType {
     Day = 0,

@@ -99,15 +99,47 @@ pub async fn admin_create_vm_template(
 
     let req = request.into_inner();
 
-    // Get disk type and interface from request
-    let disk_type = req.disk_type;
-    let disk_interface = req.disk_interface;
-
-    // Validate that cost plan exists
-    let _cost_plan = db.get_cost_plan(req.cost_plan_id).await?;
-
     // Validate that region exists
     let _region = db.get_host_region(req.region_id).await?;
+
+    // Handle cost plan creation or validation
+    let cost_plan_id = if let Some(existing_cost_plan_id) = req.cost_plan_id {
+        // Validate that the provided cost plan exists
+        let _cost_plan = db.get_cost_plan(existing_cost_plan_id).await?;
+        existing_cost_plan_id
+    } else {
+        // Auto-create a new cost plan for this template
+        let cost_plan_amount = req.cost_plan_amount
+            .ok_or_else(|| anyhow::anyhow!("cost_plan_amount is required when cost_plan_id is not provided"))?;
+        
+        if cost_plan_amount < 0.0 {
+            return Err(anyhow::anyhow!("Cost plan amount cannot be negative").into());
+        }
+
+        let cost_plan_name = req.cost_plan_name
+            .unwrap_or_else(|| format!("{} Cost Plan", req.name));
+        let cost_plan_currency = req.cost_plan_currency
+            .unwrap_or_else(|| "USD".to_string());
+        let cost_plan_interval_amount = req.cost_plan_interval_amount.unwrap_or(1);
+        let cost_plan_interval_type = req.cost_plan_interval_type
+            .unwrap_or(lnvps_api_common::ApiVmCostPlanIntervalType::Month);
+
+        if cost_plan_interval_amount == 0 {
+            return Err(anyhow::anyhow!("Cost plan interval amount cannot be zero").into());
+        }
+
+        let new_cost_plan = lnvps_db::VmCostPlan {
+            id: 0, // Will be set by database
+            name: cost_plan_name.trim().to_string(),
+            created: Utc::now(),
+            amount: cost_plan_amount,
+            currency: cost_plan_currency.trim().to_uppercase(),
+            interval_amount: cost_plan_interval_amount,
+            interval_type: cost_plan_interval_type.into(),
+        };
+
+        db.insert_cost_plan(&new_cost_plan).await?
+    };
 
     let template = VmTemplate {
         id: 0, // Will be set by database
@@ -118,9 +150,9 @@ pub async fn admin_create_vm_template(
         cpu: req.cpu,
         memory: req.memory,
         disk_size: req.disk_size,
-        disk_type: disk_type.into(),
-        disk_interface: disk_interface.into(),
-        cost_plan_id: req.cost_plan_id,
+        disk_type: req.disk_type.into(),
+        disk_interface: req.disk_interface.into(),
+        cost_plan_id,
         region_id: req.region_id,
     };
 
@@ -176,6 +208,50 @@ pub async fn admin_update_vm_template(
         let _cost_plan = db.get_cost_plan(cost_plan_id).await?;
         template.cost_plan_id = cost_plan_id;
     }
+
+    // Update the associated cost plan if any cost plan fields are provided
+    let has_cost_plan_updates = req.cost_plan_name.is_some() 
+        || req.cost_plan_amount.is_some()
+        || req.cost_plan_currency.is_some()
+        || req.cost_plan_interval_amount.is_some()
+        || req.cost_plan_interval_type.is_some();
+
+    if has_cost_plan_updates {
+        // Get the current cost plan for this template
+        let mut cost_plan = db.get_cost_plan(template.cost_plan_id).await?;
+
+        // Update cost plan fields if provided
+        if let Some(cost_plan_name) = req.cost_plan_name {
+            if cost_plan_name.trim().is_empty() {
+                return Err(anyhow::anyhow!("Cost plan name cannot be empty").into());
+            }
+            cost_plan.name = cost_plan_name.trim().to_string();
+        }
+        if let Some(cost_plan_amount) = req.cost_plan_amount {
+            if cost_plan_amount < 0.0 {
+                return Err(anyhow::anyhow!("Cost plan amount cannot be negative").into());
+            }
+            cost_plan.amount = cost_plan_amount;
+        }
+        if let Some(cost_plan_currency) = req.cost_plan_currency {
+            if cost_plan_currency.trim().is_empty() {
+                return Err(anyhow::anyhow!("Cost plan currency cannot be empty").into());
+            }
+            cost_plan.currency = cost_plan_currency.trim().to_uppercase();
+        }
+        if let Some(cost_plan_interval_amount) = req.cost_plan_interval_amount {
+            if cost_plan_interval_amount == 0 {
+                return Err(anyhow::anyhow!("Cost plan interval amount cannot be zero").into());
+            }
+            cost_plan.interval_amount = cost_plan_interval_amount;
+        }
+        if let Some(cost_plan_interval_type) = req.cost_plan_interval_type {
+            cost_plan.interval_type = cost_plan_interval_type.into();
+        }
+
+        // Update the cost plan
+        db.update_cost_plan(&cost_plan).await?;
+    }
     if let Some(region_id) = req.region_id {
         // Validate that region exists
         let _region = db.get_host_region(region_id).await?;
@@ -198,7 +274,7 @@ pub async fn admin_delete_vm_template(
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Delete)?;
 
     // Check if template exists
-    let _template = db.get_vm_template(id).await?;
+    let template = db.get_vm_template(id).await?;
 
     // Check if template is being used by any VMs
     let vm_count = db.check_vm_template_usage(id).await?;
@@ -210,9 +286,37 @@ pub async fn admin_delete_vm_template(
         .into());
     }
 
+    // Check if the cost plan is used by other templates
+    let all_templates = db.list_vm_templates().await?;
+    let cost_plan_usage_count = all_templates
+        .iter()
+        .filter(|t| t.cost_plan_id == template.cost_plan_id && t.id != id)
+        .count();
+
+    // Delete the template first
     db.delete_vm_template(id).await?;
-    ApiData::ok(serde_json::json!({
-        "success": true,
-        "message": "VM template deleted successfully"
-    }))
+
+    // If this was the only template using the cost plan, delete the cost plan too
+    if cost_plan_usage_count == 0 {
+        match db.delete_cost_plan(template.cost_plan_id).await {
+            Ok(_) => {
+                ApiData::ok(serde_json::json!({
+                    "success": true,
+                    "message": "VM template and associated cost plan deleted successfully"
+                }))
+            }
+            Err(_) => {
+                // Cost plan deletion failed, but template was deleted successfully
+                ApiData::ok(serde_json::json!({
+                    "success": true,
+                    "message": "VM template deleted successfully (cost plan cleanup failed)"
+                }))
+            }
+        }
+    } else {
+        ApiData::ok(serde_json::json!({
+            "success": true,
+            "message": "VM template deleted successfully"
+        }))
+    }
 }

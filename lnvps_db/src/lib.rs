@@ -109,6 +109,18 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get a VM cost plan by id
     async fn get_cost_plan(&self, id: u64) -> Result<VmCostPlan>;
 
+    /// List all VM cost plans
+    async fn list_cost_plans(&self) -> Result<Vec<VmCostPlan>>;
+
+    /// Insert a new VM cost plan
+    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> Result<u64>;
+
+    /// Update a VM cost plan
+    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> Result<()>;
+
+    /// Delete a VM cost plan
+    async fn delete_cost_plan(&self, id: u64) -> Result<()>;
+
     /// Get VM template by id
     async fn get_vm_template(&self, id: u64) -> Result<VmTemplate>;
 

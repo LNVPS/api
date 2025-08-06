@@ -249,7 +249,7 @@ pub struct ApiVmTemplate {
     pub region: ApiVmHostRegion,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiVmCostPlanIntervalType {
     Day = 0,
@@ -263,6 +263,16 @@ impl From<lnvps_db::VmCostPlanIntervalType> for ApiVmCostPlanIntervalType {
             lnvps_db::VmCostPlanIntervalType::Day => Self::Day,
             lnvps_db::VmCostPlanIntervalType::Month => Self::Month,
             lnvps_db::VmCostPlanIntervalType::Year => Self::Year,
+        }
+    }
+}
+
+impl From<ApiVmCostPlanIntervalType> for lnvps_db::VmCostPlanIntervalType {
+    fn from(value: ApiVmCostPlanIntervalType) -> Self {
+        match value {
+            ApiVmCostPlanIntervalType::Day => Self::Day,
+            ApiVmCostPlanIntervalType::Month => Self::Month,
+            ApiVmCostPlanIntervalType::Year => Self::Year,
         }
     }
 }

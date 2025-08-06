@@ -6,6 +6,10 @@ use crate::admin::companies::{
     admin_create_company, admin_delete_company, admin_get_company, admin_list_companies,
     admin_update_company,
 };
+use crate::admin::cost_plans::{
+    admin_create_cost_plan, admin_delete_cost_plan, admin_get_cost_plan,
+    admin_list_cost_plans, admin_update_cost_plan,
+};
 use crate::admin::custom_pricing::{
     admin_copy_custom_pricing, admin_create_custom_pricing, admin_delete_custom_pricing,
     admin_get_custom_pricing, admin_list_custom_pricing, admin_update_custom_pricing,
@@ -48,6 +52,7 @@ use rocket::{routes, Route};
 pub mod access_policies;
 pub mod auth;
 pub mod companies;
+pub mod cost_plans;
 pub mod custom_pricing;
 pub mod hosts;
 pub mod ip_ranges;
@@ -122,6 +127,12 @@ pub fn admin_routes() -> Vec<Route> {
         admin_create_company,
         admin_update_company,
         admin_delete_company,
+        // Cost Plan management
+        admin_list_cost_plans,
+        admin_get_cost_plan,
+        admin_create_cost_plan,
+        admin_update_cost_plan,
+        admin_delete_cost_plan,
         // IP Range management
         admin_list_ip_ranges,
         admin_get_ip_range,

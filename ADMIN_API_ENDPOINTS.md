@@ -34,6 +34,15 @@ All enum types used in this API are listed below with their possible values:
 - Used in: Host configuration
 - Example: `"kind": "proxmox"`
 
+#### CostPlanIntervalType
+**Values**: `"day"`, `"month"`, `"year"`
+- Used in: Cost plan configuration, VM template cost plan settings
+- Example: `"interval_type": "month"`
+- Details:
+  - `"day"`: Billing interval is daily
+  - `"month"`: Billing interval is monthly (default)
+  - `"year"`: Billing interval is yearly
+
 ### Operating System Enums
 
 #### ApiOsDistribution
@@ -582,8 +591,14 @@ Body:
   "disk_size": number,       // Disk size in bytes
   "disk_type": "hdd",        // DiskType enum: "hdd" or "ssd"
   "disk_interface": "sata",   // DiskInterface enum: "sata", "scsi", or "pcie"
-  "cost_plan_id": number,
-  "region_id": number
+  "cost_plan_id": number,    // optional - if not provided, cost plan will be auto-created
+  "region_id": number,
+  // Cost plan auto-creation fields (used when cost_plan_id not provided)
+  "cost_plan_name": "string",            // optional, defaults to "{template_name} Cost Plan"
+  "cost_plan_amount": number,            // required if cost_plan_id not provided
+  "cost_plan_currency": "string",        // optional, defaults to "USD"
+  "cost_plan_interval_amount": number,   // optional, defaults to 1
+  "cost_plan_interval_type": "day" | "month" | "year"  // optional, defaults to "month"
 }
 ```
 
@@ -605,7 +620,12 @@ Body (all optional):
   "disk_type": "string",
   "disk_interface": "string",
   "cost_plan_id": number,
-  "region_id": number
+  "region_id": number,
+  "cost_plan_name": "string",                    // Update associated cost plan name
+  "cost_plan_amount": number,                    // Update associated cost plan amount
+  "cost_plan_currency": "string",               // Update associated cost plan currency
+  "cost_plan_interval_amount": number,          // Update associated cost plan interval amount
+  "cost_plan_interval_type": "day" | "month" | "year"  // Update associated cost plan interval type
 }
 ```
 
@@ -615,7 +635,73 @@ DELETE /api/admin/v1/vm_templates/{id}
 ```
 Required Permission: `vm_template::delete`
 
-Note: VM templates that are referenced by existing VMs cannot be deleted.
+Note: VM templates that are referenced by existing VMs cannot be deleted. When a template is deleted, its associated cost plan will also be deleted if no other templates are using it.
+
+### Cost Plan Management
+
+Cost plans define the billing structure for VM templates. When creating VM templates, you can either specify an existing cost plan or let the system automatically create a new one.
+
+#### List Cost Plans
+```
+GET /api/admin/v1/cost_plans
+```
+Query Parameters:
+- `limit`: number (optional) - Items per page (max 100, default 50)
+- `offset`: number (optional) - Pagination offset
+
+Required Permission: `vm_template::view`
+
+Returns paginated list of cost plans with template usage counts.
+
+#### Get Cost Plan Details
+```
+GET /api/admin/v1/cost_plans/{id}
+```
+Required Permission: `vm_template::view`
+
+Returns detailed information about a specific cost plan including the number of templates using it.
+
+#### Create Cost Plan
+```
+POST /api/admin/v1/cost_plans
+```
+Required Permission: `vm_template::create`
+
+Body:
+```json
+{
+  "name": "string",
+  "amount": number,                        // Cost amount (must be >= 0)
+  "currency": "string",                    // Currency code (e.g., "USD", "EUR")
+  "interval_amount": number,               // Billing interval count (must be > 0)
+  "interval_type": "day" | "month" | "year"  // Billing interval type
+}
+```
+
+#### Update Cost Plan
+```
+PATCH /api/admin/v1/cost_plans/{id}
+```
+Required Permission: `vm_template::update`
+
+Body (all optional):
+```json
+{
+  "name": "string",
+  "amount": number,
+  "currency": "string",
+  "interval_amount": number,
+  "interval_type": "day" | "month" | "year"
+}
+```
+
+#### Delete Cost Plan
+```
+DELETE /api/admin/v1/cost_plans/{id}
+```
+Required Permission: `vm_template::delete`
+
+Note: Cost plans that are referenced by existing VM templates cannot be deleted.
 
 ### Custom Pricing Models Management
 
@@ -1542,5 +1628,19 @@ The RBAC system uses the following permission format: `resource::action`
     "ip4_count": number,
     "ip6_count": number
   }
+}
+```
+
+### AdminCostPlanInfo
+```json
+{
+  "id": number,
+  "name": "string",
+  "created": "string (ISO 8601)",
+  "amount": number,                         // Cost amount
+  "currency": "string",                     // Currency code (e.g., "USD", "EUR")
+  "interval_amount": number,                // Billing interval count
+  "interval_type": "day" | "month" | "year", // Billing interval type
+  "template_count": number                  // Number of VM templates using this cost plan
 }
 ```
