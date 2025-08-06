@@ -13,6 +13,6 @@ admin = []
 anyhow.workspace = true
 sqlx = { version = "0.8.2", features = ["chrono", "migrate", "runtime-tokio"] }
 chrono = { version = "0.4.38", features = ["serde"] }
-async-trait = "0.1.83"
+async-trait.workspace = true
 url = "2.5.4"
 serde.workspace = true

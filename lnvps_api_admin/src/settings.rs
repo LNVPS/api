@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use lnvps_api_common::RedisConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -8,4 +9,7 @@ pub struct Settings {
 
     /// MYSQL connection string
     pub db: String,
+
+    /// Redis configuration for shared VM state cache
+    pub redis: Option<RedisConfig>,
 }

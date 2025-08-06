@@ -71,7 +71,11 @@ async fn main() -> Result<(), Error> {
     let exchange: Arc<dyn ExchangeRateService> = Arc::new(DefaultRateCache::default());
     let node = get_node(&settings).await?;
 
-    let status = VmStateCache::new();
+    let status = if let Some(redis_config) = &settings.redis {
+        VmStateCache::new_with_redis(redis_config.clone())?
+    } else {
+        VmStateCache::new()
+    };
     let vm_history = Arc::new(VmHistoryLogger::new(db.clone()));
     let provisioner = settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
     provisioner.init().await?;

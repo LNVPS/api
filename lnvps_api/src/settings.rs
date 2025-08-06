@@ -5,6 +5,7 @@ use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Result;
 use isocountry::CountryCode;
+use lnvps_api_common::RedisConfig;
 use lnvps_db::LNVpsDb;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,6 +54,9 @@ pub struct Settings {
 
     /// public host of lnvps_nostr service
     pub nostr_address_host: Option<String>,
+
+    /// Redis configuration for shared VM state cache
+    pub redis: Option<RedisConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,5 +275,6 @@ pub fn mock_settings() -> Settings {
         revolut: None,
         tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
         nostr_address_host: None,
+        redis: None,
     }
 }

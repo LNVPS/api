@@ -3,6 +3,7 @@ use clap::Parser;
 use config::{Config, File};
 use lnvps_api_admin::admin;
 use lnvps_api_admin::settings::Settings;
+use lnvps_api_common::VmStateCache;
 use lnvps_common::CORS;
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::{error, info};
@@ -40,6 +41,13 @@ async fn main() -> Result<(), Error> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
+    // Initialize VM state cache
+    let vm_state_cache = if let Some(redis_config) = &settings.redis {
+        VmStateCache::new_with_redis(redis_config.clone())?
+    } else {
+        VmStateCache::new()
+    };
+
     let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
@@ -52,6 +60,7 @@ async fn main() -> Result<(), Error> {
     if let Err(e) = rocket::Rocket::custom(config)
         .manage(db.clone())
         .manage(settings.clone())
+        .manage(vm_state_cache.clone())
         .mount("/", admin::admin_routes())
         .attach(CORS)
         .mount(
