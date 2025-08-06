@@ -6,7 +6,7 @@ use rocket::{delete, get, post, State};
 use std::sync::Arc;
 
 /// List all VMs with pagination and filtering
-#[get("/api/admin/v1/vms?<limit>&<offset>&<user_id>&<host_id>")]
+#[get("/api/admin/v1/vms?<limit>&<offset>&<user_id>&<host_id>&<pubkey>&<region_id>&<include_deleted>")]
 pub async fn admin_list_vms(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
@@ -14,6 +14,9 @@ pub async fn admin_list_vms(
     offset: Option<u64>,
     user_id: Option<u64>,
     host_id: Option<u64>,
+    pubkey: Option<String>,
+    region_id: Option<u64>,
+    include_deleted: Option<bool>,
 ) -> ApiPaginatedResult<AdminVmInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
@@ -21,24 +24,21 @@ pub async fn admin_list_vms(
     let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
     let offset = offset.unwrap_or(0);
 
-    // Get VMs based on filters
-    let all_vms = if let Some(uid) = user_id {
-        db.list_user_vms(uid).await?
-    } else if let Some(hid) = host_id {
-        db.list_vms_on_host(hid).await?
-    } else {
-        db.list_vms().await?
-    };
-
-    let total = all_vms.len() as u64;
-    let vms_page: Vec<_> = all_vms
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    // Use the new filtered database method
+    let (vms, total) = db
+        .admin_list_vms_filtered(
+            limit,
+            offset,
+            user_id,
+            host_id,
+            pubkey.as_deref(), // Convert Option<String> to Option<&str>
+            region_id,
+            include_deleted,
+        )
+        .await?;
 
     let mut admin_vms = Vec::new();
-    for vm in vms_page {
+    for vm in vms {
         // Get user info for this VM
         let user = db.get_user(vm.user_id).await?;
 

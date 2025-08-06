@@ -1098,6 +1098,100 @@ impl AdminDb for MockDb {
             .count();
         Ok(count as u64)
     }
+
+    async fn admin_list_vms_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        host_id: Option<u64>,
+        pubkey: Option<&str>,
+        region_id: Option<u64>,
+        include_deleted: Option<bool>,
+    ) -> anyhow::Result<(Vec<Vm>, u64)> {
+        let vms = self.vms.lock().await;
+        let hosts = self.hosts.lock().await;
+        
+        // Resolve user_id from pubkey if provided
+        let resolved_user_id = if let Some(pk) = pubkey {
+            let pubkey_bytes = hex::decode(pk)
+                .map_err(|_| anyhow!("Invalid pubkey format"))?;
+            
+            match self.get_user_by_pubkey(&pubkey_bytes).await {
+                Ok(user) => Some(user.id),
+                Err(_) => return Ok((vec![], 0)), // No user found, return empty
+            }
+        } else {
+            user_id
+        };
+
+        // Filter VMs based on criteria
+        let filtered_vms: Vec<Vm> = vms
+            .values()
+            .filter(|vm| {
+                // Filter by user_id
+                if let Some(uid) = resolved_user_id {
+                    if vm.user_id != uid {
+                        return false;
+                    }
+                }
+
+                // Filter by host_id
+                if let Some(hid) = host_id {
+                    if vm.host_id != hid {
+                        return false;
+                    }
+                }
+
+                // Filter by region_id
+                if let Some(rid) = region_id {
+                    if let Some(host) = hosts.get(&vm.host_id) {
+                        if host.region_id != rid {
+                            return false;
+                        }
+                    } else {
+                        return false; // VM without valid host when region filter applied
+                    }
+                }
+
+                // Filter by deleted status
+                match include_deleted {
+                    Some(false) | None => {
+                        // Exclude deleted VMs (default behavior)
+                        if vm.deleted {
+                            return false;
+                        }
+                    }
+                    Some(true) => {
+                        // Include both deleted and non-deleted VMs
+                    }
+                }
+
+                true
+            })
+            .cloned()
+            .collect();
+
+        let total = filtered_vms.len() as u64;
+        
+        // Apply pagination
+        let paginated: Vec<Vm> = filtered_vms
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+
+        Ok((paginated, total))
+    }
+
+    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> anyhow::Result<User> {
+        let users = self.users.lock().await;
+        users
+            .values()
+            .find(|user| user.pubkey == pubkey)
+            .cloned()
+            .ok_or_else(|| anyhow!("User not found with provided pubkey"))
+    }
 }
 
 // Nostr trait implementation with stub methods

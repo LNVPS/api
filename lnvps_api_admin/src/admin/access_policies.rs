@@ -7,8 +7,8 @@ use rocket::{delete, get, patch, post, State};
 use std::sync::Arc;
 
 /// List all access policies with pagination
-#[get("/api/admin/v1/access_policies_full?<limit>&<offset>")]
-pub async fn admin_list_access_policies_full(
+#[get("/api/admin/v1/access_policies?<limit>&<offset>")]
+pub async fn admin_list_access_policies(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
     limit: Option<u64>,
@@ -50,8 +50,8 @@ pub async fn admin_list_access_policies_full(
 }
 
 /// Get a specific access policy by ID
-#[get("/api/admin/v1/access_policies_full/<id>")]
-pub async fn admin_get_access_policy_full(
+#[get("/api/admin/v1/access_policies/<id>")]
+pub async fn admin_get_access_policy(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
     id: u64,
@@ -80,8 +80,8 @@ pub async fn admin_get_access_policy_full(
 }
 
 /// Create a new access policy
-#[post("/api/admin/v1/access_policies_full", data = "<req>")]
-pub async fn admin_create_access_policy_full(
+#[post("/api/admin/v1/access_policies", data = "<req>")]
+pub async fn admin_create_access_policy(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
     req: Json<CreateAccessPolicyRequest>,
@@ -127,8 +127,8 @@ pub async fn admin_create_access_policy_full(
 }
 
 /// Update access policy information
-#[patch("/api/admin/v1/access_policies_full/<id>", data = "<req>")]
-pub async fn admin_update_access_policy_full(
+#[patch("/api/admin/v1/access_policies/<id>", data = "<req>")]
+pub async fn admin_update_access_policy(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
     id: u64,
@@ -189,8 +189,8 @@ pub async fn admin_update_access_policy_full(
 }
 
 /// Delete an access policy
-#[delete("/api/admin/v1/access_policies_full/<id>")]
-pub async fn admin_delete_access_policy_full(
+#[delete("/api/admin/v1/access_policies/<id>")]
+pub async fn admin_delete_access_policy(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
     id: u64,

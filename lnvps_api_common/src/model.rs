@@ -145,6 +145,7 @@ impl ApiVmTemplate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum VmState {
     Pending,
     Running,
@@ -181,12 +182,12 @@ impl ApiVmIpAssignment {
 
 #[derive(Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
-pub enum DiskType {
+pub enum ApiDiskType {
     HDD = 0,
     SSD = 1,
 }
 
-impl From<lnvps_db::DiskType> for DiskType {
+impl From<lnvps_db::DiskType> for ApiDiskType {
     fn from(value: lnvps_db::DiskType) -> Self {
         match value {
             lnvps_db::DiskType::HDD => Self::HDD,
@@ -195,24 +196,24 @@ impl From<lnvps_db::DiskType> for DiskType {
     }
 }
 
-impl From<DiskType> for lnvps_db::DiskType {
-    fn from(val: DiskType) -> Self {
+impl From<ApiDiskType> for lnvps_db::DiskType {
+    fn from(val: ApiDiskType) -> Self {
         match val {
-            DiskType::HDD => lnvps_db::DiskType::HDD,
-            DiskType::SSD => lnvps_db::DiskType::SSD,
+            ApiDiskType::HDD => lnvps_db::DiskType::HDD,
+            ApiDiskType::SSD => lnvps_db::DiskType::SSD,
         }
     }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
-pub enum DiskInterface {
+pub enum ApiDiskInterface {
     SATA = 0,
     SCSI = 1,
     PCIe = 2,
 }
 
-impl From<lnvps_db::DiskInterface> for DiskInterface {
+impl From<lnvps_db::DiskInterface> for ApiDiskInterface {
     fn from(value: lnvps_db::DiskInterface) -> Self {
         match value {
             lnvps_db::DiskInterface::SATA => Self::SATA,
@@ -222,12 +223,12 @@ impl From<lnvps_db::DiskInterface> for DiskInterface {
     }
 }
 
-impl From<DiskInterface> for lnvps_db::DiskInterface {
-    fn from(value: DiskInterface) -> Self {
+impl From<ApiDiskInterface> for lnvps_db::DiskInterface {
+    fn from(value: ApiDiskInterface) -> Self {
         match value {
-            DiskInterface::SATA => Self::SATA,
-            DiskInterface::SCSI => Self::SCSI,
-            DiskInterface::PCIe => Self::PCIe,
+            ApiDiskInterface::SATA => Self::SATA,
+            ApiDiskInterface::SCSI => Self::SCSI,
+            ApiDiskInterface::PCIe => Self::PCIe,
         }
     }
 }
@@ -242,8 +243,8 @@ pub struct ApiVmTemplate {
     pub cpu: u16,
     pub memory: u64,
     pub disk_size: u64,
-    pub disk_type: DiskType,
-    pub disk_interface: DiskInterface,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
     pub cost_plan: ApiVmCostPlan,
     pub region: ApiVmHostRegion,
 }
@@ -285,6 +286,7 @@ pub struct ApiVmHostRegion {
 
 // Shared models used by ApiVmStatus
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
 pub enum ApiOsDistribution {
     Ubuntu = 0,
     Debian = 1,

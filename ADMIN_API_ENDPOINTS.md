@@ -25,7 +25,7 @@ All enum types used in this API are listed below with their possible values:
 - Example: `"disk_interface": "pcie"`
 
 #### VmState
-**Values**: `"pending"`, `"running"`, `"stopped"`, `"failed"`
+**Values**: `"pending"`, `"running"`, `"stopped"`
 - Used in: VM status information
 - Example: `"status": "running"`
 
@@ -74,7 +74,7 @@ All enum types used in this API are listed below with their possible values:
   - `"read_only"`: View-only access to admin functions
 
 #### AdminUserStatus
-**Values**: `"active"`, `"suspended"`, `"pending"`
+**Values**: `"active"`, `"suspended"`, `"deleted"`
 - Used in: User account status
 - Example: `"status": "active"`
 
@@ -171,10 +171,25 @@ Query Parameters:
 - `offset`: number (optional) - Pagination offset
 - `user_id`: number (optional) - Filter by user ID
 - `host_id`: number (optional) - Filter by host ID
+- `pubkey`: string (optional) - Filter by user's public key (hex format)
+- `region_id`: number (optional) - Filter by region ID
+- `include_deleted`: boolean (optional) - Include deleted VMs in results (default: false)
 
 Required Permission: `virtual_machines::view`
 
-Returns detailed VM information including user details, host information, region, and deletion status.
+Returns detailed VM information including user details, host information, region, VM resources (CPU, memory, disk), template information (standard/custom), and deletion status.
+
+The endpoint supports multiple filter combinations:
+- Filter by specific user using either `user_id` or `pubkey` (if both provided, `pubkey` takes precedence)
+- Filter by host using `host_id`  
+- Filter by region using `region_id`
+- Control deleted VM visibility using `include_deleted` (false by default excludes deleted VMs)
+- Multiple filters can be combined (e.g., user + region, host + region, include_deleted + any filter)
+
+Template information includes:
+- `template_name`: Name of the template (shows "Custom - {pricing_name}" for custom templates)
+- `custom_template_id`: ID of custom template if applicable
+- `is_standard_template`: Boolean indicating if using a standard template
 
 #### Get VM Details
 ```
@@ -182,7 +197,7 @@ GET /api/admin/v1/vms/{id}
 ```
 Required Permission: `virtual_machines::view`
 
-Returns detailed information about a specific VM including user details, host information, region, and deletion status.
+Returns detailed information about a specific VM including user details, host information, region, VM resources (CPU, memory, disk), and deletion status.
 
 #### Start VM
 ```
@@ -962,19 +977,11 @@ Required Permission: `ip_range::delete`
 
 Note: IP ranges with active IP assignments cannot be deleted. You must first remove all IP assignments before deleting an IP range.
 
+### Access Policy Management
+
 #### List Access Policies
 ```
 GET /api/admin/v1/access_policies
-```
-Required Permission: `ip_range::view`
-
-Returns list of all access policies available for IP range configuration. This is a helper endpoint for IP range management.
-
-### Access Policy Management
-
-#### List Access Policies (Full)
-```
-GET /api/admin/v1/access_policies_full
 ```
 Query Parameters:
 - `limit`: number (optional) - Items per page (max 100, default 50)
@@ -982,11 +989,11 @@ Query Parameters:
 
 Required Permission: `access_policy::view`
 
-Returns paginated list of access policies with router names and IP range usage counts. This is the full CRUD endpoint (different from the helper endpoint used by IP ranges).
+Returns paginated list of access policies with router names and IP range usage counts.
 
 #### Get Access Policy Details
 ```
-GET /api/admin/v1/access_policies_full/{id}
+GET /api/admin/v1/access_policies/{id}
 ```
 Required Permission: `access_policy::view`
 
@@ -994,7 +1001,7 @@ Returns detailed information about a specific access policy including router nam
 
 #### Create Access Policy
 ```
-POST /api/admin/v1/access_policies_full
+POST /api/admin/v1/access_policies
 ```
 Required Permission: `access_policy::create`
 
@@ -1010,7 +1017,7 @@ Body:
 
 #### Update Access Policy
 ```
-PATCH /api/admin/v1/access_policies_full/{id}
+PATCH /api/admin/v1/access_policies/{id}
 ```
 Required Permission: `access_policy::update`
 
@@ -1026,7 +1033,7 @@ Body (all optional):
 
 #### Delete Access Policy
 ```
-DELETE /api/admin/v1/access_policies_full/{id}
+DELETE /api/admin/v1/access_policies/{id}
 ```
 Required Permission: `access_policy::delete`
 
@@ -1212,8 +1219,10 @@ The RBAC system uses the following permission format: `resource::action`
   "mac_address": "string",
   "image_id": number,                 // OS image ID for linking
   "image_name": "string",             // OS distribution, version and flavor (e.g., "Ubuntu 22.04 Server")
-  "template_id": number,              // Template ID for linking
-  "template_name": "string",          // Simplified: Template name without cost details
+  "template_id": number,              // Template ID for linking (standard templates)
+  "template_name": "string",          // Template name - shows "Custom - {pricing_name}" for custom templates
+  "custom_template_id": number | null, // Custom template ID if using custom template
+  "is_standard_template": boolean,    // True for standard templates, false for custom templates
   "ssh_key_id": number,               // SSH key ID for linking
   "ssh_key_name": "string",           // Simplified: SSH key name only
   "ip_addresses": [                   // Array of IP address objects with IDs for linking
@@ -1223,7 +1232,12 @@ The RBAC system uses the following permission format: `resource::action`
       "range_id": number              // IP range ID for linking to range details
     }
   ],
-  "status": "running",                // VmState enum: "pending", "running", "stopped", "failed"
+  "status": "running",                // VmState enum: "pending", "running", "stopped"
+  "cpu": number,                      // Number of CPU cores allocated
+  "memory": number,                   // Memory in bytes allocated
+  "disk_size": number,                // Disk size in bytes
+  "disk_type": "ssd",                 // DiskType enum: "hdd" or "ssd"
+  "disk_interface": "pcie",           // DiskInterface enum: "sata", "scsi", or "pcie"
   "host_id": number,
   "user_id": number,
   "user_pubkey": "string (hex)",

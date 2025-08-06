@@ -1,6 +1,6 @@
 use crate::admin::access_policies::{
-    admin_create_access_policy_full, admin_delete_access_policy_full, admin_get_access_policy_full,
-    admin_list_access_policies_full, admin_update_access_policy_full,
+    admin_create_access_policy, admin_delete_access_policy, admin_get_access_policy,
+    admin_list_access_policies, admin_update_access_policy,
 };
 use crate::admin::companies::{
     admin_create_company, admin_delete_company, admin_get_company, admin_list_companies,
@@ -128,12 +128,12 @@ pub fn admin_routes() -> Vec<Route> {
         admin_create_ip_range,
         admin_update_ip_range,
         admin_delete_ip_range,
-        // Access Policy management (full CRUD)
-        admin_list_access_policies_full,
-        admin_get_access_policy_full,
-        admin_create_access_policy_full,
-        admin_update_access_policy_full,
-        admin_delete_access_policy_full,
+        // Access Policy management
+        admin_list_access_policies,
+        admin_get_access_policy,
+        admin_create_access_policy,
+        admin_update_access_policy,
+        admin_delete_access_policy,
         // Router management (full CRUD)
         admin_list_routers,
         admin_get_router,

@@ -2214,4 +2214,123 @@ impl AdminDb for LNVpsDbMysql {
 
         Ok(count.0 as u64)
     }
+
+    async fn admin_list_vms_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        host_id: Option<u64>,
+        pubkey: Option<&str>,
+        region_id: Option<u64>,
+        include_deleted: Option<bool>,
+    ) -> Result<(Vec<crate::Vm>, u64)> {
+        // Resolve user_id from pubkey if provided
+        let resolved_user_id = if let Some(pk) = pubkey {
+            // Use SQL UNHEX to decode the pubkey and find the user
+            let user_result: Result<(u64,), _> = sqlx::query_as(
+                "SELECT id FROM users WHERE pubkey = UNHEX(?)"
+            )
+            .bind(pk)
+            .fetch_one(&self.db)
+            .await;
+            
+            match user_result {
+                Ok((user_id,)) => Some(user_id),
+                Err(_) => return Ok((vec![], 0)), // No user found, return empty
+            }
+        } else {
+            user_id
+        };
+
+        // Build queries using query builder
+        let base_from = "vm v LEFT JOIN vm_host h ON v.host_id = h.id";
+        
+        // Start with the base query
+        let mut count_query = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM ");
+        count_query.push(base_from);
+        
+        let mut data_query = sqlx::QueryBuilder::new("SELECT v.* FROM ");
+        data_query.push(base_from);
+        
+        // Add WHERE conditions
+        let mut has_conditions = false;
+        
+        if let Some(uid) = resolved_user_id {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("v.user_id = ").push_bind(uid);
+            data_query.push("v.user_id = ").push_bind(uid);
+        }
+        
+        if let Some(hid) = host_id {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("v.host_id = ").push_bind(hid);
+            data_query.push("v.host_id = ").push_bind(hid);
+        }
+        
+        if let Some(rid) = region_id {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("h.region_id = ").push_bind(rid);
+            data_query.push("h.region_id = ").push_bind(rid);
+        }
+        
+        // Handle deleted filter
+        match include_deleted {
+            Some(false) | None => {
+                // Exclude deleted VMs (default behavior or explicitly requested)
+                if !has_conditions {
+                    count_query.push(" WHERE ");
+                    data_query.push(" WHERE ");
+                } else {
+                    count_query.push(" AND ");
+                    data_query.push(" AND ");
+                }
+                count_query.push("v.deleted = FALSE");
+                data_query.push("v.deleted = FALSE");
+            }
+            Some(true) => {
+                // Include both deleted and non-deleted VMs - no additional filter needed
+            }
+        }
+        
+        // Execute count query
+        let total: i64 = count_query.build_query_scalar().fetch_one(&self.db).await.map_err(Error::new)?;
+        
+        // Add ordering and pagination to data query
+        data_query.push(" ORDER BY v.id LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        
+        // Execute data query
+        let vms: Vec<Vm> = data_query.build_query_as().fetch_all(&self.db).await.map_err(Error::new)?;
+
+        Ok((vms, total as u64))
+    }
+
+    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> Result<crate::User> {
+        sqlx::query_as("SELECT * FROM users WHERE pubkey = ?")
+            .bind(pubkey)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
 }

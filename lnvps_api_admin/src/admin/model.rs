@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use lnvps_api_common::{VmState, DiskType, DiskInterface, ApiOsDistribution};
+use lnvps_api_common::{VmState, ApiDiskType, ApiDiskInterface, ApiOsDistribution};
 use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution};
 use rocket_okapi::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -293,10 +293,14 @@ pub struct AdminVmInfo {
     pub image_id: u64,
     /// OS Image name/version with distribution (e.g., "Ubuntu 22.04 Server")
     pub image_name: String,
-    /// Template ID for linking
+    /// Template ID for linking (standard template if used)
     pub template_id: u64,
     /// Template name (simplified, no cost details)
     pub template_name: String,
+    /// Custom template ID for linking (custom template if used)
+    pub custom_template_id: Option<u64>,
+    /// Indicates whether this VM uses a standard template (true) or custom template (false)
+    pub is_standard_template: bool,
     /// SSH key ID for linking
     pub ssh_key_id: u64,
     /// SSH key name (simplified)
@@ -305,6 +309,18 @@ pub struct AdminVmInfo {
     pub ip_addresses: Vec<AdminVmIpAddress>,
     /// Current running state of the VM
     pub status: VmState,
+
+    // VM Resources
+    /// Number of CPU cores allocated to this VM
+    pub cpu: u16,
+    /// Memory in bytes allocated to this VM  
+    pub memory: u64,
+    /// Disk size in bytes
+    pub disk_size: u64,
+    /// Disk type (HDD/SSD)
+    pub disk_type: ApiDiskType,
+    /// Disk interface (SATA/SCSI/PCIe)
+    pub disk_interface: ApiDiskInterface,
 
     // Admin-specific fields
     pub host_id: u64,
@@ -335,17 +351,38 @@ impl AdminVmInfo {
         let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
         let ips = db.list_vm_ip_assignments(vm.id).await?;
 
-        // Get template info (simplified)
-        let (template_id, template_name) = if let Some(template_id) = vm.template_id {
-            let template = db.get_vm_template(template_id).await?;
-            (template_id, template.name)
-        } else if let Some(custom_template_id) = vm.custom_template_id {
-            let custom_template = db.get_custom_vm_template(custom_template_id).await?;
-            let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
-            (custom_template_id, pricing.name)
-        } else {
-            (0, "Unknown".to_string())
-        };
+        // Get template info and VM resources
+        let (template_id, template_name, custom_template_id, is_standard_template, cpu, memory, disk_size, disk_type, disk_interface) = 
+            if let Some(template_id) = vm.template_id {
+                let template = db.get_vm_template(template_id).await?;
+                (
+                    template_id, 
+                    template.name,
+                    None,
+                    true,
+                    template.cpu,
+                    template.memory,
+                    template.disk_size,
+                    ApiDiskType::from(template.disk_type),
+                    ApiDiskInterface::from(template.disk_interface),
+                )
+            } else if let Some(custom_template_id) = vm.custom_template_id {
+                let custom_template = db.get_custom_vm_template(custom_template_id).await?;
+                let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
+                (
+                    0, // No standard template ID
+                    format!("Custom - {}", pricing.name),
+                    Some(custom_template_id),
+                    false,
+                    custom_template.cpu,
+                    custom_template.memory,
+                    custom_template.disk_size,
+                    ApiDiskType::from(custom_template.disk_type),
+                    ApiDiskInterface::from(custom_template.disk_interface),
+                )
+            } else {
+                (0, "Unknown".to_string(), None, true, 0, 0, 0, ApiDiskType::HDD, ApiDiskInterface::SATA)
+            };
 
         let mut ip_addresses = Vec::new();
         for ip in ips {
@@ -365,10 +402,17 @@ impl AdminVmInfo {
             image_name: format!("{} {} {}", image.distribution, image.flavour, image.version),
             template_id,
             template_name,
+            custom_template_id,
+            is_standard_template,
             ssh_key_id: vm.ssh_key_id,
             ssh_key_name: ssh_key.name,
             ip_addresses,
             status: state.unwrap_or_default(),
+            cpu,
+            memory,
+            disk_size,
+            disk_type,
+            disk_interface,
             host_id,
             user_id,
             user_pubkey,
@@ -473,8 +517,8 @@ pub struct AdminHostDisk {
     pub id: u64,
     pub name: String,
     pub size: u64,
-    pub kind: DiskType,
-    pub interface: DiskInterface,
+    pub kind: ApiDiskType,
+    pub interface: ApiDiskInterface,
     pub enabled: bool,
 }
 
@@ -547,8 +591,8 @@ impl AdminHostInfo {
                 id: disk.id,
                 name: disk.name,
                 size: disk.size,
-                kind: DiskType::from(disk.kind),
-                interface: DiskInterface::from(disk.interface),
+                kind: ApiDiskType::from(disk.kind),
+                interface: ApiDiskInterface::from(disk.interface),
                 enabled: disk.enabled,
             })
             .collect();
@@ -595,8 +639,8 @@ impl AdminHostInfo {
                 id: disk.id,
                 name: disk.name,
                 size: disk.size,
-                kind: DiskType::from(disk.kind),
-                interface: DiskInterface::from(disk.interface),
+                kind: ApiDiskType::from(disk.kind),
+                interface: ApiDiskInterface::from(disk.interface),
                 enabled: disk.enabled,
             })
             .collect();
@@ -751,8 +795,8 @@ pub struct AdminVmTemplateInfo {
     pub cpu: u16,
     pub memory: u64,
     pub disk_size: u64,
-    pub disk_type: DiskType,
-    pub disk_interface: DiskInterface,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
     pub cost_plan_id: u64,
     pub region_id: u64,
     pub region_name: Option<String>,
@@ -768,8 +812,8 @@ pub struct AdminCreateVmTemplateRequest {
     pub cpu: u16,
     pub memory: u64,
     pub disk_size: u64,
-    pub disk_type: DiskType,
-    pub disk_interface: DiskInterface,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
     pub cost_plan_id: u64,
     pub region_id: u64,
 }
@@ -782,8 +826,8 @@ pub struct AdminUpdateVmTemplateRequest {
     pub cpu: Option<u16>,
     pub memory: Option<u64>,
     pub disk_size: Option<u64>,
-    pub disk_type: Option<DiskType>,
-    pub disk_interface: Option<DiskInterface>,
+    pub disk_type: Option<ApiDiskType>,
+    pub disk_interface: Option<ApiDiskInterface>,
     pub cost_plan_id: Option<u64>,
     pub region_id: Option<u64>,
 }
@@ -824,8 +868,8 @@ pub struct AdminCustomPricingInfo {
 #[derive(Serialize, JsonSchema)]
 pub struct AdminCustomPricingDisk {
     pub id: u64,
-    pub kind: DiskType,
-    pub interface: DiskInterface,
+    pub kind: ApiDiskType,
+    pub interface: ApiDiskInterface,
     pub cost: f32,
 }
 
@@ -859,8 +903,8 @@ pub struct CreateCustomPricingRequest {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct CreateCustomPricingDisk {
-    pub kind: DiskType,
-    pub interface: DiskInterface,
+    pub kind: ApiDiskType,
+    pub interface: ApiDiskInterface,
     pub cost: f32,
 }
 

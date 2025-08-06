@@ -229,4 +229,22 @@ pub trait AdminDb: Send + Sync {
 
     /// Count access policies using a router
     async fn admin_count_router_access_policies(&self, router_id: u64) -> Result<u64>;
+
+    // VM management methods with advanced filtering
+    /// List VMs with advanced filtering for admin interface
+    /// Supports filtering by user_id, host_id, pubkey (hex string), region_id, and deleted status
+    /// Returns (vms, total_count_before_pagination)
+    async fn admin_list_vms_filtered(
+        &self, 
+        limit: u64, 
+        offset: u64,
+        user_id: Option<u64>,
+        host_id: Option<u64>, 
+        pubkey: Option<&str>,
+        region_id: Option<u64>,
+        include_deleted: Option<bool>
+    ) -> Result<(Vec<crate::Vm>, u64)>;
+
+    /// Get user by pubkey (hex string)
+    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> Result<crate::User>;
 }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use lnvps_db::{PaymentMethod, VmCustomTemplate};
-use lnvps_api_common::{Currency, DiskType, DiskInterface};
+use lnvps_api_common::{Currency, ApiDiskType, ApiDiskInterface};
 use nostr::util::hex;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -65,7 +65,7 @@ impl ApiCustomTemplateParams {
         region: &lnvps_db::VmHostRegion,
         max_cpu: u16,
         max_memory: u64,
-        max_disk: &HashMap<(DiskType, DiskInterface), u64>,
+        max_disk: &HashMap<(ApiDiskType, ApiDiskInterface), u64>,
     ) -> Result<Self> {
         use crate::GB;
         Ok(ApiCustomTemplateParams {
@@ -99,8 +99,8 @@ impl ApiCustomTemplateParams {
 pub struct ApiCustomTemplateDiskParam {
     pub min_disk: u64,
     pub max_disk: u64,
-    pub disk_type: DiskType,
-    pub disk_interface: DiskInterface,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
 }
 
 // Models that are only used in lnvps_api (moved from common)
@@ -367,8 +367,8 @@ pub struct ApiCustomVmRequest {
     pub cpu: u16,
     pub memory: u64,
     pub disk: u64,
-    pub disk_type: DiskType,
-    pub disk_interface: DiskInterface,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
 }
 
 impl From<ApiCustomVmRequest> for VmCustomTemplate {  

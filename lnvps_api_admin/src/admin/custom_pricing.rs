@@ -4,7 +4,7 @@ use crate::admin::model::{
     CreateCustomPricingRequest, UpdateCustomPricingRequest,
 };
 use chrono::Utc;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, DiskType, DiskInterface};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiDiskType, ApiDiskInterface};
 use lnvps_db::{
     AdminAction, AdminResource, LNVpsDb, VmCustomPricing,
     VmCustomPricingDisk,
@@ -32,8 +32,8 @@ impl AdminCustomPricingInfo {
             .into_iter()
             .map(|dp| AdminCustomPricingDisk {
                 id: dp.id,
-                kind: DiskType::from(dp.kind),
-                interface: DiskInterface::from(dp.interface),
+                kind: ApiDiskType::from(dp.kind),
+                interface: ApiDiskInterface::from(dp.interface),
                 cost: dp.cost,
             })
             .collect();
