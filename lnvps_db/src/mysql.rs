@@ -2362,7 +2362,7 @@ impl AdminDb for LNVpsDbMysql {
         let total: i64 = count_query.build_query_scalar().fetch_one(&self.db).await.map_err(Error::new)?;
         
         // Add ordering and pagination to data query
-        data_query.push(" ORDER BY v.id LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        data_query.push(" ORDER BY v.id DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
         
         // Execute data query
         let vms: Vec<Vm> = data_query.build_query_as().fetch_all(&self.db).await.map_err(Error::new)?;
