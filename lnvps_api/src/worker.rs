@@ -16,6 +16,7 @@ use nostr::{EventBuilder, PublicKey, ToBech32};
 use nostr_sdk::Client;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug)]
@@ -300,6 +301,7 @@ impl Worker {
                         smtp.username.to_string(),
                         smtp.password.to_string(),
                     ))
+                    .timeout(Some(Duration::from_secs(10)))
                     .build();
 
                 sender.send(msg).await?;
@@ -427,10 +429,8 @@ impl Worker {
                     .await
                 {
                     error!("Failed to send notification {}: {}", user_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to send notification:\n{:?}\n{}", &job, e),
-                        Some("Job Failed".to_string()),
-                    )?
+                    // queue again for sending
+                    self.queue_notification(*user_id, message.clone(), title.clone())?;
                 }
             }
             WorkJob::CheckVms => {
