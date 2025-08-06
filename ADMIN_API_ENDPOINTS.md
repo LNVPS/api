@@ -1048,7 +1048,7 @@ Returns paginated list of routers with configuration details and access policy u
 
 #### Get Router Details
 ```
-GET /api/admin/v1/routers/{id}
+GET /api/admin/v1/routers/{router_id}
 ```
 Required Permission: `router::view`
 
@@ -1073,7 +1073,7 @@ Body:
 
 #### Update Router
 ```
-PATCH /api/admin/v1/routers/{id}
+PATCH /api/admin/v1/routers/{router_id}
 ```
 Required Permission: `router::update`
 
@@ -1090,7 +1090,7 @@ Body (all optional):
 
 #### Delete Router
 ```
-DELETE /api/admin/v1/routers/{id}
+DELETE /api/admin/v1/routers/{router_id}
 ```
 Required Permission: `router::delete`
 

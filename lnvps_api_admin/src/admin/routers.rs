@@ -5,7 +5,7 @@ use crate::admin::model::{
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
-use rocket::{get, post, put, delete, State};
+use rocket::{get, post, put, delete, State, patch};
 use std::sync::Arc;
 
 #[get("/api/admin/v1/routers?<limit>&<offset>")]
@@ -73,7 +73,7 @@ pub async fn admin_create_router(
     ApiData::ok(admin_router)
 }
 
-#[put("/api/admin/v1/routers/<router_id>", data = "<request>")]
+#[patch("/api/admin/v1/routers/<router_id>", data = "<request>")]
 pub async fn admin_update_router(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
