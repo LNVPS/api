@@ -606,6 +606,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn list_vm_payment_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<VmPayment>> {
+        sqlx::query_as("select * from vm_payment where vm_id = ? order by created desc limit ? offset ?")
+            .bind(vm_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
         sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,currency,payment_method,time_value,is_paid,rate,external_id,external_data) values(?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)

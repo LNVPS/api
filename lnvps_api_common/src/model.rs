@@ -218,6 +218,17 @@ pub enum VmState {
     Failed,
 }
 
+impl From<crate::status::VmRunningStates> for VmState {
+    fn from(running_state: crate::status::VmRunningStates) -> Self {
+        match running_state {
+            crate::status::VmRunningStates::Running => VmState::Running,
+            crate::status::VmRunningStates::Stopped => VmState::Stopped,
+            crate::status::VmRunningStates::Starting => VmState::Pending,
+            crate::status::VmRunningStates::Deleting => VmState::Failed,
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct ApiVmIpAssignment {
     pub id: u64,

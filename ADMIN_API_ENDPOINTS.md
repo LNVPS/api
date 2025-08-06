@@ -24,10 +24,20 @@ All enum types used in this API are listed below with their possible values:
 - Used in: VM templates, custom pricing, host disks
 - Example: `"disk_interface": "pcie"`
 
-#### VmState
-**Values**: `"pending"`, `"running"`, `"stopped"`
-- Used in: VM status information
-- Example: `"status": "running"`
+#### VmRunningStates
+**Values**: `"running"`, `"stopped"`, `"starting"`, `"deleting"`
+- Used in: VM running state information (within running_state object)
+- Example: `"state": "running"`
+
+#### AdminVmHistoryActionType
+**Values**: `"created"`, `"started"`, `"stopped"`, `"restarted"`, `"deleted"`, `"expired"`, `"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`
+- Used in: VM history entries
+- Example: `"action_type": "started"`
+
+#### AdminPaymentMethod
+**Values**: `"lightning"`, `"revolut"`, `"paypal"`
+- Used in: Payment information
+- Example: `"payment_method": "lightning"`
 
 #### VmHostKind
 **Values**: `"proxmox"`, `"libvirt"`
@@ -225,6 +235,46 @@ Required Permission: `virtual_machines::update`
 DELETE /api/admin/v1/vms/{id}
 ```
 Required Permission: `virtual_machines::delete`
+
+#### List VM History
+```
+GET /api/admin/v1/vms/{vm_id}/history
+```
+Query Parameters:
+- `limit`: number (optional) - Items per page (max 100, default 50)  
+- `offset`: number (optional) - Pagination offset
+
+Required Permission: `virtual_machines::view`
+
+Returns a paginated list of history entries for the specified VM, including actions like creation, start/stop operations, payments, configuration changes, etc.
+
+#### Get VM History Entry
+```
+GET /api/admin/v1/vms/{vm_id}/history/{history_id}
+```
+Required Permission: `virtual_machines::view`
+
+Returns detailed information about a specific VM history entry.
+
+#### List VM Payments
+```
+GET /api/admin/v1/vms/{vm_id}/payments
+```
+Query Parameters:
+- `limit`: number (optional) - Items per page (max 100, default 50)
+- `offset`: number (optional) - Pagination offset
+
+Required Permission: `payments::view`
+
+Returns paginated payment records for the specified VM, including payment status, amounts, and payment methods. Payments are ordered by creation date (newest first).
+
+#### Get VM Payment
+```
+GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}
+```
+Required Permission: `payments::view`
+
+Returns detailed information about a specific VM payment. The `payment_id` should be hex-encoded.
 
 ### Role Management
 
@@ -1318,7 +1368,17 @@ The RBAC system uses the following permission format: `resource::action`
       "range_id": number              // IP range ID for linking to range details
     }
   ],
-  "status": "running",                // VmState enum: "pending", "running", "stopped"
+  "running_state": {                  // Full VM running state with metrics (null if unavailable)
+    "timestamp": number,              // Unix timestamp of when state was collected
+    "state": "running",               // VmRunningStates enum: "running", "stopped", "starting", "deleting"
+    "cpu_usage": number,              // Current CPU usage percentage (0.0-100.0)
+    "mem_usage": number,              // Current memory usage percentage (0.0-100.0)
+    "uptime": number,                 // VM uptime in seconds
+    "net_in": number,                 // Network bytes received
+    "net_out": number,                // Network bytes transmitted
+    "disk_write": number,             // Disk bytes written
+    "disk_read": number               // Disk bytes read
+  } | null,
   "cpu": number,                      // Number of CPU cores allocated
   "memory": number,                   // Memory in bytes allocated
   "disk_size": number,                // Disk size in bytes
@@ -1444,6 +1504,36 @@ The RBAC system uses the following permission format: `resource::action`
   "kind": "string",
   "interface": "string",
   "enabled": boolean
+}
+```
+
+### AdminVmHistoryInfo
+```json
+{
+  "id": number,
+  "vm_id": number,
+  "action_type": "started",               // AdminVmHistoryActionType enum: "created", "started", "stopped", etc.
+  "timestamp": "string (ISO 8601)",       // When this action occurred
+  "initiated_by_user": number | null,     // User ID who initiated this action (if applicable)
+  "initiated_by_user_pubkey": "string | null", // Hex-encoded pubkey of initiating user
+  "initiated_by_user_email": "string | null",  // Email of initiating user
+  "description": "string | null"          // Human-readable description of the action
+}
+```
+
+### AdminVmPaymentInfo
+```json
+{
+  "id": "string",                         // Hex-encoded payment ID
+  "vm_id": number,
+  "created": "string (ISO 8601)",         // When payment was created
+  "expires": "string (ISO 8601)",         // When payment expires
+  "amount": number,                       // Amount in smallest currency unit (satoshis, cents)
+  "currency": "string",                   // Currency code (e.g., "EUR", "USD", "BTC")
+  "payment_method": "lightning",          // AdminPaymentMethod enum: "lightning", "revolut", "paypal"
+  "external_id": "string | null",         // External payment provider ID
+  "is_paid": boolean,                     // Whether payment has been completed
+  "rate": number                          // Exchange rate to base currency (EUR)
 }
 ```
 

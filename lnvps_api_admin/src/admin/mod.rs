@@ -46,6 +46,7 @@ use crate::admin::routers::{
 };
 use crate::admin::vms::{
     admin_delete_vm, admin_get_vm, admin_list_vms, admin_start_vm, admin_stop_vm,
+    admin_list_vm_history, admin_get_vm_history, admin_list_vm_payments, admin_get_vm_payment,
 };
 use rocket::{routes, Route};
 
@@ -76,6 +77,12 @@ pub fn admin_routes() -> Vec<Route> {
         admin_start_vm,
         admin_stop_vm,
         admin_delete_vm,
+        // VM History management
+        admin_list_vm_history,
+        admin_get_vm_history,
+        // VM Payment management
+        admin_list_vm_payments,
+        admin_get_vm_payment,
         // Host management
         admin_list_hosts,
         admin_get_host,

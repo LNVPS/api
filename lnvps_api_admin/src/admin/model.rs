@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use lnvps_api_common::{VmState, ApiDiskType, ApiDiskInterface, ApiOsDistribution, ApiVmCostPlanIntervalType};
-use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution};
+use lnvps_api_common::{VmRunningState, ApiDiskType, ApiDiskInterface, ApiOsDistribution, ApiVmCostPlanIntervalType};
+use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution, VmHistory, VmHistoryActionType, VmPayment, PaymentMethod};
 use rocket_okapi::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -307,8 +307,8 @@ pub struct AdminVmInfo {
     pub ssh_key_name: String,
     /// IP addresses with IDs for linking
     pub ip_addresses: Vec<AdminVmIpAddress>,
-    /// Current running state of the VM
-    pub status: VmState,
+    /// Full VM running state with metrics (CPU usage, memory usage, etc.)
+    pub running_state: Option<VmRunningState>,
 
     // VM Resources
     /// Number of CPU cores allocated to this VM
@@ -337,7 +337,7 @@ impl AdminVmInfo {
     pub async fn from_vm_with_admin_data(
         db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
         vm: &lnvps_db::Vm,
-        state: Option<VmState>,
+        running_state: Option<VmRunningState>,
         host_id: u64,
         user_id: u64,
         user_pubkey: String,
@@ -407,7 +407,7 @@ impl AdminVmInfo {
             ssh_key_id: vm.ssh_key_id,
             ssh_key_name: ssh_key.name,
             ip_addresses,
-            status: state.unwrap_or_default(),
+            running_state,
             cpu,
             memory,
             disk_size,
@@ -1305,5 +1305,136 @@ impl AdminCreateCostPlanRequest {
             interval_amount: self.interval_amount,
             interval_type: self.interval_type.into(),
         })
+    }
+}
+
+// VM History Models
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminVmHistoryActionType {
+    Created,
+    Started,
+    Stopped,
+    Restarted,
+    Deleted,
+    Expired,
+    Renewed,
+    Reinstalled,
+    StateChanged,
+    PaymentReceived,
+    ConfigurationChanged,
+}
+
+impl From<VmHistoryActionType> for AdminVmHistoryActionType {
+    fn from(action_type: VmHistoryActionType) -> Self {
+        match action_type {
+            VmHistoryActionType::Created => AdminVmHistoryActionType::Created,
+            VmHistoryActionType::Started => AdminVmHistoryActionType::Started,
+            VmHistoryActionType::Stopped => AdminVmHistoryActionType::Stopped,
+            VmHistoryActionType::Restarted => AdminVmHistoryActionType::Restarted,
+            VmHistoryActionType::Deleted => AdminVmHistoryActionType::Deleted,
+            VmHistoryActionType::Expired => AdminVmHistoryActionType::Expired,
+            VmHistoryActionType::Renewed => AdminVmHistoryActionType::Renewed,
+            VmHistoryActionType::Reinstalled => AdminVmHistoryActionType::Reinstalled,
+            VmHistoryActionType::StateChanged => AdminVmHistoryActionType::StateChanged,
+            VmHistoryActionType::PaymentReceived => AdminVmHistoryActionType::PaymentReceived,
+            VmHistoryActionType::ConfigurationChanged => AdminVmHistoryActionType::ConfigurationChanged,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug)]
+pub struct AdminVmHistoryInfo {
+    pub id: u64,
+    pub vm_id: u64,
+    pub action_type: AdminVmHistoryActionType,
+    pub timestamp: DateTime<Utc>,
+    pub initiated_by_user: Option<u64>,
+    pub initiated_by_user_pubkey: Option<String>, // hex encoded
+    pub initiated_by_user_email: Option<String>,
+    pub description: Option<String>,
+    // Note: previous_state, new_state, and metadata are omitted as they contain binary data
+    // and may be sensitive. They can be added later if needed.
+}
+
+impl AdminVmHistoryInfo {
+    pub async fn from_vm_history_with_admin_data(
+        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+        history: &VmHistory,
+    ) -> anyhow::Result<Self> {
+        let mut initiated_by_user_pubkey = None;
+        let mut initiated_by_user_email = None;
+
+        // Get user info if available
+        if let Some(user_id) = history.initiated_by_user {
+            if let Ok(user) = db.get_user(user_id).await {
+                initiated_by_user_pubkey = Some(hex::encode(&user.pubkey));
+                initiated_by_user_email = user.email;
+            }
+        }
+
+        Ok(Self {
+            id: history.id,
+            vm_id: history.vm_id,
+            action_type: AdminVmHistoryActionType::from(history.action_type.clone()),
+            timestamp: history.timestamp,
+            initiated_by_user: history.initiated_by_user,
+            initiated_by_user_pubkey,
+            initiated_by_user_email,
+            description: history.description.clone(),
+        })
+    }
+}
+
+// VM Payment Models
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminPaymentMethod {
+    Lightning,
+    Revolut,
+    Paypal,
+}
+
+impl From<PaymentMethod> for AdminPaymentMethod {
+    fn from(payment_method: PaymentMethod) -> Self {
+        match payment_method {
+            PaymentMethod::Lightning => AdminPaymentMethod::Lightning,
+            PaymentMethod::Revolut => AdminPaymentMethod::Revolut,
+            PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug)]
+pub struct AdminVmPaymentInfo {
+    pub id: String, // hex encoded payment ID
+    pub vm_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64, // Amount in smallest currency unit (e.g., satoshis, cents)
+    pub currency: String,
+    pub payment_method: AdminPaymentMethod,
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub rate: f32, // Exchange rate to base currency (EUR)
+    // Note: external_data is omitted as it may contain sensitive payment provider data
+}
+
+impl AdminVmPaymentInfo {
+    pub fn from_vm_payment(payment: &VmPayment) -> Self {
+        Self {
+            id: hex::encode(&payment.id),
+            vm_id: payment.vm_id,
+            created: payment.created,
+            expires: payment.expires,
+            amount: payment.amount,
+            currency: payment.currency.clone(),
+            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            external_id: payment.external_id.clone(),
+            is_paid: payment.is_paid,
+            rate: payment.rate,
+        }
     }
 }

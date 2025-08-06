@@ -6,6 +6,9 @@ lightning:
     macaroon: "/home/kieran/.polar/networks/2/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
 delete-after: 3
 public-url: "https://api.lnvps.net"
+redis:
+  url: "redis://localhost:6398"
+  ttl: 30
 provisioner:
   proxmox:
     read-only: false

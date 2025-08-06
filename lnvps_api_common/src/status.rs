@@ -34,14 +34,14 @@ pub struct VmRunningState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
     pub url: String,
-    pub ttl_seconds: u64,
+    pub ttl: u64,
 }
 
 impl Default for RedisConfig {
     fn default() -> Self {
         Self {
             url: "redis://localhost:6379".to_string(),
-            ttl_seconds: 300, // 5 minutes
+            ttl: 300, // 5 minutes
         }
     }
 }
@@ -92,7 +92,7 @@ impl RedisVmStateCache {
         let client = redis::Client::open(config.url)?;
         Ok(Self {
             client: Arc::new(client),
-            ttl: Duration::from_secs(config.ttl_seconds),
+            ttl: Duration::from_secs(config.ttl),
         })
     }
 

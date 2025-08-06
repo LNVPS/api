@@ -175,6 +175,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List payments by VM id
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>>;
 
+    /// List payments by VM id with pagination
+    async fn list_vm_payment_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<VmPayment>>;
+
     /// Insert a new VM payment record
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()>;
 

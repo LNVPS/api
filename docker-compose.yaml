@@ -11,3 +11,8 @@ services:
       - "3376:3306"
     volumes:
       - "db:/var/lib/mysql"
+  redis:
+    image: redis
+    restart: unless-stopped
+    ports:
+      - "6398:6379"

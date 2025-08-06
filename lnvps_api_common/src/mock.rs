@@ -636,6 +636,18 @@ impl LNVpsDbBase for MockDb {
         Ok(p.iter().filter(|p| p.vm_id == vm_id).cloned().collect())
     }
 
+    async fn list_vm_payment_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<Vec<VmPayment>> {
+        let p = self.payments.lock().await;
+        let mut filtered: Vec<_> = p.iter().filter(|p| p.vm_id == vm_id).cloned().collect();
+        filtered.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(filtered.into_iter().skip(offset as usize).take(limit as usize).collect())
+    }
+
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
         let mut p = self.payments.lock().await;
         p.push(vm_payment.clone());
