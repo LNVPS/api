@@ -1,0 +1,1 @@
+db: "mysql://root:root@localhost:3376/lnvps"

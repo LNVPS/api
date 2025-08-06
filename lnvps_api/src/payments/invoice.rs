@@ -40,7 +40,7 @@ impl NodeInvoiceHandler {
         // Get VM state before payment processing
         let vm_before = self.db.get_vm(payment.vm_id).await?;
         
-        self.db.vm_payment_paid(&payment).await?;
+        self.db.vm_payment_paid(payment).await?;
         
         // Get VM state after payment processing
         let vm_after = self.db.get_vm(payment.vm_id).await?;

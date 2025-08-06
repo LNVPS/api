@@ -19,12 +19,14 @@ default = [
     "revolut",
     "bitvora",
     "tokio/sync",
-    "tokio/io-util"
+    "tokio/io-util",
+    "admin"
 ]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain"]
+admin = ["lnvps_db/admin"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["dep:fedimint-tonic-lnd"]
@@ -35,6 +37,7 @@ revolut = ["dep:reqwest", "dep:sha2", "dep:hmac"]
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
 lnvps_common = { path = "../lnvps_common" }
+lnvps_api_common = { path = "../lnvps_api_common" }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -49,7 +52,7 @@ schemars = { version = "0.8.22", features = ["chrono"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 base64 = { version = "0.22.1", features = ["alloc"] }
 urlencoding = "2.1.3"
-ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "35977adc8103cfc232bc95fbc32f4e34f2b6a6d7" }
+ipnetwork.workspace = true
 rand = "0.9.0"
 clap = { version = "4.5.21", features = ["derive"] }
 ssh-key = "0.6.7"
@@ -73,7 +76,7 @@ reqwest = { version = "0.12.8", optional = true }
 
 #libvirt
 virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
-#virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}
+#virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}/
 uuid = { version = "1.16.0", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.37.3", features = ["serde", "serialize"], optional = true }
 

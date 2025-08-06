@@ -811,7 +811,7 @@ impl VmHostClient for ProxmoxClient {
         self.wait_for_task(&t_create).await?;
 
         // import template image
-        self.import_template_disk(&req).await?;
+        self.import_template_disk(req).await?;
 
         // apply firewall config and manage IPsets using patch_firewall
         self.patch_firewall(req).await?;
@@ -867,7 +867,7 @@ impl VmHostClient for ProxmoxClient {
             .await?;
 
         // import disk from template again
-        self.import_template_disk(&req).await?;
+        self.import_template_disk(req).await?;
 
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
@@ -950,11 +950,11 @@ impl VmHostClient for ProxmoxClient {
             policy_in: fw_cfg
                 .policy_in
                 .as_ref()
-                .map(|p| Self::convert_firewall_policy(p)),
+                .map(Self::convert_firewall_policy),
             policy_out: fw_cfg
                 .policy_out
                 .as_ref()
-                .map(|p| Self::convert_firewall_policy(p)),
+                .map(Self::convert_firewall_policy),
         };
 
         // Re-apply firewall configuration
@@ -1324,7 +1324,7 @@ impl NodeStorage {
     pub fn contents(&self) -> Vec<StorageContent> {
         self.content
             .split(",")
-            .map_while(|s| StorageContent::from_str(&s).ok())
+            .map_while(|s| StorageContent::from_str(s).ok())
             .collect()
     }
 }

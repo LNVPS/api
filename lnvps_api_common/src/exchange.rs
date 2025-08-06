@@ -10,7 +10,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, Copy, JsonSchema)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
 pub enum Currency {
     EUR,
     BTC,

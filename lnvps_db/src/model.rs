@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -46,6 +47,27 @@ pub struct UserSshKey {
     pub user_id: u64,
     pub created: DateTime<Utc>,
     pub key_data: String,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AdminUserInfo {
+    pub id: u64,
+    pub pubkey: Vec<u8>,
+    pub created: DateTime<Utc>,
+    pub email: Option<String>,
+    pub contact_nip17: bool,
+    pub contact_email: bool,
+    pub country_code: Option<String>,
+    pub billing_name: Option<String>,
+    pub billing_address_1: Option<String>,
+    pub billing_address_2: Option<String>,
+    pub billing_city: Option<String>,
+    pub billing_state: Option<String>,
+    pub billing_postcode: Option<String>,
+    pub billing_tax_id: Option<String>,
+    // Admin-specific fields
+    pub vm_count: i64,
+    pub is_admin: bool,
 }
 
 #[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
@@ -209,6 +231,21 @@ impl FromStr for OsDistribution {
     }
 }
 
+impl Display for OsDistribution {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OsDistribution::Ubuntu => write!(f, "Ubuntu"),
+            OsDistribution::Debian => write!(f, "Debian"),
+            OsDistribution::CentOS => write!(f, "CentOs"),
+            OsDistribution::Fedora => write!(f, "Fedora"),
+            OsDistribution::FreeBSD => write!(f, "FreeBSD"),
+            OsDistribution::OpenSUSE => write!(f, "OpenSuse"),
+            OsDistribution::ArchLinux => write!(f, "Arch Linux"),
+            OsDistribution::RedHatEnterprise => write!(f, "Red Hat Enterprise"),
+        }
+    }
+}
+
 /// OS Images are templates which are used as a basis for
 /// provisioning new vms
 #[derive(FromRow, Clone, Debug)]
@@ -230,7 +267,7 @@ impl VmOsImage {
         let mut name: PathBuf = u
             .path_segments()
             .ok_or(anyhow!("Invalid URL"))?
-            .last()
+            .next_back()
             .ok_or(anyhow!("Invalid URL"))?
             .parse()?;
         name.set_extension("img");
@@ -277,7 +314,7 @@ pub struct IpRange {
     pub use_full_range: bool,
 }
 
-#[derive(Debug, Clone, sqlx::Type, Default)]
+#[derive(Debug, Clone, Copy, sqlx::Type, Default)]
 #[repr(u16)]
 /// How ips are allocated from this range
 pub enum IpRangeAllocationMode {
@@ -302,7 +339,7 @@ pub struct AccessPolicy {
 }
 
 /// Policy that determines how packets arrive at the VM
-#[derive(Debug, Clone, sqlx::Type)]
+#[derive(Debug, Clone, Copy, sqlx::Type)]
 #[repr(u16)]
 pub enum NetworkAccessPolicy {
     /// ARP entries are added statically on the access router
@@ -542,6 +579,15 @@ pub struct Company {
     pub email: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct RegionStats {
+    pub host_count: u64,
+    pub total_vms: u64,
+    pub total_cpu_cores: u64,
+    pub total_memory_bytes: u64,
+    pub total_ip_assignments: u64,
+}
+
 #[derive(Clone, Debug, sqlx::Type)]
 #[repr(u16)]
 pub enum VmHistoryActionType {
@@ -608,4 +654,226 @@ pub struct VmHistory {
     pub new_state: Option<Vec<u8>>,
     pub metadata: Option<Vec<u8>>,
     pub description: Option<String>,
+}
+
+// RBAC Models
+
+/// Administrative role definition
+#[derive(FromRow, Clone, Debug)]
+pub struct AdminRole {
+    pub id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_system_role: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Role permission mapping
+#[derive(FromRow, Clone, Debug)]
+pub struct AdminRolePermission {
+    pub id: u64,
+    pub role_id: u64,
+    pub resource: u16, // AdminResource enum value
+    pub action: u16,   // AdminAction enum value
+    pub created_at: DateTime<Utc>,
+}
+
+/// User role assignment
+#[derive(FromRow, Clone, Debug)]
+pub struct AdminRoleAssignment {
+    pub id: u64,
+    pub user_id: u64,
+    pub role_id: u64,
+    pub assigned_by: Option<u64>,
+    pub assigned_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+}
+
+/// Administrative resources that can be managed
+#[derive(Clone, Copy, Debug, sqlx::Type, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u16)]
+pub enum AdminResource {
+    Users = 0,
+    VirtualMachines = 1,
+    Hosts = 2,
+    Payments = 3,
+    Analytics = 4,
+    System = 5,
+    Roles = 6,
+    Audit = 7,
+    AccessPolicy = 8,
+    Company = 9,
+    IpRange = 10,
+    Router = 11,
+    VmCustomPricing = 12,
+    HostRegion = 13,
+    VmOsImage = 14,
+    VmPayment = 15,
+    VmTemplate = 16,
+}
+
+/// Actions that can be performed on administrative resources
+#[derive(Clone, Copy, Debug, sqlx::Type, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u16)]
+pub enum AdminAction {
+    Create = 0,
+    View = 1, // Covers both read single item and list multiple items
+    Update = 2,
+    Delete = 3,
+}
+
+impl Display for AdminResource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdminResource::Users => write!(f, "users"),
+            AdminResource::VirtualMachines => write!(f, "virtual_machines"),
+            AdminResource::Hosts => write!(f, "hosts"),
+            AdminResource::Payments => write!(f, "payments"),
+            AdminResource::Analytics => write!(f, "analytics"),
+            AdminResource::System => write!(f, "system"),
+            AdminResource::Roles => write!(f, "roles"),
+            AdminResource::Audit => write!(f, "audit"),
+            AdminResource::AccessPolicy => write!(f, "access_policy"),
+            AdminResource::Company => write!(f, "company"),
+            AdminResource::IpRange => write!(f, "ip_range"),
+            AdminResource::Router => write!(f, "router"),
+            AdminResource::VmCustomPricing => write!(f, "vm_custom_pricing"),
+            AdminResource::HostRegion => write!(f, "host_region"),
+            AdminResource::VmOsImage => write!(f, "vm_os_image"),
+            AdminResource::VmPayment => write!(f, "vm_payment"),
+            AdminResource::VmTemplate => write!(f, "vm_template"),
+        }
+    }
+}
+
+impl FromStr for AdminResource {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "users" => Ok(AdminResource::Users),
+            "virtual_machines" | "vms" => Ok(AdminResource::VirtualMachines),
+            "hosts" => Ok(AdminResource::Hosts),
+            "payments" => Ok(AdminResource::Payments),
+            "analytics" => Ok(AdminResource::Analytics),
+            "system" => Ok(AdminResource::System),
+            "roles" => Ok(AdminResource::Roles),
+            "audit" => Ok(AdminResource::Audit),
+            "access_policy" => Ok(AdminResource::AccessPolicy),
+            "company" => Ok(AdminResource::Company),
+            "ip_range" => Ok(AdminResource::IpRange),
+            "router" => Ok(AdminResource::Router),
+            "vm_custom_pricing" => Ok(AdminResource::VmCustomPricing),
+            "host_region" => Ok(AdminResource::HostRegion),
+            "vm_os_image" => Ok(AdminResource::VmOsImage),
+            "vm_payment" => Ok(AdminResource::VmPayment),
+            "vm_template" => Ok(AdminResource::VmTemplate),
+            _ => Err(anyhow!("unknown admin resource: {}", s)),
+        }
+    }
+}
+
+impl TryFrom<u16> for AdminResource {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AdminResource::Users),
+            1 => Ok(AdminResource::VirtualMachines),
+            2 => Ok(AdminResource::Hosts),
+            3 => Ok(AdminResource::Payments),
+            4 => Ok(AdminResource::Analytics),
+            5 => Ok(AdminResource::System),
+            6 => Ok(AdminResource::Roles),
+            7 => Ok(AdminResource::Audit),
+            8 => Ok(AdminResource::AccessPolicy),
+            9 => Ok(AdminResource::Company),
+            10 => Ok(AdminResource::IpRange),
+            11 => Ok(AdminResource::Router),
+            12 => Ok(AdminResource::VmCustomPricing),
+            13 => Ok(AdminResource::HostRegion),
+            14 => Ok(AdminResource::VmOsImage),
+            15 => Ok(AdminResource::VmPayment),
+            16 => Ok(AdminResource::VmTemplate),
+            _ => Err(anyhow!("unknown admin resource value: {}", value)),
+        }
+    }
+}
+
+impl AdminResource {
+    /// Get all available admin resources
+    pub fn all() -> Vec<AdminResource> {
+        vec![
+            AdminResource::Users,
+            AdminResource::VirtualMachines,
+            AdminResource::Hosts,
+            AdminResource::Payments,
+            AdminResource::Analytics,
+            AdminResource::System,
+            AdminResource::Roles,
+            AdminResource::Audit,
+            AdminResource::AccessPolicy,
+            AdminResource::Company,
+            AdminResource::IpRange,
+            AdminResource::Router,
+            AdminResource::VmCustomPricing,
+            AdminResource::HostRegion,
+            AdminResource::VmOsImage,
+            AdminResource::VmPayment,
+            AdminResource::VmTemplate,
+        ]
+    }
+}
+
+impl Display for AdminAction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdminAction::Create => write!(f, "create"),
+            AdminAction::View => write!(f, "view"),
+            AdminAction::Update => write!(f, "update"),
+            AdminAction::Delete => write!(f, "delete"),
+        }
+    }
+}
+
+impl FromStr for AdminAction {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "create" => Ok(AdminAction::Create),
+            "view" | "read" | "list" => Ok(AdminAction::View),
+            "update" | "edit" => Ok(AdminAction::Update),
+            "delete" | "remove" => Ok(AdminAction::Delete),
+            _ => Err(anyhow!("unknown admin action: {}", s)),
+        }
+    }
+}
+
+impl TryFrom<u16> for AdminAction {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AdminAction::Create),
+            1 => Ok(AdminAction::View),
+            2 => Ok(AdminAction::Update),
+            3 => Ok(AdminAction::Delete),
+            _ => Err(anyhow!("unknown admin action value: {}", value)),
+        }
+    }
+}
+
+impl AdminAction {
+    /// Get all available admin actions
+    pub fn all() -> Vec<AdminAction> {
+        vec![
+            AdminAction::Create,
+            AdminAction::View,
+            AdminAction::Update,
+            AdminAction::Delete,
+        ]
+    }
 }

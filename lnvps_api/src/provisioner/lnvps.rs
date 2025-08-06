@@ -1,17 +1,17 @@
 use crate::dns::{BasicRecord, DnsServer};
-use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService};
 use crate::fiat::FiatPaymentService;
 use crate::host::{get_host_client, FullVmInfo};
 use crate::lightning::{AddInvoiceRequest, LightningNode};
-use crate::provisioner::{
-    AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, PricingEngine,
-};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
+use lnvps_api_common::{
+    AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, PricingEngine,
+};
+use lnvps_api_common::{Currency, CurrencyAmount, ExchangeRateService};
 use lnvps_db::{
     AccessPolicy, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, RouterKind,
     Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment,
@@ -489,7 +489,12 @@ impl LNVpsProvisioner {
     }
 
     /// Renew a VM using a specific amount
-    pub async fn renew_amount(&self, vm_id: u64, amount: CurrencyAmount, method: PaymentMethod) -> Result<VmPayment> {
+    pub async fn renew_amount(
+        &self,
+        vm_id: u64,
+        amount: CurrencyAmount,
+        method: PaymentMethod,
+    ) -> Result<VmPayment> {
         let pe = PricingEngine::new(self.db.clone(), self.rates.clone(), self.tax_rates.clone());
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
@@ -637,18 +642,18 @@ impl LNVpsProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{DefaultRateCache, Ticker};
-    use crate::mocks::{MockDb, MockDnsServer, MockExchangeRate, MockNode, MockRouter};
+    use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
-    use lnvps_db::{DiskInterface, DiskType, User, UserSshKey, VmTemplate};
+    use lnvps_api_common::{DefaultRateCache, MockDb, MockExchangeRate, Ticker};
+    use lnvps_db::{DiskInterface, DiskType, LNVpsDbBase, User, UserSshKey, VmTemplate};
     use std::net::IpAddr;
     use std::str::FromStr;
 
     const ROUTER_BRIDGE: &str = "bridge1";
 
     pub fn settings() -> Settings {
-        let settings = mock_settings();
-        settings
+        
+        mock_settings()
     }
 
     async fn add_user(db: &Arc<MockDb>) -> Result<(User, UserSshKey)> {
@@ -837,8 +842,8 @@ mod tests {
             created: Default::default(),
             expires: None,
             cpu: 64,
-            memory: 512 * crate::GB,
-            disk_size: 20 * crate::TB,
+            memory: 512 * lnvps_api_common::GB,
+            disk_size: 20 * lnvps_api_common::TB,
             disk_type: DiskType::SSD,
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,

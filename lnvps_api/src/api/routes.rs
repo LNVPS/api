@@ -1,17 +1,15 @@
 use crate::api::model::{
     AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiPaymentInfo, ApiPaymentMethod, ApiPrice, ApiTemplatesResponse, ApiUserSshKey, ApiVmHistory,
-    ApiVmIpAssignment, ApiVmOsImage, ApiVmPayment, ApiVmStatus, ApiVmTemplate, CreateSshKey,
-    CreateVmRequest, VMPatchRequest,
+    ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
+    ApiVmPayment, CreateSshKey, CreateVmRequest, VMPatchRequest, vm_to_status,
 };
-use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService};
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
-use crate::nip98::Nip98Auth;
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
-use crate::status::{VmState, VmStateCache};
+use crate::status::VmStateCache;
 use crate::vm_history::VmHistoryLogger;
 use crate::worker::WorkJob;
+use crate::{Currency, CurrencyAmount};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
@@ -19,21 +17,20 @@ use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::Tag;
-use lnvps_db::{
-    IpRange, LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+use crate::api::model::ApiVmStatus;
+use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
+use lnvps_api_common::{
+    ApiData, ApiResult, ExchangeRateService, Nip98Auth, VmState as CommonVmState,
 };
+use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
 use log::{error, info};
 use nostr::util::hex;
 use nostr::{ToBech32, Url};
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
-use rocket::{get, patch, post, routes, Responder, Route, State};
-use rocket_okapi::gen::OpenApiGenerator;
-use rocket_okapi::okapi::openapi3::Responses;
-use rocket_okapi::response::OpenApiResponderInner;
+use rocket::{get, patch, post, routes, Route, State};
 use rocket_okapi::{openapi, openapi_get_routes};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -41,6 +38,15 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
+
+fn convert_vm_state(state: Option<crate::status::VmState>) -> Option<CommonVmState> {
+    state.map(|s| match s.state {
+        crate::status::VmRunningState::Running => CommonVmState::Running,
+        crate::status::VmRunningState::Stopped => CommonVmState::Stopped,
+        crate::status::VmRunningState::Starting => CommonVmState::Pending,
+        crate::status::VmRunningState::Deleting => CommonVmState::Failed,
+    })
+}
 
 pub fn routes() -> Vec<Route> {
     let mut routes = vec![];
@@ -69,8 +75,6 @@ pub fn routes() -> Vec<Route> {
         v1_payment_history,
         v1_get_vm_history,
     ];
-    #[cfg(feature = "nostr-domain")]
-    api_routes.append(&mut super::nostr_domain::routes());
     routes.append(&mut api_routes);
 
     routes.append(&mut routes![
@@ -81,42 +85,6 @@ pub fn routes() -> Vec<Route> {
     ]);
 
     routes
-}
-
-pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
-
-#[derive(Serialize, Deserialize, JsonSchema)]
-pub struct ApiData<T: Serialize> {
-    pub data: T,
-}
-
-impl<T: Serialize> ApiData<T> {
-    pub fn ok(data: T) -> ApiResult<T> {
-        Ok(Json::from(ApiData { data }))
-    }
-    pub fn err(msg: &str) -> ApiResult<T> {
-        Err(msg.into())
-    }
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Responder)]
-#[response(status = 500)]
-pub struct ApiError {
-    pub error: String,
-}
-
-impl<T: ToString> From<T> for ApiError {
-    fn from(value: T) -> Self {
-        Self {
-            error: value.to_string(),
-        }
-    }
-}
-
-impl OpenApiResponderInner for ApiError {
-    fn responses(_gen: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
-        Ok(Responses::default())
-    }
 }
 
 /// Update user account
@@ -165,45 +133,6 @@ async fn v1_get_account(
     ApiData::ok(user.into())
 }
 
-async fn vm_to_status(
-    db: &Arc<dyn LNVpsDb>,
-    vm: lnvps_db::Vm,
-    state: Option<VmState>,
-) -> Result<ApiVmStatus> {
-    let image = db.get_os_image(vm.image_id).await?;
-    let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
-    let ips = db.list_vm_ip_assignments(vm.id).await?;
-    let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
-    let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
-    let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
-        .await
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|i| (i.id, i))
-        .collect();
-
-    let template = ApiVmTemplate::from_vm(db, &vm).await?;
-    Ok(ApiVmStatus {
-        id: vm.id,
-        created: vm.created,
-        expires: vm.expires,
-        mac_address: vm.mac_address,
-        image: image.into(),
-        template,
-        ssh_key: ssh_key.into(),
-        status: state.unwrap_or_default(),
-        ip_assignments: ips
-            .into_iter()
-            .map(|i| {
-                let range = ip_ranges
-                    .get(&i.ip_range_id)
-                    .expect("ip range id not found");
-                ApiVmIpAssignment::from(&i, range)
-            })
-            .collect(),
-    })
-}
-
 /// List VMs belonging to user
 #[openapi(tag = "VM")]
 #[get("/api/v1/vm")]
@@ -218,7 +147,7 @@ async fn v1_list_vms(
     let mut ret = vec![];
     for vm in vms {
         let vm_id = vm.id;
-        ret.push(vm_to_status(db, vm, vm_state.get_state(vm_id).await).await?);
+        ret.push(vm_to_status(db, vm, convert_vm_state(vm_state.get_state(vm_id).await)).await?);
     }
 
     ApiData::ok(ret)
@@ -239,7 +168,7 @@ async fn v1_get_vm(
     if vm.user_id != uid {
         return ApiData::err("VM doesnt belong to you");
     }
-    ApiData::ok(vm_to_status(db, vm, vm_state.get_state(id).await).await?)
+    ApiData::ok(vm_to_status(db, vm, convert_vm_state(vm_state.get_state(id).await)).await?)
 }
 
 /// Update a VM config
@@ -392,7 +321,7 @@ async fn v1_list_vm_templates(
                     } else {
                         acc.insert(k, v.2);
                     }
-                    return acc;
+                    acc
                 });
             Some(
                 custom_templates
@@ -1058,5 +987,10 @@ async fn v1_get_vm_history(
         _ => db.list_vm_history(id).await?,
     };
 
-    ApiData::ok(history.into_iter().map(|h| ApiVmHistory::from_with_owner(h, vm.user_id)).collect())
+    ApiData::ok(
+        history
+            .into_iter()
+            .map(|h| ApiVmHistory::from_with_owner(h, vm.user_id))
+            .collect(),
+    )
 }

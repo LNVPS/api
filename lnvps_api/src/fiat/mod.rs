@@ -1,5 +1,5 @@
 /// Fiat payment integrations
-use crate::exchange::CurrencyAmount;
+use crate::CurrencyAmount;
 use anyhow::Result;
 use rocket::serde::{Deserialize, Serialize};
 use std::future::Future;

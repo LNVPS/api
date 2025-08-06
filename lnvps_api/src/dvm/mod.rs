@@ -240,8 +240,7 @@ fn parse_job_request(event: &Event) -> Result<DVMJobRequest> {
             .tags
             .iter()
             .filter(|t| t.kind().as_str() == "relay")
-            .map(|c| &c.as_slice()[1..])
-            .flatten()
+            .flat_map(|c| &c.as_slice()[1..])
             .map(|s| s.to_string())
             .collect(),
     })

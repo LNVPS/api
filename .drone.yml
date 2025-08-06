@@ -15,5 +15,6 @@ steps:
     commands:
       - dockerd &
       - docker login -u registry -p $TOKEN registry.v0l.io
-      - docker buildx build --push -t registry.v0l.io/lnvps-api:latest .
+      - docker buildx build --push -t registry.v0l.io/lnvps-api:latest . -f lnvps_api/Dockerfile
+      - docker buildx build --push -t registry.v0l.io/lnvps-api-admin:latest . -f lnvps_api_admin/Dockerfile
       - kill $(cat /var/run/docker.pid)

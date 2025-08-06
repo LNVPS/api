@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use log::{debug, warn};
+use log::debug;
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, Method, Request, RequestBuilder, Url};
 use serde::de::DeserializeOwned;

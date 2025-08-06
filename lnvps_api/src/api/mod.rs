@@ -9,6 +9,8 @@ mod webhook;
 pub fn routes() -> Vec<Route> {
     let mut r = routes::routes();
     r.append(&mut webhook::routes());
+    #[cfg(feature = "nostr-domain")]
+    r.append(&mut nostr_domain::routes());
     r
 }
 

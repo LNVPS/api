@@ -1,4 +1,4 @@
-use lnvps_db::LNVPSNostrDb;
+use lnvps_db::nostr::LNVPSNostrDb;
 use log::info;
 use rocket::request::{FromRequest, Outcome};
 use rocket::serde::json::Json;

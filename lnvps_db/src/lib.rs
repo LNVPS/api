@@ -1,16 +1,24 @@
 use anyhow::Result;
+#[cfg(feature = "admin")]
+mod admin;
 mod model;
 #[cfg(feature = "mysql")]
 mod mysql;
+#[cfg(feature = "nostr-domain")]
+pub mod nostr;
 
+#[cfg(feature = "admin")]
+pub use admin::*;
 pub use model::*;
 #[cfg(feature = "mysql")]
 pub use mysql::*;
 
+#[cfg(feature = "nostr-domain")]
+use crate::nostr::LNVPSNostrDb;
 pub use async_trait::async_trait;
 
 #[async_trait]
-pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
+pub trait LNVpsDbBase: Send + Sync {
     /// Migrate database
     async fn migrate(&self) -> Result<()>;
 
@@ -25,6 +33,15 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
 
     /// Delete user record
     async fn delete_user(&self, id: u64) -> Result<()>;
+
+    /// List all users
+    async fn list_users(&self) -> Result<Vec<User>>;
+
+    /// List users with pagination
+    async fn list_users_paginated(&self, limit: u64, offset: u64) -> Result<Vec<User>>;
+
+    /// Get total count of users
+    async fn count_users(&self) -> Result<u64>;
 
     /// Insert a new user ssh key
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> Result<u64>;
@@ -49,6 +66,12 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
 
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> Result<Vec<VmHost>>;
+    
+    /// List hosts with pagination
+    async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<VmHost>, u64)>;
+    
+    /// List hosts with region information for admin interface
+    async fn list_hosts_with_regions_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)>;
 
     /// List VM's owned by a specific user
     async fn get_host(&self, id: u64) -> Result<VmHost>;
@@ -167,6 +190,7 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
     /// Return the list of disk prices for a given custom pricing model
     async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>>;
 
+
     /// Get router config
     async fn get_router(&self, router_id: u64) -> Result<Router>;
 
@@ -189,45 +213,43 @@ pub trait LNVpsDb: LNVPSNostrDb + Send + Sync {
     async fn list_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>>;
 
     /// List VM history for a given VM with pagination
-    async fn list_vm_history_paginated(&self, vm_id: u64, limit: u64, offset: u64) -> Result<Vec<VmHistory>>;
+    async fn list_vm_history_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<VmHistory>>;
 
     /// Get VM history entry by id
     async fn get_vm_history(&self, id: u64) -> Result<VmHistory>;
 }
 
-#[cfg(feature = "nostr-domain")]
+/// Super trait that combines all database functionality based on enabled features
+#[cfg(all(feature = "admin", feature = "nostr-domain"))]
 #[async_trait]
-pub trait LNVPSNostrDb: Sync + Send {
-    /// Get single handle for a domain
-    async fn get_handle(&self, handle_id: u64) -> Result<NostrDomainHandle>;
+pub trait LNVpsDb: LNVpsDbBase + AdminDb + LNVPSNostrDb + Send + Sync {}
 
-    /// Get single handle for a domain
-    async fn get_handle_by_name(&self, domain_id: u64, handle: &str) -> Result<NostrDomainHandle>;
+#[cfg(all(feature = "admin", not(feature = "nostr-domain")))]
+#[async_trait]
+pub trait LNVpsDb: LNVpsDbBase + AdminDb + Send + Sync {}
 
-    /// Insert a new handle
-    async fn insert_handle(&self, handle: &NostrDomainHandle) -> Result<u64>;
+#[cfg(all(not(feature = "admin"), feature = "nostr-domain"))]
+#[async_trait]
+pub trait LNVpsDb: LNVpsDbBase + LNVPSNostrDb + Send + Sync {}
 
-    /// Update an existing domain handle
-    async fn update_handle(&self, handle: &NostrDomainHandle) -> Result<()>;
+#[cfg(all(not(feature = "admin"), not(feature = "nostr-domain")))]
+#[async_trait]
+pub trait LNVpsDb: LNVpsDbBase + Send + Sync {}
 
-    /// Delete handle entry
-    async fn delete_handle(&self, handle_id: u64) -> Result<()>;
+// Blanket implementations for each feature combination
+#[cfg(all(feature = "admin", feature = "nostr-domain"))]
+impl<T> LNVpsDb for T where T: LNVpsDbBase + AdminDb + LNVPSNostrDb + Send + Sync {}
 
-    /// List handles
-    async fn list_handles(&self, domain_id: u64) -> Result<Vec<NostrDomainHandle>>;
+#[cfg(all(feature = "admin", not(feature = "nostr-domain")))]
+impl<T> LNVpsDb for T where T: LNVpsDbBase + AdminDb + Send + Sync {}
 
-    /// Get domain object by id
-    async fn get_domain(&self, id: u64) -> Result<NostrDomain>;
+#[cfg(all(not(feature = "admin"), feature = "nostr-domain"))]
+impl<T> LNVpsDb for T where T: LNVpsDbBase + LNVPSNostrDb + Send + Sync {}
 
-    /// Get domain object by name
-    async fn get_domain_by_name(&self, name: &str) -> Result<NostrDomain>;
-
-    /// List domains owned by a user
-    async fn list_domains(&self, owner_id: u64) -> Result<Vec<NostrDomain>>;
-
-    /// Insert a new domain
-    async fn insert_domain(&self, domain: &NostrDomain) -> Result<u64>;
-
-    /// Delete a domain
-    async fn delete_domain(&self, domain_id: u64) -> Result<()>;
-}
+#[cfg(all(not(feature = "admin"), not(feature = "nostr-domain")))]
+impl<T> LNVpsDb for T where T: LNVpsDbBase + Send + Sync {}

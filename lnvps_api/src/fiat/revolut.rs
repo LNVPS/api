@@ -1,4 +1,4 @@
-use crate::exchange::{Currency, CurrencyAmount};
+use crate::{Currency, CurrencyAmount};
 use crate::fiat::{FiatPaymentInfo, FiatPaymentService};
 use crate::json_api::{JsonApi, TokenGen};
 use crate::settings::RevolutConfig;

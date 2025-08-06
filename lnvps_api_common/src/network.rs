@@ -129,7 +129,7 @@ impl NetworkProvisioner {
             gateway,
             ip: ip_pick,
             region_id: range.region_id,
-            mode: range.allocation_mode.clone(),
+            mode: range.allocation_mode,
         })
     }
 
@@ -180,8 +180,8 @@ impl NetworkProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::*;
 
+    use crate::MockDb;
     use lnvps_db::VmIpAssignment;
     use std::str::FromStr;
 

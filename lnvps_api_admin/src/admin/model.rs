@@ -1,0 +1,1089 @@
+use anyhow::anyhow;
+use chrono::{DateTime, Utc};
+use lnvps_api_common::{VmState, DiskType, DiskInterface, ApiOsDistribution};
+use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution};
+use rocket_okapi::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::str::FromStr;
+
+// Admin API Enums - Using enums from common crate where available, creating new ones only where needed
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminVmHostKind {
+    Proxmox,
+    Libvirt,
+}
+
+impl From<VmHostKind> for AdminVmHostKind {
+    fn from(host_kind: VmHostKind) -> Self {
+        match host_kind {
+            VmHostKind::Proxmox => AdminVmHostKind::Proxmox,
+            VmHostKind::LibVirt => AdminVmHostKind::Libvirt,
+        }
+    }
+}
+
+impl From<AdminVmHostKind> for VmHostKind {
+    fn from(admin_host_kind: AdminVmHostKind) -> Self {
+        match admin_host_kind {
+            AdminVmHostKind::Proxmox => VmHostKind::Proxmox,
+            AdminVmHostKind::Libvirt => VmHostKind::LibVirt,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminIpRangeAllocationMode {
+    Random,
+    Sequential,
+    SlaacEui64,
+}
+
+impl From<IpRangeAllocationMode> for AdminIpRangeAllocationMode {
+    fn from(allocation_mode: IpRangeAllocationMode) -> Self {
+        match allocation_mode {
+            IpRangeAllocationMode::Random => AdminIpRangeAllocationMode::Random,
+            IpRangeAllocationMode::Sequential => AdminIpRangeAllocationMode::Sequential,
+            IpRangeAllocationMode::SlaacEui64 => AdminIpRangeAllocationMode::SlaacEui64,
+        }
+    }
+}
+
+impl From<AdminIpRangeAllocationMode> for IpRangeAllocationMode {
+    fn from(admin_allocation_mode: AdminIpRangeAllocationMode) -> Self {
+        match admin_allocation_mode {
+            AdminIpRangeAllocationMode::Random => IpRangeAllocationMode::Random,
+            AdminIpRangeAllocationMode::Sequential => IpRangeAllocationMode::Sequential,
+            AdminIpRangeAllocationMode::SlaacEui64 => IpRangeAllocationMode::SlaacEui64,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminNetworkAccessPolicy {
+    StaticArp,
+}
+
+impl From<NetworkAccessPolicy> for AdminNetworkAccessPolicy {
+    fn from(policy: NetworkAccessPolicy) -> Self {
+        match policy {
+            NetworkAccessPolicy::StaticArp => AdminNetworkAccessPolicy::StaticArp,
+        }
+    }
+}
+
+impl From<AdminNetworkAccessPolicy> for NetworkAccessPolicy {
+    fn from(admin_policy: AdminNetworkAccessPolicy) -> Self {
+        match admin_policy {
+            AdminNetworkAccessPolicy::StaticArp => NetworkAccessPolicy::StaticArp,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRouterKind {
+    Mikrotik,
+    OvhAdditionalIp,
+}
+
+impl From<RouterKind> for AdminRouterKind {
+    fn from(router_kind: RouterKind) -> Self {
+        match router_kind {
+            RouterKind::Mikrotik => AdminRouterKind::Mikrotik,
+            RouterKind::OvhAdditionalIp => AdminRouterKind::OvhAdditionalIp,
+        }
+    }
+}
+
+impl From<AdminRouterKind> for RouterKind {
+    fn from(admin_router_kind: AdminRouterKind) -> Self {
+        match admin_router_kind {
+            AdminRouterKind::Mikrotik => RouterKind::Mikrotik,
+            AdminRouterKind::OvhAdditionalIp => RouterKind::OvhAdditionalIp,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminUserStatus {
+    Active,
+    Suspended,
+    Deleted,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminUserRole {
+    SuperAdmin,
+    Admin,
+    ReadOnly,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct PaginatedResponse<T> {
+    pub data: Vec<T>,
+    pub total: u64,
+    pub limit: u64,
+    pub offset: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminUserInfo {
+    pub id: u64,
+    pub pubkey: String, // hex encoded
+    pub created: DateTime<Utc>,
+    pub email: Option<String>,
+    pub contact_nip17: bool,
+    pub contact_email: bool,
+    pub country_code: Option<String>,
+    pub billing_name: Option<String>,
+    pub billing_address_1: Option<String>,
+    pub billing_address_2: Option<String>,
+    pub billing_city: Option<String>,
+    pub billing_state: Option<String>,
+    pub billing_postcode: Option<String>,
+    pub billing_tax_id: Option<String>,
+    // Admin-specific fields
+    pub vm_count: u64,
+    pub last_login: Option<DateTime<Utc>>,
+    pub is_admin: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AdminUserUpdateRequest {
+    pub email: Option<String>,
+    pub contact_nip17: Option<bool>,
+    pub contact_email: Option<bool>,
+    pub country_code: Option<String>,
+    pub billing_name: Option<String>,
+    pub billing_address_1: Option<String>,
+    pub billing_address_2: Option<String>,
+    pub billing_city: Option<String>,
+    pub billing_state: Option<String>,
+    pub billing_postcode: Option<String>,
+    pub billing_tax_id: Option<String>,
+    // Admin fields
+    pub notes: Option<String>,
+    pub status: Option<AdminUserStatus>,
+    pub admin_role: Option<AdminUserRole>, // null to remove
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminUserStats {
+    pub total_users: u64,
+    pub active_users_30d: u64,
+    pub new_users_30d: u64,
+    pub users_by_country: HashMap<String, u64>,
+}
+
+// RBAC API Models
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminRoleInfo {
+    pub id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_system_role: bool,
+    pub permissions: Vec<String>, // Formatted as "resource::action"
+    pub user_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateRoleRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub permissions: Vec<String>, // Formatted as "resource::action"
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateRoleRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub permissions: Option<Vec<String>>, // Formatted as "resource::action"
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct UserRoleInfo {
+    pub role: AdminRoleInfo,
+    pub assigned_by: Option<u64>,
+    pub assigned_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AssignRoleRequest {
+    pub role_id: u64,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl From<lnvps_db::User> for AdminUserInfo {
+    fn from(user: lnvps_db::User) -> Self {
+        Self {
+            id: user.id,
+            pubkey: hex::encode(&user.pubkey),
+            created: user.created,
+            email: user.email,
+            contact_nip17: user.contact_nip17,
+            contact_email: user.contact_email,
+            country_code: user.country_code,
+            billing_name: user.billing_name,
+            billing_address_1: user.billing_address_1,
+            billing_address_2: user.billing_address_2,
+            billing_city: user.billing_city,
+            billing_state: user.billing_state,
+            billing_postcode: user.billing_postcode,
+            billing_tax_id: user.billing_tax_id,
+            // Admin-specific fields will be filled by the handler
+            vm_count: 0,
+            last_login: None,
+            is_admin: false,
+        }
+    }
+}
+
+impl From<AdminRole> for AdminRoleInfo {
+    fn from(role: AdminRole) -> Self {
+        Self {
+            id: role.id,
+            name: role.name,
+            description: role.description,
+            is_system_role: role.is_system_role,
+            permissions: Vec::new(), // Will be filled by handler
+            user_count: 0,           // Will be filled by handler
+            created_at: role.created_at,
+            updated_at: role.updated_at,
+        }
+    }
+}
+
+// VM Management Models
+
+// IP address with IDs for admin linking
+#[derive(Serialize, JsonSchema)]
+pub struct AdminVmIpAddress {
+    /// IP assignment ID for linking
+    pub id: u64,
+    /// IP address
+    pub ip: String,
+    /// IP range ID for linking to range details
+    pub range_id: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminVmInfo {
+    // Core VM information (moved from ApiVmStatus)
+    /// Unique VM ID (Same in proxmox)
+    pub id: u64,
+    /// When the VM was created
+    pub created: DateTime<Utc>,
+    /// When the VM expires
+    pub expires: DateTime<Utc>,
+    /// Network MAC address
+    pub mac_address: String,
+    /// OS Image ID for linking
+    pub image_id: u64,
+    /// OS Image name/version with distribution (e.g., "Ubuntu 22.04 Server")
+    pub image_name: String,
+    /// Template ID for linking
+    pub template_id: u64,
+    /// Template name (simplified, no cost details)
+    pub template_name: String,
+    /// SSH key ID for linking
+    pub ssh_key_id: u64,
+    /// SSH key name (simplified)
+    pub ssh_key_name: String,
+    /// IP addresses with IDs for linking
+    pub ip_addresses: Vec<AdminVmIpAddress>,
+    /// Current running state of the VM
+    pub status: VmState,
+
+    // Admin-specific fields
+    pub host_id: u64,
+    pub user_id: u64,
+    pub user_pubkey: String, // hex encoded
+    pub user_email: Option<String>,
+    pub host_name: Option<String>,
+    pub region_name: Option<String>,
+    pub deleted: bool,
+    pub ref_code: Option<String>,
+}
+
+impl AdminVmInfo {
+    pub async fn from_vm_with_admin_data(
+        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+        vm: &lnvps_db::Vm,
+        state: Option<VmState>,
+        host_id: u64,
+        user_id: u64,
+        user_pubkey: String,
+        user_email: Option<String>,
+        host_name: Option<String>,
+        region_name: Option<String>,
+        deleted: bool,
+        ref_code: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let image = db.get_os_image(vm.image_id).await?;
+        let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+
+        // Get template info (simplified)
+        let (template_id, template_name) = if let Some(template_id) = vm.template_id {
+            let template = db.get_vm_template(template_id).await?;
+            (template_id, template.name)
+        } else if let Some(custom_template_id) = vm.custom_template_id {
+            let custom_template = db.get_custom_vm_template(custom_template_id).await?;
+            let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
+            (custom_template_id, pricing.name)
+        } else {
+            (0, "Unknown".to_string())
+        };
+
+        let mut ip_addresses = Vec::new();
+        for ip in ips {
+            ip_addresses.push(AdminVmIpAddress {
+                id: ip.id,
+                ip: ip.ip,
+                range_id: ip.ip_range_id,
+            });
+        }
+
+        Ok(Self {
+            id: vm.id,
+            created: vm.created,
+            expires: vm.expires,
+            mac_address: vm.mac_address.clone(),
+            image_id: vm.image_id,
+            image_name: format!("{} {} {}", image.distribution, image.flavour, image.version),
+            template_id,
+            template_name,
+            ssh_key_id: vm.ssh_key_id,
+            ssh_key_name: ssh_key.name,
+            ip_addresses,
+            status: state.unwrap_or_default(),
+            host_id,
+            user_id,
+            user_pubkey,
+            user_email,
+            host_name,
+            region_name,
+            deleted,
+            ref_code,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminVmAction {
+    Start,
+    Stop,
+    Delete,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct VmActionRequest {
+    pub action: AdminVmAction,
+}
+
+#[derive(Eq, PartialEq, Clone, Hash)]
+pub struct Permission {
+    pub resource: AdminResource,
+    pub action: AdminAction,
+}
+
+impl FromStr for Permission {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut split = s.split("::");
+        let resource = split
+            .next()
+            .ok_or(anyhow!("resource is missing from '{}'", s))?;
+        let action = split
+            .next()
+            .ok_or(anyhow!("action is missing from '{}'", s))?;
+        Ok(Self {
+            resource: resource.parse()?,
+            action: action.parse()?,
+        })
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}::{}", self.resource, self.action)
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminHostInfo {
+    pub id: u64,
+    pub name: String,
+    pub kind: AdminVmHostKind,
+    pub region: AdminHostRegion,
+    pub ip: String,
+    pub cpu: u16,
+    pub memory: u64,
+    pub enabled: bool,
+    pub load_cpu: f32,
+    pub load_memory: f32,
+    pub load_disk: f32,
+    pub vlan_id: Option<u64>,
+    pub disks: Vec<AdminHostDisk>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminHostRegion {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminHostDisk {
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub kind: DiskType,
+    pub interface: DiskInterface,
+    pub enabled: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminRegionInfo {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub company_id: Option<u64>,
+    pub host_count: u64,
+    pub total_vms: u64,
+    pub total_cpu_cores: u64,
+    pub total_memory_bytes: u64,
+    pub total_ip_assignments: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateRegionRequest {
+    pub name: String,
+    pub company_id: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateRegionRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub company_id: Option<u64>,
+}
+
+impl AdminHostInfo {
+    pub fn from_host_and_region(host: lnvps_db::VmHost, region: lnvps_db::VmHostRegion) -> Self {
+        Self {
+            id: host.id,
+            name: host.name,
+            kind: AdminVmHostKind::from(host.kind),
+            region: AdminHostRegion {
+                id: region.id,
+                name: region.name,
+                enabled: region.enabled,
+            },
+            ip: host.ip,
+            cpu: host.cpu,
+            memory: host.memory,
+            enabled: host.enabled,
+            load_cpu: host.load_cpu,
+            load_memory: host.load_memory,
+            load_disk: host.load_disk,
+            vlan_id: host.vlan_id,
+            disks: Vec::new(), // Empty disks - should be populated separately
+        }
+    }
+
+    pub fn from_host_region_and_disks(
+        host: lnvps_db::VmHost,
+        region: lnvps_db::VmHostRegion,
+        disks: Vec<lnvps_db::VmHostDisk>,
+    ) -> Self {
+        let admin_disks = disks
+            .into_iter()
+            .map(|disk| AdminHostDisk {
+                id: disk.id,
+                name: disk.name,
+                size: disk.size,
+                kind: DiskType::from(disk.kind),
+                interface: DiskInterface::from(disk.interface),
+                enabled: disk.enabled,
+            })
+            .collect();
+
+        Self {
+            id: host.id,
+            name: host.name,
+            kind: AdminVmHostKind::from(host.kind),
+            region: AdminHostRegion {
+                id: region.id,
+                name: region.name,
+                enabled: region.enabled,
+            },
+            ip: host.ip,
+            cpu: host.cpu,
+            memory: host.memory,
+            enabled: host.enabled,
+            load_cpu: host.load_cpu,
+            load_memory: host.load_memory,
+            load_disk: host.load_disk,
+            vlan_id: host.vlan_id,
+            disks: admin_disks,
+        }
+    }
+}
+
+// VM OS Image Management Models
+#[derive(Serialize, JsonSchema)]
+pub struct AdminVmOsImageInfo {
+    pub id: u64,
+    pub distribution: ApiOsDistribution,
+    pub flavour: String,
+    pub version: String,
+    pub enabled: bool,
+    pub release_date: DateTime<Utc>,
+    pub url: String,
+    pub default_username: Option<String>,
+    pub active_vm_count: i64, // Number of active (non-deleted) VMs using this image
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateVmOsImageRequest {
+    pub distribution: ApiOsDistribution,
+    pub flavour: String,
+    pub version: String,
+    pub enabled: bool,
+    pub release_date: DateTime<Utc>,
+    pub url: String,
+    pub default_username: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateVmOsImageRequest {
+    pub distribution: Option<ApiOsDistribution>,
+    pub flavour: Option<String>,
+    pub version: Option<String>,
+    pub enabled: Option<bool>,
+    pub release_date: Option<DateTime<Utc>>,
+    pub url: Option<String>,
+    pub default_username: Option<String>,
+}
+
+impl AdminVmOsImageInfo {
+    pub async fn from_db_with_vm_count(
+        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+        image: lnvps_db::VmOsImage,
+    ) -> anyhow::Result<Self> {
+        // Count active VMs using this image
+        let all_vms = db.list_vms().await.unwrap_or_default();
+        let active_vm_count = all_vms
+            .iter()
+            .filter(|vm| vm.image_id == image.id && !vm.deleted)
+            .count() as i64;
+        
+        Ok(Self {
+            id: image.id,
+            distribution: ApiOsDistribution::from(image.distribution),
+            flavour: image.flavour,
+            version: image.version,
+            enabled: image.enabled,
+            release_date: image.release_date,
+            url: image.url,
+            default_username: image.default_username,
+            active_vm_count,
+        })
+    }
+}
+
+impl From<lnvps_db::VmOsImage> for AdminVmOsImageInfo {
+    fn from(image: lnvps_db::VmOsImage) -> Self {
+        Self {
+            id: image.id,
+            distribution: ApiOsDistribution::from(image.distribution),
+            flavour: image.flavour,
+            version: image.version,
+            enabled: image.enabled,
+            release_date: image.release_date,
+            url: image.url,
+            default_username: image.default_username,
+            active_vm_count: 0, // Default when not using the async method
+        }
+    }
+}
+
+fn api_os_distribution_to_db(api_distribution: ApiOsDistribution) -> OsDistribution {
+    match api_distribution {
+        ApiOsDistribution::Ubuntu => OsDistribution::Ubuntu,
+        ApiOsDistribution::Debian => OsDistribution::Debian,
+        ApiOsDistribution::CentOS => OsDistribution::CentOS,
+        ApiOsDistribution::Fedora => OsDistribution::Fedora,
+        ApiOsDistribution::FreeBSD => OsDistribution::FreeBSD,
+        ApiOsDistribution::OpenSUSE => OsDistribution::OpenSUSE,
+        ApiOsDistribution::ArchLinux => OsDistribution::ArchLinux,
+        ApiOsDistribution::RedHatEnterprise => OsDistribution::RedHatEnterprise,
+    }
+}
+
+impl CreateVmOsImageRequest {
+    pub fn to_vm_os_image(&self) -> anyhow::Result<lnvps_db::VmOsImage> {
+        let distribution = api_os_distribution_to_db(self.distribution);
+
+        Ok(lnvps_db::VmOsImage {
+            id: 0, // Will be set by database
+            distribution,
+            flavour: self.flavour.clone(),
+            version: self.version.clone(),
+            enabled: self.enabled,
+            release_date: self.release_date,
+            url: self.url.clone(),
+            default_username: self.default_username.clone(),
+        })
+    }
+}
+
+// VM Template Management Models
+#[derive(Serialize, JsonSchema)]
+pub struct AdminVmTemplateInfo {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk_size: u64,
+    pub disk_type: DiskType,
+    pub disk_interface: DiskInterface,
+    pub cost_plan_id: u64,
+    pub region_id: u64,
+    pub region_name: Option<String>,
+    pub cost_plan_name: Option<String>,
+    pub active_vm_count: i64, // Number of active (non-deleted) VMs using this template
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AdminCreateVmTemplateRequest {
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub expires: Option<DateTime<Utc>>,
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk_size: u64,
+    pub disk_type: DiskType,
+    pub disk_interface: DiskInterface,
+    pub cost_plan_id: u64,
+    pub region_id: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AdminUpdateVmTemplateRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub expires: Option<Option<DateTime<Utc>>>,
+    pub cpu: Option<u16>,
+    pub memory: Option<u64>,
+    pub disk_size: Option<u64>,
+    pub disk_type: Option<DiskType>,
+    pub disk_interface: Option<DiskInterface>,
+    pub cost_plan_id: Option<u64>,
+    pub region_id: Option<u64>,
+}
+
+// Common response structures
+#[derive(Serialize, JsonSchema)]
+pub struct AdminListResponse<T> {
+    pub data: Vec<T>,
+    pub total: i64,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminSingleResponse<T> {
+    pub data: T,
+}
+
+// Custom Pricing Management Models
+#[derive(Serialize, JsonSchema)]
+pub struct AdminCustomPricingInfo {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub region_id: u64,
+    pub region_name: Option<String>,
+    pub currency: String,
+    pub cpu_cost: f32,
+    pub memory_cost: f32,
+    pub ip4_cost: f32,
+    pub ip6_cost: f32,
+    pub disk_pricing: Vec<AdminCustomPricingDisk>,
+    pub template_count: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AdminCustomPricingDisk {
+    pub id: u64,
+    pub kind: DiskType,
+    pub interface: DiskInterface,
+    pub cost: f32,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateCustomPricingRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub expires: Option<Option<DateTime<Utc>>>,
+    pub region_id: Option<u64>,
+    pub currency: Option<String>,
+    pub cpu_cost: Option<f32>,
+    pub memory_cost: Option<f32>,
+    pub ip4_cost: Option<f32>,
+    pub ip6_cost: Option<f32>,
+    pub disk_pricing: Option<Vec<CreateCustomPricingDisk>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateCustomPricingRequest {
+    pub name: String,
+    pub enabled: Option<bool>,
+    pub expires: Option<DateTime<Utc>>,
+    pub region_id: u64,
+    pub currency: String,
+    pub cpu_cost: f32,
+    pub memory_cost: f32,
+    pub ip4_cost: f32,
+    pub ip6_cost: f32,
+    pub disk_pricing: Vec<CreateCustomPricingDisk>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateCustomPricingDisk {
+    pub kind: DiskType,
+    pub interface: DiskInterface,
+    pub cost: f32,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CopyCustomPricingRequest {
+    pub name: String,
+    pub region_id: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+// Company Management Models
+#[derive(Serialize, JsonSchema)]
+pub struct AdminCompanyInfo {
+    pub id: u64,
+    pub created: DateTime<Utc>,
+    pub name: String,
+    pub address_1: Option<String>,
+    pub address_2: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub country_code: Option<String>,
+    pub tax_id: Option<String>,
+    pub postcode: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub region_count: u64, // Number of regions assigned to this company
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateCompanyRequest {
+    pub name: String,
+    pub address_1: Option<String>,
+    pub address_2: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub country_code: Option<String>,
+    pub tax_id: Option<String>,
+    pub postcode: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateCompanyRequest {
+    pub name: Option<String>,
+    pub address_1: Option<String>,
+    pub address_2: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub country_code: Option<String>,
+    pub tax_id: Option<String>,
+    pub postcode: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+}
+
+impl From<lnvps_db::Company> for AdminCompanyInfo {
+    fn from(company: lnvps_db::Company) -> Self {
+        Self {
+            id: company.id,
+            created: company.created,
+            name: company.name,
+            address_1: company.address_1,
+            address_2: company.address_2,
+            city: company.city,
+            state: company.state,
+            country_code: company.country_code,
+            tax_id: company.tax_id,
+            postcode: company.postcode,
+            phone: company.phone,
+            email: company.email,
+            region_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+// IP Range Management Models
+#[derive(Serialize, JsonSchema)]
+pub struct AdminIpRangeInfo {
+    pub id: u64,
+    pub cidr: String,
+    pub gateway: String,
+    pub enabled: bool,
+    pub region_id: u64,
+    pub region_name: Option<String>, // Populated with region name
+    pub reverse_zone_id: Option<String>,
+    pub access_policy_id: Option<u64>,
+    pub access_policy_name: Option<String>, // Populated with access policy name
+    pub allocation_mode: AdminIpRangeAllocationMode,
+    pub use_full_range: bool,
+    pub assignment_count: u64, // Number of active IP assignments in this range
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateIpRangeRequest {
+    pub cidr: String,
+    pub gateway: String,
+    pub enabled: Option<bool>, // Default: true
+    pub region_id: u64,
+    pub reverse_zone_id: Option<String>,
+    pub access_policy_id: Option<u64>,
+    pub allocation_mode: Option<AdminIpRangeAllocationMode>, // default: "sequential"
+    pub use_full_range: Option<bool>, // Default: false
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateIpRangeRequest {
+    pub cidr: Option<String>,
+    pub gateway: Option<String>,
+    pub enabled: Option<bool>,
+    pub region_id: Option<u64>,
+    pub reverse_zone_id: Option<Option<String>>, // Use Option<Option<String>> to allow setting to null
+    pub access_policy_id: Option<Option<u64>>, // Use Option<Option<u64>> to allow setting to null
+    pub allocation_mode: Option<AdminIpRangeAllocationMode>,
+    pub use_full_range: Option<bool>,
+}
+
+// Access Policy Models for IP range management
+#[derive(Serialize, JsonSchema)]
+pub struct AdminAccessPolicyInfo {
+    pub id: u64,
+    pub name: String,
+    pub kind: AdminNetworkAccessPolicy,
+    pub router_id: Option<u64>,
+    pub interface: Option<String>,
+}
+
+impl From<lnvps_db::IpRange> for AdminIpRangeInfo {
+    fn from(ip_range: lnvps_db::IpRange) -> Self {
+        Self {
+            id: ip_range.id,
+            cidr: ip_range.cidr,
+            gateway: ip_range.gateway,
+            enabled: ip_range.enabled,
+            region_id: ip_range.region_id,
+            region_name: None, // Will be filled by handler
+            reverse_zone_id: ip_range.reverse_zone_id,
+            access_policy_id: ip_range.access_policy_id,
+            access_policy_name: None, // Will be filled by handler
+            allocation_mode: AdminIpRangeAllocationMode::from(ip_range.allocation_mode),
+            use_full_range: ip_range.use_full_range,
+            assignment_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+impl From<lnvps_db::AccessPolicy> for AdminAccessPolicyInfo {
+    fn from(policy: lnvps_db::AccessPolicy) -> Self {
+        Self {
+            id: policy.id,
+            name: policy.name,
+            kind: AdminNetworkAccessPolicy::from(policy.kind),
+            router_id: policy.router_id,
+            interface: policy.interface,
+        }
+    }
+}
+
+impl CreateIpRangeRequest {
+    pub fn to_ip_range(&self) -> anyhow::Result<lnvps_db::IpRange> {
+        let allocation_mode = self.allocation_mode.unwrap_or(AdminIpRangeAllocationMode::Sequential);
+        let db_allocation_mode = IpRangeAllocationMode::from(allocation_mode);
+
+        Ok(lnvps_db::IpRange {
+            id: 0, // Will be set by database
+            cidr: self.cidr.trim().to_string(),
+            gateway: self.gateway.trim().to_string(),
+            enabled: self.enabled.unwrap_or(true),
+            region_id: self.region_id,
+            reverse_zone_id: self.reverse_zone_id.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            access_policy_id: self.access_policy_id,
+            allocation_mode: db_allocation_mode,
+            use_full_range: self.use_full_range.unwrap_or(false),
+        })
+    }
+}
+
+// Access Policy Management Models (Extended)
+#[derive(Serialize, JsonSchema)]
+pub struct AdminAccessPolicyDetail {
+    pub id: u64,
+    pub name: String,
+    pub kind: AdminNetworkAccessPolicy,
+    pub router_id: Option<u64>,
+    pub router_name: Option<String>, // Populated with router name
+    pub interface: Option<String>,
+    pub ip_range_count: u64, // Number of IP ranges using this policy
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateAccessPolicyRequest {
+    pub name: String,
+    pub kind: Option<AdminNetworkAccessPolicy>, // default: "static_arp"
+    pub router_id: Option<u64>,
+    pub interface: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateAccessPolicyRequest {
+    pub name: Option<String>,
+    pub kind: Option<AdminNetworkAccessPolicy>,
+    pub router_id: Option<Option<u64>>, // Use Option<Option<u64>> to allow setting to null
+    pub interface: Option<Option<String>>, // Use Option<Option<String>> to allow setting to null
+}
+
+// Router Models for access policy management
+#[derive(Serialize, JsonSchema)]
+pub struct AdminRouterInfo {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: AdminRouterKind,
+    pub url: String,
+}
+
+impl From<lnvps_db::AccessPolicy> for AdminAccessPolicyDetail {
+    fn from(policy: lnvps_db::AccessPolicy) -> Self {
+        Self {
+            id: policy.id,
+            name: policy.name,
+            kind: AdminNetworkAccessPolicy::from(policy.kind),
+            router_id: policy.router_id,
+            router_name: None, // Will be filled by handler
+            interface: policy.interface,
+            ip_range_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+impl From<lnvps_db::Router> for AdminRouterInfo {
+    fn from(router: lnvps_db::Router) -> Self {
+        Self {
+            id: router.id,
+            name: router.name,
+            enabled: router.enabled,
+            kind: AdminRouterKind::from(router.kind),
+            url: router.url,
+        }
+    }
+}
+
+impl CreateAccessPolicyRequest {
+    pub fn to_access_policy(&self) -> anyhow::Result<lnvps_db::AccessPolicy> {
+        let admin_kind = self.kind.unwrap_or(AdminNetworkAccessPolicy::StaticArp);
+        let db_kind = NetworkAccessPolicy::from(admin_kind);
+
+        Ok(lnvps_db::AccessPolicy {
+            id: 0, // Will be set by database
+            name: self.name.trim().to_string(),
+            kind: db_kind,
+            router_id: self.router_id,
+            interface: self.interface.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        })
+    }
+}
+
+// Router Management Models (Extended)
+#[derive(Serialize, JsonSchema)]
+pub struct AdminRouterDetail {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: AdminRouterKind,
+    pub url: String,
+    pub access_policy_count: u64, // Number of access policies using this router
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateRouterRequest {
+    pub name: String,
+    pub enabled: Option<bool>, // Default: true
+    pub kind: AdminRouterKind,
+    pub url: String,
+    pub token: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateRouterRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub kind: Option<AdminRouterKind>,
+    pub url: Option<String>,
+    pub token: Option<String>,
+}
+
+impl From<lnvps_db::Router> for AdminRouterDetail {
+    fn from(router: lnvps_db::Router) -> Self {
+        Self {
+            id: router.id,
+            name: router.name,
+            enabled: router.enabled,
+            kind: AdminRouterKind::from(router.kind),
+            url: router.url,
+            access_policy_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+impl CreateRouterRequest {
+    pub fn to_router(&self) -> anyhow::Result<lnvps_db::Router> {
+        let db_kind = RouterKind::from(self.kind);
+
+        Ok(lnvps_db::Router {
+            id: 0, // Will be set by database
+            name: self.name.trim().to_string(),
+            enabled: self.enabled.unwrap_or(true),
+            kind: db_kind,
+            url: self.url.trim().to_string(),
+            token: self.token.clone(),
+        })
+    }
+}

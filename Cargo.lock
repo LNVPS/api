@@ -2128,12 +2128,13 @@ dependencies = [
  "isocountry",
  "lettre",
  "lnurl-rs",
+ "lnvps_api_common",
  "lnvps_common",
  "lnvps_db",
  "log 0.4.27",
  "mustache",
  "native-tls",
- "nostr",
+ "nostr 0.40.0",
  "nostr-sdk",
  "quick-xml",
  "rand 0.9.2",
@@ -2156,6 +2157,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_api_admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "config",
+ "env_logger",
+ "hex",
+ "ipnetwork",
+ "isocountry",
+ "lnvps_api_common",
+ "lnvps_common",
+ "lnvps_db",
+ "log 0.4.27",
+ "rocket",
+ "rocket_okapi",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lnvps_api_common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "ipnetwork",
+ "isocountry",
+ "lnvps_db",
+ "log 0.4.27",
+ "nostr 0.43.0",
+ "rand 0.9.2",
+ "reqwest",
+ "rocket",
+ "rocket_okapi",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lnvps_common"
 version = "0.1.0"
 dependencies = [
@@ -2169,6 +2216,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "serde",
  "sqlx",
  "url",
 ]
@@ -2391,13 +2439,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "nostr"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f30e6dcb36d88017587b0b5578d1ed3398afe8e4f45fdb910e48b8675aaf6f68"
+dependencies = [
+ "base64 0.22.1",
+ "bech32",
+ "bip39",
+ "bitcoin_hashes 0.14.0",
+ "cbc",
+ "chacha20",
+ "chacha20poly1305",
+ "getrandom 0.2.16",
+ "instant",
+ "scrypt",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+ "url",
+]
+
+[[package]]
 name = "nostr-database"
 version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714512e4653f4e7c4f4abb50a0ac82257541b22087dee780b9e3d787276e88d4"
 dependencies = [
  "lru",
- "nostr",
+ "nostr 0.40.0",
  "tokio",
 ]
 
@@ -2413,7 +2484,7 @@ dependencies = [
  "lru",
  "negentropy 0.3.1",
  "negentropy 0.5.0",
- "nostr",
+ "nostr 0.40.0",
  "nostr-database",
  "tokio",
  "tracing",
@@ -2426,7 +2497,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26238eee805d7dc3abcc8d570068c81cb4285b08e9db4d7999e54e20748c472e"
 dependencies = [
  "async-utility",
- "nostr",
+ "nostr 0.40.0",
  "nostr-database",
  "nostr-relay-pool",
  "tokio",

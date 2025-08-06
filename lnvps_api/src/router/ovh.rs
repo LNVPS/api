@@ -240,7 +240,7 @@ impl Router for OvhDedicatedServerVMacRouter {
                 ),
                 AddVMacAddressRequest {
                     ip_address: entry.address.clone(),
-                    comment: entry.comment.clone().unwrap_or(String::new()),
+                    comment: entry.comment.clone().unwrap_or_default(),
                 },
             )
             .await?;

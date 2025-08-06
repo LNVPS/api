@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "lnvps_db",
     "lnvps_api",
+    "lnvps_api_admin",
+    "lnvps_api_common",
     "lnvps_nostr",
     "lnvps_common"
 ]
@@ -17,3 +19,4 @@ serde_json = "1.0.132"
 rocket = { version = "0.5.1", features = ["json"] }
 config = { version = "0.15.8", features = ["yaml"] }
 hex = "0.4.3"
+ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "35977adc8103cfc232bc95fbc32f4e34f2b6a6d7" }

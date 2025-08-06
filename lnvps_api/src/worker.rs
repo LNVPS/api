@@ -122,10 +122,8 @@ impl Worker {
             info!("Stopping expired VM {}", vm.id);
             if let Err(e) = self.provisioner.stop_vm(vm.id).await {
                 warn!("Failed to stop VM {}: {}", vm.id, e);
-            } else {
-                if let Err(e) = self.vm_history_logger.log_vm_expired(vm.id, None).await {
-                    warn!("Failed to log VM {} expiration: {}", vm.id, e);
-                }
+            } else if let Err(e) = self.vm_history_logger.log_vm_expired(vm.id, None).await {
+                warn!("Failed to log VM {} expiration: {}", vm.id, e);
             }
             self.tx.send(WorkJob::SendNotification {
                     user_id: vm.user_id,
@@ -402,9 +400,9 @@ impl Worker {
         match job {
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
-                for mut host in &mut hosts {
+                for host in &mut hosts {
                     info!("Patching host {}", host.name);
-                    if let Err(e) = self.patch_host(&mut host).await {
+                    if let Err(e) = self.patch_host(host).await {
                         error!("Failed to patch host {}: {}", host.name, e);
                     }
                 }

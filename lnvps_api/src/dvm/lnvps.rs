@@ -3,7 +3,7 @@ use crate::provisioner::LNVpsProvisioner;
 use crate::{GB, MB};
 use anyhow::Context;
 use lnvps_db::{
-    DiskInterface, DiskType, LNVpsDb, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
+    DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
 };
 use nostr::prelude::DataVendingMachineStatus;
 use nostr::Tag;
@@ -155,8 +155,8 @@ impl DVMHandler for LnvpsDvm {
 mod tests {
     use super::*;
     use crate::dvm::parse_job_request;
-    use crate::exchange::{ExchangeRateService, Ticker};
-    use crate::mocks::{MockDb, MockExchangeRate, MockNode};
+    use lnvps_api_common::{ExchangeRateService, MockDb, MockExchangeRate, Ticker};
+    use crate::mocks::MockNode;
     use crate::settings::mock_settings;
     use lnvps_db::{VmCustomPricing, VmCustomPricingDisk};
     use nostr::{EventBuilder, Keys, Kind};

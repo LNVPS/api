@@ -1,4 +1,4 @@
-use crate::exchange::{Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate};
+use crate::{Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate};
 use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
@@ -305,8 +305,9 @@ impl PricingData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::{MockDb, MockExchangeRate};
+    use crate::{MockDb, MockExchangeRate};
     use lnvps_db::{DiskType, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
+
     const MOCK_RATE: f32 = 100_000.0;
 
     async fn add_custom_pricing(db: &MockDb) {
@@ -447,7 +448,12 @@ mod tests {
         let vm = db.get_vm(1).await?;
         let next_expire = PricingEngine::next_template_expire(&vm, &plan);
         match price {
-            CostResult::New { amount, time_value, tax, .. } => {
+            CostResult::New {
+                amount,
+                time_value,
+                tax,
+                ..
+            } => {
                 let expect_time = (next_expire as f64 * time_scale) as u64;
                 assert_eq!(expect_time, time_value);
                 assert_eq!(0, tax);

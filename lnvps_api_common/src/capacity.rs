@@ -1,12 +1,12 @@
-use crate::provisioner::Template;
+use crate::Template;
 use anyhow::{bail, Result};
 use chrono::Utc;
-use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
     DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
     VmIpAssignment, VmTemplate,
 };
+use rocket::futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -323,7 +323,8 @@ impl IPRangeCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::MockDb;
+    use crate::mock::MockDb;
+    use lnvps_db::LNVpsDbBase;
 
     #[test]
     fn loads() {
