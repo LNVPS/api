@@ -1,23 +1,22 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
-use lnvps_api_common::{ExchangeRateService, Ticker, TickerRate};
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
-use crate::status::{VmRunningState, VmRunningState};
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::{DateTime, TimeDelta, Utc};
 use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
-use lnvps_db::{
-    async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
-    LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmHistory, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
-};
+use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
+use lnvps_db::{
+    async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
+    LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
+    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
@@ -149,7 +148,7 @@ pub struct MockVmHost {
 
 #[derive(Debug, Clone)]
 struct MockVm {
-    pub state: VmRunningState,
+    pub state: VmRunningStates,
 }
 
 impl Default for MockVmHost {
@@ -190,7 +189,7 @@ impl VmHostClient for MockVmHost {
     async fn start_vm(&self, vm: &Vm) -> anyhow::Result<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
-            vm.state = VmRunningState::Running;
+            vm.state = VmRunningStates::Running;
         }
         Ok(())
     }
@@ -198,7 +197,7 @@ impl VmHostClient for MockVmHost {
     async fn stop_vm(&self, vm: &Vm) -> anyhow::Result<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
-            vm.state = VmRunningState::Stopped;
+            vm.state = VmRunningStates::Stopped;
         }
         Ok(())
     }
@@ -206,7 +205,7 @@ impl VmHostClient for MockVmHost {
     async fn reset_vm(&self, vm: &Vm) -> anyhow::Result<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
-            vm.state = VmRunningState::Running;
+            vm.state = VmRunningStates::Running;
         }
         Ok(())
     }
@@ -217,7 +216,7 @@ impl VmHostClient for MockVmHost {
         vms.insert(
             max_id + 1,
             MockVm {
-                state: VmRunningState::Stopped,
+                state: VmRunningStates::Stopped,
             },
         );
         Ok(())
@@ -254,17 +253,25 @@ impl VmHostClient for MockVmHost {
 
     async fn get_all_vm_states(&self) -> anyhow::Result<Vec<(u64, VmRunningState)>> {
         let vms = self.vms.lock().await;
-        let states = vms.iter().map(|(vm_id, vm)| (*vm_id, VmRunningState {
-            timestamp: Utc::now().timestamp() as u64,
-            state: vm.state.clone(),
-            cpu_usage: 69.0,
-            mem_usage: 69.0,
-            uptime: 100,
-            net_in: 69,
-            net_out: 69,
-            disk_write: 69,
-            disk_read: 69,
-        })).collect();
+        let states = vms
+            .iter()
+            .map(|(vm_id, vm)| {
+                (
+                    *vm_id,
+                    VmRunningState {
+                        timestamp: Utc::now().timestamp() as u64,
+                        state: vm.state.clone(),
+                        cpu_usage: 69.0,
+                        mem_usage: 69.0,
+                        uptime: 100,
+                        net_in: 69,
+                        net_out: 69,
+                        disk_write: 69,
+                        disk_read: 69,
+                    },
+                )
+            })
+            .collect();
         Ok(states)
     }
 

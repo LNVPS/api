@@ -1,9 +1,10 @@
+use lnvps_api_common::VmRunningStates;
+use lnvps_api_common::VmRunningState;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
 };
 use crate::settings::QemuConfig;
-use crate::status::{VmRunningState, VmRunningState};
 use crate::KB;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
@@ -192,7 +193,7 @@ impl VmHostClient for LibVirtHost {
     async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState> {
         Ok(VmRunningState {
             timestamp: Utc::now().timestamp() as u64,
-            state: VmRunningState::Stopped,
+            state: VmRunningStates::Stopped,
             cpu_usage: 0.0,
             mem_usage: 0.0,
             uptime: 0,
