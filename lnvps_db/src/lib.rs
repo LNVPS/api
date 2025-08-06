@@ -121,6 +121,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all VM's on a given host
     async fn list_vms_on_host(&self, host_id: u64) -> Result<Vec<Vm>>;
 
+    /// Count active (non-deleted) VM's on a given host
+    async fn count_active_vms_on_host(&self, host_id: u64) -> Result<u64>;
+
     /// List expired VM's
     async fn list_expired_vms(&self) -> Result<Vec<Vm>>;
 

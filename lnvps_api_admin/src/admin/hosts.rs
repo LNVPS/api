@@ -1,13 +1,38 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminHostDisk, AdminHostInfo};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, HostCapacityService};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
 use rocket::{get, patch, State};
 use rocket_okapi::openapi;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
+
+/// Create AdminHostInfo with calculated load data from host, region, and disks
+async fn create_admin_host_info_with_capacity(
+    db: &Arc<dyn LNVpsDb>,
+    host: lnvps_db::VmHost,
+    region: lnvps_db::VmHostRegion,
+    disks: Vec<lnvps_db::VmHostDisk>,
+) -> AdminHostInfo {
+    // Create capacity service to calculate load data
+    let capacity_service = HostCapacityService::new(db.clone());
+
+    // Calculate host capacity/load
+    match capacity_service.get_host_capacity(&host, None, None).await {
+        Ok(capacity) => {
+            // Count active VMs on this host - more efficient than listing all VMs
+            let active_vms = db.count_active_vms_on_host(host.id).await.unwrap_or(0);
+            
+            AdminHostInfo::from_host_capacity(&capacity, region, disks, active_vms)
+        }
+        Err(_) => {
+            // If capacity calculation fails, use the fallback method
+            AdminHostInfo::from_host_region_and_disks(host, region, disks)
+        }
+    }
+}
 
 /// List all VM hosts with pagination
 #[openapi(tag = "Admin - Hosts")]
@@ -29,13 +54,11 @@ pub async fn admin_list_hosts(
         .admin_list_hosts_with_regions_paginated(limit, offset)
         .await?;
 
-    // Convert to API model with disk information
+    // Convert to API model with disk information and calculated load data
     let mut hosts = Vec::new();
     for (host, region) in hosts_data {
         let disks = db.list_host_disks(host.id).await?;
-        hosts.push(AdminHostInfo::from_host_region_and_disks(
-            host, region, disks,
-        ));
+        hosts.push(create_admin_host_info_with_capacity(db.inner(), host, region, disks).await);
     }
 
     ApiPaginatedData::ok(hosts, total, limit, offset)
@@ -55,9 +78,9 @@ pub async fn admin_get_host(
     let host = db.get_host(id).await?;
     let region = db.get_host_region(host.region_id).await?;
     let disks = db.list_host_disks(id).await?;
-    ApiData::ok(AdminHostInfo::from_host_region_and_disks(
-        host, region, disks,
-    ))
+
+    let host_info = create_admin_host_info_with_capacity(db.inner(), host, region, disks).await;
+    ApiData::ok(host_info)
 }
 
 /// Update host configuration
@@ -95,48 +118,15 @@ pub async fn admin_update_host(
     // Save changes
     db.update_host(&host).await?;
 
-    // Return updated host
+    // Return updated host with calculated load data
     let updated_host = db.get_host(id).await?;
     let region = db.get_host_region(updated_host.region_id).await?;
     let disks = db.list_host_disks(id).await?;
-    ApiData::ok(AdminHostInfo::from_host_region_and_disks(
-        updated_host,
-        region,
-        disks,
-    ))
+
+    let host_info = create_admin_host_info_with_capacity(db.inner(), updated_host, region, disks).await;
+    ApiData::ok(host_info)
 }
 
-/// Host statistics
-#[openapi(tag = "Admin - Hosts")]
-#[get("/api/admin/v1/hosts/<id>/stats")]
-pub async fn admin_get_host_stats(
-    auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-) -> ApiResult<AdminHostStats> {
-    // Check permission
-    auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
-
-    // Check that host exists
-    let _host = db.get_host(id).await?;
-
-    // Get VM counts by status - get all VMs and filter by host
-    let all_vms = db.list_vms().await?;
-    let vms: Vec<_> = all_vms.into_iter().filter(|vm| vm.host_id == id).collect();
-    let total_vms = vms.len() as u64;
-    let active_vms = vms.iter().filter(|vm| !vm.deleted).count() as u64;
-
-    let stats = AdminHostStats {
-        total_vms,
-        active_vms,
-        deleted_vms: total_vms - active_vms,
-        cpu_usage: None,    // TODO: Get from monitoring system
-        memory_usage: None, // TODO: Get from monitoring system
-        disk_usage: None,   // TODO: Get from monitoring system
-    };
-
-    ApiData::ok(stats)
-}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct AdminHostUpdateRequest {
@@ -147,15 +137,6 @@ pub struct AdminHostUpdateRequest {
     pub load_disk: Option<f32>,
 }
 
-#[derive(Serialize, JsonSchema)]
-pub struct AdminHostStats {
-    pub total_vms: u64,
-    pub active_vms: u64,
-    pub deleted_vms: u64,
-    pub cpu_usage: Option<f32>,
-    pub memory_usage: Option<f32>,
-    pub disk_usage: Option<f32>,
-}
 
 /// List host disks
 #[openapi(tag = "Admin - Host Disks")]

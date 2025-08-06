@@ -391,6 +391,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn count_active_vms_on_host(&self, host_id: u64) -> Result<u64> {
+        let result: (i64,) = sqlx::query_as("select count(*) from vm where deleted = 0 and host_id = ?")
+            .bind(host_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(result.0 as u64)
+    }
+
     async fn list_expired_vms(&self) -> Result<Vec<Vm>> {
         sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
             .fetch_all(&self.db)

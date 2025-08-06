@@ -15,7 +15,7 @@ use crate::admin::ip_ranges::{
     admin_list_ip_ranges, admin_update_ip_range,
 };
 use crate::admin::hosts::{
-    admin_get_host, admin_get_host_disk, admin_get_host_stats, admin_list_host_disks,
+    admin_get_host, admin_get_host_disk, admin_list_host_disks,
     admin_list_hosts, admin_update_host, admin_update_host_disk,
 };
 use crate::admin::regions::{
@@ -75,7 +75,6 @@ pub fn admin_routes() -> Vec<Route> {
         admin_list_hosts,
         admin_get_host,
         admin_update_host,
-        admin_get_host_stats,
         // Host disk management
         admin_list_host_disks,
         admin_get_host_disk,

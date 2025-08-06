@@ -464,6 +464,14 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn count_active_vms_on_host(&self, host_id: u64) -> anyhow::Result<u64> {
+        let vms = self.vms.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| !v.deleted && v.host_id == host_id)
+            .count() as u64)
+    }
+
     async fn list_expired_vms(&self) -> anyhow::Result<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms

@@ -439,6 +439,26 @@ pub struct AdminHostInfo {
     pub load_disk: f32,
     pub vlan_id: Option<u64>,
     pub disks: Vec<AdminHostDisk>,
+    // Calculated load metrics
+    pub calculated_load: CalculatedHostLoad,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct CalculatedHostLoad {
+    /// Overall load percentage (0.0-1.0)
+    pub overall_load: f32,
+    /// CPU load percentage (0.0-1.0)
+    pub cpu_load: f32,
+    /// Memory load percentage (0.0-1.0)  
+    pub memory_load: f32,
+    /// Disk load percentage (0.0-1.0)
+    pub disk_load: f32,
+    /// Available CPU cores
+    pub available_cpu: u16,
+    /// Available memory in bytes
+    pub available_memory: u64,
+    /// Number of active VMs on this host
+    pub active_vms: u64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -504,6 +524,15 @@ impl AdminHostInfo {
             load_disk: host.load_disk,
             vlan_id: host.vlan_id,
             disks: Vec::new(), // Empty disks - should be populated separately
+            calculated_load: CalculatedHostLoad {
+                overall_load: 0.0,
+                cpu_load: 0.0,
+                memory_load: 0.0,
+                disk_load: 0.0,
+                available_cpu: host.cpu,
+                available_memory: host.memory,
+                active_vms: 0,
+            },
         }
     }
 
@@ -542,6 +571,63 @@ impl AdminHostInfo {
             load_disk: host.load_disk,
             vlan_id: host.vlan_id,
             disks: admin_disks,
+            calculated_load: CalculatedHostLoad {
+                overall_load: 0.0,
+                cpu_load: 0.0,
+                memory_load: 0.0,
+                disk_load: 0.0,
+                available_cpu: host.cpu,
+                available_memory: host.memory,
+                active_vms: 0,
+            },
+        }
+    }
+
+    pub fn from_host_capacity(
+        capacity: &lnvps_api_common::HostCapacity,
+        region: lnvps_db::VmHostRegion,
+        disks: Vec<lnvps_db::VmHostDisk>,
+        active_vms: u64,
+    ) -> Self {
+        let admin_disks = disks
+            .into_iter()
+            .map(|disk| AdminHostDisk {
+                id: disk.id,
+                name: disk.name,
+                size: disk.size,
+                kind: DiskType::from(disk.kind),
+                interface: DiskInterface::from(disk.interface),
+                enabled: disk.enabled,
+            })
+            .collect();
+
+        Self {
+            id: capacity.host.id,
+            name: capacity.host.name.clone(),
+            kind: AdminVmHostKind::from(capacity.host.kind.clone()),
+            region: AdminHostRegion {
+                id: region.id,
+                name: region.name,
+                enabled: region.enabled,
+            },
+            ip: capacity.host.ip.clone(),
+            cpu: capacity.host.cpu,
+            memory: capacity.host.memory,
+            enabled: capacity.host.enabled,
+            load_cpu: capacity.host.load_cpu,
+            load_memory: capacity.host.load_memory,
+            load_disk: capacity.host.load_disk,
+            vlan_id: capacity.host.vlan_id,
+            disks: admin_disks,
+            calculated_load: CalculatedHostLoad {
+                overall_load: capacity.load(),
+                cpu_load: capacity.cpu_load(),
+                memory_load: capacity.memory_load(),
+                disk_load: capacity.disk_load(),
+                available_cpu: capacity.available_cpu(),
+                available_memory: capacity.available_memory(),
+                active_vms,
+            },
         }
     }
 }

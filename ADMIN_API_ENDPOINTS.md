@@ -315,7 +315,7 @@ Query Parameters:
 
 Required Permission: `hosts::view`
 
-Returns paginated list of VM hosts with configuration details.
+Returns paginated list of VM hosts with configuration details and real-time calculated load metrics based on actual VM resource consumption.
 
 #### Get Host Details
 ```
@@ -323,7 +323,7 @@ GET /api/admin/v1/hosts/{id}
 ```
 Required Permission: `hosts::view`
 
-Returns detailed information about a specific VM host.
+Returns detailed information about a specific VM host including real-time calculated load metrics based on actual VM resource consumption.
 
 #### Update Host Configuration
 ```
@@ -342,13 +342,6 @@ Body parameters (all optional):
 }
 ```
 
-#### Get Host Statistics
-```
-GET /api/admin/v1/hosts/{id}/stats
-```
-Required Permission: `hosts::view`
-
-Returns VM counts and resource usage statistics for the host (only active VMs are counted).
 
 #### List Host Disks
 ```
@@ -1275,19 +1268,19 @@ The RBAC system uses the following permission format: `resource::action`
       "interface": "pcie",                  // DiskInterface enum: "sata", "scsi", "pcie"
       "enabled": boolean
     }
-  ]
+  ],
+  "calculated_load": {
+    "overall_load": number,                 // Overall load percentage (0.0-1.0)
+    "cpu_load": number,                     // CPU load percentage (0.0-1.0)
+    "memory_load": number,                  // Memory load percentage (0.0-1.0)
+    "disk_load": number,                    // Disk load percentage (0.0-1.0)
+    "available_cpu": number,                // Available CPU cores
+    "available_memory": number,             // Available memory in bytes
+    "active_vms": number                    // Number of active VMs on this host
+  }
 }
 ```
 
-### AdminHostStats
-```json
-{
-  "total_vms": number,  // Count of active (non-deleted) VMs only
-  "cpu_usage": "number | null",
-  "memory_usage": "number | null", 
-  "disk_usage": "number | null"
-}
-```
 
 ### AdminRegionInfo
 ```json
