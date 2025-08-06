@@ -369,6 +369,15 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn create_host(&self, host: &VmHost) -> anyhow::Result<u64> {
+        let mut hosts = self.hosts.lock().await;
+        let id = (hosts.len() as u64) + 1;
+        let mut new_host = host.clone();
+        new_host.id = id;
+        hosts.insert(id, new_host);
+        Ok(id)
+    }
+
     async fn list_host_disks(&self, host_id: u64) -> anyhow::Result<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
         Ok(disks.values().filter(|d| d.enabled).cloned().collect())

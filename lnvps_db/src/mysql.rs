@@ -258,14 +258,42 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_host(&self, host: &VmHost) -> Result<()> {
-        sqlx::query("update vm_host set name = ?, cpu = ?, memory = ? where id = ?")
+        sqlx::query("update vm_host set kind = ?, region_id = ?, name = ?, ip = ?, cpu = ?, memory = ?, enabled = ?, api_token = ?, load_cpu = ?, load_memory = ?, load_disk = ?, vlan_id = ? where id = ?")
+            .bind(&host.kind)
+            .bind(host.region_id)
             .bind(&host.name)
+            .bind(&host.ip)
             .bind(host.cpu)
             .bind(host.memory)
+            .bind(host.enabled)
+            .bind(&host.api_token)
+            .bind(host.load_cpu)
+            .bind(host.load_memory)
+            .bind(host.load_disk)
+            .bind(host.vlan_id)
             .bind(host.id)
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    async fn create_host(&self, host: &VmHost) -> Result<u64> {
+        let result = sqlx::query("insert into vm_host (kind, region_id, name, ip, cpu, memory, enabled, api_token, load_cpu, load_memory, load_disk, vlan_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&host.kind)
+            .bind(host.region_id)
+            .bind(&host.name)
+            .bind(&host.ip)
+            .bind(host.cpu)
+            .bind(host.memory)
+            .bind(host.enabled)
+            .bind(&host.api_token)
+            .bind(host.load_cpu)
+            .bind(host.load_memory)
+            .bind(host.load_disk)
+            .bind(host.vlan_id)
+            .execute(&self.db)
+            .await?;
+        Ok(result.last_insert_id())
     }
 
     async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>> {

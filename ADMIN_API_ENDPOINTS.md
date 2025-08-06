@@ -30,7 +30,7 @@ All enum types used in this API are listed below with their possible values:
 - Example: `"status": "running"`
 
 #### VmHostKind
-**Values**: `"proxmox"`, `"standalone"`
+**Values**: `"proxmox"`, `"libvirt"`
 - Used in: Host configuration
 - Example: `"kind": "proxmox"`
 
@@ -335,10 +335,39 @@ Body parameters (all optional):
 ```json
 {
   "name": "string",
+  "ip": "string",
+  "api_token": "string",
+  "region_id": number,
+  "kind": "libvirt",           // AdminVmHostKind enum: "proxmox" or "libvirt"
+  "vlan_id": number | null,
   "enabled": boolean,
   "load_cpu": number,
   "load_memory": number,
   "load_disk": number
+}
+```
+
+#### Create Host
+```
+POST /api/admin/v1/hosts
+```
+Required Permission: `hosts::create`
+
+Body:
+```json
+{
+  "name": "string",               // Required - Host name/hostname
+  "ip": "string",                // Required - Host IP address
+  "api_token": "string",         // Required - API token for host communication
+  "region_id": number,           // Required - Region ID
+  "kind": "proxmox",            // Required - AdminVmHostKind enum: "proxmox" or "libvirt"
+  "vlan_id": number | null,     // Optional - VLAN ID
+  "cpu": number,                // Required - Number of CPU cores
+  "memory": number,             // Required - Memory in bytes
+  "enabled": boolean,           // Optional - Default: true
+  "load_cpu": number,           // Optional - CPU load factor (default: 1.0)
+  "load_memory": number,        // Optional - Memory load factor (default: 1.0)
+  "load_disk": number          // Optional - Disk load factor (default: 1.0)
 }
 ```
 
@@ -1245,7 +1274,7 @@ The RBAC system uses the following permission format: `resource::action`
 {
   "id": number,
   "name": "string",
-  "kind": "proxmox",                      // VmHostKind enum: "proxmox", "standalone"
+  "kind": "proxmox",                      // VmHostKind enum: "proxmox", "libvirt"
   "region": {
     "id": number,
     "name": "string",

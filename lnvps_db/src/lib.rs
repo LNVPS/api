@@ -79,6 +79,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update host resources (usually from [auto_discover])
     async fn update_host(&self, host: &VmHost) -> Result<()>;
 
+    /// Create a new host
+    async fn create_host(&self, host: &VmHost) -> Result<u64>;
+
     /// List enabled storage disks on the host
     async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>>;
 

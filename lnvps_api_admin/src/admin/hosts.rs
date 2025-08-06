@@ -1,9 +1,11 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminHostDisk, AdminHostInfo};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, HostCapacityService};
+use crate::admin::model::{AdminHostDisk, AdminHostInfo, AdminVmHostKind};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, HostCapacityService,
+};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
-use rocket::{get, patch, State};
+use rocket::{get, patch, post, State};
 use rocket_okapi::openapi;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -24,7 +26,7 @@ async fn create_admin_host_info_with_capacity(
         Ok(capacity) => {
             // Count active VMs on this host - more efficient than listing all VMs
             let active_vms = db.count_active_vms_on_host(host.id).await.unwrap_or(0);
-            
+
             AdminHostInfo::from_host_capacity(&capacity, region, disks, active_vms)
         }
         Err(_) => {
@@ -102,6 +104,21 @@ pub async fn admin_update_host(
     if let Some(name) = &req.name {
         host.name = name.clone();
     }
+    if let Some(ip) = &req.ip {
+        host.ip = ip.clone();
+    }
+    if let Some(api_token) = &req.api_token {
+        host.api_token = api_token.clone();
+    }
+    if let Some(region_id) = req.region_id {
+        host.region_id = region_id;
+    }
+    if let Some(kind) = &req.kind {
+        host.kind = kind.clone().into();
+    }
+    if let Some(vlan_id) = req.vlan_id {
+        host.vlan_id = vlan_id;
+    }
     if let Some(enabled) = req.enabled {
         host.enabled = enabled;
     }
@@ -123,20 +140,83 @@ pub async fn admin_update_host(
     let region = db.get_host_region(updated_host.region_id).await?;
     let disks = db.list_host_disks(id).await?;
 
-    let host_info = create_admin_host_info_with_capacity(db.inner(), updated_host, region, disks).await;
+    let host_info =
+        create_admin_host_info_with_capacity(db.inner(), updated_host, region, disks).await;
     ApiData::ok(host_info)
 }
 
+/// Create a new host
+#[post("/api/admin/v1/hosts", data = "<req>")]
+pub async fn admin_create_host(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    req: Json<AdminHostCreateRequest>,
+) -> ApiResult<AdminHostInfo> {
+    // Check permission
+    auth.require_permission(AdminResource::Hosts, AdminAction::Create)?;
+
+    // Validate region exists
+    let _region = db.get_host_region(req.region_id).await?;
+
+    // Create new host object
+    let new_host = lnvps_db::VmHost {
+        id: 0, // Will be set by database
+        kind: req.kind.clone().into(),
+        region_id: req.region_id,
+        name: req.name.clone(),
+        ip: req.ip.clone(),
+        cpu: req.cpu,
+        memory: req.memory,
+        enabled: req.enabled.unwrap_or(true),
+        api_token: req.api_token.clone(),
+        load_cpu: req.load_cpu.unwrap_or(1.0),
+        load_memory: req.load_memory.unwrap_or(1.0),
+        load_disk: req.load_disk.unwrap_or(1.0),
+        vlan_id: req.vlan_id,
+    };
+
+    // Create host in database
+    let host_id = db.create_host(&new_host).await?;
+
+    // Return the created host with calculated load data
+    let created_host = db.get_host(host_id).await?;
+    let region = db.get_host_region(created_host.region_id).await?;
+    let disks = db.list_host_disks(host_id).await?;
+
+    let host_info =
+        create_admin_host_info_with_capacity(db.inner(), created_host, region, disks).await;
+    ApiData::ok(host_info)
+}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct AdminHostUpdateRequest {
     pub name: Option<String>,
+    pub ip: Option<String>,
+    pub api_token: Option<String>,
+    pub region_id: Option<u64>,
+    pub kind: Option<AdminVmHostKind>,
+    pub vlan_id: Option<Option<u64>>,
     pub enabled: Option<bool>,
     pub load_cpu: Option<f32>,
     pub load_memory: Option<f32>,
     pub load_disk: Option<f32>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct AdminHostCreateRequest {
+    pub name: String,
+    pub ip: String,
+    pub api_token: String,
+    pub region_id: u64,
+    pub kind: AdminVmHostKind,
+    pub vlan_id: Option<u64>,
+    pub cpu: u16,
+    pub memory: u64,
+    pub enabled: Option<bool>,
+    pub load_cpu: Option<f32>,
+    pub load_memory: Option<f32>,
+    pub load_disk: Option<f32>,
+}
 
 /// List host disks
 #[openapi(tag = "Admin - Host Disks")]

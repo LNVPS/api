@@ -10,7 +10,7 @@ use std::str::FromStr;
 // Admin API Enums - Using enums from common crate where available, creating new ones only where needed
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum AdminVmHostKind {
     Proxmox,
     Libvirt,
