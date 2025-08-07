@@ -1262,70 +1262,6 @@ Note: Routers that are used by access policies cannot be deleted. You must first
 
 ### Reports
 
-#### Monthly Sales Report
-```
-GET /api/admin/v1/reports/monthly-sales/{year}/{month}/{company_id}
-```
-Path Parameters:
-- `year`: number - Year (e.g., 2025)
-- `month`: number - Month (1-12)
-- `company_id`: number - Company ID to generate report for
-
-Required Permission: `analytics::view`
-
-Returns monthly sales report for a specific company with sales data grouped by currency, with separate line items for sales and taxes. The report includes:
-- Report date (last day of the specified month)
-- Exchange rates to the company's base currency calculated to ensure mathematical consistency
-- Separate line items for net sales and tax collected per currency
-- Only includes payments from VMs in regions owned by the specified company
-
-Response:
-```json
-{
-  "data": {
-    "date": "2025-05-30",
-    "exchange_rate": {
-      "BTC_USD": 92273.018191527,
-      "EUR_USD": 1.18
-    },
-    "items": [
-      {
-        "description": "LNVPS Sales",
-        "currency": "BTC", 
-        "qty": 1,
-        "rate": 0.00509358
-      },
-      {
-        "description": "Tax Collected",
-        "currency": "BTC", 
-        "qty": 1,
-        "rate": 0.00107965
-      },
-      {
-        "description": "LNVPS Sales",
-        "currency": "EUR", 
-        "qty": 1,
-        "rate": 150.75
-      },
-      {
-        "description": "Tax Collected",
-        "currency": "EUR", 
-        "qty": 1,
-        "rate": 31.66
-      }
-    ]
-  }
-}
-```
-
-The endpoint includes all paid payments for the specified company and month, grouped by currency. Each currency generates up to two line items:
-- **LNVPS Sales**: Net amount (excluding taxes) for that currency
-- **Tax Collected**: Total tax collected for that currency
-
-Exchange rates are calculated to ensure mathematical consistency: the exchange rate is derived so that `(net_amount + tax_amount) * exchange_rate` equals the total base currency equivalent from all payments in that currency. Payments in the company's base currency don't need exchange rates as they are already in the correct currency.
-
-In this example, the company's base currency is USD, so exchange rates are shown as `{currency}_{base_currency}` format (e.g., `BTC_USD`, `EUR_USD`).
-
 #### Time Series Report
 ```
 GET /api/admin/v1/reports/time-series?start_date={date}&end_date={date}&interval={interval}&company_id={company_id}&currency={currency}
@@ -1368,7 +1304,8 @@ Returns time-series payment data for a specific company with optional currency f
         "payment_count": 25,
         "net_total": 3125000,
         "tax_total": 656250,
-        "gross_total": 3781250
+        "base_currency_net": 3125000,
+        "base_currency_tax": 656250
       },
       {
         "period": "2025-01", 
@@ -1376,7 +1313,8 @@ Returns time-series payment data for a specific company with optional currency f
         "payment_count": 8,
         "net_total": 1000,
         "tax_total": 208,
-        "gross_total": 1208
+        "base_currency_net": 1000,
+        "base_currency_tax": 208
       }
     ],
     "payments": [
@@ -1460,7 +1398,15 @@ Each period summary aggregates payments by time period and currency:
 - `payment_count`: Number of individual payments in this period/currency combination
 - `net_total`: Sum of payment amounts (excluding tax) in smallest currency unit
 - `tax_total`: Sum of tax amounts in smallest currency unit
-- `gross_total`: Sum of net + tax amounts (total payment value) in smallest currency unit
+- `base_currency_net`: Sum of net amounts converted to company's base currency using proper decimal conversion and exchange rates
+- `base_currency_tax`: Sum of tax amounts converted to company's base currency using proper decimal conversion and exchange rates
+
+**Currency Conversion Logic:**
+The `base_currency_net` and `base_currency_tax` calculations properly handle different currency types:
+- BTC amounts are converted from millisatoshis to full decimal BTC before multiplying by exchange rate
+- Fiat amounts are converted from cents to full decimal amount before multiplying by exchange rate  
+- Results are converted back to the base currency's smallest unit (cents for fiat, millisatoshis for BTC)
+- Net and tax amounts are converted separately to maintain precision and allow for independent analysis
 
 **Benefits of Dual Data Approach:**
 - **Performance**: Single optimized database query with efficient aggregation
@@ -1471,10 +1417,13 @@ Each period summary aggregates payments by time period and currency:
 
 **Use Cases:**
 - **Revenue Dashboards**: Use period_summaries for charts and KPIs showing revenue trends over time
-- **Multi-currency Analysis**: Compare performance across different payment currencies using aggregated totals
+- **Multi-currency Analysis**: Compare performance across different payment currencies using both original amounts and base currency conversions
+- **Unified Reporting**: Sum base_currency_net and base_currency_tax values across currencies for total company revenue per period
+- **Tax Analysis**: Separate base_currency_tax values allow for detailed tax reporting and compliance analysis
+- **Net Revenue Tracking**: base_currency_net provides clean revenue figures excluding tax effects
 - **Seasonal Analysis**: Identify payment patterns using period summaries grouped by time intervals
 - **Detailed Investigations**: Drill down from period summaries into individual payments for investigation
-- **Financial Reporting**: Generate summary reports from period_summaries with ability to validate using raw payment data
+- **Financial Reporting**: Generate summary reports from period_summaries with consistent base currency values
 - **Payment Method Analysis**: Use raw payment data to analyze preferred payment methods by time period
 - **Custom Aggregations**: Combine period_summaries with custom groupings from raw payment data
 
