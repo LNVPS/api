@@ -14,7 +14,6 @@ pub struct SalesReportItem {
     currency: String,
     qty: i32,
     rate: f64,
-    tax: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,9 +58,8 @@ pub async fn admin_monthly_sales_report(
     // Get all payments for the month
     let payments = db.get_payments_by_date_range(start_date, end_date).await?;
 
-    // Group payments by currency and calculate net totals and tax rates
+    // Group payments by currency and calculate net and tax totals
     let mut currency_net_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
-    let mut currency_gross_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
     let mut currency_tax_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
     let mut currency_rates: HashMap<String, Vec<f32>> = HashMap::new();
     let mut exchange_rates = HashMap::new();
@@ -69,19 +67,11 @@ pub async fn admin_monthly_sales_report(
     for payment in &payments {
         // Parse currency using the existing system
         if let Ok(currency) = Currency::from_str(&payment.currency) {
-            // Create CurrencyAmount for gross amount, tax, and net amount
-            let gross_amount = CurrencyAmount::from_u64(currency, payment.amount);
+            // Create CurrencyAmount for tax and net amount
             let tax_amount = CurrencyAmount::from_u64(currency, payment.tax);
             let net_amount = CurrencyAmount::from_u64(currency, payment.amount.saturating_sub(payment.tax));
             
             // Accumulate totals by currency
-            currency_gross_totals.insert(
-                currency,
-                currency_gross_totals.get(&currency)
-                    .map(|existing| CurrencyAmount::from_u64(currency, existing.value() + gross_amount.value()))
-                    .unwrap_or(gross_amount)
-            );
-            
             currency_tax_totals.insert(
                 currency,
                 currency_tax_totals.get(&currency)
@@ -111,26 +101,31 @@ pub async fn admin_monthly_sales_report(
         }
     }
 
-    // Create line items for each currency using the currency system
+    // Create line items for each currency - separate items for sales and taxes
     let mut items = Vec::new();
-    for currency in currency_net_totals.keys() {
-        let net_total = currency_net_totals.get(currency).unwrap();
-        let tax_total = currency_tax_totals.get(currency).unwrap();
-        
-        // Calculate tax rate as percentage: (tax_total / net_total) * 100
-        let tax_rate = if net_total.value() > 0 {
-            (tax_total.value_f32() / net_total.value_f32() * 100.0) as f64
-        } else {
-            0.0
-        };
-        
-        items.push(SalesReportItem {
-            description: "LNVPS Sales".to_string(),
-            currency: currency.to_string(),
-            qty: 1,
-            rate: net_total.value_f32() as f64, // Net amount only
-            tax: tax_rate, // Tax rate as percentage
-        });
+    
+    // Add net sales line items
+    for (currency, net_total) in &currency_net_totals {
+        if net_total.value() > 0 {
+            items.push(SalesReportItem {
+                description: "LNVPS Sales".to_string(),
+                currency: currency.to_string(),
+                qty: 1,
+                rate: net_total.value_f32() as f64,
+            });
+        }
+    }
+    
+    // Add tax line items
+    for (currency, tax_total) in &currency_tax_totals {
+        if tax_total.value() > 0 {
+            items.push(SalesReportItem {
+                description: "Tax Collected".to_string(),
+                currency: currency.to_string(),
+                qty: 1,
+                rate: tax_total.value_f32() as f64,
+            });
+        }
     }
 
     // Use the last day of the month for the report date

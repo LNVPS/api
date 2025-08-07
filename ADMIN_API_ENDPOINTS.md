@@ -1251,11 +1251,10 @@ Path Parameters:
 
 Required Permission: `analytics::view`
 
-Returns monthly sales report with sales data grouped by currency, including tax handling. The report includes:
+Returns monthly sales report with sales data grouped by currency, with separate line items for sales and taxes. The report includes:
 - Report date (last day of the specified month)
 - Exchange rates to EUR from payment records (averaged for the month)
-- Sales items with one line per currency used in payments
-- Net amounts (excluding taxes) and tax rates as percentages
+- Separate line items for net sales and tax collected per currency
 
 Response:
 ```json
@@ -1271,24 +1270,34 @@ Response:
         "description": "LNVPS Sales",
         "currency": "BTC", 
         "qty": 1,
-        "rate": 0.00509358,
-        "tax": 21.0
+        "rate": 0.00509358
+      },
+      {
+        "description": "Tax Collected",
+        "currency": "BTC", 
+        "qty": 1,
+        "rate": 0.00107965
       },
       {
         "description": "LNVPS Sales",
         "currency": "USD", 
         "qty": 1,
-        "rate": 150.75,
-        "tax": 19.5
+        "rate": 150.75
+      },
+      {
+        "description": "Tax Collected",
+        "currency": "USD", 
+        "qty": 1,
+        "rate": 31.66
       }
     ]
   }
 }
 ```
 
-The endpoint includes all paid payments for the specified month, grouped by currency. Each currency gets its own line item with:
-- `rate`: Net amount (excluding taxes) for that currency
-- `tax`: Weighted average tax rate as a percentage (e.g., 21.0 = 21%)
+The endpoint includes all paid payments for the specified month, grouped by currency. Each currency generates up to two line items:
+- **LNVPS Sales**: Net amount (excluding taxes) for that currency
+- **Tax Collected**: Total tax collected for that currency
 - Exchange rates are averaged from all payment records for each currency (EUR payments don't need exchange rates as EUR is the base currency)
 
 ## Error Responses
