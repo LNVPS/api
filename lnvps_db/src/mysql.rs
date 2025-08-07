@@ -797,6 +797,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
+    async fn get_vm_base_currency(&self, vm_id: u64) -> Result<String> {
+        let currency = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(c.base_currency, 'EUR') as base_currency 
+             FROM vm v
+             JOIN vm_host vh ON v.host_id = vh.id  
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             LEFT JOIN company c ON vhr.company_id = c.id
+             WHERE v.id = ?"
+        )
+        .bind(vm_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::new)?;
+        Ok(currency)
+    }
+
     async fn insert_vm_history(&self, history: &VmHistory) -> Result<u64> {
         Ok(sqlx::query("insert into vm_history(vm_id,action_type,initiated_by_user,previous_state,new_state,metadata,description) values(?,?,?,?,?,?,?) returning id")
             .bind(history.vm_id)

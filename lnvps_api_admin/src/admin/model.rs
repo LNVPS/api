@@ -942,6 +942,7 @@ pub struct AdminCompanyInfo {
     pub postcode: Option<String>,
     pub phone: Option<String>,
     pub email: Option<String>,
+    pub base_currency: String,
     pub region_count: u64, // Number of regions assigned to this company
 }
 
@@ -957,6 +958,7 @@ pub struct CreateCompanyRequest {
     pub postcode: Option<String>,
     pub phone: Option<String>,
     pub email: Option<String>,
+    pub base_currency: Option<String>, // 3-letter ISO currency code (default: EUR)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -971,6 +973,7 @@ pub struct UpdateCompanyRequest {
     pub postcode: Option<String>,
     pub phone: Option<String>,
     pub email: Option<String>,
+    pub base_currency: Option<String>, // 3-letter ISO currency code
 }
 
 impl From<lnvps_db::Company> for AdminCompanyInfo {
@@ -988,6 +991,7 @@ impl From<lnvps_db::Company> for AdminCompanyInfo {
             postcode: company.postcode,
             phone: company.phone,
             email: company.email,
+            base_currency: company.base_currency,
             region_count: 0, // Will be filled by handler
         }
     }

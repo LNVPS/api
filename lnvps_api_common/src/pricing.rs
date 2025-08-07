@@ -19,6 +19,7 @@ pub struct PricingEngine {
     db: Arc<dyn LNVpsDb>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
+    base_currency: Currency,
 }
 
 impl PricingEngine {
@@ -26,13 +27,30 @@ impl PricingEngine {
         db: Arc<dyn LNVpsDb>,
         rates: Arc<dyn ExchangeRateService>,
         tax_rates: HashMap<CountryCode, f32>,
+        base_currency: Currency,
     ) -> Self {
         Self {
             db,
             rates,
             tax_rates,
+            base_currency,
         }
     }
+
+    /// Create a new pricing engine for a specific VM, automatically looking up the company's base currency
+    pub async fn new_for_vm(
+        db: Arc<dyn LNVpsDb>,
+        rates: Arc<dyn ExchangeRateService>,
+        tax_rates: HashMap<CountryCode, f32>,
+        vm_id: u64,
+    ) -> Result<Self> {
+        let base_currency_str = db.get_vm_base_currency(vm_id).await?;
+        let base_currency: Currency = base_currency_str.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid base currency: {}", base_currency_str))?;
+        
+        Ok(Self::new(db, rates, tax_rates, base_currency))
+    }
+
 
     /// Get amount of time a certain currency amount will extend a vm in seconds
     pub async fn get_cost_by_amount(
@@ -193,17 +211,17 @@ impl PricingEngine {
         Ok(0)
     }
 
-    async fn get_ticker(&self, currency: Currency) -> Result<TickerRate> {
-        let ticker = Ticker(Currency::BTC, currency);
+    async fn get_ticker(&self, base_currency: Currency, target_currency: Currency) -> Result<TickerRate> {
+        let ticker = Ticker(base_currency, target_currency);
         if let Some(r) = self.rates.get_rate(ticker).await {
             Ok(TickerRate(ticker, r))
         } else {
-            bail!("No exchange rate found")
+            bail!("No exchange rate found for {}/{}", base_currency, target_currency)
         }
     }
 
     async fn get_msats_amount(&self, amount: CurrencyAmount) -> Result<(u64, f32)> {
-        let rate = self.get_ticker(amount.currency()).await?;
+        let rate = self.get_ticker(Currency::BTC, amount.currency()).await?;
         let cost_btc = amount.value_f32() / rate.1;
         let cost_msats = (cost_btc as f64 * crate::BTC_SATS) as u64 * 1000;
         Ok((cost_msats, rate.1))
@@ -414,7 +432,7 @@ mod tests {
 
         let taxes = HashMap::from([(CountryCode::IRL, 23.0)]);
 
-        let pe = PricingEngine::new(db.clone(), rates, taxes);
+        let pe = PricingEngine::new(db.clone(), rates, taxes, Currency::EUR);
         let plan = MockDb::mock_cost_plan();
 
         let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
@@ -461,6 +479,57 @@ mod tests {
             }
             _ => bail!("??"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pricing_engine_with_different_currencies() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        
+        // Set up rates for different currencies
+        rates.set_rate(Ticker::btc_rate("EUR")?, 95_000.0).await;
+        rates.set_rate(Ticker::btc_rate("USD")?, 100_000.0).await;
+        
+        let taxes = HashMap::new();
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        // Test EUR pricing engine
+        let pe_eur = PricingEngine::new(db_arc.clone(), rates.clone(), taxes.clone(), Currency::EUR);
+        
+        // Test USD pricing engine  
+        let pe_usd = PricingEngine::new(db_arc.clone(), rates.clone(), taxes, Currency::USD);
+
+        // Both should work with their respective base currencies
+        // The base currency is now stored in the pricing engine itself
+        assert_eq!(pe_eur.base_currency, Currency::EUR);
+        assert_eq!(pe_usd.base_currency, Currency::USD);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_new_for_vm() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        
+        // Set up rates
+        rates.set_rate(Ticker::btc_rate("EUR")?, 95_000.0).await;
+        
+        let taxes = HashMap::new();
+
+        // Add a VM
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(1, MockDb::mock_vm());
+        }
+
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        // Test creating pricing engine for VM (should use EUR from default company)
+        let pe = PricingEngine::new_for_vm(db_arc.clone(), rates.clone(), taxes.clone(), 1).await?;
+        assert_eq!(pe.base_currency, Currency::EUR);
 
         Ok(())
     }

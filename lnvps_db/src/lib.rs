@@ -236,6 +236,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get company
     async fn get_company(&self, company_id: u64) -> Result<Company>;
 
+    /// Get base currency for a VM based on its region's company
+    async fn get_vm_base_currency(&self, vm_id: u64) -> Result<String>;
+
     /// Insert a new VM history record
     async fn insert_vm_history(&self, history: &VmHistory) -> Result<u64>;
 

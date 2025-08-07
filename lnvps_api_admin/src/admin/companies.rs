@@ -68,6 +68,24 @@ pub async fn admin_create_company(
     if req.name.trim().is_empty() {
         return ApiData::err("Company name is required");
     }
+    
+    // Validate base currency if provided, default to EUR
+    let base_currency = if let Some(currency) = &req.base_currency {
+        let currency = currency.trim().to_uppercase();
+        if currency.is_empty() {
+            "EUR".to_string()
+        } else {
+            // Validate currency by parsing it with the Currency enum
+            use lnvps_api_common::Currency;
+            match currency.parse::<Currency>() {
+                Ok(_) => {}, // Valid currency
+                Err(_) => return ApiData::err("Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC"),
+            }
+            currency
+        }
+    } else {
+        "EUR".to_string()
+    };
 
     // Create company object
     let company = Company {
@@ -83,6 +101,7 @@ pub async fn admin_create_company(
         postcode: req.postcode.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         phone: req.phone.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         email: req.email.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        base_currency,
     };
 
     let company_id = db.admin_create_company(&company).await?;
@@ -140,6 +159,20 @@ pub async fn admin_update_company(
     }
     if let Some(email) = &req.email {
         company.email = if email.trim().is_empty() { None } else { Some(email.trim().to_string()) };
+    }
+    if let Some(base_currency) = &req.base_currency {
+        let currency = base_currency.trim().to_uppercase();
+        if currency.is_empty() {
+            return ApiData::err("Base currency cannot be empty");
+        } else {
+            // Validate currency by parsing it with the Currency enum
+            use lnvps_api_common::Currency;
+            match currency.parse::<Currency>() {
+                Ok(_) => {}, // Valid currency
+                Err(_) => return ApiData::err("Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC"),
+            }
+            company.base_currency = currency;
+        }
     }
 
     // Update company in database

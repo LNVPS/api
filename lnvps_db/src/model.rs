@@ -501,8 +501,7 @@ pub struct VmPayment {
     /// External id on other system
     pub external_id: Option<String>,
     pub is_paid: bool,
-    /// TODO: handle other base currencies
-    /// Exchange rate back to base currency (EUR)
+    /// Exchange rate back to company's base currency
     pub rate: f32,
     /// Number of seconds this payment will add to vm expiry
     pub time_value: u64,
@@ -577,6 +576,7 @@ pub struct Company {
     pub postcode: Option<String>,
     pub phone: Option<String>,
     pub email: Option<String>,
+    pub base_currency: String,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -483,7 +483,7 @@ impl LNVpsProvisioner {
 
     /// Create a renewal payment
     pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
-        let pe = PricingEngine::new(self.db.clone(), self.rates.clone(), self.tax_rates.clone());
+        let pe = PricingEngine::new_for_vm(self.db.clone(), self.rates.clone(), self.tax_rates.clone(), vm_id).await?;
         let price = pe.get_vm_cost(vm_id, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -495,7 +495,7 @@ impl LNVpsProvisioner {
         amount: CurrencyAmount,
         method: PaymentMethod,
     ) -> Result<VmPayment> {
-        let pe = PricingEngine::new(self.db.clone(), self.rates.clone(), self.tax_rates.clone());
+        let pe = PricingEngine::new_for_vm(self.db.clone(), self.rates.clone(), self.tax_rates.clone(), vm_id).await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }

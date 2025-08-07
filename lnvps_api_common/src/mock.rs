@@ -50,7 +50,7 @@ impl MockDb {
             name: "mock".to_string(),
             created: Utc::now(),
             amount: 1.32,
-            currency: "EUR".to_string(),
+            currency: "EUR".to_string(), // This can be overridden based on company config
             interval_amount: 1,
             interval_type: VmCostPlanIntervalType::Month,
         }
@@ -102,7 +102,7 @@ impl Default for MockDb {
                 id: 1,
                 name: "Mock".to_string(),
                 enabled: true,
-                company_id: None,
+                company_id: Some(1), // Link to default company
             },
         );
         let mut ip_ranges = HashMap::new();
@@ -197,7 +197,25 @@ impl Default for MockDb {
             payments: Arc::new(Default::default()),
             router: Arc::new(Default::default()),
             access_policy: Arc::new(Default::default()),
-            companies: Arc::new(Default::default()),
+            companies: Arc::new(Mutex::new({
+                let mut companies = HashMap::new();
+                companies.insert(1, Company {
+                    id: 1,
+                    created: Utc::now(),
+                    name: "Default Company".to_string(),
+                    address_1: None,
+                    address_2: None,
+                    city: None,
+                    state: None,
+                    country_code: None,
+                    tax_id: None,
+                    postcode: None,
+                    phone: None,
+                    email: None,
+                    base_currency: "EUR".to_string(),
+                });
+                companies
+            })),
             vm_history: Arc::new(Default::default()),
         }
     }
@@ -773,6 +791,26 @@ impl LNVpsDbBase for MockDb {
             .get(&company_id)
             .cloned()
             .ok_or_else(|| anyhow!("Company with id {} not found", company_id))
+    }
+
+    async fn get_vm_base_currency(&self, vm_id: u64) -> anyhow::Result<String> {
+        // Follow VM -> Host -> Region -> Company chain
+        let vms = self.vms.lock().await;
+        let vm = vms.get(&vm_id).ok_or_else(|| anyhow!("VM not found"))?;
+        
+        let hosts = self.hosts.lock().await;
+        let host = hosts.get(&vm.host_id).ok_or_else(|| anyhow!("Host not found"))?;
+        
+        let regions = self.regions.lock().await;
+        let region = regions.get(&host.region_id).ok_or_else(|| anyhow!("Region not found"))?;
+        
+        if let Some(company_id) = region.company_id {
+            let companies = self.companies.lock().await;
+            let company = companies.get(&company_id).ok_or_else(|| anyhow!("Company not found"))?;
+            Ok(company.base_currency.clone())
+        } else {
+            Ok("EUR".to_string()) // Default fallback
+        }
     }
 
     async fn insert_vm_history(&self, history: &VmHistory) -> anyhow::Result<u64> {
