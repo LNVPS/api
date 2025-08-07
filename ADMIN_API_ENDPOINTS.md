@@ -1243,7 +1243,7 @@ Note: Routers that are used by access policies cannot be deleted. You must first
 
 #### Monthly Sales Report
 ```
-GET /admin/reports/monthly-sales/{year}/{month}
+GET /api/admin/v1/reports/monthly-sales/{year}/{month}
 ```
 Path Parameters:
 - `year`: number - Year (e.g., 2025)
@@ -1260,27 +1260,29 @@ Returns monthly sales report with sales data grouped by currency, including tax 
 Response:
 ```json
 {
-  "date": "2025-05-30",
-  "exchange_rate": {
-    "BTC_EUR": 92273.018191527,
-    "USD_EUR": 0.85
-  },
-  "items": [
-    {
-      "description": "LNVPS Sales",
-      "currency": "BTC", 
-      "qty": 1,
-      "rate": 0.00509358,
-      "tax": 21.0
+  "data": {
+    "date": "2025-05-30",
+    "exchange_rate": {
+      "BTC_EUR": 92273.018191527,
+      "USD_EUR": 0.85
     },
-    {
-      "description": "LNVPS Sales",
-      "currency": "USD", 
-      "qty": 1,
-      "rate": 150.75,
-      "tax": 19.5
-    }
-  ]
+    "items": [
+      {
+        "description": "LNVPS Sales",
+        "currency": "BTC", 
+        "qty": 1,
+        "rate": 0.00509358,
+        "tax": 21.0
+      },
+      {
+        "description": "LNVPS Sales",
+        "currency": "USD", 
+        "qty": 1,
+        "rate": 150.75,
+        "tax": 19.5
+      }
+    ]
+  }
 }
 ```
 

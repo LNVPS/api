@@ -1,8 +1,7 @@
 use crate::admin::auth::AdminAuth;
 use chrono::NaiveDate;
-use lnvps_api_common::{Currency, CurrencyAmount};
-use lnvps_db::LNVpsDb;
-use rocket::serde::json::Json;
+use lnvps_api_common::{ApiData, ApiResult, Currency, CurrencyAmount};
+use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::{get, State};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,23 +24,26 @@ pub struct SalesReport {
     items: Vec<SalesReportItem>,
 }
 
-#[get("/admin/reports/monthly-sales/<year>/<month>")]
+#[get("/api/admin/v1/reports/monthly-sales/<year>/<month>")]
 pub async fn admin_monthly_sales_report(
-    _auth: AdminAuth,
+    auth: AdminAuth,
     year: u32,
     month: u32,
     db: &State<Arc<dyn LNVpsDb>>,
-) -> Result<Json<SalesReport>, String> {
+) -> ApiResult<SalesReport> {
+    // Check permissions
+    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+    
     // Validate month
     if month < 1 || month > 12 {
-        return Err("Invalid month. Must be between 1 and 12.".to_string());
+        return Err(anyhow::anyhow!("Invalid month. Must be between 1 and 12.").into());
     }
     
     // Create date range for the month
     let start_date = NaiveDate::from_ymd_opt(year as i32, month, 1)
-        .ok_or("Invalid date")?
+        .ok_or_else(|| anyhow::anyhow!("Invalid date"))?
         .and_hms_opt(0, 0, 0)
-        .ok_or("Invalid time")?
+        .ok_or_else(|| anyhow::anyhow!("Invalid time"))?
         .and_utc();
     
     let end_date = if month == 12 {
@@ -49,15 +51,13 @@ pub async fn admin_monthly_sales_report(
     } else {
         NaiveDate::from_ymd_opt(year as i32, month + 1, 1)
     }
-    .ok_or("Invalid date")?
+    .ok_or_else(|| anyhow::anyhow!("Invalid date"))?
     .and_hms_opt(0, 0, 0)
-    .ok_or("Invalid time")?
+    .ok_or_else(|| anyhow::anyhow!("Invalid time"))?
     .and_utc();
 
     // Get all payments for the month
-    let payments = db.get_payments_by_date_range(start_date, end_date)
-        .await
-        .map_err(|e| format!("Database error: {}", e))?;
+    let payments = db.get_payments_by_date_range(start_date, end_date).await?;
 
     // Group payments by currency and calculate net totals and tax rates
     let mut currency_net_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
@@ -151,5 +151,5 @@ pub async fn admin_monthly_sales_report(
         items,
     };
 
-    Ok(Json(report))
+    ApiData::ok(report)
 }
