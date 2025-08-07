@@ -509,6 +509,33 @@ pub struct VmPayment {
     pub tax: u64,
 }
 
+/// VM Payment with company information for time-series reporting
+#[derive(FromRow, Clone, Debug)]
+pub struct VmPaymentWithCompany {
+    pub id: Vec<u8>,
+    pub vm_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    /// External data (invoice / json)
+    pub external_data: String,
+    /// External id on other system
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    /// Exchange rate back to company's base currency
+    pub rate: f32,
+    /// Number of seconds this payment will add to vm expiry
+    pub time_value: u64,
+    /// Taxes to charge on payment
+    pub tax: u64,
+    // Company information
+    pub company_id: u64,
+    pub company_name: String,
+    pub company_base_currency: String,
+}
+
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
 #[repr(u16)]
 pub enum PaymentMethod {

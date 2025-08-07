@@ -1,7 +1,7 @@
 use crate::{
     AccessPolicy, Company, IpRange, LNVpsDbBase, Router, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate, RegionStats,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate, RegionStats,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment};
@@ -1990,6 +1990,44 @@ impl AdminDb for LNVpsDbMysql {
         .fetch_all(&self.db)
         .await
         .map_err(Error::new)
+    }
+
+    async fn admin_get_payments_with_company_info(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64, currency: Option<&str>) -> Result<Vec<VmPaymentWithCompany>> {
+        match currency {
+            Some(currency) => {
+                sqlx::query_as(
+                    "SELECT vp.*, c.id as company_id, c.name as company_name, c.base_currency as company_base_currency
+                     FROM vm_payment vp
+                     JOIN vm v ON vp.vm_id = v.id
+                     JOIN vm_host vh ON v.host_id = vh.id
+                     JOIN vm_host_region vhr ON vh.region_id = vhr.id
+                     JOIN company c ON vhr.company_id = c.id
+                     WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND c.id = ? AND vp.currency = ?
+                     ORDER BY vp.created"
+                )
+                .bind(start_date)
+                .bind(end_date)
+                .bind(company_id)
+                .bind(currency)
+                .fetch_all(&self.db).await.map_err(Error::new)
+            },
+            None => {
+                sqlx::query_as(
+                    "SELECT vp.*, c.id as company_id, c.name as company_name, c.base_currency as company_base_currency
+                     FROM vm_payment vp
+                     JOIN vm v ON vp.vm_id = v.id
+                     JOIN vm_host vh ON v.host_id = vh.id
+                     JOIN vm_host_region vhr ON vh.region_id = vhr.id
+                     JOIN company c ON vhr.company_id = c.id
+                     WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND c.id = ?
+                     ORDER BY vp.created"
+                )
+                .bind(start_date)
+                .bind(end_date)
+                .bind(company_id)
+                .fetch_all(&self.db).await.map_err(Error::new)
+            }
+        }
     }
 
     async fn admin_list_ip_ranges(&self, limit: u64, offset: u64, region_id: Option<u64>) -> Result<(Vec<IpRange>, u64)> {

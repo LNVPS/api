@@ -5,7 +5,7 @@ use lnvps_db::{
     async_trait, AccessPolicy, AdminDb, AdminRole, AdminRoleAssignment, AdminUserInfo, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
     LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, RegionStats, Router, User, UserSshKey, Vm,
     VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany,
     VmTemplate,
 };
 use lnvps_db::nostr::LNVPSNostrDb;
@@ -1074,6 +1074,70 @@ impl AdminDb for MockDb {
             .cloned()
             .collect())
     }
+
+    async fn admin_get_payments_with_company_info(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64, currency: Option<&str>) -> anyhow::Result<Vec<VmPaymentWithCompany>> {
+        let p = self.payments.lock().await;
+        let vms = self.vms.lock().await;
+        let hosts = self.hosts.lock().await;
+        let regions = self.regions.lock().await;
+        let companies = self.companies.lock().await;
+        
+        let mut result = Vec::new();
+        
+        for payment in p.iter() {
+            if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
+                continue;
+            }
+            
+            // Filter by currency if specified
+            if let Some(filter_currency) = currency {
+                if payment.currency != filter_currency {
+                    continue;
+                }
+            }
+            
+            // Follow VM -> Host -> Region -> Company chain
+            if let Some(vm) = vms.get(&payment.vm_id) {
+                if let Some(host) = hosts.get(&vm.host_id) {
+                    if let Some(region) = regions.get(&host.region_id) {
+                        if let Some(region_company_id) = region.company_id {
+                            // Filter by company (always required)
+                            if region_company_id != company_id {
+                                continue;
+                            }
+                            
+                            if let Some(company) = companies.get(&region_company_id) {
+                                result.push(VmPaymentWithCompany {
+                                    id: payment.id.clone(),
+                                    vm_id: payment.vm_id,
+                                    created: payment.created,
+                                    expires: payment.expires,
+                                    amount: payment.amount,
+                                    currency: payment.currency.clone(),
+                                    payment_method: payment.payment_method,
+                                    external_data: payment.external_data.clone(),
+                                    external_id: payment.external_id.clone(),
+                                    is_paid: payment.is_paid,
+                                    rate: payment.rate,
+                                    time_value: payment.time_value,
+                                    tax: payment.tax,
+                                    company_id: region_company_id,
+                                    company_name: company.name.clone(),
+                                    company_base_currency: company.base_currency.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort by created timestamp
+        result.sort_by(|a, b| a.created.cmp(&b.created));
+        
+        Ok(result)
+    }
+
     async fn admin_list_ip_ranges(&self, _limit: u64, _offset: u64, _region_id: Option<u64>) -> anyhow::Result<(Vec<IpRange>, u64)> { Ok((vec![], 0)) }
     async fn admin_get_ip_range(&self, ip_range_id: u64) -> anyhow::Result<IpRange> { self.get_ip_range(ip_range_id).await }
     async fn admin_create_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<u64> { Ok(1) }

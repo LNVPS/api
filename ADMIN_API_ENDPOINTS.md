@@ -1326,6 +1326,158 @@ Exchange rates are calculated to ensure mathematical consistency: the exchange r
 
 In this example, the company's base currency is USD, so exchange rates are shown as `{currency}_{base_currency}` format (e.g., `BTC_USD`, `EUR_USD`).
 
+#### Time Series Report
+```
+GET /api/admin/v1/reports/time-series?start_date={date}&end_date={date}&interval={interval}&company_id={company_id}&currency={currency}
+```
+Query Parameters:
+- `start_date`: string (required) - Start date in YYYY-MM-DD format (e.g., "2025-01-01")
+- `end_date`: string (required) - End date in YYYY-MM-DD format (e.g., "2025-12-31")
+- `interval`: string (required) - Time interval for data aggregation: "daily", "weekly", "monthly", "quarterly", "yearly"
+- `company_id`: number (required) - Company ID to generate report for
+- `currency`: string (optional) - Filter by specific currency (EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC)
+
+Required Permission: `analytics::view`
+
+Returns time-series payment data for a specific company with optional currency filtering. This endpoint provides both period-based aggregated summaries and individual payment records with time period grouping, enabling comprehensive analysis and reporting.
+
+**Key Features:**
+- **Company-Specific Reports**: Always scoped to a specific company for focused analysis
+- **Period Aggregation**: Server-side aggregation by time period and currency with totals
+- **Raw Payment Data**: Individual payment records for detailed drill-down analysis
+- **Optimized Database Query**: Single SQL join with efficient company filtering
+- **Flexible Time Intervals**: Automatic period calculation for daily, weekly, monthly, quarterly, and yearly intervals
+- **Optional Currency Filtering**: Filter by specific currency within the company's payments
+- **Company Context**: Each payment includes company information and base currency
+- **Dual Analysis**: Both aggregated summaries and raw data for flexible client-side use
+
+**Response:**
+```json
+{
+  "data": {
+    "start_date": "2025-01-01",
+    "end_date": "2025-12-31", 
+    "interval": "monthly",
+    "company_id": 1,
+    "company_name": "Acme Corp",
+    "company_base_currency": "USD",
+    "period_summaries": [
+      {
+        "period": "2025-01",
+        "currency": "USD",
+        "payment_count": 25,
+        "net_total": 3125000,
+        "tax_total": 656250,
+        "gross_total": 3781250
+      },
+      {
+        "period": "2025-01", 
+        "currency": "BTC",
+        "payment_count": 8,
+        "net_total": 1000,
+        "tax_total": 208,
+        "gross_total": 1208
+      }
+    ],
+    "payments": [
+      {
+        "id": "a1b2c3d4e5f6...",
+        "vm_id": 123,
+        "created": "2025-01-15T10:30:45Z",
+        "expires": "2025-02-15T10:30:45Z",
+        "amount": 125000,
+        "currency": "USD",
+        "payment_method": "lightning",
+        "external_id": "inv_12345",
+        "is_paid": true,
+        "rate": 1.0,
+        "time_value": 2592000,
+        "tax": 26250,
+        "company_id": 1,
+        "company_name": "Acme Corp",
+        "company_base_currency": "USD",
+        "period": "2025-01"
+      },
+      {
+        "id": "b2c3d4e5f6a1...",
+        "vm_id": 456,
+        "created": "2025-01-20T14:22:31Z",
+        "expires": "2025-02-20T14:22:31Z",
+        "amount": 125,
+        "currency": "BTC",
+        "payment_method": "lightning",
+        "external_id": "inv_67890",
+        "is_paid": true,
+        "rate": 100000.0,
+        "time_value": 2592000,
+        "tax": 26,
+        "company_id": 1,
+        "company_name": "Acme Corp",
+        "company_base_currency": "USD",
+        "period": "2025-01"
+      }
+    ]
+  }
+}
+```
+
+**Time Interval Formats:**
+- **Daily**: `"2025-01-15"` - Individual days
+- **Weekly**: `"2025-01-13"` - Monday of each week (ISO week starting Monday)
+- **Monthly**: `"2025-01"` - Year and month
+- **Quarterly**: `"2025-Q1"` - Year and quarter
+- **Yearly**: `"2025"` - Year only
+
+**Payment Record Structure:**
+Each payment record includes complete payment information with company context:
+
+- `id`: Hex-encoded payment identifier
+- `vm_id`: Associated virtual machine ID
+- `created` / `expires`: ISO 8601 timestamps
+- `amount`: Payment amount in smallest currency unit (cents, satoshis, etc.)
+- `currency`: Payment currency code
+- `payment_method`: Payment method used ("lightning", "revolut", "paypal")
+- `external_id`: External payment system identifier  
+- `is_paid`: Payment completion status
+- `rate`: Exchange rate to company's base currency
+- `time_value`: VM expiry extension in seconds
+- `tax`: Tax amount in smallest currency unit
+- `company_id` / `company_name`: Company identification and name
+- `company_base_currency`: Company's configured base currency
+- `period`: Calculated time period based on selected interval
+
+**Benefits of Company-Scoped Approach:**
+- **Simplified Database Query**: Always filters by company for optimal performance
+- **Focused Analysis**: Company-specific data reduces complexity and improves clarity
+- **Efficient Indexing**: Database can optimize queries with consistent company filtering
+- **Security**: Natural data isolation by company boundary
+- **Scalability**: Better query performance as data grows
+
+**Period Summaries Structure:**
+Each period summary aggregates payments by time period and currency:
+- `period`: Time period identifier based on selected interval (e.g., "2025-01", "2025-Q1", "2025-01-15")
+- `currency`: Currency code for this aggregation group 
+- `payment_count`: Number of individual payments in this period/currency combination
+- `net_total`: Sum of payment amounts (excluding tax) in smallest currency unit
+- `tax_total`: Sum of tax amounts in smallest currency unit
+- `gross_total`: Sum of net + tax amounts (total payment value) in smallest currency unit
+
+**Benefits of Dual Data Approach:**
+- **Performance**: Single optimized database query with efficient aggregation
+- **Flexibility**: Both aggregated summaries for dashboards and raw data for detailed analysis
+- **Comprehensive**: Period-based totals for trending with individual records for drill-down
+- **Scalable**: Server-side aggregation reduces client-side processing for large datasets
+- **Custom Analysis**: UI can still perform additional aggregations using raw payment data
+
+**Use Cases:**
+- **Revenue Dashboards**: Use period_summaries for charts and KPIs showing revenue trends over time
+- **Multi-currency Analysis**: Compare performance across different payment currencies using aggregated totals
+- **Seasonal Analysis**: Identify payment patterns using period summaries grouped by time intervals
+- **Detailed Investigations**: Drill down from period summaries into individual payments for investigation
+- **Financial Reporting**: Generate summary reports from period_summaries with ability to validate using raw payment data
+- **Payment Method Analysis**: Use raw payment data to analyze preferred payment methods by time period
+- **Custom Aggregations**: Combine period_summaries with custom groupings from raw payment data
+
 ## Error Responses
 
 All error responses follow the format:
