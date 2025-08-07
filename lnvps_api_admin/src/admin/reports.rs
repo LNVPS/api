@@ -58,18 +58,20 @@ pub async fn admin_monthly_sales_report(
     // Get all payments for the month
     let payments = db.get_payments_by_date_range(start_date, end_date).await?;
 
-    // Group payments by currency and calculate net and tax totals
+    // Group payments by currency and calculate totals
     let mut currency_net_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
     let mut currency_tax_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
-    let mut currency_rates: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut currency_gross_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
+    let mut currency_eur_equivalents: HashMap<Currency, f64> = HashMap::new();
     let mut exchange_rates = HashMap::new();
     
     for payment in &payments {
         // Parse currency using the existing system
         if let Ok(currency) = Currency::from_str(&payment.currency) {
-            // Create CurrencyAmount for tax and net amount
+            // Create CurrencyAmount for tax, net, and gross amounts
             let tax_amount = CurrencyAmount::from_u64(currency, payment.tax);
-            let net_amount = CurrencyAmount::from_u64(currency, payment.amount.saturating_sub(payment.tax));
+            let net_amount = CurrencyAmount::from_u64(currency, payment.amount); // payment.amount is already net
+            let gross_amount = CurrencyAmount::from_u64(currency, payment.amount + payment.tax);
             
             // Accumulate totals by currency
             currency_tax_totals.insert(
@@ -86,18 +88,29 @@ pub async fn admin_monthly_sales_report(
                     .unwrap_or(net_amount)
             );
             
-            // Collect rates for averaging (only for non-EUR currencies)
+            currency_gross_totals.insert(
+                currency,
+                currency_gross_totals.get(&currency)
+                    .map(|existing| CurrencyAmount::from_u64(currency, existing.value() + gross_amount.value()))
+                    .unwrap_or(gross_amount)
+            );
+            
+            // Calculate EUR equivalent for this payment (gross_amount * rate)
             if currency != Currency::EUR {
-                currency_rates.entry(format!("{}_EUR", currency)).or_insert_with(Vec::new).push(payment.rate);
+                let eur_equivalent = gross_amount.value_f32() * payment.rate;
+                *currency_eur_equivalents.entry(currency).or_insert(0.0) += eur_equivalent as f64;
             }
         }
     }
 
-    // Calculate average exchange rates for each currency
-    for (rate_key, rates) in currency_rates {
-        if !rates.is_empty() {
-            let average_rate = rates.iter().sum::<f32>() / rates.len() as f32;
-            exchange_rates.insert(rate_key, average_rate as f64);
+    // Calculate correct exchange rates that ensure (net + tax) * rate = total_eur_equivalent
+    for (currency, eur_total) in currency_eur_equivalents {
+        if let Some(gross_total) = currency_gross_totals.get(&currency) {
+            let gross_amount = gross_total.value_f32() as f64;
+            if gross_amount > 0.0 {
+                let calculated_rate = eur_total / gross_amount;
+                exchange_rates.insert(format!("{}_EUR", currency), calculated_rate);
+            }
         }
     }
 

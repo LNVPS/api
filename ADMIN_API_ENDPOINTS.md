@@ -1253,7 +1253,7 @@ Required Permission: `analytics::view`
 
 Returns monthly sales report with sales data grouped by currency, with separate line items for sales and taxes. The report includes:
 - Report date (last day of the specified month)
-- Exchange rates to EUR from payment records (averaged for the month)
+- Exchange rates to EUR calculated to ensure mathematical consistency
 - Separate line items for net sales and tax collected per currency
 
 Response:
@@ -1298,7 +1298,8 @@ Response:
 The endpoint includes all paid payments for the specified month, grouped by currency. Each currency generates up to two line items:
 - **LNVPS Sales**: Net amount (excluding taxes) for that currency
 - **Tax Collected**: Total tax collected for that currency
-- Exchange rates are averaged from all payment records for each currency (EUR payments don't need exchange rates as EUR is the base currency)
+
+Exchange rates are calculated to ensure mathematical consistency: the exchange rate is derived so that `(net_amount + tax_amount) * exchange_rate` equals the total EUR equivalent from all payments in that currency. EUR payments don't need exchange rates as EUR is the base currency.
 
 ## Error Responses
 
