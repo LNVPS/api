@@ -694,6 +694,14 @@ impl LNVpsDbBase for MockDb {
             .max_by(|a, b| a.created.cmp(&b.created)).cloned())
     }
 
+    async fn get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Vec<VmPayment>> {
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
+            .cloned()
+            .collect())
+    }
+
     async fn list_custom_pricing(&self, region_id: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().filter(|p| p.enabled).cloned().collect())

@@ -48,6 +48,7 @@ use crate::admin::vms::{
     admin_delete_vm, admin_get_vm, admin_list_vms, admin_start_vm, admin_stop_vm,
     admin_list_vm_history, admin_get_vm_history, admin_list_vm_payments, admin_get_vm_payment,
 };
+use crate::admin::reports::{admin_monthly_sales_report};
 use rocket::{routes, Route};
 
 pub mod access_policies;
@@ -59,6 +60,7 @@ pub mod hosts;
 pub mod ip_ranges;
 pub mod model;
 pub mod regions;
+pub mod reports;
 pub mod roles;
 pub mod routers;
 pub mod users;
@@ -158,5 +160,7 @@ pub fn admin_routes() -> Vec<Route> {
         admin_create_router,
         admin_update_router,
         admin_delete_router,
+        // Reports
+        admin_monthly_sales_report,
     ]
 }

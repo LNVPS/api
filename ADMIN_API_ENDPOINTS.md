@@ -1239,6 +1239,55 @@ Required Permission: `router::delete`
 
 Note: Routers that are used by access policies cannot be deleted. You must first remove the router from all access policies before deleting it.
 
+### Reports
+
+#### Monthly Sales Report
+```
+GET /admin/reports/monthly-sales/{year}/{month}
+```
+Path Parameters:
+- `year`: number - Year (e.g., 2025)
+- `month`: number - Month (1-12)
+
+Required Permission: `analytics::view`
+
+Returns monthly sales report with sales data grouped by currency, including tax handling. The report includes:
+- Report date (last day of the specified month)
+- Exchange rates to EUR from payment records (averaged for the month)
+- Sales items with one line per currency used in payments
+- Net amounts (excluding taxes) and tax rates as percentages
+
+Response:
+```json
+{
+  "date": "2025-05-30",
+  "exchange_rate": {
+    "BTC_EUR": 92273.018191527,
+    "USD_EUR": 0.85
+  },
+  "items": [
+    {
+      "description": "LNVPS Sales",
+      "currency": "BTC", 
+      "qty": 1,
+      "rate": 0.00509358,
+      "tax": 21.0
+    },
+    {
+      "description": "LNVPS Sales",
+      "currency": "USD", 
+      "qty": 1,
+      "rate": 150.75,
+      "tax": 19.5
+    }
+  ]
+}
+```
+
+The endpoint includes all paid payments for the specified month, grouped by currency. Each currency gets its own line item with:
+- `rate`: Net amount (excluding taxes) for that currency
+- `tax`: Weighted average tax rate as a percentage (e.g., 21.0 = 21%)
+- Exchange rates are averaged from all payment records for each currency (EUR payments don't need exchange rates as EUR is the base currency)
 
 ## Error Responses
 

@@ -9,6 +9,7 @@ use crate::{AdminDb, AdminRole, AdminRoleAssignment};
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::{Executor, MySqlPool, Row};
 
 #[derive(Clone)]
@@ -696,6 +697,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "select * from vm_payment where is_paid = true order by created desc limit 1",
         )
         .fetch_optional(&self.db)
+        .await
+        .map_err(Error::new)
+    }
+
+    async fn get_payments_by_date_range(&self, start_date: DateTime<Utc>, end_date: DateTime<Utc>) -> Result<Vec<VmPayment>> {
+        sqlx::query_as(
+            "select * from vm_payment where created >= ? and created < ? and is_paid = true order by created",
+        )
+        .bind(start_date)
+        .bind(end_date)
+        .fetch_all(&self.db)
         .await
         .map_err(Error::new)
     }
