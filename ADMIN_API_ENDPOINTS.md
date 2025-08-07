@@ -1403,8 +1403,9 @@ Each period summary aggregates payments by time period and currency:
 
 **Currency Conversion Logic:**
 The `base_currency_net` and `base_currency_tax` calculations properly handle different currency types:
-- BTC amounts are converted from millisatoshis to full decimal BTC before multiplying by exchange rate
-- Fiat amounts are converted from cents to full decimal amount before multiplying by exchange rate  
+- **Same Currency**: When payment currency matches company base currency, original amounts are used directly (no conversion needed)
+- **Different Currency**: BTC amounts are converted from millisatoshis to full decimal BTC before multiplying by exchange rate
+- **Different Currency**: Fiat amounts are converted from cents to full decimal amount before multiplying by exchange rate  
 - Results are converted back to the base currency's smallest unit (cents for fiat, millisatoshis for BTC)
 - Net and tax amounts are converted separately to maintain precision and allow for independent analysis
 

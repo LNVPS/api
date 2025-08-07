@@ -137,15 +137,22 @@ pub async fn admin_time_series_report(
         let base_currency = Currency::from_str(&payment.company_base_currency)
             .map_err(|_| anyhow::anyhow!("Invalid base currency: {}", payment.company_base_currency))?;
         
-        // Convert net amount to base currency
-        let net_amount_decimal = CurrencyAmount::from_u64(payment_currency, payment.amount);
-        let base_net_decimal = net_amount_decimal.value_f32() * payment.rate;
-        let base_currency_net = CurrencyAmount::from_f32(base_currency, base_net_decimal).value();
-        
-        // Convert tax amount to base currency
-        let tax_amount_decimal = CurrencyAmount::from_u64(payment_currency, payment.tax);
-        let base_tax_decimal = tax_amount_decimal.value_f32() * payment.rate;
-        let base_currency_tax = CurrencyAmount::from_f32(base_currency, base_tax_decimal).value();
+        let (base_currency_net, base_currency_tax) = if payment_currency == base_currency {
+            // No conversion needed - use original amounts
+            (payment.amount, payment.tax)
+        } else {
+            // Convert net amount to base currency
+            let net_amount_decimal = CurrencyAmount::from_u64(payment_currency, payment.amount);
+            let base_net_decimal = net_amount_decimal.value_f32() * payment.rate;
+            let base_currency_net = CurrencyAmount::from_f32(base_currency, base_net_decimal).value();
+            
+            // Convert tax amount to base currency
+            let tax_amount_decimal = CurrencyAmount::from_u64(payment_currency, payment.tax);
+            let base_tax_decimal = tax_amount_decimal.value_f32() * payment.rate;
+            let base_currency_tax = CurrencyAmount::from_f32(base_currency, base_tax_decimal).value();
+            
+            (base_currency_net, base_currency_tax)
+        };
         
         // Aggregate by period and currency
         let key = (period_str.clone(), payment.currency.clone());
