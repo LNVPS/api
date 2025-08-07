@@ -167,6 +167,12 @@ pub trait AdminDb: Send + Sync {
     /// Count regions assigned to a company
     async fn admin_count_company_regions(&self, company_id: u64) -> Result<u64>;
 
+    /// Get payments within a date range (admin only)
+    async fn admin_get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> Result<Vec<crate::VmPayment>>;
+
+    /// Get payments within a date range for a specific company (admin only)
+    async fn admin_get_payments_by_date_range_and_company(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64) -> Result<Vec<crate::VmPayment>>;
+
     // IP Range management methods
     /// List all IP ranges with pagination
     async fn admin_list_ip_ranges(&self, limit: u64, offset: u64, region_id: Option<u64>) -> Result<(Vec<crate::IpRange>, u64)>;

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 #[cfg(feature = "admin")]
 mod admin;
 mod model;
@@ -202,8 +201,6 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Return the most recently settled invoice
     async fn last_paid_invoice(&self) -> Result<Option<VmPayment>>;
 
-    /// Get payments within a date range
-    async fn get_payments_by_date_range(&self, start_date: DateTime<Utc>, end_date: DateTime<Utc>) -> Result<Vec<VmPayment>>;
 
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>>;

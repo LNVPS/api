@@ -701,16 +701,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .map_err(Error::new)
     }
 
-    async fn get_payments_by_date_range(&self, start_date: DateTime<Utc>, end_date: DateTime<Utc>) -> Result<Vec<VmPayment>> {
-        sqlx::query_as(
-            "select * from vm_payment where created >= ? and created < ? and is_paid = true order by created",
-        )
-        .bind(start_date)
-        .bind(end_date)
-        .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
-    }
 
     async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>> {
         sqlx::query_as("select * from vm_custom_pricing where region_id = ? and enabled = 1")
@@ -1972,6 +1962,34 @@ impl AdminDb for LNVpsDbMysql {
         .map_err(Error::new)?;
 
         Ok(count as u64)
+    }
+
+    async fn admin_get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> Result<Vec<VmPayment>> {
+        sqlx::query_as(
+            "SELECT * FROM vm_payment WHERE created >= ? AND created < ? AND is_paid = true ORDER BY created",
+        )
+        .bind(start_date)
+        .bind(end_date)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::new)
+    }
+
+    async fn admin_get_payments_by_date_range_and_company(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64) -> Result<Vec<VmPayment>> {
+        sqlx::query_as(
+            "SELECT vp.* FROM vm_payment vp
+             JOIN vm v ON vp.vm_id = v.id
+             JOIN vm_host vh ON v.host_id = vh.id
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND vhr.company_id = ?
+             ORDER BY vp.created",
+        )
+        .bind(start_date)
+        .bind(end_date)
+        .bind(company_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::new)
     }
 
     async fn admin_list_ip_ranges(&self, limit: u64, offset: u64, region_id: Option<u64>) -> Result<(Vec<IpRange>, u64)> {

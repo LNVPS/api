@@ -712,13 +712,6 @@ impl LNVpsDbBase for MockDb {
             .max_by(|a, b| a.created.cmp(&b.created)).cloned())
     }
 
-    async fn get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
-            .cloned()
-            .collect())
-    }
 
     async fn list_custom_pricing(&self, region_id: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
@@ -1047,6 +1040,40 @@ impl AdminDb for MockDb {
     async fn admin_update_company(&self, _company: &Company) -> anyhow::Result<()> { Ok(()) }
     async fn admin_delete_company(&self, _company_id: u64) -> anyhow::Result<()> { Ok(()) }
     async fn admin_count_company_regions(&self, _company_id: u64) -> anyhow::Result<u64> { Ok(0) }
+    
+    async fn admin_get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Vec<VmPayment>> {
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
+            .cloned()
+            .collect())
+    }
+
+    async fn admin_get_payments_by_date_range_and_company(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64) -> anyhow::Result<Vec<VmPayment>> {
+        let p = self.payments.lock().await;
+        let vms = self.vms.lock().await;
+        let hosts = self.hosts.lock().await;
+        let regions = self.regions.lock().await;
+        
+        Ok(p.iter()
+            .filter(|payment| {
+                if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
+                    return false;
+                }
+                
+                // Follow VM -> Host -> Region -> Company chain
+                if let Some(vm) = vms.get(&payment.vm_id) {
+                    if let Some(host) = hosts.get(&vm.host_id) {
+                        if let Some(region) = regions.get(&host.region_id) {
+                            return region.company_id == Some(company_id);
+                        }
+                    }
+                }
+                false
+            })
+            .cloned()
+            .collect())
+    }
     async fn admin_list_ip_ranges(&self, _limit: u64, _offset: u64, _region_id: Option<u64>) -> anyhow::Result<(Vec<IpRange>, u64)> { Ok((vec![], 0)) }
     async fn admin_get_ip_range(&self, ip_range_id: u64) -> anyhow::Result<IpRange> { self.get_ip_range(ip_range_id).await }
     async fn admin_create_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<u64> { Ok(1) }

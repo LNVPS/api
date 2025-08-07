@@ -23,11 +23,12 @@ pub struct SalesReport {
     items: Vec<SalesReportItem>,
 }
 
-#[get("/api/admin/v1/reports/monthly-sales/<year>/<month>")]
+#[get("/api/admin/v1/reports/monthly-sales/<year>/<month>/<company_id>")]
 pub async fn admin_monthly_sales_report(
     auth: AdminAuth,
     year: u32,
     month: u32,
+    company_id: u64,
     db: &State<Arc<dyn LNVpsDb>>,
 ) -> ApiResult<SalesReport> {
     // Check permissions
@@ -37,6 +38,11 @@ pub async fn admin_monthly_sales_report(
     if month < 1 || month > 12 {
         return Err(anyhow::anyhow!("Invalid month. Must be between 1 and 12.").into());
     }
+
+    // Get company and its base currency
+    let company = db.get_company(company_id).await?;
+    let base_currency: Currency = company.base_currency.parse()
+        .map_err(|_| anyhow::anyhow!("Invalid base currency: {}", company.base_currency))?;
     
     // Create date range for the month
     let start_date = NaiveDate::from_ymd_opt(year as i32, month, 1)
@@ -55,14 +61,14 @@ pub async fn admin_monthly_sales_report(
     .ok_or_else(|| anyhow::anyhow!("Invalid time"))?
     .and_utc();
 
-    // Get all payments for the month
-    let payments = db.get_payments_by_date_range(start_date, end_date).await?;
+    // Get all payments for the month for this company
+    let payments = db.admin_get_payments_by_date_range_and_company(start_date, end_date, company_id).await?;
 
     // Group payments by currency and calculate totals
     let mut currency_net_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
     let mut currency_tax_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
     let mut currency_gross_totals: HashMap<Currency, CurrencyAmount> = HashMap::new();
-    let mut currency_eur_equivalents: HashMap<Currency, f64> = HashMap::new();
+    let mut currency_base_equivalents: HashMap<Currency, f64> = HashMap::new();
     let mut exchange_rates = HashMap::new();
     
     for payment in &payments {
@@ -95,21 +101,21 @@ pub async fn admin_monthly_sales_report(
                     .unwrap_or(gross_amount)
             );
             
-            // Calculate EUR equivalent for this payment (gross_amount * rate)
-            if currency != Currency::EUR {
-                let eur_equivalent = gross_amount.value_f32() * payment.rate;
-                *currency_eur_equivalents.entry(currency).or_insert(0.0) += eur_equivalent as f64;
+            // Calculate base currency equivalent for this payment (gross_amount * rate)
+            if currency != base_currency {
+                let base_equivalent = gross_amount.value_f32() * payment.rate;
+                *currency_base_equivalents.entry(currency).or_insert(0.0) += base_equivalent as f64;
             }
         }
     }
 
-    // Calculate correct exchange rates that ensure (net + tax) * rate = total_eur_equivalent
-    for (currency, eur_total) in currency_eur_equivalents {
+    // Calculate correct exchange rates that ensure (net + tax) * rate = total_base_equivalent
+    for (currency, base_total) in currency_base_equivalents {
         if let Some(gross_total) = currency_gross_totals.get(&currency) {
             let gross_amount = gross_total.value_f32() as f64;
             if gross_amount > 0.0 {
-                let calculated_rate = eur_total / gross_amount;
-                exchange_rates.insert(format!("{}_EUR", currency), calculated_rate);
+                let calculated_rate = base_total / gross_amount;
+                exchange_rates.insert(format!("{}_{}", currency, base_currency), calculated_rate);
             }
         }
     }

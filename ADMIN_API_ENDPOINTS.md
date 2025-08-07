@@ -8,6 +8,21 @@ This document lists all available endpoints in the LNVPS Admin API.
 
 This provides better API documentation, IDE auto-completion, and prevents runtime errors from invalid string values.
 
+## Currency Support
+
+The system supports company-based base currencies. Each company can have its own base currency which is used for pricing calculations and reports. Supported currencies include:
+
+- **EUR**: Euro
+- **USD**: US Dollar  
+- **GBP**: British Pound
+- **CAD**: Canadian Dollar
+- **CHF**: Swiss Franc
+- **AUD**: Australian Dollar
+- **JPY**: Japanese Yen
+- **BTC**: Bitcoin
+
+All financial reports and pricing calculations will use the company's configured base currency. Exchange rates are automatically calculated to ensure mathematical consistency across different payment currencies.
+
 ## Enum Types Reference
 
 All enum types used in this API are listed below with their possible values:
@@ -1004,11 +1019,14 @@ Body:
   "state": "string | null",              // Optional - State/province
   "country_code": "string | null",       // Optional - Country code
   "tax_id": "string | null",             // Optional - Tax identification number
+  "base_currency": "string",             // Required - Base currency code (EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC)
   "postcode": "string | null",           // Optional - Postal/ZIP code
   "phone": "string | null",              // Optional - Phone number
   "email": "string | null"               // Optional - Contact email
 }
 ```
+
+The `base_currency` field is validated against the supported Currency enum values. Invalid currency codes will be rejected with an error message listing valid currencies.
 
 #### Update Company
 ```
@@ -1026,11 +1044,14 @@ Body (all optional):
   "state": "string | null",              // State/province
   "country_code": "string | null",       // Country code
   "tax_id": "string | null",             // Tax identification number
+  "base_currency": "string",             // Base currency code (EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC)
   "postcode": "string | null",           // Postal/ZIP code
   "phone": "string | null",              // Phone number
   "email": "string | null"               // Contact email
 }
 ```
+
+The `base_currency` field is validated against the supported Currency enum values.
 
 Note: Empty strings are treated as null values (clearing the field).
 
@@ -1243,18 +1264,20 @@ Note: Routers that are used by access policies cannot be deleted. You must first
 
 #### Monthly Sales Report
 ```
-GET /api/admin/v1/reports/monthly-sales/{year}/{month}
+GET /api/admin/v1/reports/monthly-sales/{year}/{month}/{company_id}
 ```
 Path Parameters:
 - `year`: number - Year (e.g., 2025)
 - `month`: number - Month (1-12)
+- `company_id`: number - Company ID to generate report for
 
 Required Permission: `analytics::view`
 
-Returns monthly sales report with sales data grouped by currency, with separate line items for sales and taxes. The report includes:
+Returns monthly sales report for a specific company with sales data grouped by currency, with separate line items for sales and taxes. The report includes:
 - Report date (last day of the specified month)
-- Exchange rates to EUR calculated to ensure mathematical consistency
+- Exchange rates to the company's base currency calculated to ensure mathematical consistency
 - Separate line items for net sales and tax collected per currency
+- Only includes payments from VMs in regions owned by the specified company
 
 Response:
 ```json
@@ -1262,8 +1285,8 @@ Response:
   "data": {
     "date": "2025-05-30",
     "exchange_rate": {
-      "BTC_EUR": 92273.018191527,
-      "USD_EUR": 0.85
+      "BTC_USD": 92273.018191527,
+      "EUR_USD": 1.18
     },
     "items": [
       {
@@ -1280,13 +1303,13 @@ Response:
       },
       {
         "description": "LNVPS Sales",
-        "currency": "USD", 
+        "currency": "EUR", 
         "qty": 1,
         "rate": 150.75
       },
       {
         "description": "Tax Collected",
-        "currency": "USD", 
+        "currency": "EUR", 
         "qty": 1,
         "rate": 31.66
       }
@@ -1295,11 +1318,13 @@ Response:
 }
 ```
 
-The endpoint includes all paid payments for the specified month, grouped by currency. Each currency generates up to two line items:
+The endpoint includes all paid payments for the specified company and month, grouped by currency. Each currency generates up to two line items:
 - **LNVPS Sales**: Net amount (excluding taxes) for that currency
 - **Tax Collected**: Total tax collected for that currency
 
-Exchange rates are calculated to ensure mathematical consistency: the exchange rate is derived so that `(net_amount + tax_amount) * exchange_rate` equals the total EUR equivalent from all payments in that currency. EUR payments don't need exchange rates as EUR is the base currency.
+Exchange rates are calculated to ensure mathematical consistency: the exchange rate is derived so that `(net_amount + tax_amount) * exchange_rate` equals the total base currency equivalent from all payments in that currency. Payments in the company's base currency don't need exchange rates as they are already in the correct currency.
+
+In this example, the company's base currency is USD, so exchange rates are shown as `{currency}_{base_currency}` format (e.g., `BTC_USD`, `EUR_USD`).
 
 ## Error Responses
 
@@ -1699,6 +1724,7 @@ The RBAC system uses the following permission format: `resource::action`
   "state": "string | null",
   "country_code": "string | null",
   "tax_id": "string | null",
+  "base_currency": "string",           // Company's base currency (EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC)
   "postcode": "string | null",
   "phone": "string | null",
   "email": "string | null",
