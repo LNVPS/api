@@ -276,7 +276,14 @@ impl PricingEngine {
                 (Currency::BTC, new_price.0, new_price.1)
             }
             (cur, PaymentMethod::Revolut) if cur != Currency::BTC => {
-                (cur, list_price.value(), 0.01)
+                // Check if the currency matches the company's base currency
+                let rate = if cur == self.base_currency {
+                    1.0  // No conversion needed
+                } else {
+                    // TODO: Get actual exchange rate from rates service
+                    1.0  // Placeholder - should use actual exchange rate
+                };
+                (cur, list_price.value(), rate)
             }
             (c, m) => bail!("Cannot create payment for method {} and currency {}", m, c),
         })
