@@ -8,7 +8,6 @@ use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::vm_history::VmHistoryLogger;
-use crate::worker::WorkJob;
 use crate::{Currency, CurrencyAmount};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Utc};
@@ -17,7 +16,10 @@ use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::Tag;
-use lnvps_api_common::{ApiData, ApiResult, ExchangeRateService, Nip98Auth, VmState as CommonVmState, VmStateCache};
+use lnvps_api_common::{
+    ApiData, ApiResult, ExchangeRateService, Nip98Auth, VmState as CommonVmState, VmStateCache,
+    WorkJob,
+};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
 use log::{error, info};

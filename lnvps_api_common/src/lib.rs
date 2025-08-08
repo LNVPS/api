@@ -7,6 +7,7 @@ mod nip98;
 mod pricing;
 mod routes;
 mod status;
+mod work;
 
 pub use capacity::*;
 pub use exchange::*;
@@ -17,6 +18,7 @@ pub use nip98::*;
 pub use pricing::*;
 pub use routes::*;
 pub use status::*;
+pub use work::*;
 
 /// SATS per BTC
 pub const BTC_SATS: f64 = 100_000_000.0;

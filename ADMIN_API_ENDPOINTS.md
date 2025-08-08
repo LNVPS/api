@@ -251,6 +251,60 @@ DELETE /api/admin/v1/vms/{id}
 ```
 Required Permission: `virtual_machines::delete`
 
+**Request Body** (optional):
+```json
+{
+  "reason": "string" // Optional reason for deletion (e.g., "Policy violation", "User requested")
+}
+```
+
+**Description:**
+Queues a VM for deletion through the distributed job processing system. The VM deletion is handled asynchronously by worker processes and includes:
+
+- **Immediate Response**: API returns success immediately after queuing the job
+- **Background Processing**: Worker processes handle the actual deletion asynchronously
+- **Complete VM Removal**: Stops VM if running, deletes from hypervisor, cleans up disk storage
+- **Audit Trail**: Records admin action with user ID, reason, and timestamp in VM history
+- **User Notification**: Sends notification to VM owner about the deletion
+- **Admin Confirmation**: Sends confirmation notification to admin upon completion
+
+**Process Flow:**
+1. API validates permissions and VM existence
+2. Creates deletion job with admin user ID and optional reason
+3. Job is queued via Redis stream for distributed processing  
+4. Worker process picks up job and performs deletion
+5. VM is stopped (if running) and deleted from hypervisor
+6. VM history is updated with admin deletion record
+7. Notifications sent to both user and admin
+8. VM marked as deleted in database
+
+**Error Conditions:**
+- Returns `400` if VM is already deleted
+- Returns `503` if Redis job queue is unavailable  
+- Returns `403` if insufficient permissions
+
+**Example Requests:**
+```bash
+# Delete with reason
+curl -X DELETE "https://api.example.com/api/admin/v1/vms/123" \
+  -H "Authorization: Nostr <base64-encoded-event>" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "Policy violation"}'
+
+# Delete without reason
+curl -X DELETE "https://api.example.com/api/admin/v1/vms/123" \
+  -H "Authorization: Nostr <base64-encoded-event>"
+```
+
+**Response:**
+```json
+{
+  "data": null
+}
+```
+
+**Note:** This endpoint requires Redis to be configured for job processing. If Redis is not available, the endpoint will return a service unavailable error.
+
 #### List VM History
 ```
 GET /api/admin/v1/vms/{vm_id}/history

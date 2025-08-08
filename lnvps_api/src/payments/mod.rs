@@ -1,8 +1,8 @@
 use crate::lightning::LightningNode;
 use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
-use crate::worker::WorkJob;
 use anyhow::Result;
+use lnvps_api_common::WorkJob;
 use lnvps_db::LNVpsDb;
 use log::error;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub fn listen_all_payments(
             if let Err(e) = handler.listen().await {
                 error!("invoice-error: {}", e);
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(10)).await;
         }
     });
 

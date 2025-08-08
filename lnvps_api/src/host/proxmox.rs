@@ -833,6 +833,9 @@ impl VmHostClient for ProxmoxClient {
         //let t = self.delete_vm(&self.node, vm_id).await?;
         //self.wait_for_task(&t).await?;
 
+        //always stop first before deleting, ignoring if already stopped
+        self.stop_vm(&self.node, vm_id).await.ok();
+
         if let Some(ssh) = &self.ssh {
             let mut ses = SshClient::new()?;
             ses.connect(

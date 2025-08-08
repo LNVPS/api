@@ -628,6 +628,16 @@ impl LNVpsProvisioner {
         Ok(())
     }
 
+    /// Start a VM
+    pub async fn start_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+
+        let client = get_host_client(&host, &self.provisioner_config)?;
+        client.start_vm(&vm).await?;
+        Ok(())
+    }
+
     /// Stop a running VM
     pub async fn stop_vm(&self, vm_id: u64) -> Result<()> {
         let vm = self.db.get_vm(vm_id).await?;

@@ -1,8 +1,10 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminVmInfo, AdminVmHistoryInfo, AdminVmPaymentInfo};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmStateCache};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmStateCache, WorkCommander, WorkJob};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
+use log::{error, info};
 use rocket::{delete, get, post, State};
+use serde::Deserialize;
 use std::sync::Arc;
 
 /// List all VMs with pagination and filtering
@@ -137,6 +139,7 @@ pub async fn admin_get_vm(
 pub async fn admin_start_vm(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
+    work_commander: &State<Option<WorkCommander>>,
     id: u64,
 ) -> ApiResult<()> {
     // Check permission
@@ -149,17 +152,29 @@ pub async fn admin_start_vm(
         return ApiData::err("Cannot start a deleted VM");
     }
 
-    // TODO: Implement actual VM start logic with hypervisor
-    // This would typically involve calling Proxmox API or similar
-
-    // For now, just return success
-    // In real implementation, you would:
-    // 1. Get the host information
-    // 2. Connect to the hypervisor (Proxmox)
-    // 3. Send start command
-    // 4. Handle any errors
-
-    ApiData::ok(())
+    // Check if WorkCommander is available for distributed processing
+    if let Some(commander) = work_commander.as_ref() {
+        // Send start job via Redis stream for distributed processing
+        let start_job = WorkJob::StartVm {
+            vm_id: id,
+            admin_user_id: Some(auth.user_id),
+        };
+        
+        match commander.send_job(start_job).await {
+            Ok(stream_id) => {
+                info!("VM start job queued with stream ID: {}", stream_id);
+                ApiData::ok(())
+            }
+            Err(e) => {
+                error!("Failed to queue VM start job: {}", e);
+                ApiData::err("Failed to queue VM start job")
+            }
+        }
+    } else {
+        // WorkCommander not available - cannot process start
+        error!("WorkCommander not configured - cannot process VM start");
+        ApiData::err("VM start service is not available")
+    }
 }
 
 /// Stop a VM
@@ -167,6 +182,7 @@ pub async fn admin_start_vm(
 pub async fn admin_stop_vm(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
+    work_commander: &State<Option<WorkCommander>>,
     id: u64,
 ) -> ApiResult<()> {
     // Check permission
@@ -179,18 +195,44 @@ pub async fn admin_stop_vm(
         return ApiData::err("Cannot stop a deleted VM");
     }
 
-    // TODO: Implement actual VM stop logic with hypervisor
-    // This would typically involve calling Proxmox API or similar
+    // Check if WorkCommander is available for distributed processing
+    if let Some(commander) = work_commander.as_ref() {
+        // Send stop job via Redis stream for distributed processing
+        let stop_job = WorkJob::StopVm {
+            vm_id: id,
+            admin_user_id: Some(auth.user_id),
+        };
+        
+        match commander.send_job(stop_job).await {
+            Ok(stream_id) => {
+                info!("VM stop job queued with stream ID: {}", stream_id);
+                ApiData::ok(())
+            }
+            Err(e) => {
+                error!("Failed to queue VM stop job: {}", e);
+                ApiData::err("Failed to queue VM stop job")
+            }
+        }
+    } else {
+        // WorkCommander not available - cannot process stop
+        error!("WorkCommander not configured - cannot process VM stop");
+        ApiData::err("VM stop service is not available")
+    }
+}
 
-    ApiData::ok(())
+#[derive(Deserialize)]
+pub struct AdminDeleteVmRequest {
+    pub reason: Option<String>,
 }
 
 /// Delete a VM
-#[delete("/api/admin/v1/vms/<id>")]
+#[delete("/api/admin/v1/vms/<id>", data = "<req>")]
 pub async fn admin_delete_vm(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
+    work_commander: &State<Option<WorkCommander>>,
     id: u64,
+    req: Option<rocket::serde::json::Json<AdminDeleteVmRequest>>,
 ) -> ApiResult<()> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Delete)?;
@@ -202,21 +244,33 @@ pub async fn admin_delete_vm(
         return ApiData::err("VM is already deleted");
     }
 
-    // TODO: Implement proper VM deletion
-    // In a real implementation, you would:
-    // 1. Stop the VM if it's running
-    // 2. Delete VM from hypervisor
-    // 3. Clean up disk storage
-    // 4. Update network configurations
-    // 5. Mark VM as deleted in database
-
-    // For now, just mark as deleted in database
-    // db.delete_vm(id).await?;
-
-    // TODO: Log admin action for audit trail
-    // audit_log.log_vm_deleted(auth.user_id, id).await?;
-
-    ApiData::ok(())
+    // Extract reason from request
+    let reason = req.and_then(|r| r.reason.clone());
+    
+    // Check if WorkCommander is available for distributed processing
+    if let Some(commander) = work_commander.as_ref() {
+        // Send delete job via Redis stream for distributed processing
+        let delete_job = WorkJob::DeleteVm {
+            vm_id: id,
+            reason,
+            admin_user_id: Some(auth.user_id),
+        };
+        
+        match commander.send_job(delete_job).await {
+            Ok(stream_id) => {
+                info!("VM deletion job queued with stream ID: {}", stream_id);
+                ApiData::ok(())
+            }
+            Err(e) => {
+                error!("Failed to queue VM deletion job: {}", e);
+                ApiData::err("Failed to queue VM deletion job")
+            }
+        }
+    } else {
+        // WorkCommander not available - cannot process deletion
+        error!("WorkCommander not configured - cannot process VM deletion");
+        ApiData::err("VM deletion service is not available")
+    }
 }
 
 /// List VM history with pagination

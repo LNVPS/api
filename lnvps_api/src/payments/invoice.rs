@@ -1,7 +1,7 @@
 use crate::lightning::{InvoiceUpdate, LightningNode};
 use crate::vm_history::VmHistoryLogger;
-use crate::worker::WorkJob;
 use anyhow::Result;
+use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, VmPayment};
 use log::{error, info, warn};
 use nostr::util::hex;
@@ -23,7 +23,12 @@ impl NodeInvoiceHandler {
         tx: UnboundedSender<WorkJob>,
     ) -> Self {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
-        Self { node, tx, db, vm_history_logger }
+        Self {
+            node,
+            tx,
+            db,
+            vm_history_logger,
+        }
     }
 
     async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
@@ -39,9 +44,9 @@ impl NodeInvoiceHandler {
     async fn mark_payment_paid(&self, payment: &VmPayment) -> Result<()> {
         // Get VM state before payment processing
         let vm_before = self.db.get_vm(payment.vm_id).await?;
-        
+
         self.db.vm_payment_paid(payment).await?;
-        
+
         // Get VM state after payment processing
         let vm_after = self.db.get_vm(payment.vm_id).await?;
 
@@ -50,31 +55,39 @@ impl NodeInvoiceHandler {
             "payment_id": hex::encode(&payment.id),
             "payment_method": "lightning"
         });
-        
-        if let Err(e) = self.vm_history_logger.log_vm_payment_received(
-            payment.vm_id,
-            payment.amount,
-            &payment.currency,
-            payment.time_value,
-            Some(payment_metadata)
-        ).await {
+
+        if let Err(e) = self
+            .vm_history_logger
+            .log_vm_payment_received(
+                payment.vm_id,
+                payment.amount,
+                &payment.currency,
+                payment.time_value,
+                Some(payment_metadata),
+            )
+            .await
+        {
             warn!("Failed to log payment for VM {}: {}", payment.vm_id, e);
         }
-        
+
         // Log VM renewal if this extends the expiration
         if payment.time_value > 0 {
-            if let Err(e) = self.vm_history_logger.log_vm_renewed(
-                payment.vm_id,
-                None,
-                vm_before.expires,
-                vm_after.expires,
-                Some(payment.amount),
-                Some(&payment.currency),
-                Some(serde_json::json!({
-                    "time_added_seconds": payment.time_value,
-                    "payment_id": hex::encode(&payment.id)
-                }))
-            ).await {
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_renewed(
+                    payment.vm_id,
+                    None,
+                    vm_before.expires,
+                    vm_after.expires,
+                    Some(payment.amount),
+                    Some(&payment.currency),
+                    Some(serde_json::json!({
+                        "time_added_seconds": payment.time_value,
+                        "payment_id": hex::encode(&payment.id)
+                    })),
+                )
+                .await
+            {
                 warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
             }
         }

@@ -2,10 +2,10 @@ use crate::api::{WebhookMessage, WEBHOOK_BRIDGE};
 use crate::fiat::{RevolutApi, RevolutWebhookEvent};
 use crate::settings::RevolutConfig;
 use crate::vm_history::VmHistoryLogger;
-use crate::worker::WorkJob;
 use anyhow::{anyhow, bail, Context, Result};
 use hmac::{Hmac, Mac};
 use isocountry::CountryCode;
+use lnvps_api_common::WorkJob;
 use lnvps_db::LNVpsDb;
 use log::{error, info, warn};
 use reqwest::Url;
@@ -109,7 +109,7 @@ impl RevolutPaymentHandler {
         }
 
         self.db.vm_payment_paid(&p).await?;
-        
+
         // Get VM state after payment processing
         let vm_after = self.db.get_vm(p.vm_id).await?;
 
@@ -118,31 +118,39 @@ impl RevolutPaymentHandler {
             "external_id": ext_id,
             "payment_method": "revolut"
         });
-        
-        if let Err(e) = self.vm_history_logger.log_vm_payment_received(
-            p.vm_id,
-            p.amount,
-            &p.currency,
-            p.time_value,
-            Some(payment_metadata)
-        ).await {
+
+        if let Err(e) = self
+            .vm_history_logger
+            .log_vm_payment_received(
+                p.vm_id,
+                p.amount,
+                &p.currency,
+                p.time_value,
+                Some(payment_metadata),
+            )
+            .await
+        {
             warn!("Failed to log payment for VM {}: {}", p.vm_id, e);
         }
-        
+
         // Log VM renewal if this extends the expiration
         if p.time_value > 0 {
-            if let Err(e) = self.vm_history_logger.log_vm_renewed(
-                p.vm_id,
-                None,
-                vm_before.expires,
-                vm_after.expires,
-                Some(p.amount),
-                Some(&p.currency),
-                Some(serde_json::json!({
-                    "time_added_seconds": p.time_value,
-                    "external_id": ext_id
-                }))
-            ).await {
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_renewed(
+                    p.vm_id,
+                    None,
+                    vm_before.expires,
+                    vm_after.expires,
+                    Some(p.amount),
+                    Some(&p.currency),
+                    Some(serde_json::json!({
+                        "time_added_seconds": p.time_value,
+                        "external_id": ext_id
+                    })),
+                )
+                .await
+            {
                 warn!("Failed to log VM {} renewal: {}", p.vm_id, e);
             }
         }

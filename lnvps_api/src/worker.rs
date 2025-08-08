@@ -8,7 +8,9 @@ use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
-use lnvps_api_common::{VmRunningState, VmRunningStates, VmStateCache};
+use lnvps_api_common::{
+    RedisConfig, VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkJob,
+};
 use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};
 use nostr::{EventBuilder, PublicKey, ToBech32};
@@ -18,24 +20,6 @@ use std::ops::{Add, Sub};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-#[derive(Debug)]
-pub enum WorkJob {
-    /// Sync resources from hosts to database
-    PatchHosts,
-    /// Check all running VMS
-    CheckVms,
-    /// Check the VM status matches database state
-    ///
-    /// This job starts a vm if stopped and also creates the vm if it doesn't exist yet
-    CheckVm { vm_id: u64 },
-    /// Send a notification to the users chosen contact preferences
-    SendNotification {
-        user_id: u64,
-        message: String,
-        title: Option<String>,
-    },
-}
 
 /// Primary background worker logic
 /// Handles deleting expired VMs and sending notifications
@@ -50,6 +34,7 @@ pub struct Worker {
     vm_state_cache: VmStateCache,
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
+    work_commander: Option<WorkCommander>,
     last_check_vms: DateTime<Utc>,
 }
 
@@ -57,6 +42,7 @@ pub struct WorkerSettings {
     pub delete_after: u16,
     pub smtp: Option<SmtpConfig>,
     pub provisioner_config: ProvisionerConfig,
+    pub redis: Option<RedisConfig>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -65,6 +51,7 @@ impl From<&Settings> for WorkerSettings {
             delete_after: val.delete_after,
             smtp: val.smtp.clone(),
             provisioner_config: val.provisioner.clone(),
+            redis: val.redis.clone(),
         }
     }
 }
@@ -76,20 +63,34 @@ impl Worker {
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
         nostr: Option<Client>,
-    ) -> Self {
+    ) -> Result<Self> {
         let (tx, rx) = unbounded_channel();
         let vm_history_logger = VmHistoryLogger::new(db.clone());
-        Self {
+        let settings = settings.into();
+
+        // Initialize WorkCommander if Redis is configured
+        let work_commander = if let Some(redis_config) = &settings.redis {
+            Some(WorkCommander::new(
+                &redis_config.url,
+                "workers",
+                "api-worker",
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
             db,
             provisioner,
             vm_state_cache,
             nostr,
             vm_history_logger,
-            settings: settings.into(),
+            settings,
             tx,
             rx,
+            work_commander,
             last_check_vms: Utc::now(),
-        }
+        })
     }
 
     pub fn sender(&self) -> UnboundedSender<WorkJob> {
@@ -487,16 +488,257 @@ impl Worker {
                     )?
                 }
             }
+            WorkJob::DeleteVm {
+                vm_id,
+                reason,
+                admin_user_id,
+            } => {
+                info!("Processing admin delete request for VM {}", vm_id);
+
+                let vm = self.db.get_vm(*vm_id).await?;
+                if vm.deleted {
+                    info!("VM {} is already marked as deleted", vm_id);
+                    return Ok(());
+                }
+
+                // Delete the VM via provisioner
+                if let Err(e) = self.provisioner.delete_vm(*vm_id).await {
+                    error!("Failed to delete VM {} via provisioner: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to delete VM {} via provisioner:\n{}", vm_id, e),
+                        Some(format!("VM {} Deletion Failed", vm_id)),
+                    )?;
+                    return Err(e);
+                }
+
+                // Log VM deletion
+                let metadata = if let Some(admin_id) = admin_user_id {
+                    Some(serde_json::json!({
+                        "admin_user_id": admin_id,
+                        "admin_action": true
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "admin_action": true
+                    }))
+                };
+
+                if let Err(e) = self
+                    .vm_history_logger
+                    .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
+                    .await
+                {
+                    warn!("Failed to log VM {} deletion: {}", vm_id, e);
+                }
+
+                // Send notifications
+                let reason_text = reason.as_deref().unwrap_or("Admin requested deletion");
+                let title = Some(format!("[VM{}] Deleted by Admin", vm_id));
+
+                // Notify user
+                self.tx.send(WorkJob::SendNotification {
+                    user_id: vm.user_id,
+                    title: title.clone(),
+                    message: format!(
+                        "Your VM #{} has been deleted by an administrator.\nReason: {}",
+                        vm_id, reason_text
+                    ),
+                })?;
+
+                // Notify admin
+                self.queue_admin_notification(
+                    format!(
+                        "VM {} has been successfully deleted.\nUser ID: {}\nReason: {}",
+                        vm_id, vm.user_id, reason_text
+                    ),
+                    title,
+                )?;
+
+                info!("Successfully deleted VM {} at admin request", vm_id);
+            }
+            WorkJob::StartVm {
+                vm_id,
+                admin_user_id,
+            } => {
+                info!("Processing admin start request for VM {}", vm_id);
+
+                let vm = self.db.get_vm(*vm_id).await?;
+                if vm.deleted {
+                    error!("Cannot start deleted VM {}", vm_id);
+                    return Ok(());
+                }
+
+                // Check if VM is expired
+                if vm.expires < Utc::now() {
+                    warn!("Attempting to start expired VM {}", vm_id);
+                    // Send notification to admin about the expired VM
+                    self.queue_admin_notification(
+                        format!(
+                            "Cannot start VM {} - it has expired (expires: {})",
+                            vm_id, vm.expires
+                        ),
+                        Some(format!("VM {} Start Failed - Expired", vm_id)),
+                    )?;
+                    return Ok(());
+                }
+
+                // Start the VM via provisioner
+                if let Err(e) = self.provisioner.start_vm(*vm_id).await {
+                    error!("Failed to start VM {} via provisioner: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to start VM {} via provisioner:\n{}", vm_id, e),
+                        Some(format!("VM {} Start Failed", vm_id)),
+                    )?;
+                    return Err(e);
+                }
+
+                // Log VM start
+                let metadata = if let Some(admin_id) = admin_user_id {
+                    Some(serde_json::json!({
+                        "admin_user_id": admin_id,
+                        "admin_action": true
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "admin_action": true
+                    }))
+                };
+
+                if let Err(e) = self
+                    .vm_history_logger
+                    .log_vm_started(*vm_id, *admin_user_id, metadata)
+                    .await
+                {
+                    warn!("Failed to log VM {} start: {}", vm_id, e);
+                }
+
+                let title = Some(format!("[VM{}] Started by Admin", vm_id));
+
+                // Notify user
+                self.tx.send(WorkJob::SendNotification {
+                    user_id: vm.user_id,
+                    title: title.clone(),
+                    message: format!(
+                        "Your VM #{} has been started by an administrator.",
+                        vm_id
+                    ),
+                })?;
+
+                // Notify admin
+                self.queue_admin_notification(
+                    format!(
+                        "VM {} has been successfully started.\nUser ID: {}",
+                        vm_id, vm.user_id
+                    ),
+                    title,
+                )?;
+
+                info!("Successfully started VM {} at admin request", vm_id);
+            }
+            WorkJob::StopVm {
+                vm_id,
+                admin_user_id,
+            } => {
+                info!("Processing admin stop request for VM {}", vm_id);
+
+                let vm = self.db.get_vm(*vm_id).await?;
+                if vm.deleted {
+                    error!("Cannot stop deleted VM {}", vm_id);
+                    return Ok(());
+                }
+
+                // Stop the VM via provisioner
+                if let Err(e) = self.provisioner.stop_vm(*vm_id).await {
+                    error!("Failed to stop VM {} via provisioner: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to stop VM {} via provisioner:\n{}", vm_id, e),
+                        Some(format!("VM {} Stop Failed", vm_id)),
+                    )?;
+                    return Err(e);
+                }
+
+                // Log VM stop
+                let metadata = if let Some(admin_id) = admin_user_id {
+                    Some(serde_json::json!({
+                        "admin_user_id": admin_id,
+                        "admin_action": true
+                    }))
+                } else {
+                    Some(serde_json::json!({
+                        "admin_action": true
+                    }))
+                };
+
+                if let Err(e) = self
+                    .vm_history_logger
+                    .log_vm_stopped(*vm_id, *admin_user_id, metadata)
+                    .await
+                {
+                    warn!("Failed to log VM {} stop: {}", vm_id, e);
+                }
+
+                let title = Some(format!("[VM{}] Stopped by Admin", vm_id));
+
+                // Notify user
+                self.tx.send(WorkJob::SendNotification {
+                    user_id: vm.user_id,
+                    title: title.clone(),
+                    message: format!(
+                        "Your VM #{} has been stopped by an administrator.",
+                        vm_id
+                    ),
+                })?;
+
+                // Notify admin
+                self.queue_admin_notification(
+                    format!(
+                        "VM {} has been successfully stopped.\nUser ID: {}",
+                        vm_id, vm.user_id
+                    ),
+                    title,
+                )?;
+
+                info!("Successfully stopped VM {} at admin request", vm_id);
+            }
         }
         Ok(())
     }
 
     pub async fn handle(&mut self) -> Result<()> {
-        while let Some(job) = self.rx.recv().await {
-            if let Err(e) = self.try_job(&job).await {
-                error!("Job failed to execute: {:?} {}", job, e);
+        loop {
+            tokio::select! {
+                // Handle local channel jobs
+                job = self.rx.recv() => {
+                    if let Some(job) = job {
+                        if let Err(e) = self.try_job(&job).await {
+                            error!("Job failed to execute: {:?} {}", job, e);
+                        }
+                    }
+                }
+                // Handle Redis stream jobs (only if Redis is configured)
+                redis_result = async {
+                    self.work_commander.as_ref().unwrap().listen_for_jobs().await
+                }, if self.work_commander.is_some() => {
+                    match redis_result {
+                        Ok(jobs) => {
+                            for (stream_id, job) in jobs {
+                                if let Err(e) = self.try_job(&job).await {
+                                    error!("Failed to process Redis stream job: {:?} {}", job, e);
+                                }
+
+                                // Always try to acknowledge the job
+                                if let Err(e) = self.work_commander.as_ref().unwrap().acknowledge_job(&stream_id).await {
+                                    error!("Failed to acknowledge job {}: {}", stream_id, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to listen for Redis stream jobs: {}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
             }
         }
-        Ok(())
     }
 }

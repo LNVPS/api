@@ -3,7 +3,7 @@ use clap::Parser;
 use config::{Config, File};
 use lnvps_api_admin::admin;
 use lnvps_api_admin::settings::Settings;
-use lnvps_api_common::VmStateCache;
+use lnvps_api_common::{VmStateCache, WorkCommander};
 use lnvps_common::CORS;
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::{error, info};
@@ -48,6 +48,13 @@ async fn main() -> Result<(), Error> {
         VmStateCache::new()
     };
 
+    // Initialize WorkCommander for job distribution (publisher mode)
+    let work_commander = if let Some(redis_config) = &settings.redis {
+        Some(WorkCommander::new_publisher(&redis_config.url)?)
+    } else {
+        None
+    };
+
     let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
@@ -61,6 +68,7 @@ async fn main() -> Result<(), Error> {
         .manage(db.clone())
         .manage(settings.clone())
         .manage(vm_state_cache.clone())
+        .manage(work_commander)
         .mount("/", admin::admin_routes())
         .attach(CORS)
         .mount(
