@@ -1,7 +1,6 @@
 use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
-use crate::vm_history::VmHistoryLogger;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Days, Utc};
 use lettre::message::{MessageBuilder, MultiPart};
@@ -9,7 +8,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
-    RedisConfig, VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkJob,
+    RedisConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkJob,
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};

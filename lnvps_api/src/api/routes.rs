@@ -7,7 +7,7 @@ use crate::api::model::{
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
-use crate::vm_history::VmHistoryLogger;
+use lnvps_api_common::VmHistoryLogger;
 use crate::{Currency, CurrencyAmount};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Utc};

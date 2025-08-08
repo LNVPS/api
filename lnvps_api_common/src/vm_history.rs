@@ -202,6 +202,55 @@ impl VmHistoryLogger {
         Ok(())
     }
 
+    pub async fn log_vm_extended(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        old_expires: chrono::DateTime<Utc>,
+        new_expires: chrono::DateTime<Utc>,
+        days_extended: u32,
+        reason: Option<String>,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let mut meta = metadata.unwrap_or_else(|| json!({}));
+        meta["days_extended"] = json!(days_extended);
+        meta["admin_action"] = json!(true);
+        if let Some(r) = &reason {
+            meta["reason"] = json!(r);
+        }
+
+        let description = match reason {
+            Some(r) => format!(
+                "VM {} was extended by {} days until {} - Reason: {}",
+                vm_id,
+                days_extended,
+                new_expires.format("%Y-%m-%d %H:%M UTC"),
+                r
+            ),
+            None => format!(
+                "VM {} was extended by {} days until {}",
+                vm_id,
+                days_extended,
+                new_expires.format("%Y-%m-%d %H:%M UTC")
+            ),
+        };
+
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::Renewed,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: serialize_json_to_bytes(Some(json!({"expires": old_expires}))),
+            new_state: serialize_json_to_bytes(Some(json!({"expires": new_expires}))),
+            metadata: serialize_json_to_bytes(Some(meta)),
+            description: Some(description),
+        };
+
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
+
     pub async fn log_vm_reinstalled(
         &self,
         vm_id: u64,

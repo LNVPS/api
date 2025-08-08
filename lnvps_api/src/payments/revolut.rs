@@ -1,7 +1,7 @@
 use crate::api::{WebhookMessage, WEBHOOK_BRIDGE};
 use crate::fiat::{RevolutApi, RevolutWebhookEvent};
 use crate::settings::RevolutConfig;
-use crate::vm_history::VmHistoryLogger;
+use lnvps_api_common::VmHistoryLogger;
 use anyhow::{anyhow, bail, Context, Result};
 use hmac::{Hmac, Mac};
 use isocountry::CountryCode;

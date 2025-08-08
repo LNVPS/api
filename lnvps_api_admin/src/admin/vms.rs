@@ -1,9 +1,10 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminVmInfo, AdminVmHistoryInfo, AdminVmPaymentInfo};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmStateCache, WorkCommander, WorkJob};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmHistoryLogger, VmStateCache, WorkCommander, WorkJob};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use log::{error, info};
-use rocket::{delete, get, post, State};
+use rocket::{delete, get, post, put, State};
+use chrono::Days;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -225,6 +226,12 @@ pub struct AdminDeleteVmRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct AdminExtendVmRequest {
+    pub days: u32,
+    pub reason: Option<String>,
+}
+
 /// Delete a VM
 #[delete("/api/admin/v1/vms/<id>", data = "<req>")]
 pub async fn admin_delete_vm(
@@ -271,6 +278,66 @@ pub async fn admin_delete_vm(
         error!("WorkCommander not configured - cannot process VM deletion");
         ApiData::err("VM deletion service is not available")
     }
+}
+
+/// Extend a VM's expiration date
+#[put("/api/admin/v1/vms/<id>/extend", data = "<req>")]
+pub async fn admin_extend_vm(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    id: u64,
+    req: rocket::serde::json::Json<AdminExtendVmRequest>,
+) -> ApiResult<()> {
+    // Check permission
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+
+    // Verify VM exists
+    let mut vm = db.get_vm(id).await?;
+
+    if vm.deleted {
+        return ApiData::err("Cannot extend a deleted VM");
+    }
+
+    // Validate days (reasonable limits)
+    if req.days == 0 {
+        return ApiData::err("Must extend by at least 1 day");
+    }
+    if req.days > 365 {
+        return ApiData::err("Cannot extend by more than 365 days");
+    }
+
+    let old_expires = vm.expires;
+    let new_expires = vm.expires + Days::new(req.days as u64);
+
+    // Update VM expiration date in database
+    vm.expires = new_expires;
+    db.update_vm(&vm).await?;
+
+    // Log the extension in VM history
+    let vm_history_logger = VmHistoryLogger::new(db.inner().clone());
+    let metadata = Some(serde_json::json!({
+        "admin_user_id": auth.user_id,
+        "admin_action": true
+    }));
+
+    if let Err(e) = vm_history_logger.log_vm_extended(
+        id,
+        Some(auth.user_id),
+        old_expires,
+        new_expires,
+        req.days,
+        req.reason.clone(),
+        metadata,
+    ).await {
+        error!("Failed to log VM {} extension: {}", id, e);
+    }
+
+    info!(
+        "Admin {} extended VM {} by {} days until {}",
+        auth.user_id, id, req.days, new_expires
+    );
+
+    ApiData::ok(())
 }
 
 /// List VM history with pagination

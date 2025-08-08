@@ -1,5 +1,5 @@
 use crate::lightning::{InvoiceUpdate, LightningNode};
-use crate::vm_history::VmHistoryLogger;
+use lnvps_api_common::VmHistoryLogger;
 use anyhow::Result;
 use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, VmPayment};

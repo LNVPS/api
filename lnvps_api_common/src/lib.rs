@@ -7,6 +7,7 @@ mod nip98;
 mod pricing;
 mod routes;
 mod status;
+mod vm_history;
 mod work;
 
 pub use capacity::*;
@@ -18,6 +19,7 @@ pub use nip98::*;
 pub use pricing::*;
 pub use routes::*;
 pub use status::*;
+pub use vm_history::*;
 pub use work::*;
 
 /// SATS per BTC

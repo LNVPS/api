@@ -45,7 +45,7 @@ use crate::admin::routers::{
     admin_update_router,
 };
 use crate::admin::vms::{
-    admin_delete_vm, admin_get_vm, admin_list_vms, admin_start_vm, admin_stop_vm,
+    admin_delete_vm, admin_extend_vm, admin_get_vm, admin_list_vms, admin_start_vm, admin_stop_vm,
     admin_list_vm_history, admin_get_vm_history, admin_list_vm_payments, admin_get_vm_payment,
 };
 use crate::admin::reports::{admin_time_series_report};
@@ -79,6 +79,7 @@ pub fn admin_routes() -> Vec<Route> {
         admin_start_vm,
         admin_stop_vm,
         admin_delete_vm,
+        admin_extend_vm,
         // VM History management
         admin_list_vm_history,
         admin_get_vm_history,

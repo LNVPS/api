@@ -7,7 +7,7 @@ use lnvps_api::dvm::start_dvms;
 use lnvps_api::lightning::get_node;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
-use lnvps_api::vm_history::VmHistoryLogger;
+use lnvps_api_common::VmHistoryLogger;
 use lnvps_api::worker::Worker;
 use lnvps_api::ExchangeRateService;
 use lnvps_api_common::{DefaultRateCache, VmStateCache, WorkJob};

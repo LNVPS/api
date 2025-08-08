@@ -305,6 +305,96 @@ curl -X DELETE "https://api.example.com/api/admin/v1/vms/123" \
 
 **Note:** This endpoint requires Redis to be configured for job processing. If Redis is not available, the endpoint will return a service unavailable error.
 
+#### Extend VM
+```
+PUT /api/admin/v1/vms/{id}/extend
+```
+Required Permission: `virtual_machines::update`
+
+**Request Body**:
+```json
+{
+  "days": 30,                           // Required: Number of days to extend (1-365)
+  "reason": "string"                    // Optional: Reason for extension (e.g., "Customer support request")
+}
+```
+
+**Description:**
+Extends a VM's expiration date by the specified number of days. This operation provides administrative "credit" to VMs by directly updating the expiration date in the database and logging the action in VM history.
+
+**Key Features:**
+- **Direct Database Operation**: Updates VM expiration immediately without requiring background processing
+- **Input Validation**: Validates days between 1-365 and prevents extending deleted VMs
+- **Comprehensive Audit Trail**: Logs extension with admin user ID, old/new expiration dates, and optional reason
+- **Immediate Response**: Returns success immediately after database update
+- **History Tracking**: Records detailed metadata including days extended and admin action context
+
+**Process Flow:**
+1. API validates admin permissions and VM existence
+2. Validates input parameters (days 1-365, VM not deleted)
+3. Calculates new expiration date by adding days to current expiration
+4. Updates VM expiration date directly in database via `update_vm()`
+5. Logs extension action in VM history with comprehensive metadata
+6. Returns immediate success response
+
+**Validation Rules:**
+- Days must be between 1 and 365 (inclusive)
+- Cannot extend deleted VMs
+- VM must exist in the database
+
+**History Logging:**
+The extension is logged in VM history with:
+- Action type: `Renewed` (reusing existing renewal action type)
+- Previous state: Original expiration date
+- New state: Extended expiration date  
+- Metadata: Admin user ID, days extended, reason (if provided), admin action flag
+- Description: Formatted message with extension details and reason
+
+**Error Conditions:**
+- Returns `400` if VM is deleted or invalid input parameters
+- Returns `404` if VM does not exist
+- Returns `403` if insufficient permissions
+
+**Example Requests:**
+```bash
+# Extend with reason
+curl -X PUT "https://api.example.com/api/admin/v1/vms/123/extend" \
+  -H "Authorization: Nostr <base64-encoded-event>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "days": 30,
+    "reason": "Customer support request - payment processing delayed"
+  }'
+
+# Extend without reason
+curl -X PUT "https://api.example.com/api/admin/v1/vms/456/extend" \
+  -H "Authorization: Nostr <base64-encoded-event>" \
+  -H "Content-Type: application/json" \
+  -d '{"days": 7}'
+```
+
+**Response:**
+```json
+{
+  "data": null
+}
+```
+
+**Use Cases:**
+- Customer support extending VMs due to payment issues
+- Promotional credit extensions
+- Emergency extensions during system maintenance
+- Compensating users for service disruptions
+- Testing and development VM extensions
+
+**Benefits:**
+- **Fast Operation**: Direct database update without job queues or background processing
+- **Immediate Feedback**: Instant confirmation of extension
+- **Full Audit Trail**: Complete tracking of all administrative extensions
+- **Flexible Reasoning**: Optional reason field for documentation and compliance
+- **Precise Control**: Exact day-based extension control
+- **Safe Validation**: Comprehensive input validation prevents misuse
+
 #### List VM History
 ```
 GET /api/admin/v1/vms/{vm_id}/history

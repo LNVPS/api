@@ -11,7 +11,6 @@ pub mod router;
 pub mod settings;
 #[cfg(feature = "proxmox")]
 pub mod ssh_client;
-pub mod vm_history;
 pub mod worker;
 
 #[cfg(test)]
