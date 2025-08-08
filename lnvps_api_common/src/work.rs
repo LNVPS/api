@@ -34,7 +34,7 @@ pub enum WorkJob {
         vm_id: u64,
         admin_user_id: Option<u64>,
     },
-    /// Check all nostr domains CNAME entries - enable disabled domains with CNAME, disable active domains without CNAME
+    /// Check all nostr domains DNS records - enable disabled domains with DNS records, disable active domains without DNS records
     CheckNostrDomains,
 }
 

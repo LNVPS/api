@@ -451,64 +451,76 @@ impl Worker {
         Ok(())
     }
 
-    /// Check if a domain has a CNAME record pointing to the configured nostr hostname
-    async fn check_domain_cname(&self, domain: &str) -> Result<bool> {
+    /// Check if a domain has a DNS record pointing to the configured nostr hostname or resolves to the same IP
+    async fn check_domain_dns(&self, domain: &str) -> Result<bool> {
         let Some(expected_hostname) = &self.settings.nostr_hostname else {
-            warn!("No nostr hostname configured, skipping CNAME check");
+            warn!("No nostr hostname configured, skipping DNS record check");
             return Ok(false);
         };
 
         // Create a resolver using system configuration
         let resolver = TokioResolver::builder_tokio()?.build();
 
-        // Query for CNAME records
-        match resolver.lookup(domain, RecordType::CNAME).await {
-            Ok(cnames) => {
-                // Check if any CNAME points to our expected hostname
-                for cname in cnames.iter() {
-                    let cname_target = cname.to_string();
-                    // Remove trailing dot if present and compare
-                    let cname_target = cname_target.strip_suffix('.').unwrap_or(&cname_target);
-                    let expected_hostname = expected_hostname
-                        .strip_suffix('.')
-                        .unwrap_or(expected_hostname);
+        // Resolve both domain and expected hostname to IP addresses
+        // lookup_ip automatically follows DNS records to get final IPs
+        debug!("Checking IP resolution for {} vs {}", domain, expected_hostname);
 
-                    if cname_target == expected_hostname {
+        // Resolve our expected hostname to IP addresses
+        let expected_ips = match resolver.lookup_ip(expected_hostname).await {
+            Ok(ips) => {
+                let ip_addrs: Vec<String> = ips.iter()
+                    .map(|ip| ip.to_string())
+                    .collect();
+                debug!("Expected hostname {} resolves to IPs: {:?}", expected_hostname, ip_addrs);
+                ip_addrs
+            }
+            Err(e) => {
+                debug!("Failed to resolve expected hostname {} to IP: {}", expected_hostname, e);
+                return Ok(false);
+            }
+        };
+
+        // Resolve the domain to IP addresses (follows DNS records automatically)
+        match resolver.lookup_ip(domain).await {
+            Ok(domain_ips) => {
+                let domain_ip_addrs: Vec<String> = domain_ips.iter()
+                    .map(|ip| ip.to_string())
+                    .collect();
+                debug!("Domain {} resolves to IPs: {:?}", domain, domain_ip_addrs);
+
+                // Check if any of the domain's IPs match any of our expected IPs
+                for domain_ip in &domain_ip_addrs {
+                    if expected_ips.contains(domain_ip) {
                         debug!(
-                            "Domain {} CNAME check: {} -> {} (matches: true)",
-                            domain, cname_target, expected_hostname
+                            "Domain {} IP check: {} matches expected hostname {} (matches: true)",
+                            domain, domain_ip, expected_hostname
                         );
                         return Ok(true);
-                    } else {
-                        debug!(
-                            "Domain {} CNAME check: {} -> {} (matches: false)",
-                            domain, cname_target, expected_hostname
-                        );
                     }
                 }
 
                 debug!(
-                    "No CNAME record found for {} pointing to {}",
+                    "Domain {} IP check: no IP overlap with expected hostname {} (matches: false)",
                     domain, expected_hostname
                 );
                 Ok(false)
             }
             Err(e) => {
-                debug!("DNS lookup error for {}: {}", domain, e);
+                debug!("DNS IP lookup error for {}: {}", domain, e);
                 Ok(false)
             }
         }
     }
 
-    /// Check all nostr domains for CNAME entries - enable disabled domains with CNAME, disable active domains without CNAME
+    /// Check all nostr domains for DNS records - enable disabled domains with DNS records, disable active domains without DNS records
     async fn check_nostr_domains(&self) -> Result<()> {
         let Some(expected_hostname) = &self.settings.nostr_hostname else {
-            info!("No nostr hostname configured, skipping nostr domain CNAME checks");
+            info!("No nostr hostname configured, skipping nostr domain DNS record checks");
             return Ok(());
         };
 
         info!(
-            "Checking all nostr domains for CNAME entries pointing to {}",
+            "Checking all nostr domains for DNS records or A record IP matches pointing to {}",
             expected_hostname
         );
 
@@ -521,12 +533,12 @@ impl Worker {
         let mut domains_deleted = Vec::new();
 
         for domain in &all_domains {
-            match self.check_domain_cname(&domain.name).await {
-                Ok(has_cname) => {
-                    // If domain is disabled but has CNAME, activate it
-                    if !domain.enabled && has_cname {
+            match self.check_domain_dns(&domain.name).await {
+                Ok(has_dns_record) => {
+                    // If domain is disabled but has DNS record, activate it
+                    if !domain.enabled && has_dns_record {
                         info!(
-                            "Domain {} has CNAME pointing to {} - activating domain",
+                            "Domain {} has DNS record or matching A record pointing to {} - activating domain",
                             domain.name, expected_hostname
                         );
 
@@ -539,7 +551,7 @@ impl Worker {
                                 // Send notification to the domain owner
                                 let notification_message = format!(
                                     "Your nostr domain '{}' has been automatically activated! \n\n\
-                                    We detected that you've set up the required CNAME record pointing to {}. \
+                                    We detected that you've set up the required DNS record pointing to {}. \
                                     Your domain is now active and ready to use for nostr addresses.",
                                     domain.name, expected_hostname
                                 );
@@ -557,7 +569,7 @@ impl Worker {
                                 
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
-                                    format!("Failed to enable domain '{}' (ID: {}) despite CNAME being detected: {}", 
+                                    format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}", 
                                            domain.name, domain.id, e),
                                     Some(format!("Domain Activation Failed: {}", domain.name)),
                                 ) {
@@ -566,10 +578,10 @@ impl Worker {
                             }
                         }
                     }
-                    // If domain is active but has no CNAME, deactivate it
-                    else if domain.enabled && !has_cname {
+                    // If domain is active but has no DNS record, deactivate it
+                    else if domain.enabled && !has_dns_record {
                         info!(
-                            "Domain {} no longer has CNAME pointing to {} - deactivating domain",
+                            "Domain {} no longer has DNS record or matching A record pointing to {} - deactivating domain",
                             domain.name, expected_hostname
                         );
 
@@ -582,8 +594,8 @@ impl Worker {
                                 // Send notification to the domain owner
                                 let notification_message = format!(
                                     "Your nostr domain '{}' has been automatically deactivated. \n\n\
-                                    We detected that the required CNAME record pointing to {} is no longer configured. \
-                                    To reactivate your domain, please ensure your DNS CNAME record is correctly set up.",
+                                    We detected that the required DNS record pointing to {} is no longer configured. \
+                                    To reactivate your domain, please ensure your DNS record is correctly set up.",
                                     domain.name, expected_hostname
                                 );
 
@@ -600,7 +612,7 @@ impl Worker {
                                 
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
-                                    format!("Failed to disable domain '{}' (ID: {}) despite missing CNAME: {}", 
+                                    format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}", 
                                            domain.name, domain.id, e),
                                     Some(format!("Domain Deactivation Failed: {}", domain.name)),
                                 ) {
@@ -609,11 +621,11 @@ impl Worker {
                             }
                         }
                     }
-                    // Domain status matches CNAME status - no change needed
-                    else if domain.enabled && has_cname {
-                        debug!("Domain {} is correctly active with CNAME pointing to {}", domain.name, expected_hostname);
-                    } else if !domain.enabled && !has_cname {
-                        debug!("Domain {} is correctly inactive without CNAME pointing to {}", domain.name, expected_hostname);
+                    // Domain status matches DNS record status - no change needed
+                    else if domain.enabled && has_dns_record {
+                        debug!("Domain {} is correctly active with DNS record pointing to {}", domain.name, expected_hostname);
+                    } else if !domain.enabled && !has_dns_record {
+                        debug!("Domain {} is correctly inactive without DNS record pointing to {}", domain.name, expected_hostname);
                         
                         // Check if domain has been disabled for more than 1 week - if so, delete it
                         let one_week_ago = Utc::now().sub(Days::new(7));
@@ -632,7 +644,7 @@ impl Worker {
                                     // Send notification to the domain owner
                                     let notification_message = format!(
                                         "Your nostr domain '{}' has been permanently deleted. \n\n\
-                                        The domain was disabled for more than 1 week without the required CNAME record. \
+                                        The domain was disabled for more than 1 week without the required DNS record. \
                                         If you wish to use this domain again, you will need to register it again.",
                                         domain.name
                                     );
@@ -662,7 +674,7 @@ impl Worker {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to check CNAME for domain {}: {}", domain.name, e);
+                    error!("Failed to check DNS record for domain {}: {}", domain.name, e);
                 }
             }
         }
@@ -673,7 +685,7 @@ impl Worker {
             
             if !domains_activated.is_empty() {
                 message_parts.push(format!(
-                    "ACTIVATED {} domains with CNAME entries pointing to {}:\n{}",
+                    "ACTIVATED {} domains with DNS record entries pointing to {}:\n{}",
                     domains_activated.len(),
                     expected_hostname,
                     domains_activated
@@ -686,7 +698,7 @@ impl Worker {
 
             if !domains_deactivated.is_empty() {
                 message_parts.push(format!(
-                    "DEACTIVATED {} domains without CNAME entries pointing to {}:\n{}",
+                    "DEACTIVATED {} domains without DNS record entries pointing to {}:\n{}",
                     domains_deactivated.len(),
                     expected_hostname,
                     domains_deactivated
@@ -720,7 +732,7 @@ impl Worker {
                 Some("Nostr Domains Status Update".to_string()),
             )?;
         } else {
-            info!("No nostr domain changes required - all domains have correct CNAME configuration and no old disabled domains to delete");
+            info!("No nostr domain changes required - all domains have correct DNS configuration and no old disabled domains to delete");
         }
 
         Ok(())
