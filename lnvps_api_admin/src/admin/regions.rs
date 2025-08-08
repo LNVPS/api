@@ -4,13 +4,10 @@ use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult}
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
 use rocket::{delete, get, patch, post, State};
-use rocket_okapi::openapi;
-use schemars::JsonSchema;
 use serde::Serialize;
 use std::sync::Arc;
 
 /// List all regions with pagination
-#[openapi(tag = "Admin - Regions")]
 #[get("/api/admin/v1/regions?<limit>&<offset>")]
 pub async fn admin_list_regions(
     auth: AdminAuth,
@@ -48,7 +45,6 @@ pub async fn admin_list_regions(
 }
 
 /// Get detailed information about a specific region
-#[openapi(tag = "Admin - Regions")]
 #[get("/api/admin/v1/regions/<id>")]
 pub async fn admin_get_region(
     auth: AdminAuth,
@@ -77,7 +73,6 @@ pub async fn admin_get_region(
 }
 
 /// Create a new region
-#[openapi(tag = "Admin - Regions")]
 #[post("/api/admin/v1/regions", data = "<req>")]
 pub async fn admin_create_region(
     auth: AdminAuth,
@@ -107,7 +102,6 @@ pub async fn admin_create_region(
 }
 
 /// Update region information
-#[openapi(tag = "Admin - Regions")]
 #[patch("/api/admin/v1/regions/<id>", data = "<req>")]
 pub async fn admin_update_region(
     auth: AdminAuth,
@@ -153,7 +147,6 @@ pub async fn admin_update_region(
 }
 
 /// Delete/disable region
-#[openapi(tag = "Admin - Regions")]
 #[delete("/api/admin/v1/regions/<id>")]
 pub async fn admin_delete_region(
     auth: AdminAuth,
@@ -171,7 +164,7 @@ pub async fn admin_delete_region(
     })
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct RegionDeleteResponse {
     pub success: bool,
     pub message: String,

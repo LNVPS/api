@@ -2193,8 +2193,6 @@ dependencies = [
  "lnvps_db",
  "log 0.4.27",
  "rocket",
- "rocket_okapi",
- "schemars",
  "serde",
  "serde_json",
 ]

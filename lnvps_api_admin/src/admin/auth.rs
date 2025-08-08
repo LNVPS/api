@@ -5,9 +5,6 @@ use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
 use rocket::{async_trait, Request, State};
-use rocket_okapi::gen::OpenApiGenerator;
-use rocket_okapi::okapi::openapi3::{SecurityRequirement, SecurityScheme, SecuritySchemeData};
-use rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -120,29 +117,5 @@ impl<'r> FromRequest<'r> for AdminAuth {
             Ok(admin_auth) => Outcome::Success(admin_auth),
             Err(e) => Outcome::Error((Status::Forbidden, e.to_string())),
         }
-    }
-}
-
-impl OpenApiFromRequest<'_> for AdminAuth {
-    fn from_request_input(
-        _gen: &mut OpenApiGenerator,
-        _name: String,
-        _required: bool,
-    ) -> rocket_okapi::Result<RequestHeaderInput> {
-        let security_scheme = SecurityScheme {
-            description: Some("Requires admin Bearer token to access".to_owned()),
-            data: SecuritySchemeData::Http {
-                scheme: "Nostr".to_owned(),
-                bearer_format: Some("base64-encoded-admin-auth-event".to_owned()),
-            },
-            extensions: Default::default(),
-        };
-        let mut security_req = SecurityRequirement::new();
-        security_req.insert("AdminAuth".to_owned(), Vec::new());
-        Ok(RequestHeaderInput::Security(
-            "AdminAuth".to_owned(),
-            security_scheme,
-            security_req,
-        ))
     }
 }

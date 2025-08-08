@@ -2,14 +2,13 @@ use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use lnvps_api_common::{VmRunningState, ApiDiskType, ApiDiskInterface, ApiOsDistribution, ApiVmCostPlanIntervalType};
 use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution, VmHistory, VmHistoryActionType, VmPayment, PaymentMethod};
-use rocket_okapi::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 
 // Admin API Enums - Using enums from common crate where available, creating new ones only where needed
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AdminVmHostKind {
     Proxmox,
@@ -34,7 +33,7 @@ impl From<AdminVmHostKind> for VmHostKind {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminIpRangeAllocationMode {
     Random,
@@ -62,7 +61,7 @@ impl From<AdminIpRangeAllocationMode> for IpRangeAllocationMode {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminNetworkAccessPolicy {
     StaticArp,
@@ -84,7 +83,7 @@ impl From<AdminNetworkAccessPolicy> for NetworkAccessPolicy {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminRouterKind {
     Mikrotik,
@@ -109,7 +108,7 @@ impl From<AdminRouterKind> for RouterKind {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminUserStatus {
     Active,
@@ -117,7 +116,7 @@ pub enum AdminUserStatus {
     Deleted,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminUserRole {
     SuperAdmin,
@@ -125,7 +124,7 @@ pub enum AdminUserRole {
     ReadOnly,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct PaginatedResponse<T> {
     pub data: Vec<T>,
     pub total: u64,
@@ -133,7 +132,7 @@ pub struct PaginatedResponse<T> {
     pub offset: u64,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminUserInfo {
     pub id: u64,
     pub pubkey: String, // hex encoded
@@ -155,7 +154,7 @@ pub struct AdminUserInfo {
     pub is_admin: bool,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminUserUpdateRequest {
     pub email: Option<String>,
     pub contact_nip17: Option<bool>,
@@ -174,7 +173,7 @@ pub struct AdminUserUpdateRequest {
     pub admin_role: Option<AdminUserRole>, // null to remove
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminUserStats {
     pub total_users: u64,
     pub active_users_30d: u64,
@@ -184,7 +183,7 @@ pub struct AdminUserStats {
 
 // RBAC API Models
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminRoleInfo {
     pub id: u64,
     pub name: String,
@@ -196,30 +195,29 @@ pub struct AdminRoleInfo {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateRoleRequest {
     pub name: String,
     pub description: Option<String>,
     pub permissions: Vec<String>, // Formatted as "resource::action"
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateRoleRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub permissions: Option<Vec<String>>, // Formatted as "resource::action"
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct UserRoleInfo {
     pub role: AdminRoleInfo,
     pub assigned_by: Option<u64>,
     pub assigned_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-    pub is_active: bool,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AssignRoleRequest {
     pub role_id: u64,
     pub expires_at: Option<DateTime<Utc>>,
@@ -268,7 +266,7 @@ impl From<AdminRole> for AdminRoleInfo {
 // VM Management Models
 
 // IP address with IDs for admin linking
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminVmIpAddress {
     /// IP assignment ID for linking
     pub id: u64,
@@ -278,7 +276,7 @@ pub struct AdminVmIpAddress {
     pub range_id: u64,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminVmInfo {
     // Core VM information (moved from ApiVmStatus)
     /// Unique VM ID (Same in proxmox)
@@ -425,7 +423,7 @@ impl AdminVmInfo {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminVmAction {
     Start,
@@ -433,7 +431,7 @@ pub enum AdminVmAction {
     Delete,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct VmActionRequest {
     pub action: AdminVmAction,
 }
@@ -468,7 +466,7 @@ impl std::fmt::Display for Permission {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminHostInfo {
     pub id: u64,
     pub name: String,
@@ -487,7 +485,7 @@ pub struct AdminHostInfo {
     pub calculated_load: CalculatedHostLoad,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct CalculatedHostLoad {
     /// Overall load percentage (0.0-1.0)
     pub overall_load: f32,
@@ -505,14 +503,14 @@ pub struct CalculatedHostLoad {
     pub active_vms: u64,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminHostRegion {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminHostDisk {
     pub id: u64,
     pub name: String,
@@ -522,7 +520,7 @@ pub struct AdminHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminRegionInfo {
     pub id: u64,
     pub name: String,
@@ -535,13 +533,13 @@ pub struct AdminRegionInfo {
     pub total_ip_assignments: u64,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateRegionRequest {
     pub name: String,
     pub company_id: Option<u64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateRegionRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
@@ -677,7 +675,7 @@ impl AdminHostInfo {
 }
 
 // VM OS Image Management Models
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminVmOsImageInfo {
     pub id: u64,
     pub distribution: ApiOsDistribution,
@@ -690,7 +688,7 @@ pub struct AdminVmOsImageInfo {
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this image
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateVmOsImageRequest {
     pub distribution: ApiOsDistribution,
     pub flavour: String,
@@ -701,7 +699,7 @@ pub struct CreateVmOsImageRequest {
     pub default_username: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateVmOsImageRequest {
     pub distribution: Option<ApiOsDistribution>,
     pub flavour: Option<String>,
@@ -785,7 +783,7 @@ impl CreateVmOsImageRequest {
 }
 
 // VM Template Management Models
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminVmTemplateInfo {
     pub id: u64,
     pub name: String,
@@ -804,7 +802,7 @@ pub struct AdminVmTemplateInfo {
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this template
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminCreateVmTemplateRequest {
     pub name: String,
     pub enabled: Option<bool>,
@@ -824,7 +822,7 @@ pub struct AdminCreateVmTemplateRequest {
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminUpdateVmTemplateRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
@@ -845,7 +843,7 @@ pub struct AdminUpdateVmTemplateRequest {
 }
 
 // Common response structures
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminListResponse<T> {
     pub data: Vec<T>,
     pub total: i64,
@@ -853,13 +851,13 @@ pub struct AdminListResponse<T> {
     pub offset: u32,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminSingleResponse<T> {
     pub data: T,
 }
 
 // Custom Pricing Management Models
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminCustomPricingInfo {
     pub id: u64,
     pub name: String,
@@ -877,7 +875,7 @@ pub struct AdminCustomPricingInfo {
     pub template_count: u64,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminCustomPricingDisk {
     pub id: u64,
     pub kind: ApiDiskType,
@@ -885,7 +883,7 @@ pub struct AdminCustomPricingDisk {
     pub cost: f32,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateCustomPricingRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
@@ -899,7 +897,7 @@ pub struct UpdateCustomPricingRequest {
     pub disk_pricing: Option<Vec<CreateCustomPricingDisk>>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateCustomPricingRequest {
     pub name: String,
     pub enabled: Option<bool>,
@@ -913,14 +911,14 @@ pub struct CreateCustomPricingRequest {
     pub disk_pricing: Vec<CreateCustomPricingDisk>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateCustomPricingDisk {
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
     pub cost: f32,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CopyCustomPricingRequest {
     pub name: String,
     pub region_id: Option<u64>,
@@ -928,7 +926,7 @@ pub struct CopyCustomPricingRequest {
 }
 
 // Company Management Models
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminCompanyInfo {
     pub id: u64,
     pub created: DateTime<Utc>,
@@ -946,7 +944,7 @@ pub struct AdminCompanyInfo {
     pub region_count: u64, // Number of regions assigned to this company
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateCompanyRequest {
     pub name: String,
     pub address_1: Option<String>,
@@ -961,7 +959,7 @@ pub struct CreateCompanyRequest {
     pub base_currency: Option<String>, // 3-letter ISO currency code (default: EUR)
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateCompanyRequest {
     pub name: Option<String>,
     pub address_1: Option<String>,
@@ -998,7 +996,7 @@ impl From<lnvps_db::Company> for AdminCompanyInfo {
 }
 
 // IP Range Management Models
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminIpRangeInfo {
     pub id: u64,
     pub cidr: String,
@@ -1014,7 +1012,7 @@ pub struct AdminIpRangeInfo {
     pub assignment_count: u64, // Number of active IP assignments in this range
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateIpRangeRequest {
     pub cidr: String,
     pub gateway: String,
@@ -1026,7 +1024,7 @@ pub struct CreateIpRangeRequest {
     pub use_full_range: Option<bool>, // Default: false
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateIpRangeRequest {
     pub cidr: Option<String>,
     pub gateway: Option<String>,
@@ -1039,7 +1037,7 @@ pub struct UpdateIpRangeRequest {
 }
 
 // Access Policy Models for IP range management
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminAccessPolicyInfo {
     pub id: u64,
     pub name: String,
@@ -1099,7 +1097,7 @@ impl CreateIpRangeRequest {
 }
 
 // Access Policy Management Models (Extended)
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminAccessPolicyDetail {
     pub id: u64,
     pub name: String,
@@ -1110,7 +1108,7 @@ pub struct AdminAccessPolicyDetail {
     pub ip_range_count: u64, // Number of IP ranges using this policy
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateAccessPolicyRequest {
     pub name: String,
     pub kind: Option<AdminNetworkAccessPolicy>, // default: "static_arp"
@@ -1118,7 +1116,7 @@ pub struct CreateAccessPolicyRequest {
     pub interface: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateAccessPolicyRequest {
     pub name: Option<String>,
     pub kind: Option<AdminNetworkAccessPolicy>,
@@ -1127,7 +1125,7 @@ pub struct UpdateAccessPolicyRequest {
 }
 
 // Router Models for access policy management
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminRouterInfo {
     pub id: u64,
     pub name: String,
@@ -1178,7 +1176,7 @@ impl CreateAccessPolicyRequest {
 }
 
 // Router Management Models (Extended)
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminRouterDetail {
     pub id: u64,
     pub name: String,
@@ -1188,7 +1186,7 @@ pub struct AdminRouterDetail {
     pub access_policy_count: u64, // Number of access policies using this router
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct CreateRouterRequest {
     pub name: String,
     pub enabled: Option<bool>, // Default: true
@@ -1197,7 +1195,7 @@ pub struct CreateRouterRequest {
     pub token: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct UpdateRouterRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
@@ -1235,7 +1233,7 @@ impl CreateRouterRequest {
 }
 
 // Cost Plan Management Models
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct AdminCostPlanInfo {
     pub id: u64,
     pub name: String,
@@ -1247,7 +1245,7 @@ pub struct AdminCostPlanInfo {
     pub template_count: u64, // Number of VM templates using this cost plan
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminCreateCostPlanRequest {
     pub name: String,
     pub amount: f32,
@@ -1256,7 +1254,7 @@ pub struct AdminCreateCostPlanRequest {
     pub interval_type: ApiVmCostPlanIntervalType,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminUpdateCostPlanRequest {
     pub name: Option<String>,
     pub amount: Option<f32>,
@@ -1314,7 +1312,7 @@ impl AdminCreateCostPlanRequest {
 
 // VM History Models
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminVmHistoryActionType {
     Created,
@@ -1348,7 +1346,7 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[derive(Serialize, Deserialize,  Debug)]
 pub struct AdminVmHistoryInfo {
     pub id: u64,
     pub vm_id: u64,
@@ -1393,7 +1391,7 @@ impl AdminVmHistoryInfo {
 
 // VM Payment Models
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminPaymentMethod {
     Lightning,
@@ -1411,7 +1409,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Debug)]
+#[derive(Serialize, Deserialize,  Debug)]
 pub struct AdminVmPaymentInfo {
     pub id: String, // hex encoded payment ID
     pub vm_id: u64,

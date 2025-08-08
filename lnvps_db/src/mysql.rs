@@ -975,7 +975,7 @@ impl AdminDb for LNVpsDbMysql {
             SELECT DISTINCT rp.resource, rp.action
             FROM admin_role_assignments ara
             JOIN admin_role_permissions rp ON ara.role_id = rp.role_id
-            WHERE ara.user_id = ? AND ara.is_active = true
+            WHERE ara.user_id = ?
             AND (ara.expires_at IS NULL OR ara.expires_at > NOW())
         "#;
 
@@ -991,7 +991,7 @@ impl AdminDb for LNVpsDbMysql {
         let query = r#"
             SELECT role_id
             FROM admin_role_assignments
-            WHERE user_id = ? AND is_active = true
+            WHERE user_id = ?
             AND (expires_at IS NULL OR expires_at > NOW())
         "#;
 
@@ -1007,7 +1007,7 @@ impl AdminDb for LNVpsDbMysql {
         let query = r#"
             SELECT COUNT(*) > 0
             FROM admin_role_assignments
-            WHERE user_id = ? AND is_active = true
+            WHERE user_id = ?
             AND (expires_at IS NULL OR expires_at > NOW())
         "#;
 
@@ -1021,12 +1021,11 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn assign_user_role(&self, user_id: u64, role_id: u64, assigned_by: u64) -> Result<()> {
         let query = r#"
-            INSERT INTO admin_role_assignments (user_id, role_id, assigned_by, is_active)
-            VALUES (?, ?, ?, true)
+            INSERT INTO admin_role_assignments (user_id, role_id, assigned_by)
+            VALUES (?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 assigned_by = VALUES(assigned_by),
                 assigned_at = CURRENT_TIMESTAMP,
-                is_active = true,
                 expires_at = NULL
         "#;
 
@@ -1042,8 +1041,7 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn revoke_user_role(&self, user_id: u64, role_id: u64) -> Result<()> {
         let query = r#"
-            UPDATE admin_role_assignments
-            SET is_active = false
+            DELETE FROM admin_role_assignments
             WHERE user_id = ? AND role_id = ?
         "#;
 
@@ -1139,7 +1137,7 @@ impl AdminDb for LNVpsDbMysql {
     async fn delete_role(&self, role_id: u64) -> Result<()> {
         // First check if role has any assignments
         let assignments_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM admin_role_assignments WHERE role_id = ? AND is_active = true",
+            "SELECT COUNT(*) FROM admin_role_assignments WHERE role_id = ?",
         )
         .bind(role_id)
         .fetch_one(&self.db)
@@ -1234,7 +1232,7 @@ impl AdminDb for LNVpsDbMysql {
         let query = r#"
             SELECT COUNT(*)
             FROM admin_role_assignments
-            WHERE role_id = ? AND is_active = true
+            WHERE role_id = ?
             AND (expires_at IS NULL OR expires_at > NOW())
         "#;
 
@@ -1296,7 +1294,7 @@ impl AdminDb for LNVpsDbMysql {
             LEFT JOIN (
                 SELECT DISTINCT user_id
                 FROM admin_role_assignments
-                WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > NOW())
+                WHERE expires_at IS NULL OR expires_at > NOW()
             ) admin_roles ON u.id = admin_roles.user_id
             {}
             ORDER BY u.id

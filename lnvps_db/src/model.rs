@@ -715,7 +715,6 @@ pub struct AdminRoleAssignment {
     pub assigned_by: Option<u64>,
     pub assigned_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-    pub is_active: bool,
 }
 
 /// Administrative resources that can be managed

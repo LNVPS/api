@@ -7,7 +7,6 @@ use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult}
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
 use rocket::{delete, get, patch, post, State};
-use rocket_okapi::openapi;
 use std::sync::Arc;
 
 /// List all roles
@@ -63,7 +62,6 @@ pub async fn admin_list_roles(
 }
 
 /// Get role details
-#[openapi(tag = "Admin - Roles")]
 #[get("/api/admin/v1/roles/<id>")]
 pub async fn admin_get_role(
     auth: AdminAuth,
@@ -105,7 +103,6 @@ pub async fn admin_get_role(
 }
 
 /// Create a new role
-#[openapi(tag = "Admin - Roles")]
 #[post("/api/admin/v1/roles", data = "<req>")]
 pub async fn admin_create_role(
     auth: AdminAuth,
@@ -242,12 +239,48 @@ pub async fn admin_get_user_roles(
 
     for assignment in role_assignments {
         let role = db.get_role(assignment.role_id).await?;
+        
+        // Get role permissions
+        let permissions = db.get_role_permissions(assignment.role_id).await?;
+        let permission_strings: Vec<String> = permissions
+            .into_iter()
+            .filter_map(|(resource, action)| {
+                // Convert enum values back to AdminResource and AdminAction
+                let admin_resource = match AdminResource::try_from(resource) {
+                    Ok(r) => r,
+                    Err(_) => return None,
+                };
+                let admin_action = match AdminAction::try_from(action) {
+                    Ok(a) => a,
+                    Err(_) => return None,
+                };
+                let permission = Permission {
+                    resource: admin_resource,
+                    action: admin_action,
+                };
+                Some(permission.to_string())
+            })
+            .collect();
+
+        // Get user count for this role
+        let user_count = db.count_role_users(assignment.role_id).await?;
+
+        let role_info = AdminRoleInfo {
+            id: role.id,
+            name: role.name,
+            description: role.description,
+            is_system_role: role.is_system_role,
+            permissions: permission_strings,
+            user_count,
+            created_at: role.created_at,
+            updated_at: role.updated_at,
+        };
+
         user_roles.push(UserRoleInfo {
-            role: role.into(),
+            role: role_info,
             assigned_by: assignment.assigned_by,
             assigned_at: assignment.assigned_at,
             expires_at: assignment.expires_at,
-            is_active: assignment.is_active,
         });
     }
 
@@ -293,11 +326,19 @@ pub async fn admin_revoke_user_role(
     let _user = db.get_user(user_id).await?;
 
     // Check that role exists
-    let _role = db.get_role(role_id).await?;
+    let role = db.get_role(role_id).await?;
 
-    // Prevent users from revoking their own roles (to avoid locking themselves out)
-    if auth.user_id == user_id {
-        return ApiData::err("Cannot revoke your own roles");
+    // Only prevent super_admin users from revoking their own super_admin role 
+    // (to avoid locking themselves out of the system)
+    if auth.user_id == user_id && role.name == "super_admin" {
+        // Check if the current user has super_admin role
+        let user_roles = db.get_user_roles(auth.user_id).await?;
+        for user_role_id in user_roles {
+            let user_role = db.get_role(user_role_id).await?;
+            if user_role.name == "super_admin" {
+                return ApiData::err("Super admins cannot revoke their own super_admin role");
+            }
+        }
     }
 
     // Revoke the role
@@ -307,7 +348,6 @@ pub async fn admin_revoke_user_role(
 }
 
 /// Get current user's admin roles
-#[openapi(tag = "Admin - Roles")]
 #[get("/api/admin/v1/me/roles")]
 pub async fn admin_get_my_roles(
     auth: AdminAuth,
@@ -364,7 +404,6 @@ pub async fn admin_get_my_roles(
             assigned_by: assignment.assigned_by,
             assigned_at: assignment.assigned_at,
             expires_at: assignment.expires_at,
-            is_active: assignment.is_active,
         };
 
         user_roles.push(user_role);

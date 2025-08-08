@@ -6,8 +6,6 @@ use lnvps_api_common::{
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, State};
-use rocket_okapi::openapi;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -37,7 +35,6 @@ async fn create_admin_host_info_with_capacity(
 }
 
 /// List all VM hosts with pagination
-#[openapi(tag = "Admin - Hosts")]
 #[get("/api/admin/v1/hosts?<limit>&<offset>")]
 pub async fn admin_list_hosts(
     auth: AdminAuth,
@@ -67,7 +64,6 @@ pub async fn admin_list_hosts(
 }
 
 /// Get detailed information about a specific host
-#[openapi(tag = "Admin - Hosts")]
 #[get("/api/admin/v1/hosts/<id>")]
 pub async fn admin_get_host(
     auth: AdminAuth,
@@ -86,7 +82,6 @@ pub async fn admin_get_host(
 }
 
 /// Update host configuration
-#[openapi(tag = "Admin - Hosts")]
 #[patch("/api/admin/v1/hosts/<id>", data = "<req>")]
 pub async fn admin_update_host(
     auth: AdminAuth,
@@ -188,7 +183,7 @@ pub async fn admin_create_host(
     ApiData::ok(host_info)
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminHostUpdateRequest {
     pub name: Option<String>,
     pub ip: Option<String>,
@@ -202,7 +197,7 @@ pub struct AdminHostUpdateRequest {
     pub load_disk: Option<f32>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminHostCreateRequest {
     pub name: String,
     pub ip: String,
@@ -219,7 +214,6 @@ pub struct AdminHostCreateRequest {
 }
 
 /// List host disks
-#[openapi(tag = "Admin - Host Disks")]
 #[get("/api/admin/v1/hosts/<host_id>/disks")]
 pub async fn admin_list_host_disks(
     auth: AdminAuth,
@@ -250,7 +244,6 @@ pub async fn admin_list_host_disks(
 }
 
 /// Get specific host disk details
-#[openapi(tag = "Admin - Host Disks")]
 #[get("/api/admin/v1/hosts/<host_id>/disks/<disk_id>")]
 pub async fn admin_get_host_disk(
     auth: AdminAuth,
@@ -285,7 +278,6 @@ pub async fn admin_get_host_disk(
 }
 
 /// Update host disk configuration
-#[openapi(tag = "Admin - Host Disks")]
 #[patch("/api/admin/v1/hosts/<host_id>/disks/<disk_id>", data = "<req>")]
 pub async fn admin_update_host_disk(
     auth: AdminAuth,
@@ -329,7 +321,7 @@ pub async fn admin_update_host_disk(
     ApiData::ok(admin_disk)
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 pub struct AdminHostDiskUpdateRequest {
     pub enabled: Option<bool>,
 }
