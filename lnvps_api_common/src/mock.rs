@@ -1418,4 +1418,8 @@ impl LNVPSNostrDb for MockDb {
     async fn delete_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
+    
+    async fn list_active_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
+        Ok(vec![])
+    }
 }

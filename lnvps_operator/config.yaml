@@ -1,0 +1,56 @@
+# LNVPS Kubernetes Operator Configuration
+
+# Database connection string
+db: "mysql://root:root@localhost:3376/lnvps"
+
+# Kubernetes namespace to watch (optional, defaults to "default")
+namespace: "lnvps"
+
+# Reconciliation interval in seconds (optional, defaults to 60)
+reconcile-interval: 60
+
+# Error retry interval in seconds (optional, defaults to 30)  
+error-retry-interval: 30
+
+# Enable verbose logging (optional, defaults to false)
+verbose: true
+
+# Service name for nostr domain ingress (optional, defaults to "lnvps-nostr")
+# All nostr domains will point to this single service
+service-name: "lnvps-nostr"
+
+# Service port name for nostr domain ingress (optional, defaults to "http")
+port-name: "http"
+
+# Cert-manager cluster issuer name (optional, defaults to "letsencrypt-prod")
+# Used to automatically generate TLS certificates for all nostr domains
+cluster-issuer: "letsencrypt-prod"
+
+# Ingress class name (optional, defaults to "nginx")
+ingress-class: "nginx"
+
+# Additional custom annotations for the ingress (optional)
+# These will be merged with the default annotations
+# Custom annotations take precedence over defaults
+annotations:
+  # Example: Enable rate limiting
+  nginx.ingress.kubernetes.io/rate-limit: "100"
+  nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+  
+  # Example: Set client body size
+  nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+  
+  # Example: Enable CORS
+  nginx.ingress.kubernetes.io/enable-cors: "true"
+  nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+  
+  # Example: Custom SSL settings (overrides the default ssl-redirect: false)
+  nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  
+  # Example: Custom backend protocol
+  nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+  
+  # Example: Add custom headers
+  nginx.ingress.kubernetes.io/configuration-snippet: |
+    more_set_headers "X-Frame-Options: SAMEORIGIN";
+    more_set_headers "X-Content-Type-Options: nosniff";

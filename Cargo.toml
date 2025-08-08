@@ -6,7 +6,8 @@ members = [
     "lnvps_api_admin",
     "lnvps_api_common",
     "lnvps_nostr",
-    "lnvps_common"
+    "lnvps_common",
+    "lnvps_operator"
 ]
 
 [workspace.dependencies]

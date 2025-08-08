@@ -962,6 +962,13 @@ impl LNVPSNostrDb for LNVpsDbMysql {
             .map_err(Error::new)?;
         Ok(())
     }
+
+    async fn list_active_domains(&self) -> Result<Vec<NostrDomain>> {
+        sqlx::query_as("select * from nostr_domain where enabled=1")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
 }
 
 #[cfg(feature = "admin")]

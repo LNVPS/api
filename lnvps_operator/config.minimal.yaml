@@ -1,0 +1,20 @@
+# Minimal LNVPS Kubernetes Operator Configuration
+
+# Database connection string
+db: "mysql://root:root@localhost:3376/lnvps"
+
+# Kubernetes namespace to watch
+namespace: "lnvps"
+
+# Service configuration for nostr domains
+service-name: "lnvps-nostr"
+port-name: "http"
+
+# TLS certificate configuration
+cluster-issuer: "letsencrypt-prod"
+
+# Ingress configuration (optional - defaults shown)
+# ingress-class: "nginx"
+# reconcile-interval: 60
+# error-retry-interval: 30
+# verbose: false

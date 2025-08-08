@@ -1,0 +1,92 @@
+---
+# Minimal LNVPS Operator Deployment
+# This is a simplified version for quick deployment
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lnvps-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lnvps-operator
+  namespace: lnvps-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lnvps-operator
+rules:
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lnvps-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lnvps-operator
+subjects:
+- kind: ServiceAccount
+  name: lnvps-operator
+  namespace: lnvps-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lnvps-operator-config
+  namespace: lnvps-system
+data:
+  config.yaml: |
+    # CHANGE THESE VALUES FOR YOUR SETUP
+    db: "mysql://root:password@mysql-service:3306/lnvps"
+    namespace: "default"
+    service-name: "lnvps-nostr"
+    port-name: "http"
+    cluster-issuer: "letsencrypt-prod"
+    verbose: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lnvps-operator
+  namespace: lnvps-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lnvps-operator
+  template:
+    metadata:
+      labels:
+        app: lnvps-operator
+    spec:
+      serviceAccountName: lnvps-operator
+      containers:
+      - name: lnvps-operator
+        image: lnvps-operator:latest  # UPDATE THIS
+        args: ["--config", "/etc/config/config.yaml"]
+        env:
+        - name: RUST_LOG
+          value: "info"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/config
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 128Mi
+      volumes:
+      - name: config
+        configMap:
+          name: lnvps-operator-config
