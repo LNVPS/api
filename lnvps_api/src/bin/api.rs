@@ -113,6 +113,20 @@ async fn main() -> Result<(), Error> {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
+
+    // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)
+    #[cfg(feature = "nostr-domain")]
+    {
+        let sender_clone = sender.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = sender_clone.send(WorkJob::CheckNostrDomains) {
+                    error!("failed to send check nostr domains: {}", e);
+                }
+                tokio::time::sleep(Duration::from_secs(600)).await; // 10 minutes
+            }
+        });
+    }
     // refresh rates every 1min
     let rates = exchange.clone();
     tokio::spawn(async move {

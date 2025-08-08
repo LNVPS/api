@@ -36,6 +36,18 @@ pub trait LNVPSNostrDb: Sync + Send {
     /// Delete a domain
     async fn delete_domain(&self, domain_id: u64) -> anyhow::Result<()>;
 
+    /// List all domains across all users (both active and disabled)
+    async fn list_all_domains(&self) -> anyhow::Result<Vec<NostrDomain>>;
+
     /// List all active (enabled) domains across all users
     async fn list_active_domains(&self) -> anyhow::Result<Vec<NostrDomain>>;
+
+    /// List all disabled domains across all users
+    async fn list_disabled_domains(&self) -> anyhow::Result<Vec<NostrDomain>>;
+
+    /// Enable a domain by setting enabled=true
+    async fn enable_domain(&self, domain_id: u64) -> anyhow::Result<()>;
+
+    /// Disable a domain by setting enabled=false
+    async fn disable_domain(&self, domain_id: u64) -> anyhow::Result<()>;
 }

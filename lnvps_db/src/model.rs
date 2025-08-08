@@ -577,6 +577,7 @@ pub struct NostrDomain {
     pub enabled: bool,
     pub relays: Option<String>,
     pub handles: i64,
+    pub last_status_change: DateTime<Utc>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

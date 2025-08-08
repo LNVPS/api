@@ -3,12 +3,18 @@ use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Days, Utc};
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::{
+    name_server::TokioConnectionProvider, system_conf, Resolver, TokioResolver,
+};
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
-    RedisConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkJob,
+    RedisConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
+    WorkJob,
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};
@@ -42,6 +48,7 @@ pub struct WorkerSettings {
     pub smtp: Option<SmtpConfig>,
     pub provisioner_config: ProvisionerConfig,
     pub redis: Option<RedisConfig>,
+    pub nostr_hostname: Option<String>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -51,6 +58,7 @@ impl From<&Settings> for WorkerSettings {
             smtp: val.smtp.clone(),
             provisioner_config: val.provisioner.clone(),
             redis: val.redis.clone(),
+            nostr_hostname: val.nostr_address_host.clone(),
         }
     }
 }
@@ -443,6 +451,281 @@ impl Worker {
         Ok(())
     }
 
+    /// Check if a domain has a CNAME record pointing to the configured nostr hostname
+    async fn check_domain_cname(&self, domain: &str) -> Result<bool> {
+        let Some(expected_hostname) = &self.settings.nostr_hostname else {
+            warn!("No nostr hostname configured, skipping CNAME check");
+            return Ok(false);
+        };
+
+        // Create a resolver using system configuration
+        let resolver = TokioResolver::builder_tokio()?.build();
+
+        // Query for CNAME records
+        match resolver.lookup(domain, RecordType::CNAME).await {
+            Ok(cnames) => {
+                // Check if any CNAME points to our expected hostname
+                for cname in cnames.iter() {
+                    let cname_target = cname.to_string();
+                    // Remove trailing dot if present and compare
+                    let cname_target = cname_target.strip_suffix('.').unwrap_or(&cname_target);
+                    let expected_hostname = expected_hostname
+                        .strip_suffix('.')
+                        .unwrap_or(expected_hostname);
+
+                    if cname_target == expected_hostname {
+                        debug!(
+                            "Domain {} CNAME check: {} -> {} (matches: true)",
+                            domain, cname_target, expected_hostname
+                        );
+                        return Ok(true);
+                    } else {
+                        debug!(
+                            "Domain {} CNAME check: {} -> {} (matches: false)",
+                            domain, cname_target, expected_hostname
+                        );
+                    }
+                }
+
+                debug!(
+                    "No CNAME record found for {} pointing to {}",
+                    domain, expected_hostname
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                debug!("DNS lookup error for {}: {}", domain, e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Check all nostr domains for CNAME entries - enable disabled domains with CNAME, disable active domains without CNAME
+    async fn check_nostr_domains(&self) -> Result<()> {
+        let Some(expected_hostname) = &self.settings.nostr_hostname else {
+            info!("No nostr hostname configured, skipping nostr domain CNAME checks");
+            return Ok(());
+        };
+
+        info!(
+            "Checking all nostr domains for CNAME entries pointing to {}",
+            expected_hostname
+        );
+
+        // Get all domains in a single query
+        let all_domains = self.db.list_all_domains().await?;
+        info!("Found {} total nostr domains to check", all_domains.len());
+
+        let mut domains_activated = Vec::new();
+        let mut domains_deactivated = Vec::new();
+        let mut domains_deleted = Vec::new();
+
+        for domain in &all_domains {
+            match self.check_domain_cname(&domain.name).await {
+                Ok(has_cname) => {
+                    // If domain is disabled but has CNAME, activate it
+                    if !domain.enabled && has_cname {
+                        info!(
+                            "Domain {} has CNAME pointing to {} - activating domain",
+                            domain.name, expected_hostname
+                        );
+
+                        // Enable the domain in the database
+                        match self.db.enable_domain(domain.id).await {
+                            Ok(()) => {
+                                info!("Successfully enabled domain {} (ID: {})", domain.name, domain.id);
+                                domains_activated.push(&domain.name);
+
+                                // Send notification to the domain owner
+                                let notification_message = format!(
+                                    "Your nostr domain '{}' has been automatically activated! \n\n\
+                                    We detected that you've set up the required CNAME record pointing to {}. \
+                                    Your domain is now active and ready to use for nostr addresses.",
+                                    domain.name, expected_hostname
+                                );
+
+                                if let Err(e) = self.tx.send(WorkJob::SendNotification {
+                                    user_id: domain.owner_id,
+                                    title: Some(format!("Nostr Domain '{}' Activated", domain.name)),
+                                    message: notification_message,
+                                }) {
+                                    error!("Failed to queue user notification for domain {}: {}", domain.name, e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to enable domain {} (ID: {}): {}", domain.name, domain.id, e);
+                                
+                                // Send admin notification about the failure
+                                if let Err(notification_err) = self.queue_admin_notification(
+                                    format!("Failed to enable domain '{}' (ID: {}) despite CNAME being detected: {}", 
+                                           domain.name, domain.id, e),
+                                    Some(format!("Domain Activation Failed: {}", domain.name)),
+                                ) {
+                                    error!("Failed to queue admin notification: {}", notification_err);
+                                }
+                            }
+                        }
+                    }
+                    // If domain is active but has no CNAME, deactivate it
+                    else if domain.enabled && !has_cname {
+                        info!(
+                            "Domain {} no longer has CNAME pointing to {} - deactivating domain",
+                            domain.name, expected_hostname
+                        );
+
+                        // Disable the domain in the database
+                        match self.db.disable_domain(domain.id).await {
+                            Ok(()) => {
+                                info!("Successfully disabled domain {} (ID: {})", domain.name, domain.id);
+                                domains_deactivated.push(&domain.name);
+
+                                // Send notification to the domain owner
+                                let notification_message = format!(
+                                    "Your nostr domain '{}' has been automatically deactivated. \n\n\
+                                    We detected that the required CNAME record pointing to {} is no longer configured. \
+                                    To reactivate your domain, please ensure your DNS CNAME record is correctly set up.",
+                                    domain.name, expected_hostname
+                                );
+
+                                if let Err(e) = self.tx.send(WorkJob::SendNotification {
+                                    user_id: domain.owner_id,
+                                    title: Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
+                                    message: notification_message,
+                                }) {
+                                    error!("Failed to queue user notification for domain {}: {}", domain.name, e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to disable domain {} (ID: {}): {}", domain.name, domain.id, e);
+                                
+                                // Send admin notification about the failure
+                                if let Err(notification_err) = self.queue_admin_notification(
+                                    format!("Failed to disable domain '{}' (ID: {}) despite missing CNAME: {}", 
+                                           domain.name, domain.id, e),
+                                    Some(format!("Domain Deactivation Failed: {}", domain.name)),
+                                ) {
+                                    error!("Failed to queue admin notification: {}", notification_err);
+                                }
+                            }
+                        }
+                    }
+                    // Domain status matches CNAME status - no change needed
+                    else if domain.enabled && has_cname {
+                        debug!("Domain {} is correctly active with CNAME pointing to {}", domain.name, expected_hostname);
+                    } else if !domain.enabled && !has_cname {
+                        debug!("Domain {} is correctly inactive without CNAME pointing to {}", domain.name, expected_hostname);
+                        
+                        // Check if domain has been disabled for more than 1 week - if so, delete it
+                        let one_week_ago = Utc::now().sub(Days::new(7));
+                        if domain.last_status_change < one_week_ago {
+                            info!(
+                                "Domain {} has been disabled for more than 1 week (since {}) - deleting domain",
+                                domain.name, domain.last_status_change
+                            );
+
+                            // Delete the domain
+                            match self.db.delete_domain(domain.id).await {
+                                Ok(()) => {
+                                    info!("Successfully deleted domain {} (ID: {})", domain.name, domain.id);
+                                    domains_deleted.push(&domain.name);
+
+                                    // Send notification to the domain owner
+                                    let notification_message = format!(
+                                        "Your nostr domain '{}' has been permanently deleted. \n\n\
+                                        The domain was disabled for more than 1 week without the required CNAME record. \
+                                        If you wish to use this domain again, you will need to register it again.",
+                                        domain.name
+                                    );
+
+                                    if let Err(e) = self.tx.send(WorkJob::SendNotification {
+                                        user_id: domain.owner_id,
+                                        title: Some(format!("Nostr Domain '{}' Deleted", domain.name)),
+                                        message: notification_message,
+                                    }) {
+                                        error!("Failed to queue user notification for deleted domain {}: {}", domain.name, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to delete domain {} (ID: {}): {}", domain.name, domain.id, e);
+                                    
+                                    // Send admin notification about the failure
+                                    if let Err(notification_err) = self.queue_admin_notification(
+                                        format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}", 
+                                               domain.name, domain.id, domain.last_status_change, e),
+                                        Some(format!("Domain Deletion Failed: {}", domain.name)),
+                                    ) {
+                                        error!("Failed to queue admin notification: {}", notification_err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to check CNAME for domain {}: {}", domain.name, e);
+                }
+            }
+        }
+
+        // Send single admin notification with summary of all changes
+        if !domains_activated.is_empty() || !domains_deactivated.is_empty() || !domains_deleted.is_empty() {
+            let mut message_parts = Vec::new();
+            
+            if !domains_activated.is_empty() {
+                message_parts.push(format!(
+                    "ACTIVATED {} domains with CNAME entries pointing to {}:\n{}",
+                    domains_activated.len(),
+                    expected_hostname,
+                    domains_activated
+                        .iter()
+                        .map(|s| format!("  • {}", s))
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                ));
+            }
+
+            if !domains_deactivated.is_empty() {
+                message_parts.push(format!(
+                    "DEACTIVATED {} domains without CNAME entries pointing to {}:\n{}",
+                    domains_deactivated.len(),
+                    expected_hostname,
+                    domains_deactivated
+                        .iter()
+                        .map(|s| format!("  • {}", s))
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                ));
+            }
+
+            if !domains_deleted.is_empty() {
+                message_parts.push(format!(
+                    "DELETED {} domains that were disabled for more than 1 week:\n{}",
+                    domains_deleted.len(),
+                    domains_deleted
+                        .iter()
+                        .map(|s| format!("  • {}", s))
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                ));
+            }
+
+            let message = format!(
+                "Nostr Domain Status Changes:\n\n{}",
+                message_parts.join("\n\n")
+            );
+
+            info!("{}", message.replace('\n', " | "));
+            self.queue_admin_notification(
+                message,
+                Some("Nostr Domains Status Update".to_string()),
+            )?;
+        } else {
+            info!("No nostr domain changes required - all domains have correct CNAME configuration and no old disabled domains to delete");
+        }
+
+        Ok(())
+    }
+
     async fn try_job(&mut self, job: &WorkJob) -> Result<()> {
         match job {
             WorkJob::PatchHosts => {
@@ -617,10 +900,7 @@ impl Worker {
                 self.tx.send(WorkJob::SendNotification {
                     user_id: vm.user_id,
                     title: title.clone(),
-                    message: format!(
-                        "Your VM #{} has been started by an administrator.",
-                        vm_id
-                    ),
+                    message: format!("Your VM #{} has been started by an administrator.", vm_id),
                 })?;
 
                 // Notify admin
@@ -682,10 +962,7 @@ impl Worker {
                 self.tx.send(WorkJob::SendNotification {
                     user_id: vm.user_id,
                     title: title.clone(),
-                    message: format!(
-                        "Your VM #{} has been stopped by an administrator.",
-                        vm_id
-                    ),
+                    message: format!("Your VM #{} has been stopped by an administrator.", vm_id),
                 })?;
 
                 // Notify admin
@@ -698,6 +975,16 @@ impl Worker {
                 )?;
 
                 info!("Successfully stopped VM {} at admin request", vm_id);
+            }
+            WorkJob::CheckNostrDomains => {
+                info!("Processing check nostr domains job");
+                if let Err(e) = self.check_nostr_domains().await {
+                    error!("Failed to check nostr domains: {}", e);
+                    self.queue_admin_notification(
+                        format!("Failed to check nostr domains:\n{}", e),
+                        Some("Nostr Domains Check Failed".to_string()),
+                    )?
+                }
             }
         }
         Ok(())

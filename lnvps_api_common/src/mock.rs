@@ -1,14 +1,15 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{anyhow, bail, Context};
 use chrono::{TimeDelta, Utc};
-use lnvps_db::{
-    async_trait, AccessPolicy, AdminDb, AdminRole, AdminRoleAssignment, AdminUserInfo, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
-    LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, RegionStats, Router, User, UserSshKey, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany,
-    VmTemplate,
-};
 use lnvps_db::nostr::LNVPSNostrDb;
+use lnvps_db::{
+    async_trait, AccessPolicy, AdminDb, AdminRole, AdminRoleAssignment, AdminUserInfo, Company,
+    DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase, NostrDomain,
+    NostrDomainHandle, OsDistribution, RegionStats, Router, User, UserSshKey, Vm, VmCostPlan,
+    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmPaymentWithCompany, VmTemplate,
+};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
@@ -199,21 +200,24 @@ impl Default for MockDb {
             access_policy: Arc::new(Default::default()),
             companies: Arc::new(Mutex::new({
                 let mut companies = HashMap::new();
-                companies.insert(1, Company {
-                    id: 1,
-                    created: Utc::now(),
-                    name: "Default Company".to_string(),
-                    address_1: None,
-                    address_2: None,
-                    city: None,
-                    state: None,
-                    country_code: None,
-                    tax_id: None,
-                    postcode: None,
-                    phone: None,
-                    email: None,
-                    base_currency: "EUR".to_string(),
-                });
+                companies.insert(
+                    1,
+                    Company {
+                        id: 1,
+                        created: Utc::now(),
+                        name: "Default Company".to_string(),
+                        address_1: None,
+                        address_2: None,
+                        city: None,
+                        state: None,
+                        country_code: None,
+                        tax_id: None,
+                        postcode: None,
+                        phone: None,
+                        email: None,
+                        base_currency: "EUR".to_string(),
+                    },
+                );
                 companies
             })),
             vm_history: Arc::new(Default::default()),
@@ -275,7 +279,8 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_users_paginated(&self, limit: u64, offset: u64) -> anyhow::Result<Vec<User>> {
         let users = self.users.lock().await;
-        Ok(users.values()
+        Ok(users
+            .values()
             .skip(offset as usize)
             .take(limit as usize)
             .cloned()
@@ -345,7 +350,11 @@ impl LNVpsDbBase for MockDb {
         Ok(hosts.values().filter(|h| h.enabled).cloned().collect())
     }
 
-    async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> anyhow::Result<(Vec<VmHost>, u64)> {
+    async fn list_hosts_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<(Vec<VmHost>, u64)> {
         let hosts = self.hosts.lock().await;
         let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
         let total = filtered_hosts.len() as u64;
@@ -357,14 +366,22 @@ impl LNVpsDbBase for MockDb {
         Ok((paginated, total))
     }
 
-    async fn list_hosts_with_regions_paginated(&self, limit: u64, offset: u64) -> anyhow::Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    async fn list_hosts_with_regions_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
         let total = filtered_hosts.len() as u64;
-        
+
         let mut hosts_with_regions = Vec::new();
-        for host in filtered_hosts.into_iter().skip(offset as usize).take(limit as usize) {
+        for host in filtered_hosts
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+        {
             if let Some(region) = regions.get(&host.region_id) {
                 hosts_with_regions.push((host, region.clone()));
             }
@@ -663,7 +680,11 @@ impl LNVpsDbBase for MockDb {
         let p = self.payments.lock().await;
         let mut filtered: Vec<_> = p.iter().filter(|p| p.vm_id == vm_id).cloned().collect();
         filtered.sort_by(|a, b| b.created.cmp(&a.created));
-        Ok(filtered.into_iter().skip(offset as usize).take(limit as usize).collect())
+        Ok(filtered
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
@@ -709,9 +730,9 @@ impl LNVpsDbBase for MockDb {
         let p = self.payments.lock().await;
         Ok(p.iter()
             .filter(|p| p.is_paid)
-            .max_by(|a, b| a.created.cmp(&b.created)).cloned())
+            .max_by(|a, b| a.created.cmp(&b.created))
+            .cloned())
     }
-
 
     async fn list_custom_pricing(&self, region_id: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
@@ -790,16 +811,22 @@ impl LNVpsDbBase for MockDb {
         // Follow VM -> Host -> Region -> Company chain
         let vms = self.vms.lock().await;
         let vm = vms.get(&vm_id).ok_or_else(|| anyhow!("VM not found"))?;
-        
+
         let hosts = self.hosts.lock().await;
-        let host = hosts.get(&vm.host_id).ok_or_else(|| anyhow!("Host not found"))?;
-        
+        let host = hosts
+            .get(&vm.host_id)
+            .ok_or_else(|| anyhow!("Host not found"))?;
+
         let regions = self.regions.lock().await;
-        let region = regions.get(&host.region_id).ok_or_else(|| anyhow!("Region not found"))?;
-        
+        let region = regions
+            .get(&host.region_id)
+            .ok_or_else(|| anyhow!("Region not found"))?;
+
         if let Some(company_id) = region.company_id {
             let companies = self.companies.lock().await;
-            let company = companies.get(&company_id).ok_or_else(|| anyhow!("Company not found"))?;
+            let company = companies
+                .get(&company_id)
+                .ok_or_else(|| anyhow!("Company not found"))?;
             Ok(company.base_currency.clone())
         } else {
             Ok("EUR".to_string()) // Default fallback
@@ -850,7 +877,6 @@ impl LNVpsDbBase for MockDb {
             .cloned()
             .ok_or_else(|| anyhow!("VM history not found: {}", id))
     }
-
 }
 
 pub struct MockExchangeRate {
@@ -900,74 +926,101 @@ impl ExchangeRateService for MockExchangeRate {
 // Admin trait implementation with stub methods
 #[async_trait]
 impl AdminDb for MockDb {
-    async fn get_user_permissions(&self, _user_id: u64) -> anyhow::Result<std::collections::HashSet<(u16, u16)>> {
+    async fn get_user_permissions(
+        &self,
+        _user_id: u64,
+    ) -> anyhow::Result<std::collections::HashSet<(u16, u16)>> {
         Ok(std::collections::HashSet::new())
     }
-    
+
     async fn get_user_roles(&self, _user_id: u64) -> anyhow::Result<Vec<u64>> {
         Ok(vec![])
     }
-    
+
     async fn is_admin_user(&self, _user_id: u64) -> anyhow::Result<bool> {
         Ok(false)
     }
-    
-    async fn assign_user_role(&self, _user_id: u64, _role_id: u64, _assigned_by: u64) -> anyhow::Result<()> {
+
+    async fn assign_user_role(
+        &self,
+        _user_id: u64,
+        _role_id: u64,
+        _assigned_by: u64,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     async fn revoke_user_role(&self, _user_id: u64, _role_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     async fn create_role(&self, _name: &str, _description: Option<&str>) -> anyhow::Result<u64> {
         Ok(1)
     }
-    
+
     async fn get_role(&self, _role_id: u64) -> anyhow::Result<AdminRole> {
         bail!("Mock implementation: get_role not implemented")
     }
-    
+
     async fn get_role_by_name(&self, _name: &str) -> anyhow::Result<AdminRole> {
         bail!("Mock implementation: get_role_by_name not implemented")
     }
-    
+
     async fn list_roles(&self) -> anyhow::Result<Vec<AdminRole>> {
         Ok(vec![])
     }
-    
+
     async fn update_role(&self, _role: &AdminRole) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     async fn delete_role(&self, _role_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
-    
-    async fn add_role_permission(&self, _role_id: u64, _resource: u16, _action: u16) -> anyhow::Result<()> {
+
+    async fn add_role_permission(
+        &self,
+        _role_id: u64,
+        _resource: u16,
+        _action: u16,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    
-    async fn remove_role_permission(&self, _role_id: u64, _resource: u16, _action: u16) -> anyhow::Result<()> {
+
+    async fn remove_role_permission(
+        &self,
+        _role_id: u64,
+        _resource: u16,
+        _action: u16,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     async fn get_role_permissions(&self, _role_id: u64) -> anyhow::Result<Vec<(u16, u16)>> {
         Ok(vec![])
     }
-    
-    async fn get_user_role_assignments(&self, _user_id: u64) -> anyhow::Result<Vec<AdminRoleAssignment>> {
+
+    async fn get_user_role_assignments(
+        &self,
+        _user_id: u64,
+    ) -> anyhow::Result<Vec<AdminRoleAssignment>> {
         Ok(vec![])
     }
-    
+
     async fn count_role_users(&self, _role_id: u64) -> anyhow::Result<u64> {
         Ok(0)
     }
-    
-    async fn admin_list_users(&self, limit: u64, offset: u64, _search_pubkey: Option<&str>) -> anyhow::Result<(Vec<AdminUserInfo>, u64)> {
+
+    async fn admin_list_users(
+        &self,
+        limit: u64,
+        offset: u64,
+        _search_pubkey: Option<&str>,
+    ) -> anyhow::Result<(Vec<AdminUserInfo>, u64)> {
         let users = self.users.lock().await;
         let total = users.len() as u64;
-        let paginated_users: Vec<AdminUserInfo> = users.values()
+        let paginated_users: Vec<AdminUserInfo> = users
+            .values()
             .skip(offset as usize)
             .take(limit as usize)
             .map(|u| AdminUserInfo {
@@ -991,57 +1044,121 @@ impl AdminDb for MockDb {
             .collect();
         Ok((paginated_users, total))
     }
-    
-    async fn admin_list_regions(&self, limit: u64, offset: u64) -> anyhow::Result<(Vec<VmHostRegion>, u64)> {
+
+    async fn admin_list_regions(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<(Vec<VmHostRegion>, u64)> {
         let regions = self.regions.lock().await;
         let total = regions.len() as u64;
-        let paginated_regions: Vec<VmHostRegion> = regions.values()
+        let paginated_regions: Vec<VmHostRegion> = regions
+            .values()
             .skip(offset as usize)
             .take(limit as usize)
             .cloned()
             .collect();
         Ok((paginated_regions, total))
     }
-    
+
     // Add stub implementations for all remaining AdminDb methods
-    async fn admin_create_region(&self, _name: &str, _company_id: Option<u64>) -> anyhow::Result<u64> { Ok(1) }
-    async fn admin_update_region(&self, _region: &VmHostRegion) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_delete_region(&self, _region_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_count_region_hosts(&self, _region_id: u64) -> anyhow::Result<u64> { Ok(0) }
-    async fn admin_get_region_stats(&self, _region_id: u64) -> anyhow::Result<RegionStats> { 
+    async fn admin_create_region(
+        &self,
+        _name: &str,
+        _company_id: Option<u64>,
+    ) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+    async fn admin_update_region(&self, _region: &VmHostRegion) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_delete_region(&self, _region_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_count_region_hosts(&self, _region_id: u64) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn admin_get_region_stats(&self, _region_id: u64) -> anyhow::Result<RegionStats> {
         bail!("Mock implementation: admin_get_region_stats not implemented")
     }
-    async fn admin_list_vm_os_images(&self, _limit: u64, _offset: u64) -> anyhow::Result<(Vec<VmOsImage>, u64)> { Ok((vec![], 0)) }
-    async fn admin_get_vm_os_image(&self, _image_id: u64) -> anyhow::Result<VmOsImage> { 
+    async fn admin_list_vm_os_images(
+        &self,
+        _limit: u64,
+        _offset: u64,
+    ) -> anyhow::Result<(Vec<VmOsImage>, u64)> {
+        Ok((vec![], 0))
+    }
+    async fn admin_get_vm_os_image(&self, _image_id: u64) -> anyhow::Result<VmOsImage> {
         bail!("Mock implementation: admin_get_vm_os_image not implemented")
     }
-    async fn admin_create_vm_os_image(&self, _image: &VmOsImage) -> anyhow::Result<u64> { Ok(1) }
-    async fn admin_update_vm_os_image(&self, _image: &VmOsImage) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_delete_vm_os_image(&self, _image_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn list_vm_templates_paginated(&self, limit: i64, offset: i64) -> anyhow::Result<(Vec<VmTemplate>, i64)> {
+    async fn admin_create_vm_os_image(&self, _image: &VmOsImage) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+    async fn admin_update_vm_os_image(&self, _image: &VmOsImage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_delete_vm_os_image(&self, _image_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn list_vm_templates_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<(Vec<VmTemplate>, i64)> {
         let templates = self.templates.lock().await;
         let total = templates.len() as i64;
-        let paginated: Vec<VmTemplate> = templates.values()
+        let paginated: Vec<VmTemplate> = templates
+            .values()
             .skip(offset as usize)
             .take(limit as usize)
             .cloned()
             .collect();
         Ok((paginated, total))
     }
-    async fn update_vm_template(&self, _template: &VmTemplate) -> anyhow::Result<()> { Ok(()) }
-    async fn delete_vm_template(&self, _template_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn check_vm_template_usage(&self, _template_id: u64) -> anyhow::Result<i64> { Ok(0) }
-    async fn admin_list_hosts_with_regions_paginated(&self, limit: u64, offset: u64) -> anyhow::Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    async fn update_vm_template(&self, _template: &VmTemplate) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn delete_vm_template(&self, _template_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn check_vm_template_usage(&self, _template_id: u64) -> anyhow::Result<i64> {
+        Ok(0)
+    }
+    async fn admin_list_hosts_with_regions_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> anyhow::Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
         self.list_hosts_with_regions_paginated(limit, offset).await
     }
-    async fn admin_list_companies(&self, _limit: u64, _offset: u64) -> anyhow::Result<(Vec<Company>, u64)> { Ok((vec![], 0)) }
-    async fn admin_get_company(&self, company_id: u64) -> anyhow::Result<Company> { self.get_company(company_id).await }
-    async fn admin_create_company(&self, _company: &Company) -> anyhow::Result<u64> { Ok(1) }
-    async fn admin_update_company(&self, _company: &Company) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_delete_company(&self, _company_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_count_company_regions(&self, _company_id: u64) -> anyhow::Result<u64> { Ok(0) }
-    
-    async fn admin_get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> anyhow::Result<Vec<VmPayment>> {
+    async fn admin_list_companies(
+        &self,
+        _limit: u64,
+        _offset: u64,
+    ) -> anyhow::Result<(Vec<Company>, u64)> {
+        Ok((vec![], 0))
+    }
+    async fn admin_get_company(&self, company_id: u64) -> anyhow::Result<Company> {
+        self.get_company(company_id).await
+    }
+    async fn admin_create_company(&self, _company: &Company) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+    async fn admin_update_company(&self, _company: &Company) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_delete_company(&self, _company_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_count_company_regions(&self, _company_id: u64) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn admin_get_payments_by_date_range(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         Ok(p.iter()
             .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
@@ -1049,18 +1166,23 @@ impl AdminDb for MockDb {
             .collect())
     }
 
-    async fn admin_get_payments_by_date_range_and_company(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64) -> anyhow::Result<Vec<VmPayment>> {
+    async fn admin_get_payments_by_date_range_and_company(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+    ) -> anyhow::Result<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         let vms = self.vms.lock().await;
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
-        
+
         Ok(p.iter()
             .filter(|payment| {
                 if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
                     return false;
                 }
-                
+
                 // Follow VM -> Host -> Region -> Company chain
                 if let Some(vm) = vms.get(&payment.vm_id) {
                     if let Some(host) = hosts.get(&vm.host_id) {
@@ -1075,27 +1197,33 @@ impl AdminDb for MockDb {
             .collect())
     }
 
-    async fn admin_get_payments_with_company_info(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64, currency: Option<&str>) -> anyhow::Result<Vec<VmPaymentWithCompany>> {
+    async fn admin_get_payments_with_company_info(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        currency: Option<&str>,
+    ) -> anyhow::Result<Vec<VmPaymentWithCompany>> {
         let p = self.payments.lock().await;
         let vms = self.vms.lock().await;
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let companies = self.companies.lock().await;
-        
+
         let mut result = Vec::new();
-        
+
         for payment in p.iter() {
             if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
                 continue;
             }
-            
+
             // Filter by currency if specified
             if let Some(filter_currency) = currency {
                 if payment.currency != filter_currency {
                     continue;
                 }
             }
-            
+
             // Follow VM -> Host -> Region -> Company chain
             if let Some(vm) = vms.get(&payment.vm_id) {
                 if let Some(host) = hosts.get(&vm.host_id) {
@@ -1105,7 +1233,7 @@ impl AdminDb for MockDb {
                             if region_company_id != company_id {
                                 continue;
                             }
-                            
+
                             if let Some(company) = companies.get(&region_company_id) {
                                 result.push(VmPaymentWithCompany {
                                     id: payment.id.clone(),
@@ -1131,34 +1259,96 @@ impl AdminDb for MockDb {
                 }
             }
         }
-        
+
         // Sort by created timestamp
         result.sort_by(|a, b| a.created.cmp(&b.created));
-        
+
         Ok(result)
     }
 
-    async fn admin_list_ip_ranges(&self, _limit: u64, _offset: u64, _region_id: Option<u64>) -> anyhow::Result<(Vec<IpRange>, u64)> { Ok((vec![], 0)) }
-    async fn admin_get_ip_range(&self, ip_range_id: u64) -> anyhow::Result<IpRange> { self.get_ip_range(ip_range_id).await }
-    async fn admin_create_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<u64> { Ok(1) }
-    async fn admin_update_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_delete_ip_range(&self, _ip_range_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_count_ip_range_assignments(&self, _ip_range_id: u64) -> anyhow::Result<u64> { Ok(0) }
-    async fn admin_list_access_policies(&self) -> anyhow::Result<Vec<AccessPolicy>> { Ok(vec![]) }
-    async fn admin_list_access_policies_paginated(&self, _limit: u64, _offset: u64) -> anyhow::Result<(Vec<AccessPolicy>, u64)> { Ok((vec![], 0)) }
-    async fn admin_get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> { self.get_access_policy(access_policy_id).await }
-    async fn admin_create_access_policy(&self, _access_policy: &AccessPolicy) -> anyhow::Result<u64> { Ok(1) }
-    async fn admin_update_access_policy(&self, _access_policy: &AccessPolicy) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_delete_access_policy(&self, _access_policy_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_count_access_policy_ip_ranges(&self, _access_policy_id: u64) -> anyhow::Result<u64> { Ok(0) }
-    async fn admin_list_routers(&self) -> anyhow::Result<Vec<Router>> { self.list_routers().await }
-    async fn admin_list_routers_paginated(&self, _limit: u64, _offset: u64) -> anyhow::Result<(Vec<Router>, u64)> { Ok((vec![], 0)) }
-    async fn admin_get_router(&self, router_id: u64) -> anyhow::Result<Router> { self.get_router(router_id).await }
-    async fn admin_create_router(&self, _router: &Router) -> anyhow::Result<u64> { Ok(1) }
-    async fn admin_update_router(&self, _router: &Router) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_delete_router(&self, _router_id: u64) -> anyhow::Result<()> { Ok(()) }
-    async fn admin_count_router_access_policies(&self, _router_id: u64) -> anyhow::Result<u64> { Ok(0) }
-    
+    async fn admin_list_ip_ranges(
+        &self,
+        _limit: u64,
+        _offset: u64,
+        _region_id: Option<u64>,
+    ) -> anyhow::Result<(Vec<IpRange>, u64)> {
+        Ok((vec![], 0))
+    }
+    async fn admin_get_ip_range(&self, ip_range_id: u64) -> anyhow::Result<IpRange> {
+        self.get_ip_range(ip_range_id).await
+    }
+    async fn admin_create_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+    async fn admin_update_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_delete_ip_range(&self, _ip_range_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_count_ip_range_assignments(&self, _ip_range_id: u64) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn admin_list_access_policies(&self) -> anyhow::Result<Vec<AccessPolicy>> {
+        Ok(vec![])
+    }
+    async fn admin_list_access_policies_paginated(
+        &self,
+        _limit: u64,
+        _offset: u64,
+    ) -> anyhow::Result<(Vec<AccessPolicy>, u64)> {
+        Ok((vec![], 0))
+    }
+    async fn admin_get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> {
+        self.get_access_policy(access_policy_id).await
+    }
+    async fn admin_create_access_policy(
+        &self,
+        _access_policy: &AccessPolicy,
+    ) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+    async fn admin_update_access_policy(
+        &self,
+        _access_policy: &AccessPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_delete_access_policy(&self, _access_policy_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_count_access_policy_ip_ranges(
+        &self,
+        _access_policy_id: u64,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+    async fn admin_list_routers(&self) -> anyhow::Result<Vec<Router>> {
+        self.list_routers().await
+    }
+    async fn admin_list_routers_paginated(
+        &self,
+        _limit: u64,
+        _offset: u64,
+    ) -> anyhow::Result<(Vec<Router>, u64)> {
+        Ok((vec![], 0))
+    }
+    async fn admin_get_router(&self, router_id: u64) -> anyhow::Result<Router> {
+        self.get_router(router_id).await
+    }
+    async fn admin_create_router(&self, _router: &Router) -> anyhow::Result<u64> {
+        Ok(1)
+    }
+    async fn admin_update_router(&self, _router: &Router) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_delete_router(&self, _router_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn admin_count_router_access_policies(&self, _router_id: u64) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<u64> {
         let mut pricing_map = self.custom_pricing.lock().await;
         let max_id = pricing_map.keys().max().unwrap_or(&0) + 1;
@@ -1251,7 +1441,8 @@ impl AdminDb for MockDb {
 
     async fn update_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
         let mut template_map = self.custom_template.lock().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = template_map.entry(template.id) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = template_map.entry(template.id)
+        {
             e.insert(template.clone());
             Ok(())
         } else {
@@ -1289,12 +1480,11 @@ impl AdminDb for MockDb {
     ) -> anyhow::Result<(Vec<Vm>, u64)> {
         let vms = self.vms.lock().await;
         let hosts = self.hosts.lock().await;
-        
+
         // Resolve user_id from pubkey if provided
         let resolved_user_id = if let Some(pk) = pubkey {
-            let pubkey_bytes = hex::decode(pk)
-                .map_err(|_| anyhow!("Invalid pubkey format"))?;
-            
+            let pubkey_bytes = hex::decode(pk).map_err(|_| anyhow!("Invalid pubkey format"))?;
+
             match self.get_user_by_pubkey(&pubkey_bytes).await {
                 Ok(user) => Some(user.id),
                 Err(_) => return Ok((vec![], 0)), // No user found, return empty
@@ -1351,7 +1541,7 @@ impl AdminDb for MockDb {
             .collect();
 
         let total = filtered_vms.len() as u64;
-        
+
         // Apply pagination
         let paginated: Vec<Vm> = filtered_vms
             .into_iter()
@@ -1378,48 +1568,68 @@ impl LNVPSNostrDb for MockDb {
     async fn get_handle(&self, _handle_id: u64) -> anyhow::Result<NostrDomainHandle> {
         bail!("Mock implementation: get_handle not implemented")
     }
-    
-    async fn get_handle_by_name(&self, _domain_id: u64, _handle: &str) -> anyhow::Result<NostrDomainHandle> {
+
+    async fn get_handle_by_name(
+        &self,
+        _domain_id: u64,
+        _handle: &str,
+    ) -> anyhow::Result<NostrDomainHandle> {
         bail!("Mock implementation: get_handle_by_name not implemented")
     }
-    
+
     async fn insert_handle(&self, _handle: &NostrDomainHandle) -> anyhow::Result<u64> {
         Ok(1)
     }
-    
+
     async fn update_handle(&self, _handle: &NostrDomainHandle) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     async fn delete_handle(&self, _handle_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     async fn list_handles(&self, _domain_id: u64) -> anyhow::Result<Vec<NostrDomainHandle>> {
         Ok(vec![])
     }
-    
+
     async fn get_domain(&self, _id: u64) -> anyhow::Result<NostrDomain> {
         bail!("Mock implementation: get_domain not implemented")
     }
-    
+
     async fn get_domain_by_name(&self, _name: &str) -> anyhow::Result<NostrDomain> {
         bail!("Mock implementation: get_domain_by_name not implemented")
     }
-    
+
     async fn list_domains(&self, _owner_id: u64) -> anyhow::Result<Vec<NostrDomain>> {
         Ok(vec![])
     }
-    
+
     async fn insert_domain(&self, _domain: &NostrDomain) -> anyhow::Result<u64> {
         Ok(1)
     }
-    
+
     async fn delete_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
+    async fn list_all_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
+        todo!()
+    }
+
     async fn list_active_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
         Ok(vec![])
+    }
+
+    async fn list_disabled_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
+        Ok(vec![])
+    }
+
+    async fn enable_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn disable_domain(&self, domain_id: u64) -> anyhow::Result<()> {
+        todo!()
     }
 }

@@ -955,19 +955,49 @@ impl LNVPSNostrDb for LNVpsDbMysql {
     }
 
     async fn delete_domain(&self, domain_id: u64) -> Result<()> {
-        sqlx::query("update nostr_domain set deleted = current_timestamp where id = ?")
+        sqlx::query("delete from nostr_domain where id = ?")
             .bind(domain_id)
-            .fetch_one(&self.db)
+            .execute(&self.db)
             .await
             .map_err(Error::new)?;
         Ok(())
     }
 
-    async fn list_active_domains(&self) -> Result<Vec<NostrDomain>> {
-        sqlx::query_as("select * from nostr_domain where enabled=1")
+    async fn list_all_domains(&self) -> Result<Vec<NostrDomain>> {
+        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain")
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)
+    }
+
+    async fn list_active_domains(&self) -> Result<Vec<NostrDomain>> {
+        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=1")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_disabled_domains(&self) -> Result<Vec<NostrDomain>> {
+        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=0")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn enable_domain(&self, domain_id: u64) -> Result<()> {
+        sqlx::query("update nostr_domain set enabled=1, last_status_change=CURRENT_TIMESTAMP where id=?")
+            .bind(domain_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn disable_domain(&self, domain_id: u64) -> Result<()> {
+        sqlx::query("update nostr_domain set enabled=0, last_status_change=CURRENT_TIMESTAMP where id=?")
+            .bind(domain_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 }
 
