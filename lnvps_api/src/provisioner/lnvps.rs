@@ -514,46 +514,6 @@ impl LNVpsProvisioner {
         self.price_to_payment(vm_id, method, price).await
     }
 
-    #[cfg(feature = "nostr-nwc")]
-    /// Attempt automatic renewal via Nostr Wallet Connect
-    pub async fn auto_renew_via_nwc(&self, vm_id: u64, nwc_connection_string: &str) -> Result<bool> {
-        use nostr_sdk::prelude::*;
-        use log::{error, debug};
-
-        debug!("Attempting automatic renewal for VM {} via NWC", vm_id);
-
-        // Use existing renew method to create the payment/invoice
-        let vm_payment = match self.renew(vm_id, PaymentMethod::Lightning).await {
-            Ok(payment) => payment,
-            Err(e) => {
-                debug!("Failed to create renewal payment for VM {}: {}", vm_id, e);
-                return Ok(false);
-            }
-        };
-
-        // Extract the invoice from external_data
-        let invoice: String = vm_payment.external_data.into();
-        debug!("Created renewal invoice for VM {}, attempting NWC payment", vm_id);
-
-        // Parse NWC connection string  
-        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
-            .context("Invalid NWC connection string")?;
-
-        // Create nostr client for NWC
-        let client = nwc::NWC::new(nwc_uri);
-        match client.pay_invoice(PayInvoiceRequest::new(invoice)).await {
-            Ok(_payment_preimage) => {
-                info!("Successful NWC auto-renewal payment for VM {}", vm_id);
-                Ok(true)
-            }
-            Err(e) => {
-                error!("NWC auto-renewal payment failed for VM {}: {}", vm_id, e);
-                // The invoice will expire naturally, so no need to cancel explicitly
-                Ok(false)
-            }
-        }
-    }
-
     async fn price_to_payment(
         &self,
         vm_id: u64,

@@ -67,7 +67,7 @@ impl WorkCommander {
     /// Generic KV store
     pub async fn store_key(&self, key: &str, value: &[u8]) -> Result<()> {
         let mut conn = self.client().get_multiplexed_async_connection().await?;
-        conn.set(key, value).await?;
+        conn.set::<_, _, ()>(key, value).await?;
         Ok(())
     }
 

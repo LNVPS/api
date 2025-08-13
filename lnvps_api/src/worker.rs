@@ -1,7 +1,7 @@
 use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Datelike, Days, Utc};
 use hickory_resolver::TokioResolver;
 use lettre::message::{MessageBuilder, MultiPart};
@@ -12,11 +12,12 @@ use lnvps_api_common::{
     RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache,
     WorkCommander, WorkJob,
 };
-use lnvps_db::{LNVpsDb, Vm, VmHost};
+use lnvps_db::{LNVpsDb, PaymentMethod, Vm, VmHost};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -125,6 +126,45 @@ impl Worker {
         Ok(())
     }
 
+    #[cfg(feature = "nostr-nwc")]
+    /// Attempt automatic renewal via Nostr Wallet Connect
+    pub async fn auto_renew_via_nwc(&self, vm_id: u64, nwc_connection_string: &str) -> Result<()> {
+        use log::{debug, error};
+        use nostr_sdk::prelude::*;
+
+        debug!("Attempting automatic renewal for VM {} via NWC", vm_id);
+
+        // Use existing renew method to create the payment/invoice
+        let vm_payment = match self
+            .provisioner
+            .renew(vm_id, PaymentMethod::Lightning)
+            .await
+        {
+            Ok(payment) => payment,
+            Err(e) => {
+                debug!("Failed to create renewal payment for VM {}: {}", vm_id, e);
+                return Ok(());
+            }
+        };
+
+        // Extract the invoice from external_data
+        let invoice: String = vm_payment.external_data.into();
+        debug!(
+            "Created renewal invoice for VM {}, attempting NWC payment",
+            vm_id
+        );
+
+        // Parse NWC connection string
+        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
+            .context("Invalid NWC connection string")?;
+
+        // Create nostr client for NWC
+        let client = nwc::NWC::new(nwc_uri);
+        client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
+        info!("Successful NWC auto-renewal payment for VM {}", vm_id);
+        Ok(())
+    }
+
     /// Handle VM state
     /// 1. Expire VM and send notification
     /// 2. Stop VM if expired and still running
@@ -142,6 +182,7 @@ impl Worker {
             let user = self.db.get_user(vm.user_id).await?;
             let mut renewal_attempted = false;
             let mut renewal_successful = false;
+            let mut nwc_error = String::new();
 
             #[cfg(feature = "nostr-nwc")]
             if vm.auto_renewal_enabled {
@@ -151,12 +192,8 @@ impl Worker {
                         info!("Attempting automatic renewal for VM {} via NWC (user has NWC configured and VM auto-renewal is enabled)", vm.id);
                         renewal_attempted = true;
 
-                        match self
-                            .provisioner
-                            .auto_renew_via_nwc(vm.id, &nwc_string)
-                            .await
-                        {
-                            Ok(true) => {
+                        match self.auto_renew_via_nwc(vm.id, &nwc_string).await {
+                            Ok(_) => {
                                 renewal_successful = true;
                                 info!("Successfully auto-renewed VM {} via NWC", vm.id);
                                 self.tx.send(WorkJob::SendNotification {
@@ -165,14 +202,9 @@ impl Worker {
                                     message: format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id)
                                 })?;
                             }
-                            Ok(false) => {
-                                info!(
-                                    "Auto-renewal failed for VM {}, sending expiry notification",
-                                    vm.id
-                                );
-                            }
                             Err(e) => {
                                 warn!("Auto-renewal error for VM {}: {}", vm.id, e);
+                                nwc_error = e.to_string();
                             }
                         }
                     } else {
@@ -190,7 +222,7 @@ impl Worker {
             if !renewal_attempted || !renewal_successful {
                 info!("Sending expire soon notification VM {}", vm.id);
                 let message = if renewal_attempted {
-                    format!("Your VM #{} will expire soon. Automatic renewal failed, please manually renew in the next {} days or your VM will be stopped.", vm.id, BEFORE_EXPIRE_NOTIFICATION)
+                    format!("Your VM #{} will expire soon.\nAutomatic renewal failed, please manually renew in the next {} days or your VM will be stopped.\nError: '{}'", vm.id, BEFORE_EXPIRE_NOTIFICATION, nwc_error)
                 } else {
                     format!("Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.", vm.id, BEFORE_EXPIRE_NOTIFICATION)
                 };
