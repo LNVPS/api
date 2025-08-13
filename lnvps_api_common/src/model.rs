@@ -1,5 +1,5 @@
 use crate::pricing::PricingEngine;
-use crate::{Currency, VmRunningState};
+use crate::{Currency, CurrencyAmount, VmRunningState};
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
@@ -457,4 +457,30 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
 pub struct ApiPrice {
     pub currency: Currency,
     pub amount: f32,
+}
+
+impl From<CurrencyAmount> for ApiPrice {
+    fn from(amount: CurrencyAmount) -> Self {
+        ApiPrice {
+            currency: amount.currency(),
+            amount: amount.value_f32(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UpgradeConfig {
+    pub new_cpu: Option<u16>,
+    pub new_memory: Option<u64>,
+    pub new_disk: Option<u64>,
+}
+
+impl UpgradeConfig {
+    pub fn new(new_cpu: Option<u16>, new_memory: Option<u64>, new_disk: Option<u64>) -> Self {
+        Self {
+            new_cpu,
+            new_memory,
+            new_disk,
+        }
+    }
 }

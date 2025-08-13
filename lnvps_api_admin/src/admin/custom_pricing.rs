@@ -4,11 +4,10 @@ use crate::admin::model::{
     CreateCustomPricingRequest, UpdateCustomPricingRequest,
 };
 use chrono::Utc;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiDiskType, ApiDiskInterface};
-use lnvps_db::{
-    AdminAction, AdminResource, LNVpsDb, VmCustomPricing,
-    VmCustomPricingDisk,
+use lnvps_api_common::{
+    ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
 };
+use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCustomPricing, VmCustomPricingDisk};
 use rocket::serde::json::Json;
 use rocket::{delete, get, patch, post, State};
 use std::sync::Arc;

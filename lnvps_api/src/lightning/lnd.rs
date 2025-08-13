@@ -1,7 +1,7 @@
 use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use anyhow::Result;
 use fedimint_tonic_lnd::invoicesrpc::lookup_invoice_msg::InvoiceRef;
-use fedimint_tonic_lnd::invoicesrpc::LookupInvoiceMsg;
+use fedimint_tonic_lnd::invoicesrpc::{CancelInvoiceMsg, LookupInvoiceMsg};
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use fedimint_tonic_lnd::lnrpc::{Invoice, InvoiceSubscription};
 use fedimint_tonic_lnd::{connect, Client};
@@ -42,6 +42,16 @@ impl LightningNode for LndNode {
             payment_hash: hex::encode(inner.r_hash),
             external_id: None,
         })
+    }
+
+    async fn cancel_invoice(&self, id: &Vec<u8>) -> Result<()> {
+        let mut client = self.client.clone();
+        let ln = client.invoices();
+        ln.cancel_invoice(CancelInvoiceMsg {
+            payment_hash: id.clone().into(),
+        })
+        .await?;
+        Ok(())
     }
 
     async fn subscribe_invoices(

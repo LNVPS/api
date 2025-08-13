@@ -52,6 +52,10 @@ impl LightningNode for BitvoraNode {
         })
     }
 
+    async fn cancel_invoice(&self, _id: &Vec<u8>) -> anyhow::Result<()> {
+        bail!("Not supported yet!")
+    }
+
     async fn subscribe_invoices(
         &self,
         _from_payment_hash: Option<Vec<u8>>,

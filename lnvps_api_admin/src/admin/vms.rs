@@ -1,15 +1,20 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminVmInfo, AdminVmHistoryInfo, AdminVmPaymentInfo};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmHistoryLogger, VmStateCache, WorkCommander, WorkJob};
+use crate::admin::model::{AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo};
+use chrono::Days;
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmHistoryLogger, VmStateCache,
+    WorkCommander, WorkJob,
+};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use log::{error, info};
 use rocket::{delete, get, post, put, State};
-use chrono::Days;
 use serde::Deserialize;
 use std::sync::Arc;
 
 /// List all VMs with pagination and filtering
-#[get("/api/admin/v1/vms?<limit>&<offset>&<user_id>&<host_id>&<pubkey>&<region_id>&<include_deleted>")]
+#[get(
+    "/api/admin/v1/vms?<limit>&<offset>&<user_id>&<host_id>&<pubkey>&<region_id>&<include_deleted>"
+)]
 pub async fn admin_list_vms(
     auth: AdminAuth,
     db: &State<Arc<dyn LNVpsDb>>,
@@ -160,7 +165,7 @@ pub async fn admin_start_vm(
             vm_id: id,
             admin_user_id: Some(auth.user_id),
         };
-        
+
         match commander.send_job(start_job).await {
             Ok(stream_id) => {
                 info!("VM start job queued with stream ID: {}", stream_id);
@@ -203,7 +208,7 @@ pub async fn admin_stop_vm(
             vm_id: id,
             admin_user_id: Some(auth.user_id),
         };
-        
+
         match commander.send_job(stop_job).await {
             Ok(stream_id) => {
                 info!("VM stop job queued with stream ID: {}", stream_id);
@@ -253,7 +258,7 @@ pub async fn admin_delete_vm(
 
     // Extract reason from request
     let reason = req.and_then(|r| r.reason.clone());
-    
+
     // Check if WorkCommander is available for distributed processing
     if let Some(commander) = work_commander.as_ref() {
         // Send delete job via Redis stream for distributed processing
@@ -262,7 +267,7 @@ pub async fn admin_delete_vm(
             reason,
             admin_user_id: Some(auth.user_id),
         };
-        
+
         match commander.send_job(delete_job).await {
             Ok(stream_id) => {
                 info!("VM deletion job queued with stream ID: {}", stream_id);
@@ -320,15 +325,18 @@ pub async fn admin_extend_vm(
         "admin_action": true
     }));
 
-    if let Err(e) = vm_history_logger.log_vm_extended(
-        id,
-        Some(auth.user_id),
-        old_expires,
-        new_expires,
-        req.days,
-        req.reason.clone(),
-        metadata,
-    ).await {
+    if let Err(e) = vm_history_logger
+        .log_vm_extended(
+            id,
+            Some(auth.user_id),
+            old_expires,
+            new_expires,
+            req.days,
+            req.reason.clone(),
+            metadata,
+        )
+        .await
+    {
         error!("Failed to log VM {} extension: {}", id, e);
     }
 
@@ -360,7 +368,7 @@ pub async fn admin_list_vm_history(
 
     // Get VM history with pagination
     let history_entries = db.list_vm_history_paginated(vm_id, limit, offset).await?;
-    
+
     // For total count, we'll get all history entries and count them
     // This is not ideal for large datasets, but works for now
     let all_history = db.list_vm_history(vm_id).await?;
@@ -368,7 +376,8 @@ pub async fn admin_list_vm_history(
 
     let mut admin_history = Vec::new();
     for history in history_entries {
-        let admin_history_info = AdminVmHistoryInfo::from_vm_history_with_admin_data(db, &history).await?;
+        let admin_history_info =
+            AdminVmHistoryInfo::from_vm_history_with_admin_data(db, &history).await?;
         admin_history.push(admin_history_info);
     }
 
@@ -397,8 +406,9 @@ pub async fn admin_get_vm_history(
         return ApiData::err("History entry does not belong to this VM");
     }
 
-    let admin_history_info = AdminVmHistoryInfo::from_vm_history_with_admin_data(db, &history).await?;
-    
+    let admin_history_info =
+        AdminVmHistoryInfo::from_vm_history_with_admin_data(db, &history).await?;
+
     ApiData::ok(admin_history_info)
 }
 
@@ -451,8 +461,7 @@ pub async fn admin_get_vm_payment(
     let _vm = db.get_vm(vm_id).await?;
 
     // Decode payment ID from hex
-    let payment_id_bytes = hex::decode(&payment_id)
-        .map_err(|_| "Invalid payment ID format")?;
+    let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
 
     // Get payment
     let payment = db.get_vm_payment(&payment_id_bytes).await?;
@@ -463,6 +472,6 @@ pub async fn admin_get_vm_payment(
     }
 
     let admin_payment_info = AdminVmPaymentInfo::from_vm_payment(&payment);
-    
+
     ApiData::ok(admin_payment_info)
 }

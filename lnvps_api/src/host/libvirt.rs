@@ -1,5 +1,3 @@
-use lnvps_api_common::VmRunningStates;
-use lnvps_api_common::VmRunningState;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
@@ -8,6 +6,8 @@ use crate::settings::QemuConfig;
 use crate::KB;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
+use lnvps_api_common::VmRunningState;
+use lnvps_api_common::VmRunningStates;
 use lnvps_db::{async_trait, LNVpsDb, Vm, VmOsImage};
 use log::info;
 use rand::random;
@@ -187,6 +187,10 @@ impl VmHostClient for LibVirtHost {
     }
 
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()> {
+        todo!()
+    }
+
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> Result<()> {
         todo!()
     }
 
@@ -630,7 +634,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
-            firewall_config: None
+            firewall_config: None,
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
         let xml = host.create_domain_xml(&cfg)?;
@@ -661,7 +665,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
-            firewall_config: None
+            firewall_config: None,
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
         println!("{:?}", host.get_info().await?);

@@ -1,12 +1,12 @@
 use lnvps_db::nostr::LNVPSNostrDb;
 use log::info;
+use rocket::http::ContentType;
 use rocket::request::{FromRequest, Outcome};
 use rocket::serde::json::Json;
 use rocket::{Request, Route, State, routes};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use rocket::http::ContentType;
 
 pub fn routes() -> Vec<Route> {
     routes![get_index, nostr_address]

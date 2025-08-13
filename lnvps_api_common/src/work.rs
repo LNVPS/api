@@ -1,6 +1,10 @@
-use serde::{Deserialize, Serialize};
+use crate::model::UpgradeConfig;
 use anyhow::Result;
-use redis::{AsyncCommands, streams::{StreamReadOptions, StreamReadReply}, FromRedisValue};
+use redis::{
+    streams::{StreamReadOptions, StreamReadReply},
+    AsyncCommands, FromRedisValue,
+};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WorkJob {
@@ -19,7 +23,7 @@ pub enum WorkJob {
         title: Option<String>,
     },
     /// Delete a VM at admin request
-    DeleteVm { 
+    DeleteVm {
         vm_id: u64,
         reason: Option<String>,
         admin_user_id: Option<u64>,
@@ -36,6 +40,8 @@ pub enum WorkJob {
     },
     /// Check all nostr domains DNS records - enable disabled domains with DNS records, disable active domains without DNS records
     CheckNostrDomains,
+    /// Process VM upgrade after payment confirmation
+    ProcessVmUpgrade { vm_id: u64, config: UpgradeConfig },
 }
 
 pub struct WorkCommander {
@@ -47,7 +53,7 @@ pub struct WorkCommander {
 impl WorkCommander {
     pub fn new(redis_url: &str, group_name: &str, consumer_name: &str) -> Result<Self> {
         let redis = redis::Client::open(redis_url)?;
-        Ok(Self { 
+        Ok(Self {
             redis,
             group_name: group_name.to_string(),
             consumer_name: consumer_name.to_string(),
@@ -65,39 +71,39 @@ impl WorkCommander {
 
     pub async fn ensure_group_exists(&self) -> Result<()> {
         let mut conn = self.redis.get_multiplexed_async_connection().await?;
-        
+
         // Try to create the group with MKSTREAM option, ignore error if it already exists
-        let _: Result<String, _> = conn.xgroup_create_mkstream("worker", &self.group_name, "$").await;
+        let _: Result<String, _> = conn
+            .xgroup_create_mkstream("worker", &self.group_name, "$")
+            .await;
         Ok(())
     }
 
     pub async fn send_job(&self, job: WorkJob) -> Result<String> {
         let mut conn = self.redis.get_multiplexed_async_connection().await?;
         let job_json = serde_json::to_string(&job)?;
-        
+
         let fields = &[("job", job_json.as_str())];
-        
+
         let stream_id: String = conn.xadd("worker", "*", fields).await?;
         Ok(stream_id)
     }
 
     pub async fn listen_for_jobs(&self) -> Result<Vec<(String, WorkJob)>> {
         let mut conn = self.redis.get_multiplexed_async_connection().await?;
-        
+
         // Ensure the consumer group exists
         self.ensure_group_exists().await?;
-        
+
         let opts = StreamReadOptions::default()
             .count(10)
             .block(1000)
             .group(&self.group_name, &self.consumer_name);
-        
-        let results: StreamReadReply = conn
-            .xread_options(&["worker"], &[">"], &opts)
-            .await?;
-        
+
+        let results: StreamReadReply = conn.xread_options(&["worker"], &[">"], &opts).await?;
+
         let mut jobs = Vec::new();
-        
+
         for stream_key in results.keys {
             for stream_id in stream_key.ids {
                 if let Some(job_value) = stream_id.map.get("job") {
@@ -114,7 +120,7 @@ impl WorkCommander {
                 }
             }
         }
-        
+
         Ok(jobs)
     }
 

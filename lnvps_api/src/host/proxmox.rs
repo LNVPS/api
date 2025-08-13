@@ -17,12 +17,30 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::io::Write;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
+
+// Custom deserializer to handle Proxmox's integer-to-boolean conversion for KVM field
+fn deserialize_int_to_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrBool {
+        Int(i32),
+        Bool(bool),
+    }
+
+    match IntOrBool::deserialize(deserializer) {
+        Ok(IntOrBool::Int(i)) => Ok(Some(i != 0)),
+        Ok(IntOrBool::Bool(b)) => Ok(Some(b)),
+        Err(_) => Ok(None), // Return None for missing/invalid values, serde default will handle it
+    }
+}
 
 pub struct ProxmoxClient {
     api: JsonApi,
@@ -124,6 +142,17 @@ impl ProxmoxClient {
         } else {
             Err(anyhow!("Failed to configure VM"))
         }
+    }
+
+    /// Get a VM current config
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
+    pub async fn get_vm_config(&self, node: &str, vm_id: ProxmoxVmId) -> Result<HashedVmConfig> {
+        let rsp: ResponseBase<HashedVmConfig> = self
+            .api
+            .get(&format!("/api2/json/nodes/{}/qemu/{}/config", node, vm_id))
+            .await?;
+        Ok(rsp.data)
     }
 
     /// Configure a VM
@@ -654,6 +683,7 @@ impl ProxmoxClient {
 
         let vm_resources = value.resources()?;
         Ok(VmConfig {
+            name: Some(format!("VM{}", value.vm.id)), // set name to DB name
             cpu: Some(self.config.cpu.clone()),
             kvm: Some(self.config.kvm),
             ip_config: Some(ip_config.join(",")),
@@ -882,6 +912,19 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> Result<()> {
+        let task = self
+            .resize_disk(ResizeDiskRequest {
+                node: self.node.clone(),
+                vm_id: cfg.vm.id.into(),
+                disk: "scsi0".to_string(),
+                size: cfg.resources()?.disk_size.to_string(),
+            })
+            .await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
     async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState> {
         let s = self.get_vm_status(&self.node, vm.id.into()).await?;
         Ok(s.into())
@@ -900,18 +943,24 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()> {
+        let current_config = self.get_vm_config(&self.node, cfg.vm.id.into()).await?;
+
         let mut config = self.make_config(cfg)?;
 
         // dont re-create the disks
         config.scsi_0 = None;
         config.scsi_1 = None;
         config.efi_disk_0 = None;
+        if current_config.config.ssh_keys == config.ssh_keys {
+            config.ssh_keys = None;
+        }
 
         self.configure_vm(ConfigureVm {
             node: self.node.clone(),
             vm_id: cfg.vm.id.into(),
             current: None,
             snapshot: None,
+            digest: Some(current_config.digest),
             config,
         })
         .await?;
@@ -1423,6 +1472,15 @@ pub struct ConfigureVm {
     pub current: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(flatten)]
+    pub config: VmConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct HashedVmConfig {
+    pub digest: String,
     #[serde(flatten)]
     pub config: VmConfig,
 }
@@ -1431,6 +1489,7 @@ pub struct ConfigureVm {
 pub struct VmConfig {
     #[serde(rename = "onboot")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_int_to_bool")]
     pub on_boot: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balloon: Option<i32>,
@@ -1475,6 +1534,7 @@ pub struct VmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub efi_disk_0: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_int_to_bool")]
     pub kvm: Option<bool>,
     #[serde(rename = "serial0")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1682,5 +1742,38 @@ mod tests {
             )
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_kvm_field_deserializes_integer_to_bool() {
+        // Test that KVM field can deserialize from integer (as Proxmox sends it)
+        let json_with_int = r#"{"kvm":1}"#;
+        let config: VmConfig =
+            serde_json::from_str(json_with_int).expect("Should deserialize integer to bool");
+        assert_eq!(config.kvm, Some(true));
+
+        let json_with_zero = r#"{"kvm":0}"#;
+        let config: VmConfig =
+            serde_json::from_str(json_with_zero).expect("Should deserialize 0 to false");
+        assert_eq!(config.kvm, Some(false));
+
+        // Test that it still works with boolean values
+        let json_with_bool = r#"{"kvm":true}"#;
+        let config: VmConfig =
+            serde_json::from_str(json_with_bool).expect("Should deserialize boolean");
+        assert_eq!(config.kvm, Some(true));
+
+        // Test null/missing value
+        let json_empty = r#"{}"#;
+        let config: VmConfig =
+            serde_json::from_str(json_empty).expect("Should handle missing field");
+        assert_eq!(config.kvm, None);
+
+        // Test the actual JSON from the error message to ensure it parses correctly
+        let actual_proxmox_json = r#"{"smbios1":"uuid=42ecc256-a7c5-4d93-b630-0e7a06c051c2","cpu":"host","scsihw":"virtio-scsi-pci","bios":"ovmf","ostype":"l26","serial0":"socket","net0":"virtio=bc:24:11:4e:8f:d1,bridge=vmbr0,firewall=1","meta":"creation-qemu=10.0.2,ctime=1754900283","scsi0":"local-zfs:vm-111-disk-1,discard=on,size=160G,ssd=1","scsi1":"local-zfs:vm-111-cloudinit,media=cdrom","vmgenid":"abac705c-31ed-4b75-8587-8c86d5c810c4","digest":"18389648fd69603dd93ab0c443e1f32267f6c436","efidisk0":"local-zfs:vm-111-disk-0,efitype=4m,size=1M","machine":"q35","kvm":1,"onboot":1,"sshkeys":"ssh-ed25519%20AAAAC3NzaC1lZDI1NTE5AAAAILnyd2niY8ht8KRea6M6y%2BTBx08F7zRdhBlKjk7aywMT","memory":"4096","cores":4,"ipconfig0":"ip=10.100.1.174/24,gw=10.100.1.1,ip6=auto","boot":"order=scsi0"}"#;
+        let config: VmConfig = serde_json::from_str(actual_proxmox_json)
+            .expect("Should deserialize actual Proxmox JSON");
+        assert_eq!(config.kvm, Some(true)); // kvm:1 should become Some(true)
+        assert_eq!(config.on_boot, Some(true)); // onboot:1 should become Some(true)
     }
 }

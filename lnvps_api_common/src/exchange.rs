@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::ops::Sub;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -71,8 +72,11 @@ impl Display for Ticker {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub struct TickerRate(pub Ticker, pub f32);
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct TickerRate {
+    pub ticker: Ticker,
+    pub rate: f32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CurrencyAmount(Currency, u64);
@@ -114,9 +118,46 @@ impl CurrencyAmount {
     }
 }
 
+impl Sub for CurrencyAmount {
+    type Output = Result<CurrencyAmount>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        ensure!(self.0 == rhs.0, "Currency doesnt match");
+        Ok(CurrencyAmount::from_u64(self.0, self.1 - rhs.1))
+    }
+}
+
+impl Display for CurrencyAmount {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Currency::BTC => write!(f, "BTC {:.8}", self.value_f32()),
+            _ => write!(f, "{} {:.2}", self.0, self.value_f32()),
+        }
+    }
+}
+
+/// A currency amount converted into a new amount using exchange rates
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConvertedCurrencyAmount {
+    pub amount: CurrencyAmount,
+    pub rate: TickerRate,
+}
+
+impl Sub for ConvertedCurrencyAmount {
+    type Output = Result<ConvertedCurrencyAmount>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        ensure!(self.rate.ticker == rhs.rate.ticker, "Exchange doesnt match");
+        Ok(ConvertedCurrencyAmount {
+            amount: (self.amount - rhs.amount)?,
+            rate: self.rate,
+        })
+    }
+}
+
 impl TickerRate {
     pub fn can_convert(&self, currency: Currency) -> bool {
-        currency == self.0 .0 || currency == self.0 .1
+        currency == self.ticker.0 || currency == self.ticker.1
     }
 
     /// Convert from the source currency into the target currency
@@ -125,17 +166,33 @@ impl TickerRate {
             self.can_convert(source.0),
             "Cant convert, currency doesnt match"
         );
-        if source.0 == self.0 .0 {
+        if source.0 == self.ticker.0 {
             Ok(CurrencyAmount::from_f32(
-                self.0 .1,
-                source.value_f32() * self.1,
+                self.ticker.1,
+                source.value_f32() * self.rate,
             ))
         } else {
             Ok(CurrencyAmount::from_f32(
-                self.0 .0,
-                source.value_f32() / self.1,
+                self.ticker.0,
+                source.value_f32() / self.rate,
             ))
         }
+    }
+
+    pub fn passthrough(currency: Currency) -> Self {
+        Self {
+            ticker: Ticker(currency, currency),
+            rate: 1.0,
+        }
+    }
+
+    /// Convert from the source currency into the target currency and return ConvertedCurrencyAmount
+    pub fn convert_with_rate(&self, source: CurrencyAmount) -> Result<ConvertedCurrencyAmount> {
+        let converted_amount = self.convert(source)?;
+        Ok(ConvertedCurrencyAmount {
+            amount: converted_amount,
+            rate: *self,
+        })
     }
 }
 
@@ -184,25 +241,46 @@ impl ExchangeRateService for DefaultRateCache {
 
         let mut ret = vec![];
         if let Some(usd) = rates.usd {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::USD), usd));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::USD),
+                rate: usd,
+            });
         }
         if let Some(eur) = rates.eur {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::EUR), eur));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::EUR),
+                rate: eur,
+            });
         }
         if let Some(gbp) = rates.gbp {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::GBP), gbp));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::GBP),
+                rate: gbp,
+            });
         }
         if let Some(cad) = rates.cad {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::CAD), cad));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::CAD),
+                rate: cad,
+            });
         }
         if let Some(chf) = rates.chf {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::CHF), chf));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::CHF),
+                rate: chf,
+            });
         }
         if let Some(aud) = rates.aud {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::AUD), aud));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::AUD),
+                rate: aud,
+            });
         }
         if let Some(jpy) = rates.jpy {
-            ret.push(TickerRate(Ticker(Currency::BTC, Currency::JPY), jpy));
+            ret.push(TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::JPY),
+                rate: jpy,
+            });
         }
 
         Ok(ret)
@@ -221,7 +299,13 @@ impl ExchangeRateService for DefaultRateCache {
 
     async fn list_rates(&self) -> Result<Vec<TickerRate>> {
         let cache = self.cache.read().await;
-        Ok(cache.iter().map(|(k, v)| TickerRate(*k, *v)).collect())
+        Ok(cache
+            .iter()
+            .map(|(k, v)| TickerRate {
+                ticker: *k,
+                rate: *v,
+            })
+            .collect())
     }
 }
 
@@ -251,7 +335,10 @@ mod tests {
     #[test]
     fn convert() {
         let ticker = Ticker::btc_rate("EUR").unwrap();
-        let f = TickerRate(ticker, RATE);
+        let f = TickerRate {
+            ticker: ticker,
+            rate: RATE,
+        };
 
         assert_eq!(
             f.convert(CurrencyAmount::from_f32(Currency::EUR, 5.0))

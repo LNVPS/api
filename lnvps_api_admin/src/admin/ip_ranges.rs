@@ -1,5 +1,7 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminIpRangeAllocationMode, AdminIpRangeInfo, CreateIpRangeRequest, UpdateIpRangeRequest};
+use crate::admin::model::{
+    AdminIpRangeAllocationMode, AdminIpRangeInfo, CreateIpRangeRequest, UpdateIpRangeRequest,
+};
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode, LNVpsDb};
 use rocket::serde::json::Json;
@@ -142,14 +144,14 @@ pub async fn admin_create_ip_range(
 
     // Fetch the created IP range to return
     let created_ip_range = db.admin_get_ip_range(ip_range_id).await?;
-    
+
     // Get region name
     let region_name = match db.get_host_region(created_ip_range.region_id).await {
         Ok(region) => Some(region.name),
         Err(_) => None,
     };
 
-    // Get access policy name if set  
+    // Get access policy name if set
     let access_policy_name = if let Some(policy_id) = created_ip_range.access_policy_id {
         match db.get_access_policy(policy_id).await {
             Ok(policy) => Some(policy.name),
@@ -216,7 +218,10 @@ pub async fn admin_update_ip_range(
     }
 
     if let Some(reverse_zone_id) = &req.reverse_zone_id {
-        ip_range.reverse_zone_id = reverse_zone_id.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        ip_range.reverse_zone_id = reverse_zone_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
     }
 
     if let Some(access_policy_id) = &req.access_policy_id {
@@ -247,7 +252,7 @@ pub async fn admin_update_ip_range(
 
     // Return updated IP range
     let assignment_count = db.admin_count_ip_range_assignments(id).await.unwrap_or(0);
-    
+
     // Get region name
     let region_name = match db.get_host_region(ip_range.region_id).await {
         Ok(region) => Some(region.name),

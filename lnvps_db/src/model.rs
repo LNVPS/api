@@ -496,6 +496,7 @@ pub struct VmPayment {
     pub amount: u64,
     pub currency: String,
     pub payment_method: PaymentMethod,
+    pub payment_type: PaymentType,
     /// External data (invoice / json)
     pub external_data: String,
     /// External id on other system
@@ -507,6 +508,8 @@ pub struct VmPayment {
     pub time_value: u64,
     /// Taxes to charge on payment
     pub tax: u64,
+    /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
+    pub upgrade_params: Option<String>,
 }
 
 /// VM Payment with company information for time-series reporting
@@ -519,6 +522,7 @@ pub struct VmPaymentWithCompany {
     pub amount: u64,
     pub currency: String,
     pub payment_method: PaymentMethod,
+    pub payment_type: PaymentType,
     /// External data (invoice / json)
     pub external_data: String,
     /// External id on other system
@@ -530,6 +534,8 @@ pub struct VmPaymentWithCompany {
     pub time_value: u64,
     /// Taxes to charge on payment
     pub tax: u64,
+    /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
+    pub upgrade_params: Option<String>,
     // Company information
     pub company_id: u64,
     pub company_name: String,
@@ -543,6 +549,14 @@ pub enum PaymentMethod {
     Lightning,
     Revolut,
     Paypal,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
+#[repr(u16)]
+pub enum PaymentType {
+    #[default]
+    Renewal = 0,
+    Upgrade = 1,
 }
 
 impl Display for PaymentMethod {
@@ -564,6 +578,27 @@ impl FromStr for PaymentMethod {
             "revolut" => Ok(PaymentMethod::Revolut),
             "paypal" => Ok(PaymentMethod::Paypal),
             _ => bail!("Unknown payment method: {}", s),
+        }
+    }
+}
+
+impl Display for PaymentType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaymentType::Renewal => write!(f, "Renewal"),
+            PaymentType::Upgrade => write!(f, "Upgrade"),
+        }
+    }
+}
+
+impl FromStr for PaymentType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "renewal" => Ok(PaymentType::Renewal),
+            "upgrade" => Ok(PaymentType::Upgrade),
+            _ => bail!("Unknown payment type: {}", s),
         }
     }
 }

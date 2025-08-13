@@ -1,7 +1,8 @@
 use crate::{
-    AccessPolicy, Company, IpRange, LNVpsDbBase, Router, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate, RegionStats,
+    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType, RegionStats, Router,
+    User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment};
@@ -9,7 +10,6 @@ use crate::{AdminDb, AdminRole, AdminRoleAssignment};
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use sqlx::{Executor, MySqlPool, Row};
 
 #[derive(Clone)]
@@ -184,7 +184,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await
         .map_err(Error::new)?;
 
-        // Get paginated results  
+        // Get paginated results
         let hosts = sqlx::query_as(
             "SELECT h.* FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
         )
@@ -197,7 +197,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok((hosts, total as u64))
     }
 
-    async fn list_hosts_with_regions_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    async fn list_hosts_with_regions_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
@@ -236,14 +240,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 load_disk: row.get("load_disk"),
                 vlan_id: row.get("vlan_id"),
             };
-            
+
             let region = VmHostRegion {
                 id: row.get("region_id"),
                 name: row.get("region_name"),
                 enabled: row.get("region_enabled"),
                 company_id: row.get("region_company_id"),
             };
-            
+
             results.push((host, region));
         }
 
@@ -465,11 +469,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn count_active_vms_on_host(&self, host_id: u64) -> Result<u64> {
-        let result: (i64,) = sqlx::query_as("select count(*) from vm where deleted = 0 and host_id = ?")
-            .bind(host_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let result: (i64,) =
+            sqlx::query_as("select count(*) from vm where deleted = 0 and host_id = ?")
+                .bind(host_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::new)?;
         Ok(result.0 as u64)
     }
 
@@ -526,10 +531,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> Result<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
+            .bind(vm.custom_template_id)
             .bind(vm.ssh_key_id)
             .bind(vm.expires)
             .bind(vm.disk_id)
@@ -613,17 +619,36 @@ impl LNVpsDbBase for LNVpsDbMysql {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<VmPayment>> {
-        sqlx::query_as("select * from vm_payment where vm_id = ? order by created desc limit ? offset ?")
-            .bind(vm_id)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+        sqlx::query_as(
+            "select * from vm_payment where vm_id = ? order by created desc limit ? offset ?",
+        )
+        .bind(vm_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::new)
+    }
+
+    async fn list_vm_payment_by_method_and_type(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        payment_type: PaymentType,
+    ) -> Result<Vec<VmPayment>> {
+        sqlx::query_as(
+            "select * from vm_payment where vm_id = ? and payment_method = ? and payment_type = ? and expires > NOW() and is_paid = false order by created desc",
+        )
+        .bind(vm_id)
+        .bind(method)
+        .bind(payment_type)
+        .fetch_all(&self.db)
+        .await
+        .map_err(Error::new)
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,currency,payment_method,time_value,is_paid,rate,external_id,external_data) values(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
             .bind(vm_payment.vm_id)
             .bind(vm_payment.created)
@@ -632,11 +657,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm_payment.tax)
             .bind(&vm_payment.currency)
             .bind(vm_payment.payment_method)
+            .bind(vm_payment.payment_type)
             .bind(vm_payment.time_value)
             .bind(vm_payment.is_paid)
             .bind(vm_payment.rate)
             .bind(&vm_payment.external_id)
             .bind(&vm_payment.external_data)
+            .bind(&vm_payment.upgrade_params)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
@@ -701,7 +728,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .map_err(Error::new)
     }
 
-
     async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>> {
         sqlx::query_as("select * from vm_custom_pricing where region_id = ? and enabled = 1")
             .bind(region_id)
@@ -738,6 +764,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await
             .map_err(Error::new)?
             .try_get(0)?)
+    }
+
+    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<()> {
+        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=? where id=?")
+            .bind(template.cpu)
+            .bind(template.memory)
+            .bind(template.disk_size)
+            .bind(template.disk_type)
+            .bind(template.disk_interface)
+            .bind(template.pricing_id)
+            .bind(template.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(())
     }
 
     async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>> {
@@ -794,7 +835,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
              JOIN vm_host vh ON v.host_id = vh.id  
              JOIN vm_host_region vhr ON vh.region_id = vhr.id
              LEFT JOIN company c ON vhr.company_id = c.id
-             WHERE v.id = ?"
+             WHERE v.id = ?",
         )
         .bind(vm_id)
         .fetch_one(&self.db)
@@ -985,18 +1026,22 @@ impl LNVPSNostrDb for LNVpsDbMysql {
     }
 
     async fn enable_domain(&self, domain_id: u64) -> Result<()> {
-        sqlx::query("update nostr_domain set enabled=1, last_status_change=CURRENT_TIMESTAMP where id=?")
-            .bind(domain_id)
-            .execute(&self.db)
-            .await?;
+        sqlx::query(
+            "update nostr_domain set enabled=1, last_status_change=CURRENT_TIMESTAMP where id=?",
+        )
+        .bind(domain_id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
     async fn disable_domain(&self, domain_id: u64) -> Result<()> {
-        sqlx::query("update nostr_domain set enabled=0, last_status_change=CURRENT_TIMESTAMP where id=?")
-            .bind(domain_id)
-            .execute(&self.db)
-            .await?;
+        sqlx::query(
+            "update nostr_domain set enabled=0, last_status_change=CURRENT_TIMESTAMP where id=?",
+        )
+        .bind(domain_id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 }
@@ -1365,7 +1410,11 @@ impl AdminDb for LNVpsDbMysql {
         Ok((users, total))
     }
 
-    async fn admin_list_regions(&self, limit: u64, offset: u64) -> Result<(Vec<VmHostRegion>, u64)> {
+    async fn admin_list_regions(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<VmHostRegion>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host_region")
             .fetch_one(&self.db)
@@ -1374,7 +1423,7 @@ impl AdminDb for LNVpsDbMysql {
 
         // Get paginated results
         let regions = sqlx::query_as::<_, VmHostRegion>(
-            "SELECT * FROM vm_host_region ORDER BY name LIMIT ? OFFSET ?"
+            "SELECT * FROM vm_host_region ORDER BY name LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -1387,7 +1436,7 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_region(&self, name: &str, company_id: Option<u64>) -> Result<u64> {
         let id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id"
+            "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(true) // New regions are enabled by default
@@ -1400,32 +1449,32 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_update_region(&self, region: &VmHostRegion) -> Result<()> {
-        sqlx::query(
-            "UPDATE vm_host_region SET name = ?, enabled = ?, company_id = ? WHERE id = ?"
-        )
-        .bind(&region.name)
-        .bind(region.enabled)
-        .bind(region.company_id)
-        .bind(region.id)
-        .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        sqlx::query("UPDATE vm_host_region SET name = ?, enabled = ?, company_id = ? WHERE id = ?")
+            .bind(&region.name)
+            .bind(region.enabled)
+            .bind(region.company_id)
+            .bind(region.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
 
         Ok(())
     }
 
     async fn admin_delete_region(&self, region_id: u64) -> Result<()> {
         // First check if any hosts are assigned to this region
-        let host_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host WHERE region_id = ?"
-        )
-        .bind(region_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        let host_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
+                .bind(region_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::new)?;
 
         if host_count > 0 {
-            return Err(anyhow::anyhow!("Cannot delete region with {} assigned hosts", host_count));
+            return Err(anyhow::anyhow!(
+                "Cannot delete region with {} assigned hosts",
+                host_count
+            ));
         }
 
         // Disable the region instead of deleting to preserve referential integrity
@@ -1440,13 +1489,11 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_count_region_hosts(&self, region_id: u64) -> Result<u64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host WHERE region_id = ?"
-        )
-        .bind(region_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
+            .bind(region_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?;
 
         Ok(count as u64)
     }
@@ -1466,7 +1513,7 @@ impl AdminDb for LNVpsDbMysql {
             LEFT JOIN vm v ON v.host_id = h.id
             LEFT JOIN vm_ip_assignment ip ON ip.vm_id = v.id AND ip.deleted = 0
             WHERE h.region_id = ?
-            "#
+            "#,
         )
         .bind(region_id)
         .fetch_one(&self.db)
@@ -1482,10 +1529,14 @@ impl AdminDb for LNVpsDbMysql {
         })
     }
 
-    async fn admin_list_vm_os_images(&self, limit: u64, offset: u64) -> Result<(Vec<VmOsImage>, u64)> {
+    async fn admin_list_vm_os_images(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<VmOsImage>, u64)> {
         // Get paginated list of VM OS images
         let images = sqlx::query_as::<_, VmOsImage>(
-            "SELECT * FROM vm_os_image ORDER BY id LIMIT ? OFFSET ?"
+            "SELECT * FROM vm_os_image ORDER BY id LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -1563,7 +1614,10 @@ impl AdminDb for LNVpsDbMysql {
             .map_err(Error::new)?;
 
         if vm_count.0 > 0 {
-            bail!("Cannot delete VM OS image: {} VMs are using this image", vm_count.0);
+            bail!(
+                "Cannot delete VM OS image: {} VMs are using this image",
+                vm_count.0
+            );
         }
 
         sqlx::query("DELETE FROM vm_os_image WHERE id = ?")
@@ -1575,10 +1629,14 @@ impl AdminDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn list_vm_templates_paginated(&self, limit: i64, offset: i64) -> Result<(Vec<VmTemplate>, i64)> {
+    async fn list_vm_templates_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<VmTemplate>, i64)> {
         // Get paginated list of VM templates
         let templates = sqlx::query_as::<_, VmTemplate>(
-            "SELECT * FROM vm_template ORDER BY id LIMIT ? OFFSET ?"
+            "SELECT * FROM vm_template ORDER BY id LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -1601,7 +1659,7 @@ impl AdminDb for LNVpsDbMysql {
                name = ?, enabled = ?, expires = ?, cpu = ?, memory = ?, 
                disk_size = ?, disk_type = ?, disk_interface = ?, 
                cost_plan_id = ?, region_id = ?
-               WHERE id = ?"#
+               WHERE id = ?"#,
         )
         .bind(&template.name)
         .bind(template.enabled)
@@ -1638,10 +1696,14 @@ impl AdminDb for LNVpsDbMysql {
         Ok(count.0)
     }
 
-    async fn admin_list_hosts_with_regions_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    async fn admin_list_hosts_with_regions_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
         // Get total count (including disabled hosts)
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.region_id = hr.id"
+            "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.region_id = hr.id",
         )
         .fetch_one(&self.db)
         .await
@@ -1747,7 +1809,11 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn delete_custom_pricing(&self, id: u64) -> Result<()> {
         let query = "DELETE FROM vm_custom_pricing WHERE id = ?";
-        let result = sqlx::query(query).bind(id).execute(&self.db).await.map_err(Error::new)?;
+        let result = sqlx::query(query)
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
 
         if result.rows_affected() == 0 {
             bail!("Custom pricing model not found");
@@ -1776,7 +1842,11 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> Result<()> {
         let query = "DELETE FROM vm_custom_pricing_disk WHERE pricing_id = ?";
-        sqlx::query(query).bind(pricing_id).execute(&self.db).await.map_err(Error::new)?;
+        sqlx::query(query)
+            .bind(pricing_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
         Ok(())
     }
 
@@ -1792,7 +1862,12 @@ impl AdminDb for LNVpsDbMysql {
         Ok(count as u64)
     }
 
-    async fn list_custom_templates_by_pricing_paginated(&self, pricing_id: u64, limit: i64, offset: i64) -> Result<(Vec<VmCustomTemplate>, u64)> {
+    async fn list_custom_templates_by_pricing_paginated(
+        &self,
+        pricing_id: u64,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<VmCustomTemplate>, u64)> {
         let total = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vm_custom_template WHERE pricing_id = ?",
         )
@@ -1835,13 +1910,12 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn get_custom_template(&self, id: u64) -> Result<VmCustomTemplate> {
-        let template = sqlx::query_as::<_, VmCustomTemplate>(
-            "SELECT * FROM vm_custom_template WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        let template =
+            sqlx::query_as::<_, VmCustomTemplate>("SELECT * FROM vm_custom_template WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::new)?;
 
         Ok(template)
     }
@@ -1874,7 +1948,11 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn delete_custom_template(&self, id: u64) -> Result<()> {
         let query = "DELETE FROM vm_custom_template WHERE id = ?";
-        let result = sqlx::query(query).bind(id).execute(&self.db).await.map_err(Error::new)?;
+        let result = sqlx::query(query)
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
 
         if result.rows_affected() == 0 {
             bail!("Custom template not found");
@@ -1973,7 +2051,7 @@ impl AdminDb for LNVpsDbMysql {
         let region_count = self.admin_count_company_regions(company_id).await?;
         if region_count > 0 {
             return Err(anyhow::anyhow!(
-                "Cannot delete company with {} assigned regions", 
+                "Cannot delete company with {} assigned regions",
                 region_count
             ));
         }
@@ -1999,7 +2077,11 @@ impl AdminDb for LNVpsDbMysql {
         Ok(count as u64)
     }
 
-    async fn admin_get_payments_by_date_range(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>) -> Result<Vec<VmPayment>> {
+    async fn admin_get_payments_by_date_range(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<VmPayment>> {
         sqlx::query_as(
             "SELECT * FROM vm_payment WHERE created >= ? AND created < ? AND is_paid = true ORDER BY created",
         )
@@ -2010,7 +2092,12 @@ impl AdminDb for LNVpsDbMysql {
         .map_err(Error::new)
     }
 
-    async fn admin_get_payments_by_date_range_and_company(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64) -> Result<Vec<VmPayment>> {
+    async fn admin_get_payments_by_date_range_and_company(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+    ) -> Result<Vec<VmPayment>> {
         sqlx::query_as(
             "SELECT vp.* FROM vm_payment vp
              JOIN vm v ON vp.vm_id = v.id
@@ -2027,7 +2114,13 @@ impl AdminDb for LNVpsDbMysql {
         .map_err(Error::new)
     }
 
-    async fn admin_get_payments_with_company_info(&self, start_date: chrono::DateTime<chrono::Utc>, end_date: chrono::DateTime<chrono::Utc>, company_id: u64, currency: Option<&str>) -> Result<Vec<VmPaymentWithCompany>> {
+    async fn admin_get_payments_with_company_info(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        currency: Option<&str>,
+    ) -> Result<Vec<VmPaymentWithCompany>> {
         match currency {
             Some(currency) => {
                 sqlx::query_as(
@@ -2065,7 +2158,12 @@ impl AdminDb for LNVpsDbMysql {
         }
     }
 
-    async fn admin_list_ip_ranges(&self, limit: u64, offset: u64, region_id: Option<u64>) -> Result<(Vec<IpRange>, u64)> {
+    async fn admin_list_ip_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+        region_id: Option<u64>,
+    ) -> Result<(Vec<IpRange>, u64)> {
         let (ip_ranges, total) = if let Some(region_id) = region_id {
             // Filter by region
             let ip_ranges = sqlx::query_as::<_, IpRange>(
@@ -2078,13 +2176,12 @@ impl AdminDb for LNVpsDbMysql {
             .await
             .map_err(Error::new)?;
 
-            let total = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM ip_range WHERE region_id = ?",
-            )
-            .bind(region_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            let total =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ip_range WHERE region_id = ?")
+                    .bind(region_id)
+                    .fetch_one(&self.db)
+                    .await
+                    .map_err(Error::new)?;
 
             (ip_ranges, total)
         } else {
@@ -2165,7 +2262,7 @@ impl AdminDb for LNVpsDbMysql {
         let assignment_count = self.admin_count_ip_range_assignments(ip_range_id).await?;
         if assignment_count > 0 {
             return Err(anyhow::anyhow!(
-                "Cannot delete IP range with {} active IP assignments", 
+                "Cannot delete IP range with {} active IP assignments",
                 assignment_count
             ));
         }
@@ -2198,7 +2295,11 @@ impl AdminDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn admin_list_access_policies_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<AccessPolicy>, u64)> {
+    async fn admin_list_access_policies_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<AccessPolicy>, u64)> {
         let access_policies = sqlx::query_as::<_, AccessPolicy>(
             "SELECT * FROM access_policy ORDER BY name LIMIT ? OFFSET ?",
         )
@@ -2260,10 +2361,12 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_delete_access_policy(&self, access_policy_id: u64) -> Result<()> {
         // Check if access policy is used by any IP ranges
-        let usage_count = self.admin_count_access_policy_ip_ranges(access_policy_id).await?;
+        let usage_count = self
+            .admin_count_access_policy_ip_ranges(access_policy_id)
+            .await?;
         if usage_count > 0 {
             return Err(anyhow::anyhow!(
-                "Cannot delete access policy used by {} IP ranges", 
+                "Cannot delete access policy used by {} IP ranges",
                 usage_count
             ));
         }
@@ -2296,15 +2399,18 @@ impl AdminDb for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn admin_list_routers_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<Router>, u64)> {
-        let routers = sqlx::query_as::<_, Router>(
-            "SELECT * FROM router ORDER BY name LIMIT ? OFFSET ?"
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+    async fn admin_list_routers_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<Router>, u64)> {
+        let routers =
+            sqlx::query_as::<_, Router>("SELECT * FROM router ORDER BY name LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.db)
+                .await
+                .map_err(Error::new)?;
 
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM router")
             .fetch_one(&self.db)
@@ -2324,7 +2430,7 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_router(&self, router: &Router) -> Result<u64> {
         let result = sqlx::query(
-            "INSERT INTO router (name, enabled, kind, url, token) VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO router (name, enabled, kind, url, token) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&router.name)
         .bind(router.enabled)
@@ -2340,7 +2446,7 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_update_router(&self, router: &Router) -> Result<()> {
         sqlx::query(
-            "UPDATE router SET name = ?, enabled = ?, kind = ?, url = ?, token = ? WHERE id = ?"
+            "UPDATE router SET name = ?, enabled = ?, kind = ?, url = ?, token = ? WHERE id = ?",
         )
         .bind(&router.name)
         .bind(router.enabled)
@@ -2357,13 +2463,12 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_delete_router(&self, router_id: u64) -> Result<()> {
         // Check if router is used by any access policies
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM access_policy WHERE router_id = ?"
-        )
-        .bind(router_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM access_policy WHERE router_id = ?")
+                .bind(router_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::new)?;
 
         if count.0 > 0 {
             return Err(anyhow::anyhow!(
@@ -2382,13 +2487,12 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_count_router_access_policies(&self, router_id: u64) -> Result<u64> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM access_policy WHERE router_id = ?"
-        )
-        .bind(router_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM access_policy WHERE router_id = ?")
+                .bind(router_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(Error::new)?;
 
         Ok(count.0 as u64)
     }
@@ -2406,13 +2510,12 @@ impl AdminDb for LNVpsDbMysql {
         // Resolve user_id from pubkey if provided
         let resolved_user_id = if let Some(pk) = pubkey {
             // Use SQL UNHEX to decode the pubkey and find the user
-            let user_result: Result<(u64,), _> = sqlx::query_as(
-                "SELECT id FROM users WHERE pubkey = UNHEX(?)"
-            )
-            .bind(pk)
-            .fetch_one(&self.db)
-            .await;
-            
+            let user_result: Result<(u64,), _> =
+                sqlx::query_as("SELECT id FROM users WHERE pubkey = UNHEX(?)")
+                    .bind(pk)
+                    .fetch_one(&self.db)
+                    .await;
+
             match user_result {
                 Ok((user_id,)) => Some(user_id),
                 Err(_) => return Ok((vec![], 0)), // No user found, return empty
@@ -2423,17 +2526,17 @@ impl AdminDb for LNVpsDbMysql {
 
         // Build queries using query builder
         let base_from = "vm v LEFT JOIN vm_host h ON v.host_id = h.id";
-        
+
         // Start with the base query
         let mut count_query = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM ");
         count_query.push(base_from);
-        
+
         let mut data_query = sqlx::QueryBuilder::new("SELECT v.* FROM ");
         data_query.push(base_from);
-        
+
         // Add WHERE conditions
         let mut has_conditions = false;
-        
+
         if let Some(uid) = resolved_user_id {
             if !has_conditions {
                 count_query.push(" WHERE ");
@@ -2446,7 +2549,7 @@ impl AdminDb for LNVpsDbMysql {
             count_query.push("v.user_id = ").push_bind(uid);
             data_query.push("v.user_id = ").push_bind(uid);
         }
-        
+
         if let Some(hid) = host_id {
             if !has_conditions {
                 count_query.push(" WHERE ");
@@ -2459,7 +2562,7 @@ impl AdminDb for LNVpsDbMysql {
             count_query.push("v.host_id = ").push_bind(hid);
             data_query.push("v.host_id = ").push_bind(hid);
         }
-        
+
         if let Some(rid) = region_id {
             if !has_conditions {
                 count_query.push(" WHERE ");
@@ -2472,7 +2575,7 @@ impl AdminDb for LNVpsDbMysql {
             count_query.push("h.region_id = ").push_bind(rid);
             data_query.push("h.region_id = ").push_bind(rid);
         }
-        
+
         // Handle deleted filter
         match include_deleted {
             Some(false) | None => {
@@ -2491,15 +2594,27 @@ impl AdminDb for LNVpsDbMysql {
                 // Include both deleted and non-deleted VMs - no additional filter needed
             }
         }
-        
+
         // Execute count query
-        let total: i64 = count_query.build_query_scalar().fetch_one(&self.db).await.map_err(Error::new)?;
-        
+        let total: i64 = count_query
+            .build_query_scalar()
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?;
+
         // Add ordering and pagination to data query
-        data_query.push(" ORDER BY v.id DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
-        
+        data_query
+            .push(" ORDER BY v.id DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+
         // Execute data query
-        let vms: Vec<Vm> = data_query.build_query_as().fetch_all(&self.db).await.map_err(Error::new)?;
+        let vms: Vec<Vm> = data_query
+            .build_query_as()
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)?;
 
         Ok((vms, total as u64))
     }

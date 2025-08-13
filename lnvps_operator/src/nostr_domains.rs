@@ -5,10 +5,9 @@ use k8s_openapi::api::networking::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
-use lnvps_db::{LNVpsDb, NostrDomain};
+use lnvps_db::NostrDomain;
 use log::{error, info};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use crate::{Context, Settings};
 

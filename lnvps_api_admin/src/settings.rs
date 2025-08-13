@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use lnvps_api_common::RedisConfig;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]

@@ -604,7 +604,12 @@ impl LNVpsDbBase for MockDb {
     async fn update_vm(&self, vm: &Vm) -> anyhow::Result<()> {
         let mut vms = self.vms.lock().await;
         if let Some(v) = vms.get_mut(&vm.id) {
+            v.image_id = vm.image_id;
+            v.template_id = vm.template_id;
+            v.custom_template_id = vm.custom_template_id;
             v.ssh_key_id = vm.ssh_key_id;
+            v.expires = vm.expires;
+            v.disk_id = vm.disk_id;
             v.mac_address = vm.mac_address.clone();
         }
         Ok(())
@@ -687,6 +692,28 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_vm_payment_by_method_and_type(
+        &self,
+        vm_id: u64,
+        method: lnvps_db::PaymentMethod,
+        payment_type: lnvps_db::PaymentType,
+    ) -> anyhow::Result<Vec<VmPayment>> {
+        let p = self.payments.lock().await;
+        let mut filtered: Vec<_> = p
+            .iter()
+            .filter(|p| {
+                p.vm_id == vm_id
+                    && p.payment_method == method
+                    && p.payment_type == payment_type
+                    && p.expires > Utc::now()
+                    && !p.is_paid
+            })
+            .cloned()
+            .collect();
+        filtered.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(filtered)
+    }
+
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
         let mut p = self.payments.lock().await;
         p.push(vm_payment.clone());
@@ -760,6 +787,12 @@ impl LNVpsDbBase for MockDb {
             },
         );
         Ok(max_id + 1)
+    }
+
+    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
+        let mut t = self.custom_template.lock().await;
+        t.insert(template.id, template.clone());
+        Ok(())
     }
 
     async fn list_custom_pricing_disk(
@@ -901,7 +934,12 @@ impl MockExchangeRate {
 impl ExchangeRateService for MockExchangeRate {
     async fn fetch_rates(&self) -> anyhow::Result<Vec<TickerRate>> {
         let r = self.rate.lock().await;
-        Ok(r.iter().map(|(k, v)| TickerRate(*k, *v)).collect())
+        Ok(r.iter()
+            .map(|(k, v)| TickerRate {
+                ticker: *k,
+                rate: *v,
+            })
+            .collect())
     }
 
     async fn set_rate(&self, ticker: Ticker, amount: f32) {
@@ -1243,12 +1281,14 @@ impl AdminDb for MockDb {
                                     amount: payment.amount,
                                     currency: payment.currency.clone(),
                                     payment_method: payment.payment_method,
+                                    payment_type: payment.payment_type,
                                     external_data: payment.external_data.clone(),
                                     external_id: payment.external_id.clone(),
                                     is_paid: payment.is_paid,
                                     rate: payment.rate,
                                     time_value: payment.time_value,
                                     tax: payment.tax,
+                                    upgrade_params: payment.upgrade_params.clone(),
                                     company_id: region_company_id,
                                     company_name: company.name.clone(),
                                     company_base_currency: company.base_currency.clone(),

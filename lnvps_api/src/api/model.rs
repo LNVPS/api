@@ -4,13 +4,16 @@ pub use lnvps_api_common::*;
 use crate::exchange::{alt_prices, ExchangeRateService};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use lnvps_api_common::{ApiDiskInterface, ApiDiskType, Currency};
-use lnvps_db::{PaymentMethod, VmCustomTemplate};
+use humantime::format_duration;
+use lnvps_api_common::{ApiDiskInterface, ApiDiskType, Currency, CurrencyAmount};
+use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
 use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomVmOrder {
@@ -181,6 +184,63 @@ pub struct ApiVmPayment {
     pub is_paid: bool,
     pub data: ApiPaymentData,
     pub time: u64,
+    pub is_upgrade: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_params: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ApiInvoiceItem {
+    /// Raw amount in smallest currency unit (cents for fiat, millisats for BTC)
+    pub amount: u64,
+    /// Raw tax amount in smallest currency unit (cents for fiat, millisats for BTC)
+    pub tax: u64,
+    /// Raw currency string
+    pub currency: String,
+    /// Raw duration in seconds
+    pub time: u64,
+    /// Formatted currency amount (e.g., "EUR 12.34", "BTC 0.00012345")
+    pub formatted_amount: String,
+    /// Formatted tax amount (e.g., "EUR 2.88", "BTC 0.00002879")
+    pub formatted_tax: String,
+    /// Formatted duration (e.g., "30 days", "1 month", "6 hours")
+    pub formatted_duration: String,
+}
+
+impl ApiInvoiceItem {
+    /// Creates a formatted invoice item from raw payment data
+    pub fn from_payment_data(
+        amount: u64,
+        tax: u64,
+        currency: &str,
+        time_seconds: u64,
+    ) -> Result<Self, anyhow::Error> {
+        let parsed_currency = Currency::from_str(currency)
+            .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency))?;
+
+        let amount_currency = CurrencyAmount::from_u64(parsed_currency, amount);
+        let tax_currency = CurrencyAmount::from_u64(parsed_currency, tax);
+
+        Ok(Self {
+            amount,
+            tax,
+            currency: currency.to_string(),
+            time: time_seconds,
+            formatted_amount: amount_currency.to_string(),
+            formatted_tax: tax_currency.to_string(),
+            formatted_duration: format_duration(Duration::from_secs(time_seconds)).to_string(),
+        })
+    }
+
+    /// Creates a formatted invoice item from a VmPayment
+    pub fn from_vm_payment(payment: &lnvps_db::VmPayment) -> Result<Self, anyhow::Error> {
+        Self::from_payment_data(
+            payment.amount,
+            payment.tax,
+            &payment.currency,
+            payment.time_value,
+        )
+    }
 }
 
 impl From<lnvps_db::VmPayment> for ApiVmPayment {
@@ -195,6 +255,8 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             currency: value.currency,
             is_paid: value.is_paid,
             time: value.time_value,
+            is_upgrade: value.payment_type == PaymentType::Upgrade,
+            upgrade_params: value.upgrade_params.clone(),
             data: match &value.payment_method {
                 PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data),
                 PaymentMethod::Revolut => {
@@ -381,4 +443,18 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
             pricing_id: value.pricing_id,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ApiVmUpgradeRequest {
+    pub cpu: Option<u16>,
+    pub memory: Option<u64>,
+    pub disk: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ApiVmUpgradeQuote {
+    pub cost_difference: ApiPrice,
+    pub new_renewal_cost: ApiPrice,
+    pub discount: ApiPrice,
 }

@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::{NostrDomain, NostrDomainHandle};
+use async_trait::async_trait;
 
 #[async_trait]
 pub trait LNVPSNostrDb: Sync + Send {
@@ -7,7 +7,11 @@ pub trait LNVPSNostrDb: Sync + Send {
     async fn get_handle(&self, handle_id: u64) -> anyhow::Result<NostrDomainHandle>;
 
     /// Get single handle for a domain
-    async fn get_handle_by_name(&self, domain_id: u64, handle: &str) -> anyhow::Result<NostrDomainHandle>;
+    async fn get_handle_by_name(
+        &self,
+        domain_id: u64,
+        handle: &str,
+    ) -> anyhow::Result<NostrDomainHandle>;
 
     /// Insert a new handle
     async fn insert_handle(&self, handle: &NostrDomainHandle) -> anyhow::Result<u64>;

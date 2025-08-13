@@ -133,6 +133,10 @@ impl LightningNode for MockNode {
         })
     }
 
+    async fn cancel_invoice(&self, id: &Vec<u8>) -> anyhow::Result<()> {
+        todo!()
+    }
+
     async fn subscribe_invoices(
         &self,
         from_payment_hash: Option<Vec<u8>>,
@@ -293,6 +297,11 @@ impl VmHostClient for MockVmHost {
 
     async fn connect_terminal(&self, vm: &Vm) -> anyhow::Result<TerminalStream> {
         todo!()
+    }
+
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+        // Mock implementation - just return Ok for testing
+        Ok(())
     }
 }
 

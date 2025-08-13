@@ -1,6 +1,6 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminCreateCostPlanRequest, AdminUpdateCostPlanRequest, AdminCostPlanInfo,
+    AdminCostPlanInfo, AdminCreateCostPlanRequest, AdminUpdateCostPlanRequest,
 };
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCostPlan};
@@ -42,7 +42,7 @@ pub async fn admin_list_cost_plans(
 
     let all_cost_plans = db.list_cost_plans().await?;
     let total = all_cost_plans.len() as u64;
-    
+
     let cost_plans = all_cost_plans
         .into_iter()
         .skip(offset as usize)
@@ -163,7 +163,7 @@ pub async fn admin_delete_cost_plan(
         .iter()
         .filter(|template| template.cost_plan_id == id)
         .count();
-    
+
     if template_count > 0 {
         return Err(anyhow::anyhow!(
             "Cannot delete cost plan: {} VM templates are using this cost plan",

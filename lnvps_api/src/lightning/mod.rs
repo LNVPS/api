@@ -14,6 +14,7 @@ mod lnd;
 #[async_trait]
 pub trait LightningNode: Send + Sync {
     async fn add_invoice(&self, req: AddInvoiceRequest) -> Result<AddInvoiceResult>;
+    async fn cancel_invoice(&self, id: &Vec<u8>) -> Result<()>;
     async fn subscribe_invoices(
         &self,
         from_payment_hash: Option<Vec<u8>>,

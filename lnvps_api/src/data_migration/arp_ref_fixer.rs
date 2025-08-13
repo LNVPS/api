@@ -19,7 +19,7 @@ impl ArpRefFixerDataMigration {
 }
 
 impl DataMigration for ArpRefFixerDataMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output=Result<()>> + Send>> {
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
         let db = self.db.clone();
         let provisioner = self.provisioner.clone();
         Box::pin(async move {
@@ -36,15 +36,23 @@ impl DataMigration for ArpRefFixerDataMigration {
                     Ok(router_client) => {
                         match router_client.list_arp_entry().await {
                             Ok(arp_entries) => {
-                                info!("Found {} ARP entries on router {}", arp_entries.len(), router.id);
+                                info!(
+                                    "Found {} ARP entries on router {}",
+                                    arp_entries.len(),
+                                    router.id
+                                );
 
                                 for arp_entry in arp_entries {
                                     if let Some(arp_id) = &arp_entry.id {
                                         // Try to find IP assignment for this ARP entry
-                                        match db.get_vm_ip_assignment_by_ip(&arp_entry.address).await {
+                                        match db
+                                            .get_vm_ip_assignment_by_ip(&arp_entry.address)
+                                            .await
+                                        {
                                             Ok(mut assignment) => {
                                                 // Check if the ARP ref needs updating
-                                                let needs_update = assignment.arp_ref
+                                                let needs_update = assignment
+                                                    .arp_ref
                                                     .as_ref()
                                                     .map(|current_ref| current_ref != arp_id)
                                                     .unwrap_or(true);
@@ -59,7 +67,10 @@ impl DataMigration for ArpRefFixerDataMigration {
                                                     assignment.arp_ref = Some(arp_id.clone());
 
                                                     // Update in database
-                                                    if let Err(e) = db.update_vm_ip_assignment(&assignment).await {
+                                                    if let Err(e) = db
+                                                        .update_vm_ip_assignment(&assignment)
+                                                        .await
+                                                    {
                                                         warn!("Failed to update ARP ref for IP {}: {}", assignment.ip, e);
                                                     } else {
                                                         fixed_count += 1;
@@ -84,7 +95,10 @@ impl DataMigration for ArpRefFixerDataMigration {
                 }
             }
 
-            info!("ARP reference fixer migration completed, fixed {} references", fixed_count);
+            info!(
+                "ARP reference fixer migration completed, fixed {} references",
+                fixed_count
+            );
             Ok(())
         })
     }

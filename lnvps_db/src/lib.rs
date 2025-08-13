@@ -66,12 +66,16 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> Result<Vec<VmHost>>;
-    
+
     /// List hosts with pagination
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<VmHost>, u64)>;
-    
+
     /// List hosts with region information for admin interface
-    async fn list_hosts_with_regions_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)>;
+    async fn list_hosts_with_regions_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)>;
 
     /// List VM's owned by a specific user
     async fn get_host(&self, id: u64) -> Result<VmHost>;
@@ -183,6 +187,14 @@ pub trait LNVpsDbBase: Send + Sync {
         offset: u64,
     ) -> Result<Vec<VmPayment>>;
 
+    /// List active payments by VM id, payment method, and payment type
+    async fn list_vm_payment_by_method_and_type(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        payment_type: PaymentType,
+    ) -> Result<Vec<VmPayment>>;
+
     /// Insert a new VM payment record
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()>;
 
@@ -201,7 +213,6 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Return the most recently settled invoice
     async fn last_paid_invoice(&self) -> Result<Option<VmPayment>>;
 
-
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>>;
 
@@ -214,9 +225,11 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Insert custom vm template
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<u64>;
 
+    /// Update custom vm template
+    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<()>;
+
     /// Return the list of disk prices for a given custom pricing model
     async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>>;
-
 
     /// Get router config
     async fn get_router(&self, router_id: u64) -> Result<Router>;

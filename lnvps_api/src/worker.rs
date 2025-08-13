@@ -1,20 +1,16 @@
 use crate::host::{get_host_client, FullVmInfo};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Datelike, Days, Utc};
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::{
-    name_server::TokioConnectionProvider, system_conf, Resolver, TokioResolver,
-};
+use hickory_resolver::TokioResolver;
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
-    RedisConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
-    WorkJob,
+    RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache,
+    WorkCommander, WorkJob,
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};
@@ -463,19 +459,26 @@ impl Worker {
 
         // Resolve both domain and expected hostname to IP addresses
         // lookup_ip automatically follows DNS records to get final IPs
-        debug!("Checking IP resolution for {} vs {}", domain, expected_hostname);
+        debug!(
+            "Checking IP resolution for {} vs {}",
+            domain, expected_hostname
+        );
 
         // Resolve our expected hostname to IP addresses
         let expected_ips = match resolver.lookup_ip(expected_hostname).await {
             Ok(ips) => {
-                let ip_addrs: Vec<String> = ips.iter()
-                    .map(|ip| ip.to_string())
-                    .collect();
-                debug!("Expected hostname {} resolves to IPs: {:?}", expected_hostname, ip_addrs);
+                let ip_addrs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+                debug!(
+                    "Expected hostname {} resolves to IPs: {:?}",
+                    expected_hostname, ip_addrs
+                );
                 ip_addrs
             }
             Err(e) => {
-                debug!("Failed to resolve expected hostname {} to IP: {}", expected_hostname, e);
+                debug!(
+                    "Failed to resolve expected hostname {} to IP: {}",
+                    expected_hostname, e
+                );
                 return Ok(false);
             }
         };
@@ -483,9 +486,8 @@ impl Worker {
         // Resolve the domain to IP addresses (follows DNS records automatically)
         match resolver.lookup_ip(domain).await {
             Ok(domain_ips) => {
-                let domain_ip_addrs: Vec<String> = domain_ips.iter()
-                    .map(|ip| ip.to_string())
-                    .collect();
+                let domain_ip_addrs: Vec<String> =
+                    domain_ips.iter().map(|ip| ip.to_string()).collect();
                 debug!("Domain {} resolves to IPs: {:?}", domain, domain_ip_addrs);
 
                 // Check if any of the domain's IPs match any of our expected IPs
@@ -545,7 +547,10 @@ impl Worker {
                         // Enable the domain in the database
                         match self.db.enable_domain(domain.id).await {
                             Ok(()) => {
-                                info!("Successfully enabled domain {} (ID: {})", domain.name, domain.id);
+                                info!(
+                                    "Successfully enabled domain {} (ID: {})",
+                                    domain.name, domain.id
+                                );
                                 domains_activated.push(&domain.name);
 
                                 // Send notification to the domain owner
@@ -558,15 +563,24 @@ impl Worker {
 
                                 if let Err(e) = self.tx.send(WorkJob::SendNotification {
                                     user_id: domain.owner_id,
-                                    title: Some(format!("Nostr Domain '{}' Activated", domain.name)),
+                                    title: Some(format!(
+                                        "Nostr Domain '{}' Activated",
+                                        domain.name
+                                    )),
                                     message: notification_message,
                                 }) {
-                                    error!("Failed to queue user notification for domain {}: {}", domain.name, e);
+                                    error!(
+                                        "Failed to queue user notification for domain {}: {}",
+                                        domain.name, e
+                                    );
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to enable domain {} (ID: {}): {}", domain.name, domain.id, e);
-                                
+                                error!(
+                                    "Failed to enable domain {} (ID: {}): {}",
+                                    domain.name, domain.id, e
+                                );
+
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
                                     format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}", 
@@ -588,7 +602,10 @@ impl Worker {
                         // Disable the domain in the database
                         match self.db.disable_domain(domain.id).await {
                             Ok(()) => {
-                                info!("Successfully disabled domain {} (ID: {})", domain.name, domain.id);
+                                info!(
+                                    "Successfully disabled domain {} (ID: {})",
+                                    domain.name, domain.id
+                                );
                                 domains_deactivated.push(&domain.name);
 
                                 // Send notification to the domain owner
@@ -601,15 +618,24 @@ impl Worker {
 
                                 if let Err(e) = self.tx.send(WorkJob::SendNotification {
                                     user_id: domain.owner_id,
-                                    title: Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
+                                    title: Some(format!(
+                                        "Nostr Domain '{}' Deactivated",
+                                        domain.name
+                                    )),
                                     message: notification_message,
                                 }) {
-                                    error!("Failed to queue user notification for domain {}: {}", domain.name, e);
+                                    error!(
+                                        "Failed to queue user notification for domain {}: {}",
+                                        domain.name, e
+                                    );
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to disable domain {} (ID: {}): {}", domain.name, domain.id, e);
-                                
+                                error!(
+                                    "Failed to disable domain {} (ID: {}): {}",
+                                    domain.name, domain.id, e
+                                );
+
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
                                     format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}", 
@@ -623,10 +649,16 @@ impl Worker {
                     }
                     // Domain status matches DNS record status - no change needed
                     else if domain.enabled && has_dns_record {
-                        debug!("Domain {} is correctly active with DNS record pointing to {}", domain.name, expected_hostname);
+                        debug!(
+                            "Domain {} is correctly active with DNS record pointing to {}",
+                            domain.name, expected_hostname
+                        );
                     } else if !domain.enabled && !has_dns_record {
-                        debug!("Domain {} is correctly inactive without DNS record pointing to {}", domain.name, expected_hostname);
-                        
+                        debug!(
+                            "Domain {} is correctly inactive without DNS record pointing to {}",
+                            domain.name, expected_hostname
+                        );
+
                         // Check if domain has been disabled for more than 1 week - if so, delete it
                         let one_week_ago = Utc::now().sub(Days::new(7));
                         if domain.last_status_change < one_week_ago {
@@ -638,7 +670,10 @@ impl Worker {
                             // Delete the domain
                             match self.db.delete_domain(domain.id).await {
                                 Ok(()) => {
-                                    info!("Successfully deleted domain {} (ID: {})", domain.name, domain.id);
+                                    info!(
+                                        "Successfully deleted domain {} (ID: {})",
+                                        domain.name, domain.id
+                                    );
                                     domains_deleted.push(&domain.name);
 
                                     // Send notification to the domain owner
@@ -651,15 +686,21 @@ impl Worker {
 
                                     if let Err(e) = self.tx.send(WorkJob::SendNotification {
                                         user_id: domain.owner_id,
-                                        title: Some(format!("Nostr Domain '{}' Deleted", domain.name)),
+                                        title: Some(format!(
+                                            "Nostr Domain '{}' Deleted",
+                                            domain.name
+                                        )),
                                         message: notification_message,
                                     }) {
                                         error!("Failed to queue user notification for deleted domain {}: {}", domain.name, e);
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to delete domain {} (ID: {}): {}", domain.name, domain.id, e);
-                                    
+                                    error!(
+                                        "Failed to delete domain {} (ID: {}): {}",
+                                        domain.name, domain.id, e
+                                    );
+
                                     // Send admin notification about the failure
                                     if let Err(notification_err) = self.queue_admin_notification(
                                         format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}", 
@@ -674,15 +715,21 @@ impl Worker {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to check DNS record for domain {}: {}", domain.name, e);
+                    error!(
+                        "Failed to check DNS record for domain {}: {}",
+                        domain.name, e
+                    );
                 }
             }
         }
 
         // Send single admin notification with summary of all changes
-        if !domains_activated.is_empty() || !domains_deactivated.is_empty() || !domains_deleted.is_empty() {
+        if !domains_activated.is_empty()
+            || !domains_deactivated.is_empty()
+            || !domains_deleted.is_empty()
+        {
             let mut message_parts = Vec::new();
-            
+
             if !domains_activated.is_empty() {
                 message_parts.push(format!(
                     "ACTIVATED {} domains with DNS record entries pointing to {}:\n{}",
@@ -988,6 +1035,16 @@ impl Worker {
 
                 info!("Successfully stopped VM {} at admin request", vm_id);
             }
+            WorkJob::ProcessVmUpgrade { vm_id, config } => {
+                info!("Processing VM upgrade for VM {}", vm_id);
+                if let Err(e) = self.process_vm_upgrade(*vm_id, config).await {
+                    error!("Failed to process VM upgrade for VM {}: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to upgrade VM {}:\n{}", vm_id, e),
+                        Some("VM Upgrade Failed".to_string()),
+                    )?
+                }
+            }
             WorkJob::CheckNostrDomains => {
                 info!("Processing check nostr domains job");
                 if let Err(e) = self.check_nostr_domains().await {
@@ -999,6 +1056,170 @@ impl Worker {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn process_vm_upgrade(&self, vm_id: u64, cfg: &UpgradeConfig) -> Result<()> {
+        info!("Processing VM {} upgrade with new specs", vm_id);
+
+        let vm_before = self.db.get_vm(vm_id).await?;
+        if vm_before.custom_template_id.is_some() {
+            // VM already uses custom template - update the existing template
+            info!(
+                "VM {} already uses custom template, updating existing template",
+                vm_id
+            );
+
+            let custom_template_id = vm_before.custom_template_id.unwrap();
+            let old_template = self.db.get_custom_vm_template(custom_template_id).await?;
+            let mut new_template = old_template.clone();
+
+            // Update the template with new specifications
+            if let Some(new_cpu) = cfg.new_cpu {
+                new_template.cpu = new_cpu;
+            }
+            if let Some(new_memory) = cfg.new_memory {
+                new_template.memory = new_memory;
+            }
+            if let Some(new_disk) = cfg.new_disk {
+                new_template.disk_size = new_disk;
+            }
+
+            ensure!(old_template.cpu <= new_template.cpu, "Cannot downgrade CPU");
+            ensure!(
+                old_template.memory <= new_template.memory,
+                "Cannot downgrade memory"
+            );
+            ensure!(
+                old_template.disk_size <= new_template.disk_size,
+                "Cannot downgrade disk size"
+            );
+
+            // Update the custom template in the database
+            self.db.update_custom_vm_template(&new_template).await?;
+
+            // Log the upgrade in VM history
+            let upgrade_metadata = serde_json::json!({
+                "upgrade_type": "custom_template_update",
+                "old_specs": {
+                    "cpu": old_template.cpu,
+                    "memory": old_template.memory,
+                    "disk_size": old_template.disk_size
+                },
+                "new_specs": {
+                    "cpu": new_template.cpu,
+                    "memory": new_template.memory,
+                    "disk_size": new_template.disk_size
+                }
+            });
+
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_configuration_changed(
+                    vm_id,
+                    None, // System-initiated upgrade
+                    &vm_before,
+                    &vm_before, // VM record doesn't change, only the template
+                    Some(upgrade_metadata),
+                )
+                .await
+            {
+                warn!("Failed to log VM upgrade history for VM {}: {}", vm_id, e);
+            }
+
+            info!(
+                "Successfully updated custom template {} for VM {}",
+                custom_template_id, vm_id
+            );
+        } else {
+            // VM uses standard template - convert to custom template
+            info!(
+                "VM {} uses standard template, converting to custom template",
+                vm_id
+            );
+            self.provisioner
+                .convert_to_custom_template(vm_id, cfg)
+                .await?;
+
+            // Get the VM after conversion to see the changes
+            let vm_after = self.db.get_vm(vm_id).await?;
+
+            // Log the conversion in VM history
+            let upgrade_metadata = serde_json::json!({
+                "upgrade_type": "standard_to_custom_conversion",
+                "changes": {
+                    "cpu": cfg.new_cpu,
+                    "memory": cfg.new_memory,
+                    "disk": cfg.new_disk
+                },
+                "converted_from_template_id": vm_before.template_id,
+                "new_custom_template_id": vm_after.custom_template_id
+            });
+
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_configuration_changed(
+                    vm_id,
+                    None, // System-initiated upgrade
+                    &vm_before,
+                    &vm_after,
+                    Some(upgrade_metadata),
+                )
+                .await
+            {
+                warn!("Failed to log VM upgrade history for VM {}: {}", vm_id, e);
+            }
+
+            info!("Successfully converted VM {} to custom template", vm_id);
+        }
+
+        // apply changes on host - requires VM restart
+        let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        let host = self.db.get_host(full_info.host.id).await?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+
+        // Get current VM state to determine if we need to restart
+        let vm_state = client.get_vm_state(&full_info.vm).await?;
+        let was_running = vm_state.state == VmRunningStates::Running;
+
+        if was_running {
+            info!("Stopping VM {} for upgrade configuration changes", vm_id);
+            client.stop_vm(&full_info.vm).await?;
+        }
+
+        // Apply the hardware changes while VM is stopped
+        if cfg.new_disk.is_some() {
+            info!("Resizing disk for VM {}", vm_id);
+            client.resize_disk(&full_info).await?;
+        }
+        if cfg.new_cpu.is_some() || cfg.new_memory.is_some() {
+            info!("Updating CPU/memory configuration for VM {}", vm_id);
+            client.configure_vm(&full_info).await?;
+        }
+
+        // Restart the VM if it was running before
+        if was_running {
+            info!("Starting VM {} after upgrade configuration changes", vm_id);
+            client.start_vm(&full_info.vm).await?;
+        }
+
+        // Notify the user about the successful upgrade
+        let restart_message = if was_running {
+            "Your VM was restarted to apply the new hardware configuration."
+        } else {
+            "Your VM was not running during the upgrade."
+        };
+
+        self.tx.send(WorkJob::SendNotification {
+            user_id: full_info.vm.user_id,
+            title: Some(format!("[VM{}] Upgrade Complete", vm_id)),
+            message: format!(
+                "Your VM #{} has been successfully upgraded. The new specifications are now active. {}",
+                vm_id, restart_message
+            ),
+        })?;
+
+        info!("Successfully completed upgrade for VM {}", vm_id);
         Ok(())
     }
 

@@ -1,8 +1,10 @@
 use crate::lightning::{InvoiceUpdate, LightningNode};
-use lnvps_api_common::VmHistoryLogger;
+use crate::payments::handle_upgrade;
 use anyhow::Result;
+use chrono::Utc;
+use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
-use lnvps_db::{LNVpsDb, VmPayment};
+use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType, VmPayment};
 use log::{error, info, warn};
 use nostr::util::hex;
 use rocket::futures::StreamExt;
@@ -97,9 +99,40 @@ impl NodeInvoiceHandler {
             hex::encode(&payment.id),
             payment.vm_id
         );
-        self.tx.send(WorkJob::CheckVm {
-            vm_id: payment.vm_id,
-        })?;
+
+        // Handle upgrade payments differently - trigger upgrade processing instead of just checking VM
+        if payment.payment_type == PaymentType::Upgrade {
+            handle_upgrade(payment, &self.tx, self.db.clone()).await?;
+
+            // cancel other upgrade payments
+            let other_upgrades = self
+                .db
+                .list_vm_payment_by_method_and_type(
+                    payment.vm_id,
+                    PaymentMethod::Lightning,
+                    PaymentType::Upgrade,
+                )
+                .await?;
+            for mut ugp in other_upgrades {
+                if ugp.id == payment.id {
+                    continue;
+                }
+
+                ugp.expires = Utc::now();
+                let hex_id = hex::encode(&ugp.id);
+                if let Err(e) = self.node.cancel_invoice(&ugp.id).await {
+                    warn!("Failed to cancel invoice {}: {}", hex_id, e);
+                }
+                if let Err(e) = self.db.update_vm_payment(&ugp).await {
+                    warn!("Failed to update invoice {}: {}", hex_id, e);
+                }
+            }
+        } else {
+            // Regular renewal payment - just check the VM
+            self.tx.send(WorkJob::CheckVm {
+                vm_id: payment.vm_id,
+            })?;
+        }
 
         Ok(())
     }

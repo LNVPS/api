@@ -184,7 +184,7 @@ pub struct FirewallConfig {
     pub ndp: Option<bool>,
     /// Input policy (ACCEPT, REJECT, DROP)
     pub policy_in: Option<FirewallPolicy>,
-    /// Output policy (ACCEPT, REJECT, DROP) 
+    /// Output policy (ACCEPT, REJECT, DROP)
     pub policy_out: Option<FirewallPolicy>,
 }
 

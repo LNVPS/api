@@ -1,7 +1,7 @@
 use crate::settings::ProvisionerConfig;
 use anyhow::{bail, Result};
 use futures::future::join_all;
-use lnvps_api_common::{VmRunningState, VmState, VmStateCache};
+use lnvps_api_common::VmRunningState;
 use lnvps_db::{
     async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
     VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
@@ -51,6 +51,9 @@ pub trait VmHostClient: Send + Sync {
     /// Re-install a vm OS
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()>;
 
+    /// Resize the primary disk of a VM
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> Result<()>;
+
     /// Get the running status of a VM
     async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState>;
 
@@ -72,6 +75,17 @@ pub trait VmHostClient: Send + Sync {
 
     /// Connect to terminal serial port
     async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream>;
+}
+
+pub async fn get_vm_host_client(
+    db: &Arc<dyn LNVpsDb>,
+    vm_id: u64,
+    cfg: &ProvisionerConfig,
+) -> Result<Arc<dyn VmHostClient>> {
+    let vm = db.get_vm(vm_id).await?;
+    let host = db.get_host(vm.host_id).await?;
+    let client = get_host_client(&host, cfg)?;
+    Ok(client)
 }
 
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {

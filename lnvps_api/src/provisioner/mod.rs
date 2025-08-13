@@ -1,4 +1,4 @@
 mod lnvps;
 
 pub use lnvps::*;
-pub use lnvps_api_common::{HostCapacityService, PricingEngine, NetworkProvisioner};
+pub use lnvps_api_common::{HostCapacityService, NetworkProvisioner, PricingEngine};

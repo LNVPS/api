@@ -1,7 +1,7 @@
-use crate::Nip98Auth;
-use lnvps_api_common::{ApiData, ApiResult};
 use crate::settings::Settings;
+use crate::Nip98Auth;
 use chrono::{DateTime, Utc};
+use lnvps_api_common::{ApiData, ApiResult};
 use lnvps_db::{LNVpsDb, NostrDomain, NostrDomainHandle};
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};

@@ -189,6 +189,10 @@ type PaymentData =
   | { lightning: string } // Lightning Network invoice
   | { revolut: { token: string } }; // Revolut payment token
 
+interface PaymentType {
+  type: 'new' | 'renew' | 'upgrade';
+}
+
 interface PaymentMethod {
   name: 'lightning' | 'revolut' | 'paypal';
   metadata: Record<string, string>;
@@ -225,6 +229,22 @@ interface CreateVmRequest {
   image_id: number;
   ssh_key_id: number;
   ref_code?: string;
+}
+```
+
+### VM Upgrades
+
+```typescript
+interface VmUpgradeRequest {
+  cpu?: number; // New CPU core count (must be >= current)
+  memory?: number; // New memory in bytes (must be >= current)
+  disk?: number; // New disk size in bytes (must be >= current)
+}
+
+interface VmUpgradeQuote {
+  cost_difference: Price; // Pro-rated cost for remaining VM time
+  new_renewal_cost: Price; // Monthly renewal cost after upgrade
+  discount: Price; // Amount discounted for remaining time on the old rate
 }
 ```
 
@@ -285,6 +305,24 @@ interface CreateVmRequest {
 - **Auth**: Required
 - **Body**: `CustomVmOrder`
 - **Response**: `VmStatus`
+
+#### Get VM Upgrade Quote
+- **POST** `/api/v1/vm/{id}/upgrade/quote?method={payment_method}`
+- **Auth**: Required
+- **Query Params**: 
+  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
+- **Body**: `VmUpgradeRequest`
+- **Response**: `VmUpgradeQuote`
+- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate.
+
+#### Create VM Upgrade Payment
+- **POST** `/api/v1/vm/{id}/upgrade?method={payment_method}`
+- **Auth**: Required
+- **Query Params**: 
+  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
+- **Body**: `VmUpgradeRequest`
+- **Response**: `VmPayment`
+- **Description**: Create a payment for upgrading VM specifications. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
 
 ### VM Operations
 
@@ -446,5 +484,63 @@ function isApiSuccess<T>(response: ApiResult<T>): response is ApiResponse<T> {
 5. **VM States**: VM states are string enums representing current operational status
 6. **Error Handling**: Always check for error responses before accessing data
 7. **Pagination**: Some endpoints support optional pagination with `limit` and `offset` parameters
+
+### VM Upgrade Process
+
+8. **Upgrade Eligibility**: All VMs can be upgraded, including both standard template VMs and custom template VMs. For standard template VMs, upgrades transition them to custom templates. For custom template VMs, upgrades modify the existing custom template specifications.
+9. **Pro-rated Billing**: Upgrade costs are calculated based on the remaining time until VM expiration. The cost represents the difference between current and new specifications, pro-rated for the remaining billing period. The system calculates: (new_rate_per_second * seconds_remaining) - (old_rate_per_second * seconds_remaining). The discount field shows the value of remaining time at the old rate. The system respects the actual billing interval of the cost plan (daily, monthly, yearly) rather than assuming monthly billing.
+10. **Billing Interval Handling**: 
+    - Standard template VMs: Use their cost plan's actual interval (interval_type and interval_amount)
+    - Custom template VMs: Always use monthly billing for pro-rating calculations
+    - Examples: A cost plan with interval_type="day" and interval_amount=7 bills every 7 days
+11. **Upgrade Payment Flow**: 
+    - First, get a quote using `/api/v1/vm/{id}/upgrade/quote`
+    - Then, create an upgrade payment using `/api/v1/vm/{id}/upgrade`
+    - Complete the payment (Lightning Network, Revolut, or PayPal)
+    - The upgrade is automatically applied after payment confirmation
+    - **VM Restart**: Running VMs are automatically stopped, upgraded, and restarted to apply hardware changes
+12. **Specification Requirements**: All upgrade values must be greater than or equal to current values (no downgrades allowed)
+13. **Minimum Billing**: Even very short upgrade periods (e.g., VMs expiring soon) have a minimum billing of 1 hour
+14. **Payment Method Support**: Upgrades support multiple payment methods (Lightning Network, Revolut, PayPal) specified via the optional `method` query parameter
+
+### Example: VM Upgrade Flow
+
+```typescript
+// Step 1: Get upgrade quote
+const upgradeRequest: VmUpgradeRequest = {
+  cpu: 4,      // Upgrade from 2 to 4 CPUs
+  memory: 4 * 1024 * 1024 * 1024, // 4GB in bytes
+  disk: 120 * 1024 * 1024 * 1024  // 120GB in bytes
+};
+
+// Optional: specify payment method (defaults to 'lightning')
+const paymentMethod = 'revolut'; // or 'lightning' or 'paypal'
+
+const quoteResponse = await fetch(`/api/v1/vm/123/upgrade/quote?method=${paymentMethod}`, {
+  method: 'POST',
+  headers: authHeaders, // NIP-98 authentication
+  body: JSON.stringify(upgradeRequest)
+});
+
+const quote: ApiResponse<VmUpgradeQuote> = await quoteResponse.json();
+console.log(`Upgrade cost: ${quote.data.cost_difference.amount} ${quote.data.cost_difference.currency}`);
+console.log(`New monthly cost: ${quote.data.new_renewal_cost.amount} ${quote.data.new_renewal_cost.currency}`);
+console.log(`Discount applied: ${quote.data.discount.amount} ${quote.data.discount.currency}`);
+
+// Step 2: Create upgrade payment if user accepts the quote (using same payment method)
+// Note: The VM will be restarted automatically after payment to apply hardware changes
+const paymentResponse = await fetch(`/api/v1/vm/123/upgrade?method=${paymentMethod}`, {
+  method: 'POST',
+  headers: authHeaders,
+  body: JSON.stringify(upgradeRequest)
+});
+
+const payment: ApiResponse<VmPayment> = await paymentResponse.json();
+
+// Step 3: Complete payment based on method
+// For Lightning Network: payment.data.data.lightning contains the invoice string
+// For Revolut: payment.data.data.revolut.token contains the payment token
+// After payment confirmation, the upgrade is automatically applied
+```
 
 This documentation is optimized for LLM code generation and provides all necessary type definitions and endpoint specifications for building TypeScript frontend applications.

@@ -1,7 +1,13 @@
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use lnvps_api_common::{VmRunningState, ApiDiskType, ApiDiskInterface, ApiOsDistribution, ApiVmCostPlanIntervalType};
-use lnvps_db::{AdminAction, AdminResource, AdminRole, VmHostKind, IpRangeAllocationMode, NetworkAccessPolicy, RouterKind, OsDistribution, VmHistory, VmHistoryActionType, VmPayment, PaymentMethod};
+use lnvps_api_common::{
+    ApiDiskInterface, ApiDiskType, ApiOsDistribution, ApiVmCostPlanIntervalType, VmRunningState,
+};
+use lnvps_db::{
+    AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
+    OsDistribution, PaymentMethod, RouterKind, VmHistory, VmHistoryActionType, VmHostKind,
+    VmPayment,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -33,7 +39,7 @@ impl From<AdminVmHostKind> for VmHostKind {
     }
 }
 
-#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminIpRangeAllocationMode {
     Random,
@@ -108,7 +114,7 @@ impl From<AdminRouterKind> for RouterKind {
     }
 }
 
-#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminUserStatus {
     Active,
@@ -116,7 +122,7 @@ pub enum AdminUserStatus {
     Deleted,
 }
 
-#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminUserRole {
     SuperAdmin,
@@ -350,37 +356,56 @@ impl AdminVmInfo {
         let ips = db.list_vm_ip_assignments(vm.id).await?;
 
         // Get template info and VM resources
-        let (template_id, template_name, custom_template_id, is_standard_template, cpu, memory, disk_size, disk_type, disk_interface) = 
-            if let Some(template_id) = vm.template_id {
-                let template = db.get_vm_template(template_id).await?;
-                (
-                    template_id, 
-                    template.name,
-                    None,
-                    true,
-                    template.cpu,
-                    template.memory,
-                    template.disk_size,
-                    ApiDiskType::from(template.disk_type),
-                    ApiDiskInterface::from(template.disk_interface),
-                )
-            } else if let Some(custom_template_id) = vm.custom_template_id {
-                let custom_template = db.get_custom_vm_template(custom_template_id).await?;
-                let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
-                (
-                    0, // No standard template ID
-                    format!("Custom - {}", pricing.name),
-                    Some(custom_template_id),
-                    false,
-                    custom_template.cpu,
-                    custom_template.memory,
-                    custom_template.disk_size,
-                    ApiDiskType::from(custom_template.disk_type),
-                    ApiDiskInterface::from(custom_template.disk_interface),
-                )
-            } else {
-                (0, "Unknown".to_string(), None, true, 0, 0, 0, ApiDiskType::HDD, ApiDiskInterface::SATA)
-            };
+        let (
+            template_id,
+            template_name,
+            custom_template_id,
+            is_standard_template,
+            cpu,
+            memory,
+            disk_size,
+            disk_type,
+            disk_interface,
+        ) = if let Some(template_id) = vm.template_id {
+            let template = db.get_vm_template(template_id).await?;
+            (
+                template_id,
+                template.name,
+                None,
+                true,
+                template.cpu,
+                template.memory,
+                template.disk_size,
+                ApiDiskType::from(template.disk_type),
+                ApiDiskInterface::from(template.disk_interface),
+            )
+        } else if let Some(custom_template_id) = vm.custom_template_id {
+            let custom_template = db.get_custom_vm_template(custom_template_id).await?;
+            let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
+            (
+                0, // No standard template ID
+                format!("Custom - {}", pricing.name),
+                Some(custom_template_id),
+                false,
+                custom_template.cpu,
+                custom_template.memory,
+                custom_template.disk_size,
+                ApiDiskType::from(custom_template.disk_type),
+                ApiDiskInterface::from(custom_template.disk_interface),
+            )
+        } else {
+            (
+                0,
+                "Unknown".to_string(),
+                None,
+                true,
+                0,
+                0,
+                0,
+                ApiDiskType::HDD,
+                ApiDiskInterface::SATA,
+            )
+        };
 
         let mut ip_addresses = Vec::new();
         for ip in ips {
@@ -423,7 +448,7 @@ impl AdminVmInfo {
     }
 }
 
-#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminVmAction {
     Start,
@@ -721,7 +746,7 @@ impl AdminVmOsImageInfo {
             .iter()
             .filter(|vm| vm.image_id == image.id && !vm.deleted)
             .count() as i64;
-        
+
         Ok(Self {
             id: image.id,
             distribution: ApiOsDistribution::from(image.distribution),
@@ -816,7 +841,7 @@ pub struct AdminCreateVmTemplateRequest {
     pub region_id: u64,
     // Cost plan creation fields - used when cost_plan_id is not provided
     pub cost_plan_name: Option<String>, // Defaults to "{template_name} Cost Plan"
-    pub cost_plan_amount: Option<f32>, // Required if cost_plan_id not provided
+    pub cost_plan_amount: Option<f32>,  // Required if cost_plan_id not provided
     pub cost_plan_currency: Option<String>, // Defaults to "USD"
     pub cost_plan_interval_amount: Option<u64>, // Defaults to 1
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
@@ -1021,7 +1046,7 @@ pub struct CreateIpRangeRequest {
     pub reverse_zone_id: Option<String>,
     pub access_policy_id: Option<u64>,
     pub allocation_mode: Option<AdminIpRangeAllocationMode>, // default: "sequential"
-    pub use_full_range: Option<bool>, // Default: false
+    pub use_full_range: Option<bool>,                        // Default: false
 }
 
 #[derive(Deserialize)]
@@ -1031,7 +1056,7 @@ pub struct UpdateIpRangeRequest {
     pub enabled: Option<bool>,
     pub region_id: Option<u64>,
     pub reverse_zone_id: Option<Option<String>>, // Use Option<Option<String>> to allow setting to null
-    pub access_policy_id: Option<Option<u64>>, // Use Option<Option<u64>> to allow setting to null
+    pub access_policy_id: Option<Option<u64>>,   // Use Option<Option<u64>> to allow setting to null
     pub allocation_mode: Option<AdminIpRangeAllocationMode>,
     pub use_full_range: Option<bool>,
 }
@@ -1079,7 +1104,9 @@ impl From<lnvps_db::AccessPolicy> for AdminAccessPolicyInfo {
 
 impl CreateIpRangeRequest {
     pub fn to_ip_range(&self) -> anyhow::Result<lnvps_db::IpRange> {
-        let allocation_mode = self.allocation_mode.unwrap_or(AdminIpRangeAllocationMode::Sequential);
+        let allocation_mode = self
+            .allocation_mode
+            .unwrap_or(AdminIpRangeAllocationMode::Sequential);
         let db_allocation_mode = IpRangeAllocationMode::from(allocation_mode);
 
         Ok(lnvps_db::IpRange {
@@ -1088,7 +1115,11 @@ impl CreateIpRangeRequest {
             gateway: self.gateway.trim().to_string(),
             enabled: self.enabled.unwrap_or(true),
             region_id: self.region_id,
-            reverse_zone_id: self.reverse_zone_id.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            reverse_zone_id: self
+                .reverse_zone_id
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             access_policy_id: self.access_policy_id,
             allocation_mode: db_allocation_mode,
             use_full_range: self.use_full_range.unwrap_or(false),
@@ -1170,7 +1201,11 @@ impl CreateAccessPolicyRequest {
             name: self.name.trim().to_string(),
             kind: db_kind,
             router_id: self.router_id,
-            interface: self.interface.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            interface: self
+                .interface
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }
@@ -1281,7 +1316,7 @@ impl From<lnvps_db::VmCostPlan> for AdminCostPlanInfo {
 impl AdminCreateCostPlanRequest {
     pub fn to_cost_plan(&self) -> anyhow::Result<lnvps_db::VmCostPlan> {
         use chrono::Utc;
-        
+
         if self.name.trim().is_empty() {
             return Err(anyhow::anyhow!("Cost plan name cannot be empty"));
         }
@@ -1312,7 +1347,7 @@ impl AdminCreateCostPlanRequest {
 
 // VM History Models
 
-#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminVmHistoryActionType {
     Created,
@@ -1341,12 +1376,14 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             VmHistoryActionType::Reinstalled => AdminVmHistoryActionType::Reinstalled,
             VmHistoryActionType::StateChanged => AdminVmHistoryActionType::StateChanged,
             VmHistoryActionType::PaymentReceived => AdminVmHistoryActionType::PaymentReceived,
-            VmHistoryActionType::ConfigurationChanged => AdminVmHistoryActionType::ConfigurationChanged,
+            VmHistoryActionType::ConfigurationChanged => {
+                AdminVmHistoryActionType::ConfigurationChanged
+            }
         }
     }
 }
 
-#[derive(Serialize, Deserialize,  Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct AdminVmHistoryInfo {
     pub id: u64,
     pub vm_id: u64,
@@ -1391,7 +1428,7 @@ impl AdminVmHistoryInfo {
 
 // VM Payment Models
 
-#[derive(Serialize, Deserialize,  Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminPaymentMethod {
     Lightning,
@@ -1409,7 +1446,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
     }
 }
 
-#[derive(Serialize, Deserialize,  Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct AdminVmPaymentInfo {
     pub id: String, // hex encoded payment ID
     pub vm_id: u64,
@@ -1421,7 +1458,7 @@ pub struct AdminVmPaymentInfo {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32, // Exchange rate to base currency (EUR)
-    // Note: external_data is omitted as it may contain sensitive payment provider data
+                   // Note: external_data is omitted as it may contain sensitive payment provider data
 }
 
 impl AdminVmPaymentInfo {

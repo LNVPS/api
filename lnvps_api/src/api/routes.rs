@@ -1,13 +1,13 @@
 use crate::api::model::ApiVmStatus;
 use crate::api::model::{
     vm_to_status, AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder,
-    ApiCustomVmRequest, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
-    ApiVmPayment, CreateSshKey, CreateVmRequest, VMPatchRequest,
+    ApiCustomVmRequest, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse,
+    ApiVmHistory, ApiVmPayment, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
+    CreateVmRequest, VMPatchRequest,
 };
 use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
-use lnvps_api_common::VmHistoryLogger;
 use crate::{Currency, CurrencyAmount};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Utc};
@@ -16,9 +16,10 @@ use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::Tag;
+use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::{
-    ApiData, ApiResult, ExchangeRateService, Nip98Auth, VmState as CommonVmState, VmStateCache,
-    WorkJob,
+    ApiData, ApiResult, ExchangeRateService, Nip98Auth, UpgradeConfig,
+    VmStateCache, WorkJob,
 };
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
@@ -64,6 +65,8 @@ pub fn routes() -> Vec<Route> {
         v1_get_payment_methods,
         v1_payment_history,
         v1_get_vm_history,
+        v1_vm_upgrade_quote,
+        v1_vm_upgrade,
     ];
     routes.append(&mut api_routes);
 
@@ -884,10 +887,24 @@ async fn v1_get_payment_invoice(
         current_date: DateTime<Utc>,
         vm: ApiVmStatus,
         payment: ApiVmPayment,
+        invoice_item: ApiInvoiceItem,
         user: AccountPatchRequest,
         npub: String,
         total: u64,
+        total_formatted: String,
         company: Option<ApiCompany>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        upgrade_details: Option<UpgradeDetails>,
+    }
+
+    #[derive(Serialize)]
+    struct UpgradeDetails {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cpu_upgrade: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_upgrade: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disk_upgrade: Option<u64>,
     }
 
     let host = db
@@ -911,7 +928,25 @@ async fn v1_get_payment_invoice(
     let template = mustache::compile_str(include_str!("../../invoice.html"))
         .map_err(|_| "Invalid template")?;
 
+    // Parse upgrade details if this is an upgrade payment
+    let upgrade_details = if payment.payment_type == lnvps_db::PaymentType::Upgrade {
+        payment
+            .upgrade_params
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<UpgradeConfig>(s).ok())
+            .map(|c| UpgradeDetails {
+                cpu_upgrade: c.new_cpu,
+                memory_upgrade: c.new_memory.map(|m| m / crate::GB),
+                disk_upgrade: c.new_disk.map(|m| m / crate::GB),
+            })
+    } else {
+        None
+    };
+
     let now = Utc::now();
+    let invoice_item = ApiInvoiceItem::from_vm_payment(&payment)
+        .map_err(|_| "Failed to create formatted invoice item")?;
+
     let mut html = Cursor::new(Vec::new());
     template
         .render(
@@ -923,13 +958,20 @@ async fn v1_get_payment_invoice(
                     .await
                     .map_err(|_| "Failed to get VM state")?,
                 total: payment.amount + payment.tax,
+                total_formatted: CurrencyAmount::from_u64(
+                    payment.currency.parse().map_err(|_| "Invalid currency")?,
+                    payment.amount + payment.tax,
+                )
+                .to_string(),
                 payment: payment.into(),
+                invoice_item,
                 npub: nostr::PublicKey::from_slice(&user.pubkey)
                     .map_err(|_| "Invalid pubkey")?
                     .to_bech32()
                     .unwrap(),
                 user: user.into(),
                 company: company.map(|c| c.into()),
+                upgrade_details,
             },
         )
         .map_err(|_| "Failed to generate invoice")?;
@@ -983,4 +1025,93 @@ async fn v1_get_vm_history(
             .map(|h| ApiVmHistory::from_with_owner(h, vm.user_id))
             .collect(),
     )
+}
+
+/// Get a quote for upgrading a VM
+#[openapi(tag = "VM")]
+#[post(
+    "/api/v1/vm/<id>/upgrade/quote?<method>",
+    data = "<req>",
+    format = "json"
+)]
+async fn v1_vm_upgrade_quote(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    provisioner: &State<Arc<LNVpsProvisioner>>,
+    id: u64,
+    req: Json<ApiVmUpgradeRequest>,
+    method: Option<&str>,
+) -> ApiResult<ApiVmUpgradeQuote> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    // Create UpgradeConfig from request
+    let cfg = UpgradeConfig {
+        new_cpu: req.cpu,
+        new_memory: req.memory,
+        new_disk: req.disk,
+    };
+
+    // Calculate the upgrade cost and new renewal cost
+    match provisioner
+        .calculate_upgrade_cost(
+            id,
+            &cfg,
+            method
+                .and_then(|m| PaymentMethod::from_str(m).ok())
+                .unwrap_or(PaymentMethod::Lightning),
+        )
+        .await
+    {
+        Ok(quote) => ApiData::ok(ApiVmUpgradeQuote {
+            cost_difference: quote.upgrade.amount.into(),
+            new_renewal_cost: quote.renewal.amount.into(),
+            discount: quote.discount.amount.into(),
+        }),
+        Err(e) => ApiData::err(e.to_string().as_str()),
+    }
+}
+
+/// Upgrade a VM (requires payment first)
+#[openapi(tag = "VM")]
+#[post("/api/v1/vm/<id>/upgrade?<method>", data = "<req>", format = "json")]
+async fn v1_vm_upgrade(
+    auth: Nip98Auth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    provisioner: &State<Arc<LNVpsProvisioner>>,
+    id: u64,
+    req: Json<ApiVmUpgradeRequest>,
+    method: Option<&str>,
+) -> ApiResult<ApiVmPayment> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = db.upsert_user(&pubkey).await?;
+    let vm = db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return ApiData::err("VM does not belong to you");
+    }
+
+    // Create UpgradeConfig from request
+    let cfg = UpgradeConfig {
+        new_cpu: req.cpu,
+        new_memory: req.memory,
+        new_disk: req.disk,
+    };
+
+    // Create upgrade payment
+    let payment = provisioner
+        .create_upgrade_payment(
+            id,
+            &cfg,
+            method
+                .and_then(|m| PaymentMethod::from_str(m).ok())
+                .unwrap_or(PaymentMethod::Lightning),
+        )
+        .await?;
+
+    // Note: The actual upgrade happens after payment is confirmed
+    ApiData::ok(payment.into())
 }

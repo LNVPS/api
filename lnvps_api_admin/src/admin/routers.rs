@@ -5,7 +5,7 @@ use crate::admin::model::{
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
-use rocket::{get, post, put, delete, State, patch};
+use rocket::{delete, get, patch, post, State};
 use std::sync::Arc;
 
 #[get("/api/admin/v1/routers?<limit>&<offset>")]
@@ -17,7 +17,7 @@ pub async fn admin_list_routers(
 ) -> ApiPaginatedResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::View)?;
-    
+
     let limit = limit.unwrap_or(50).min(100);
     let offset = offset.unwrap_or(0);
 
@@ -27,7 +27,9 @@ pub async fn admin_list_routers(
     let mut admin_routers = Vec::new();
     for router in routers {
         let mut admin_router = AdminRouterDetail::from(router.clone());
-        admin_router.access_policy_count = db.admin_count_router_access_policies(router.id).await
+        admin_router.access_policy_count = db
+            .admin_count_router_access_policies(router.id)
+            .await
             .unwrap_or(0);
         admin_routers.push(admin_router);
     }
@@ -43,11 +45,13 @@ pub async fn admin_get_router(
 ) -> ApiResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::View)?;
-    
+
     let router = db.admin_get_router(router_id).await?;
 
     let mut admin_router = AdminRouterDetail::from(router.clone());
-    admin_router.access_policy_count = db.admin_count_router_access_policies(router.id).await
+    admin_router.access_policy_count = db
+        .admin_count_router_access_policies(router.id)
+        .await
         .unwrap_or(0);
 
     ApiData::ok(admin_router)
@@ -61,7 +65,7 @@ pub async fn admin_create_router(
 ) -> ApiResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::Create)?;
-    
+
     let router = request.to_router()?;
 
     let router_id = db.admin_create_router(&router).await?;
@@ -82,7 +86,7 @@ pub async fn admin_update_router(
 ) -> ApiResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::Update)?;
-    
+
     // Fetch the existing router
     let mut router = db.admin_get_router(router_id).await?;
 
@@ -111,7 +115,9 @@ pub async fn admin_update_router(
     let updated_router = db.admin_get_router(router_id).await?;
 
     let mut admin_router = AdminRouterDetail::from(updated_router.clone());
-    admin_router.access_policy_count = db.admin_count_router_access_policies(updated_router.id).await
+    admin_router.access_policy_count = db
+        .admin_count_router_access_policies(updated_router.id)
+        .await
         .unwrap_or(0);
 
     ApiData::ok(admin_router)
@@ -125,7 +131,7 @@ pub async fn admin_delete_router(
 ) -> ApiResult<()> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::Delete)?;
-    
+
     db.admin_delete_router(router_id).await?;
 
     ApiData::ok(())

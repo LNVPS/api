@@ -155,9 +155,9 @@ impl DVMHandler for LnvpsDvm {
 mod tests {
     use super::*;
     use crate::dvm::parse_job_request;
-    use lnvps_api_common::{ExchangeRateService, MockDb, MockExchangeRate, Ticker};
     use crate::mocks::MockNode;
     use crate::settings::mock_settings;
+    use lnvps_api_common::{ExchangeRateService, MockDb, MockExchangeRate, Ticker};
     use lnvps_db::{VmCustomPricing, VmCustomPricingDisk};
     use nostr::{EventBuilder, Keys, Kind};
 

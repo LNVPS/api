@@ -84,6 +84,11 @@
             {{^payment.is_paid}}Unpaid{{/payment.is_paid}}
         </div>
         <div>
+            <b>Type:</b>
+            {{#payment.is_upgrade}}Upgrade{{/payment.is_upgrade}}
+            {{^payment.is_upgrade}}Renewal{{/payment.is_upgrade}}
+        </div>
+        <div>
             <b>Nostr Pubkey:</b>
             {{npub}}
         </div>
@@ -130,28 +135,37 @@
         <tbody>
         <tr>
             <td>
+                {{#payment.is_upgrade}}
+                VM Upgrade #{{vm.id}}
+                - {{vm.template.name}}
+                - {{vm.image.distribution}} {{vm.image.version}}
+                {{#upgrade_details}}
+                {{#cpu_upgrade}}<br/>• CPU: {{cpu_upgrade}} cores{{/cpu_upgrade}}
+                {{#memory_upgrade}}<br/>• Memory: {{memory_upgrade}}GB{{/memory_upgrade}}
+                {{#disk_upgrade}}<br/>• Disk: {{disk_upgrade}}GB{{/disk_upgrade}}
+                {{/upgrade_details}}
+                {{/payment.is_upgrade}}
+                {{^payment.is_upgrade}}
                 VM Renewal #{{vm.id}}
                 - {{vm.template.name}}
                 - {{vm.image.distribution}} {{vm.image.version}}
-                - {{payment.time}} seconds
+                - {{invoice_item.formatted_duration}}
+                {{/payment.is_upgrade}}
             </td>
-            <td>{{payment.currency}}</td>
-            <td>{{payment.amount}}</td>
-            <td>{{payment.tax}}</td>
+            <td>{{invoice_item.currency}}</td>
+            <td>{{invoice_item.formatted_amount}}</td>
+            <td>{{invoice_item.formatted_tax}}</td>
         </tr>
         </tbody>
         <tbody>
         <tr>
             <td colspan="4" class="total">
-                Total: {{total}}
+                Total: {{total_formatted}}
             </td>
         </tr>
         </tbody>
     </table>
     <br/>
-    <b>
-        All BTC amounts are in milli-satoshis and all fiat amounts are in cents.
-    </b>
     <hr/>
     <small>
         (c) {{year}} LNVPS.net - Generated at {{current_date}}

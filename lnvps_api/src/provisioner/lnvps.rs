@@ -9,12 +9,13 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_api_common::{
-    AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, PricingEngine,
+    AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
+    PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
 use lnvps_api_common::{Currency, CurrencyAmount, ExchangeRateService};
 use lnvps_db::{
-    AccessPolicy, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, RouterKind,
-    Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment,
+    AccessPolicy, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType,
+    RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate,
 };
 use log::{info, warn};
 use nostr::util::hex;
@@ -483,7 +484,13 @@ impl LNVpsProvisioner {
 
     /// Create a renewal payment
     pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
-        let pe = PricingEngine::new_for_vm(self.db.clone(), self.rates.clone(), self.tax_rates.clone(), vm_id).await?;
+        let pe = PricingEngine::new_for_vm(
+            self.db.clone(),
+            self.rates.clone(),
+            self.tax_rates.clone(),
+            vm_id,
+        )
+        .await?;
         let price = pe.get_vm_cost(vm_id, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -495,7 +502,13 @@ impl LNVpsProvisioner {
         amount: CurrencyAmount,
         method: PaymentMethod,
     ) -> Result<VmPayment> {
-        let pe = PricingEngine::new_for_vm(self.db.clone(), self.rates.clone(), self.tax_rates.clone(), vm_id).await?;
+        let pe = PricingEngine::new_for_vm(
+            self.db.clone(),
+            self.rates.clone(),
+            self.tax_rates.clone(),
+            vm_id,
+        )
+        .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -506,25 +519,33 @@ impl LNVpsProvisioner {
         method: PaymentMethod,
         price: CostResult,
     ) -> Result<VmPayment> {
+        self.price_to_payment_with_type(vm_id, method, price, PaymentType::Renewal, None)
+            .await
+    }
+
+    async fn price_to_payment_with_type(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        price: CostResult,
+        payment_type: PaymentType,
+        upgrade_params: Option<String>,
+    ) -> Result<VmPayment> {
         match price {
             CostResult::Existing(p) => Ok(p),
-            CostResult::New {
-                amount,
-                currency,
-                time_value,
-                new_expiry,
-                rate,
-                tax,
-            } => {
-                let desc = format!("VM renewal {vm_id} to {new_expiry}");
+            CostResult::New(p) => {
+                let desc = match payment_type {
+                    PaymentType::Renewal => format!("VM renewal {vm_id} to {}", p.new_expiry),
+                    PaymentType::Upgrade => format!("VM upgrade {vm_id}"),
+                };
                 let vm_payment = match method {
                     PaymentMethod::Lightning => {
                         ensure!(
-                            currency == Currency::BTC,
+                            p.currency == Currency::BTC,
                             "Cannot create invoices for non-BTC currency"
                         );
                         const INVOICE_EXPIRE: u64 = 600;
-                        let total_amount = amount + tax;
+                        let total_amount = p.amount + p.tax;
                         info!(
                             "Creating invoice for {vm_id} for {} sats",
                             total_amount / 1000
@@ -542,15 +563,17 @@ impl LNVpsProvisioner {
                             vm_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
-                            amount,
-                            tax,
-                            currency: currency.to_string(),
+                            amount: p.amount,
+                            tax: p.tax,
+                            currency: p.currency.to_string(),
                             payment_method: method,
-                            time_value,
+                            payment_type,
+                            time_value: p.time_value,
                             is_paid: false,
-                            rate,
+                            rate: p.rate.rate,
                             external_data: invoice.pr,
                             external_id: invoice.external_id,
+                            upgrade_params,
                         }
                     }
                     PaymentMethod::Revolut => {
@@ -560,11 +583,14 @@ impl LNVpsProvisioner {
                             bail!("Revolut not configured")
                         };
                         ensure!(
-                            currency != Currency::BTC,
+                            p.currency != Currency::BTC,
                             "Cannot create revolut orders for BTC currency"
                         );
                         let order = rev
-                            .create_order(&desc, CurrencyAmount::from_u64(currency, amount + tax))
+                            .create_order(
+                                &desc,
+                                CurrencyAmount::from_u64(p.currency, p.amount + p.tax),
+                            )
                             .await?;
                         let new_id: [u8; 32] = rand::random();
                         VmPayment {
@@ -572,15 +598,17 @@ impl LNVpsProvisioner {
                             vm_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(3600)),
-                            amount,
-                            tax,
-                            currency: currency.to_string(),
+                            amount: p.amount,
+                            tax: p.tax,
+                            currency: p.currency.to_string(),
                             payment_method: method,
-                            time_value,
+                            payment_type,
+                            time_value: p.time_value,
                             is_paid: false,
-                            rate,
+                            rate: p.rate.rate,
                             external_data: order.raw_data,
                             external_id: Some(order.external_id),
+                            upgrade_params,
                         }
                     }
                     PaymentMethod::Paypal => todo!(),
@@ -647,6 +675,146 @@ impl LNVpsProvisioner {
         client.stop_vm(&vm).await?;
         Ok(())
     }
+
+    /// Calculate both upgrade cost and new renewal cost for a VM upgrade
+    pub async fn calculate_upgrade_cost(
+        &self,
+        vm_id: u64,
+        cfg: &UpgradeConfig,
+        method: PaymentMethod,
+    ) -> Result<UpgradeCostQuote> {
+        let pe = PricingEngine::new_for_vm(
+            self.db.clone(),
+            self.rates.clone(),
+            self.tax_rates.clone(),
+            vm_id,
+        )
+        .await?;
+        pe.calculate_upgrade_cost(vm_id, cfg, method).await
+    }
+
+    /// Convert a VM from standard template to custom template
+    pub async fn convert_to_custom_template(&self, vm_id: u64, cfg: &UpgradeConfig) -> Result<()> {
+        let (mut vm, _, new_custom_template) = self.create_upgrade_template(vm_id, cfg).await?;
+
+        // Insert the new custom template
+        let custom_template_id = self
+            .db
+            .insert_custom_vm_template(&new_custom_template)
+            .await?;
+
+        // Update the VM to use the custom template instead of the standard template
+        vm.template_id = None;
+        vm.custom_template_id = Some(custom_template_id);
+
+        self.db.update_vm(&vm).await?;
+
+        Ok(())
+    }
+
+    /// Create an upgrade payment
+    pub async fn create_upgrade_payment(
+        &self,
+        vm_id: u64,
+        cfg: &UpgradeConfig,
+        method: PaymentMethod,
+    ) -> Result<VmPayment> {
+        let cost_difference = self.calculate_upgrade_cost(vm_id, cfg, method).await?;
+
+        // create a payment entry for upgrade
+        let payment = NewPaymentInfo {
+            amount: cost_difference.upgrade.amount.value(),
+            currency: cost_difference.upgrade.amount.currency(),
+            rate: cost_difference.upgrade.rate,
+            time_value: 0, //upgrades dont add time
+            new_expiry: Default::default(),
+            tax: 0, // No tax on upgrades for now
+        };
+        let upgrade_params_json = serde_json::to_string(cfg)?;
+
+        self.price_to_payment_with_type(
+            vm_id,
+            method,
+            CostResult::New(payment),
+            PaymentType::Upgrade,
+            Some(upgrade_params_json),
+        )
+        .await
+    }
+
+    /// Create a new custom template using a vm's existing standard template
+    async fn create_upgrade_template(
+        &self,
+        vm_id: u64,
+        cfg: &UpgradeConfig,
+    ) -> Result<(Vm, VmTemplate, VmCustomTemplate)> {
+        let vm = self.db.get_vm(vm_id).await?;
+
+        // Only allow upgrading VMs with standard templates
+        let template_id = vm
+            .template_id
+            .ok_or_else(|| anyhow::anyhow!("VM must have a standard template to upgrade"))?;
+        let current_template = self.db.get_vm_template(template_id).await?;
+
+        // Get the custom pricing for the region that supports the required disk type and interface
+        let custom_pricings = self
+            .db
+            .list_custom_pricing(current_template.region_id)
+            .await?;
+        let mut compatible_pricing = None;
+
+        for pricing in custom_pricings {
+            if !pricing.enabled {
+                continue;
+            }
+
+            // Check if this pricing supports the required disk type and interface
+            let disk_configs = self.db.list_custom_pricing_disk(pricing.id).await?;
+            let has_compatible_disk = disk_configs.iter().any(|disk| {
+                disk.kind == current_template.disk_type
+                    && disk.interface == current_template.disk_interface
+            });
+
+            if has_compatible_disk {
+                compatible_pricing = Some(pricing);
+                break;
+            }
+        }
+
+        let custom_pricing = compatible_pricing
+            .ok_or_else(|| anyhow::anyhow!(
+                "No custom pricing available for this region that supports disk type {:?} with interface {:?}", 
+                current_template.disk_type, 
+                current_template.disk_interface
+            ))?;
+
+        // Build the new custom template with upgraded specs
+        let new_custom_template = VmCustomTemplate {
+            id: 0,
+            cpu: cfg.new_cpu.unwrap_or(current_template.cpu),
+            memory: cfg.new_memory.unwrap_or(current_template.memory),
+            disk_size: cfg.new_disk.unwrap_or(current_template.disk_size),
+            disk_type: current_template.disk_type,
+            disk_interface: current_template.disk_interface,
+            pricing_id: custom_pricing.id,
+        };
+
+        // Validate the upgrade (ensure we're not downgrading)
+        ensure!(
+            new_custom_template.cpu >= current_template.cpu,
+            "Cannot downgrade CPU"
+        );
+        ensure!(
+            new_custom_template.memory >= current_template.memory,
+            "Cannot downgrade memory"
+        );
+        ensure!(
+            new_custom_template.disk_size >= current_template.disk_size,
+            "Cannot downgrade disk"
+        );
+
+        Ok((vm, current_template, new_custom_template))
+    }
 }
 
 #[cfg(test)]
@@ -662,7 +830,6 @@ mod tests {
     const ROUTER_BRIDGE: &str = "bridge1";
 
     pub fn settings() -> Settings {
-        
         mock_settings()
     }
 

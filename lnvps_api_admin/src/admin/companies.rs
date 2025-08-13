@@ -26,7 +26,10 @@ pub async fn admin_list_companies(
     // Convert to API format with region counts
     let mut companies = Vec::new();
     for company in db_companies {
-        let region_count = db.admin_count_company_regions(company.id).await.unwrap_or(0);
+        let region_count = db
+            .admin_count_company_regions(company.id)
+            .await
+            .unwrap_or(0);
         let mut admin_company = AdminCompanyInfo::from(company);
         admin_company.region_count = region_count;
         companies.push(admin_company);
@@ -47,7 +50,7 @@ pub async fn admin_get_company(
 
     let company = db.admin_get_company(id).await?;
     let region_count = db.admin_count_company_regions(id).await.unwrap_or(0);
-    
+
     let mut admin_company = AdminCompanyInfo::from(company);
     admin_company.region_count = region_count;
 
@@ -68,7 +71,7 @@ pub async fn admin_create_company(
     if req.name.trim().is_empty() {
         return ApiData::err("Company name is required");
     }
-    
+
     // Validate base currency if provided, default to EUR
     let base_currency = if let Some(currency) = &req.base_currency {
         let currency = currency.trim().to_uppercase();
@@ -92,20 +95,56 @@ pub async fn admin_create_company(
         id: 0, // Will be set by database
         created: Utc::now(),
         name: req.name.trim().to_string(),
-        address_1: req.address_1.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        address_2: req.address_2.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        city: req.city.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        state: req.state.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        country_code: req.country_code.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        tax_id: req.tax_id.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        postcode: req.postcode.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        phone: req.phone.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        email: req.email.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        address_1: req
+            .address_1
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        address_2: req
+            .address_2
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        city: req
+            .city
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        state: req
+            .state
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        country_code: req
+            .country_code
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        tax_id: req
+            .tax_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        postcode: req
+            .postcode
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        phone: req
+            .phone
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        email: req
+            .email
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         base_currency,
     };
 
     let company_id = db.admin_create_company(&company).await?;
-    
+
     // Fetch the created company to return
     let created_company = db.admin_get_company(company_id).await?;
     let admin_company = AdminCompanyInfo::from(created_company);
@@ -134,31 +173,67 @@ pub async fn admin_update_company(
         company.name = name.trim().to_string();
     }
     if let Some(address_1) = &req.address_1 {
-        company.address_1 = if address_1.trim().is_empty() { None } else { Some(address_1.trim().to_string()) };
+        company.address_1 = if address_1.trim().is_empty() {
+            None
+        } else {
+            Some(address_1.trim().to_string())
+        };
     }
     if let Some(address_2) = &req.address_2 {
-        company.address_2 = if address_2.trim().is_empty() { None } else { Some(address_2.trim().to_string()) };
+        company.address_2 = if address_2.trim().is_empty() {
+            None
+        } else {
+            Some(address_2.trim().to_string())
+        };
     }
     if let Some(city) = &req.city {
-        company.city = if city.trim().is_empty() { None } else { Some(city.trim().to_string()) };
+        company.city = if city.trim().is_empty() {
+            None
+        } else {
+            Some(city.trim().to_string())
+        };
     }
     if let Some(state) = &req.state {
-        company.state = if state.trim().is_empty() { None } else { Some(state.trim().to_string()) };
+        company.state = if state.trim().is_empty() {
+            None
+        } else {
+            Some(state.trim().to_string())
+        };
     }
     if let Some(country_code) = &req.country_code {
-        company.country_code = if country_code.trim().is_empty() { None } else { Some(country_code.trim().to_string()) };
+        company.country_code = if country_code.trim().is_empty() {
+            None
+        } else {
+            Some(country_code.trim().to_string())
+        };
     }
     if let Some(tax_id) = &req.tax_id {
-        company.tax_id = if tax_id.trim().is_empty() { None } else { Some(tax_id.trim().to_string()) };
+        company.tax_id = if tax_id.trim().is_empty() {
+            None
+        } else {
+            Some(tax_id.trim().to_string())
+        };
     }
     if let Some(postcode) = &req.postcode {
-        company.postcode = if postcode.trim().is_empty() { None } else { Some(postcode.trim().to_string()) };
+        company.postcode = if postcode.trim().is_empty() {
+            None
+        } else {
+            Some(postcode.trim().to_string())
+        };
     }
     if let Some(phone) = &req.phone {
-        company.phone = if phone.trim().is_empty() { None } else { Some(phone.trim().to_string()) };
+        company.phone = if phone.trim().is_empty() {
+            None
+        } else {
+            Some(phone.trim().to_string())
+        };
     }
     if let Some(email) = &req.email {
-        company.email = if email.trim().is_empty() { None } else { Some(email.trim().to_string()) };
+        company.email = if email.trim().is_empty() {
+            None
+        } else {
+            Some(email.trim().to_string())
+        };
     }
     if let Some(base_currency) = &req.base_currency {
         let currency = base_currency.trim().to_uppercase();

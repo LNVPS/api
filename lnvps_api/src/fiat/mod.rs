@@ -16,6 +16,8 @@ pub trait FiatPaymentService: Send + Sync {
         description: &str,
         amount: CurrencyAmount,
     ) -> Pin<Box<dyn Future<Output = Result<FiatPaymentInfo>> + Send>>;
+
+    fn cancel_order(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]

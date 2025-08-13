@@ -1,11 +1,9 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{
-    AdminVmOsImageInfo, CreateVmOsImageRequest, UpdateVmOsImageRequest,
-};
-use lnvps_api_common::{ApiData, ApiResult, ApiPaginatedResult, ApiPaginatedData};
+use crate::admin::model::{AdminVmOsImageInfo, CreateVmOsImageRequest, UpdateVmOsImageRequest};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
-use rocket::{get, post, patch, delete, State};
+use rocket::{delete, get, patch, post, State};
 use std::sync::Arc;
 
 /// List VM OS images with pagination
@@ -27,7 +25,7 @@ pub async fn admin_list_vm_os_images(
     for image in images {
         admin_images.push(AdminVmOsImageInfo::from_db_with_vm_count(db, image).await?);
     }
-    
+
     ApiPaginatedData::ok(admin_images, total, limit, offset)
 }
 
@@ -62,7 +60,7 @@ pub async fn admin_create_vm_os_image(
     // Create the image in the database
     let image_id = db.admin_create_vm_os_image(&vm_os_image).await?;
     vm_os_image.id = image_id;
-    
+
     ApiData::ok(vm_os_image.into())
 }
 
@@ -111,7 +109,7 @@ pub async fn admin_update_vm_os_image(
 
     // Update in database
     db.admin_update_vm_os_image(&image).await?;
-    
+
     ApiData::ok(image.into())
 }
 

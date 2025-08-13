@@ -4,7 +4,7 @@ use crate::routes::routes;
 use anyhow::Result;
 use config::{Config, File};
 use lnvps_common::CORS;
-use lnvps_db::{nostr::LNVPSNostrDb, LNVpsDbMysql};
+use lnvps_db::{LNVpsDbMysql, nostr::LNVPSNostrDb};
 use log::error;
 use rocket::http::Method;
 use serde::Deserialize;

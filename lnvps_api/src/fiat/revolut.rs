@@ -1,7 +1,7 @@
-use crate::{Currency, CurrencyAmount};
 use crate::fiat::{FiatPaymentInfo, FiatPaymentService};
 use crate::json_api::{JsonApi, TokenGen};
 use crate::settings::RevolutConfig;
+use crate::{Currency, CurrencyAmount};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use nostr::Url;
@@ -103,6 +103,16 @@ impl RevolutApi {
     pub async fn get_order(&self, order_id: &str) -> Result<RevolutOrder> {
         self.api.get(&format!("/api/orders/{}", order_id)).await
     }
+
+    pub async fn cancel_order(&self, order_id: &str) -> Result<RevolutOrder> {
+        self.api
+            .req::<_, ()>(
+                Method::POST,
+                &format!("/api/orders/{}/cancel", order_id),
+                None,
+            )
+            .await
+    }
 }
 
 impl FiatPaymentService for RevolutApi {
@@ -119,6 +129,15 @@ impl FiatPaymentService for RevolutApi {
                 raw_data: serde_json::to_string(&rsp)?,
                 external_id: rsp.id,
             })
+        })
+    }
+
+    fn cancel_order(&self, id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+        let s = self.clone();
+        let id = id.to_string();
+        Box::pin(async move {
+            s.cancel_order(&id).await?;
+            Ok(())
         })
     }
 }

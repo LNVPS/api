@@ -7,29 +7,34 @@ use crate::admin::companies::{
     admin_update_company,
 };
 use crate::admin::cost_plans::{
-    admin_create_cost_plan, admin_delete_cost_plan, admin_get_cost_plan,
-    admin_list_cost_plans, admin_update_cost_plan,
+    admin_create_cost_plan, admin_delete_cost_plan, admin_get_cost_plan, admin_list_cost_plans,
+    admin_update_cost_plan,
 };
 use crate::admin::custom_pricing::{
     admin_copy_custom_pricing, admin_create_custom_pricing, admin_delete_custom_pricing,
     admin_get_custom_pricing, admin_list_custom_pricing, admin_update_custom_pricing,
 };
-use crate::admin::ip_ranges::{
-    admin_create_ip_range, admin_delete_ip_range, admin_get_ip_range,
-    admin_list_ip_ranges, admin_update_ip_range,
-};
 use crate::admin::hosts::{
     admin_create_host, admin_get_host, admin_get_host_disk, admin_list_host_disks,
     admin_list_hosts, admin_update_host, admin_update_host_disk,
+};
+use crate::admin::ip_ranges::{
+    admin_create_ip_range, admin_delete_ip_range, admin_get_ip_range, admin_list_ip_ranges,
+    admin_update_ip_range,
 };
 use crate::admin::regions::{
     admin_create_region, admin_delete_region, admin_get_region, admin_list_regions,
     admin_update_region,
 };
+use crate::admin::reports::admin_time_series_report;
 use crate::admin::roles::{
     admin_assign_user_role, admin_create_role, admin_delete_role, admin_get_my_roles,
     admin_get_role, admin_get_user_roles, admin_list_roles, admin_revoke_user_role,
     admin_update_role,
+};
+use crate::admin::routers::{
+    admin_create_router, admin_delete_router, admin_get_router, admin_list_routers,
+    admin_update_router,
 };
 use crate::admin::users::{admin_list_users, admin_update_user};
 use crate::admin::vm_os_images::{
@@ -40,15 +45,10 @@ use crate::admin::vm_templates::{
     admin_create_vm_template, admin_delete_vm_template, admin_get_vm_template,
     admin_list_vm_templates, admin_update_vm_template,
 };
-use crate::admin::routers::{
-    admin_create_router, admin_delete_router, admin_get_router, admin_list_routers,
-    admin_update_router,
-};
 use crate::admin::vms::{
-    admin_delete_vm, admin_extend_vm, admin_get_vm, admin_list_vms, admin_start_vm, admin_stop_vm,
-    admin_list_vm_history, admin_get_vm_history, admin_list_vm_payments, admin_get_vm_payment,
+    admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
+    admin_list_vm_history, admin_list_vm_payments, admin_list_vms, admin_start_vm, admin_stop_vm,
 };
-use crate::admin::reports::{admin_time_series_report};
 use rocket::{routes, Route};
 
 pub mod access_policies;

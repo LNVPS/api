@@ -239,7 +239,7 @@ pub async fn admin_get_user_roles(
 
     for assignment in role_assignments {
         let role = db.get_role(assignment.role_id).await?;
-        
+
         // Get role permissions
         let permissions = db.get_role_permissions(assignment.role_id).await?;
         let permission_strings: Vec<String> = permissions
@@ -328,7 +328,7 @@ pub async fn admin_revoke_user_role(
     // Check that role exists
     let role = db.get_role(role_id).await?;
 
-    // Only prevent super_admin users from revoking their own super_admin role 
+    // Only prevent super_admin users from revoking their own super_admin role
     // (to avoid locking themselves out of the system)
     if auth.user_id == user_id && role.name == "super_admin" {
         // Check if the current user has super_admin role

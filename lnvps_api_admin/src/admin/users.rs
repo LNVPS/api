@@ -112,10 +112,10 @@ pub async fn admin_update_user(
             AdminUserRole::SuperAdmin | AdminUserRole::Admin | AdminUserRole::ReadOnly => {
                 let role_name = match admin_role {
                     AdminUserRole::SuperAdmin => "super_admin",
-                    AdminUserRole::Admin => "admin", 
+                    AdminUserRole::Admin => "admin",
                     AdminUserRole::ReadOnly => "read_only",
                 };
-                
+
                 // Get the role by name
                 if let Ok(role) = db.get_role_by_name(role_name).await {
                     // First revoke any existing roles for this user

@@ -1,12 +1,12 @@
 use anyhow::Result;
+use redis::AsyncCommands;
 use rocket::serde::Deserialize;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use redis::AsyncCommands;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Serialize, Deserialize, Default, JsonSchema, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -106,7 +106,7 @@ impl VmStateCacheBackend for RedisVmStateCache {
     async fn set_state(&self, id: u64, state: VmRunningState) -> Result<()> {
         let key = self.vm_key(id);
         let serialized = serde_json::to_string(&state)?;
-        
+
         let mut conn = self.client.get_multiplexed_async_connection().await?;
         let _: () = conn.set_ex(&key, &serialized, self.ttl.as_secs()).await?;
         Ok(())
@@ -114,7 +114,7 @@ impl VmStateCacheBackend for RedisVmStateCache {
 
     async fn get_state(&self, id: u64) -> Result<Option<VmRunningState>> {
         let key = self.vm_key(id);
-        
+
         let mut conn = self.client.get_multiplexed_async_connection().await?;
         match conn.get::<_, Option<String>>(&key).await? {
             Some(serialized) => {
