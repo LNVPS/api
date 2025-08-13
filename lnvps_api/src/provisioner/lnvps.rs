@@ -17,7 +17,7 @@ use lnvps_db::{
     AccessPolicy, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType,
     RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate,
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::str::FromStr;
@@ -481,6 +481,37 @@ impl LNVpsProvisioner {
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
         Ok(new_vm)
+    }
+
+
+    #[cfg(feature = "nostr-nwc")]
+    /// Attempt automatic renewal via Nostr Wallet Connect
+    pub async fn auto_renew_via_nwc(&self, vm_id: u64, nwc_connection_string: &str) -> Result<VmPayment> {
+        use nostr_sdk::prelude::*;
+
+        debug!("Attempting automatic renewal for VM {} via NWC", vm_id);
+
+        // Use existing renew method to create the payment/invoice
+        let vm_payment = self
+            .renew(vm_id, PaymentMethod::Lightning)
+            .await?;
+
+        // Extract the invoice from external_data
+        let invoice: String = vm_payment.external_data.clone().into();
+        debug!(
+            "Created renewal invoice for VM {}, attempting NWC payment",
+            vm_id
+        );
+
+        // Parse NWC connection string
+        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
+            .context("Invalid NWC connection string")?;
+
+        // Create nostr client for NWC
+        let client = nwc::NWC::new(nwc_uri);
+        client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
+        info!("Successful NWC auto-renewal payment for VM {}", vm_id);
+        Ok(vm_payment)
     }
 
     /// Create a renewal payment

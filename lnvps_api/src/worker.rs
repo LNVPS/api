@@ -126,45 +126,6 @@ impl Worker {
         Ok(())
     }
 
-    #[cfg(feature = "nostr-nwc")]
-    /// Attempt automatic renewal via Nostr Wallet Connect
-    pub async fn auto_renew_via_nwc(&self, vm_id: u64, nwc_connection_string: &str) -> Result<()> {
-        use log::{debug, error};
-        use nostr_sdk::prelude::*;
-
-        debug!("Attempting automatic renewal for VM {} via NWC", vm_id);
-
-        // Use existing renew method to create the payment/invoice
-        let vm_payment = match self
-            .provisioner
-            .renew(vm_id, PaymentMethod::Lightning)
-            .await
-        {
-            Ok(payment) => payment,
-            Err(e) => {
-                debug!("Failed to create renewal payment for VM {}: {}", vm_id, e);
-                return Ok(());
-            }
-        };
-
-        // Extract the invoice from external_data
-        let invoice: String = vm_payment.external_data.into();
-        debug!(
-            "Created renewal invoice for VM {}, attempting NWC payment",
-            vm_id
-        );
-
-        // Parse NWC connection string
-        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
-            .context("Invalid NWC connection string")?;
-
-        // Create nostr client for NWC
-        let client = nwc::NWC::new(nwc_uri);
-        client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
-        info!("Successful NWC auto-renewal payment for VM {}", vm_id);
-        Ok(())
-    }
-
     /// Handle VM state
     /// 1. Expire VM and send notification
     /// 2. Stop VM if expired and still running
@@ -192,7 +153,11 @@ impl Worker {
                         info!("Attempting automatic renewal for VM {} via NWC (user has NWC configured and VM auto-renewal is enabled)", vm.id);
                         renewal_attempted = true;
 
-                        match self.auto_renew_via_nwc(vm.id, &nwc_string).await {
+                        match self
+                            .provisioner
+                            .auto_renew_via_nwc(vm.id, &nwc_string)
+                            .await
+                        {
                             Ok(_) => {
                                 renewal_successful = true;
                                 info!("Successfully auto-renewed VM {} via NWC", vm.id);

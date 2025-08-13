@@ -509,15 +509,24 @@ async fn v1_renew_vm(
     if uid != vm.user_id {
         return ApiData::err("VM does not belong to you");
     }
+    let user = db.get_user(uid).await?;
 
-    let rsp = provisioner
-        .renew(
-            id,
-            method
-                .and_then(|m| PaymentMethod::from_str(m).ok())
-                .unwrap_or(PaymentMethod::Lightning),
-        )
-        .await?;
+    // handle "nwc" payments automatically
+    let rsp = if method == Some("nwc") && user.nwc_connection_string.is_some() {
+        provisioner
+            .auto_renew_via_nwc(id, user.nwc_connection_string.unwrap().as_str())
+            .await?
+    } else {
+        provisioner
+            .renew(
+                id,
+                method
+                    .and_then(|m| PaymentMethod::from_str(m).ok())
+                    .unwrap_or(PaymentMethod::Lightning),
+            )
+            .await?
+    };
+
     ApiData::ok(rsp.into())
 }
 
@@ -835,6 +844,12 @@ async fn v1_get_payment_methods(settings: &State<Settings>) -> ApiResult<Vec<Api
         metadata: HashMap::new(),
         currencies: vec![Currency::BTC],
     }];
+    #[cfg(feature = "nostr-nwc")]
+    ret.push(ApiPaymentInfo {
+        name: ApiPaymentMethod::NWC,
+        metadata: HashMap::new(),
+        currencies: vec![Currency::BTC],
+    });
     #[cfg(feature = "revolut")]
     if let Some(r) = &settings.revolut {
         ret.push(ApiPaymentInfo {

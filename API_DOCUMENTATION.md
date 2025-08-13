@@ -196,7 +196,7 @@ interface PaymentType {
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'revolut' | 'paypal';
+  name: 'lightning' | 'revolut' | 'paypal' | 'nwc';
   metadata: Record<string, string>;
   currencies: ('BTC' | 'EUR' | 'USD')[];
 }

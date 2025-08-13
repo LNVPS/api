@@ -314,6 +314,7 @@ pub enum ApiPaymentMethod {
     Lightning,
     Revolut,
     Paypal,
+    NWC
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {
