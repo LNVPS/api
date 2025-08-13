@@ -5,14 +5,13 @@ use anyhow::Context;
 use lnvps_db::{
     DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
 };
-use nostr::prelude::DataVendingMachineStatus;
-use nostr::Tag;
-use nostr_sdk::Client;
+use nostr_sdk::{Client, Tag};
 use ssh_key::PublicKey;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use nostr_sdk::prelude::DataVendingMachineStatus;
 
 pub struct LnvpsDvm {
     client: Client,
@@ -159,7 +158,7 @@ mod tests {
     use crate::settings::mock_settings;
     use lnvps_api_common::{ExchangeRateService, MockDb, MockExchangeRate, Ticker};
     use lnvps_db::{VmCustomPricing, VmCustomPricingDisk};
-    use nostr::{EventBuilder, Keys, Kind};
+    use nostr_sdk::{EventBuilder, Keys, Kind};
 
     #[tokio::test]
     #[ignore]

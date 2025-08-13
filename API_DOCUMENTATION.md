@@ -37,6 +37,7 @@ interface AccountInfo {
   state?: string;
   postcode?: string;
   tax_id?: string;
+  nwc_connection_string?: string; // Nostr Wallet Connect URI for automatic renewals
 }
 ```
 
@@ -53,6 +54,7 @@ interface VmStatus {
   ssh_key: UserSshKey;
   ip_assignments: VmIpAssignment[];
   status: VmState;
+  auto_renewal_enabled: boolean; // Whether automatic renewal via NWC is enabled for this VM
 }
 
 type VmState = 'running' | 'stopped' | 'pending' | 'error' | 'unknown';
@@ -222,6 +224,7 @@ interface VmHistory {
 interface VmPatchRequest {
   ssh_key_id?: number;
   reverse_dns?: string;
+  auto_renewal_enabled?: boolean; // Enable/disable automatic renewal via NWC for this VM
 }
 
 interface CreateVmRequest {
@@ -263,6 +266,60 @@ interface VmUpgradeQuote {
 - **Body**: `AccountInfo`
 - **Response**: `null`
 
+### Automatic Renewal with Nostr Wallet Connect
+
+The LNVPS platform supports automatic VM renewal using Nostr Wallet Connect (NWC). This feature allows users to set up their Lightning wallets to automatically pay for VM renewals before expiration.
+
+#### How It Works
+
+1. **User Setup**: Configure your NWC connection string in your account settings
+2. **Per-VM Control**: Enable automatic renewal for specific VMs you want to auto-renew
+3. **Automatic Processing**: The system attempts renewal 1 day before VM expiration
+4. **Dual Requirements**: Auto-renewal only works when BOTH conditions are met:
+   - User has a valid NWC connection string configured
+   - VM has `auto_renewal_enabled` set to `true`
+
+#### Setup Process
+
+1. **Configure NWC Connection**: Use the account PATCH endpoint to set your `nwc_connection_string`
+2. **Enable Per-VM**: Use the VM PATCH endpoint to set `auto_renewal_enabled: true` for desired VMs
+3. **Monitor Status**: Check VM details to see current auto-renewal status
+
+#### NWC Connection String Format
+
+The `nwc_connection_string` should be a valid Nostr Wallet Connect URI in the format:
+```
+nostr+walletconnect://relay_url?relay=ws://...&secret=...&pubkey=...
+```
+
+#### Important Notes
+
+- **Safety First**: New VMs default to `auto_renewal_enabled: false` - you must explicitly enable it
+- **Cost Control**: Only enable auto-renewal for VMs you definitely want to keep running
+- **Fallback**: If auto-renewal fails, you'll receive the standard expiration notification
+- **Validation**: The system validates NWC connection strings when you set them
+- **Encryption**: NWC connection strings are encrypted in the database for security
+
+#### Example Usage
+
+```typescript
+// 1. Set up NWC connection string
+const accountUpdate = {
+  nwc_connection_string: "nostr+walletconnect://relay.damus.io?relay=wss://relay.damus.io&secret=..."
+};
+await api.patch('/api/v1/account', accountUpdate);
+
+// 2. Enable auto-renewal for a specific VM
+const vmUpdate = {
+  auto_renewal_enabled: true
+};
+await api.patch('/api/v1/vm/123', vmUpdate);
+
+// 3. Check VM auto-renewal status
+const vmStatus = await api.get('/api/v1/vm/123');
+console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
+```
+
 ### SSH Key Management
 
 #### List SSH Keys
@@ -293,6 +350,7 @@ interface VmUpgradeQuote {
 - **Auth**: Required
 - **Body**: `VmPatchRequest`
 - **Response**: `null`
+- **Description**: Updates VM settings including SSH key, reverse DNS, and automatic renewal preferences
 
 #### Create Standard VM Order
 - **POST** `/api/v1/vm`

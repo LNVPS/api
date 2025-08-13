@@ -9,23 +9,21 @@ use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::{Currency, CurrencyAmount};
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::Tag;
-use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::{
-    ApiData, ApiResult, ExchangeRateService, Nip98Auth, UpgradeConfig,
-    VmStateCache, WorkJob,
+    ApiData, ApiResult, ExchangeRateService, Nip98Auth, UpgradeConfig, VmStateCache, WorkJob,
 };
+use lnvps_api_common::{ApiError, VmHistoryLogger};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
 use log::{error, info};
-use nostr::util::hex;
-use nostr::{ToBech32, Url};
+use nostr_sdk::{ToBech32, Url};
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
 use rocket::{get, patch, post, routes, Route, State};
@@ -92,6 +90,23 @@ async fn v1_patch_account(
     let uid = db.upsert_user(&pubkey).await?;
     let mut user = db.get_user(uid).await?;
 
+    // validate nwc string
+    #[cfg(feature = "nostr-nwc")]
+    if let Some(nwc) = &req.nwc_connection_string {
+        match nwc::prelude::NostrWalletConnectURI::parse(nwc) {
+            Ok(s) => {
+                // test connection
+                let client = nwc::NWC::new(s);
+                let info = client.get_info().await?;
+                let method = "pay_invoice".to_string();
+                if !info.methods.contains(&method) {
+                    return ApiData::err("NWC connection must allow pay_invoice");
+                }
+            }
+            Err(e) => return ApiData::err(&format!("Failed to parse NWC url: {}", e)),
+        }
+    }
+
     user.email = req.email.clone().map(|s| s.into());
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
@@ -107,6 +122,7 @@ async fn v1_patch_account(
     user.billing_state = req.state.clone();
     user.billing_postcode = req.postcode.clone();
     user.billing_tax_id = req.tax_id.clone();
+    user.nwc_connection_string = req.nwc_connection_string.clone().map(|s| s.into());
 
     db.update_user(&user).await?;
     ApiData::ok(())
@@ -185,6 +201,7 @@ async fn v1_patch_vm(
 
     let mut vm = old_vm.clone();
     let mut vm_config = false;
+    let mut host_config = false;
     if let Some(k) = data.ssh_key_id {
         let ssh_key = db.get_user_ssh_key(k).await?;
         if ssh_key.user_id != uid {
@@ -192,6 +209,7 @@ async fn v1_patch_vm(
         }
         vm.ssh_key_id = ssh_key.id;
         vm_config = true;
+        host_config = true;
     }
 
     if let Some(ptr) = &data.reverse_dns {
@@ -203,8 +221,16 @@ async fn v1_patch_vm(
         }
     }
 
+    // Handle auto-renewal setting change
+    if let Some(auto_renewal) = data.auto_renewal_enabled {
+        vm.auto_renewal_enabled = auto_renewal;
+        vm_config = true;
+    }
+
     if vm_config {
         db.update_vm(&vm).await?;
+    }
+    if host_config {
         let info = FullVmInfo::load(vm.id, (*db).clone()).await?;
         let host = db.get_host(vm.host_id).await?;
         let client = get_host_client(&host, &settings.provisioner)?;
@@ -965,7 +991,7 @@ async fn v1_get_payment_invoice(
                 .to_string(),
                 payment: payment.into(),
                 invoice_item,
-                npub: nostr::PublicKey::from_slice(&user.pubkey)
+                npub: nostr_sdk::PublicKey::from_slice(&user.pubkey)
                     .map_err(|_| "Invalid pubkey")?
                     .to_bech32()
                     .unwrap(),

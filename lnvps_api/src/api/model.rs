@@ -7,7 +7,6 @@ use chrono::{DateTime, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType, Currency, CurrencyAmount};
 use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
-use nostr::util::hex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -114,6 +113,9 @@ pub struct VMPatchRequest {
     pub ssh_key_id: Option<u64>,
     /// Reverse DNS PTR domain
     pub reverse_dns: Option<String>,
+    /// Enable automatic renewal via NWC for this VM
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_renewal_enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -138,6 +140,9 @@ pub struct AccountPatchRequest {
     pub postcode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tax_id: Option<String>,
+    /// Nostr Wallet Connect connection string for automatic VM renewals
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nwc_connection_string: Option<String>,
 }
 
 impl From<lnvps_db::User> for AccountPatchRequest {
@@ -154,6 +159,7 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             city: user.billing_city,
             postcode: user.billing_postcode,
             tax_id: user.billing_tax_id,
+            nwc_connection_string: user.nwc_connection_string.map(|nwc| nwc.into()),
         }
     }
 }

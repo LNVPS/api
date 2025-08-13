@@ -39,6 +39,8 @@ pub struct User {
     pub billing_postcode: Option<String>,
     /// Billing tax id
     pub billing_tax_id: Option<String>,
+    /// Nostr Wallet Connect connection string for automatic renewals (encrypted)
+    pub nwc_connection_string: Option<EncryptedString>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -66,6 +68,8 @@ pub struct AdminUserInfo {
     pub billing_state: Option<String>,
     pub billing_postcode: Option<String>,
     pub billing_tax_id: Option<String>,
+    /// Nostr Wallet Connect connection string for automatic renewals (encrypted)
+    pub nwc_connection_string: Option<EncryptedString>,
     // Admin-specific fields
     pub vm_count: i64,
     pub is_admin: bool,
@@ -456,6 +460,8 @@ pub struct Vm {
     pub deleted: bool,
     /// Referral code (recorded during ordering)
     pub ref_code: Option<String>,
+    /// Enable automatic renewal
+    pub auto_renewal_enabled: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

@@ -60,6 +60,24 @@ impl WorkCommander {
         })
     }
 
+    pub fn client(&self) -> redis::Client {
+        self.redis.clone()
+    }
+
+    /// Generic KV store
+    pub async fn store_key(&self, key: &str, value: &[u8]) -> Result<()> {
+        let mut conn = self.client().get_multiplexed_async_connection().await?;
+        conn.set(key, value).await?;
+        Ok(())
+    }
+
+    /// Generic KV store
+    pub async fn get_key(&self, key: &str) -> Result<Vec<u8>> {
+        let mut conn = self.client().get_multiplexed_async_connection().await?;
+        let value = conn.get(key).await?;
+        Ok(value)
+    }
+
     pub fn new_publisher(redis_url: &str) -> Result<Self> {
         let redis = redis::Client::open(redis_url)?;
         Ok(Self {

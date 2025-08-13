@@ -90,6 +90,7 @@ impl MockDb {
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code: None,
+            auto_renewal_enabled: false,
         }
     }
 }
@@ -1091,6 +1092,7 @@ impl AdminDb for MockDb {
                 billing_state: u.billing_state.clone(),
                 billing_postcode: u.billing_postcode.clone(),
                 billing_tax_id: u.billing_tax_id.clone(),
+                nwc_connection_string: u.nwc_connection_string.clone(),
                 vm_count: 0,
                 is_admin: false,
             })

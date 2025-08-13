@@ -166,6 +166,8 @@ pub struct ApiVmStatus {
     pub ip_assignments: Vec<ApiVmIpAssignment>,
     /// Current running state of the VM
     pub status: VmRunningState,
+    /// Enable automatic renewal via NWC for this VM
+    pub auto_renewal_enabled: bool,
 }
 
 // Function to build ApiVmStatus from VM data (moved from common)
@@ -205,6 +207,7 @@ pub async fn vm_to_status(
                 ApiVmIpAssignment::from(&i, range)
             })
             .collect(),
+        auto_renewal_enabled: vm.auto_renewal_enabled,
     })
 }
 

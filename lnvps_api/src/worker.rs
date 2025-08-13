@@ -14,8 +14,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost};
 use log::{debug, error, info, warn};
-use nostr::{EventBuilder, PublicKey, ToBech32};
-use nostr_sdk::Client;
+use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
@@ -60,6 +59,8 @@ impl From<&Settings> for WorkerSettings {
 }
 
 impl Worker {
+    const CHECK_VMS_SECONDS: u64 = 30;
+
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         provisioner: Arc<LNVpsProvisioner>,
@@ -71,7 +72,6 @@ impl Worker {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         let settings = settings.into();
 
-        // Initialize WorkCommander if Redis is configured
         let work_commander = if let Some(redis_config) = &settings.redis {
             Some(WorkCommander::new(
                 &redis_config.url,
@@ -100,6 +100,31 @@ impl Worker {
         self.tx.clone()
     }
 
+    pub async fn get_last_check_vms(&self) -> Result<DateTime<Utc>> {
+        if let Some(w) = &self.work_commander {
+            let v = w.get_key("worker-last-check-vms").await?;
+            let timestamp = if v.len() == 8 {
+                u64::from_le_bytes(v.as_slice().try_into()?)
+            } else {
+                0
+            };
+            let date = DateTime::from_timestamp(timestamp as _, 0).unwrap();
+            Ok(date)
+        } else {
+            Ok(self.last_check_vms)
+        }
+    }
+
+    pub async fn set_last_check_vms(&mut self, last_check_vms: DateTime<Utc>) -> Result<()> {
+        self.last_check_vms = last_check_vms;
+        if let Some(w) = &self.work_commander {
+            let t = last_check_vms.timestamp() as u64;
+            w.store_key("worker-last-check-vms", &t.to_le_bytes())
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Handle VM state
     /// 1. Expire VM and send notification
     /// 2. Stop VM if expired and still running
@@ -107,19 +132,75 @@ impl Worker {
     async fn handle_vm_state(&self, vm: &Vm, state: &VmRunningState) -> Result<()> {
         const BEFORE_EXPIRE_NOTIFICATION: u64 = 1;
 
-        // Send notification of VM expiring soon
+        let last_check = self.get_last_check_vms().await?;
+
+        // Attempt automatic renewal or send notification of VM expiring soon
         if vm.expires < Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
-            && vm.expires
-                > self
-                    .last_check_vms
-                    .add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
+            && vm.expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
         {
-            info!("Sending expire soon notification VM {}", vm.id);
-            self.tx.send(WorkJob::SendNotification {
+            // Try automatic renewal via NWC if both user NWC and VM auto-renewal are enabled
+            let user = self.db.get_user(vm.user_id).await?;
+            let mut renewal_attempted = false;
+            let mut renewal_successful = false;
+
+            #[cfg(feature = "nostr-nwc")]
+            if vm.auto_renewal_enabled {
+                if let Some(ref nwc_connection) = user.nwc_connection_string {
+                    let nwc_string: String = nwc_connection.clone().into();
+                    if !nwc_string.is_empty() {
+                        info!("Attempting automatic renewal for VM {} via NWC (user has NWC configured and VM auto-renewal is enabled)", vm.id);
+                        renewal_attempted = true;
+
+                        match self
+                            .provisioner
+                            .auto_renew_via_nwc(vm.id, &nwc_string)
+                            .await
+                        {
+                            Ok(true) => {
+                                renewal_successful = true;
+                                info!("Successfully auto-renewed VM {} via NWC", vm.id);
+                                self.tx.send(WorkJob::SendNotification {
+                                    user_id: vm.user_id,
+                                    title: Some(format!("[VM{}] Auto-Renewed", vm.id)),
+                                    message: format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id)
+                                })?;
+                            }
+                            Ok(false) => {
+                                info!(
+                                    "Auto-renewal failed for VM {}, sending expiry notification",
+                                    vm.id
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Auto-renewal error for VM {}: {}", vm.id, e);
+                            }
+                        }
+                    } else {
+                        info!("VM {} has auto-renewal enabled but user has no NWC connection configured", vm.id);
+                    }
+                } else {
+                    info!(
+                        "VM {} has auto-renewal enabled but user has no NWC connection configured",
+                        vm.id
+                    );
+                }
+            }
+
+            // If no renewal was attempted or renewal failed, send the expiry notification
+            if !renewal_attempted || !renewal_successful {
+                info!("Sending expire soon notification VM {}", vm.id);
+                let message = if renewal_attempted {
+                    format!("Your VM #{} will expire soon. Automatic renewal failed, please manually renew in the next {} days or your VM will be stopped.", vm.id, BEFORE_EXPIRE_NOTIFICATION)
+                } else {
+                    format!("Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.", vm.id, BEFORE_EXPIRE_NOTIFICATION)
+                };
+
+                self.tx.send(WorkJob::SendNotification {
                     user_id: vm.user_id,
                     title: Some(format!("[VM{}] Expiring Soon", vm.id)),
-                    message: format!("Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.", vm.id, BEFORE_EXPIRE_NOTIFICATION)
+                    message,
                 })?;
+            }
         }
 
         // Stop VM if expired and is running
@@ -256,7 +337,32 @@ impl Worker {
         Ok(())
     }
 
+    pub fn spawn_check_loop(&self) {
+        let sender_clone = self.sender();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = sender_clone.send(WorkJob::CheckVms) {
+                    error!("failed to send check vm: {}", e);
+                }
+                tokio::time::sleep(Duration::from_secs(Self::CHECK_VMS_SECONDS)).await;
+            }
+        });
+    }
+
     pub async fn check_vms(&mut self) -> Result<()> {
+        // Check if enough time has passed since last check to prevent rapid back-to-back calls
+        let last_check = self.get_last_check_vms().await?;
+        let time_since_last_check = Utc::now().signed_duration_since(last_check);
+
+        if time_since_last_check.num_seconds() < Self::CHECK_VMS_SECONDS as i64 {
+            debug!(
+                "Skipping CheckVms job - only {}s since last check (rate limit: {}s)",
+                time_since_last_check.num_seconds(),
+                Self::CHECK_VMS_SECONDS
+            );
+            return Ok(());
+        }
+
         // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
 
@@ -314,7 +420,7 @@ impl Worker {
             }
         }
 
-        self.last_check_vms = Utc::now();
+        self.set_last_check_vms(Utc::now()).await?;
         Ok(())
     }
 
@@ -583,7 +689,7 @@ impl Worker {
 
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
-                                    format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}", 
+                                    format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}",
                                            domain.name, domain.id, e),
                                     Some(format!("Domain Activation Failed: {}", domain.name)),
                                 ) {
@@ -638,7 +744,7 @@ impl Worker {
 
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
-                                    format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}", 
+                                    format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}",
                                            domain.name, domain.id, e),
                                     Some(format!("Domain Deactivation Failed: {}", domain.name)),
                                 ) {
@@ -703,7 +809,7 @@ impl Worker {
 
                                     // Send admin notification about the failure
                                     if let Err(notification_err) = self.queue_admin_notification(
-                                        format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}", 
+                                        format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}",
                                                domain.name, domain.id, domain.last_status_change, e),
                                         Some(format!("Domain Deletion Failed: {}", domain.name)),
                                     ) {
@@ -1227,8 +1333,12 @@ impl Worker {
         loop {
             tokio::select! {
                 // Handle local channel jobs
-                job = self.rx.recv() => {
-                    if let Some(job) = job {
+                Some(job) = self.rx.recv() => {
+                    if let Some(w) = &self.work_commander {
+                        // send internal commands to work queue on redis
+                        w.send_job(job).await?;
+                    } else {
+                        // handle job directly if redis is not used
                         if let Err(e) = self.try_job(&job).await {
                             error!("Job failed to execute: {:?} {}", job, e);
                         }

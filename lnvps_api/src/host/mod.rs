@@ -300,6 +300,7 @@ mod tests {
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 deleted: false,
                 ref_code: None,
+                auto_renewal_enabled: false,
             },
             host: VmHost {
                 id: 1,

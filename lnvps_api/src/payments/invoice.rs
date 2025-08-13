@@ -6,7 +6,6 @@ use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType, VmPayment};
 use log::{error, info, warn};
-use nostr::util::hex;
 use rocket::futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;

@@ -12,6 +12,7 @@ default = [
     "mikrotik",
     "nostr-dm",
     "nostr-dvm",
+    "nostr-nwc",
     "nostr-domain",
     "proxmox",
     "lnd",
@@ -23,9 +24,10 @@ default = [
     "admin"
 ]
 mikrotik = ["dep:reqwest"]
-nostr-dm = ["dep:nostr-sdk"]
+nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain"]
+nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
 admin = ["lnvps_db/admin"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
@@ -68,8 +70,10 @@ hickory-resolver = "0.25.2"
 humantime = "2.2.0"
 
 #nostr-dm
-nostr = { version = "0.40.0", default-features = false, features = ["std"] }
-nostr-sdk = { version = "0.40.0", optional = true, default-features = false, features = ["nip44", "nip59"] }
+nostr-sdk = { version = "0.43.0", optional = true, default-features = false }
+
+#nostr-nwc
+nwc = { version = "0.43.0", optional = true }
 
 #proxmox
 tokio-tungstenite = { version = "^0.21", features = ["native-tls"], optional = true }

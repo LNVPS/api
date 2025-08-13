@@ -3,12 +3,10 @@ mod lnvps;
 use crate::dvm::lnvps::LnvpsDvm;
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Result;
-use futures::FutureExt;
 use log::{error, info, warn};
-use nostr::Filter;
 use nostr_sdk::prelude::DataVendingMachineStatus;
 use nostr_sdk::{
-    Client, Event, EventBuilder, EventId, Kind, RelayPoolNotification, Tag, Timestamp, Url,
+    Client, Event, EventBuilder, EventId, Filter, Kind, RelayPoolNotification, Tag, Timestamp, Url,
 };
 use std::collections::HashMap;
 use std::future::Future;

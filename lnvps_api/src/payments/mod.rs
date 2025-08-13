@@ -5,7 +5,6 @@ use anyhow::Result;
 use lnvps_api_common::{UpgradeConfig, WorkJob};
 use lnvps_db::{LNVpsDb, VmPayment};
 use log::{error, info, warn};
-use nostr::util::hex;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;

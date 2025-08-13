@@ -14,8 +14,7 @@ use lnvps_api_common::{DefaultRateCache, VmStateCache, WorkJob};
 use lnvps_common::CORS;
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
 use log::{error, info};
-use nostr::Keys;
-use nostr_sdk::Client;
+use nostr_sdk::{Client, Keys};
 use rocket::http::Method;
 use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
 use std::net::{IpAddr, SocketAddr};
@@ -99,6 +98,7 @@ async fn main() -> Result<(), Error> {
         status.clone(),
         nostr_client.clone(),
     )?;
+    worker.spawn_check_loop();
     let sender = worker.sender();
     tokio::spawn(async move {
         loop {
@@ -111,17 +111,6 @@ async fn main() -> Result<(), Error> {
 
     // setup payment handlers
     listen_all_payments(&settings, node.clone(), db.clone(), sender.clone())?;
-
-    // request work every 30s to check vm status
-    let sender_clone = sender.clone();
-    tokio::spawn(async move {
-        loop {
-            if let Err(e) = sender_clone.send(WorkJob::CheckVms) {
-                error!("failed to send check vm: {}", e);
-            }
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-    });
 
     // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)
     #[cfg(feature = "nostr-domain")]
