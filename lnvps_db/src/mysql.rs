@@ -1,8 +1,8 @@
 use crate::{
-    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType, RegionStats, Router,
-    User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmPaymentWithCompany, VmTemplate,
+    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage,
+    RegionStats, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment};
@@ -2197,6 +2197,54 @@ impl AdminDb for LNVpsDbMysql {
             }
         }
     }
+
+    async fn admin_get_referral_usage_by_date_range(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        ref_code: Option<&str>,
+    ) -> Result<Vec<ReferralCostUsage>> {
+        let mut query = "SELECT v.id as vm_id,
+                                v.ref_code,
+                                vp.created,
+                                vp.amount,
+                                vp.currency,
+                                vp.rate,
+                                c.base_currency
+                         FROM vm v
+                         JOIN (
+                             SELECT vm_id, currency, amount, created, rate,
+                                    ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) as rn
+                             FROM vm_payment
+                             WHERE is_paid = 1
+                         ) vp ON v.id = vp.vm_id AND vp.rn = 1
+                         JOIN vm_host vh ON v.host_id = vh.id
+                         JOIN vm_host_region vhr ON vh.region_id = vhr.id
+                         JOIN company c ON vhr.company_id = c.id
+                         WHERE v.ref_code IS NOT NULL 
+                           AND vp.created >= ? 
+                           AND vp.created <= ?
+                           AND c.id = ?".to_string();
+        
+        if ref_code.is_some() {
+            query.push_str(" AND v.ref_code = ?");
+        }
+        
+        query.push_str(" ORDER BY vp.created DESC");
+
+        let mut db_query = sqlx::query_as(&query)
+            .bind(start_date)
+            .bind(end_date)
+            .bind(company_id);
+            
+        if let Some(code) = ref_code {
+            db_query = db_query.bind(code);
+        }
+        
+        db_query.fetch_all(&self.db).await.map_err(Error::new)
+    }
+
 
     async fn admin_list_ip_ranges(
         &self,

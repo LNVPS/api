@@ -221,6 +221,15 @@ pub trait AdminDb: Send + Sync {
         currency: Option<&str>,
     ) -> Result<Vec<crate::VmPaymentWithCompany>>;
 
+    /// Get referral cost usage report within date range for a specific company
+    async fn admin_get_referral_usage_by_date_range(
+        &self,
+        start_date: chrono::DateTime<chrono::Utc>,
+        end_date: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        ref_code: Option<&str>,
+    ) -> Result<Vec<crate::ReferralCostUsage>>;
+
     // IP Range management methods
     /// List all IP ranges with pagination
     async fn admin_list_ip_ranges(

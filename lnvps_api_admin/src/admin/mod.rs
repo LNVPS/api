@@ -26,7 +26,7 @@ use crate::admin::regions::{
     admin_create_region, admin_delete_region, admin_get_region, admin_list_regions,
     admin_update_region,
 };
-use crate::admin::reports::admin_time_series_report;
+use crate::admin::reports::{admin_referral_time_series_report, admin_time_series_report};
 use crate::admin::roles::{
     admin_assign_user_role, admin_create_role, admin_delete_role, admin_get_my_roles,
     admin_get_role, admin_get_user_roles, admin_list_roles, admin_revoke_user_role,
@@ -163,5 +163,6 @@ pub fn admin_routes() -> Vec<Route> {
         admin_delete_router,
         // Reports
         admin_time_series_report,
+        admin_referral_time_series_report,
     ]
 }

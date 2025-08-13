@@ -1309,6 +1309,17 @@ impl AdminDb for MockDb {
         Ok(result)
     }
 
+    async fn admin_get_referral_usage_by_date_range(
+        &self,
+        _start_date: chrono::DateTime<chrono::Utc>,
+        _end_date: chrono::DateTime<chrono::Utc>,
+        _company_id: u64,
+        _ref_code: Option<&str>,
+    ) -> anyhow::Result<Vec<lnvps_db::ReferralCostUsage>> {
+        // Mock implementation - return empty for now
+        Ok(vec![])
+    }
+
     async fn admin_list_ip_ranges(
         &self,
         _limit: u64,

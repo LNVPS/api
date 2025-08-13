@@ -505,6 +505,18 @@ pub struct VmPayment {
     pub upgrade_params: Option<String>,
 }
 
+#[derive(FromRow, Clone, Debug)]
+pub struct ReferralCostUsage {
+    pub vm_id: u64,
+    pub ref_code: String,
+    pub created: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub rate: f32,
+    pub base_currency: String,
+}
+
+
 /// VM Payment with company information for time-series reporting
 #[derive(FromRow, Clone, Debug)]
 pub struct VmPaymentWithCompany {

@@ -1,157 +1,31 @@
 # LNVPS Admin API Endpoints
 
-This document lists all available endpoints in the LNVPS Admin API.
+Admin API request/response format reference for LLM consumption.
 
-## API Design Changes
+## Enums
 
-**Enum Values**: This API uses strongly-typed enums instead of arbitrary strings for better type safety and validation. When you see a field with an enum comment like `// Enum: "value1", "value2"`, only those exact values are accepted. Invalid values will be rejected during deserialization.
-
-This provides better API documentation, IDE auto-completion, and prevents runtime errors from invalid string values.
-
-## Currency Support
-
-The system supports company-based base currencies. Each company can have its own base currency which is used for pricing calculations and reports. Supported currencies include:
-
-- **EUR**: Euro
-- **USD**: US Dollar  
-- **GBP**: British Pound
-- **CAD**: Canadian Dollar
-- **CHF**: Swiss Franc
-- **AUD**: Australian Dollar
-- **JPY**: Japanese Yen
-- **BTC**: Bitcoin
-
-All financial reports and pricing calculations will use the company's configured base currency. Exchange rates are automatically calculated to ensure mathematical consistency across different payment currencies.
-
-## Enum Types Reference
-
-All enum types used in this API are listed below with their possible values:
-
-### VM and Hardware Enums
-
-#### DiskType
-**Values**: `"hdd"`, `"ssd"`
-- Used in: VM templates, custom pricing, host disks
-- Example: `"disk_type": "ssd"`
-
-#### DiskInterface  
-**Values**: `"sata"`, `"scsi"`, `"pcie"`
-- Used in: VM templates, custom pricing, host disks
-- Example: `"disk_interface": "pcie"`
-
-#### VmRunningStates
-**Values**: `"running"`, `"stopped"`, `"starting"`, `"deleting"`
-- Used in: VM running state information (within running_state object)
-- Example: `"state": "running"`
-
-#### AdminVmHistoryActionType
-**Values**: `"created"`, `"started"`, `"stopped"`, `"restarted"`, `"deleted"`, `"expired"`, `"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`
-- Used in: VM history entries
-- Example: `"action_type": "started"`
-
-#### AdminPaymentMethod
-**Values**: `"lightning"`, `"revolut"`, `"paypal"`
-- Used in: Payment information
-- Example: `"payment_method": "lightning"`
-
-#### VmHostKind
-**Values**: `"proxmox"`, `"libvirt"`
-- Used in: Host configuration
-- Example: `"kind": "proxmox"`
-
-#### CostPlanIntervalType
-**Values**: `"day"`, `"month"`, `"year"`
-- Used in: Cost plan configuration, VM template cost plan settings
-- Example: `"interval_type": "month"`
-- Details:
-  - `"day"`: Billing interval is daily
-  - `"month"`: Billing interval is monthly (default)
-  - `"year"`: Billing interval is yearly
-
-### Operating System Enums
-
-#### ApiOsDistribution
-**Values**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`, `"redhatenterprise"`
-- Used in: VM OS images
-- Example: `"distribution": "ubuntu"`
-
-### Network Configuration Enums
-
-#### IpRangeAllocationMode
-**Values**: `"random"`, `"sequential"`, `"slaac_eui64"`
-- Used in: IP range configuration
-- Example: `"allocation_mode": "sequential"`
-- Details:
-  - `"random"`: Assign IPs randomly from available pool
-  - `"sequential"`: Assign IPs in sequential order
-  - `"slaac_eui64"`: Use SLAAC with EUI-64 for IPv6 auto-configuration
-
-#### NetworkAccessPolicyKind
-**Values**: `"static_arp"`
-- Used in: Access policy configuration
-- Example: `"kind": "static_arp"`
-
-#### RouterKind
-**Values**: `"mikrotik"`, `"ovh_additional_ip"`
-- Used in: Router configuration
-- Example: `"kind": "mikrotik"`
-
-### User Management Enums
-
-#### AdminUserRole
-**Values**: `"super_admin"`, `"admin"`, `"read_only"`
-- Used in: User role assignment
-- Example: `"admin_role": "admin"`
-- Details:
-  - `"super_admin"`: Full system access including user role management
-  - `"admin"`: Administrative access with some restrictions
-  - `"read_only"`: View-only access to admin functions
-
-#### AdminUserStatus
-**Values**: `"active"`, `"suspended"`, `"deleted"`
-- Used in: User account status
-- Example: `"status": "active"`
-
-### Enum Validation
-
-All enum fields in request bodies are validated during deserialization. Sending an invalid enum value will result in a `400 Bad Request` error with a descriptive message indicating the accepted values.
-
-**Example error response for invalid enum**:
-```json
-{
-  "error": "Invalid disk_type 'nvme'. Valid values are: hdd, ssd"
-}
-```
+**DiskType**: `"hdd"`, `"ssd"`
+**DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
+**VmRunningStates**: `"running"`, `"stopped"`, `"starting"`, `"deleting"`
+**AdminVmHistoryActionType**: `"created"`, `"started"`, `"stopped"`, `"restarted"`, `"deleted"`, `"expired"`, `"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`
+**AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`
+**VmHostKind**: `"proxmox"`, `"libvirt"`
+**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**ApiOsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`, `"redhatenterprise"`
+**IpRangeAllocationMode**: `"random"`, `"sequential"`, `"slaac_eui64"`
+**NetworkAccessPolicyKind**: `"static_arp"`
+**RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`
+**AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
+**AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
 
 ## Authentication
-
-All endpoints require NIP-98 (Nostr) authentication. The authentication header should be formatted as:
 ```
 Authorization: Nostr <base64-encoded-event>
 ```
 
-Each endpoint also requires specific admin permissions, which are validated through the RBAC system.
-
-## Common Response Format
-
-All endpoints return data in a standardized format:
-
-**Single item responses:**
-```json
-{
-  "data": T
-}
-```
-
-**Paginated list responses:**
-```json
-{
-  "data": T[],
-  "total": number,
-  "limit": number,
-  "offset": number
-}
-```
+## Response Formats
+**Single item**: `{"data": T}`
+**Paginated list**: `{"data": T[], "total": number, "limit": number, "offset": number}`
 
 ## Endpoints
 
@@ -162,13 +36,11 @@ All endpoints return data in a standardized format:
 GET /api/admin/v1/users
 ```
 Query Parameters:
-- `limit`: number (optional) - Items per page (max 100, default 50)
-- `offset`: number (optional) - Pagination offset
-- `search`: string (optional) - Search by user pubkey (hex format)
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `search`: string (optional) - user pubkey (hex format)
 
 Required Permission: `users::view`
-
-Response includes user details with VM count, admin status, and billing information.
 
 #### Update User
 ```
@@ -176,7 +48,7 @@ PATCH /api/admin/v1/users/{id}
 ```
 Required Permission: `users::update`
 
-Body parameters (all optional):
+Body (all optional):
 ```json
 {
   "email": "string",
@@ -190,7 +62,7 @@ Body parameters (all optional):
   "billing_state": "string",
   "billing_postcode": "string",
   "billing_tax_id": "string",
-  "admin_role": "super_admin" // AdminUserRole enum: "super_admin", "admin", "read_only", or null
+  "admin_role": "super_admin" // AdminUserRole enum or null
 }
 ```
 
@@ -201,37 +73,21 @@ Body parameters (all optional):
 GET /api/admin/v1/vms
 ```
 Query Parameters:
-- `limit`: number (optional) - Items per page (max 100, default 50)
-- `offset`: number (optional) - Pagination offset
-- `user_id`: number (optional) - Filter by user ID
-- `host_id`: number (optional) - Filter by host ID
-- `pubkey`: string (optional) - Filter by user's public key (hex format)
-- `region_id`: number (optional) - Filter by region ID
-- `include_deleted`: boolean (optional) - Include deleted VMs in results (default: false)
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `user_id`: number (optional)
+- `host_id`: number (optional)
+- `pubkey`: string (optional) - hex format
+- `region_id`: number (optional)
+- `include_deleted`: boolean (optional) - default false
 
 Required Permission: `virtual_machines::view`
-
-Returns detailed VM information including user details, host information, region, VM resources (CPU, memory, disk), template information (standard/custom), and deletion status.
-
-The endpoint supports multiple filter combinations:
-- Filter by specific user using either `user_id` or `pubkey` (if both provided, `pubkey` takes precedence)
-- Filter by host using `host_id`  
-- Filter by region using `region_id`
-- Control deleted VM visibility using `include_deleted` (false by default excludes deleted VMs)
-- Multiple filters can be combined (e.g., user + region, host + region, include_deleted + any filter)
-
-Template information includes:
-- `template_name`: Name of the template (shows "Custom - {pricing_name}" for custom templates)
-- `custom_template_id`: ID of custom template if applicable
-- `is_standard_template`: Boolean indicating if using a standard template
 
 #### Get VM Details
 ```
 GET /api/admin/v1/vms/{id}
 ```
 Required Permission: `virtual_machines::view`
-
-Returns detailed information about a specific VM including user details, host information, region, VM resources (CPU, memory, disk), and deletion status.
 
 #### Start VM
 ```
@@ -251,59 +107,13 @@ DELETE /api/admin/v1/vms/{id}
 ```
 Required Permission: `virtual_machines::delete`
 
-**Request Body** (optional):
+Body (optional):
 ```json
 {
-  "reason": "string" // Optional reason for deletion (e.g., "Policy violation", "User requested")
+  "reason": "string"
 }
 ```
 
-**Description:**
-Queues a VM for deletion through the distributed job processing system. The VM deletion is handled asynchronously by worker processes and includes:
-
-- **Immediate Response**: API returns success immediately after queuing the job
-- **Background Processing**: Worker processes handle the actual deletion asynchronously
-- **Complete VM Removal**: Stops VM if running, deletes from hypervisor, cleans up disk storage
-- **Audit Trail**: Records admin action with user ID, reason, and timestamp in VM history
-- **User Notification**: Sends notification to VM owner about the deletion
-- **Admin Confirmation**: Sends confirmation notification to admin upon completion
-
-**Process Flow:**
-1. API validates permissions and VM existence
-2. Creates deletion job with admin user ID and optional reason
-3. Job is queued via Redis stream for distributed processing  
-4. Worker process picks up job and performs deletion
-5. VM is stopped (if running) and deleted from hypervisor
-6. VM history is updated with admin deletion record
-7. Notifications sent to both user and admin
-8. VM marked as deleted in database
-
-**Error Conditions:**
-- Returns `400` if VM is already deleted
-- Returns `503` if Redis job queue is unavailable  
-- Returns `403` if insufficient permissions
-
-**Example Requests:**
-```bash
-# Delete with reason
-curl -X DELETE "https://api.example.com/api/admin/v1/vms/123" \
-  -H "Authorization: Nostr <base64-encoded-event>" \
-  -H "Content-Type: application/json" \
-  -d '{"reason": "Policy violation"}'
-
-# Delete without reason
-curl -X DELETE "https://api.example.com/api/admin/v1/vms/123" \
-  -H "Authorization: Nostr <base64-encoded-event>"
-```
-
-**Response:**
-```json
-{
-  "data": null
-}
-```
-
-**Note:** This endpoint requires Redis to be configured for job processing. If Redis is not available, the endpoint will return a service unavailable error.
 
 #### Extend VM
 ```
@@ -311,101 +121,23 @@ PUT /api/admin/v1/vms/{id}/extend
 ```
 Required Permission: `virtual_machines::update`
 
-**Request Body**:
+Body:
 ```json
 {
-  "days": 30,                           // Required: Number of days to extend (1-365)
-  "reason": "string"                    // Optional: Reason for extension (e.g., "Customer support request")
+  "days": 30,        // Required: 1-365
+  "reason": "string" // Optional
 }
 ```
-
-**Description:**
-Extends a VM's expiration date by the specified number of days. This operation provides administrative "credit" to VMs by directly updating the expiration date in the database and logging the action in VM history.
-
-**Key Features:**
-- **Direct Database Operation**: Updates VM expiration immediately without requiring background processing
-- **Input Validation**: Validates days between 1-365 and prevents extending deleted VMs
-- **Comprehensive Audit Trail**: Logs extension with admin user ID, old/new expiration dates, and optional reason
-- **Immediate Response**: Returns success immediately after database update
-- **History Tracking**: Records detailed metadata including days extended and admin action context
-
-**Process Flow:**
-1. API validates admin permissions and VM existence
-2. Validates input parameters (days 1-365, VM not deleted)
-3. Calculates new expiration date by adding days to current expiration
-4. Updates VM expiration date directly in database via `update_vm()`
-5. Logs extension action in VM history with comprehensive metadata
-6. Returns immediate success response
-
-**Validation Rules:**
-- Days must be between 1 and 365 (inclusive)
-- Cannot extend deleted VMs
-- VM must exist in the database
-
-**History Logging:**
-The extension is logged in VM history with:
-- Action type: `Renewed` (reusing existing renewal action type)
-- Previous state: Original expiration date
-- New state: Extended expiration date  
-- Metadata: Admin user ID, days extended, reason (if provided), admin action flag
-- Description: Formatted message with extension details and reason
-
-**Error Conditions:**
-- Returns `400` if VM is deleted or invalid input parameters
-- Returns `404` if VM does not exist
-- Returns `403` if insufficient permissions
-
-**Example Requests:**
-```bash
-# Extend with reason
-curl -X PUT "https://api.example.com/api/admin/v1/vms/123/extend" \
-  -H "Authorization: Nostr <base64-encoded-event>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "days": 30,
-    "reason": "Customer support request - payment processing delayed"
-  }'
-
-# Extend without reason
-curl -X PUT "https://api.example.com/api/admin/v1/vms/456/extend" \
-  -H "Authorization: Nostr <base64-encoded-event>" \
-  -H "Content-Type: application/json" \
-  -d '{"days": 7}'
-```
-
-**Response:**
-```json
-{
-  "data": null
-}
-```
-
-**Use Cases:**
-- Customer support extending VMs due to payment issues
-- Promotional credit extensions
-- Emergency extensions during system maintenance
-- Compensating users for service disruptions
-- Testing and development VM extensions
-
-**Benefits:**
-- **Fast Operation**: Direct database update without job queues or background processing
-- **Immediate Feedback**: Instant confirmation of extension
-- **Full Audit Trail**: Complete tracking of all administrative extensions
-- **Flexible Reasoning**: Optional reason field for documentation and compliance
-- **Precise Control**: Exact day-based extension control
-- **Safe Validation**: Comprehensive input validation prevents misuse
 
 #### List VM History
 ```
 GET /api/admin/v1/vms/{vm_id}/history
 ```
 Query Parameters:
-- `limit`: number (optional) - Items per page (max 100, default 50)  
-- `offset`: number (optional) - Pagination offset
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
 
 Required Permission: `virtual_machines::view`
-
-Returns a paginated list of history entries for the specified VM, including actions like creation, start/stop operations, payments, configuration changes, etc.
 
 #### Get VM History Entry
 ```
@@ -413,27 +145,21 @@ GET /api/admin/v1/vms/{vm_id}/history/{history_id}
 ```
 Required Permission: `virtual_machines::view`
 
-Returns detailed information about a specific VM history entry.
-
 #### List VM Payments
 ```
 GET /api/admin/v1/vms/{vm_id}/payments
 ```
 Query Parameters:
-- `limit`: number (optional) - Items per page (max 100, default 50)
-- `offset`: number (optional) - Pagination offset
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
 
 Required Permission: `payments::view`
-
-Returns paginated payment records for the specified VM, including payment status, amounts, and payment methods. Payments are ordered by creation date (newest first).
 
 #### Get VM Payment
 ```
 GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}
 ```
 Required Permission: `payments::view`
-
-Returns detailed information about a specific VM payment. The `payment_id` should be hex-encoded.
 
 ### Role Management
 
@@ -442,20 +168,16 @@ Returns detailed information about a specific VM payment. The `payment_id` shoul
 GET /api/admin/v1/roles
 ```
 Query Parameters:
-- `limit`: number (optional) - Items per page (max 100, default 50)
-- `offset`: number (optional) - Pagination offset
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
 
 Required Permission: `roles::view`
-
-Returns roles with their permissions and user count.
 
 #### Get Role Details
 ```
 GET /api/admin/v1/roles/{id}
 ```
 Required Permission: `roles::view`
-
-Returns detailed role information including permissions and user count.
 
 #### Create Role
 ```
@@ -468,7 +190,7 @@ Body:
 {
   "name": "string",
   "description": "string (optional)",
-  "permissions": ["string array of permissions like 'users::view'"]
+  "permissions": ["string"]
 }
 ```
 
@@ -483,19 +205,15 @@ Body (all optional):
 {
   "name": "string",
   "description": "string",
-  "permissions": ["string array of permissions"]
+  "permissions": ["string"]
 }
 ```
-
-Note: System roles cannot be modified.
 
 #### Delete Role
 ```
 DELETE /api/admin/v1/roles/{id}
 ```
 Required Permission: `roles::delete`
-
-Note: System roles cannot be deleted. Roles with assigned users cannot be deleted.
 
 ### User Role Assignments
 
@@ -504,8 +222,6 @@ Note: System roles cannot be deleted. Roles with assigned users cannot be delete
 GET /api/admin/v1/users/{user_id}/roles
 ```
 Required Permission: `users::view`
-
-Returns detailed role assignment information including who assigned the role, when it was assigned, expiration date, and active status.
 
 #### Assign Role to User
 ```
@@ -516,7 +232,7 @@ Required Permission: `users::update`
 Body:
 ```json
 {
-  "role_id": "number"
+  "role_id": number
 }
 ```
 
@@ -526,15 +242,11 @@ DELETE /api/admin/v1/users/{user_id}/roles/{role_id}
 ```
 Required Permission: `users::update`
 
-Note: Users cannot revoke their own roles to prevent locking themselves out.
-
 #### Get Current User's Admin Roles
 ```
 GET /api/admin/v1/me/roles
 ```
-Required Permission: None (authenticated admin user can view their own roles)
-
-Returns array of `UserRoleInfo` objects for the current authenticated user.
+Required Permission: None
 
 ### Host Management
 
@@ -543,12 +255,10 @@ Returns array of `UserRoleInfo` objects for the current authenticated user.
 GET /api/admin/v1/hosts
 ```
 Query Parameters:
-- `limit`: number (optional) - Items per page (max 100, default 50)
-- `offset`: number (optional) - Pagination offset
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
 
 Required Permission: `hosts::view`
-
-Returns paginated list of VM hosts with configuration details and real-time calculated load metrics based on actual VM resource consumption.
 
 #### Get Host Details
 ```
@@ -556,22 +266,20 @@ GET /api/admin/v1/hosts/{id}
 ```
 Required Permission: `hosts::view`
 
-Returns detailed information about a specific VM host including real-time calculated load metrics based on actual VM resource consumption.
-
 #### Update Host Configuration
 ```
 PATCH /api/admin/v1/hosts/{id}
 ```
 Required Permission: `hosts::update`
 
-Body parameters (all optional):
+Body (all optional):
 ```json
 {
   "name": "string",
   "ip": "string",
   "api_token": "string",
   "region_id": number,
-  "kind": "libvirt",           // AdminVmHostKind enum: "proxmox" or "libvirt"
+  "kind": "libvirt", // VmHostKind enum
   "vlan_id": number | null,
   "enabled": boolean,
   "load_cpu": number,
@@ -589,21 +297,20 @@ Required Permission: `hosts::create`
 Body:
 ```json
 {
-  "name": "string",               // Required - Host name/hostname
-  "ip": "string",                // Required - Host IP address
-  "api_token": "string",         // Required - API token for host communication
-  "region_id": number,           // Required - Region ID
-  "kind": "proxmox",            // Required - AdminVmHostKind enum: "proxmox" or "libvirt"
-  "vlan_id": number | null,     // Optional - VLAN ID
-  "cpu": number,                // Required - Number of CPU cores
-  "memory": number,             // Required - Memory in bytes
-  "enabled": boolean,           // Optional - Default: true
-  "load_cpu": number,           // Optional - CPU load factor (default: 1.0)
-  "load_memory": number,        // Optional - Memory load factor (default: 1.0)
-  "load_disk": number          // Optional - Disk load factor (default: 1.0)
+  "name": "string",        // Required
+  "ip": "string",         // Required
+  "api_token": "string",  // Required
+  "region_id": number,    // Required
+  "kind": "proxmox",     // Required - VmHostKind enum
+  "vlan_id": number | null,
+  "cpu": number,         // Required
+  "memory": number,      // Required
+  "enabled": boolean,    // Optional - default true
+  "load_cpu": number,    // Optional - default 1.0
+  "load_memory": number, // Optional - default 1.0
+  "load_disk": number    // Optional - default 1.0
 }
 ```
-
 
 #### List Host Disks
 ```
@@ -611,15 +318,11 @@ GET /api/admin/v1/hosts/{id}/disks
 ```
 Required Permission: `hosts::view`
 
-Returns list of all disks available on the specified host with disk configuration details.
-
 #### Get Host Disk Details
 ```
 GET /api/admin/v1/hosts/{host_id}/disks/{disk_id}
 ```
 Required Permission: `hosts::view`
-
-Returns detailed information about a specific disk on a host.
 
 #### Update Host Disk Configuration
 ```
@@ -627,7 +330,7 @@ PATCH /api/admin/v1/hosts/{host_id}/disks/{disk_id}
 ```
 Required Permission: `hosts::update`
 
-Body parameters (all optional):
+Body (all optional):
 ```json
 {
   "enabled": boolean
@@ -1408,59 +1111,22 @@ Note: Routers that are used by access policies cannot be deleted. You must first
 
 #### Time Series Report
 ```
-GET /api/admin/v1/reports/time-series?start_date={date}&end_date={date}&interval={interval}&company_id={company_id}&currency={currency}
+GET /api/admin/v1/reports/time-series
 ```
 Query Parameters:
-- `start_date`: string (required) - Start date in YYYY-MM-DD format (e.g., "2025-01-01")
-- `end_date`: string (required) - End date in YYYY-MM-DD format (e.g., "2025-12-31")
-- `interval`: string (required) - Time interval for data aggregation: "daily", "weekly", "monthly", "quarterly", "yearly"
-- `company_id`: number (required) - Company ID to generate report for
-- `currency`: string (optional) - Filter by specific currency (EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC)
+- `start_date`: string (required) - YYYY-MM-DD format
+- `end_date`: string (required) - YYYY-MM-DD format
+- `company_id`: number (required)
+- `currency`: string (optional) - EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC
 
 Required Permission: `analytics::view`
 
-Returns time-series payment data for a specific company with optional currency filtering. This endpoint provides both period-based aggregated summaries and individual payment records with time period grouping, enabling comprehensive analysis and reporting.
-
-**Key Features:**
-- **Company-Specific Reports**: Always scoped to a specific company for focused analysis
-- **Period Aggregation**: Server-side aggregation by time period and currency with totals
-- **Raw Payment Data**: Individual payment records for detailed drill-down analysis
-- **Optimized Database Query**: Single SQL join with efficient company filtering
-- **Flexible Time Intervals**: Automatic period calculation for daily, weekly, monthly, quarterly, and yearly intervals
-- **Optional Currency Filtering**: Filter by specific currency within the company's payments
-- **Company Context**: Each payment includes company information and base currency
-- **Dual Analysis**: Both aggregated summaries and raw data for flexible client-side use
-
-**Response:**
+Response:
 ```json
 {
   "data": {
     "start_date": "2025-01-01",
-    "end_date": "2025-12-31", 
-    "interval": "monthly",
-    "company_id": 1,
-    "company_name": "Acme Corp",
-    "company_base_currency": "USD",
-    "period_summaries": [
-      {
-        "period": "2025-01",
-        "currency": "USD",
-        "payment_count": 25,
-        "net_total": 3125000,
-        "tax_total": 656250,
-        "base_currency_net": 3125000,
-        "base_currency_tax": 656250
-      },
-      {
-        "period": "2025-01", 
-        "currency": "BTC",
-        "payment_count": 8,
-        "net_total": 1000,
-        "tax_total": 208,
-        "base_currency_net": 1000,
-        "base_currency_tax": 208
-      }
-    ],
+    "end_date": "2025-12-31",
     "payments": [
       {
         "id": "a1b2c3d4e5f6...",
@@ -1477,100 +1143,46 @@ Returns time-series payment data for a specific company with optional currency f
         "tax": 26250,
         "company_id": 1,
         "company_name": "Acme Corp",
-        "company_base_currency": "USD",
-        "period": "2025-01"
-      },
-      {
-        "id": "b2c3d4e5f6a1...",
-        "vm_id": 456,
-        "created": "2025-01-20T14:22:31Z",
-        "expires": "2025-02-20T14:22:31Z",
-        "amount": 125,
-        "currency": "BTC",
-        "payment_method": "lightning",
-        "external_id": "inv_67890",
-        "is_paid": true,
-        "rate": 100000.0,
-        "time_value": 2592000,
-        "tax": 26,
-        "company_id": 1,
-        "company_name": "Acme Corp",
-        "company_base_currency": "USD",
-        "period": "2025-01"
+        "company_base_currency": "USD"
       }
     ]
   }
 }
 ```
 
-**Time Interval Formats:**
-- **Daily**: `"2025-01-15"` - Individual days
-- **Weekly**: `"2025-01-13"` - Monday of each week (ISO week starting Monday)
-- **Monthly**: `"2025-01"` - Year and month
-- **Quarterly**: `"2025-Q1"` - Year and quarter
-- **Yearly**: `"2025"` - Year only
+#### Referral Usage Time Series Report
+```
+GET /api/admin/v1/reports/referral-usage/time-series
+```
+Query Parameters:
+- `start_date`: string (required) - YYYY-MM-DD format
+- `end_date`: string (required) - YYYY-MM-DD format  
+- `company_id`: number (required)
+- `ref_code`: string (optional)
 
-**Payment Record Structure:**
-Each payment record includes complete payment information with company context:
+Required Permission: `analytics::view`
 
-- `id`: Hex-encoded payment identifier
-- `vm_id`: Associated virtual machine ID
-- `created` / `expires`: ISO 8601 timestamps
-- `amount`: Payment amount in smallest currency unit (cents, satoshis, etc.)
-- `currency`: Payment currency code
-- `payment_method`: Payment method used ("lightning", "revolut", "paypal")
-- `external_id`: External payment system identifier  
-- `is_paid`: Payment completion status
-- `rate`: Exchange rate to company's base currency
-- `time_value`: VM expiry extension in seconds
-- `tax`: Tax amount in smallest currency unit
-- `company_id` / `company_name`: Company identification and name
-- `company_base_currency`: Company's configured base currency
-- `period`: Calculated time period based on selected interval
+Response:
+```json
+{
+  "data": {
+    "start_date": "2025-01-01",
+    "end_date": "2025-12-31",
+    "referrals": [
+      {
+        "vm_id": 123,
+        "ref_code": "PROMO2025",
+        "created": "2025-01-15T10:30:45Z",
+        "amount": 125000,
+        "currency": "USD",
+        "rate": 1.0,
+        "base_currency": "USD"
+      }
+    ]
+  }
+}
+```
 
-**Benefits of Company-Scoped Approach:**
-- **Simplified Database Query**: Always filters by company for optimal performance
-- **Focused Analysis**: Company-specific data reduces complexity and improves clarity
-- **Efficient Indexing**: Database can optimize queries with consistent company filtering
-- **Security**: Natural data isolation by company boundary
-- **Scalability**: Better query performance as data grows
-
-**Period Summaries Structure:**
-Each period summary aggregates payments by time period and currency:
-- `period`: Time period identifier based on selected interval (e.g., "2025-01", "2025-Q1", "2025-01-15")
-- `currency`: Currency code for this aggregation group 
-- `payment_count`: Number of individual payments in this period/currency combination
-- `net_total`: Sum of payment amounts (excluding tax) in smallest currency unit
-- `tax_total`: Sum of tax amounts in smallest currency unit
-- `base_currency_net`: Sum of net amounts converted to company's base currency using proper decimal conversion and exchange rates
-- `base_currency_tax`: Sum of tax amounts converted to company's base currency using proper decimal conversion and exchange rates
-
-**Currency Conversion Logic:**
-The `base_currency_net` and `base_currency_tax` calculations properly handle different currency types:
-- **Same Currency**: When payment currency matches company base currency, original amounts are used directly (no conversion needed)
-- **Different Currency**: BTC amounts are converted from millisatoshis to full decimal BTC before multiplying by exchange rate
-- **Different Currency**: Fiat amounts are converted from cents to full decimal amount before multiplying by exchange rate  
-- Results are converted back to the base currency's smallest unit (cents for fiat, millisatoshis for BTC)
-- Net and tax amounts are converted separately to maintain precision and allow for independent analysis
-
-**Benefits of Dual Data Approach:**
-- **Performance**: Single optimized database query with efficient aggregation
-- **Flexibility**: Both aggregated summaries for dashboards and raw data for detailed analysis
-- **Comprehensive**: Period-based totals for trending with individual records for drill-down
-- **Scalable**: Server-side aggregation reduces client-side processing for large datasets
-- **Custom Analysis**: UI can still perform additional aggregations using raw payment data
-
-**Use Cases:**
-- **Revenue Dashboards**: Use period_summaries for charts and KPIs showing revenue trends over time
-- **Multi-currency Analysis**: Compare performance across different payment currencies using both original amounts and base currency conversions
-- **Unified Reporting**: Sum base_currency_net and base_currency_tax values across currencies for total company revenue per period
-- **Tax Analysis**: Separate base_currency_tax values allow for detailed tax reporting and compliance analysis
-- **Net Revenue Tracking**: base_currency_net provides clean revenue figures excluding tax effects
-- **Seasonal Analysis**: Identify payment patterns using period summaries grouped by time intervals
-- **Detailed Investigations**: Drill down from period summaries into individual payments for investigation
-- **Financial Reporting**: Generate summary reports from period_summaries with consistent base currency values
-- **Payment Method Analysis**: Use raw payment data to analyze preferred payment methods by time period
-- **Custom Aggregations**: Combine period_summaries with custom groupings from raw payment data
 
 ## Error Responses
 
@@ -2065,5 +1677,120 @@ The RBAC system uses the following permission format: `resource::action`
   "interval_amount": number,                // Billing interval count
   "interval_type": "day" | "month" | "year", // Billing interval type
   "template_count": number                  // Number of VM templates using this cost plan
+}
+```
+
+### ReferralReport
+```json
+{
+  "vm_id": number,
+  "ref_code": "string",
+  "created": "string (ISO 8601)",
+  "amount": number,
+  "currency": "string",
+  "rate": number,
+  "base_currency": "string"
+}
+```
+
+### ReferralTimeSeriesReport
+```json
+{
+  "start_date": "string",
+  "end_date": "string",
+  "referrals": ["ReferralReport"]
+}
+```
+
+### TimeSeriesPayment
+```json
+{
+  "id": "string",                    // Hex-encoded payment ID
+  "vm_id": number,
+  "created": "string (ISO 8601)",
+  "expires": "string (ISO 8601)",
+  "amount": number,                  // Amount in smallest currency unit
+  "currency": "string",
+  "payment_method": "string",
+  "external_id": "string | null",
+  "is_paid": boolean,
+  "rate": number,                    // Exchange rate to company's base currency
+  "time_value": number,              // Seconds this payment adds to VM expiry
+  "tax": number,                     // Tax amount in smallest currency unit
+  "company_id": number,
+  "company_name": "string",
+  "company_base_currency": "string"
+}
+```
+
+### TimeSeriesReport
+```json
+{
+  "start_date": "string",
+  "end_date": "string",
+  "payments": ["TimeSeriesPayment"]
+}
+```
+
+### AdminVmIpAddress
+```json
+{
+  "id": number,                      // IP assignment ID for linking
+  "ip": "string",                    // IP address
+  "range_id": number                 // IP range ID for linking to range details
+}
+```
+
+### CalculatedHostLoad
+```json
+{
+  "overall_load": number,            // Overall load percentage (0.0-1.0)
+  "cpu_load": number,                // CPU load percentage (0.0-1.0)
+  "memory_load": number,             // Memory load percentage (0.0-1.0)
+  "disk_load": number,               // Disk load percentage (0.0-1.0)
+  "available_cpu": number,           // Available CPU cores
+  "available_memory": number,        // Available memory in bytes
+  "active_vms": number               // Number of active VMs on this host
+}
+```
+
+### AdminHostRegion
+```json
+{
+  "id": number,
+  "name": "string",
+  "enabled": boolean
+}
+```
+
+### AdminCustomPricingDisk
+```json
+{
+  "id": number,
+  "kind": "ssd",                     // DiskType enum: "hdd" or "ssd"
+  "interface": "pcie",               // DiskInterface enum: "sata", "scsi", or "pcie"
+  "cost": number
+}
+```
+
+### CustomPricingCalculation
+```json
+{
+  "currency": "string",
+  "cpu_cost": number,                // Cost for specified CPU cores
+  "memory_cost": number,             // Cost for specified memory
+  "disk_cost": number,               // Cost for specified disk size
+  "ip4_cost": number,                // Cost for specified IPv4 addresses
+  "ip6_cost": number,                // Cost for specified IPv6 addresses
+  "total_monthly_cost": number,      // Sum of all costs
+  "configuration": {                 // Echo of input configuration
+    "cpu": number,
+    "memory": number,
+    "disk_size": number,
+    "disk_type": "string",
+    "disk_interface": "string",
+    "ip4_count": number,
+    "ip6_count": number
+  }
 }
 ```
