@@ -92,7 +92,7 @@ async fn v1_patch_account(
     let uid = db.upsert_user(&pubkey).await?;
     let mut user = db.get_user(uid).await?;
 
-    user.email = req.email.clone();
+    user.email = req.email.clone().map(|s| s.into());
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
     user.country_code = req
@@ -423,7 +423,7 @@ async fn v1_add_ssh_key(
     let mut new_key = lnvps_db::UserSshKey {
         name: key_name.to_string(),
         user_id: uid,
-        key_data: pk.to_openssh()?,
+        key_data: pk.to_openssh()?.into(),
         ..Default::default()
     };
     let key_id = db.insert_user_ssh_key(&new_key).await?;
@@ -521,7 +521,7 @@ async fn v1_renew_vm_lnurlp(
         .map_err(|_| "Error generating invoice")?;
 
     // external_data is pr for lightning payment method
-    Ok(Json(LnURLPayInvoice::new(rsp.external_data)))
+    Ok(Json(LnURLPayInvoice::new(rsp.external_data.into())))
 }
 
 /// LNURL ad-hoc extend vm

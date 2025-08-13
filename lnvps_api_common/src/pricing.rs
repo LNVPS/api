@@ -241,7 +241,7 @@ impl PricingEngine {
         let ticker = Ticker(base_currency, target_currency);
         if let Some(r) = self.rates.get_rate(ticker).await {
             Ok(TickerRate {
-                ticker: ticker,
+                ticker,
                 rate: r,
             })
         } else {

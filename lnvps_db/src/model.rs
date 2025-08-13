@@ -1,3 +1,4 @@
+use crate::encrypted_string::EncryptedString;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,8 +17,8 @@ pub struct User {
     pub pubkey: Vec<u8>,
     /// When this user first started using the service (first login)
     pub created: DateTime<Utc>,
-    /// Users email address for notifications
-    pub email: Option<String>,
+    /// Users email address for notifications (encrypted)
+    pub email: Option<EncryptedString>,
     /// If user should be contacted via NIP-17 for notifications
     pub contact_nip17: bool,
     /// If user should be contacted via email for notifications
@@ -46,7 +47,7 @@ pub struct UserSshKey {
     pub name: String,
     pub user_id: u64,
     pub created: DateTime<Utc>,
-    pub key_data: String,
+    pub key_data: EncryptedString,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -54,7 +55,7 @@ pub struct AdminUserInfo {
     pub id: u64,
     pub pubkey: Vec<u8>,
     pub created: DateTime<Utc>,
-    pub email: Option<String>,
+    pub email: Option<EncryptedString>,
     pub contact_nip17: bool,
     pub contact_email: bool,
     pub country_code: Option<String>,
@@ -115,8 +116,8 @@ pub struct VmHost {
     pub memory: u64,
     /// If VM's should be provisioned on this host
     pub enabled: bool,
-    /// API token used to control this host via [ip]
-    pub api_token: String,
+    /// API token used to control this host via [ip] (encrypted)
+    pub api_token: EncryptedString,
     /// CPU load factor for provisioning
     pub load_cpu: f32,
     /// Memory load factor
@@ -288,7 +289,7 @@ pub struct Router {
     pub enabled: bool,
     pub kind: RouterKind,
     pub url: String,
-    pub token: String,
+    pub token: EncryptedString,
 }
 
 #[derive(Debug, Clone, sqlx::Type)]
@@ -497,8 +498,8 @@ pub struct VmPayment {
     pub currency: String,
     pub payment_method: PaymentMethod,
     pub payment_type: PaymentType,
-    /// External data (invoice / json)
-    pub external_data: String,
+    /// External data (invoice / json) (encrypted)
+    pub external_data: EncryptedString,
     /// External id on other system
     pub external_id: Option<String>,
     pub is_paid: bool,
@@ -523,8 +524,8 @@ pub struct VmPaymentWithCompany {
     pub currency: String,
     pub payment_method: PaymentMethod,
     pub payment_type: PaymentType,
-    /// External data (invoice / json)
-    pub external_data: String,
+    /// External data (invoice / json) (encrypted)
+    pub external_data: EncryptedString,
     /// External id on other system
     pub external_id: Option<String>,
     pub is_paid: bool,

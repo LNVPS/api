@@ -57,6 +57,9 @@ pub struct Settings {
 
     /// Redis configuration for shared VM state cache
     pub redis: Option<RedisConfig>,
+
+    /// Database encryption configuration
+    pub encryption: Option<EncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -197,6 +200,15 @@ pub struct RevolutConfig {
     pub public_key: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EncryptionConfig {
+    /// Path to the encryption key file
+    pub key_file: PathBuf,
+    /// Automatically generate key if file doesn't exist
+    pub auto_generate: bool,
+}
+
 impl Settings {
     pub fn get_provisioner(
         &self,
@@ -276,5 +288,6 @@ pub fn mock_settings() -> Settings {
         tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
         nostr_address_host: None,
         redis: None,
+        encryption: None,
     }
 }

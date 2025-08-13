@@ -891,7 +891,43 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await
             .map_err(Error::new)
     }
+
+    async fn execute_query(&self, query: &str) -> Result<u64> {
+        let result = sqlx::query(query)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn execute_query_with_string_params(&self, query: &str, params: Vec<String>) -> Result<u64> {
+        let mut query_builder = sqlx::query(query);
+        for param in params {
+            query_builder = query_builder.bind(param);
+        }
+        let result = query_builder
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn fetch_raw_strings(&self, query: &str) -> Result<Vec<(u64, String)>> {
+        let rows = sqlx::query(query)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)?;
+        
+        let mut results = Vec::new();
+        for row in rows {
+            let id: u64 = row.try_get(0).map_err(Error::new)?;
+            let value: String = row.try_get(1).map_err(Error::new)?;
+            results.push((id, value));
+        }
+        Ok(results)
+    }
 }
+
 
 #[cfg(feature = "nostr-domain")]
 #[async_trait]

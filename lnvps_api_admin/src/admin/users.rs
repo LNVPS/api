@@ -33,7 +33,7 @@ pub async fn admin_list_users(
             id: db_user.id,
             pubkey: hex::encode(&db_user.pubkey),
             created: db_user.created,
-            email: db_user.email,
+            email: db_user.email.map(|e| e.into()),
             contact_nip17: db_user.contact_nip17,
             contact_email: db_user.contact_email,
             country_code: db_user.country_code,
@@ -68,7 +68,7 @@ pub async fn admin_update_user(
 
     // Update user fields if provided
     if let Some(email) = &req.email {
-        user.email = Some(email.clone());
+        user.email = Some(email.into());
     }
     if let Some(contact_nip17) = req.contact_nip17 {
         user.contact_nip17 = contact_nip17;

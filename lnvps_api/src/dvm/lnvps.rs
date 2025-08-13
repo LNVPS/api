@@ -101,7 +101,7 @@ impl DVMHandler for LnvpsDvm {
             let new_key = UserSshKey {
                 name: key_name,
                 user_id: uid,
-                key_data: pk.to_openssh()?,
+                key_data: pk.to_openssh()?.into(),
                 ..Default::default()
             };
 
@@ -112,7 +112,7 @@ impl DVMHandler for LnvpsDvm {
 
             let existing_keys = db.list_user_ssh_key(uid).await?;
             let ssh_key_id = if let Some(k) = existing_keys.iter().find(|k| {
-                let ek: PublicKey = k.key_data.parse().unwrap();
+                let ek: PublicKey = k.key_data.as_str().parse().unwrap();
                 ek.eq(&pk)
             }) {
                 k.id
@@ -142,7 +142,7 @@ impl DVMHandler for LnvpsDvm {
             payment = payment.tag(Tag::parse([
                 "amount",
                 invoice.amount.to_string().as_str(),
-                &invoice.external_data,
+                &invoice.external_data.as_str(),
             ])?);
             client.send_event_builder(payment).await?;
 

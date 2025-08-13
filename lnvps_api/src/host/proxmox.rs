@@ -698,7 +698,7 @@ impl ProxmoxClient {
             scsi_hw: Some("virtio-scsi-pci".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
-            ssh_keys: Some(urlencoding::encode(&value.ssh_key.key_data).to_string()),
+            ssh_keys: Some(urlencoding::encode(&value.ssh_key.key_data.as_str()).to_string()),
             efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
             ..Default::default()
         })

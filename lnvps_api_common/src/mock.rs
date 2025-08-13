@@ -142,7 +142,7 @@ impl Default for MockDb {
                 cpu: 4,
                 memory: 8 * crate::GB,
                 enabled: true,
-                api_token: "".to_string(),
+                api_token: "".into(),
                 load_cpu: 1.5,
                 load_memory: 2.0,
                 load_disk: 3.0,
@@ -909,6 +909,21 @@ impl LNVpsDbBase for MockDb {
             .get(&id)
             .cloned()
             .ok_or_else(|| anyhow!("VM history not found: {}", id))
+    }
+
+    async fn execute_query(&self, _query: &str) -> anyhow::Result<u64> {
+        // Mock implementation - always returns success
+        Ok(0)
+    }
+
+    async fn execute_query_with_string_params(&self, _query: &str, _params: Vec<String>) -> anyhow::Result<u64> {
+        // Mock implementation - always returns success
+        Ok(0)
+    }
+
+    async fn fetch_raw_strings(&self, _query: &str) -> anyhow::Result<Vec<(u64, String)>> {
+        // Mock implementation - returns empty result
+        Ok(vec![])
     }
 }
 

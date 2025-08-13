@@ -328,7 +328,7 @@ impl Worker {
         if let Some(smtp) = self.settings.smtp.as_ref() {
             if user.contact_email && user.email.is_some() {
                 // send email
-                let mut b = MessageBuilder::new().to(user.email.unwrap().parse()?);
+                let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
                 if let Some(t) = title {
                     b = b.subject(t);
                 }

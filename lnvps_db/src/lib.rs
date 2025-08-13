@@ -1,6 +1,8 @@
 use anyhow::Result;
 #[cfg(feature = "admin")]
 mod admin;
+pub mod encrypted_string;
+pub mod encryption;
 mod model;
 #[cfg(feature = "mysql")]
 mod mysql;
@@ -9,6 +11,8 @@ pub mod nostr;
 
 #[cfg(feature = "admin")]
 pub use admin::*;
+pub use encrypted_string::EncryptedString;
+pub use encryption::EncryptionContext;
 pub use model::*;
 #[cfg(feature = "mysql")]
 pub use mysql::*;
@@ -265,6 +269,19 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Get VM history entry by id
     async fn get_vm_history(&self, id: u64) -> Result<VmHistory>;
+
+    /// Execute a raw SQL query that doesn't return data
+    async fn execute_query(&self, query: &str) -> Result<u64>;
+
+    /// Execute a raw SQL query with string parameters that doesn't return data  
+    async fn execute_query_with_string_params(
+        &self,
+        query: &str,
+        params: Vec<String>,
+    ) -> Result<u64>;
+
+    /// Fetch raw string data from database bypassing EncryptedString decoding
+    async fn fetch_raw_strings(&self, query: &str) -> Result<Vec<(u64, String)>>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

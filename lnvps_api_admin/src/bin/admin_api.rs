@@ -5,7 +5,7 @@ use lnvps_api_admin::admin;
 use lnvps_api_admin::settings::Settings;
 use lnvps_api_common::{VmStateCache, WorkCommander};
 use lnvps_common::CORS;
-use lnvps_db::{LNVpsDb, LNVpsDbMysql};
+use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
 use log::{error, info};
 use rocket::http::Method;
 use std::net::{IpAddr, SocketAddr};
@@ -36,6 +36,15 @@ async fn main() -> Result<(), Error> {
         ))
         .build()?
         .try_deserialize()?;
+
+    // Initialize encryption if configured
+    if let Some(ref encryption_config) = settings.encryption {
+        EncryptionContext::init_from_file(
+            &encryption_config.key_file,
+            encryption_config.auto_generate,
+        )?;
+        info!("Database encryption initialized");
+    }
 
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;

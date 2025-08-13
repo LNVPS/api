@@ -12,8 +12,8 @@ use lnvps_api::ExchangeRateService;
 use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::{DefaultRateCache, VmStateCache, WorkJob};
 use lnvps_common::CORS;
-use lnvps_db::{LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
-use log::error;
+use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
+use log::{error, info};
 use nostr::Keys;
 use nostr_sdk::Client;
 use rocket::http::Method;
@@ -47,6 +47,15 @@ async fn main() -> Result<(), Error> {
         ))
         .build()?
         .try_deserialize()?;
+
+    // Initialize encryption if configured
+    if let Some(ref encryption_config) = settings.encryption {
+        EncryptionContext::init_from_file(
+            &encryption_config.key_file,
+            encryption_config.auto_generate,
+        )?;
+        info!("Database encryption initialized");
+    }
 
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;

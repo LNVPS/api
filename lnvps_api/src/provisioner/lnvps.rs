@@ -72,7 +72,7 @@ impl LNVpsProvisioner {
         let cfg = self.db.get_router(router_id).await?;
         match cfg.kind {
             RouterKind::Mikrotik => {
-                let mut t_split = cfg.token.split(":");
+                let mut t_split = cfg.token.as_str().split(":");
                 let (username, password) = (
                     t_split.next().context("Invalid username:password")?,
                     t_split.next().context("Invalid username:password")?,
@@ -80,7 +80,7 @@ impl LNVpsProvisioner {
                 Ok(Arc::new(MikrotikRouter::new(&cfg.url, username, password)))
             }
             RouterKind::OvhAdditionalIp => Ok(Arc::new(
-                OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, &cfg.token).await?,
+                OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, &cfg.token.as_str()).await?,
             )),
         }
     }
@@ -490,7 +490,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         let price = pe.get_vm_cost(vm_id, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -508,7 +508,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -571,7 +571,7 @@ impl LNVpsProvisioner {
                             time_value: p.time_value,
                             is_paid: false,
                             rate: p.rate.rate,
-                            external_data: invoice.pr,
+                            external_data: invoice.pr.into(),
                             external_id: invoice.external_id,
                             upgrade_params,
                         }
@@ -606,7 +606,7 @@ impl LNVpsProvisioner {
                             time_value: p.time_value,
                             is_paid: false,
                             rate: p.rate.rate,
-                            external_data: order.raw_data,
+                            external_data: order.raw_data.into(),
                             external_id: Some(order.external_id),
                             upgrade_params,
                         }
@@ -689,7 +689,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         pe.calculate_upgrade_cost(vm_id, cfg, method).await
     }
 
@@ -739,7 +739,7 @@ impl LNVpsProvisioner {
             PaymentType::Upgrade,
             Some(upgrade_params_json),
         )
-        .await
+            .await
     }
 
     /// Create a new custom template using a vm's existing standard template
@@ -842,7 +842,7 @@ mod tests {
             name: "test-key".to_string(),
             user_id,
             created: Default::default(),
-            key_data: "ssh-rsa AAA==".to_string(),
+            key_data: "ssh-rsa AAA==".into(),
         };
         let ssh_key = db.insert_user_ssh_key(&new_key).await?;
         new_key.id = ssh_key;
@@ -869,7 +869,7 @@ mod tests {
                     enabled: true,
                     kind: RouterKind::Mikrotik,
                     url: "https://localhost".to_string(),
-                    token: "username:password".to_string(),
+                    token: "username:password".into(),
                 },
             );
             let mut p = db.access_policy.lock().await;

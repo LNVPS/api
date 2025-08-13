@@ -235,7 +235,7 @@ impl From<lnvps_db::User> for AdminUserInfo {
             id: user.id,
             pubkey: hex::encode(&user.pubkey),
             created: user.created,
-            email: user.email,
+            email: user.email.map(|e| e.into()),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
             country_code: user.country_code,
@@ -1262,7 +1262,7 @@ impl CreateRouterRequest {
             enabled: self.enabled.unwrap_or(true),
             kind: db_kind,
             url: self.url.trim().to_string(),
-            token: self.token.clone(),
+            token: self.token.as_str().into(),
         })
     }
 }
@@ -1409,7 +1409,7 @@ impl AdminVmHistoryInfo {
         if let Some(user_id) = history.initiated_by_user {
             if let Ok(user) = db.get_user(user_id).await {
                 initiated_by_user_pubkey = Some(hex::encode(&user.pubkey));
-                initiated_by_user_email = user.email;
+                initiated_by_user_email = user.email.map(|e| e.into());
             }
         }
 

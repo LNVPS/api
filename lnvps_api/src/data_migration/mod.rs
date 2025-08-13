@@ -1,5 +1,6 @@
 use crate::data_migration::arp_ref_fixer::ArpRefFixerDataMigration;
 use crate::data_migration::dns::DnsDataMigration;
+use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::Settings;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 
 mod arp_ref_fixer;
 mod dns;
+mod encryption_migration;
 mod ip6_init;
 
 /// Basic data migration to run at startup
@@ -25,6 +27,10 @@ pub async fn run_data_migrations(
     settings: &Settings,
 ) -> Result<()> {
     let mut migrations: Vec<Box<dyn DataMigration>> = vec![];
+    
+    // Add encryption migration first (should run before other migrations)
+    migrations.push(Box::new(EncryptionDataMigration::new(db.clone())));
+    
     migrations.push(Box::new(Ip6InitDataMigration::new(
         db.clone(),
         lnvps.clone(),

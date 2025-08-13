@@ -103,7 +103,7 @@ pub async fn admin_update_host(
         host.ip = ip.clone();
     }
     if let Some(api_token) = &req.api_token {
-        host.api_token = api_token.clone();
+        host.api_token = api_token.clone().into();
     }
     if let Some(region_id) = req.region_id {
         host.region_id = region_id;
@@ -163,7 +163,7 @@ pub async fn admin_create_host(
         cpu: req.cpu,
         memory: req.memory,
         enabled: req.enabled.unwrap_or(true),
-        api_token: req.api_token.clone(),
+        api_token: req.api_token.clone().into(),
         load_cpu: req.load_cpu.unwrap_or(1.0),
         load_memory: req.load_memory.unwrap_or(1.0),
         load_disk: req.load_disk.unwrap_or(1.0),

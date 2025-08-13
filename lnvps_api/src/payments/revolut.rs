@@ -89,9 +89,8 @@ impl RevolutPaymentHandler {
         let vm_before = self.db.get_vm(payment.vm_id).await?;
 
         // save payment state json into external_data
-        // TODO: encrypt payment_data
         let order = self.api.get_order(ext_id).await?;
-        payment.external_data = serde_json::to_string(&order)?;
+        payment.external_data = serde_json::to_string(&order)?.into();
 
         // check user country matches card country
         if let Some(cc) = order

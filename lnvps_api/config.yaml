@@ -9,6 +9,9 @@ public-url: "https://api.lnvps.net"
 redis:
   url: "redis://localhost:6398"
   ttl: 30
+encryption:
+  key-file: "encryption.key"
+  auto-generate: true
 provisioner:
   proxmox:
     read-only: false

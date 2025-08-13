@@ -143,7 +143,7 @@ pub struct AccountPatchRequest {
 impl From<lnvps_db::User> for AccountPatchRequest {
     fn from(user: lnvps_db::User) -> Self {
         AccountPatchRequest {
-            email: user.email,
+            email: user.email.map(|e| e.into()),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
             country_code: user.country_code,
@@ -258,13 +258,16 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             is_upgrade: value.payment_type == PaymentType::Upgrade,
             upgrade_params: value.upgrade_params.clone(),
             data: match &value.payment_method {
-                PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data),
+                PaymentMethod::Lightning => {
+                    ApiPaymentData::Lightning(value.external_data.into())
+                }
                 PaymentMethod::Revolut => {
                     #[derive(Deserialize)]
                     struct RevolutData {
                         pub token: String,
                     }
-                    let data: RevolutData = serde_json::from_str(&value.external_data).unwrap();
+                    let data: RevolutData =
+                        serde_json::from_str(&value.external_data.as_str()).unwrap();
                     ApiPaymentData::Revolut { token: data.token }
                 }
                 PaymentMethod::Paypal => {

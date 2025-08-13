@@ -107,7 +107,7 @@ pub async fn admin_update_router(
         router.url = url.trim().to_string();
     }
     if let Some(token) = &request.token {
-        router.token = token.clone();
+        router.token = token.as_str().into();
     }
 
     db.admin_update_router(&router).await?;

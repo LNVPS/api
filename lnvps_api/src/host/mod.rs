@@ -99,7 +99,7 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
             Arc::new(proxmox::ProxmoxClient::new(
                 host.ip.parse()?,
                 &host.name,
-                &host.api_token,
+                host.api_token.as_str(),
                 cfg.mac_prefix,
                 cfg.qemu,
                 cfg.ssh,
@@ -310,7 +310,7 @@ mod tests {
                 cpu: 20,
                 memory: 128 * GB,
                 enabled: true,
-                api_token: "mock".to_string(),
+                api_token: "mock".into(),
                 load_cpu: 1.0,
                 load_memory: 1.0,
                 load_disk: 1.0,
@@ -407,7 +407,7 @@ mod tests {
                 name: "test".to_string(),
                 user_id: 1,
                 created: Default::default(),
-                key_data: "ssh-ed25519 AAA=".to_string(),
+                key_data: "ssh-ed25519 AAA=".into(),
             },
         }
     }
