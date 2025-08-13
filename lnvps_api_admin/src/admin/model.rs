@@ -158,6 +158,7 @@ pub struct AdminUserInfo {
     pub vm_count: u64,
     pub last_login: Option<DateTime<Utc>>,
     pub is_admin: bool,
+    pub has_nwc: bool,
 }
 
 #[derive(Deserialize)]
@@ -250,6 +251,33 @@ impl From<lnvps_db::User> for AdminUserInfo {
             vm_count: 0,
             last_login: None,
             is_admin: false,
+            has_nwc: user.nwc_connection_string.is_some(),
+        }
+    }
+}
+
+impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
+    fn from(user: lnvps_db::AdminUserInfo) -> Self {
+        Self {
+            id: user.user_info.id,
+            pubkey: hex::encode(&user.user_info.pubkey),
+            created: user.user_info.created,
+            email: user.user_info.email.map(|e| e.into()),
+            contact_nip17: user.user_info.contact_nip17,
+            contact_email: user.user_info.contact_email,
+            country_code: user.user_info.country_code,
+            billing_name: user.user_info.billing_name,
+            billing_address_1: user.user_info.billing_address_1,
+            billing_address_2: user.user_info.billing_address_2,
+            billing_city: user.user_info.billing_city,
+            billing_state: user.user_info.billing_state,
+            billing_postcode: user.user_info.billing_postcode,
+            billing_tax_id: user.user_info.billing_tax_id,
+            // Admin-specific fields will be filled by the handler
+            vm_count: user.vm_count as _,
+            last_login: None,
+            is_admin: user.is_admin,
+            has_nwc: user.user_info.nwc_connection_string.is_some(),
         }
     }
 }
@@ -313,6 +341,7 @@ pub struct AdminVmInfo {
     pub ip_addresses: Vec<AdminVmIpAddress>,
     /// Full VM running state with metrics (CPU usage, memory usage, etc.)
     pub running_state: Option<VmRunningState>,
+    pub auto_renewal_enabled: bool,
 
     // VM Resources
     /// Number of CPU cores allocated to this VM
@@ -431,6 +460,7 @@ impl AdminVmInfo {
             ssh_key_name: ssh_key.name,
             ip_addresses,
             running_state,
+            auto_renewal_enabled: vm.auto_renewal_enabled,
             cpu,
             memory,
             disk_size,

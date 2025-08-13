@@ -1078,21 +1078,7 @@ impl AdminDb for MockDb {
             .skip(offset as usize)
             .take(limit as usize)
             .map(|u| AdminUserInfo {
-                id: u.id,
-                pubkey: u.pubkey.clone(),
-                created: u.created,
-                email: u.email.clone(),
-                contact_nip17: u.contact_nip17,
-                contact_email: u.contact_email,
-                country_code: u.country_code.clone(),
-                billing_name: u.billing_name.clone(),
-                billing_address_1: u.billing_address_1.clone(),
-                billing_address_2: u.billing_address_2.clone(),
-                billing_city: u.billing_city.clone(),
-                billing_state: u.billing_state.clone(),
-                billing_postcode: u.billing_postcode.clone(),
-                billing_tax_id: u.billing_tax_id.clone(),
-                nwc_connection_string: u.nwc_connection_string.clone(),
+                user_info: u.clone(),
                 vm_count: 0,
                 is_admin: false,
             })

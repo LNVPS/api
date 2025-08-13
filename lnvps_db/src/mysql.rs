@@ -1401,6 +1401,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
+                u.nwc_connection_string,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
             FROM users u

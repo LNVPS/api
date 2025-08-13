@@ -54,22 +54,8 @@ pub struct UserSshKey {
 
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct AdminUserInfo {
-    pub id: u64,
-    pub pubkey: Vec<u8>,
-    pub created: DateTime<Utc>,
-    pub email: Option<EncryptedString>,
-    pub contact_nip17: bool,
-    pub contact_email: bool,
-    pub country_code: Option<String>,
-    pub billing_name: Option<String>,
-    pub billing_address_1: Option<String>,
-    pub billing_address_2: Option<String>,
-    pub billing_city: Option<String>,
-    pub billing_state: Option<String>,
-    pub billing_postcode: Option<String>,
-    pub billing_tax_id: Option<String>,
-    /// Nostr Wallet Connect connection string for automatic renewals (encrypted)
-    pub nwc_connection_string: Option<EncryptedString>,
+    #[sqlx(flatten)]
+    pub user_info: User,
     // Admin-specific fields
     pub vm_count: i64,
     pub is_admin: bool,

@@ -26,31 +26,12 @@ pub async fn admin_list_users(
     let search_pubkey = search.as_deref();
     let (db_admin_users, total) = db.admin_list_users(limit, offset, search_pubkey).await?;
 
-    // Convert database AdminUserInfo to API AdminUserInfo
-    let admin_users: Vec<AdminUserInfo> = db_admin_users
-        .into_iter()
-        .map(|db_user| AdminUserInfo {
-            id: db_user.id,
-            pubkey: hex::encode(&db_user.pubkey),
-            created: db_user.created,
-            email: db_user.email.map(|e| e.into()),
-            contact_nip17: db_user.contact_nip17,
-            contact_email: db_user.contact_email,
-            country_code: db_user.country_code,
-            billing_name: db_user.billing_name,
-            billing_address_1: db_user.billing_address_1,
-            billing_address_2: db_user.billing_address_2,
-            billing_city: db_user.billing_city,
-            billing_state: db_user.billing_state,
-            billing_postcode: db_user.billing_postcode,
-            billing_tax_id: db_user.billing_tax_id,
-            vm_count: db_user.vm_count as u64,
-            last_login: None, // TODO: Add last_login tracking
-            is_admin: db_user.is_admin,
-        })
-        .collect();
-
-    ApiPaginatedData::ok(admin_users, total, limit, offset)
+    ApiPaginatedData::ok(
+        db_admin_users.into_iter().map(|u| u.into()).collect(),
+        total,
+        limit,
+        offset,
+    )
 }
 
 /// Update user account information
