@@ -154,24 +154,21 @@ fn load_or_generate_key<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Once;
-    use tempfile::tempdir;
 
-    static INIT: Once = Once::new();
-
-    fn setup_encryption_context() {
-        INIT.call_once(|| {
-            let temp_file = tempdir().unwrap().path().join("test_key.key");
-            EncryptionContext::try_init_from_file(temp_file, true).unwrap();
-        });
+    fn create_test_cipher() -> Result<Aes256Gcm> {
+        let mut rng = OsRng;
+        let mut new_key: [u8; 32] = [0; 32];
+        rng.fill_bytes(&mut new_key);
+        Ok(Aes256Gcm::new_from_slice(new_key.as_slice())?)
     }
 
     #[test]
-    fn test_encryption_roundtrip() {
-        setup_encryption_context();
-        let context = EncryptionContext::get().unwrap();
-        let plaintext = "Hello, World!";
+    fn test_local_encryption_roundtrip() {
+        // Test encryption/decryption without using global state
+        let cipher = create_test_cipher().unwrap();
+        let context = EncryptionContext { cipher };
 
+        let plaintext = "Hello, World!";
         let encrypted = context.encrypt(plaintext).unwrap();
         let decrypted = context.decrypt(&encrypted).unwrap();
 
@@ -179,26 +176,12 @@ mod tests {
     }
 
     #[test]
-    fn test_key_generation() {
-        setup_encryption_context();
+    fn test_local_different_encryptions_produce_different_results() {
+        // Test that multiple encryptions of same data produce different results
+        let cipher = create_test_cipher().unwrap();
+        let context = EncryptionContext { cipher };
 
-        // This test verifies that the setup function created a proper key
-        // We can't verify the specific temp file since it's created in setup
-        let context = EncryptionContext::get().unwrap();
-
-        // Test that we can encrypt and decrypt, which proves the key works
-        let test_data = "test key generation";
-        let encrypted = context.encrypt(test_data).unwrap();
-        let decrypted = context.decrypt(&encrypted).unwrap();
-        assert_eq!(test_data, decrypted);
-    }
-
-    #[test]
-    fn test_different_encryptions_produce_different_results() {
-        setup_encryption_context();
-        let context = EncryptionContext::get().unwrap();
         let plaintext = "Same message";
-
         let encrypted1 = context.encrypt(plaintext).unwrap();
         let encrypted2 = context.encrypt(plaintext).unwrap();
 
@@ -208,5 +191,12 @@ mod tests {
         // But both should decrypt to the same plaintext
         assert_eq!(context.decrypt(&encrypted1).unwrap(), plaintext);
         assert_eq!(context.decrypt(&encrypted2).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_is_encrypted_detection() {
+        assert!(EncryptionContext::is_encrypted("ENC:some_base64_data"));
+        assert!(!EncryptionContext::is_encrypted("plain_text_data"));
+        assert!(!EncryptionContext::is_encrypted(""));
     }
 }
