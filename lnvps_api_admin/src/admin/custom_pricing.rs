@@ -34,6 +34,8 @@ impl AdminCustomPricingInfo {
                 kind: ApiDiskType::from(dp.kind),
                 interface: ApiDiskInterface::from(dp.interface),
                 cost: dp.cost,
+                min_disk_size: dp.min_disk_size,
+                max_disk_size: dp.max_disk_size,
             })
             .collect();
 
@@ -50,6 +52,10 @@ impl AdminCustomPricingInfo {
             memory_cost: pricing.memory_cost,
             ip4_cost: pricing.ip4_cost,
             ip6_cost: pricing.ip6_cost,
+            min_cpu: pricing.min_cpu,
+            max_cpu: pricing.max_cpu,
+            min_memory: pricing.min_memory,
+            max_memory: pricing.max_memory,
             disk_pricing: disk_pricing_info,
             template_count,
         })

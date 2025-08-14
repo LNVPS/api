@@ -1016,6 +1016,10 @@ pub struct AdminCustomPricingInfo {
     pub memory_cost: f32,
     pub ip4_cost: f32,
     pub ip6_cost: f32,
+    pub min_cpu: u16,
+    pub max_cpu: u16,
+    pub min_memory: u64,
+    pub max_memory: u64,
     pub disk_pricing: Vec<AdminCustomPricingDisk>,
     pub template_count: u64,
 }
@@ -1026,6 +1030,8 @@ pub struct AdminCustomPricingDisk {
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
     pub cost: f32,
+    pub max_disk_size: u64,
+    pub min_disk_size: u64
 }
 
 #[derive(Deserialize)]
