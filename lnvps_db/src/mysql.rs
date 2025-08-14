@@ -1,6 +1,6 @@
 use crate::{
-    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage,
-    RegionStats, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    AccessPolicy, AdminVmHost, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType,
+    ReferralCostUsage, RegionStats, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
     VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
     VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
@@ -319,16 +319,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_host_disk(&self, disk: &VmHostDisk) -> Result<()> {
-        sqlx::query("update vm_host_disk set name=?,size=?,kind=?,interface=?,enabled=? where id=?")
-            .bind(&disk.name)
-            .bind(disk.size)
-            .bind(disk.kind)
-            .bind(disk.interface)
-            .bind(disk.enabled)
-            .bind(disk.id)
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+        sqlx::query(
+            "update vm_host_disk set name=?,size=?,kind=?,interface=?,enabled=? where id=?",
+        )
+        .bind(&disk.name)
+        .bind(disk.size)
+        .bind(disk.kind)
+        .bind(disk.interface)
+        .bind(disk.enabled)
+        .bind(disk.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
         Ok(())
     }
 
@@ -919,15 +921,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(result.rows_affected())
     }
 
-    async fn execute_query_with_string_params(&self, query: &str, params: Vec<String>) -> Result<u64> {
+    async fn execute_query_with_string_params(
+        &self,
+        query: &str,
+        params: Vec<String>,
+    ) -> Result<u64> {
         let mut query_builder = sqlx::query(query);
         for param in params {
             query_builder = query_builder.bind(param);
         }
-        let result = query_builder
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let result = query_builder.execute(&self.db).await.map_err(Error::new)?;
         Ok(result.rows_affected())
     }
 
@@ -936,7 +939,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .fetch_all(&self.db)
             .await
             .map_err(Error::new)?;
-        
+
         let mut results = Vec::new();
         for row in rows {
             let id: u64 = row.try_get(0).map_err(Error::new)?;
@@ -946,7 +949,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(results)
     }
 }
-
 
 #[cfg(feature = "nostr-domain")]
 #[async_trait]
@@ -1490,7 +1492,12 @@ impl AdminDb for LNVpsDbMysql {
         Ok((regions, total as u64))
     }
 
-    async fn admin_create_region(&self, name: &str, enabled: bool, company_id: Option<u64>) -> Result<u64> {
+    async fn admin_create_region(
+        &self,
+        name: &str,
+        enabled: bool,
+        company_id: Option<u64>,
+    ) -> Result<u64> {
         let id = sqlx::query_scalar::<_, u64>(
             "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
         )
@@ -1756,21 +1763,33 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    ) -> Result<(Vec<AdminVmHost>, u64)> {
         // Get total count (including disabled hosts)
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.region_id = hr.id",
+            "SELECT COUNT(*) FROM vm_host h JOIN vm_host_region hr ON h.region_id = hr.id",
         )
         .fetch_one(&self.db)
         .await
         .map_err(Error::new)?;
 
-        // Get paginated results with region info (including disabled hosts)
-        let rows = sqlx::query(
-            "SELECT h.*, hr.id as region_id, hr.name as region_name, hr.enabled as region_enabled, hr.company_id as region_company_id 
-             FROM vm_host h, vm_host_region hr 
-             WHERE h.region_id = hr.id 
-             ORDER BY h.name LIMIT ? OFFSET ?"
+        // Get paginated results with region info and active VM count (including disabled hosts)
+        let mut hosts: Vec<AdminVmHost> = sqlx::query_as(
+            "SELECT h.*, 
+                    hr.id as region_id, 
+                    hr.name as region_name, 
+                    hr.enabled as region_enabled, 
+                    hr.company_id as region_company_id,
+                    COALESCE(vm_counts.active_vm_count, 0) as active_vm_count
+             FROM vm_host h 
+             JOIN vm_host_region hr ON h.region_id = hr.id 
+             LEFT JOIN (
+                 SELECT host_id, COUNT(*) as active_vm_count 
+                 FROM vm 
+                 WHERE deleted = 0 
+                 GROUP BY host_id
+             ) vm_counts ON h.id = vm_counts.host_id
+             ORDER BY h.name 
+             LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -1778,35 +1797,19 @@ impl AdminDb for LNVpsDbMysql {
         .await
         .map_err(Error::new)?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            let host = VmHost {
-                id: row.get("id"),
-                kind: row.get("kind"),
-                region_id: row.get("region_id"),
-                name: row.get("name"),
-                ip: row.get("ip"),
-                cpu: row.get("cpu"),
-                memory: row.get("memory"),
-                enabled: row.get("enabled"),
-                api_token: row.get("api_token"),
-                load_cpu: row.get("load_cpu"),
-                load_memory: row.get("load_memory"),
-                load_disk: row.get("load_disk"),
-                vlan_id: row.get("vlan_id"),
-            };
+        // Fetch disk information for each host
+        for host in &mut hosts {
+            let disks: Vec<VmHostDisk> =
+                sqlx::query_as("SELECT * FROM vm_host_disk WHERE host_id = ? ORDER BY name")
+                    .bind(host.host.id)
+                    .fetch_all(&self.db)
+                    .await
+                    .map_err(Error::new)?;
 
-            let region = VmHostRegion {
-                id: row.get("region_id"),
-                name: row.get("region_name"),
-                enabled: row.get("region_enabled"),
-                company_id: row.get("region_company_id"),
-            };
-
-            results.push((host, region));
+            host.disks = disks;
         }
 
-        Ok((results, total as u64))
+        Ok((hosts, total as u64))
     }
 
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> Result<u64> {
@@ -2068,8 +2071,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_company(&self, company: &Company) -> Result<u64> {
         let result = sqlx::query(
-            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())"#,
+            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)"#,
         )
         .bind(&company.name)
         .bind(&company.address_1)
@@ -2081,6 +2084,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.postcode)
         .bind(&company.phone)
         .bind(&company.email)
+            .bind(&company.base_currency)
         .execute(&self.db)
         .await
         .map_err(Error::new)?;
@@ -2253,25 +2257,24 @@ impl AdminDb for LNVpsDbMysql {
                            AND vp.created >= ? 
                            AND vp.created <= ?
                            AND c.id = ?".to_string();
-        
+
         if ref_code.is_some() {
             query.push_str(" AND v.ref_code = ?");
         }
-        
+
         query.push_str(" ORDER BY vp.created DESC");
 
         let mut db_query = sqlx::query_as(&query)
             .bind(start_date)
             .bind(end_date)
             .bind(company_id);
-            
+
         if let Some(code) = ref_code {
             db_query = db_query.bind(code);
         }
-        
+
         db_query.fetch_all(&self.db).await.map_err(Error::new)
     }
-
 
     async fn admin_list_ip_ranges(
         &self,

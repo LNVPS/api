@@ -356,7 +356,19 @@ pub async fn admin_get_my_roles(
     let user_id = auth.user_id;
 
     // Get user's role assignments
-    let role_assignments = db.get_user_role_assignments(user_id).await?;
+    let mut role_assignments = db.get_user_role_assignments(user_id).await?;
+
+    #[cfg(feature = "demo")]
+    {
+        // assign admin role when no roles are found
+        if role_assignments.len() == 0 {
+            let roles = db.list_roles().await?;
+            if let Some(admin_role) = roles.iter().find(|r| r.name == "admin") {
+                db.assign_user_role(user_id, admin_role.id, user_id).await?;
+                role_assignments = db.get_user_role_assignments(user_id).await?;
+            }
+        }
+    }
 
     let mut user_roles = Vec::new();
     for assignment in role_assignments {

@@ -3,7 +3,7 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    async_trait, AccessPolicy, AdminDb, AdminRole, AdminRoleAssignment, AdminUserInfo, Company,
+    async_trait, AccessPolicy, AdminDb, AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, Company,
     DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase, NostrDomain,
     NostrDomainHandle, OsDistribution, RegionStats, Router, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
@@ -1182,8 +1182,27 @@ impl AdminDb for MockDb {
         &self,
         limit: u64,
         offset: u64,
-    ) -> anyhow::Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
-        self.list_hosts_with_regions_paginated(limit, offset).await
+    ) -> anyhow::Result<(Vec<AdminVmHost>, u64)> {
+        let (host_region_pairs, total) = self.list_hosts_with_regions_paginated(limit, offset).await?;
+        
+        let mut admin_hosts = Vec::new();
+        for (host, region) in host_region_pairs {
+            let disks = self.list_host_disks(host.id).await?;
+            let active_vm_count = self.count_active_vms_on_host(host.id).await.unwrap_or(0);
+            
+            let admin_host = AdminVmHost {
+                host,
+                region_id: region.id,
+                region_name: region.name,
+                region_enabled: region.enabled,
+                region_company_id: region.company_id,
+                disks,
+                active_vm_count: active_vm_count as _,
+            };
+            admin_hosts.push(admin_host);
+        }
+        
+        Ok((admin_hosts, total))
     }
     async fn admin_list_companies(
         &self,

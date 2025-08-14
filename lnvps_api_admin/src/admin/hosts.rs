@@ -1,7 +1,7 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminHostDisk, AdminHostInfo, AdminVmHostKind};
 use lnvps_api_common::{
-    ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult, HostCapacityService,
+    ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
@@ -9,30 +9,6 @@ use rocket::{get, patch, post, State};
 use serde::Deserialize;
 use std::sync::Arc;
 
-/// Create AdminHostInfo with calculated load data from host, region, and disks
-async fn create_admin_host_info_with_capacity(
-    db: &Arc<dyn LNVpsDb>,
-    host: lnvps_db::VmHost,
-    region: lnvps_db::VmHostRegion,
-    disks: Vec<lnvps_db::VmHostDisk>,
-) -> AdminHostInfo {
-    // Create capacity service to calculate load data
-    let capacity_service = HostCapacityService::new(db.clone());
-
-    // Calculate host capacity/load
-    match capacity_service.get_host_capacity(&host, None, None).await {
-        Ok(capacity) => {
-            // Count active VMs on this host - more efficient than listing all VMs
-            let active_vms = db.count_active_vms_on_host(host.id).await.unwrap_or(0);
-
-            AdminHostInfo::from_host_capacity(&capacity, region, disks, active_vms)
-        }
-        Err(_) => {
-            // If capacity calculation fails, use the fallback method
-            AdminHostInfo::from_host_region_and_disks(host, region, disks)
-        }
-    }
-}
 
 /// List all VM hosts with pagination
 #[get("/api/admin/v1/hosts?<limit>&<offset>")]
@@ -48,16 +24,15 @@ pub async fn admin_list_hosts(
     let limit = limit.unwrap_or(50).min(100);
     let offset = offset.unwrap_or(0);
 
-    // Get paginated hosts with region info from database (including disabled hosts for admin)
-    let (hosts_data, total) = db
+    // Get paginated hosts with all data from database (including disabled hosts for admin)
+    let (admin_hosts, total) = db
         .admin_list_hosts_with_regions_paginated(limit, offset)
         .await?;
 
-    // Convert to API model with disk information and calculated load data
+    // Convert to API model with calculated load data
     let mut hosts = Vec::new();
-    for (host, region) in hosts_data {
-        let disks = db.list_host_disks(host.id).await?;
-        hosts.push(create_admin_host_info_with_capacity(db.inner(), host, region, disks).await);
+    for admin_host in admin_hosts {
+        hosts.push(AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await);
     }
 
     ApiPaginatedData::ok(hosts, total, limit, offset)
@@ -77,7 +52,17 @@ pub async fn admin_get_host(
     let region = db.get_host_region(host.region_id).await?;
     let disks = db.list_host_disks(id).await?;
 
-    let host_info = create_admin_host_info_with_capacity(db.inner(), host, region, disks).await;
+    // Create admin host manually since we don't have the unified query for a single host
+    let admin_host = lnvps_db::AdminVmHost {
+        host,
+        region_id: region.id,
+        region_name: region.name.clone(),
+        region_enabled: region.enabled,
+        region_company_id: region.company_id,
+        disks,
+        active_vm_count: db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
+    };
+    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await;
     ApiData::ok(host_info)
 }
 
@@ -135,8 +120,17 @@ pub async fn admin_update_host(
     let region = db.get_host_region(updated_host.region_id).await?;
     let disks = db.list_host_disks(id).await?;
 
-    let host_info =
-        create_admin_host_info_with_capacity(db.inner(), updated_host, region, disks).await;
+    // Create admin host manually
+    let admin_host = lnvps_db::AdminVmHost {
+        host: updated_host,
+        region_id: region.id,
+        region_name: region.name.clone(),
+        region_enabled: region.enabled,
+        region_company_id: region.company_id,
+        disks,
+        active_vm_count: db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
+    };
+    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await;
     ApiData::ok(host_info)
 }
 
@@ -178,8 +172,17 @@ pub async fn admin_create_host(
     let region = db.get_host_region(created_host.region_id).await?;
     let disks = db.list_host_disks(host_id).await?;
 
-    let host_info =
-        create_admin_host_info_with_capacity(db.inner(), created_host, region, disks).await;
+    // Create admin host manually
+    let admin_host = lnvps_db::AdminVmHost {
+        host: created_host,
+        region_id: region.id,
+        region_name: region.name.clone(),
+        region_enabled: region.enabled,
+        region_company_id: region.company_id,
+        disks,
+        active_vm_count: 0, // New host has no VMs
+    };
+    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await;
     ApiData::ok(host_info)
 }
 

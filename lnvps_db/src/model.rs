@@ -137,6 +137,29 @@ pub enum DiskType {
     SSD = 1,
 }
 
+/// Unified struct containing all VM host data needed for admin purposes
+#[derive(FromRow, Clone, Debug)]
+pub struct AdminVmHost {
+    #[sqlx(flatten)]
+    pub host: VmHost,
+    
+    // Region fields with prefixed names to avoid conflicts
+    pub region_id: u64,
+    #[sqlx(rename = "region_name")]
+    pub region_name: String,
+    #[sqlx(rename = "region_enabled")]
+    pub region_enabled: bool,
+    #[sqlx(rename = "region_company_id")]
+    pub region_company_id: Option<u64>,
+    
+    // Disk information (populated separately, not from SQL)
+    #[sqlx(skip)]
+    pub disks: Vec<VmHostDisk>,
+    
+    // Additional calculated data that can be populated by the database function
+    pub active_vm_count: i64,
+}
+
 impl FromStr for DiskType {
     type Err = anyhow::Error;
 

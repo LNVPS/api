@@ -2,14 +2,37 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo};
 use chrono::Days;
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmHistoryLogger, VmStateCache,
-    WorkCommander, WorkJob,
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmHistoryLogger, VmRunningState,
+    VmStateCache, WorkCommander, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use log::{error, info};
 use rocket::{delete, get, post, put, State};
 use serde::Deserialize;
 use std::sync::Arc;
+
+async fn get_vm_state(vm_state_cache: &VmStateCache, vm_id: u64) -> Option<VmRunningState> {
+    #[cfg(feature = "demo")]
+    let vm_running_state = Some(VmRunningState {
+        timestamp: chrono::Utc::now().timestamp() as _,
+        state: match rand::random::<f32>() {
+            n if n >= 0.0 && n < 0.75 => lnvps_api_common::VmRunningStates::Running,
+            _ => lnvps_api_common::VmRunningStates::Stopped,
+        },
+        cpu_usage: rand::random(),
+        mem_usage: rand::random(),
+        uptime: rand::random::<u16>() as _,
+        net_in: 1024 * 1024 * rand::random::<u8>() as u64,
+        net_out: 1024 * 1024 * rand::random::<u8>() as u64,
+        disk_write: 1024 * rand::random::<u8>() as u64,
+        disk_read: 1024 * rand::random::<u8>() as u64,
+    });
+
+    #[cfg(not(feature = "demo"))]
+    let vm_running_state = vm_state_cache.get_state(vm_id).await;
+
+    vm_running_state
+}
 
 /// List all VMs with pagination and filtering
 #[get(
@@ -66,7 +89,7 @@ pub async fn admin_list_vms(
         };
 
         // Get VM running state from cache
-        let vm_running_state = vm_state_cache.get_state(vm.id).await;
+        let vm_running_state = get_vm_state(vm_state_cache, vm.id).await;
 
         // Build the AdminVmInfo with all data
         let admin_vm = AdminVmInfo::from_vm_with_admin_data(
@@ -119,7 +142,7 @@ pub async fn admin_get_vm(
     };
 
     // Get VM running state from cache
-    let vm_running_state = vm_state_cache.get_state(id).await;
+    let vm_running_state = get_vm_state(vm_state_cache, vm.id).await;
 
     // Build the AdminVmInfo with all data
     let admin_vm = AdminVmInfo::from_vm_with_admin_data(

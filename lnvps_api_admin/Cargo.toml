@@ -7,8 +7,14 @@ edition = "2021"
 name = "lnvps_api_admin"
 path = "src/bin/admin_api.rs"
 
+[[bin]]
+name = "generate_demo_data"
+path = "src/bin/generate_demo_data.rs"
+required-features = ["demo"]
+
 [features]
 default = ["lnvps_db/admin"]
+demo = ["dep:rand", "dep:tokio"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
@@ -26,3 +32,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.21", features = ["derive"] }
 isocountry = "0.3.2"
 ipnetwork.workspace = true
+
+#demo
+rand = { version = "0.9.2", optional = true }
+tokio = { workspace = true, optional = true }

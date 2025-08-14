@@ -727,6 +727,96 @@ impl AdminHostInfo {
             },
         }
     }
+
+    /// Convert from unified AdminVmHost struct with basic load calculation
+    pub fn from_admin_vm_host(admin_host: lnvps_db::AdminVmHost) -> Self {
+        let admin_disks = admin_host.disks
+            .into_iter()
+            .map(|disk| disk.into())
+            .collect();
+
+        Self {
+            id: admin_host.host.id,
+            name: admin_host.host.name,
+            kind: AdminVmHostKind::from(admin_host.host.kind),
+            region: AdminHostRegion {
+                id: admin_host.region_id,
+                name: admin_host.region_name,
+                enabled: admin_host.region_enabled,
+            },
+            ip: admin_host.host.ip,
+            cpu: admin_host.host.cpu,
+            memory: admin_host.host.memory,
+            enabled: admin_host.host.enabled,
+            load_cpu: admin_host.host.load_cpu,
+            load_memory: admin_host.host.load_memory,
+            load_disk: admin_host.host.load_disk,
+            vlan_id: admin_host.host.vlan_id,
+            disks: admin_disks,
+            calculated_load: CalculatedHostLoad {
+                overall_load: 0.0,
+                cpu_load: 0.0,
+                memory_load: 0.0,
+                disk_load: 0.0,
+                available_cpu: admin_host.host.cpu,
+                available_memory: admin_host.host.memory,
+                active_vms: admin_host.active_vm_count as _,
+            },
+        }
+    }
+
+    /// Convert from unified AdminVmHost struct with capacity calculation
+    pub async fn from_admin_vm_host_with_capacity(
+        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+        admin_host: lnvps_db::AdminVmHost,
+    ) -> Self {
+        // Try to calculate capacity data
+        match lnvps_api_common::HostCapacityService::new(db.clone())
+            .get_host_capacity(&admin_host.host, None, None)
+            .await
+        {
+            Ok(capacity) => {
+                // Convert disks
+                let admin_disks = admin_host.disks
+                    .into_iter()
+                    .map(|disk| disk.into())
+                    .collect();
+
+                Self {
+                    id: capacity.host.id,
+                    name: capacity.host.name.clone(),
+                    kind: AdminVmHostKind::from(capacity.host.kind.clone()),
+                    region: AdminHostRegion {
+                        id: admin_host.region_id,
+                        name: admin_host.region_name,
+                        enabled: admin_host.region_enabled,
+                    },
+                    ip: capacity.host.ip.clone(),
+                    cpu: capacity.host.cpu,
+                    memory: capacity.host.memory,
+                    enabled: capacity.host.enabled,
+                    load_cpu: capacity.host.load_cpu,
+                    load_memory: capacity.host.load_memory,
+                    load_disk: capacity.host.load_disk,
+                    vlan_id: capacity.host.vlan_id,
+                    disks: admin_disks,
+                    calculated_load: CalculatedHostLoad {
+                        overall_load: capacity.load(),
+                        cpu_load: capacity.cpu_load(),
+                        memory_load: capacity.memory_load(),
+                        disk_load: capacity.disk_load(),
+                        available_cpu: capacity.available_cpu(),
+                        available_memory: capacity.available_memory(),
+                        active_vms: admin_host.active_vm_count as _,
+                    },
+                }
+            }
+            Err(_) => {
+                // Fallback to basic conversion if capacity calculation fails
+                Self::from_admin_vm_host(admin_host)
+            }
+        }
+    }
 }
 
 // VM OS Image Management Models

@@ -23,10 +23,6 @@ impl AdminAuth {
         // Check if user has admin privileges and get their permissions
         let permission_tuples = db.get_user_permissions(user_id).await?;
 
-        if permission_tuples.is_empty() {
-            bail!("User does not have admin privileges");
-        }
-
         // Convert database tuples to Permission structs
         let permissions: HashSet<Permission> = permission_tuples
             .into_iter()

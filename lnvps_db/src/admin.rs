@@ -130,7 +130,7 @@ pub trait AdminDb: Send + Sync {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<(crate::VmHost, crate::VmHostRegion)>, u64)>;
+    ) -> Result<(Vec<crate::AdminVmHost>, u64)>;
 
     // Custom Pricing management methods
     /// Insert a new custom pricing model
