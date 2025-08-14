@@ -12,7 +12,7 @@ name = "generate_demo_data"
 path = "src/bin/generate_demo_data.rs"
 
 [features]
-default = ["lnvps_db/admin", "demo"]
+default = ["lnvps_db/admin"]
 demo = ["dep:rand", "dep:tokio"]
 
 [dependencies]
