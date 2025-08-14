@@ -10,10 +10,9 @@ path = "src/bin/admin_api.rs"
 [[bin]]
 name = "generate_demo_data"
 path = "src/bin/generate_demo_data.rs"
-required-features = ["demo"]
 
 [features]
-default = ["lnvps_db/admin"]
+default = ["lnvps_db/admin", "demo"]
 demo = ["dep:rand", "dep:tokio"]
 
 [dependencies]
