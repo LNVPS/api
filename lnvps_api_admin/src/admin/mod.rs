@@ -15,7 +15,7 @@ use crate::admin::custom_pricing::{
     admin_get_custom_pricing, admin_list_custom_pricing, admin_update_custom_pricing,
 };
 use crate::admin::hosts::{
-    admin_create_host, admin_get_host, admin_get_host_disk, admin_list_host_disks,
+    admin_create_host, admin_create_host_disk, admin_get_host, admin_get_host_disk, admin_list_host_disks,
     admin_list_hosts, admin_update_host, admin_update_host_disk,
 };
 use crate::admin::ip_ranges::{
@@ -94,6 +94,7 @@ pub fn admin_routes() -> Vec<Route> {
         // Host disk management
         admin_list_host_disks,
         admin_get_host_disk,
+        admin_create_host_disk,
         admin_update_host_disk,
         // Region management
         admin_list_regions,

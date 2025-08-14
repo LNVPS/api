@@ -82,7 +82,7 @@ pub async fn admin_create_region(
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Create)?;
 
-    let region_id = db.admin_create_region(&req.name, req.company_id).await?;
+    let region_id = db.admin_create_region(&req.name, req.enabled, req.company_id).await?;
 
     // Get the created region
     let region = db.get_host_region(region_id).await?;

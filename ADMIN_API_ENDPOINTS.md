@@ -324,6 +324,23 @@ GET /api/admin/v1/hosts/{host_id}/disks/{disk_id}
 ```
 Required Permission: `hosts::view`
 
+#### Create Host Disk
+```
+POST /api/admin/v1/hosts/{host_id}/disks
+```
+Required Permission: `hosts::update`
+
+Body:
+```json
+{
+  "name": "string",         // Required - Disk name (e.g., "main-storage")
+  "size": number,           // Required - Size in bytes
+  "kind": "ssd",           // Required - DiskType enum: "hdd" or "ssd"
+  "interface": "pcie",     // Required - DiskInterface enum: "sata", "scsi", or "pcie"
+  "enabled": boolean       // Optional - Default: true
+}
+```
+
 #### Update Host Disk Configuration
 ```
 PATCH /api/admin/v1/hosts/{host_id}/disks/{disk_id}
@@ -333,7 +350,11 @@ Required Permission: `hosts::update`
 Body (all optional):
 ```json
 {
-  "enabled": boolean
+  "name": "string",         // Disk name
+  "size": number,           // Size in bytes
+  "kind": "ssd",           // DiskType enum: "hdd" or "ssd"
+  "interface": "pcie",     // DiskInterface enum: "sata", "scsi", or "pcie"
+  "enabled": boolean       // Enable/disable disk
 }
 ```
 

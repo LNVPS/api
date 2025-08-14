@@ -1,7 +1,7 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminHostDisk, AdminHostInfo, AdminVmHostKind};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, HostCapacityService,
+    ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult, HostCapacityService,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
@@ -230,14 +230,7 @@ pub async fn admin_list_host_disks(
     let disks = db.list_host_disks(host_id).await?;
     let admin_disks: Vec<AdminHostDisk> = disks
         .into_iter()
-        .map(|disk| AdminHostDisk {
-            id: disk.id,
-            name: disk.name,
-            size: disk.size,
-            kind: disk.kind.into(),
-            interface: disk.interface.into(),
-            enabled: disk.enabled,
-        })
+        .map(|disk| disk.into())
         .collect();
 
     ApiData::ok(admin_disks)
@@ -265,16 +258,7 @@ pub async fn admin_get_host_disk(
         return Err(anyhow::anyhow!("Disk {} does not belong to host {}", disk_id, host_id).into());
     }
 
-    let admin_disk = AdminHostDisk {
-        id: disk.id,
-        name: disk.name,
-        size: disk.size,
-        kind: disk.kind.into(),
-        interface: disk.interface.into(),
-        enabled: disk.enabled,
-    };
-
-    ApiData::ok(admin_disk)
+    ApiData::ok(disk.into())
 }
 
 /// Update host disk configuration
@@ -301,6 +285,18 @@ pub async fn admin_update_host_disk(
     }
 
     // Update fields if provided
+    if let Some(name) = &req.name {
+        disk.name = name.clone();
+    }
+    if let Some(size) = req.size {
+        disk.size = size;
+    }
+    if let Some(kind) = &req.kind {
+        disk.kind = (*kind).into();
+    }
+    if let Some(interface) = &req.interface {
+        disk.interface = (*interface).into();
+    }
     if let Some(enabled) = req.enabled {
         disk.enabled = enabled;
     }
@@ -309,19 +305,56 @@ pub async fn admin_update_host_disk(
     db.update_host_disk(&disk).await?;
 
     // Return updated disk
-    let admin_disk = AdminHostDisk {
-        id: disk.id,
-        name: disk.name,
-        size: disk.size,
-        kind: disk.kind.into(),
-        interface: disk.interface.into(),
-        enabled: disk.enabled,
+    ApiData::ok(disk.into())
+}
+
+/// Create a new host disk
+#[post("/api/admin/v1/hosts/<host_id>/disks", data = "<req>")]
+pub async fn admin_create_host_disk(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    host_id: u64,
+    req: Json<AdminHostDiskCreateRequest>,
+) -> ApiResult<AdminHostDisk> {
+    // Check permission
+    auth.require_permission(AdminResource::Hosts, AdminAction::Update)?;
+
+    // Check that host exists
+    let _host = db.get_host(host_id).await?;
+
+    // Create new host disk object
+    let new_disk = lnvps_db::VmHostDisk {
+        id: 0, // Will be set by database
+        host_id,
+        name: req.name.clone(),
+        size: req.size,
+        kind: req.kind.into(),
+        interface: req.interface.into(),
+        enabled: req.enabled.unwrap_or(true),
     };
 
-    ApiData::ok(admin_disk)
+    // Create disk in database
+    let disk_id = db.create_host_disk(&new_disk).await?;
+
+    // Return the created disk
+    let created_disk = db.get_host_disk(disk_id).await?;
+    ApiData::ok(created_disk.into())
+}
+
+#[derive(Deserialize)]
+pub struct AdminHostDiskCreateRequest {
+    pub name: String,
+    pub size: u64,
+    pub kind: ApiDiskType,
+    pub interface: ApiDiskInterface,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
 pub struct AdminHostDiskUpdateRequest {
+    pub name: Option<String>,
+    pub size: Option<u64>,
+    pub kind: Option<ApiDiskType>,
+    pub interface: Option<ApiDiskInterface>,
     pub enabled: Option<bool>,
 }

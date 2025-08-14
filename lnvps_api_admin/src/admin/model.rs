@@ -575,6 +575,19 @@ pub struct AdminHostDisk {
     pub enabled: bool,
 }
 
+impl From<lnvps_db::VmHostDisk> for AdminHostDisk {
+    fn from(disk: lnvps_db::VmHostDisk) -> Self {
+        Self {
+            id: disk.id,
+            name: disk.name,
+            size: disk.size,
+            kind: disk.kind.into(),
+            interface: disk.interface.into(),
+            enabled: disk.enabled,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct AdminRegionInfo {
     pub id: u64,
@@ -591,6 +604,7 @@ pub struct AdminRegionInfo {
 #[derive(Deserialize)]
 pub struct CreateRegionRequest {
     pub name: String,
+    pub enabled: bool,
     pub company_id: Option<u64>,
 }
 
@@ -640,14 +654,7 @@ impl AdminHostInfo {
     ) -> Self {
         let admin_disks = disks
             .into_iter()
-            .map(|disk| AdminHostDisk {
-                id: disk.id,
-                name: disk.name,
-                size: disk.size,
-                kind: ApiDiskType::from(disk.kind),
-                interface: ApiDiskInterface::from(disk.interface),
-                enabled: disk.enabled,
-            })
+            .map(|disk| disk.into())
             .collect();
 
         Self {
@@ -688,14 +695,7 @@ impl AdminHostInfo {
     ) -> Self {
         let admin_disks = disks
             .into_iter()
-            .map(|disk| AdminHostDisk {
-                id: disk.id,
-                name: disk.name,
-                size: disk.size,
-                kind: ApiDiskType::from(disk.kind),
-                interface: ApiDiskInterface::from(disk.interface),
-                enabled: disk.enabled,
-            })
+            .map(|disk| disk.into())
             .collect();
 
         Self {

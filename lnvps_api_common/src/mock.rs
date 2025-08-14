@@ -427,11 +427,23 @@ impl LNVpsDbBase for MockDb {
     async fn update_host_disk(&self, disk: &VmHostDisk) -> anyhow::Result<()> {
         let mut disks = self.host_disks.lock().await;
         if let Some(d) = disks.get_mut(&disk.id) {
+            d.name = disk.name.clone();
             d.size = disk.size;
             d.kind = disk.kind;
             d.interface = disk.interface;
+            d.enabled = disk.enabled;
         }
         Ok(())
+    }
+
+    async fn create_host_disk(&self, disk: &VmHostDisk) -> anyhow::Result<u64> {
+        let mut disks = self.host_disks.lock().await;
+        let max_id = disks.keys().max().unwrap_or(&0);
+        let new_id = max_id + 1;
+        let mut new_disk = disk.clone();
+        new_disk.id = new_id;
+        disks.insert(new_id, new_disk);
+        Ok(new_id)
     }
 
     async fn get_os_image(&self, id: u64) -> anyhow::Result<VmOsImage> {
@@ -1106,6 +1118,7 @@ impl AdminDb for MockDb {
     async fn admin_create_region(
         &self,
         _name: &str,
+        _enabled: bool,
         _company_id: Option<u64>,
     ) -> anyhow::Result<u64> {
         Ok(1)

@@ -319,15 +319,31 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_host_disk(&self, disk: &VmHostDisk) -> Result<()> {
-        sqlx::query("update vm_host_disk set size=?,kind=?,interface=? where id=?")
+        sqlx::query("update vm_host_disk set name=?,size=?,kind=?,interface=?,enabled=? where id=?")
+            .bind(&disk.name)
             .bind(disk.size)
             .bind(disk.kind)
             .bind(disk.interface)
+            .bind(disk.enabled)
             .bind(disk.id)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
         Ok(())
+    }
+
+    async fn create_host_disk(&self, disk: &VmHostDisk) -> Result<u64> {
+        let result = sqlx::query("insert into vm_host_disk (host_id,name,size,kind,interface,enabled) values (?,?,?,?,?,?)")
+            .bind(disk.host_id)
+            .bind(&disk.name)
+            .bind(disk.size)
+            .bind(disk.kind)
+            .bind(disk.interface)
+            .bind(disk.enabled)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+        Ok(result.last_insert_id())
     }
 
     async fn get_os_image(&self, id: u64) -> Result<VmOsImage> {
@@ -1474,18 +1490,18 @@ impl AdminDb for LNVpsDbMysql {
         Ok((regions, total as u64))
     }
 
-    async fn admin_create_region(&self, name: &str, company_id: Option<u64>) -> Result<u64> {
-        let id = sqlx::query_scalar::<_, i64>(
+    async fn admin_create_region(&self, name: &str, enabled: bool, company_id: Option<u64>) -> Result<u64> {
+        let id = sqlx::query_scalar::<_, u64>(
             "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
         )
         .bind(name)
-        .bind(true) // New regions are enabled by default
+        .bind(enabled)
         .bind(company_id)
         .fetch_one(&self.db)
         .await
         .map_err(Error::new)?;
 
-        Ok(id as u64)
+        Ok(id)
     }
 
     async fn admin_update_region(&self, region: &VmHostRegion) -> Result<()> {

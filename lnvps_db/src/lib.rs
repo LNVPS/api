@@ -99,6 +99,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update a host disk
     async fn update_host_disk(&self, disk: &VmHostDisk) -> Result<()>;
 
+    /// Create a new host disk
+    async fn create_host_disk(&self, disk: &VmHostDisk) -> Result<u64>;
+
     /// Get OS image by id
     async fn get_os_image(&self, id: u64) -> Result<VmOsImage>;
 

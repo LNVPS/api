@@ -73,7 +73,7 @@ pub trait AdminDb: Send + Sync {
     ) -> Result<(Vec<crate::VmHostRegion>, u64)>;
 
     /// Create a new region
-    async fn admin_create_region(&self, name: &str, company_id: Option<u64>) -> Result<u64>;
+    async fn admin_create_region(&self, name: &str, enabled: bool, company_id: Option<u64>) -> Result<u64>;
 
     /// Update region information
     async fn admin_update_region(&self, region: &crate::VmHostRegion) -> Result<()>;
