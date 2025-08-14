@@ -258,6 +258,7 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
     ApiData::ok(ret)
 }
 
+
 /// List available VM templates (Offers)
 #[openapi(tag = "VM")]
 #[get("/api/v1/vm/templates")]
@@ -325,40 +326,20 @@ async fn v1_list_vm_templates(
         custom_template: if custom_templates.is_empty() {
             None
         } else {
-            const GB: u64 = 1024 * 1024 * 1024;
-            let max_cpu = templates.iter().map(|t| t.cpu).max().unwrap_or(8);
-            let max_memory = templates.iter().map(|t| t.memory).max().unwrap_or(GB * 2);
-            let max_disk = templates
-                .iter()
-                .map(|t| (t.disk_type, t.disk_interface, t.disk_size))
-                .fold(HashMap::new(), |mut acc, v| {
-                    let k = (v.0.into(), v.1.into());
-                    if let Some(x) = acc.get_mut(&k) {
-                        if *x < v.2 {
-                            *x = v.2;
-                        }
-                    } else {
-                        acc.insert(k, v.2);
-                    }
-                    acc
-                });
-            Some(
-                custom_templates
-                    .into_iter()
-                    .filter_map(|t| {
-                        let region = regions.get(&t.region_id)?;
-                        ApiCustomTemplateParams::from(
-                            &t,
-                            &custom_template_disks,
-                            region,
-                            max_cpu,
-                            max_memory,
-                            &max_disk,
-                        )
-                        .ok()
-                    })
-                    .collect(),
-            )
+            let mut api_templates: Vec<ApiCustomTemplateParams> = custom_templates
+                .into_iter()
+                .filter_map(|t| {
+                    let region = regions.get(&t.region_id)?;
+                    ApiCustomTemplateParams::from(
+                        &t,
+                        &custom_template_disks,
+                        region,
+                    )
+                    .ok()
+                })
+                .collect();
+            
+            Some(hc.apply_host_capacity_limits(&mut api_templates).await?)
         },
     };
     rsp.expand_pricing(rates).await?;

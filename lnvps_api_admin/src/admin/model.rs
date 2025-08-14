@@ -949,6 +949,10 @@ pub struct UpdateCustomPricingRequest {
     pub memory_cost: Option<f32>,
     pub ip4_cost: Option<f32>,
     pub ip6_cost: Option<f32>,
+    pub min_cpu: Option<u16>,
+    pub max_cpu: Option<u16>,
+    pub min_memory: Option<u64>,
+    pub max_memory: Option<u64>,
     pub disk_pricing: Option<Vec<CreateCustomPricingDisk>>,
 }
 
@@ -963,6 +967,10 @@ pub struct CreateCustomPricingRequest {
     pub memory_cost: f32,
     pub ip4_cost: f32,
     pub ip6_cost: f32,
+    pub min_cpu: u16,
+    pub max_cpu: u16,
+    pub min_memory: u64,
+    pub max_memory: u64,
     pub disk_pricing: Vec<CreateCustomPricingDisk>,
 }
 
@@ -971,6 +979,8 @@ pub struct CreateCustomPricingDisk {
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
     pub cost: f32,
+    pub min_disk_size: u64,
+    pub max_disk_size: u64,
 }
 
 #[derive(Deserialize)]

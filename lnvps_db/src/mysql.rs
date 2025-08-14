@@ -1811,8 +1811,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> Result<u64> {
         let query = r#"
-            INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_cost, memory_cost, ip4_cost, ip6_cost)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#;
 
         let result = sqlx::query(query)
@@ -1826,6 +1826,10 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.memory_cost)
             .bind(pricing.ip4_cost)
             .bind(pricing.ip6_cost)
+            .bind(pricing.min_cpu)
+            .bind(pricing.max_cpu)
+            .bind(pricing.min_memory)
+            .bind(pricing.max_memory)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;
@@ -1837,7 +1841,8 @@ impl AdminDb for LNVpsDbMysql {
         let query = r#"
             UPDATE vm_custom_pricing 
             SET name = ?, enabled = ?, expires = ?, region_id = ?, currency = ?, 
-                cpu_cost = ?, memory_cost = ?, ip4_cost = ?, ip6_cost = ?
+                cpu_cost = ?, memory_cost = ?, ip4_cost = ?, ip6_cost = ?, 
+                min_cpu = ?, max_cpu = ?, min_memory = ?, max_memory = ?
             WHERE id = ?
         "#;
 
@@ -1851,6 +1856,10 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.memory_cost)
             .bind(pricing.ip4_cost)
             .bind(pricing.ip6_cost)
+            .bind(pricing.min_cpu)
+            .bind(pricing.max_cpu)
+            .bind(pricing.min_memory)
+            .bind(pricing.max_memory)
             .bind(pricing.id)
             .execute(&self.db)
             .await
@@ -1880,8 +1889,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> Result<u64> {
         let query = r#"
-            INSERT INTO vm_custom_pricing_disk (pricing_id, kind, interface, cost)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO vm_custom_pricing_disk (pricing_id, kind, interface, cost, min_disk_size, max_disk_size)
+            VALUES (?, ?, ?, ?, ?, ?)
         "#;
 
         let result = sqlx::query(query)
@@ -1889,6 +1898,8 @@ impl AdminDb for LNVpsDbMysql {
             .bind(disk.kind as u16)
             .bind(disk.interface as u16)
             .bind(disk.cost)
+            .bind(disk.min_disk_size)
+            .bind(disk.max_disk_size)
             .execute(&self.db)
             .await
             .map_err(Error::new)?;

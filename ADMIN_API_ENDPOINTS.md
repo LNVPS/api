@@ -678,11 +678,17 @@ Body:
   "memory_cost": number,                // Cost per GB RAM per month
   "ip4_cost": number,                   // Cost per IPv4 address per month
   "ip6_cost": number,                   // Cost per IPv6 address per month
+  "min_cpu": number,                    // Minimum CPU cores allowed
+  "max_cpu": number,                    // Maximum CPU cores allowed
+  "min_memory": number,                 // Minimum memory in bytes
+  "max_memory": number,                 // Maximum memory in bytes
   "disk_pricing": [                     // Array of disk pricing configurations
     {
       "kind": "ssd",                    // DiskType enum: "hdd" or "ssd"
       "interface": "pcie",              // DiskInterface enum: "sata", "scsi", or "pcie"
-      "cost": number                    // Cost per GB per month
+      "cost": number,                   // Cost per GB per month
+      "min_disk_size": number,          // Minimum disk size in bytes for this type/interface
+      "max_disk_size": number           // Maximum disk size in bytes for this type/interface
     }
   ]
 }
@@ -706,11 +712,17 @@ Body (all optional):
   "memory_cost": number,
   "ip4_cost": number,
   "ip6_cost": number,
+  "min_cpu": number,                        // Minimum CPU cores allowed
+  "max_cpu": number,                        // Maximum CPU cores allowed
+  "min_memory": number,                     // Minimum memory in bytes
+  "max_memory": number,                     // Maximum memory in bytes
   "disk_pricing": [
     {
       "kind": "ssd",                        // DiskType enum: "hdd", "ssd"
       "interface": "pcie",                  // DiskInterface enum: "sata", "scsi", "pcie"
-      "cost": number
+      "cost": number,
+      "min_disk_size": number,              // Minimum disk size in bytes for this type/interface
+      "max_disk_size": number               // Maximum disk size in bytes for this type/interface
     }
   ]
 }
@@ -1553,12 +1565,18 @@ The RBAC system uses the following permission format: `resource::action`
   "memory_cost": number,                // Cost per GB RAM per month
   "ip4_cost": number,                   // Cost per IPv4 address per month
   "ip6_cost": number,                   // Cost per IPv6 address per month
+  "min_cpu": number,                    // Minimum CPU cores allowed
+  "max_cpu": number,                    // Maximum CPU cores allowed
+  "min_memory": number,                 // Minimum memory in bytes
+  "max_memory": number,                 // Maximum memory in bytes
   "disk_pricing": [                     // Array of disk pricing configurations
     {
       "id": number,
       "kind": "ssd",                    // DiskType enum: "hdd" or "ssd"
       "interface": "pcie",              // DiskInterface enum: "sata", "scsi", or "pcie"
-      "cost": number                    // Cost per GB per month
+      "cost": number,                   // Cost per GB per month
+      "min_disk_size": number,          // Minimum disk size in bytes for this type/interface
+      "max_disk_size": number           // Maximum disk size in bytes for this type/interface
     }
   ],
   "template_count": number              // Number of custom templates using this pricing
@@ -1790,7 +1808,9 @@ The RBAC system uses the following permission format: `resource::action`
   "id": number,
   "kind": "ssd",                     // DiskType enum: "hdd" or "ssd"
   "interface": "pcie",               // DiskInterface enum: "sata", "scsi", or "pcie"
-  "cost": number
+  "cost": number,
+  "min_disk_size": number,           // Minimum disk size in bytes for this type/interface
+  "max_disk_size": number            // Maximum disk size in bytes for this type/interface
 }
 ```
 

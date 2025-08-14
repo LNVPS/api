@@ -48,62 +48,6 @@ impl ApiTemplatesResponse {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
-pub struct ApiCustomTemplateParams {
-    pub id: u64,
-    pub name: String,
-    pub region: ApiVmHostRegion,
-    pub max_cpu: u16,
-    pub min_cpu: u16,
-    pub min_memory: u64,
-    pub max_memory: u64,
-    pub disks: Vec<ApiCustomTemplateDiskParam>,
-}
-
-impl ApiCustomTemplateParams {
-    pub fn from(
-        pricing: &lnvps_db::VmCustomPricing,
-        disks: &Vec<lnvps_db::VmCustomPricingDisk>,
-        region: &lnvps_db::VmHostRegion,
-        max_cpu: u16,
-        max_memory: u64,
-        max_disk: &HashMap<(ApiDiskType, ApiDiskInterface), u64>,
-    ) -> Result<Self> {
-        use crate::GB;
-        Ok(ApiCustomTemplateParams {
-            id: pricing.id,
-            name: pricing.name.clone(),
-            region: ApiVmHostRegion {
-                id: region.id,
-                name: region.name.clone(),
-            },
-            max_cpu,
-            min_cpu: 1,
-            min_memory: GB,
-            max_memory,
-            disks: disks
-                .iter()
-                .filter(|d| d.pricing_id == pricing.id)
-                .filter_map(|d| {
-                    Some(ApiCustomTemplateDiskParam {
-                        min_disk: GB * 5,
-                        max_disk: *max_disk.get(&(d.kind.into(), d.interface.into()))?,
-                        disk_type: d.kind.into(),
-                        disk_interface: d.interface.into(),
-                    })
-                })
-                .collect(),
-        })
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ApiCustomTemplateDiskParam {
-    pub min_disk: u64,
-    pub max_disk: u64,
-    pub disk_type: ApiDiskType,
-    pub disk_interface: ApiDiskInterface,
-}
 
 // Models that are only used in lnvps_api (moved from common)
 

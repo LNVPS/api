@@ -1,6 +1,5 @@
 use crate::dvm::{build_status_for_job, DVMHandler, DVMJobRequest};
 use crate::provisioner::LNVpsProvisioner;
-use crate::{GB, MB};
 use anyhow::Context;
 use lnvps_db::{
     DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
@@ -83,8 +82,8 @@ impl DVMHandler for LnvpsDvm {
             let template = VmCustomTemplate {
                 id: 0,
                 cpu: cpu.parse()?,
-                memory: MB * memory.parse::<u64>()?,
-                disk_size: GB * disk.parse::<u64>()?,
+                memory: crate::MB * memory.parse::<u64>()?,
+                disk_size: crate::GB * disk.parse::<u64>()?,
                 disk_type: DiskType::from_str(disk_type)?,
                 disk_interface: DiskInterface::from_str(disk_interface)?,
                 pricing_id: pricing.id,
@@ -184,6 +183,10 @@ mod tests {
                     memory_cost: 0.5,
                     ip4_cost: 1.5,
                     ip6_cost: 0.05,
+                    min_cpu: 0,
+                    max_cpu: 0,
+                    min_memory: 0,
+                    max_memory: 0,
                 },
             );
             let mut cpd = db.custom_pricing_disk.lock().await;
@@ -195,6 +198,8 @@ mod tests {
                     kind: DiskType::SSD,
                     interface: DiskInterface::PCIe,
                     cost: 0.05,
+                    min_disk_size: 5 * crate::GB,
+                    max_disk_size: 1 * crate::TB,
                 },
             );
         }

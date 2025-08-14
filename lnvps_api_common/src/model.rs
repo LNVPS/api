@@ -366,7 +366,7 @@ pub struct ApiVmCostPlan {
     pub interval_type: ApiVmCostPlanIntervalType,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
 pub struct ApiVmHostRegion {
     pub id: u64,
     pub name: String,
@@ -486,4 +486,57 @@ impl UpgradeConfig {
             new_disk,
         }
     }
+}
+
+#[derive(Serialize, JsonSchema, Clone)]
+pub struct ApiCustomTemplateParams {
+    pub id: u64,
+    pub name: String,
+    pub region: ApiVmHostRegion,
+    pub max_cpu: u16,
+    pub min_cpu: u16,
+    pub min_memory: u64,
+    pub max_memory: u64,
+    pub disks: Vec<ApiCustomTemplateDiskParam>,
+}
+
+impl ApiCustomTemplateParams {
+    pub fn from(
+        pricing: &lnvps_db::VmCustomPricing,
+        disks: &Vec<lnvps_db::VmCustomPricingDisk>,
+        region: &lnvps_db::VmHostRegion,
+    ) -> Result<Self> {
+        Ok(ApiCustomTemplateParams {
+            id: pricing.id,
+            name: pricing.name.clone(),
+            region: ApiVmHostRegion {
+                id: region.id,
+                name: region.name.clone(),
+            },
+            max_cpu: pricing.max_cpu,
+            min_cpu: pricing.min_cpu,
+            min_memory: pricing.min_memory,
+            max_memory: pricing.max_memory,
+            disks: disks
+                .iter()
+                .filter(|d| d.pricing_id == pricing.id)
+                .map(|d| {
+                    ApiCustomTemplateDiskParam {
+                        min_disk: d.min_disk_size,
+                        max_disk: d.max_disk_size,
+                        disk_type: d.kind.into(),
+                        disk_interface: d.interface.into(),
+                    }
+                })
+                .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ApiCustomTemplateDiskParam {
+    pub min_disk: u64,
+    pub max_disk: u64,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
 }

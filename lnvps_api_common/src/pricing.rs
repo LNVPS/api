@@ -240,10 +240,7 @@ impl PricingEngine {
         }
         let ticker = Ticker(base_currency, target_currency);
         if let Some(r) = self.rates.get_rate(ticker).await {
-            Ok(TickerRate {
-                ticker,
-                rate: r,
-            })
+            Ok(TickerRate { ticker, rate: r })
         } else {
             bail!(
                 "No exchange rate found for {}/{}",
@@ -549,7 +546,6 @@ mod tests {
     use lnvps_db::{
         DiskType, LNVpsDbBase, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     };
-    
 
     const MOCK_RATE: f32 = 100_000.0;
     const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0; // 30 days * 24 hours * 3600 seconds
@@ -570,6 +566,10 @@ mod tests {
                 memory_cost: 0.5,
                 ip4_cost: 0.5,
                 ip6_cost: 0.05,
+                min_cpu: 1,
+                max_cpu: 16,
+                min_memory: 1 * crate::GB,
+                max_memory: 64 * crate::GB,
             },
         );
         let mut p = db.custom_template.lock().await;
@@ -594,6 +594,8 @@ mod tests {
                 kind: DiskType::SSD,
                 interface: Default::default(),
                 cost: 0.05,
+                min_disk_size: 5 * crate::GB,
+                max_disk_size: 1 * crate::TB,
             },
         );
     }
@@ -778,6 +780,10 @@ mod tests {
                     memory_cost: 1.0, // 1 EUR per GB per month
                     ip4_cost: 0.0,
                     ip6_cost: 0.0,
+                    min_cpu: 1,
+                    max_cpu: 16,
+                    min_memory: 1 * crate::GB,
+                    max_memory: 64 * crate::GB,
                 },
             );
         }
@@ -793,6 +799,8 @@ mod tests {
                     kind: DiskType::SSD,
                     interface: DiskInterface::PCIe,
                     cost: 0.5, // 0.5 EUR per GB per month
+                    min_disk_size: 5 * crate::GB,
+                    max_disk_size: 1 * crate::TB,
                 },
             );
         }

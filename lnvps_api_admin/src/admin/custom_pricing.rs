@@ -156,6 +156,10 @@ pub async fn admin_create_custom_pricing(
         memory_cost: req.memory_cost,
         ip4_cost: req.ip4_cost,
         ip6_cost: req.ip6_cost,
+        min_cpu: req.min_cpu,
+        max_cpu: req.max_cpu,
+        min_memory: req.min_memory,
+        max_memory: req.max_memory,
     };
 
     let pricing_id = db.insert_custom_pricing(&pricing).await?;
@@ -171,6 +175,8 @@ pub async fn admin_create_custom_pricing(
             kind: disk_type.into(),
             interface: disk_interface.into(),
             cost: disk_config.cost,
+            min_disk_size: disk_config.min_disk_size,
+            max_disk_size: disk_config.max_disk_size,
         };
 
         db.insert_custom_pricing_disk(&disk_pricing).await?;
@@ -227,6 +233,18 @@ pub async fn admin_update_custom_pricing(
     if let Some(ip6_cost) = req.ip6_cost {
         pricing.ip6_cost = ip6_cost;
     }
+    if let Some(min_cpu) = req.min_cpu {
+        pricing.min_cpu = min_cpu;
+    }
+    if let Some(max_cpu) = req.max_cpu {
+        pricing.max_cpu = max_cpu;
+    }
+    if let Some(min_memory) = req.min_memory {
+        pricing.min_memory = min_memory;
+    }
+    if let Some(max_memory) = req.max_memory {
+        pricing.max_memory = max_memory;
+    }
 
     db.update_custom_pricing(&pricing).await?;
 
@@ -246,6 +264,8 @@ pub async fn admin_update_custom_pricing(
                 kind: disk_type.into(),
                 interface: disk_interface.into(),
                 cost: disk_config.cost,
+                min_disk_size: disk_config.min_disk_size,
+                max_disk_size: disk_config.max_disk_size,
             };
 
             db.insert_custom_pricing_disk(&disk_pricing).await?;
@@ -329,6 +349,10 @@ pub async fn admin_copy_custom_pricing(
         memory_cost: source_pricing.memory_cost,
         ip4_cost: source_pricing.ip4_cost,
         ip6_cost: source_pricing.ip6_cost,
+        min_cpu: source_pricing.min_cpu,
+        max_cpu: source_pricing.max_cpu,
+        min_memory: source_pricing.min_memory,
+        max_memory: source_pricing.max_memory,
     };
 
     let new_pricing_id = db.insert_custom_pricing(&new_pricing).await?;
@@ -341,6 +365,8 @@ pub async fn admin_copy_custom_pricing(
             kind: disk_config.kind,
             interface: disk_config.interface,
             cost: disk_config.cost,
+            min_disk_size: disk_config.min_disk_size,
+            max_disk_size: disk_config.max_disk_size,
         };
 
         db.insert_custom_pricing_disk(&new_disk_pricing).await?;

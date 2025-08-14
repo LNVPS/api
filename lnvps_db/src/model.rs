@@ -129,7 +129,7 @@ pub struct VmHostDisk {
     pub enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum DiskType {
     #[default]
@@ -158,7 +158,7 @@ impl Display for DiskType {
     }
 }
 
-#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum DiskInterface {
     #[default]
@@ -405,6 +405,14 @@ pub struct VmCustomPricing {
     pub ip4_cost: f32,
     /// Cost per IPv6 address
     pub ip6_cost: f32,
+    /// Minimum CPU cores allowed
+    pub min_cpu: u16,
+    /// Maximum CPU cores allowed
+    pub max_cpu: u16,
+    /// Minimum memory in bytes
+    pub min_memory: u64,
+    /// Maximum memory in bytes
+    pub max_memory: u64,
 }
 
 /// Pricing per GB on a disk type (SSD/HDD)
@@ -416,6 +424,10 @@ pub struct VmCustomPricingDisk {
     pub interface: DiskInterface,
     /// Cost as per the currency of the [VmCustomPricing::currency]
     pub cost: f32,
+    /// Minimum disk size in bytes for this disk type/interface
+    pub min_disk_size: u64,
+    /// Maximum disk size in bytes for this disk type/interface
+    pub max_disk_size: u64,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

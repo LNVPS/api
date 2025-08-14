@@ -7,7 +7,7 @@ use lnvps_db::{
     VmIpAssignment, VmTemplate,
 };
 use rocket::futures::future::join_all;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Simple capacity management
@@ -72,6 +72,83 @@ impl HostCapacityService {
         } else {
             bail!("No available hosts found");
         }
+    }
+
+    /// Calculate and apply host capacity limits to custom pricing templates
+    /// Processes all regions efficiently and modifies the vector in place
+    pub async fn apply_host_capacity_limits(
+        &self,
+        templates: &Vec<crate::ApiCustomTemplateParams>,
+    ) -> Result<Vec<crate::ApiCustomTemplateParams>> {
+        if templates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // make a copy for modification
+        let mut templates = templates.clone();
+
+        // Get distinct region IDs from the templates
+        let region_ids: HashSet<u64> = templates.iter().map(|t| t.region.id).collect();
+
+        let hosts = self.db.list_hosts().await?;
+        let caps: Vec<Result<HostCapacity>> = join_all(
+            hosts
+                .iter()
+                .filter(|h| region_ids.contains(&h.region_id))
+                .map(|h| self.get_host_capacity(h, None, None)),
+        )
+        .await;
+        let caps: Vec<HostCapacity> = caps.into_iter().filter_map(|v| v.ok()).collect();
+
+        // Now apply the calculated limits to each template in place
+        for template in &mut templates {
+            let hosts_in_region = caps
+                .iter()
+                .filter(|c| c.host.region_id == template.region.id);
+            let max_cpu = hosts_in_region
+                .clone()
+                .map(|h| h.available_cpu())
+                .max()
+                .unwrap_or(0);
+            let max_memory = hosts_in_region
+                .clone()
+                .map(|h| h.available_memory())
+                .max()
+                .unwrap_or(0);
+
+            // Limit the template maximums to what's actually available
+            template.max_cpu = template.max_cpu.min(max_cpu);
+            template.max_memory = template.max_memory.min(max_memory);
+
+            // Limit disk maximums based on actual host capacity
+            for disk in &mut template.disks {
+                let disks_in_region = hosts_in_region.clone().flat_map(|d| {
+                    d.disks.iter().filter(|c| {
+                        c.disk.kind == disk.disk_type.into()
+                            && c.disk.interface == disk.disk_interface.into()
+                    })
+                });
+                let max_disk_size = disks_in_region
+                    .map(|d| d.available_capacity())
+                    .max()
+                    .unwrap_or(0);
+                disk.max_disk = disk.max_disk.min(max_disk_size);
+            }
+
+            // remove disks with 0 max
+            template.disks = template
+                .disks
+                .iter()
+                .filter(|d| d.max_disk > 0)
+                .cloned()
+                .collect();
+        }
+
+        // remove templates with 0 max cpu/ram/disk
+        Ok(templates
+            .into_iter()
+            .filter(|t| t.max_cpu > 0 && t.max_memory > 0 && t.disks.len() > 0)
+            .collect())
     }
 
     /// Get available capacity of a given host
