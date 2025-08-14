@@ -23,7 +23,6 @@ impl LNVpsDbMysql {
         Ok(Self { db })
     }
 
-    #[cfg(debug_assertions)]
     pub async fn execute(&self, sql: &str) -> Result<()> {
         self.db.execute(sql).await.map_err(Error::new)?;
         Ok(())
