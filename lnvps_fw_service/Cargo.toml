@@ -1,0 +1,15 @@
+[package]
+name = "lnvps_fw_service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["time", "signal", "fs"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+aya = "0.13.1"
+aya-log = "0.2.1"
+
+[build-dependencies]
+aya-build = "0.1.2"

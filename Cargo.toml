@@ -7,8 +7,13 @@ members = [
     "lnvps_api_common",
     "lnvps_nostr",
     "lnvps_common",
-    "lnvps_operator"
+    "lnvps_operator",
+    "lnvps_ebpf",
+    "lnvps_fw_service"
 ]
+
+[workspace.package]
+edition = "2024"
 
 [workspace.dependencies]
 tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread", "macros"] }
@@ -22,3 +27,8 @@ config = { version = "0.15.8", features = ["yaml"] }
 hex = "0.4.3"
 ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "35977adc8103cfc232bc95fbc32f4e34f2b6a6d7" }
 async-trait = "0.1.83"
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

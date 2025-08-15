@@ -37,14 +37,14 @@ impl TokenGen for RevolutTokenGen {
 
 impl RevolutApi {
     pub fn new(config: RevolutConfig) -> Result<Self> {
-        let gen = RevolutTokenGen {
+        let token_gen = RevolutTokenGen {
             token: config.token,
             api_version: config.api_version,
         };
         const DEFAULT_URL: &str = "https://merchant.revolut.com";
 
         Ok(Self {
-            api: JsonApi::token_gen(&config.url.unwrap_or(DEFAULT_URL.to_string()), false, gen)?,
+            api: JsonApi::token_gen(&config.url.unwrap_or(DEFAULT_URL.to_string()), false, token_gen)?,
         })
     }
 

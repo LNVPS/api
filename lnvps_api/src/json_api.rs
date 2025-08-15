@@ -112,16 +112,16 @@ impl JsonApi {
         let mut req = self.client.request(method.clone(), url.clone());
         let req = if let Some(body) = body {
             let body = serde_json::to_string(&body)?;
-            if let Some(gen) = self.token_gen.as_ref() {
-                req = gen.generate_token(method.clone(), &url, Some(&body), req)?;
+            if let Some(token_gen) = self.token_gen.as_ref() {
+                req = token_gen.generate_token(method.clone(), &url, Some(&body), req)?;
             }
             debug!(">> {} {}: {}", method.clone(), path, &body);
             req.header(CONTENT_TYPE, "application/json; charset=utf-8")
                 .body(body)
                 .build()?
         } else {
-            if let Some(gen) = self.token_gen.as_ref() {
-                req = gen.generate_token(method.clone(), &url, None, req)?;
+            if let Some(token_gen) = self.token_gen.as_ref() {
+                req = token_gen.generate_token(method.clone(), &url, None, req)?;
             }
             req.build()?
         };

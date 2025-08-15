@@ -1,0 +1,12 @@
+[package]
+name = "lnvps_ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+aya-ebpf = { version = "0.1.1" }
+aya-log-ebpf = { version = "0.1.1" }
+network-types = "0.0.8"
+
+[build-dependencies]
+which = { version = "8.0.0", default-features = false, features = ["real-sys"] }
