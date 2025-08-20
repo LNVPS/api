@@ -1,12 +1,12 @@
-use crate::host::{get_host_client, FullVmInfo};
+use crate::host::{FullVmInfo, get_host_client};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Datelike, Days, Utc};
 use hickory_resolver::TokioResolver;
+use lettre::AsyncTransport;
 use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
     RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache,
@@ -20,7 +20,7 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Primary background worker logic
 /// Handles deleting expired VMs and sending notifications
@@ -150,7 +150,10 @@ impl Worker {
                 if let Some(ref nwc_connection) = user.nwc_connection_string {
                     let nwc_string: String = nwc_connection.clone().into();
                     if !nwc_string.is_empty() {
-                        info!("Attempting automatic renewal for VM {} via NWC (user has NWC configured and VM auto-renewal is enabled)", vm.id);
+                        info!(
+                            "Attempting automatic renewal for VM {} via NWC (user has NWC configured and VM auto-renewal is enabled)",
+                            vm.id
+                        );
                         renewal_attempted = true;
 
                         match self
@@ -173,7 +176,10 @@ impl Worker {
                             }
                         }
                     } else {
-                        info!("VM {} has auto-renewal enabled but user has no NWC connection configured", vm.id);
+                        info!(
+                            "VM {} has auto-renewal enabled but user has no NWC connection configured",
+                            vm.id
+                        );
                     }
                 } else {
                     info!(
@@ -187,9 +193,15 @@ impl Worker {
             if !renewal_attempted || !renewal_successful {
                 info!("Sending expire soon notification VM {}", vm.id);
                 let message = if renewal_attempted {
-                    format!("Your VM #{} will expire soon.\nAutomatic renewal failed, please manually renew in the next {} days or your VM will be stopped.\nError: '{}'", vm.id, BEFORE_EXPIRE_NOTIFICATION, nwc_error)
+                    format!(
+                        "Your VM #{} will expire soon.\nAutomatic renewal failed, please manually renew in the next {} days or your VM will be stopped.\nError: '{}'",
+                        vm.id, BEFORE_EXPIRE_NOTIFICATION, nwc_error
+                    )
                 } else {
-                    format!("Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.", vm.id, BEFORE_EXPIRE_NOTIFICATION)
+                    format!(
+                        "Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.",
+                        vm.id, BEFORE_EXPIRE_NOTIFICATION
+                    )
                 };
 
                 self.tx.send(WorkJob::SendNotification {
@@ -795,7 +807,10 @@ impl Worker {
                                         )),
                                         message: notification_message,
                                     }) {
-                                        error!("Failed to queue user notification for deleted domain {}: {}", domain.name, e);
+                                        error!(
+                                            "Failed to queue user notification for deleted domain {}: {}",
+                                            domain.name, e
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -882,7 +897,9 @@ impl Worker {
                 Some("Nostr Domains Status Update".to_string()),
             )?;
         } else {
-            info!("No nostr domain changes required - all domains have correct DNS configuration and no old disabled domains to delete");
+            info!(
+                "No nostr domain changes required - all domains have correct DNS configuration and no old disabled domains to delete"
+            );
         }
 
         Ok(())
@@ -1148,6 +1165,25 @@ impl Worker {
                     )?
                 }
             }
+            WorkJob::ConfigureVm {
+                vm_id,
+                admin_user_id,
+            } => {
+                info!("Processing admin configure request for VM {}", vm_id);
+                if let Err(e) = self.configure_vm(*vm_id, *admin_user_id).await {
+                    error!("Failed to configure VM {}: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to configure VM {}:\n{}", vm_id, e),
+                        Some(format!("VM {} Configuration Failed", vm_id)),
+                    )?;
+                } else {
+                    info!("Successfully configured VM {} at admin request", vm_id);
+                    self.queue_admin_notification(
+                        format!("VM {} has been successfully re-configured using current database settings", vm_id),
+                        Some(format!("VM {} Configuration Complete", vm_id)),
+                    )?;
+                }
+            }
             WorkJob::CheckNostrDomains => {
                 info!("Processing check nostr domains job");
                 if let Err(e) = self.check_nostr_domains().await {
@@ -1323,6 +1359,30 @@ impl Worker {
         })?;
 
         info!("Successfully completed upgrade for VM {}", vm_id);
+        Ok(())
+    }
+
+    async fn configure_vm(&self, vm_id: u64, _admin_user_id: Option<u64>) -> Result<()> {
+        info!(
+            "Re-configuring VM {} using current database configuration",
+            vm_id
+        );
+
+        let vm = self.db.get_vm(vm_id).await?;
+        if vm.deleted {
+            bail!("Cannot configure deleted VM {}", vm_id);
+        }
+
+        let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        let host = self.db.get_host(full_info.host.id).await?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+
+        client.configure_vm(&full_info).await?;
+
+        info!(
+            "Successfully re-configured VM {} using current database settings",
+            vm_id
+        );
         Ok(())
     }
 

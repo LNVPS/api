@@ -1646,6 +1646,39 @@ impl AdminDb for MockDb {
             .cloned()
             .ok_or_else(|| anyhow!("User not found with provided pubkey"))
     }
+
+    async fn admin_list_vm_ip_assignments(
+        &self,
+        _limit: u64,
+        _offset: u64,
+        _vm_id: Option<u64>,
+        _ip_range_id: Option<u64>,
+        _ip: Option<&str>,
+        _include_deleted: Option<bool>,
+    ) -> anyhow::Result<(Vec<lnvps_db::VmIpAssignment>, u64)> {
+        // Mock implementation
+        Ok((vec![], 0))
+    }
+
+    async fn admin_get_vm_ip_assignment(&self, _assignment_id: u64) -> anyhow::Result<lnvps_db::VmIpAssignment> {
+        // Mock implementation
+        Ok(lnvps_db::VmIpAssignment::default())
+    }
+
+    async fn admin_create_vm_ip_assignment(&self, _assignment: &lnvps_db::VmIpAssignment) -> anyhow::Result<u64> {
+        // Mock implementation
+        Ok(1)
+    }
+
+    async fn admin_update_vm_ip_assignment(&self, _assignment: &lnvps_db::VmIpAssignment) -> anyhow::Result<()> {
+        // Mock implementation
+        Ok(())
+    }
+
+    async fn admin_delete_vm_ip_assignment(&self, _assignment_id: u64) -> anyhow::Result<()> {
+        // Mock implementation
+        Ok(())
+    }
 }
 
 // Nostr trait implementation with stub methods
@@ -1715,7 +1748,7 @@ impl LNVPSNostrDb for MockDb {
         Ok(())
     }
 
-    async fn disable_domain(&self, domain_id: u64) -> anyhow::Result<()> {
-        todo!()
+    async fn disable_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
+        Ok(())
     }
 }

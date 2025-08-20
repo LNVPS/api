@@ -69,24 +69,31 @@ pub async fn admin_list_vms(
         )
         .await?;
 
+    // Load all hosts and regions upfront to avoid N+1 queries
+    let hosts = db.list_hosts().await?;
+    let mut host_map = std::collections::HashMap::new();
+    for host in hosts {
+        host_map.insert(host.id, host);
+    }
+
+    let regions = db.list_host_region().await?;
+    let mut region_map = std::collections::HashMap::new();
+    for region in regions {
+        region_map.insert(region.id, region);
+    }
+
     let mut admin_vms = Vec::new();
     for vm in vms {
         // Get user info for this VM
         let user = db.get_user(vm.user_id).await?;
 
-        // Get host info
-        let host = db.get_host(vm.host_id).await.ok();
-        let host_name = host.as_ref().map(|h| h.name.clone());
+        // Get host info from pre-loaded map
+        let host = host_map.get(&vm.host_id)
+            .ok_or_else(|| anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id))?;
 
-        // Get region info if host is available
-        let region_name = if let Some(host) = &host {
-            db.get_host_region(host.region_id)
-                .await
-                .ok()
-                .map(|r| r.name)
-        } else {
-            None
-        };
+        // Get region info from pre-loaded map
+        let region = region_map.get(&host.region_id)
+            .ok_or_else(|| anyhow::anyhow!("Host {} references non-existent region {}", host.id, host.region_id))?;
 
         // Get VM running state from cache
         let vm_running_state = get_vm_state(vm_state_cache, vm.id).await;
@@ -100,8 +107,9 @@ pub async fn admin_list_vms(
             vm.user_id,
             hex::encode(&user.pubkey),
             user.email.map(|e| e.into()),
-            host_name,
-            region_name,
+            host.name.clone(),
+            region.id,
+            region.name.clone(),
             vm.deleted,
             vm.ref_code.clone(),
         )
@@ -127,19 +135,31 @@ pub async fn admin_get_vm(
     let vm = db.get_vm(id).await?;
     let user = db.get_user(vm.user_id).await?;
 
-    // Get host info
-    let host = db.get_host(vm.host_id).await.ok();
-    let host_name = host.as_ref().map(|h| h.name.clone());
+    // Load all hosts and regions upfront for consistency
+    let hosts = db.list_hosts().await?;
+    let mut host_map = std::collections::HashMap::new();
+    for host in hosts {
+        host_map.insert(host.id, host);
+    }
 
-    // Get region info if host is available
-    let region_name = if let Some(host) = &host {
-        db.get_host_region(host.region_id)
-            .await
-            .ok()
-            .map(|r| r.name)
-    } else {
-        None
-    };
+    let regions = db.list_host_region().await?;
+    let mut region_map = std::collections::HashMap::new();
+    for region in regions {
+        region_map.insert(region.id, region);
+    }
+
+    // Get host info from pre-loaded map
+    let host = host_map.get(&vm.host_id)
+        .ok_or_else(|| anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id))?;
+    
+    let host_name = host.name.clone();
+
+    // Get region info from pre-loaded map
+    let region = region_map.get(&host.region_id)
+        .ok_or_else(|| anyhow::anyhow!("Host {} references non-existent region {}", host.id, host.region_id))?;
+    
+    let region_id = region.id;
+    let region_name = region.name.clone();
 
     // Get VM running state from cache
     let vm_running_state = get_vm_state(vm_state_cache, vm.id).await;
@@ -154,6 +174,7 @@ pub async fn admin_get_vm(
         hex::encode(&user.pubkey),
         user.email.map(|e| e.into()),
         host_name,
+        region_id,
         region_name,
         vm.deleted,
         vm.ref_code.clone(),
@@ -498,3 +519,4 @@ pub async fn admin_get_vm_payment(
 
     ApiData::ok(admin_payment_info)
 }
+

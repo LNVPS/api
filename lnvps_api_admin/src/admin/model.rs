@@ -11,6 +11,7 @@ use lnvps_db::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 // Admin API Enums - Using enums from common crate where available, creating new ones only where needed
 
@@ -360,8 +361,9 @@ pub struct AdminVmInfo {
     pub user_id: u64,
     pub user_pubkey: String, // hex encoded
     pub user_email: Option<String>,
-    pub host_name: Option<String>,
-    pub region_name: Option<String>,
+    pub host_name: String,
+    pub region_id: u64,
+    pub region_name: String,
     pub deleted: bool,
     pub ref_code: Option<String>,
 }
@@ -375,8 +377,9 @@ impl AdminVmInfo {
         user_id: u64,
         user_pubkey: String,
         user_email: Option<String>,
-        host_name: Option<String>,
-        region_name: Option<String>,
+        host_name: String,
+        region_id: u64,
+        region_name: String,
         deleted: bool,
         ref_code: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -471,6 +474,7 @@ impl AdminVmInfo {
             user_pubkey,
             user_email,
             host_name,
+            region_id,
             region_name,
             deleted,
             ref_code,
@@ -652,10 +656,7 @@ impl AdminHostInfo {
         region: lnvps_db::VmHostRegion,
         disks: Vec<lnvps_db::VmHostDisk>,
     ) -> Self {
-        let admin_disks = disks
-            .into_iter()
-            .map(|disk| disk.into())
-            .collect();
+        let admin_disks = disks.into_iter().map(|disk| disk.into()).collect();
 
         Self {
             id: host.id,
@@ -693,10 +694,7 @@ impl AdminHostInfo {
         disks: Vec<lnvps_db::VmHostDisk>,
         active_vms: u64,
     ) -> Self {
-        let admin_disks = disks
-            .into_iter()
-            .map(|disk| disk.into())
-            .collect();
+        let admin_disks = disks.into_iter().map(|disk| disk.into()).collect();
 
         Self {
             id: capacity.host.id,
@@ -730,7 +728,8 @@ impl AdminHostInfo {
 
     /// Convert from unified AdminVmHost struct with basic load calculation
     pub fn from_admin_vm_host(admin_host: lnvps_db::AdminVmHost) -> Self {
-        let admin_disks = admin_host.disks
+        let admin_disks = admin_host
+            .disks
             .into_iter()
             .map(|disk| disk.into())
             .collect();
@@ -777,7 +776,8 @@ impl AdminHostInfo {
         {
             Ok(capacity) => {
                 // Convert disks
-                let admin_disks = admin_host.disks
+                let admin_disks = admin_host
+                    .disks
                     .into_iter()
                     .map(|disk| disk.into())
                     .collect();
@@ -1031,7 +1031,7 @@ pub struct AdminCustomPricingDisk {
     pub interface: ApiDiskInterface,
     pub cost: f32,
     pub max_disk_size: u64,
-    pub min_disk_size: u64
+    pub min_disk_size: u64,
 }
 
 #[derive(Deserialize)]
@@ -1612,4 +1612,83 @@ impl AdminVmPaymentInfo {
             rate: payment.rate,
         }
     }
+}
+
+// VM IP Assignment Management Models
+#[derive(Serialize)]
+pub struct AdminVmIpAssignmentInfo {
+    pub id: u64,
+    pub vm_id: u64,
+    pub ip_range_id: u64,
+    pub region_id: u64,
+    pub user_id: u64,
+    pub ip: String,
+    pub deleted: bool,
+    pub arp_ref: Option<String>,
+    pub dns_forward: Option<String>,
+    pub dns_forward_ref: Option<String>,
+    pub dns_reverse: Option<String>,
+    pub dns_reverse_ref: Option<String>,
+    pub ip_range_cidr: Option<String>,
+    pub region_name: Option<String>,
+}
+
+impl AdminVmIpAssignmentInfo {
+    pub async fn from_ip_assignment_with_admin_data(
+        db: &Arc<dyn lnvps_db::LNVpsDb>,
+        assignment: &lnvps_db::VmIpAssignment,
+    ) -> anyhow::Result<Self> {
+        let mut admin_assignment = Self {
+            id: assignment.id,
+            vm_id: assignment.vm_id,
+            ip_range_id: assignment.ip_range_id,
+            region_id: 0, // Will be set when IP range is fetched
+            ip: assignment.ip.clone(),
+            deleted: assignment.deleted,
+            arp_ref: assignment.arp_ref.clone(),
+            dns_forward: assignment.dns_forward.clone(),
+            dns_forward_ref: assignment.dns_forward_ref.clone(),
+            dns_reverse: assignment.dns_reverse.clone(),
+            dns_reverse_ref: assignment.dns_reverse_ref.clone(),
+            user_id: 0,
+            ip_range_cidr: None,
+            region_name: None,
+        };
+
+        // Get VM details
+        if let Ok(vm) = db.get_vm(assignment.vm_id).await {
+            admin_assignment.user_id = vm.user_id;
+        }
+
+        // Get IP range details
+        if let Ok(ip_range) = db.admin_get_ip_range(assignment.ip_range_id).await {
+            admin_assignment.ip_range_cidr = Some(ip_range.cidr);
+            admin_assignment.region_id = ip_range.region_id;
+
+            // Get region name
+            if let Ok(region) = db.get_host_region(ip_range.region_id).await {
+                admin_assignment.region_name = Some(region.name);
+            }
+        }
+
+        Ok(admin_assignment)
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateVmIpAssignmentRequest {
+    pub vm_id: u64,
+    pub ip_range_id: u64,
+    pub ip: Option<String>,
+    pub arp_ref: Option<String>,
+    pub dns_forward: Option<String>,
+    pub dns_reverse: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateVmIpAssignmentRequest {
+    pub ip: Option<String>,
+    pub arp_ref: Option<Option<String>>,
+    pub dns_forward: Option<Option<String>>,
+    pub dns_reverse: Option<Option<String>>,
 }

@@ -42,6 +42,11 @@ pub enum WorkJob {
     CheckNostrDomains,
     /// Process VM upgrade after payment confirmation
     ProcessVmUpgrade { vm_id: u64, config: UpgradeConfig },
+    /// Re-configure a VM using current database configuration
+    ConfigureVm {
+        vm_id: u64,
+        admin_user_id: Option<u64>,
+    },
 }
 
 pub struct WorkCommander {

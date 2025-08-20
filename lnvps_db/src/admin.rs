@@ -323,4 +323,28 @@ pub trait AdminDb: Send + Sync {
 
     /// Get user by pubkey (hex string)
     async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> Result<crate::User>;
+
+    // VM IP Assignment management methods
+    /// List all VM IP assignments with pagination and filtering
+    async fn admin_list_vm_ip_assignments(
+        &self,
+        limit: u64,
+        offset: u64,
+        vm_id: Option<u64>,
+        ip_range_id: Option<u64>,
+        ip: Option<&str>,
+        include_deleted: Option<bool>,
+    ) -> Result<(Vec<crate::VmIpAssignment>, u64)>;
+
+    /// Get VM IP assignment by ID
+    async fn admin_get_vm_ip_assignment(&self, assignment_id: u64) -> Result<crate::VmIpAssignment>;
+
+    /// Create a new VM IP assignment
+    async fn admin_create_vm_ip_assignment(&self, assignment: &crate::VmIpAssignment) -> Result<u64>;
+
+    /// Update VM IP assignment
+    async fn admin_update_vm_ip_assignment(&self, assignment: &crate::VmIpAssignment) -> Result<()>;
+
+    /// Delete VM IP assignment (soft delete)
+    async fn admin_delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()>;
 }

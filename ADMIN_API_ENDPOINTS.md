@@ -83,11 +83,15 @@ Query Parameters:
 
 Required Permission: `virtual_machines::view`
 
+Returns paginated list of VMs with complete host and region information. All VMs are guaranteed to have valid host and region associations - missing references will result in an error.
+
 #### Get VM Details
 ```
 GET /api/admin/v1/vms/{id}
 ```
 Required Permission: `virtual_machines::view`
+
+Returns detailed VM information with complete host and region data. The VM must have valid host and region associations.
 
 #### Start VM
 ```
@@ -1140,6 +1144,87 @@ Required Permission: `router::delete`
 
 Note: Routers that are used by access policies cannot be deleted. You must first remove the router from all access policies before deleting it.
 
+### VM IP Assignment Management
+
+VM IP assignments bind specific IP addresses from IP ranges to virtual machines. These endpoints provide comprehensive management of these assignments.
+
+#### List VM IP Assignments
+```
+GET /api/admin/v1/vm_ip_assignments
+```
+Query Parameters:
+- `limit`: number (optional) - Items per page (max 100, default 50)
+- `offset`: number (optional) - Pagination offset
+- `vm_id`: number (optional) - Filter by VM ID
+- `ip_range_id`: number (optional) - Filter by IP range ID
+- `ip`: string (optional) - Filter by specific IP address
+- `include_deleted`: boolean (optional) - Include soft-deleted assignments (default false)
+
+Required Permission: `ip_range::view`
+
+Returns paginated list of VM IP assignments with enriched data including user IDs, IP range CIDRs, region names, and all relevant IDs (vm_id, ip_range_id, region_id, user_id) for easy cross-referencing.
+
+**Automatic IP Assignment:** When creating IP assignments without specifying an IP address, the system uses the IP range's allocation mode:
+- **Sequential**: Assigns IPs in order, starting from the beginning of the range
+- **Random**: Randomly selects available IPs from the range  
+- **SLAAC EUI-64**: Uses IPv6 Stateless Address Autoconfiguration with EUI-64 (IPv6 only)
+
+#### Get VM IP Assignment Details
+```
+GET /api/admin/v1/vm_ip_assignments/{id}
+```
+Required Permission: `ip_range::view`
+
+Returns detailed information about a specific VM IP assignment including IP range and region details, with all relevant IDs for easy cross-referencing.
+
+#### Create VM IP Assignment
+```
+POST /api/admin/v1/vm_ip_assignments
+```
+Required Permission: `virtual_machines::update`
+
+Body:
+```json
+{
+  "vm_id": number,                       // Required - VM ID to assign IP to
+  "ip_range_id": number,                 // Required - IP range ID to assign from
+  "ip": "string | null",                // Optional - Specific IP to assign (if null, auto-assigns from range)
+  "arp_ref": "string | null",           // Optional - External ARP reference ID
+  "dns_forward": "string | null",       // Optional - Forward DNS FQDN
+  "dns_reverse": "string | null"        // Optional - Reverse DNS FQDN
+}
+```
+
+Note: If `ip` is not provided, the system will automatically assign an available IP from the specified range using the range's allocation mode (sequential, random, or SLAAC EUI-64). If `ip` is provided, it must be within the specified IP range's CIDR and not already assigned to another VM.
+
+**Automatic VM Configuration:** After successful IP assignment, a ConfigureVm work job is automatically queued to update the VM's network configuration.
+
+#### Update VM IP Assignment
+```
+PATCH /api/admin/v1/vm_ip_assignments/{id}
+```
+Required Permission: `virtual_machines::update`
+
+Body (all optional):
+```json
+{
+  "ip": "string",                        // New IP address (must be within the IP range)
+  "arp_ref": "string | null",           // ARP reference ID (null to clear)
+  "dns_forward": "string | null",       // Forward DNS FQDN (null to clear)
+  "dns_reverse": "string | null"        // Reverse DNS FQDN (null to clear)
+}
+```
+
+#### Delete VM IP Assignment
+```
+DELETE /api/admin/v1/vm_ip_assignments/{id}
+```
+Required Permission: `virtual_machines::update`
+
+Soft-deletes the VM IP assignment, marking it as deleted rather than permanently removing it from the database.
+
+**Automatic VM Configuration:** After successful IP assignment deletion, a ConfigureVm work job is automatically queued to update the VM's network configuration.
+
 ### Reports
 
 #### Time Series Report
@@ -1365,8 +1450,9 @@ The RBAC system uses the following permission format: `resource::action`
   "user_id": number,
   "user_pubkey": "string (hex)",
   "user_email": "string | null",
-  "host_name": "string | null",
-  "region_name": "string | null",
+  "host_name": "string",
+  "region_id": number,
+  "region_name": "string",
   "deleted": boolean,
   "ref_code": "string | null"
 }
@@ -1811,6 +1897,26 @@ The RBAC system uses the following permission format: `resource::action`
   "cost": number,
   "min_disk_size": number,           // Minimum disk size in bytes for this type/interface
   "max_disk_size": number            // Maximum disk size in bytes for this type/interface
+}
+```
+
+### AdminVmIpAssignmentInfo
+```json
+{
+  "id": number,                      // Assignment ID
+  "vm_id": number,                   // VM ID this IP is assigned to
+  "ip_range_id": number,             // IP range ID this IP belongs to
+  "region_id": number,               // Region ID containing the IP range
+  "user_id": number,                 // User ID who owns the VM
+  "ip": "string",                    // The assigned IP address (IPv4 or IPv6)
+  "deleted": boolean,                // Whether this assignment is soft-deleted
+  "arp_ref": "string | null",       // External ARP reference ID
+  "dns_forward": "string | null",   // Forward DNS FQDN
+  "dns_forward_ref": "string | null", // External reference for forward DNS entry
+  "dns_reverse": "string | null",   // Reverse DNS FQDN
+  "dns_reverse_ref": "string | null", // External reference for reverse DNS entry
+  "ip_range_cidr": "string | null", // CIDR notation of the IP range
+  "region_name": "string | null"    // Name of the region containing the IP range
 }
 ```
 

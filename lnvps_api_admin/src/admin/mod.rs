@@ -15,8 +15,8 @@ use crate::admin::custom_pricing::{
     admin_get_custom_pricing, admin_list_custom_pricing, admin_update_custom_pricing,
 };
 use crate::admin::hosts::{
-    admin_create_host, admin_create_host_disk, admin_get_host, admin_get_host_disk, admin_list_host_disks,
-    admin_list_hosts, admin_update_host, admin_update_host_disk,
+    admin_create_host, admin_create_host_disk, admin_get_host, admin_get_host_disk,
+    admin_list_host_disks, admin_list_hosts, admin_update_host, admin_update_host_disk,
 };
 use crate::admin::ip_ranges::{
     admin_create_ip_range, admin_delete_ip_range, admin_get_ip_range, admin_list_ip_ranges,
@@ -37,6 +37,10 @@ use crate::admin::routers::{
     admin_update_router,
 };
 use crate::admin::users::{admin_list_users, admin_update_user};
+use crate::admin::vm_ip_assignments::{
+    admin_create_vm_ip_assignment, admin_delete_vm_ip_assignment, admin_get_vm_ip_assignment,
+    admin_list_vm_ip_assignments, admin_update_vm_ip_assignment,
+};
 use crate::admin::vm_os_images::{
     admin_create_vm_os_image, admin_delete_vm_os_image, admin_get_vm_os_image,
     admin_list_vm_os_images, admin_update_vm_os_image,
@@ -49,7 +53,7 @@ use crate::admin::vms::{
     admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
     admin_list_vm_history, admin_list_vm_payments, admin_list_vms, admin_start_vm, admin_stop_vm,
 };
-use rocket::{routes, Route};
+use rocket::{Route, routes};
 
 pub mod access_policies;
 pub mod auth;
@@ -64,6 +68,7 @@ pub mod reports;
 pub mod roles;
 pub mod routers;
 pub mod users;
+pub mod vm_ip_assignments;
 pub mod vm_os_images;
 pub mod vm_templates;
 pub mod vms;
@@ -162,6 +167,12 @@ pub fn admin_routes() -> Vec<Route> {
         admin_create_router,
         admin_update_router,
         admin_delete_router,
+        // VM IP Assignment management
+        admin_list_vm_ip_assignments,
+        admin_get_vm_ip_assignment,
+        admin_create_vm_ip_assignment,
+        admin_update_vm_ip_assignment,
+        admin_delete_vm_ip_assignment,
         // Reports
         admin_time_series_report,
         admin_referral_time_series_report,

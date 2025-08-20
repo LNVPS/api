@@ -10,7 +10,7 @@ use crate::{AdminDb, AdminRole, AdminRoleAssignment};
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
 use anyhow::{bail, Error, Result};
 use async_trait::async_trait;
-use sqlx::{Executor, MySqlPool, Row};
+use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
 #[derive(Clone)]
 pub struct LNVpsDbMysql {
@@ -2742,5 +2742,181 @@ impl AdminDb for LNVpsDbMysql {
             .fetch_one(&self.db)
             .await
             .map_err(Error::new)
+    }
+
+    async fn admin_list_vm_ip_assignments(
+        &self,
+        limit: u64,
+        offset: u64,
+        vm_id: Option<u64>,
+        ip_range_id: Option<u64>,
+        ip: Option<&str>,
+        include_deleted: Option<bool>,
+    ) -> Result<(Vec<VmIpAssignment>, u64)> {
+        let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM vm_ip_assignment");
+        let mut data_query = QueryBuilder::new("SELECT * FROM vm_ip_assignment");
+        
+        let mut has_conditions = false;
+
+        // Apply filters
+        if let Some(vm_id) = vm_id {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("vm_id = ").push_bind(vm_id);
+            data_query.push("vm_id = ").push_bind(vm_id);
+        }
+
+        if let Some(ip_range_id) = ip_range_id {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("ip_range_id = ").push_bind(ip_range_id);
+            data_query.push("ip_range_id = ").push_bind(ip_range_id);
+        }
+
+        if let Some(ip) = ip {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("ip = ").push_bind(ip);
+            data_query.push("ip = ").push_bind(ip);
+        }
+
+        // Handle deleted filter
+        match include_deleted {
+            Some(false) | None => {
+                // Exclude deleted assignments (default behavior)
+                if !has_conditions {
+                    count_query.push(" WHERE ");
+                    data_query.push(" WHERE ");
+                } else {
+                    count_query.push(" AND ");
+                    data_query.push(" AND ");
+                }
+                count_query.push("deleted = FALSE");
+                data_query.push("deleted = FALSE");
+            }
+            Some(true) => {
+                // Include both deleted and non-deleted assignments
+            }
+        }
+
+        // Execute count query
+        let total: i64 = count_query
+            .build_query_scalar()
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)?;
+
+        // Add ordering and pagination to data query
+        data_query
+            .push(" ORDER BY id DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+
+        // Execute data query
+        let assignments: Vec<VmIpAssignment> = data_query
+            .build_query_as()
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)?;
+
+        Ok((assignments, total as u64))
+    }
+
+    async fn admin_get_vm_ip_assignment(&self, assignment_id: u64) -> Result<VmIpAssignment> {
+        sqlx::query_as::<_, VmIpAssignment>("SELECT * FROM vm_ip_assignment WHERE id = ?")
+            .bind(assignment_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn admin_create_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> Result<u64> {
+        // Check if IP already exists and is not deleted
+        if let Ok(_existing) = sqlx::query_as::<_, VmIpAssignment>(
+            "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE"
+        )
+        .bind(&assignment.ip)
+        .fetch_one(&self.db)
+        .await {
+            bail!("IP address {} is already assigned", assignment.ip);
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO vm_ip_assignment (vm_id, ip_range_id, ip, deleted, arp_ref, dns_forward, dns_forward_ref, dns_reverse, dns_reverse_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(assignment.vm_id)
+        .bind(assignment.ip_range_id)
+        .bind(&assignment.ip)
+        .bind(assignment.deleted)
+        .bind(&assignment.arp_ref)
+        .bind(&assignment.dns_forward)
+        .bind(&assignment.dns_forward_ref)
+        .bind(&assignment.dns_reverse)
+        .bind(&assignment.dns_reverse_ref)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn admin_update_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> Result<()> {
+        // Check if IP already exists for a different assignment
+        if let Ok(existing) = sqlx::query_as::<_, VmIpAssignment>(
+            "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE AND id != ?"
+        )
+        .bind(&assignment.ip)
+        .bind(assignment.id)
+        .fetch_one(&self.db)
+        .await {
+            bail!("IP address {} is already assigned to assignment {}", assignment.ip, existing.id);
+        }
+
+        sqlx::query(
+            "UPDATE vm_ip_assignment SET vm_id = ?, ip_range_id = ?, ip = ?, arp_ref = ?, dns_forward = ?, dns_forward_ref = ?, dns_reverse = ?, dns_reverse_ref = ? WHERE id = ?"
+        )
+        .bind(assignment.vm_id)
+        .bind(assignment.ip_range_id)
+        .bind(&assignment.ip)
+        .bind(&assignment.arp_ref)
+        .bind(&assignment.dns_forward)
+        .bind(&assignment.dns_forward_ref)
+        .bind(&assignment.dns_reverse)
+        .bind(&assignment.dns_reverse_ref)
+        .bind(assignment.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    async fn admin_delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()> {
+        sqlx::query("UPDATE vm_ip_assignment SET deleted = TRUE WHERE id = ?")
+            .bind(assignment_id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+
+        Ok(())
     }
 }
