@@ -6,7 +6,7 @@ use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult}
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode, LNVpsDb};
 use rocket::serde::json::Json;
 use rocket::{delete, get, patch, post, State};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 /// List all IP ranges with pagination and optional region filtering
@@ -121,7 +121,7 @@ pub async fn admin_create_ip_range(
     }
 
     // Validate gateway IP format
-    if req.gateway.trim().parse::<Ipv4Addr>().is_err() {
+    if req.gateway.trim().parse::<IpAddr>().is_err() {
         return ApiData::err("Invalid gateway IP address format");
     }
 

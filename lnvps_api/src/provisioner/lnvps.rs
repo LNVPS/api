@@ -405,6 +405,7 @@ impl LNVpsProvisioner {
             bail!("No host disk found")
         };
 
+        let now = Utc::now();
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -413,8 +414,8 @@ impl LNVpsProvisioner {
             template_id: Some(template.id),
             custom_template_id: None,
             ssh_key_id: ssh_key.id,
-            created: Utc::now(),
-            expires: Utc::now(),
+            created: now,
+            expires: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
