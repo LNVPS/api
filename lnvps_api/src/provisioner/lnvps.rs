@@ -441,7 +441,7 @@ impl LNVpsProvisioner {
         ref_code: Option<String>,
     ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
-        let pricing = self.db.get_vm_template(template.pricing_id).await?;
+        let pricing = self.db.get_custom_pricing(template.pricing_id).await?;
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
 

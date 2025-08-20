@@ -1,32 +1,32 @@
 use crate::api::model::ApiVmStatus;
 use crate::api::model::{
-    vm_to_status, AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder,
-    ApiCustomVmRequest, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse,
-    ApiVmHistory, ApiVmPayment, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
-    CreateVmRequest, VMPatchRequest,
+    AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
+    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
+    ApiVmPayment, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmRequest,
+    VMPatchRequest, vm_to_status,
 };
-use crate::host::{get_host_client, FullVmInfo, TimeSeries, TimeSeriesData};
+use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
 use crate::{Currency, CurrencyAmount};
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
-use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::Tag;
+use lnurl::pay::{LnURLPayInvoice, PayResponse};
+use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::{
     ApiData, ApiResult, ExchangeRateService, Nip98Auth, UpgradeConfig, VmStateCache, WorkJob,
 };
-use lnvps_api_common::{ApiError, VmHistoryLogger};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
 use log::{error, info};
 use nostr_sdk::{ToBech32, Url};
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
-use rocket::{get, patch, post, routes, Route, State};
+use rocket::{Route, State, get, patch, post, routes};
 use rocket_okapi::{openapi, openapi_get_routes};
 use serde::Serialize;
 use ssh_key::PublicKey;
@@ -258,7 +258,6 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
     ApiData::ok(ret)
 }
 
-
 /// List available VM templates (Offers)
 #[openapi(tag = "VM")]
 #[get("/api/v1/vm/templates")]
@@ -330,15 +329,10 @@ async fn v1_list_vm_templates(
                 .into_iter()
                 .filter_map(|t| {
                     let region = regions.get(&t.region_id)?;
-                    ApiCustomTemplateParams::from(
-                        &t,
-                        &custom_template_disks,
-                        region,
-                    )
-                    .ok()
+                    ApiCustomTemplateParams::from(&t, &custom_template_disks, region).ok()
                 })
                 .collect();
-            
+
             Some(hc.apply_host_capacity_limits(&mut api_templates).await?)
         },
     };
