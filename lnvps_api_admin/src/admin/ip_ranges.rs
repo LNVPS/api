@@ -199,7 +199,7 @@ pub async fn admin_update_ip_range(
             return ApiData::err("Gateway cannot be empty");
         }
         // Validate gateway IP format
-        if gateway.trim().parse::<Ipv4Addr>().is_err() {
+        if gateway.trim().parse::<IpAddr>().is_err() {
             return ApiData::err("Invalid gateway IP address format");
         }
         ip_range.gateway = gateway.trim().to_string();
