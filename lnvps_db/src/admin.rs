@@ -162,9 +162,6 @@ pub trait AdminDb: Send + Sync {
     /// Insert a custom template
     async fn insert_custom_template(&self, template: &crate::VmCustomTemplate) -> Result<u64>;
 
-    /// Get a custom template by id
-    async fn get_custom_template(&self, id: u64) -> Result<crate::VmCustomTemplate>;
-
     /// Update a custom template
     async fn update_custom_template(&self, template: &crate::VmCustomTemplate) -> Result<()>;
 

@@ -9,13 +9,14 @@ use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
-    RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache,
-    WorkCommander, WorkJob,
+    NetworkProvisioner, RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState,
+    VmRunningStates, VmStateCache, WorkCommander, WorkJob,
 };
-use lnvps_db::{LNVpsDb, PaymentMethod, Vm, VmHost};
+use lnvps_db::{LNVpsDb, PaymentMethod, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1194,6 +1195,86 @@ impl Worker {
                     )?
                 }
             }
+            WorkJob::AssignVmIp {
+                vm_id,
+                ip_range_id,
+                ip,
+                admin_user_id,
+            } => {
+                info!("Processing IP assignment for VM {}", vm_id);
+                if let Err(e) = self
+                    .assign_vm_ip(*vm_id, *ip_range_id, ip.clone(), *admin_user_id)
+                    .await
+                {
+                    error!("Failed to assign IP to VM {}: {}", vm_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to assign IP to VM {}:\n{}", vm_id, e),
+                        Some(format!("VM {} IP Assignment Failed", vm_id)),
+                    )?;
+                } else {
+                    info!("Successfully assigned IP to VM {} at admin request", vm_id);
+                    self.queue_admin_notification(
+                        format!(
+                            "IP has been successfully assigned to VM {} using provisioner",
+                            vm_id
+                        ),
+                        Some(format!("VM {} IP Assignment Complete", vm_id)),
+                    )?;
+                }
+            }
+            WorkJob::UnassignVmIp {
+                assignment_id,
+                admin_user_id,
+            } => {
+                info!(
+                    "Processing IP unassignment for assignment {}",
+                    assignment_id
+                );
+                if let Err(e) = self.unassign_vm_ip(*assignment_id, *admin_user_id).await {
+                    error!("Failed to unassign IP assignment {}: {}", assignment_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to unassign IP assignment {}:\n{}", assignment_id, e),
+                        Some(format!("IP Assignment {} Removal Failed", assignment_id)),
+                    )?;
+                } else {
+                    info!(
+                        "Successfully unassigned IP assignment {} at admin request",
+                        assignment_id
+                    );
+                    self.queue_admin_notification(
+                        format!(
+                            "IP assignment {} has been successfully removed using provisioner",
+                            assignment_id
+                        ),
+                        Some(format!("IP Assignment {} Removal Complete", assignment_id)),
+                    )?;
+                }
+            }
+            WorkJob::UpdateVmIp {
+                assignment_id,
+                admin_user_id,
+            } => {
+                info!("Processing IP update for assignment {}", assignment_id);
+                if let Err(e) = self.update_vm_ip(*assignment_id, *admin_user_id).await {
+                    error!("Failed to update IP assignment {}: {}", assignment_id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to update IP assignment {}:\n{}", assignment_id, e),
+                        Some(format!("IP Assignment {} Removal Failed", assignment_id)),
+                    )?;
+                } else {
+                    info!(
+                        "Successfully updated IP assignment {} at admin request",
+                        assignment_id
+                    );
+                    self.queue_admin_notification(
+                        format!(
+                            "IP assignment {} has been successfully updated using provisioner",
+                            assignment_id
+                        ),
+                        Some(format!("IP Assignment {} update Complete", assignment_id)),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -1382,6 +1463,181 @@ impl Worker {
         info!(
             "Successfully re-configured VM {} using current database settings",
             vm_id
+        );
+        Ok(())
+    }
+
+    async fn assign_vm_ip(
+        &self,
+        vm_id: u64,
+        ip_range_id: u64,
+        ip: Option<String>,
+        admin_user_id: Option<u64>,
+    ) -> Result<()> {
+        info!(
+            "Assigning IP to VM {} from range {} using provisioner",
+            vm_id, ip_range_id
+        );
+
+        // Validate VM exists and is not deleted
+        let vm = self.db.get_vm(vm_id).await?;
+        if vm.deleted {
+            bail!("Cannot assign IP to a deleted VM");
+        }
+
+        // Determine the IP to assign
+        let assigned_ip = if let Some(ip_str) = &ip {
+            ip_str.trim().to_string()
+        } else {
+            // Auto-assign IP from the range
+            let network_provisioner = NetworkProvisioner::new(self.db.clone());
+            let available_ip = network_provisioner
+                .pick_ip_from_range_id(ip_range_id)
+                .await
+                .context("Failed to auto-assign IP from range")?;
+            available_ip.ip.ip().to_string()
+        };
+
+        // Create the assignment (similar to admin API but without saving yet)
+        let mut assignment = VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id,
+            ip: assigned_ip,
+            deleted: false,
+            arp_ref: None,
+            dns_forward: None,
+            dns_forward_ref: None,
+            dns_reverse: None,
+            dns_reverse_ref: None,
+        };
+
+        self.provisioner.save_ip_assignment(&mut assignment).await?;
+
+        // Log the assignment
+        let metadata = if let Some(admin_id) = admin_user_id {
+            Some(serde_json::json!({
+                "admin_user_id": admin_id,
+                "admin_action": true,
+                "ip_range_id": ip_range_id,
+                "assigned_ip": assignment.ip
+            }))
+        } else {
+            Some(serde_json::json!({
+                "admin_action": true,
+                "ip_range_id": ip_range_id,
+                "assigned_ip": assignment.ip
+            }))
+        };
+
+        if let Err(e) = self
+            .vm_history_logger
+            .log_vm_configuration_changed(vm_id, admin_user_id, &vm, &vm, metadata)
+            .await
+        {
+            warn!("Failed to log IP assignment for VM {}: {}", vm_id, e);
+        }
+
+        // Send ConfigureVm job to update VM network configuration
+        self.tx.send(WorkJob::ConfigureVm {
+            vm_id,
+            admin_user_id,
+        })?;
+
+        info!(
+            "Successfully assigned IP {} to VM {} from range {}",
+            assignment.ip, vm_id, ip_range_id
+        );
+        Ok(())
+    }
+
+    async fn unassign_vm_ip(&self, assignment_id: u64, admin_user_id: Option<u64>) -> Result<()> {
+        info!(
+            "Unassigning IP assignment {} using provisioner",
+            assignment_id
+        );
+
+        // Get the assignment to verify it exists and get VM info
+        let mut assignment = self.db.get_vm_ip_assignment(assignment_id).await?;
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+
+        self.provisioner
+            .delete_ip_assignment(&mut assignment, &range)
+            .await?;
+
+        // Log the unassignment
+        let metadata = if let Some(admin_id) = admin_user_id {
+            Some(serde_json::json!({
+                "admin_user_id": admin_id,
+                "admin_action": true,
+                "unassigned_ip": assignment.ip,
+                "ip_range_id": assignment.ip_range_id
+            }))
+        } else {
+            Some(serde_json::json!({
+                "admin_action": true,
+                "unassigned_ip": assignment.ip,
+                "ip_range_id": assignment.ip_range_id
+            }))
+        };
+
+        let vm = self.db.get_vm(assignment.vm_id).await?;
+        if let Err(e) = self
+            .vm_history_logger
+            .log_vm_configuration_changed(vm.id, admin_user_id, &vm, &vm, metadata)
+            .await
+        {
+            warn!(
+                "Failed to log IP unassignment for VM {}: {}",
+                assignment.vm_id, e
+            );
+        }
+
+        // Send ConfigureVm job to update VM network configuration
+        self.tx.send(WorkJob::ConfigureVm {
+            vm_id: vm.id,
+            admin_user_id,
+        })?;
+
+        info!(
+            "Successfully unassigned IP {} (assignment {}) from VM {}",
+            assignment.ip, assignment_id, assignment.vm_id
+        );
+        Ok(())
+    }
+
+    async fn update_vm_ip(&self, assignment_id: u64, admin_user_id: Option<u64>) -> Result<()> {
+        info!("Updating IP assignment {} using provisioner", assignment_id);
+
+        // Get the assignment to verify it exists and get VM info
+        let mut assignment = self.db.get_vm_ip_assignment(assignment_id).await?;
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+
+        self.provisioner
+            .update_ip_assignment_policy(&mut assignment, &range)
+            .await?;
+
+        let vm = self.db.get_vm(assignment.vm_id).await?;
+        if let Err(e) = self
+            .vm_history_logger
+            .log_vm_configuration_changed(vm.id, admin_user_id, &vm, &vm, None)
+            .await
+        {
+            warn!(
+                "Failed to log IP unassignment for VM {}: {}",
+                assignment.vm_id, e
+            );
+        }
+
+        // Send ConfigureVm job to update VM network configuration
+        self.tx.send(WorkJob::ConfigureVm {
+            vm_id: vm.id,
+            admin_user_id,
+        })?;
+
+        info!(
+            "Successfully unassigned IP {} (assignment {}) from VM {}",
+            assignment.ip, assignment_id, assignment.vm_id
         );
         Ok(())
     }

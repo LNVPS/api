@@ -47,6 +47,23 @@ pub enum WorkJob {
         vm_id: u64,
         admin_user_id: Option<u64>,
     },
+    /// Assign an IP to a VM using the provisioner (handles all additional steps)
+    AssignVmIp {
+        vm_id: u64,
+        ip_range_id: u64,
+        ip: Option<String>, // If None, auto-assign from range
+        admin_user_id: Option<u64>,
+    },
+    /// Delete/unassign an IP from a VM using the provisioner (handles all cleanup)
+    UnassignVmIp {
+        assignment_id: u64,
+        admin_user_id: Option<u64>,
+    },
+    /// Update an assignment
+    UpdateVmIp {
+        assignment_id: u64,
+        admin_user_id: Option<u64>,
+    },
 }
 
 pub struct WorkCommander {

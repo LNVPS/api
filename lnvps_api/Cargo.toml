@@ -21,14 +21,12 @@ default = [
     "bitvora",
     "tokio/sync",
     "tokio/io-util",
-    "admin"
 ]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain"]
 nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
-admin = ["lnvps_db/admin"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["dep:fedimint-tonic-lnd"]

@@ -13,12 +13,10 @@ use lnvps_api_common::{
     PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
 use lnvps_api_common::{Currency, CurrencyAmount, ExchangeRateService};
-use lnvps_db::{
-    AccessPolicy, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType,
-    RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate,
-};
+use lnvps_db::{AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate};
 use log::{debug, info, warn};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -212,30 +210,63 @@ impl LNVpsProvisioner {
     }
 
     /// Delete all ip assignments for a given vm
-    pub async fn delete_ip_assignments(&self, vm_id: u64) -> Result<()> {
+    pub async fn delete_all_ip_assignments(&self, vm_id: u64) -> Result<()> {
         let ips = self.db.list_vm_ip_assignments(vm_id).await?;
         for mut ip in ips {
-            // load range info to check access policy
             let range = self.db.get_ip_range(ip.ip_range_id).await?;
-            if let Some(ap) = range.access_policy_id {
-                let ap = self.db.get_access_policy(ap).await?;
-                // remove access policy
-                self.remove_access_policy(&mut ip, &ap).await?;
-            }
-            // remove dns
-            self.remove_ip_dns(&mut ip).await?;
-            // save arp/dns changes
-            self.db.update_vm_ip_assignment(&ip).await?;
+            self.delete_ip_assignment(&mut ip, &range).await?;
         }
-        // mark as deleted
-        self.db.delete_vm_ip_assignment(vm_id).await?;
 
         Ok(())
     }
 
-    async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+    /// Delete ip assignment
+    pub async fn delete_ip_assignment(&self, ip: &mut VmIpAssignment, range: &IpRange) -> Result<()> {
+        if let Some(ap) = range.access_policy_id {
+            let ap = self.db.get_access_policy(ap).await?;
+            // remove access policy
+            self.remove_access_policy(ip, &ap).await?;
+        }
+        // remove dns
+        self.remove_ip_dns(ip).await?;
+        // save arp/dns changes
+        self.db.update_vm_ip_assignment(ip).await?;
+        // mark as deleted
+        self.db.delete_vm_ip_assignment(ip.id).await?;
+
+        Ok(())
+    }
+
+    pub async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> Result<()> {
         // load range info to check access policy
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+
+        // Validate provided IP format and range
+        let provided_ip = assignment.ip
+            .trim()
+            .parse::<IpAddr>()
+            .context("Invalid IP address format")?;
+
+        let cidr = range
+            .cidr
+            .parse::<IpNetwork>()
+            .context("Invalid CIDR format in IP range")?;
+
+        ensure!(
+            cidr.contains(provided_ip),
+            "IP address is not within the specified IP range"
+        );
+
+        // Update access policy / dns
+        self.update_ip_assignment_policy(assignment, &range).await?;
+
+        // save to db
+        self.db.insert_vm_ip_assignment(assignment).await?;
+        Ok(())
+    }
+
+    /// Update access policy and dns
+    pub async fn update_ip_assignment_policy(&self, assignment: &mut VmIpAssignment, range: &IpRange) -> Result<()> {
         if let Some(ap) = range.access_policy_id {
             let ap = self.db.get_access_policy(ap).await?;
             // apply access policy
@@ -245,9 +276,6 @@ impl LNVpsProvisioner {
         // Add DNS records
         self.update_forward_ip_dns(assignment).await?;
         self.update_reverse_ip_dns(assignment).await?;
-
-        // save to db
-        self.db.insert_vm_ip_assignment(assignment).await?;
         Ok(())
     }
 
@@ -683,7 +711,7 @@ impl LNVpsProvisioner {
             warn!("Failed to delete VM: {}", e);
         }
 
-        self.delete_ip_assignments(vm_id).await?;
+        self.delete_all_ip_assignments(vm_id).await?;
         self.db.delete_vm(vm_id).await?;
 
         Ok(())

@@ -181,7 +181,10 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn list_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>>;
 
     /// Delete assigned VM ips
-    async fn delete_vm_ip_assignment(&self, vm_id: u64) -> Result<()>;
+    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> Result<()>;
+
+    /// Delete assigned VM ip
+    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()>;
 
     /// List payments by VM id
     async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>>;
@@ -243,6 +246,9 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List all routers
     async fn list_routers(&self) -> Result<Vec<Router>>;
+
+    /// Get VM IP assignment
+    async fn get_vm_ip_assignment(&self, id: u64) -> Result<VmIpAssignment>;
 
     /// Get VM IP assignment by IP address
     async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> Result<VmIpAssignment>;

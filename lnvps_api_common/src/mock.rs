@@ -3,7 +3,7 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    async_trait, AccessPolicy, AdminDb, AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, Company,
+    async_trait, AccessPolicy, AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, Company,
     DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase, NostrDomain,
     NostrDomainHandle, OsDistribution, RegionStats, Router, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
@@ -674,10 +674,20 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn delete_vm_ip_assignment(&self, vm_id: u64) -> anyhow::Result<()> {
+    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> anyhow::Result<()> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         for ip_assignment in ip_assignments.values_mut() {
             if ip_assignment.vm_id == vm_id {
+                ip_assignment.deleted = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> anyhow::Result<()> {
+        let mut ip_assignments = self.ip_assignments.lock().await;
+        for ip_assignment in ip_assignments.values_mut() {
+            if ip_assignment.id == assignment_id {
                 ip_assignment.deleted = true;
             }
         }
@@ -827,6 +837,15 @@ impl LNVpsDbBase for MockDb {
     async fn list_routers(&self) -> anyhow::Result<Vec<Router>> {
         let routers = self.router.lock().await;
         Ok(routers.values().cloned().collect())
+    }
+
+    async fn get_vm_ip_assignment(&self, id: u64) -> anyhow::Result<VmIpAssignment> {
+        let assignments = self.ip_assignments.lock().await;
+        assignments
+            .values()
+            .find(|a| a.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP assignment not found for {}", id))
     }
 
     async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> anyhow::Result<VmIpAssignment> {
@@ -990,8 +1009,9 @@ impl ExchangeRateService for MockExchangeRate {
 }
 
 // Admin trait implementation with stub methods
+#[cfg(feature = "admin")]
 #[async_trait]
-impl AdminDb for MockDb {
+impl lnvps_db::AdminDb for MockDb {
     async fn get_user_permissions(
         &self,
         _user_id: u64,
@@ -1204,6 +1224,118 @@ impl AdminDb for MockDb {
         
         Ok((admin_hosts, total))
     }
+    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<u64> {
+        let mut pricing_map = self.custom_pricing.lock().await;
+        let max_id = pricing_map.keys().max().unwrap_or(&0) + 1;
+        let mut new_pricing = pricing.clone();
+        new_pricing.id = max_id;
+        pricing_map.insert(max_id, new_pricing);
+        Ok(max_id)
+    }
+    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<()> {
+        let mut pricing_map = self.custom_pricing.lock().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = pricing_map.entry(pricing.id) {
+            e.insert(pricing.clone());
+            Ok(())
+        } else {
+            bail!("Custom pricing not found: {}", pricing.id)
+        }
+    }
+    async fn delete_custom_pricing(&self, id: u64) -> anyhow::Result<()> {
+        let mut pricing_map = self.custom_pricing.lock().await;
+        if pricing_map.remove(&id).is_some() {
+            Ok(())
+        } else {
+            bail!("Custom pricing not found: {}", id)
+        }
+    }
+    async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> anyhow::Result<u64> {
+        let mut disk_map = self.custom_pricing_disk.lock().await;
+        let max_id = disk_map.keys().max().unwrap_or(&0) + 1;
+        let mut new_disk = disk.clone();
+        new_disk.id = max_id;
+        disk_map.insert(max_id, new_disk);
+        Ok(max_id)
+    }
+    async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> anyhow::Result<()> {
+        let mut disk_map = self.custom_pricing_disk.lock().await;
+        disk_map.retain(|_, disk| disk.pricing_id != pricing_id);
+        Ok(())
+    }
+    async fn count_custom_templates_by_pricing(&self, pricing_id: u64) -> anyhow::Result<u64> {
+        let template_map = self.custom_template.lock().await;
+        let count = template_map
+            .values()
+            .filter(|template| template.pricing_id == pricing_id)
+            .count();
+        Ok(count as u64)
+    }
+
+    async fn list_custom_templates_by_pricing_paginated(
+        &self,
+        pricing_id: u64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<(Vec<VmCustomTemplate>, u64)> {
+        let template_map = self.custom_template.lock().await;
+        let filtered_templates: Vec<VmCustomTemplate> = template_map
+            .values()
+            .filter(|template| template.pricing_id == pricing_id)
+            .cloned()
+            .collect();
+        let total = filtered_templates.len() as u64;
+        let paginated: Vec<VmCustomTemplate> = filtered_templates
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((paginated, total))
+    }
+
+    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<u64> {
+        let mut template_map = self.custom_template.lock().await;
+        let max_id = template_map.keys().max().unwrap_or(&0) + 1;
+        let mut new_template = template.clone();
+        new_template.id = max_id;
+        template_map.insert(max_id, new_template);
+        Ok(max_id)
+    }
+
+    async fn get_custom_template(&self, id: u64) -> anyhow::Result<VmCustomTemplate> {
+        let template_map = self.custom_template.lock().await;
+        template_map
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Custom template not found: {}", id))
+    }
+
+    async fn update_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
+        let mut template_map = self.custom_template.lock().await;
+        if let std::collections::hash_map::Entry::Occupied(mut e) = template_map.entry(template.id)
+        {
+            e.insert(template.clone());
+            Ok(())
+        } else {
+            bail!("Custom template not found: {}", template.id)
+        }
+    }
+
+    async fn delete_custom_template(&self, id: u64) -> anyhow::Result<()> {
+        let mut template_map = self.custom_template.lock().await;
+        if template_map.remove(&id).is_some() {
+            Ok(())
+        } else {
+            bail!("Custom template not found: {}", id)
+        }
+    }
+    async fn count_vms_by_custom_template(&self, template_id: u64) -> anyhow::Result<u64> {
+        let vm_map = self.vms.lock().await;
+        let count = vm_map
+            .values()
+            .filter(|vm| vm.custom_template_id == Some(template_id))
+            .count();
+        Ok(count as u64)
+    }
     async fn admin_list_companies(
         &self,
         _limit: u64,
@@ -1226,7 +1358,6 @@ impl AdminDb for MockDb {
     async fn admin_count_company_regions(&self, _company_id: u64) -> anyhow::Result<u64> {
         Ok(0)
     }
-
     async fn admin_get_payments_by_date_range(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
@@ -1238,7 +1369,6 @@ impl AdminDb for MockDb {
             .cloned()
             .collect())
     }
-
     async fn admin_get_payments_by_date_range_and_company(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
@@ -1269,7 +1399,6 @@ impl AdminDb for MockDb {
             .cloned()
             .collect())
     }
-
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
@@ -1340,7 +1469,6 @@ impl AdminDb for MockDb {
 
         Ok(result)
     }
-
     async fn admin_get_referral_usage_by_date_range(
         &self,
         _start_date: chrono::DateTime<chrono::Utc>,
@@ -1351,7 +1479,6 @@ impl AdminDb for MockDb {
         // Mock implementation - return empty for now
         Ok(vec![])
     }
-
     async fn admin_list_ip_ranges(
         &self,
         _limit: u64,
@@ -1385,33 +1512,40 @@ impl AdminDb for MockDb {
     ) -> anyhow::Result<(Vec<AccessPolicy>, u64)> {
         Ok((vec![], 0))
     }
+
     async fn admin_get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> {
         self.get_access_policy(access_policy_id).await
     }
+
     async fn admin_create_access_policy(
         &self,
         _access_policy: &AccessPolicy,
     ) -> anyhow::Result<u64> {
         Ok(1)
     }
+
     async fn admin_update_access_policy(
         &self,
         _access_policy: &AccessPolicy,
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
     async fn admin_delete_access_policy(&self, _access_policy_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
+
     async fn admin_count_access_policy_ip_ranges(
         &self,
         _access_policy_id: u64,
     ) -> anyhow::Result<u64> {
         Ok(0)
     }
+
     async fn admin_list_routers(&self) -> anyhow::Result<Vec<Router>> {
         self.list_routers().await
     }
+
     async fn admin_list_routers_paginated(
         &self,
         _limit: u64,
@@ -1419,139 +1553,25 @@ impl AdminDb for MockDb {
     ) -> anyhow::Result<(Vec<Router>, u64)> {
         Ok((vec![], 0))
     }
+
     async fn admin_get_router(&self, router_id: u64) -> anyhow::Result<Router> {
         self.get_router(router_id).await
     }
+
     async fn admin_create_router(&self, _router: &Router) -> anyhow::Result<u64> {
         Ok(1)
     }
+
     async fn admin_update_router(&self, _router: &Router) -> anyhow::Result<()> {
         Ok(())
     }
+
     async fn admin_delete_router(&self, _router_id: u64) -> anyhow::Result<()> {
         Ok(())
     }
+
     async fn admin_count_router_access_policies(&self, _router_id: u64) -> anyhow::Result<u64> {
         Ok(0)
-    }
-
-    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<u64> {
-        let mut pricing_map = self.custom_pricing.lock().await;
-        let max_id = pricing_map.keys().max().unwrap_or(&0) + 1;
-        let mut new_pricing = pricing.clone();
-        new_pricing.id = max_id;
-        pricing_map.insert(max_id, new_pricing);
-        Ok(max_id)
-    }
-
-    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<()> {
-        let mut pricing_map = self.custom_pricing.lock().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = pricing_map.entry(pricing.id) {
-            e.insert(pricing.clone());
-            Ok(())
-        } else {
-            bail!("Custom pricing not found: {}", pricing.id)
-        }
-    }
-
-    async fn delete_custom_pricing(&self, id: u64) -> anyhow::Result<()> {
-        let mut pricing_map = self.custom_pricing.lock().await;
-        if pricing_map.remove(&id).is_some() {
-            Ok(())
-        } else {
-            bail!("Custom pricing not found: {}", id)
-        }
-    }
-
-    async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> anyhow::Result<u64> {
-        let mut disk_map = self.custom_pricing_disk.lock().await;
-        let max_id = disk_map.keys().max().unwrap_or(&0) + 1;
-        let mut new_disk = disk.clone();
-        new_disk.id = max_id;
-        disk_map.insert(max_id, new_disk);
-        Ok(max_id)
-    }
-
-    async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> anyhow::Result<()> {
-        let mut disk_map = self.custom_pricing_disk.lock().await;
-        disk_map.retain(|_, disk| disk.pricing_id != pricing_id);
-        Ok(())
-    }
-
-    async fn count_custom_templates_by_pricing(&self, pricing_id: u64) -> anyhow::Result<u64> {
-        let template_map = self.custom_template.lock().await;
-        let count = template_map
-            .values()
-            .filter(|template| template.pricing_id == pricing_id)
-            .count();
-        Ok(count as u64)
-    }
-
-    async fn list_custom_templates_by_pricing_paginated(
-        &self,
-        pricing_id: u64,
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<(Vec<VmCustomTemplate>, u64)> {
-        let template_map = self.custom_template.lock().await;
-        let filtered_templates: Vec<VmCustomTemplate> = template_map
-            .values()
-            .filter(|template| template.pricing_id == pricing_id)
-            .cloned()
-            .collect();
-        let total = filtered_templates.len() as u64;
-        let paginated: Vec<VmCustomTemplate> = filtered_templates
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-        Ok((paginated, total))
-    }
-
-    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<u64> {
-        let mut template_map = self.custom_template.lock().await;
-        let max_id = template_map.keys().max().unwrap_or(&0) + 1;
-        let mut new_template = template.clone();
-        new_template.id = max_id;
-        template_map.insert(max_id, new_template);
-        Ok(max_id)
-    }
-
-    async fn get_custom_template(&self, id: u64) -> anyhow::Result<VmCustomTemplate> {
-        let template_map = self.custom_template.lock().await;
-        template_map
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow!("Custom template not found: {}", id))
-    }
-
-    async fn update_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
-        let mut template_map = self.custom_template.lock().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = template_map.entry(template.id)
-        {
-            e.insert(template.clone());
-            Ok(())
-        } else {
-            bail!("Custom template not found: {}", template.id)
-        }
-    }
-
-    async fn delete_custom_template(&self, id: u64) -> anyhow::Result<()> {
-        let mut template_map = self.custom_template.lock().await;
-        if template_map.remove(&id).is_some() {
-            Ok(())
-        } else {
-            bail!("Custom template not found: {}", id)
-        }
-    }
-
-    async fn count_vms_by_custom_template(&self, template_id: u64) -> anyhow::Result<u64> {
-        let vm_map = self.vms.lock().await;
-        let count = vm_map
-            .values()
-            .filter(|vm| vm.custom_template_id == Some(template_id))
-            .count();
-        Ok(count as u64)
     }
 
     async fn admin_list_vms_filtered(

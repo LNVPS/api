@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb};
 use log::warn;
@@ -74,6 +74,11 @@ impl NetworkProvisioner {
         } else {
             Ok(ret)
         }
+    }
+
+    pub async fn pick_ip_from_range_id(&self, range_id: u64) -> Result<AvailableIp> {
+        let range = self.db.get_ip_range(range_id).await?;
+        self.pick_ip_from_range(&range).await
     }
 
     pub async fn pick_ip_from_range(&self, range: &IpRange) -> Result<AvailableIp> {

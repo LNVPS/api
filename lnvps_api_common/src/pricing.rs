@@ -353,7 +353,7 @@ impl PricingEngine {
                     template.disk_interface,
                 )
             } else if let Some(custom_template_id) = vm.custom_template_id {
-                let custom_template = self.db.get_custom_template(custom_template_id).await?;
+                let custom_template = self.db.get_custom_vm_template(custom_template_id).await?;
                 (
                     self.db
                         .get_custom_pricing(custom_template.pricing_id)

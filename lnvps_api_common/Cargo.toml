@@ -4,8 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-default = ["admin", "nostr-domain"]
-admin = ["lnvps_db/admin"]
+default = ["nostr-domain"]
 nostr-domain = ["lnvps_db/nostr-domain"]
 
 [dependencies]

@@ -6,11 +6,12 @@ use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkCommander,
     WorkJob,
 };
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmIpAssignment};
+use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post};
 use std::net::IpAddr;
 use std::sync::Arc;
+use chrono::Utc;
 
 /// List all VM IP assignments with pagination and optional filtering
 #[get(
@@ -88,6 +89,14 @@ pub async fn admin_create_vm_ip_assignment(
         return ApiData::err("Cannot assign IP to a deleted VM");
     }
 
+    if vm.expires == vm.created {
+        return ApiData::err("Cannot assign IP to a new VM");
+    }
+
+    if vm.expires < Utc::now() {
+        return ApiData::err("Cannot assign IP to an expired VM");
+    }
+
     // Validate IP range exists and is enabled
     let ip_range = db.admin_get_ip_range(req.ip_range_id).await?;
     if !ip_range.enabled {
@@ -127,47 +136,46 @@ pub async fn admin_create_vm_ip_assignment(
         }
     };
 
-    // Create the assignment
-    let assignment = VmIpAssignment {
-        id: 0, // Will be set by database
-        vm_id: req.vm_id,
-        ip_range_id: req.ip_range_id,
-        ip: assigned_ip,
-        deleted: false,
-        arp_ref: req.arp_ref.clone(),
-        dns_forward: req.dns_forward.clone(),
-        dns_forward_ref: None,
-        dns_reverse: req.dns_reverse.clone(),
-        dns_reverse_ref: None,
-    };
-
-    let assignment_id = db.admin_create_vm_ip_assignment(&assignment).await?;
-
-    // Fetch the created assignment to return
-    let created_assignment = db.admin_get_vm_ip_assignment(assignment_id).await?;
-    let admin_assignment =
-        AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(db, &created_assignment)
-            .await?;
-
-    // Send ConfigureVm job to update VM network configuration
+    // Send AssignVmIp job to handle the assignment using the provisioner
+    // This will create the IP assignment and handle all additional setup
     if let Some(work_commander) = work_commander.inner() {
         if let Err(e) = work_commander
-            .send_job(WorkJob::ConfigureVm {
+            .send_job(WorkJob::AssignVmIp {
                 vm_id: req.vm_id,
+                ip_range_id: req.ip_range_id,
+                ip: Some(assigned_ip.clone()),
                 admin_user_id: Some(auth.user_id),
             })
             .await
         {
-            // Log error but don't fail the API call
-            log::warn!(
-                "Failed to queue VM configuration job for VM {} after IP assignment: {}",
+            log::error!(
+                "Failed to queue IP assignment job for VM {}: {}",
                 req.vm_id,
                 e
             );
+            return ApiData::err("Failed to queue IP assignment job");
         }
-    }
 
-    ApiData::ok(admin_assignment)
+        // Return a success response indicating the job has been queued
+        return ApiData::ok(AdminVmIpAssignmentInfo {
+            id: 0, // Will be assigned by worker
+            vm_id: req.vm_id,
+            ip_range_id: req.ip_range_id,
+            region_id: 0, // Will be filled by worker
+            user_id: 0,   // Will be filled by worker
+            ip: assigned_ip,
+            deleted: false,
+            arp_ref: None,
+            dns_forward: None,
+            dns_forward_ref: None,
+            dns_reverse: None,
+            dns_reverse_ref: None,
+            ip_range_cidr: None,
+            region_name: None,
+        });
+    } else {
+        return ApiData::err("Work commander not configured - cannot assign IP via provisioner");
+    }
 }
 
 /// Update VM IP assignment information
@@ -237,15 +245,15 @@ pub async fn admin_update_vm_ip_assignment(
     // Send ConfigureVm job to update VM network configuration
     if let Some(work_commander) = work_commander.inner() {
         if let Err(e) = work_commander
-            .send_job(WorkJob::ConfigureVm {
-                vm_id: assignment.vm_id,
+            .send_job(WorkJob::UpdateVmIp {
+                assignment_id: assignment.id,
                 admin_user_id: Some(auth.user_id),
             })
             .await
         {
             // Log error but don't fail the API call
             log::warn!(
-                "Failed to queue VM configuration job for VM {} after IP assignment update: {}",
+                "Failed to queue update vm ip job for VM {} after IP assignment update: {}",
                 assignment.vm_id,
                 e
             );
@@ -265,29 +273,28 @@ pub async fn admin_delete_vm_ip_assignment(
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
-    // Verify assignment exists and get VM ID for later configuration
-    let assignment = db.admin_get_vm_ip_assignment(id).await?;
-    let vm_id = assignment.vm_id;
+    // Verify assignment exists
+    let _assignment = db.admin_get_vm_ip_assignment(id).await?;
 
-    // Soft delete the assignment
-    db.admin_delete_vm_ip_assignment(id).await?;
-
-    // Send ConfigureVm job to update VM network configuration
+    // Send UnassignVmIp job to handle the unassignment using the provisioner
+    // This will handle all cleanup (ARP, DNS, access policies) and then delete the assignment
     if let Some(work_commander) = work_commander.inner() {
         if let Err(e) = work_commander
-            .send_job(WorkJob::ConfigureVm {
-                vm_id,
+            .send_job(WorkJob::UnassignVmIp {
+                assignment_id: id,
                 admin_user_id: Some(auth.user_id),
             })
             .await
         {
-            // Log error but don't fail the API call
-            log::warn!(
-                "Failed to queue VM configuration job for VM {} after IP assignment deletion: {}",
-                vm_id,
+            log::error!(
+                "Failed to queue IP unassignment job for assignment {}: {}",
+                id,
                 e
             );
+            return ApiData::err("Failed to queue IP unassignment job");
         }
+    } else {
+        return ApiData::err("Work commander not configured - cannot unassign IP via provisioner");
     }
 
     ApiData::ok(())

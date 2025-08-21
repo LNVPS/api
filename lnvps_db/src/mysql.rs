@@ -617,9 +617,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn delete_vm_ip_assignment(&self, vm_id: u64) -> Result<()> {
+    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> Result<()> {
         sqlx::query("update vm_ip_assignment set deleted = 1 where vm_id = ?")
             .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()> {
+        sqlx::query("update vm_ip_assignment set deleted = 1 where id = ?")
+            .bind(assignment_id)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -820,6 +828,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_routers(&self) -> Result<Vec<Router>> {
         sqlx::query_as("select * from router")
             .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_vm_ip_assignment(&self, id: u64) -> Result<VmIpAssignment> {
+        sqlx::query_as("select * from vm_ip_assignment where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
             .await
             .map_err(Error::new)
     }
@@ -1976,17 +1992,6 @@ impl AdminDb for LNVpsDbMysql {
             .map_err(Error::new)?;
 
         Ok(result.last_insert_id())
-    }
-
-    async fn get_custom_template(&self, id: u64) -> Result<VmCustomTemplate> {
-        let template =
-            sqlx::query_as::<_, VmCustomTemplate>("SELECT * FROM vm_custom_template WHERE id = ?")
-                .bind(id)
-                .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?;
-
-        Ok(template)
     }
 
     async fn update_custom_template(&self, template: &VmCustomTemplate) -> Result<()> {
