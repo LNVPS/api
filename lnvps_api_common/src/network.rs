@@ -3,6 +3,7 @@ use ipnetwork::IpNetwork;
 use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb};
 use log::warn;
 use rand::prelude::{IteratorRandom, SliceRandom};
+use rand::{Rng, RngCore};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -107,14 +108,25 @@ impl NetworkProvisioner {
                     .and_then(|i| IpNetwork::new(i, range_cidr.prefix()).ok()),
                 IpRangeAllocationMode::Random => {
                     let mut rng = rand::rng();
-                    loop {
-                        if let Some(i) = range_cidr.iter().choose(&mut rng) {
-                            if !ips.contains(&i) {
-                                break IpNetwork::new(i, range_cidr.prefix()).ok();
+                    match range_cidr {
+                        IpNetwork::V4(v4) => loop {
+                            let n = rng.random_range(0..v4.size());
+                            let addr = IpAddr::V4(v4.nth(n).unwrap());
+                            if !ips.contains(&addr) {
+                                break IpNetwork::new(addr, range_cidr.prefix()).ok();
+                            } else {
+                                break None;
                             }
-                        } else {
-                            break None;
-                        }
+                        },
+                        IpNetwork::V6(v6) => loop {
+                            let n = rng.random_range(0..v6.size());
+                            let addr = IpAddr::V6(v6.nth(n).unwrap());
+                            if !ips.contains(&addr) {
+                                break IpNetwork::new(addr, range_cidr.prefix()).ok();
+                            } else {
+                                break None;
+                            }
+                        },
                     }
                 }
                 IpRangeAllocationMode::SlaacEui64 => {
@@ -231,6 +243,7 @@ mod tests {
         let mac: [u8; 6] = [0xff, 0xff, 0xff, 0xfa, 0xfb, 0xfc];
         let ip = mgr.pick_ip_for_region(1).await.expect("No ip found in db");
         let v4 = ip.ip4.unwrap();
+        let v6 = ip.ip6.unwrap();
         assert_eq!(1, v4.region_id);
     }
 }

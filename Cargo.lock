@@ -2452,7 +2452,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "ipnetwork"
 version = "0.21.1"
-source = "git+https://git.v0l.io/Kieran/ipnetwork.git?rev=35977adc8103cfc232bc95fbc32f4e34f2b6a6d7#35977adc8103cfc232bc95fbc32f4e34f2b6a6d7"
+source = "git+https://git.v0l.io/Kieran/ipnetwork.git?rev=f01575cbf2fc596c0a1761c122aa92525cbb7974#f01575cbf2fc596c0a1761c122aa92525cbb7974"
 
 [[package]]
 name = "iri-string"

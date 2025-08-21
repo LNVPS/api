@@ -25,7 +25,7 @@ serde_json = "1.0.132"
 rocket = { version = "0.5.1", features = ["json"] }
 config = { version = "0.15.8", features = ["yaml"] }
 hex = "0.4.3"
-ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "35977adc8103cfc232bc95fbc32f4e34f2b6a6d7" }
+ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "f01575cbf2fc596c0a1761c122aa92525cbb7974" }
 async-trait = "0.1.83"
 
 [profile.dev]
