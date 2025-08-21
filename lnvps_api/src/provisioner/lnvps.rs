@@ -62,6 +62,10 @@ impl LNVpsProvisioner {
         }
     }
 
+    pub fn config(&self) -> &ProvisionerConfig {
+        &self.provisioner_config
+    }
+
     pub async fn get_router(&self, router_id: u64) -> Result<Arc<dyn Router>> {
         #[cfg(test)]
         return Ok(Arc::new(crate::mocks::MockRouter::new()));
@@ -682,6 +686,13 @@ impl LNVpsProvisioner {
         }
     }
 
+    /// Apply vm config to host
+    pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> Result<()> {
+        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        let client = get_host_client(&info.host, &self.provisioner_config)?;
+        client.configure_vm(&info).await
+    }
+
     /// Create a vm on the host as configured by the template
     pub async fn spawn_vm(&self, vm_id: u64) -> Result<()> {
         if self.read_only {
@@ -692,10 +703,7 @@ impl LNVpsProvisioner {
 
         // load full info
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-
-        // load host client
-        let host = self.db.get_host(info.vm.host_id).await?;
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&info.host, &self.provisioner_config)?;
         client.create_vm(&info).await?;
 
         Ok(())

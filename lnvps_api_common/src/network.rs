@@ -29,6 +29,12 @@ pub struct NetworkProvisioner {
     db: Arc<dyn LNVpsDb>,
 }
 
+#[derive(Clone)]
+pub enum IpAddrKind {
+    IPv4,
+    IPv6,
+}
+
 impl NetworkProvisioner {
     pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
         Self { db }
@@ -37,10 +43,32 @@ impl NetworkProvisioner {
     /// Pick an IP from one of the available ip ranges
     /// This method MUST return a free IP which can be used
     pub async fn pick_ip_for_region(&self, region_id: u64) -> Result<AvailableIps> {
+        self.pick_ip_kind_for_region(region_id, None).await
+    }
+
+    pub async fn pick_ip_kind_for_region(
+        &self,
+        region_id: u64,
+        kind: Option<IpAddrKind>,
+    ) -> Result<AvailableIps> {
         let mut ip_ranges = self.db.list_ip_range_in_region(region_id).await?;
         if ip_ranges.is_empty() {
             bail!("No ip range found in this region");
         }
+
+        // filter by kind
+        ip_ranges = ip_ranges
+            .into_iter()
+            .filter(|r| {
+                let net = r.cidr.parse();
+                match (net, &kind) {
+                    (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
+                    (Ok(IpNetwork::V6(_)), Some(IpAddrKind::IPv6)) => true,
+                    (Err(_),_) => false,
+                    _ => true,
+                }
+            })
+            .collect();
 
         // Randomize the order of IP ranges for even distribution
         ip_ranges.shuffle(&mut rand::rng());
