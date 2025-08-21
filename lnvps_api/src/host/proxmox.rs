@@ -5,12 +5,12 @@ use crate::host::{
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use futures::StreamExt;
 use ipnetwork::IpNetwork;
 use lnvps_api_common::{VmRunningState, VmRunningStates};
-use lnvps_db::{async_trait, DiskType, IpRangeAllocationMode, Vm, VmOsImage};
+use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage, async_trait};
 use log::{info, warn};
 use rand::random;
 use reqwest::{Method, Url};
@@ -662,7 +662,13 @@ impl ProxmoxClient {
                                 // what's in the db is purely informational
                                 "ip6=auto".to_string()
                             } else {
-                                format!("ip6={}", addr)
+                                let range: IpNetwork = ip_range.cidr.parse().ok()?;
+                                let range_gw: IpNetwork = ip_range.gateway.parse().ok()?;
+                                format!(
+                                    "ip6={},gw6={}",
+                                    IpNetwork::new(addr.into(), range.prefix()).ok()?,
+                                    range_gw.ip(),
+                                )
                             }
                         }
                     })
@@ -1700,8 +1706,8 @@ pub struct VmFirewallRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::tests::mock_full_vm;
     use crate::MB;
+    use crate::host::tests::mock_full_vm;
 
     #[test]
     fn test_config() -> Result<()> {
