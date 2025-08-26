@@ -22,6 +22,12 @@ pub enum WorkJob {
         message: String,
         title: Option<String>,
     },
+    /// Send bulk message to all active customers based on their contact preferences
+    BulkMessage {
+        subject: String,
+        message: String,
+        admin_user_id: u64,
+    },
     /// Delete a VM at admin request
     DeleteVm {
         vm_id: u64,

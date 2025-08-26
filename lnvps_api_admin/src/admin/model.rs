@@ -1692,3 +1692,16 @@ pub struct UpdateVmIpAssignmentRequest {
     pub dns_forward: Option<Option<String>>,
     pub dns_reverse: Option<Option<String>>,
 }
+
+// Bulk Message Models
+#[derive(Deserialize)]
+pub struct BulkMessageRequest {
+    pub subject: String,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct BulkMessageResponse {
+    pub job_dispatched: bool,
+    pub job_id: Option<String>,
+}

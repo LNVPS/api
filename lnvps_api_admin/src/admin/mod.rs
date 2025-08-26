@@ -2,6 +2,7 @@ use crate::admin::access_policies::{
     admin_create_access_policy, admin_delete_access_policy, admin_get_access_policy,
     admin_list_access_policies, admin_update_access_policy,
 };
+use crate::admin::bulk_message::admin_bulk_message;
 use crate::admin::companies::{
     admin_create_company, admin_delete_company, admin_get_company, admin_list_companies,
     admin_update_company,
@@ -57,6 +58,7 @@ use rocket::{Route, routes};
 
 pub mod access_policies;
 pub mod auth;
+pub mod bulk_message;
 pub mod companies;
 pub mod cost_plans;
 pub mod custom_pricing;
@@ -78,6 +80,7 @@ pub fn admin_routes() -> Vec<Route> {
         // User management
         admin_list_users,
         admin_update_user,
+        admin_bulk_message,
         // VM management
         admin_list_vms,
         admin_get_vm,

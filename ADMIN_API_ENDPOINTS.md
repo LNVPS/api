@@ -48,6 +48,43 @@ PATCH /api/admin/v1/users/{id}
 ```
 Required Permission: `users::update`
 
+#### Bulk Message Active Customers
+```
+POST /api/admin/v1/users/bulk-message
+```
+Dispatch a bulk message job to send messages to all active customers based on their contact preferences. The job is processed asynchronously by the worker system.
+
+Request body:
+```json
+{
+  "subject": "Message subject",
+  "message": "Message content"
+}
+```
+
+Response:
+```json
+{
+  "data": {
+    "job_dispatched": true,
+    "job_id": "1234567890-bulk-message"
+  }
+}
+```
+
+**Note:** The endpoint dispatches a work job and returns immediately with the job ID. The admin user will receive a completion notification via their contact preferences when the job finishes with full delivery statistics.
+
+**Active customers** are defined as users who:
+- Have at least one non-deleted VM (`vm.deleted = false`)
+- Have at least one contact method enabled (`contact_email = true` OR `contact_nip17 = true`)
+- Have the necessary contact information (email address for email, pubkey for NIP-17)
+
+**Message delivery priority:**
+1. Email (if `contact_email = true` and email address exists and SMTP configured)
+2. NIP-17 DM (if `contact_nip17 = true` and email failed/unavailable and Nostr configured)
+
+Required Permission: `users::update`
+
 Body (all optional):
 ```json
 {

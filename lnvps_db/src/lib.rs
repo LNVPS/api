@@ -291,6 +291,10 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Fetch raw string data from database bypassing EncryptedString decoding
     async fn fetch_raw_strings(&self, query: &str) -> Result<Vec<(u64, String)>>;
+
+    /// Get all active customers with their contact preferences for bulk messaging
+    /// Returns users who have at least one non-deleted VM and at least one contact method enabled
+    async fn get_active_customers_with_contact_prefs(&self) -> Result<Vec<crate::User>>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

@@ -963,6 +963,42 @@ impl LNVpsDbBase for LNVpsDbMysql {
         }
         Ok(results)
     }
+
+    async fn get_active_customers_with_contact_prefs(&self) -> Result<Vec<crate::User>> {
+        let query = r#"
+            SELECT DISTINCT 
+                u.id,
+                u.pubkey,
+                u.created,
+                u.email,
+                u.contact_nip17,
+                u.contact_email,
+                u.country_code,
+                u.billing_name,
+                u.billing_address_1,
+                u.billing_address_2,
+                u.billing_city,
+                u.billing_state,
+                u.billing_postcode,
+                u.billing_tax_id,
+                u.nwc_connection_string
+            FROM users u
+            INNER JOIN vm ON u.id = vm.user_id
+            WHERE vm.deleted = 0 
+            AND (
+                (u.contact_email = 1 AND u.email IS NOT NULL) 
+                OR 
+                u.contact_nip17 = 1
+            )
+            ORDER BY u.id
+        "#;
+
+        let users = sqlx::query_as::<_, crate::User>(query)
+            .fetch_all(&self.db)
+            .await?;
+
+        Ok(users)
+    }
 }
 
 #[cfg(feature = "nostr-domain")]

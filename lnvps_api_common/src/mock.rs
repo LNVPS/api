@@ -957,6 +957,29 @@ impl LNVpsDbBase for MockDb {
         // Mock implementation - returns empty result
         Ok(vec![])
     }
+
+    async fn get_active_customers_with_contact_prefs(&self) -> anyhow::Result<Vec<User>> {
+        let users = self.users.lock().await;
+        let vms = self.vms.lock().await;
+        
+        // Find users who have non-deleted VMs and contact preferences enabled
+        let mut active_customers = Vec::new();
+        
+        for user in users.values() {
+            // Check if user has at least one non-deleted VM
+            let has_active_vm = vms.values().any(|vm| vm.user_id == user.id && !vm.deleted);
+            
+            if has_active_vm && (user.contact_email || user.contact_nip17) {
+                // For email: check if they have an email address
+                // For nip17: they should have a pubkey (which all users do)
+                if (user.contact_email && user.email.is_some()) || user.contact_nip17 {
+                    active_customers.push(user.clone());
+                }
+            }
+        }
+        
+        Ok(active_customers)
+    }
 }
 
 pub struct MockExchangeRate {
@@ -1117,6 +1140,7 @@ impl lnvps_db::AdminDb for MockDb {
             .collect();
         Ok((paginated_users, total))
     }
+
 
     async fn admin_list_regions(
         &self,

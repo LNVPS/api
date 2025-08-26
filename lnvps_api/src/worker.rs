@@ -502,6 +502,72 @@ impl Worker {
         Ok(())
     }
 
+    async fn process_bulk_message(
+        &self,
+        subject: String,
+        message: String,
+        admin_user_id: u64,
+    ) -> Result<()> {
+        info!("Processing bulk message: '{}'", subject);
+        
+        // Get all active customers with contact preferences
+        let active_customers = self.db.get_active_customers_with_contact_prefs().await?;
+        let total_customers = active_customers.len();
+        
+        if total_customers == 0 {
+            info!("No active customers found for bulk message");
+            return Ok(());
+        }
+
+        info!("Sending bulk message to {} active customers", total_customers);
+        
+        let mut sent_count = 0;
+        let mut failed_count = 0;
+
+        for customer in active_customers {
+            // Personalize the message with customer name if available
+            let personalized_message = if let Some(ref name) = customer.billing_name {
+                format!("Dear {},\n\n{}", name, message)
+            } else {
+                format!("Dear Customer,\n\n{}", message)
+            };
+
+            // Use the existing send_notification method which handles both email and NIP-17
+            match self.send_notification(
+                customer.id, 
+                personalized_message, 
+                Some(subject.clone())
+            ).await {
+                Ok(_) => {
+                    sent_count += 1;
+                    info!("Bulk message sent to user ID: {}", customer.id);
+                }
+                Err(e) => {
+                    failed_count += 1;
+                    warn!("Failed to send bulk message to user ID {}: {}", customer.id, e);
+                }
+            }
+        }
+
+        info!(
+            "Bulk message completed: {} sent, {} failed out of {} total recipients",
+            sent_count, failed_count, total_customers
+        );
+
+        // Send completion notification to admin
+        self.queue_notification(
+            admin_user_id,
+            format!(
+                "Bulk message '{}' completed.\nSent: {}\nFailed: {}\nTotal recipients: {}",
+                subject, sent_count, failed_count, total_customers
+            ),
+            Some("Bulk Message Complete".to_string()),
+        )?;
+
+        Ok(())
+    }
+
+
     fn queue_admin_notification(&self, message: String, title: Option<String>) -> Result<()> {
         if let Some(a) = self.settings.smtp.as_ref().and_then(|s| s.admin) {
             self.queue_notification(a, message, title)?;
@@ -939,6 +1005,22 @@ impl Worker {
                     error!("Failed to send notification {}: {}", user_id, e);
                     // queue again for sending
                     self.queue_notification(*user_id, message.clone(), title.clone())?;
+                }
+            }
+            WorkJob::BulkMessage {
+                subject,
+                message,
+                admin_user_id,
+            } => {
+                if let Err(e) = self
+                    .process_bulk_message(subject.clone(), message.clone(), *admin_user_id)
+                    .await
+                {
+                    error!("Failed to process bulk message: {}", e);
+                    self.queue_admin_notification(
+                        format!("Failed to process bulk message:\nSubject: {}\nError: {}", subject, e),
+                        Some("Bulk Message Job Failed".to_string()),
+                    )?;
                 }
             }
             WorkJob::CheckVms => {
