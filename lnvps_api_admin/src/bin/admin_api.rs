@@ -3,7 +3,9 @@ use clap::Parser;
 use config::{Config, File};
 use lnvps_api_admin::admin;
 use lnvps_api_admin::settings::Settings;
-use lnvps_api_common::{VmStateCache, WorkCommander};
+use lnvps_api_common::{
+    ExchangeRateService, InMemoryRateCache, RedisExchangeRateService, VmStateCache, WorkCommander,
+};
 use lnvps_common::CORS;
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
 use log::{error, info};
@@ -52,16 +54,36 @@ async fn main() -> Result<(), Error> {
 
     // Initialize VM state cache
     let vm_state_cache = if let Some(redis_config) = &settings.redis {
-        VmStateCache::new_with_redis(redis_config.clone())?
+        VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {
         VmStateCache::new()
     };
 
     // Initialize WorkCommander for job distribution (publisher mode)
     let work_commander = if let Some(redis_config) = &settings.redis {
-        Some(WorkCommander::new_publisher(&redis_config.url)?)
+        Some(WorkCommander::new_publisher(&redis_config.url).await?)
     } else {
         None
+    };
+
+    // Initialize exchange rate service
+    let exchange: Arc<dyn ExchangeRateService> = if let Some(redis_config) = &settings.redis {
+        match RedisExchangeRateService::new(&redis_config.url) {
+            Ok(redis_service) => {
+                info!("Using Redis exchange rate service");
+                Arc::new(redis_service)
+            }
+            Err(e) => {
+                error!(
+                    "Failed to initialize Redis exchange rate service: {}, falling back to in-memory cache",
+                    e
+                );
+                Arc::new(InMemoryRateCache::default())
+            }
+        }
+    } else {
+        info!("Using in-memory exchange rate cache");
+        Arc::new(InMemoryRateCache::default())
     };
 
     let mut config = rocket::Config::default();
@@ -78,6 +100,7 @@ async fn main() -> Result<(), Error> {
         .manage(settings.clone())
         .manage(vm_state_cache.clone())
         .manage(work_commander)
+        .manage(exchange.clone())
         .mount("/", admin::admin_routes())
         .attach(CORS)
         .mount(

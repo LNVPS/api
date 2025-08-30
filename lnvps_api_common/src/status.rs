@@ -1,5 +1,6 @@
 use anyhow::Result;
 use redis::AsyncCommands;
+use redis::aio::MultiplexedConnection;
 use rocket::serde::Deserialize;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -83,15 +84,17 @@ impl VmStateCacheBackend for LocalVmStateCache {
 /// Redis-backed cache backend
 #[derive(Clone)]
 pub struct RedisVmStateCache {
-    client: Arc<redis::Client>,
+    client: redis::Client,
+    conn: MultiplexedConnection,
     ttl: Duration,
 }
 
 impl RedisVmStateCache {
-    pub fn new(config: RedisConfig) -> Result<Self> {
+    pub async fn new(config: RedisConfig) -> Result<Self> {
         let client = redis::Client::open(config.url)?;
         Ok(Self {
-            client: Arc::new(client),
+            conn: client.get_multiplexed_async_connection().await?,
+            client,
             ttl: Duration::from_secs(config.ttl),
         })
     }
@@ -107,7 +110,7 @@ impl VmStateCacheBackend for RedisVmStateCache {
         let key = self.vm_key(id);
         let serialized = serde_json::to_string(&state)?;
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn.clone();
         let _: () = conn.set_ex(&key, &serialized, self.ttl.as_secs()).await?;
         Ok(())
     }
@@ -115,7 +118,7 @@ impl VmStateCacheBackend for RedisVmStateCache {
     async fn get_state(&self, id: u64) -> Result<Option<VmRunningState>> {
         let key = self.vm_key(id);
 
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn.clone();
         match conn.get::<_, Option<String>>(&key).await? {
             Some(serialized) => {
                 let state = serde_json::from_str::<VmRunningState>(&serialized)?;
@@ -139,9 +142,9 @@ impl VmStateCache {
         }
     }
 
-    pub fn new_with_redis(config: RedisConfig) -> Result<Self> {
+    pub async fn new_with_redis(config: RedisConfig) -> Result<Self> {
         Ok(Self {
-            backend: Arc::new(RedisVmStateCache::new(config)?),
+            backend: Arc::new(RedisVmStateCache::new(config).await?),
         })
     }
 
