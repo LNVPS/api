@@ -21,7 +21,9 @@ use lnvps_api_common::{
     ApiData, ApiResult, ExchangeRateService, Nip98Auth, UpgradeConfig, VmStateCache, WorkJob,
 };
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
-use lnvps_db::{LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate};
+use lnvps_db::{
+    LNVpsDb, PaymentMethod, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
+};
 use log::{error, info};
 use nostr_sdk::{ToBech32, Url};
 use rocket::http::ContentType;
@@ -269,23 +271,19 @@ async fn v1_list_vm_templates(
     let templates = hc.list_available_vm_templates().await?;
 
     let cost_plans: HashSet<u64> = templates.iter().map(|t| t.cost_plan_id).collect();
-    let regions: HashSet<u64> = templates.iter().map(|t| t.region_id).collect();
+    let regions: HashMap<u64, VmHostRegion> = db
+        .list_host_region()
+        .await?
+        .into_iter()
+        .map(|h| (h.id, h))
+        .collect();
 
     let cost_plans: Vec<_> = cost_plans
         .into_iter()
         .map(|i| db.get_cost_plan(i))
         .collect();
-    let regions: Vec<_> = regions.into_iter().map(|r| db.get_host_region(r)).collect();
 
     let cost_plans: HashMap<u64, lnvps_db::VmCostPlan> = join_all(cost_plans)
-        .await
-        .into_iter()
-        .filter_map(|c| {
-            let c = c.ok()?;
-            Some((c.id, c))
-        })
-        .collect();
-    let regions: HashMap<u64, lnvps_db::VmHostRegion> = join_all(regions)
         .await
         .into_iter()
         .filter_map(|c| {
@@ -329,7 +327,11 @@ async fn v1_list_vm_templates(
                 .into_iter()
                 .filter_map(|t| {
                     let region = regions.get(&t.region_id)?;
-                    ApiCustomTemplateParams::from(&t, &custom_template_disks, region).ok()
+                    Some(ApiCustomTemplateParams::from(
+                        &t,
+                        &custom_template_disks,
+                        region,
+                    ))
                 })
                 .collect();
 
