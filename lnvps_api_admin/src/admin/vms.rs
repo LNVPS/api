@@ -1,8 +1,8 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo};
-use chrono::Days;
+use crate::admin::model::{AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse};
+use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, VmHistoryLogger, VmRunningState,
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, ExchangeRateService, PricingEngine, VmHistoryLogger, VmRunningState,
     VmStateCache, WorkCommander, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
@@ -191,7 +191,7 @@ pub async fn admin_start_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     work_commander: &State<Option<WorkCommander>>,
     id: u64,
-) -> ApiResult<()> {
+) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
@@ -213,7 +213,7 @@ pub async fn admin_start_vm(
         match commander.send_job(start_job).await {
             Ok(stream_id) => {
                 info!("VM start job queued with stream ID: {}", stream_id);
-                ApiData::ok(())
+                ApiData::ok(JobResponse { job_id: stream_id })
             }
             Err(e) => {
                 error!("Failed to queue VM start job: {}", e);
@@ -234,7 +234,7 @@ pub async fn admin_stop_vm(
     db: &State<Arc<dyn LNVpsDb>>,
     work_commander: &State<Option<WorkCommander>>,
     id: u64,
-) -> ApiResult<()> {
+) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
@@ -256,7 +256,7 @@ pub async fn admin_stop_vm(
         match commander.send_job(stop_job).await {
             Ok(stream_id) => {
                 info!("VM stop job queued with stream ID: {}", stream_id);
-                ApiData::ok(())
+                ApiData::ok(JobResponse { job_id: stream_id })
             }
             Err(e) => {
                 error!("Failed to queue VM stop job: {}", e);
@@ -281,6 +281,14 @@ pub struct AdminExtendVmRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct AdminProcessRefundRequest {
+    pub payment_method: Option<String>,
+    pub refund_from_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub reason: Option<String>,
+    pub lightning_invoice: Option<String>,
+}
+
 /// Delete a VM
 #[delete("/api/admin/v1/vms/<id>", data = "<req>")]
 pub async fn admin_delete_vm(
@@ -289,7 +297,7 @@ pub async fn admin_delete_vm(
     work_commander: &State<Option<WorkCommander>>,
     id: u64,
     req: Option<rocket::serde::json::Json<AdminDeleteVmRequest>>,
-) -> ApiResult<()> {
+) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Delete)?;
 
@@ -315,7 +323,7 @@ pub async fn admin_delete_vm(
         match commander.send_job(delete_job).await {
             Ok(stream_id) => {
                 info!("VM deletion job queued with stream ID: {}", stream_id);
-                ApiData::ok(())
+                ApiData::ok(JobResponse { job_id: stream_id })
             }
             Err(e) => {
                 error!("Failed to queue VM deletion job: {}", e);
@@ -518,5 +526,125 @@ pub async fn admin_get_vm_payment(
     let admin_payment_info = AdminVmPaymentInfo::from_vm_payment(&payment);
 
     ApiData::ok(admin_payment_info)
+}
+
+/// Calculate pro-rated refund amount for a VM
+#[get("/api/admin/v1/vms/<vm_id>/refund?<method>&<from_date>")]
+pub async fn admin_calculate_vm_refund(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    exchange: &State<Arc<dyn ExchangeRateService>>,
+    vm_id: u64,
+    method: Option<String>,
+    from_date: Option<i64>,
+) -> ApiResult<AdminRefundAmountInfo> {
+    // Check permission
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+
+    // Verify VM exists
+    let vm = db.get_vm(vm_id).await?;
+
+    // Parse payment method
+    let payment_method = match method.as_deref() {
+        Some(method_str) => match method_str.parse::<lnvps_db::PaymentMethod>() {
+            Ok(method) => method,
+            Err(_) => return ApiData::err("Invalid payment method"),
+        },
+        None => lnvps_db::PaymentMethod::Lightning, // Default
+    };
+
+    // Parse from_date parameter or use current time
+    let calculation_date = if let Some(timestamp) = from_date {
+        match DateTime::from_timestamp(timestamp, 0) {
+            Some(parsed_date) => parsed_date,
+            None => return ApiData::err("Invalid from_date timestamp"),
+        }
+    } else {
+        Utc::now()
+    };
+
+    // Create pricing engine instance with real exchange rates
+    let tax_rates = std::collections::HashMap::new();
+    
+    let pricing_engine = PricingEngine::new_for_vm(
+        db.inner().clone(),
+        exchange.inner().clone(),
+        tax_rates,
+        vm_id,
+    ).await?;
+
+    // Calculate the refund amount from the specified date
+    let refund_result = pricing_engine.calculate_refund_amount_from_date(vm_id, payment_method, calculation_date).await?;
+
+    let refund_info = AdminRefundAmountInfo {
+        amount: refund_result.amount.value(),
+        currency: refund_result.amount.currency().to_string(),
+        rate: refund_result.rate.rate,
+        expires: vm.expires,
+        seconds_remaining: (vm.expires - calculation_date).num_seconds(),
+    };
+
+    ApiData::ok(refund_info)
+}
+
+/// Process a refund for a VM automatically via work job
+#[post("/api/admin/v1/vms/<vm_id>/refund", data = "<req>")]
+pub async fn admin_process_vm_refund(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    work_commander: &State<Option<WorkCommander>>,
+    vm_id: u64,
+    req: rocket::serde::json::Json<AdminProcessRefundRequest>,
+) -> ApiResult<JobResponse> {
+    // Check permission
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+
+    // Verify VM exists
+    let _vm = db.get_vm(vm_id).await?;
+
+    // Validate payment method
+    let payment_method = req.payment_method.clone().unwrap_or_else(|| "lightning".to_string());
+    match payment_method.as_str() {
+        "lightning" | "revolut" | "paypal" => {},
+        _ => return ApiData::err("Invalid payment method. Must be 'lightning', 'revolut', or 'paypal'"),
+    }
+
+    // For lightning payments, require invoice
+    if payment_method == "lightning" && req.lightning_invoice.is_none() {
+        return ApiData::err("Lightning invoice is required when payment method is 'lightning'");
+    }
+
+    // For non-lightning payments, ensure invoice is not provided
+    if payment_method != "lightning" && req.lightning_invoice.is_some() {
+        return ApiData::err("Lightning invoice should only be provided when payment method is 'lightning'");
+    }
+
+    // Check if WorkCommander is available for distributed processing
+    if let Some(commander) = work_commander.as_ref() {
+        // Send refund job via Redis stream for distributed processing
+        let refund_job = WorkJob::ProcessVmRefund {
+            vm_id,
+            admin_user_id: auth.user_id,
+            refund_from_date: req.refund_from_date,
+            reason: req.reason.clone(),
+            payment_method,
+            lightning_invoice: req.lightning_invoice.clone(),
+        };
+
+        match commander.send_job(refund_job).await {
+            Ok(stream_id) => {
+                info!("VM refund job queued with stream ID: {}", stream_id);
+                ApiData::ok(JobResponse { job_id: stream_id })
+            }
+            Err(e) => {
+                error!("Failed to queue VM refund job: {}", e);
+                ApiData::err("Failed to queue VM refund job")
+            }
+        }
+    } else {
+        // WorkCommander not available - cannot process refund
+        error!("WorkCommander not configured - cannot process VM refund");
+        ApiData::err("VM refund service is not available")
+    }
 }
 

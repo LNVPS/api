@@ -51,9 +51,10 @@ use crate::admin::vm_templates::{
     admin_list_vm_templates, admin_update_vm_template,
 };
 use crate::admin::vms::{
-    admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
-    admin_list_vm_history, admin_list_vm_payments, admin_list_vms, admin_start_vm, admin_stop_vm,
+    admin_calculate_vm_refund, admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
+    admin_list_vm_history, admin_list_vm_payments, admin_list_vms, admin_process_vm_refund, admin_start_vm, admin_stop_vm,
 };
+use crate::admin::websocket::admin_job_feedback_websocket;
 use rocket::{Route, routes};
 
 pub mod access_policies;
@@ -74,6 +75,7 @@ pub mod vm_ip_assignments;
 pub mod vm_os_images;
 pub mod vm_templates;
 pub mod vms;
+pub mod websocket;
 
 pub fn admin_routes() -> Vec<Route> {
     routes![
@@ -94,6 +96,8 @@ pub fn admin_routes() -> Vec<Route> {
         // VM Payment management
         admin_list_vm_payments,
         admin_get_vm_payment,
+        admin_calculate_vm_refund,
+        admin_process_vm_refund,
         // Host management
         admin_list_hosts,
         admin_get_host,
@@ -179,5 +183,7 @@ pub fn admin_routes() -> Vec<Route> {
         // Reports
         admin_time_series_report,
         admin_referral_time_series_report,
+        // WebSocket endpoints
+        admin_job_feedback_websocket,
     ]
 }

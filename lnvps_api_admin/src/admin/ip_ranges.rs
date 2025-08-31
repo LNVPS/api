@@ -5,8 +5,8 @@ use crate::admin::model::{
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode, LNVpsDb};
 use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
-use std::net::{IpAddr, Ipv4Addr};
+use rocket::{State, delete, get, patch, post};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// List all IP ranges with pagination and optional region filtering

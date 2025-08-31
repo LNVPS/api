@@ -9,16 +9,14 @@ use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
-    NetworkProvisioner, RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState,
-    VmRunningStates, VmStateCache, WorkCommander, WorkJob,
+    JobFeedbackStatus, NetworkProvisioner, RedisConfig, UpgradeConfig, VmHistoryLogger,
+    VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkJob,
 };
-use lnvps_db::{LNVpsDb, PaymentMethod, Vm, VmHost, VmIpAssignment};
+use lnvps_db::{LNVpsDb, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::ops::{Add, Sub};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -63,7 +61,7 @@ impl From<&Settings> for WorkerSettings {
 impl Worker {
     const CHECK_VMS_SECONDS: u64 = 30;
 
-    pub fn new(
+    pub async fn new(
         db: Arc<dyn LNVpsDb>,
         provisioner: Arc<LNVpsProvisioner>,
         settings: impl Into<WorkerSettings>,
@@ -75,11 +73,7 @@ impl Worker {
         let settings = settings.into();
 
         let work_commander = if let Some(redis_config) = &settings.redis {
-            Some(WorkCommander::new(
-                &redis_config.url,
-                "workers",
-                "api-worker",
-            )?)
+            Some(WorkCommander::new(&redis_config.url, "workers", "api-worker").await?)
         } else {
             None
         };
@@ -509,18 +503,21 @@ impl Worker {
         admin_user_id: u64,
     ) -> Result<()> {
         info!("Processing bulk message: '{}'", subject);
-        
+
         // Get all active customers with contact preferences
         let active_customers = self.db.get_active_customers_with_contact_prefs().await?;
         let total_customers = active_customers.len();
-        
+
         if total_customers == 0 {
             info!("No active customers found for bulk message");
             return Ok(());
         }
 
-        info!("Sending bulk message to {} active customers", total_customers);
-        
+        info!(
+            "Sending bulk message to {} active customers",
+            total_customers
+        );
+
         let mut sent_count = 0;
         let mut failed_count = 0;
 
@@ -533,18 +530,20 @@ impl Worker {
             };
 
             // Use the existing send_notification method which handles both email and NIP-17
-            match self.send_notification(
-                customer.id, 
-                personalized_message, 
-                Some(subject.clone())
-            ).await {
+            match self
+                .send_notification(customer.id, personalized_message, Some(subject.clone()))
+                .await
+            {
                 Ok(_) => {
                     sent_count += 1;
                     info!("Bulk message sent to user ID: {}", customer.id);
                 }
                 Err(e) => {
                     failed_count += 1;
-                    warn!("Failed to send bulk message to user ID {}: {}", customer.id, e);
+                    warn!(
+                        "Failed to send bulk message to user ID {}: {}",
+                        customer.id, e
+                    );
                 }
             }
         }
@@ -566,7 +565,6 @@ impl Worker {
 
         Ok(())
     }
-
 
     fn queue_admin_notification(&self, message: String, title: Option<String>) -> Result<()> {
         if let Some(a) = self.settings.smtp.as_ref().and_then(|s| s.admin) {
@@ -972,7 +970,12 @@ impl Worker {
         Ok(())
     }
 
-    async fn try_job(&mut self, job: &WorkJob) -> Result<()> {
+    async fn try_job(
+        &mut self,
+        job: &WorkJob,
+        stream_id: Option<&str>,
+        commander: Option<&WorkCommander>,
+    ) -> Result<()> {
         match job {
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
@@ -1012,15 +1015,22 @@ impl Worker {
                 message,
                 admin_user_id,
             } => {
-                if let Err(e) = self
-                    .process_bulk_message(subject.clone(), message.clone(), *admin_user_id)
-                    .await
-                {
-                    error!("Failed to process bulk message: {}", e);
-                    self.queue_admin_notification(
-                        format!("Failed to process bulk message:\nSubject: {}\nError: {}", subject, e),
-                        Some("Bulk Message Job Failed".to_string()),
-                    )?;
+                self.process_bulk_message(subject.clone(), message.clone(), *admin_user_id)
+                    .await?;
+
+                // Send specific job feedback for admin-initiated bulk message
+                if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                    let feedback = commander.create_job_completed_feedback(
+                        stream_id.to_string(),
+                        "Bulk Message".to_string(),
+                        Some(format!(
+                            "Bulk message '{}' sent successfully",
+                            subject.trim()
+                        )),
+                    );
+                    if let Err(e) = commander.publish_feedback(&feedback).await {
+                        warn!("Failed to publish BulkMessage job feedback: {}", e);
+                    }
                 }
             }
             WorkJob::CheckVms => {
@@ -1037,23 +1047,13 @@ impl Worker {
                 reason,
                 admin_user_id,
             } => {
-                info!("Processing admin delete request for VM {}", vm_id);
-
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
-                    info!("VM {} is already marked as deleted", vm_id);
                     return Ok(());
                 }
 
                 // Delete the VM via provisioner
-                if let Err(e) = self.provisioner.delete_vm(*vm_id).await {
-                    error!("Failed to delete VM {} via provisioner: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to delete VM {} via provisioner:\n{}", vm_id, e),
-                        Some(format!("VM {} Deletion Failed", vm_id)),
-                    )?;
-                    return Err(e);
-                }
+                self.provisioner.delete_vm(*vm_id).await?;
 
                 // Log VM deletion
                 let metadata = if let Some(admin_id) = admin_user_id {
@@ -1067,27 +1067,23 @@ impl Worker {
                     }))
                 };
 
-                if let Err(e) = self
-                    .vm_history_logger
+                self.vm_history_logger
                     .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
-                    .await
-                {
-                    warn!("Failed to log VM {} deletion: {}", vm_id, e);
-                }
+                    .await?;
 
                 // Send notifications
                 let reason_text = reason.as_deref().unwrap_or("Admin requested deletion");
                 let title = Some(format!("[VM{}] Deleted by Admin", vm_id));
 
                 // Notify user
-                self.tx.send(WorkJob::SendNotification {
-                    user_id: vm.user_id,
-                    title: title.clone(),
-                    message: format!(
+                self.queue_notification(
+                    vm.user_id,
+                    format!(
                         "Your VM #{} has been deleted by an administrator.\nReason: {}",
                         vm_id, reason_text
                     ),
-                })?;
+                    title.clone(),
+                )?;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1098,43 +1094,40 @@ impl Worker {
                     title,
                 )?;
 
-                info!("Successfully deleted VM {} at admin request", vm_id);
+                // Send specific job feedback for admin-initiated deletion
+                if admin_user_id.is_some() {
+                    if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                        let feedback = commander.create_job_completed_feedback(
+                            stream_id.to_string(),
+                            "Delete VM".to_string(),
+                            Some(format!("VM {} deleted successfully", vm_id)),
+                        );
+                        if let Err(e) = commander.publish_feedback(&feedback).await {
+                            warn!("Failed to publish DeleteVm job feedback: {}", e);
+                        }
+                    }
+                }
             }
             WorkJob::StartVm {
                 vm_id,
                 admin_user_id,
             } => {
-                info!("Processing admin start request for VM {}", vm_id);
-
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
-                    error!("Cannot start deleted VM {}", vm_id);
-                    return Ok(());
+                    bail!("Cannot start deleted VM {}", vm_id);
                 }
 
                 // Check if VM is expired
                 if vm.expires < Utc::now() {
-                    warn!("Attempting to start expired VM {}", vm_id);
-                    // Send notification to admin about the expired VM
-                    self.queue_admin_notification(
-                        format!(
-                            "Cannot start VM {} - it has expired (expires: {})",
-                            vm_id, vm.expires
-                        ),
-                        Some(format!("VM {} Start Failed - Expired", vm_id)),
-                    )?;
-                    return Ok(());
+                    bail!(
+                        "Cannot start expired VM {} - it has expired (expires: {})",
+                        vm_id,
+                        vm.expires
+                    );
                 }
 
                 // Start the VM via provisioner
-                if let Err(e) = self.provisioner.start_vm(*vm_id).await {
-                    error!("Failed to start VM {} via provisioner: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to start VM {} via provisioner:\n{}", vm_id, e),
-                        Some(format!("VM {} Start Failed", vm_id)),
-                    )?;
-                    return Err(e);
-                }
+                self.provisioner.start_vm(*vm_id).await?;
 
                 // Log VM start
                 let metadata = if let Some(admin_id) = admin_user_id {
@@ -1148,22 +1141,18 @@ impl Worker {
                     }))
                 };
 
-                if let Err(e) = self
-                    .vm_history_logger
+                self.vm_history_logger
                     .log_vm_started(*vm_id, *admin_user_id, metadata)
-                    .await
-                {
-                    warn!("Failed to log VM {} start: {}", vm_id, e);
-                }
+                    .await?;
 
                 let title = Some(format!("[VM{}] Started by Admin", vm_id));
 
                 // Notify user
-                self.tx.send(WorkJob::SendNotification {
-                    user_id: vm.user_id,
-                    title: title.clone(),
-                    message: format!("Your VM #{} has been started by an administrator.", vm_id),
-                })?;
+                self.queue_notification(
+                    vm.user_id,
+                    format!("Your VM #{} has been started by an administrator.", vm_id),
+                    title.clone(),
+                )?;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1174,29 +1163,31 @@ impl Worker {
                     title,
                 )?;
 
-                info!("Successfully started VM {} at admin request", vm_id);
+                // Send specific job feedback for admin-initiated jobs
+                if admin_user_id.is_some() {
+                    if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                        let feedback = commander.create_job_completed_feedback(
+                            stream_id.to_string(),
+                            "Start VM".to_string(),
+                            Some(format!("VM {} started successfully", vm_id)),
+                        );
+                        if let Err(e) = commander.publish_feedback(&feedback).await {
+                            warn!("Failed to publish StartVm job feedback: {}", e);
+                        }
+                    }
+                }
             }
             WorkJob::StopVm {
                 vm_id,
                 admin_user_id,
             } => {
-                info!("Processing admin stop request for VM {}", vm_id);
-
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
-                    error!("Cannot stop deleted VM {}", vm_id);
-                    return Ok(());
+                    bail!("Cannot stop deleted VM {}", vm_id);
                 }
 
                 // Stop the VM via provisioner
-                if let Err(e) = self.provisioner.stop_vm(*vm_id).await {
-                    error!("Failed to stop VM {} via provisioner: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to stop VM {} via provisioner:\n{}", vm_id, e),
-                        Some(format!("VM {} Stop Failed", vm_id)),
-                    )?;
-                    return Err(e);
-                }
+                self.provisioner.stop_vm(*vm_id).await?;
 
                 // Log VM stop
                 let metadata = if let Some(admin_id) = admin_user_id {
@@ -1210,22 +1201,18 @@ impl Worker {
                     }))
                 };
 
-                if let Err(e) = self
-                    .vm_history_logger
+                self.vm_history_logger
                     .log_vm_stopped(*vm_id, *admin_user_id, metadata)
-                    .await
-                {
-                    warn!("Failed to log VM {} stop: {}", vm_id, e);
-                }
+                    .await?;
 
                 let title = Some(format!("[VM{}] Stopped by Admin", vm_id));
 
                 // Notify user
-                self.tx.send(WorkJob::SendNotification {
-                    user_id: vm.user_id,
-                    title: title.clone(),
-                    message: format!("Your VM #{} has been stopped by an administrator.", vm_id),
-                })?;
+                self.queue_notification(
+                    vm.user_id,
+                    format!("Your VM #{} has been stopped by an administrator.", vm_id),
+                    title.clone(),
+                )?;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1236,36 +1223,28 @@ impl Worker {
                     title,
                 )?;
 
-                info!("Successfully stopped VM {} at admin request", vm_id);
+                // Send specific job feedback for admin-initiated stop
+                if admin_user_id.is_some() {
+                    if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                        let feedback = commander.create_job_completed_feedback(
+                            stream_id.to_string(),
+                            "Stop VM".to_string(),
+                            Some(format!("VM {} stopped successfully", vm_id)),
+                        );
+                        if let Err(e) = commander.publish_feedback(&feedback).await {
+                            warn!("Failed to publish StopVm job feedback: {}", e);
+                        }
+                    }
+                }
             }
             WorkJob::ProcessVmUpgrade { vm_id, config } => {
-                info!("Processing VM upgrade for VM {}", vm_id);
-                if let Err(e) = self.process_vm_upgrade(*vm_id, config).await {
-                    error!("Failed to process VM upgrade for VM {}: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to upgrade VM {}:\n{}", vm_id, e),
-                        Some("VM Upgrade Failed".to_string()),
-                    )?
-                }
+                self.process_vm_upgrade(*vm_id, config).await?;
             }
             WorkJob::ConfigureVm {
                 vm_id,
                 admin_user_id,
             } => {
-                info!("Processing admin configure request for VM {}", vm_id);
-                if let Err(e) = self.configure_vm(*vm_id, *admin_user_id).await {
-                    error!("Failed to configure VM {}: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to configure VM {}:\n{}", vm_id, e),
-                        Some(format!("VM {} Configuration Failed", vm_id)),
-                    )?;
-                } else {
-                    info!("Successfully configured VM {} at admin request", vm_id);
-                    self.queue_admin_notification(
-                        format!("VM {} has been successfully re-configured using current database settings", vm_id),
-                        Some(format!("VM {} Configuration Complete", vm_id)),
-                    )?;
-                }
+                self.configure_vm(*vm_id, *admin_user_id).await?;
             }
             WorkJob::CheckNostrDomains => {
                 info!("Processing check nostr domains job");
@@ -1283,79 +1262,76 @@ impl Worker {
                 ip,
                 admin_user_id,
             } => {
-                info!("Processing IP assignment for VM {}", vm_id);
-                if let Err(e) = self
-                    .assign_vm_ip(*vm_id, *ip_range_id, ip.clone(), *admin_user_id)
-                    .await
-                {
-                    error!("Failed to assign IP to VM {}: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to assign IP to VM {}:\n{}", vm_id, e),
-                        Some(format!("VM {} IP Assignment Failed", vm_id)),
-                    )?;
-                } else {
-                    info!("Successfully assigned IP to VM {} at admin request", vm_id);
-                    self.queue_admin_notification(
-                        format!(
-                            "IP has been successfully assigned to VM {} using provisioner",
-                            vm_id
-                        ),
-                        Some(format!("VM {} IP Assignment Complete", vm_id)),
-                    )?;
+                self.assign_vm_ip(*vm_id, *ip_range_id, ip.clone(), *admin_user_id)
+                    .await?;
+
+                // Send specific job feedback for admin-initiated IP assignment
+                if admin_user_id.is_some() {
+                    if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                        let feedback = commander.create_job_completed_feedback(
+                            stream_id.to_string(),
+                            "Assign VM IP".to_string(),
+                            Some(format!(
+                                "IP assignment to VM {} completed successfully",
+                                vm_id
+                            )),
+                        );
+                        if let Err(e) = commander.publish_feedback(&feedback).await {
+                            warn!("Failed to publish AssignVmIp job feedback: {}", e);
+                        }
+                    }
                 }
             }
             WorkJob::UnassignVmIp {
                 assignment_id,
                 admin_user_id,
             } => {
-                info!(
-                    "Processing IP unassignment for assignment {}",
-                    assignment_id
-                );
-                if let Err(e) = self.unassign_vm_ip(*assignment_id, *admin_user_id).await {
-                    error!("Failed to unassign IP assignment {}: {}", assignment_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to unassign IP assignment {}:\n{}", assignment_id, e),
-                        Some(format!("IP Assignment {} Removal Failed", assignment_id)),
-                    )?;
-                } else {
-                    info!(
-                        "Successfully unassigned IP assignment {} at admin request",
-                        assignment_id
-                    );
-                    self.queue_admin_notification(
-                        format!(
-                            "IP assignment {} has been successfully removed using provisioner",
-                            assignment_id
-                        ),
-                        Some(format!("IP Assignment {} Removal Complete", assignment_id)),
-                    )?;
+                self.unassign_vm_ip(*assignment_id, *admin_user_id).await?;
+
+                // Send specific job feedback for admin-initiated IP unassignment
+                if admin_user_id.is_some() {
+                    if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                        let feedback = commander.create_job_completed_feedback(
+                            stream_id.to_string(),
+                            "Unassign VM IP".to_string(),
+                            Some(format!("IP unassignment from VM completed successfully")),
+                        );
+                        if let Err(e) = commander.publish_feedback(&feedback).await {
+                            warn!("Failed to publish UnassignVmIp job feedback: {}", e);
+                        }
+                    }
                 }
             }
             WorkJob::UpdateVmIp {
                 assignment_id,
                 admin_user_id,
             } => {
-                info!("Processing IP update for assignment {}", assignment_id);
-                if let Err(e) = self.update_vm_ip(*assignment_id, *admin_user_id).await {
-                    error!("Failed to update IP assignment {}: {}", assignment_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to update IP assignment {}:\n{}", assignment_id, e),
-                        Some(format!("IP Assignment {} Removal Failed", assignment_id)),
-                    )?;
-                } else {
-                    info!(
-                        "Successfully updated IP assignment {} at admin request",
-                        assignment_id
-                    );
-                    self.queue_admin_notification(
-                        format!(
-                            "IP assignment {} has been successfully updated using provisioner",
-                            assignment_id
-                        ),
-                        Some(format!("IP Assignment {} update Complete", assignment_id)),
-                    )?;
+                self.update_vm_ip(*assignment_id, *admin_user_id).await?;
+
+                // Send specific job feedback for admin-initiated IP update
+                if admin_user_id.is_some() {
+                    if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                        let feedback = commander.create_job_completed_feedback(
+                            stream_id.to_string(),
+                            "Update VM IP".to_string(),
+                            Some("IP configuration updated successfully".to_string()),
+                        );
+                        if let Err(e) = commander.publish_feedback(&feedback).await {
+                            warn!("Failed to publish UpdateVmIp job feedback: {}", e);
+                        }
+                    }
                 }
+            }
+            WorkJob::ProcessVmRefund {
+                vm_id: _,
+                admin_user_id: _,
+                refund_from_date: _,
+                reason: _,
+                payment_method: _,
+                lightning_invoice: _,
+            } => {
+                // TODO: Implement the actual refund processing logic
+                bail!("Refund processing is not yet implemented");
             }
         }
         Ok(())
@@ -1630,6 +1606,7 @@ impl Worker {
             "Successfully assigned IP {} to VM {} from range {}",
             assignment.ip, vm_id, ip_range_id
         );
+
         Ok(())
     }
 
@@ -1734,7 +1711,7 @@ impl Worker {
                         w.send_job(job).await?;
                     } else {
                         // handle job directly if redis is not used
-                        if let Err(e) = self.try_job(&job).await {
+                        if let Err(e) = self.try_job(&job, None, None).await {
                             error!("Job failed to execute: {:?} {}", job, e);
                         }
                     }
@@ -1743,17 +1720,40 @@ impl Worker {
                 redis_result = async {
                     self.work_commander.as_ref().unwrap().listen_for_jobs().await
                 }, if self.work_commander.is_some() => {
+                    let mut commander = self.work_commander.as_ref().unwrap().clone();
                     match redis_result {
                         Ok(jobs) => {
                             for (stream_id, job) in jobs {
-                                if let Err(e) = self.try_job(&job).await {
-                                    error!("Failed to process Redis stream job: {:?} {}", job, e);
-                                }
+                                let job_type = job.to_string();
 
-                                // Always try to acknowledge the job
-                                if let Err(e) = self.work_commander.as_ref().unwrap().acknowledge_job(&stream_id).await {
-                                    error!("Failed to acknowledge job {}: {}", stream_id, e);
-                                }
+                                // Create feedback messages first
+                                commander.publish_feedback(&commander.create_job_started_feedback(stream_id.clone(), job_type.clone())).await?;
+
+                                // Execute the job
+                                let job_result = self.try_job(&job, Some(&stream_id), Some(&commander)).await;
+
+                                // Handle feedback based on result
+                                    match job_result {
+                                        Ok(_) => {
+                                            // Generic completion feedback - admin jobs provide their own specific feedback
+                                        }
+                                        Err(ref e) => {
+                                            error!("Failed to process Redis stream job: {:?} {}", job, e);
+                                            let failed_feedback = commander.create_job_failed_feedback(
+                                                stream_id.clone(),
+                                                job_type.clone(),
+                                                e.to_string()
+                                            );
+                                            if let Err(feedback_err) = commander.publish_feedback(&failed_feedback).await {
+                                                warn!("Failed to publish job failed feedback for {}: {}", stream_id, feedback_err);
+                                            }
+                                        }
+                                    }
+
+                                    // Always try to acknowledge the job
+                                    if let Err(e) = commander.acknowledge_job(&stream_id).await {
+                                        error!("Failed to acknowledge job {}: {}", stream_id, e);
+                                    }
                             }
                         }
                         Err(e) => {

@@ -891,7 +891,7 @@ mod tests {
     use super::*;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
-    use lnvps_api_common::{DefaultRateCache, MockDb, MockExchangeRate, Ticker};
+    use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate, Ticker};
     use lnvps_db::{DiskInterface, DiskType, LNVpsDbBase, User, UserSshKey, VmTemplate};
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -1078,7 +1078,7 @@ mod tests {
         let settings = settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
-        let rates = Arc::new(DefaultRateCache::default());
+        let rates = Arc::new(InMemoryRateCache::default());
         let prov = LNVpsProvisioner::new(settings.clone(), db.clone(), node.clone(), rates.clone());
 
         let large_template = VmTemplate {

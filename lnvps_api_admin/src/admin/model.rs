@@ -131,6 +131,20 @@ pub enum AdminUserRole {
     ReadOnly,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebSocketMessage {
+    Connected { message: String },
+    Pong,
+    Error { error: String },
+    JobFeedback { feedback: lnvps_api_common::JobFeedback },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JobResponse {
+    pub job_id: String,
+}
+
 #[derive(Serialize)]
 pub struct PaginatedResponse<T> {
     pub data: Vec<T>,
@@ -1580,6 +1594,20 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AdminRefundAmountInfo {
+    /// The refund amount in smallest currency units (cents for fiat, milli-sats for BTC)
+    pub amount: u64,
+    /// The currency of the refund amount
+    pub currency: String,
+    /// Exchange rate used for conversion (if applicable)
+    pub rate: f32,
+    /// VM expiry date
+    pub expires: DateTime<Utc>,
+    /// Seconds remaining until VM expires
+    pub seconds_remaining: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

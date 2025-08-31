@@ -136,11 +136,29 @@ POST /api/admin/v1/vms/{id}/start
 ```
 Required Permission: `virtual_machines::update`
 
+Response:
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
 #### Stop VM
 ```
 POST /api/admin/v1/vms/{id}/stop
 ```
 Required Permission: `virtual_machines::update`
+
+Response:
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
 
 #### Delete VM
 ```
@@ -154,6 +172,68 @@ Body (optional):
   "reason": "string"
 }
 ```
+
+Response:
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
+#### Calculate VM Refund
+```
+GET /api/admin/v1/vms/{vm_id}/refund?method={payment_method}&from_date={unix_timestamp}
+```
+Required Permission: `virtual_machines::view`
+
+Query Parameters:
+- `method`: string (required) - Payment method: "lightning", "revolut", "paypal"
+- `from_date`: number (optional) - Unix timestamp to calculate refund from (defaults to current time)
+
+Returns calculated pro-rated refund amount for the VM based on remaining time from the specified date and payment method.
+
+Response:
+```json
+{
+  "data": {
+    "amount": number,      // Refund amount in the currency
+    "currency": "string",  // Currency code (USD, EUR, etc.)
+    "rate": number         // Exchange rate used for calculation
+  }
+}
+```
+
+#### Process VM Refund
+```
+POST /api/admin/v1/vms/{vm_id}/refund
+```
+Required Permission: `virtual_machines::delete`
+
+Initiates an automated refund process for a VM. This creates a work job that will be processed asynchronously by the worker system.
+
+Body:
+```json
+{
+  "payment_method": "lightning",                    // Required - "lightning", "revolut", "paypal"
+  "refund_from_date": 1705312200,                  // Optional - Unix timestamp to calculate refund from (defaults to current time)
+  "reason": "Customer requested cancellation",     // Optional - Reason for the refund
+  "lightning_invoice": "lnbc..."                   // Required when payment_method is "lightning"
+}
+```
+
+Response:
+```json
+{
+  "data": {
+    "job_dispatched": true,
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
+**Note:** The refund is processed asynchronously via work jobs. The admin will receive notifications about the refund status through their configured contact preferences.
 
 
 #### Extend VM
@@ -1234,7 +1314,17 @@ Body:
 
 Note: If `ip` is not provided, the system will automatically assign an available IP from the specified range using the range's allocation mode (sequential, random, or SLAAC EUI-64). If `ip` is provided, it must be within the specified IP range's CIDR and not already assigned to another VM.
 
-**Automatic VM Configuration:** After successful IP assignment, a ConfigureVm work job is automatically queued to update the VM's network configuration.
+**Asynchronous Processing:** This endpoint dispatches an `AssignVmIp` work job for distributed processing. The operation returns immediately with a job ID. Use the job feedback pub/sub channels to monitor progress.
+
+Response:
+```json
+{
+  "data": {
+    "job_dispatched": true,
+    "job_id": "stream-id-12345"
+  }
+}
+```
 
 #### Update VM IP Assignment
 ```
@@ -1252,6 +1342,18 @@ Body (all optional):
 }
 ```
 
+**Asynchronous Processing:** This endpoint dispatches an `UpdateVmIp` work job for distributed processing. The operation returns immediately with a job ID.
+
+Response:
+```json
+{
+  "data": {
+    "job_dispatched": true,
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
 #### Delete VM IP Assignment
 ```
 DELETE /api/admin/v1/vm_ip_assignments/{id}
@@ -1260,7 +1362,151 @@ Required Permission: `virtual_machines::update`
 
 Soft-deletes the VM IP assignment, marking it as deleted rather than permanently removing it from the database.
 
-**Automatic VM Configuration:** After successful IP assignment deletion, a ConfigureVm work job is automatically queued to update the VM's network configuration.
+Response:
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
+**Asynchronous Processing:** This endpoint dispatches an `UnassignVmIp` work job for distributed processing. The operation returns immediately with a job ID.
+
+### Work Job Feedback System
+
+Many admin endpoints now dispatch work jobs for asynchronous processing instead of blocking operations. This provides better performance and scalability for resource-intensive operations.
+
+#### Job Feedback Channels
+
+Work jobs publish real-time feedback via Redis pub/sub channels:
+
+**Specific job feedback:** `worker:feedback:{job_id}` - Monitor a specific job
+**Global feedback:** `worker:feedback` - Monitor all job activity
+
+#### Job Feedback Message Format
+
+```json
+{
+  "job_id": "stream-id-12345",
+  "job_type": "StartVm",
+  "status": {
+    "Started": null
+    // OR
+    "Progress": { "percent": 50, "message": "Configuring network..." }
+    // OR  
+    "Completed": { "result": "VM started successfully" }
+    // OR
+    "Failed": { "error": "VM failed to start: insufficient resources" }
+    // OR
+    "Cancelled": { "reason": "Admin cancelled operation" }
+  },
+  "timestamp": 1640995200,
+  "metadata": {}
+}
+```
+
+#### Job Status Types
+
+- **Started** - Job has begun execution
+- **Progress** - Job progress with percentage (0-100) and optional message
+- **Completed** - Job completed successfully with optional result message
+- **Failed** - Job failed with detailed error message
+- **Cancelled** - Job was cancelled with optional reason
+
+#### Work Job Types
+
+The following admin operations are processed asynchronously via work jobs:
+
+- **StartVm** - Start a VM via the provisioner
+- **StopVm** - Stop a VM via the provisioner  
+- **DeleteVm** - Delete a VM and clean up resources
+- **ProcessVmRefund** - Process automated VM refunds
+- **AssignVmIp** - Assign IP address to VM via provisioner
+- **UnassignVmIp** - Remove IP assignment from VM via provisioner
+- **UpdateVmIp** - Update VM IP assignment configuration
+- **ConfigureVm** - Re-configure VM using current database settings
+- **BulkMessage** - Send bulk messages to active customers
+
+#### Monitoring Job Progress
+
+To monitor job progress, subscribe to the appropriate Redis pub/sub channel:
+
+```bash
+# Monitor all job activity
+redis-cli SUBSCRIBE worker:feedback
+
+# Monitor specific job
+redis-cli SUBSCRIBE worker:feedback:stream-id-12345
+```
+
+**Integration Notes:**
+- All job feedback messages are JSON-encoded
+- Jobs include unique worker IDs for tracking which worker processed the job
+- Failed jobs include detailed error messages for debugging
+- Completed jobs may include result data or success confirmations
+
+#### WebSocket Endpoints
+
+For real-time job monitoring via WebSocket connections:
+
+##### Job Feedback WebSocket
+```
+GET /api/admin/v1/jobs/feedback?auth={auth_token}&job_id={job_id} (WebSocket)
+```
+Required Permission: Any admin role
+
+**Query Parameters:**
+- `auth`: Base64-encoded NIP-98 authentication token (required, since WebSocket headers aren't supported in browsers)
+- `job_id`: Specific job ID to monitor (optional, omit for global monitoring)
+
+Establishes a WebSocket connection that streams job feedback messages. When `job_id` is provided, only feedback for that specific job is sent. When omitted, all job feedback is streamed.
+
+**Message Types:**
+
+All messages are structured with a `type` field for consistent handling:
+
+- **Connected**: 
+  ```json
+  {
+    "type": "connected", 
+    "message": "Job feedback stream connected"
+  }
+  ```
+  Or for specific job:
+  ```json
+  {
+    "type": "connected", 
+    "message": "Connected to job {job_id} feedback stream"
+  }
+  ```
+
+- **Pong Response**: 
+  ```json
+  {"type": "pong"}
+  ```
+
+- **Error Messages**: 
+  ```json
+  {
+    "type": "error", 
+    "error": "Error description"
+  }
+  ```
+
+- **Job Feedback**: 
+  ```json
+  {
+    "type": "job_feedback",
+    "feedback": {
+      "job_id": "stream-id-12345",
+      "worker_id": "worker-uuid",
+      "status": { "Started": {} },
+      "timestamp": "2024-01-15T10:30:00Z"
+    }
+  }
+  ```
+
 
 ### Reports
 
@@ -1422,6 +1668,17 @@ The RBAC system uses the following permission format: `resource::action`
 
 ## Response Models
 
+### AdminRefundAmountInfo
+```json
+{
+  "amount": number,      // Refund amount in smallest currency units (cents for fiat, milli-sats for BTC)
+  "currency": "string",  // Currency code (USD, EUR, BTC, etc.)
+  "rate": number,        // Exchange rate used for calculation
+  "expires": "string",   // VM expiry date (ISO 8601)
+  "seconds_remaining": number  // Seconds until VM expires
+}
+```
+
 ### AdminUserInfo
 ```json
 {
@@ -1478,6 +1735,7 @@ The RBAC system uses the following permission format: `resource::action`
     "disk_write": number,             // Disk bytes written
     "disk_read": number               // Disk bytes read
   } | null,
+  "auto_renewal_enabled": boolean,    // Whether automatic renewal via NWC is enabled
   "cpu": number,                      // Number of CPU cores allocated
   "memory": number,                   // Memory in bytes allocated
   "disk_size": number,                // Disk size in bytes

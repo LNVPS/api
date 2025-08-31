@@ -115,3 +115,9 @@ impl<'r> FromRequest<'r> for AdminAuth {
         }
     }
 }
+
+/// Verify admin authentication from a query parameter auth token
+pub async fn verify_admin_auth_from_token(auth_token: &str, db: &Arc<dyn LNVpsDb>) -> Result<AdminAuth> {
+    let nip98_auth = Nip98Auth::from_base64(auth_token)?;
+    AdminAuth::from_nip98_auth(nip98_auth, db).await
+}

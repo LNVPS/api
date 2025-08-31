@@ -1,6 +1,6 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminVmIpAssignmentInfo, CreateVmIpAssignmentRequest, UpdateVmIpAssignmentRequest,
+    AdminVmIpAssignmentInfo, CreateVmIpAssignmentRequest, JobResponse, UpdateVmIpAssignmentRequest,
 };
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkCommander,
@@ -269,7 +269,7 @@ pub async fn admin_delete_vm_ip_assignment(
     db: &State<Arc<dyn LNVpsDb>>,
     work_commander: &State<Option<WorkCommander>>,
     id: u64,
-) -> ApiResult<()> {
+) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
@@ -279,23 +279,27 @@ pub async fn admin_delete_vm_ip_assignment(
     // Send UnassignVmIp job to handle the unassignment using the provisioner
     // This will handle all cleanup (ARP, DNS, access policies) and then delete the assignment
     if let Some(work_commander) = work_commander.inner() {
-        if let Err(e) = work_commander
+        match work_commander
             .send_job(WorkJob::UnassignVmIp {
                 assignment_id: id,
                 admin_user_id: Some(auth.user_id),
             })
             .await
         {
-            log::error!(
-                "Failed to queue IP unassignment job for assignment {}: {}",
-                id,
-                e
-            );
-            return ApiData::err("Failed to queue IP unassignment job");
+            Ok(stream_id) => {
+                log::info!("IP unassignment job queued with stream ID: {}", stream_id);
+                ApiData::ok(JobResponse { job_id: stream_id })
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to queue IP unassignment job for assignment {}: {}",
+                    id,
+                    e
+                );
+                ApiData::err("Failed to queue IP unassignment job")
+            }
         }
     } else {
-        return ApiData::err("Work commander not configured - cannot unassign IP via provisioner");
+        ApiData::err("Work commander not configured - cannot unassign IP via provisioner")
     }
-
-    ApiData::ok(())
 }

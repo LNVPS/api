@@ -26,6 +26,21 @@ pub struct UpgradeCostQuote {
     pub discount: ConvertedCurrencyAmount,
 }
 
+/// Information about remaining time and costs for a VM
+#[derive(Debug, Clone)]
+pub struct RemainingTimeInfo {
+    /// Seconds remaining until VM expires
+    pub seconds_remaining: i64,
+    /// Current renewal cost for full period
+    pub renewal_cost: CurrencyAmount,
+    /// Duration of renewal period in seconds
+    pub renewal_period_seconds: i64,
+    /// Cost per second at current rate
+    pub cost_per_second: f64,
+    /// Pro-rated cost for remaining time
+    pub prorated_cost: CurrencyAmount,
+}
+
 /// Pricing engine is used to calculate billing amounts for
 /// different resource allocations
 #[derive(Clone)]
@@ -381,41 +396,27 @@ impl PricingEngine {
         Ok(new_custom_template)
     }
 
-    /// Calculate both the upgrade cost and new renewal cost for a VM
-    pub async fn calculate_upgrade_cost(
+    /// Get remaining time and pro-rated cost information for a VM
+    pub async fn get_remaining_time_info(
         &self,
         vm_id: u64,
-        cfg: &UpgradeConfig,
-        method: PaymentMethod,
-    ) -> Result<UpgradeCostQuote> {
+    ) -> Result<RemainingTimeInfo> {
+        self.get_remaining_time_info_from_date(vm_id, Utc::now()).await
+    }
+
+    /// Get remaining time and pro-rated cost information for a VM from a specific date
+    pub async fn get_remaining_time_info_from_date(
+        &self,
+        vm_id: u64,
+        from_date: DateTime<Utc>,
+    ) -> Result<RemainingTimeInfo> {
         let vm = self.db.get_vm(vm_id).await?;
 
-        ensure!(!vm.deleted, "Can't upgrade deleted VM");
-        ensure!(vm.expires > Utc::now(), "Can't upgrade an expired VM");
+        ensure!(!vm.deleted, "Can't calculate for deleted VM");
+        ensure!(vm.expires > from_date, "Can't calculate for expired VM from the specified date");
 
-        // create the custom template which represents this upgrade request
-        let new_custom_template = self.create_upgrade_template(vm_id, cfg).await?;
-
-        // Get the cost of renewal
-        let new_price =
-            Self::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
-        let new_price = CurrencyAmount::from_f32(new_price.currency, new_price.total());
-
-        // Get the time value for the custom template
-        let custom_plan_seconds =
-            Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
-        let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
-
-        let seconds_until_expire = (vm.expires - Utc::now()).num_seconds();
-
-        // calculate the cost based on the time until the vm expires
-        let new_cost_until_expire = CurrencyAmount::from_u64(
-            new_price.currency(),
-            (new_cost_per_second * seconds_until_expire as f64) as u64,
-        );
-
-        // get how much it cost to renew the VM currently
-        let (old_cost, old_time_value) = if let Some(tid) = vm.template_id {
+        // Get current VM pricing information
+        let (current_cost, current_time_value) = if let Some(tid) = vm.template_id {
             let template = self.db.get_vm_template(tid).await?;
             let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
             let time_value = Self::cost_plan_interval_to_seconds(
@@ -441,14 +442,72 @@ impl PricingEngine {
                 time_value,
             )
         } else {
-            bail!("VM must have either a standard template or custom template to upgrade");
+            bail!("VM must have either a standard template or custom template");
         };
 
+        let seconds_remaining = (vm.expires - from_date).num_seconds();
+        let cost_per_second = current_cost.value() as f64 / current_time_value as f64;
+        let prorated_amount = seconds_remaining as f64 * cost_per_second;
+        let prorated_cost = CurrencyAmount::from_u64(current_cost.currency(), prorated_amount as u64);
+
+        Ok(RemainingTimeInfo {
+            seconds_remaining,
+            renewal_cost: current_cost,
+            renewal_period_seconds: current_time_value,
+            cost_per_second,
+            prorated_cost,
+        })
+    }
+
+    /// Calculate pro-rated refund amount for a VM from a specific date
+    pub async fn calculate_refund_amount_from_date(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        from_date: DateTime<Utc>,
+    ) -> Result<ConvertedCurrencyAmount> {
+        let remaining_info = self.get_remaining_time_info_from_date(vm_id, from_date).await?;
+        
+        // Convert to the requested payment method currency
+        self.get_amount_and_rate(remaining_info.prorated_cost, method).await
+    }
+
+    /// Calculate both the upgrade cost and new renewal cost for a VM
+    pub async fn calculate_upgrade_cost(
+        &self,
+        vm_id: u64,
+        cfg: &UpgradeConfig,
+        method: PaymentMethod,
+    ) -> Result<UpgradeCostQuote> {
+        let vm = self.db.get_vm(vm_id).await?;
+
+        ensure!(!vm.deleted, "Can't upgrade deleted VM");
+        ensure!(vm.expires > Utc::now(), "Can't upgrade an expired VM");
+
+        // Get remaining time info for current VM
+        let remaining_info = self.get_remaining_time_info(vm_id).await?;
+
+        // create the custom template which represents this upgrade request
+        let new_custom_template = self.create_upgrade_template(vm_id, cfg).await?;
+
+        // Get the cost of renewal
+        let new_price =
+            Self::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
+        let new_price = CurrencyAmount::from_f32(new_price.currency, new_price.total());
+
+        // Get the time value for the custom template
+        let custom_plan_seconds =
+            Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
+        let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
+
+        // calculate the cost based on the time until the vm expires
+        let new_cost_until_expire = CurrencyAmount::from_u64(
+            new_price.currency(),
+            (new_cost_per_second * remaining_info.seconds_remaining as f64) as u64,
+        );
+
         // create a discount off the new price for the time remaining at the old rate
-        let old_cost_per_second = old_cost.value() as f64 / old_time_value as f64;
-        let discount_from_expire = seconds_until_expire as f64 * old_cost_per_second;
-        let discount_currency =
-            CurrencyAmount::from_u64(old_cost.currency(), discount_from_expire as u64);
+        let discount_currency = remaining_info.prorated_cost;
 
         // convert prices to match payment method
         let new_cost_until_expire = self
