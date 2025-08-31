@@ -1,9 +1,12 @@
 use crate::pricing::PricingEngine;
 use crate::{Currency, CurrencyAmount, VmRunningState};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
-use lnvps_db::{IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomTemplate, VmHostRegion, VmTemplate};
+use lnvps_db::{
+    IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHostRegion, VmTemplate,
+};
 use rocket::futures::future::join_all;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -502,11 +505,11 @@ pub struct ApiCustomTemplateParams {
 
 impl ApiCustomTemplateParams {
     pub fn from(
-        pricing: &lnvps_db::VmCustomPricing,
-        disks: &Vec<lnvps_db::VmCustomPricingDisk>,
-        region: &lnvps_db::VmHostRegion,
-    ) -> Result<Self> {
-        Ok(ApiCustomTemplateParams {
+        pricing: &VmCustomPricing,
+        disks: &Vec<VmCustomPricingDisk>,
+        region: &VmHostRegion,
+    ) -> Self {
+        ApiCustomTemplateParams {
             id: pricing.id,
             name: pricing.name.clone(),
             region: ApiVmHostRegion {
@@ -520,16 +523,14 @@ impl ApiCustomTemplateParams {
             disks: disks
                 .iter()
                 .filter(|d| d.pricing_id == pricing.id)
-                .map(|d| {
-                    ApiCustomTemplateDiskParam {
-                        min_disk: d.min_disk_size,
-                        max_disk: d.max_disk_size,
-                        disk_type: d.kind.into(),
-                        disk_interface: d.interface.into(),
-                    }
+                .map(|d| ApiCustomTemplateDiskParam {
+                    min_disk: d.min_disk_size,
+                    max_disk: d.max_disk_size,
+                    disk_type: d.kind.into(),
+                    disk_interface: d.interface.into(),
                 })
                 .collect(),
-        })
+        }
     }
 }
 

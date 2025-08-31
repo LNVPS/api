@@ -51,7 +51,7 @@ use crate::admin::vm_templates::{
     admin_list_vm_templates, admin_update_vm_template,
 };
 use crate::admin::vms::{
-    admin_calculate_vm_refund, admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
+    admin_calculate_vm_refund, admin_create_vm, admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
     admin_list_vm_history, admin_list_vm_payments, admin_list_vms, admin_process_vm_refund, admin_start_vm, admin_stop_vm,
 };
 use crate::admin::websocket::admin_job_feedback_websocket;
@@ -86,6 +86,7 @@ pub fn admin_routes() -> Vec<Route> {
         // VM management
         admin_list_vms,
         admin_get_vm,
+        admin_create_vm,
         admin_start_vm,
         admin_stop_vm,
         admin_delete_vm,

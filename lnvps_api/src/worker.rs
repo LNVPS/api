@@ -1333,6 +1333,53 @@ impl Worker {
                 // TODO: Implement the actual refund processing logic
                 bail!("Refund processing is not yet implemented");
             }
+            WorkJob::CreateVm {
+                user_id,
+                template_id,
+                image_id,
+                ssh_key_id,
+                ref_code,
+                admin_user_id,
+                reason,
+            } => {
+                info!("Admin {} creating VM for user {}", admin_user_id, user_id);
+                
+                let vm = self.provisioner.provision(
+                    *user_id,
+                    *template_id,
+                    *image_id,
+                    *ssh_key_id,
+                    ref_code.clone(),
+                ).await?;
+
+                // Log VM creation with admin metadata
+                let metadata = Some(serde_json::json!({
+                    "admin_user_id": admin_user_id,
+                    "admin_action": true,
+                    "reason": reason
+                }));
+
+                if let Err(e) = self.vm_history_logger
+                    .log_vm_created(&vm, Some(*user_id), metadata)
+                    .await
+                {
+                    error!("Failed to log VM {} creation: {}", vm.id, e);
+                }
+
+                info!("Admin {} successfully created VM {} for user {}", admin_user_id, vm.id, user_id);
+
+                // Send job feedback if we have stream_id and commander
+                if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
+                    let feedback = commander.create_job_completed_feedback(
+                        stream_id.to_string(),
+                        "Create VM".to_string(),
+                        Some(format!("VM {} created successfully for user {}", vm.id, user_id)),
+                    );
+                    if let Err(e) = commander.publish_feedback(&feedback).await {
+                        warn!("Failed to publish CreateVm job feedback: {}", e);
+                    }
+                }
+            }
         }
         Ok(())
     }

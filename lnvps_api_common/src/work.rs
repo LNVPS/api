@@ -85,6 +85,16 @@ pub enum WorkJob {
         payment_method: String,            // "lightning", "revolut", "paypal"
         lightning_invoice: Option<String>, // Required when payment_method is "lightning"
     },
+    /// Create a VM for a specific user (admin action)
+    CreateVm {
+        user_id: u64,
+        template_id: u64,
+        image_id: u64,
+        ssh_key_id: u64,
+        ref_code: Option<String>,
+        admin_user_id: u64,
+        reason: Option<String>,
+    },
 }
 
 impl fmt::Display for WorkJob {
@@ -105,6 +115,7 @@ impl fmt::Display for WorkJob {
             WorkJob::UnassignVmIp { .. } => write!(f, "UnassignVmIp"),
             WorkJob::UpdateVmIp { .. } => write!(f, "UpdateVmIp"),
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
+            WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
         }
     }
 }

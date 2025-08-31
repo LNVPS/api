@@ -1733,3 +1733,13 @@ pub struct BulkMessageResponse {
     pub job_dispatched: bool,
     pub job_id: Option<String>,
 }
+
+#[derive(Deserialize)]
+pub struct AdminCreateVmRequest {
+    pub user_id: u64,
+    pub template_id: u64,
+    pub image_id: u64,
+    pub ssh_key_id: u64,
+    pub ref_code: Option<String>,
+    pub reason: Option<String>,
+}

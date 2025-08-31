@@ -1,5 +1,5 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse};
+use crate::admin::model::{AdminCreateVmRequest, AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, ExchangeRateService, PricingEngine, VmHistoryLogger, VmRunningState,
@@ -645,6 +645,61 @@ pub async fn admin_process_vm_refund(
         // WorkCommander not available - cannot process refund
         error!("WorkCommander not configured - cannot process VM refund");
         ApiData::err("VM refund service is not available")
+    }
+}
+
+/// Create a VM for a specific user (admin action)
+#[post("/api/admin/v1/vms", data = "<req>")]
+pub async fn admin_create_vm(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    work_commander: &State<Option<WorkCommander>>,
+    req: rocket::serde::json::Json<AdminCreateVmRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Create)?;
+
+    let req = req.into_inner();
+
+    // Verify the target user exists
+    let _user = db.get_user(req.user_id).await?;
+
+    // Verify template exists
+    let _template = db.get_vm_template(req.template_id).await?;
+
+    // Verify image exists  
+    let _image = db.get_os_image(req.image_id).await?;
+
+    // Verify SSH key exists and belongs to the user
+    let ssh_key = db.get_user_ssh_key(req.ssh_key_id).await?;
+    if ssh_key.user_id != req.user_id {
+        return ApiData::err("SSH key does not belong to the specified user");
+    }
+
+    // Check if WorkCommander is available for distributed processing
+    if let Some(commander) = work_commander.as_ref() {
+        let create_job = WorkJob::CreateVm {
+            user_id: req.user_id,
+            template_id: req.template_id,
+            image_id: req.image_id,
+            ssh_key_id: req.ssh_key_id,
+            ref_code: req.ref_code,
+            admin_user_id: auth.user_id,
+            reason: req.reason,
+        };
+
+        match commander.send_job(create_job).await {
+            Ok(stream_id) => {
+                info!("VM creation job queued with stream ID: {}", stream_id);
+                ApiData::ok(JobResponse { job_id: stream_id })
+            }
+            Err(e) => {
+                error!("Failed to queue VM creation job: {}", e);
+                ApiData::err("Failed to queue VM creation job")
+            }
+        }
+    } else {
+        error!("WorkCommander not configured - cannot process VM creation");
+        ApiData::err("VM creation service is not available")
     }
 }
 

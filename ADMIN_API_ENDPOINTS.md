@@ -130,6 +130,43 @@ Required Permission: `virtual_machines::view`
 
 Returns detailed VM information with complete host and region data. The VM must have valid host and region associations.
 
+#### Create VM for User
+```
+POST /api/admin/v1/vms
+```
+Required Permission: `virtual_machines::create`
+
+Creates a VM for a specific user (admin action). The VM creation is processed asynchronously via the work job system.
+
+Body:
+```json
+{
+  "user_id": number,       // Required - Target user ID
+  "template_id": number,   // Required - VM template ID
+  "image_id": number,      // Required - OS image ID
+  "ssh_key_id": number,    // Required - SSH key ID (must belong to user)
+  "ref_code": "string",    // Optional - Referral code
+  "reason": "string"       // Optional - Admin reason for audit trail
+}
+```
+
+Response:
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
+**Validation:**
+- User must exist
+- Template must exist  
+- Image must exist
+- SSH key must exist and belong to the specified user
+
+**Asynchronous Processing:** This endpoint dispatches a `CreateVm` work job for distributed processing. The operation returns immediately with a job ID. The VM creation is handled by the provisioner and includes full audit logging with admin action metadata.
+
 #### Start VM
 ```
 POST /api/admin/v1/vms/{id}/start
@@ -1418,6 +1455,7 @@ Work jobs publish real-time feedback via Redis pub/sub channels:
 
 The following admin operations are processed asynchronously via work jobs:
 
+- **CreateVm** - Create a VM for a specific user (admin action)
 - **StartVm** - Start a VM via the provisioner
 - **StopVm** - Stop a VM via the provisioner  
 - **DeleteVm** - Delete a VM and clean up resources
