@@ -976,6 +976,7 @@ impl Worker {
         stream_id: Option<&str>,
         commander: Option<&WorkCommander>,
     ) -> Result<()> {
+        info!("Starting job: {}", job);
         match job {
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
@@ -1343,14 +1344,17 @@ impl Worker {
                 reason,
             } => {
                 info!("Admin {} creating VM for user {}", admin_user_id, user_id);
-                
-                let vm = self.provisioner.provision(
-                    *user_id,
-                    *template_id,
-                    *image_id,
-                    *ssh_key_id,
-                    ref_code.clone(),
-                ).await?;
+
+                let vm = self
+                    .provisioner
+                    .provision(
+                        *user_id,
+                        *template_id,
+                        *image_id,
+                        *ssh_key_id,
+                        ref_code.clone(),
+                    )
+                    .await?;
 
                 // Log VM creation with admin metadata
                 let metadata = Some(serde_json::json!({
@@ -1359,21 +1363,28 @@ impl Worker {
                     "reason": reason
                 }));
 
-                if let Err(e) = self.vm_history_logger
+                if let Err(e) = self
+                    .vm_history_logger
                     .log_vm_created(&vm, Some(*user_id), metadata)
                     .await
                 {
                     error!("Failed to log VM {} creation: {}", vm.id, e);
                 }
 
-                info!("Admin {} successfully created VM {} for user {}", admin_user_id, vm.id, user_id);
+                info!(
+                    "Admin {} successfully created VM {} for user {}",
+                    admin_user_id, vm.id, user_id
+                );
 
                 // Send job feedback if we have stream_id and commander
                 if let (Some(stream_id), Some(commander)) = (stream_id, commander) {
                     let feedback = commander.create_job_completed_feedback(
                         stream_id.to_string(),
                         "Create VM".to_string(),
-                        Some(format!("VM {} created successfully for user {}", vm.id, user_id)),
+                        Some(format!(
+                            "VM {} created successfully for user {}",
+                            vm.id, user_id
+                        )),
                     );
                     if let Err(e) = commander.publish_feedback(&feedback).await {
                         warn!("Failed to publish CreateVm job feedback: {}", e);
@@ -1754,8 +1765,11 @@ impl Worker {
                 // Handle local channel jobs
                 Some(job) = self.rx.recv() => {
                     if let Some(w) = &self.work_commander {
+                        debug!("Forwarding job to work queue: {}", job);
                         // send internal commands to work queue on redis
-                        w.send_job(job).await?;
+                        if let Err(e) = w.send_job(job).await {
+                            error!("Failed to send job to worker: {}", e);
+                        }
                     } else {
                         // handle job directly if redis is not used
                         if let Err(e) = self.try_job(&job, None, None).await {
@@ -1767,7 +1781,7 @@ impl Worker {
                 redis_result = async {
                     self.work_commander.as_ref().unwrap().listen_for_jobs().await
                 }, if self.work_commander.is_some() => {
-                    let mut commander = self.work_commander.as_ref().unwrap().clone();
+                    let commander = self.work_commander.as_ref().unwrap().clone();
                     match redis_result {
                         Ok(jobs) => {
                             for (stream_id, job) in jobs {

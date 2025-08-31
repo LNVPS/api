@@ -240,14 +240,14 @@ impl WorkCommander {
     }
 
     pub async fn listen_for_jobs(&self) -> Result<Vec<(String, WorkJob)>> {
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn.clone();
 
         // Ensure the consumer group exists
         self.ensure_group_exists(&mut conn).await?;
 
         let opts = StreamReadOptions::default()
             .count(10)
-            .block(1000)
+            .block(100)
             .group(&self.group_name, &self.consumer_name);
 
         let results: StreamReadReply = conn.xread_options(&["worker"], &[">"], &opts).await?;
