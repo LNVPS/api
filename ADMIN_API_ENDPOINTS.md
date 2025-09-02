@@ -1423,20 +1423,74 @@ Work jobs publish real-time feedback via Redis pub/sub channels:
 
 #### Job Feedback Message Format
 
+Job feedback messages use Rust enum serialization where the enum variant becomes the key. Here are the possible status formats:
+
+**Job Started:**
+```json
+{
+  "job_id": "stream-id-12345",
+  "job_type": "StartVm",
+  "status": "Started",
+  "timestamp": 1640995200,
+  "metadata": {}
+}
+```
+
+**Job Progress:**
+```json
+{
+  "job_id": "stream-id-12345", 
+  "job_type": "StartVm",
+  "status": {
+    "Progress": {
+      "percent": 50,
+      "message": "Configuring network..."
+    }
+  },
+  "timestamp": 1640995200,
+  "metadata": {}
+}
+```
+
+**Job Completed:**
+```json
+{
+  "job_id": "stream-id-12345",
+  "job_type": "StartVm", 
+  "status": {
+    "Completed": {
+      "result": "VM started successfully"
+    }
+  },
+  "timestamp": 1640995200,
+  "metadata": {}
+}
+```
+
+**Job Failed:**
 ```json
 {
   "job_id": "stream-id-12345",
   "job_type": "StartVm",
   "status": {
-    "Started": null
-    // OR
-    "Progress": { "percent": 50, "message": "Configuring network..." }
-    // OR  
-    "Completed": { "result": "VM started successfully" }
-    // OR
-    "Failed": { "error": "VM failed to start: insufficient resources" }
-    // OR
-    "Cancelled": { "reason": "Admin cancelled operation" }
+    "Failed": {
+      "error": "VM failed to start: insufficient resources"
+    }
+  },
+  "timestamp": 1640995200,
+  "metadata": {}
+}
+```
+
+**Job Cancelled:**
+```json
+{
+  "job_id": "stream-id-12345",
+  "job_type": "StartVm",
+  "status": {
+    "Cancelled": {
+      "reason": "Admin cancelled operation"
+    }
   },
   "timestamp": 1640995200,
   "metadata": {}
@@ -1539,8 +1593,27 @@ All messages are structured with a `type` field for consistent handling:
     "feedback": {
       "job_id": "stream-id-12345",
       "worker_id": "worker-uuid",
-      "status": { "Started": {} },
+      "job_type": "StartVm",
+      "status": "Started",
       "timestamp": "2024-01-15T10:30:00Z"
+    }
+  }
+  ```
+  
+  Or for progress/completion:
+  ```json
+  {
+    "type": "job_feedback", 
+    "feedback": {
+      "job_id": "stream-id-12345",
+      "worker_id": "worker-uuid",
+      "job_type": "CreateVm",
+      "status": {
+        "Completed": {
+          "result": "VM 456 created successfully for user 123"
+        }
+      },
+      "timestamp": "2024-01-15T10:35:00Z"
     }
   }
   ```
