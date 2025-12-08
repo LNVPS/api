@@ -84,3 +84,7 @@ virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
 #virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}/
 uuid = { version = "1.16.0", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.37.3", features = ["serde", "serialize"], optional = true }
+
+[dev-dependencies]
+lightning-invoice = "0.34"
+bitcoin = "0.32"

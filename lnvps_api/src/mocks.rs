@@ -7,6 +7,11 @@ use crate::router::{ArpEntry, Router};
 use anyhow::{Context, anyhow, bail, ensure};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::Stream;
+use hex::ToHex;
+use lightning_invoice::{
+    Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret, PositiveTimestamp, RawBolt11Invoice,
+    RawDataPart, RawHrp, SignedRawBolt11Invoice, TaggedField,
+};
 use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
@@ -17,11 +22,15 @@ use lnvps_db::{
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
     async_trait,
 };
+use nostr_sdk::Timestamp;
 use payments_rs::lightning::{AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode};
+use ssh2::HashType::Sha256;
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+use bitcoin::hashes::Hash;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -115,19 +124,33 @@ impl MockNode {
 #[async_trait]
 impl LightningNode for MockNode {
     async fn add_invoice(&self, req: AddInvoiceRequest) -> anyhow::Result<AddInvoiceResponse> {
+        const NODE_KEY: [u8; 32] = [0xcd; 32];
+
         let mut invoices = self.invoices.lock().await;
-        let id: [u8; 32] = rand::random();
-        let hex_id = hex::encode(id);
+        let secret: [u8; 32] = rand::random();
+        let pr = InvoiceBuilder::new(Currency::Regtest)
+            .duration_since_epoch(Duration::from_secs(Timestamp::now().as_secs()))
+            .payment_hash(bitcoin::hashes::sha256::Hash::from_slice(&secret).unwrap())
+            .payment_secret(PaymentSecret(secret))
+            .description("mock-invoice".to_string())
+            .build_raw()
+            .map_err(|e| anyhow!(e))?
+            .sign::<_, anyhow::Error>(|s| {
+                let sk = bitcoin::secp256k1::SecretKey::from_slice(&NODE_KEY)?;
+                Ok(bitcoin::secp256k1::Secp256k1::signing_only().sign_ecdsa_recoverable(s, &sk))
+            })?;
+        let ph = hex::encode(&pr.payment_hash().unwrap().0);
+        let pr = pr.to_string();
         invoices.insert(
-            hex_id.clone(),
+            ph.clone(),
             MockInvoice {
-                pr: format!("lnrt1{}", hex_id),
+                pr: pr.clone(),
                 amount: req.amount,
                 expiry: Utc::now().add(TimeDelta::seconds(req.expire.unwrap_or(3600) as i64)),
                 is_paid: false,
             },
         );
-        AddInvoiceResponse::from_invoice(&format!("lnrt1{}", hex_id), None)
+        Ok(AddInvoiceResponse::from_invoice(&pr, None)?)
     }
 
     async fn cancel_invoice(&self, id: &Vec<u8>) -> anyhow::Result<()> {

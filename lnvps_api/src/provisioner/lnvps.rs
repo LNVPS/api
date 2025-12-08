@@ -625,7 +625,7 @@ impl LNVpsProvisioner {
                             })
                             .await?;
                         VmPayment {
-                            id: hex::decode(invoice.parsed_invoice.payment_hash())?,
+                            id: hex::decode(invoice.payment_hash())?,
                             vm_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
@@ -637,7 +637,7 @@ impl LNVpsProvisioner {
                             time_value: p.time_value,
                             is_paid: false,
                             rate: p.rate.rate,
-                            external_data: invoice.parsed_invoice.to_string().into(),
+                            external_data: invoice.pr().into(),
                             external_id: invoice.external_id,
                             upgrade_params,
                         }
