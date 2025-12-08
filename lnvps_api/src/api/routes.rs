@@ -8,7 +8,6 @@ use crate::api::model::{
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, LNVpsProvisioner, PricingEngine};
 use crate::settings::Settings;
-use crate::{Currency, CurrencyAmount};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
@@ -16,7 +15,7 @@ use futures::{SinkExt, StreamExt};
 use isocountry::CountryCode;
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
-use lnvps_api_common::VmHistoryLogger;
+use lnvps_api_common::{ApiCurrency, VmHistoryLogger};
 use lnvps_api_common::{
     ApiData, ApiResult, ExchangeRateService, Nip98Auth, UpgradeConfig, VmStateCache, WorkJob,
 };
@@ -37,6 +36,7 @@ use std::fmt::Display;
 use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
+use payments_rs::currency::{Currency, CurrencyAmount};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 
 pub fn routes() -> Vec<Route> {
@@ -100,8 +100,7 @@ async fn v1_patch_account(
                 // test connection
                 let client = nwc::NWC::new(s);
                 let info = client.get_info().await?;
-                let method = "pay_invoice".to_string();
-                if !info.methods.contains(&method) {
+                if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
                     return ApiData::err("NWC connection must allow pay_invoice");
                 }
             }
@@ -354,7 +353,7 @@ async fn v1_custom_template_calc(
 
     let price = PricingEngine::get_custom_vm_cost_amount(db, 0, &template).await?;
     ApiData::ok(ApiPrice {
-        currency: price.currency,
+        currency: price.currency.into(),
         amount: price.total(),
     })
 }
@@ -819,20 +818,20 @@ async fn v1_get_payment_methods(settings: &State<Settings>) -> ApiResult<Vec<Api
     let mut ret = vec![ApiPaymentInfo {
         name: ApiPaymentMethod::Lightning,
         metadata: HashMap::new(),
-        currencies: vec![Currency::BTC],
+        currencies: vec![ApiCurrency::BTC],
     }];
     #[cfg(feature = "nostr-nwc")]
     ret.push(ApiPaymentInfo {
         name: ApiPaymentMethod::NWC,
         metadata: HashMap::new(),
-        currencies: vec![Currency::BTC],
+        currencies: vec![ApiCurrency::BTC],
     });
     #[cfg(feature = "revolut")]
     if let Some(r) = &settings.revolut {
         ret.push(ApiPaymentInfo {
             name: ApiPaymentMethod::Revolut,
             metadata: HashMap::from([("pubkey".to_string(), r.public_key.to_string())]),
-            currencies: vec![Currency::EUR, Currency::USD],
+            currencies: vec![ApiCurrency::EUR, ApiCurrency::USD],
         })
     }
 

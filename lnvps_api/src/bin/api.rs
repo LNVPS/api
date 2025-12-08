@@ -4,7 +4,6 @@ use config::{Config, File};
 use lnvps_api::api;
 use lnvps_api::data_migration::run_data_migrations;
 use lnvps_api::dvm::start_dvms;
-use lnvps_api::lightning::get_node;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
 use lnvps_api::worker::Worker;
@@ -91,7 +90,7 @@ async fn main() -> Result<(), Error> {
         info!("Using in-memory exchange rate cache");
         Arc::new(InMemoryRateCache::default())
     };
-    let node = get_node(&settings).await?;
+    let node = settings.get_node().await?;
 
     let status = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?

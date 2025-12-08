@@ -1,5 +1,5 @@
+use crate::VmRunningState;
 use crate::pricing::PricingEngine;
-use crate::{Currency, CurrencyAmount, VmRunningState};
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use ipnetwork::IpNetwork;
@@ -7,6 +7,7 @@ use lnvps_db::{
     IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmHostRegion, VmTemplate,
 };
+use payments_rs::currency::{Currency, CurrencyAmount};
 use rocket::futures::future::join_all;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -93,7 +94,7 @@ impl ApiVmTemplate {
                 id: pricing.id,
                 name: pricing.name,
                 amount: price.total(),
-                currency: price.currency,
+                currency: price.currency.into(),
                 other_price: vec![], // filled externally
                 interval_amount: 1,
                 interval_type: ApiVmCostPlanIntervalType::Month,
@@ -135,7 +136,8 @@ impl ApiVmTemplate {
                 name: cost_plan.name.clone(),
                 amount: cost_plan.amount,
                 currency: Currency::from_str(&cost_plan.currency)
-                    .map_err(|_| anyhow!("Invalid currency: {}", &cost_plan.currency))?,
+                    .map_err(|_| anyhow!("Invalid currency: {}", &cost_plan.currency))?
+                    .into(),
                 other_price: vec![], //filled externally
                 interval_amount: cost_plan.interval_amount,
                 interval_type: cost_plan.interval_type.clone().into(),
@@ -358,11 +360,53 @@ impl From<ApiVmCostPlanIntervalType> for lnvps_db::VmCostPlanIntervalType {
     }
 }
 
+#[derive(Copy, Clone, Serialize, Deserialize, JsonSchema)]
+pub enum ApiCurrency {
+    EUR,
+    BTC,
+    USD,
+    GBP,
+    CAD,
+    CHF,
+    AUD,
+    JPY,
+}
+
+impl From<Currency> for ApiCurrency {
+    fn from(value: Currency) -> Self {
+        match value {
+            Currency::EUR => ApiCurrency::EUR,
+            Currency::BTC => ApiCurrency::BTC,
+            Currency::USD => ApiCurrency::USD,
+            Currency::GBP => ApiCurrency::GBP,
+            Currency::CAD => ApiCurrency::CAD,
+            Currency::CHF => ApiCurrency::CHF,
+            Currency::AUD => ApiCurrency::AUD,
+            Currency::JPY => ApiCurrency::JPY,
+        }
+    }
+}
+
+impl Into<Currency> for ApiCurrency {
+    fn into(self) -> Currency {
+        match self {
+            ApiCurrency::EUR => Currency::EUR,
+            ApiCurrency::BTC => Currency::BTC,
+            ApiCurrency::USD => Currency::USD,
+            ApiCurrency::GBP => Currency::GBP,
+            ApiCurrency::CAD => Currency::CAD,
+            ApiCurrency::CHF => Currency::CHF,
+            ApiCurrency::AUD => Currency::AUD,
+            ApiCurrency::JPY => Currency::JPY,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiVmCostPlan {
     pub id: u64,
     pub name: String,
-    pub currency: Currency,
+    pub currency: ApiCurrency,
     pub amount: f32,
     pub other_price: Vec<ApiPrice>,
     pub interval_amount: u64,
@@ -461,14 +505,14 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
 
 #[derive(Copy, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApiPrice {
-    pub currency: Currency,
+    pub currency: ApiCurrency,
     pub amount: f32,
 }
 
 impl From<CurrencyAmount> for ApiPrice {
     fn from(amount: CurrencyAmount) -> Self {
         ApiPrice {
-            currency: amount.currency(),
+            currency: amount.currency().into(),
             amount: amount.value_f32(),
         }
     }

@@ -1,15 +1,13 @@
-use crate::api::{WebhookMessage, WEBHOOK_BRIDGE};
-use crate::fiat::{RevolutApi, RevolutWebhookEvent};
 use crate::payments::handle_upgrade;
-use crate::settings::RevolutConfig;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use hmac::{Hmac, Mac};
 use isocountry::CountryCode;
 use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType};
 use log::{error, info, warn};
+use payments_rs::fiat::{RevolutApi, RevolutConfig, RevolutWebhook, RevolutWebhookBody, RevolutWebhookEvent};
+use payments_rs::webhook::WEBHOOK_BRIDGE;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -61,20 +59,21 @@ impl RevolutPaymentHandler {
 
         let secret = wh.signing_secret.context("Signing secret is missing")?;
         // listen to events
-        let mut listenr = WEBHOOK_BRIDGE.listen();
-        while let Ok(m) = listenr.recv().await {
+        let mut listener = WEBHOOK_BRIDGE.listen();
+        while let Ok(m) = listener.recv().await {
             if m.endpoint != "/api/v1/webhook/revolut" {
                 continue;
             }
-            let body: RevolutWebhook = serde_json::from_slice(m.body.as_slice())?;
-            info!("Received webhook {:?}", body);
-            if let Err(e) = verify_webhook(&secret, &m) {
-                error!("Signature verification failed: {}", e);
-                continue;
-            }
+            let msg = match RevolutWebhookBody::verify(&secret, &m) {
+                Err(e) => {
+                    error!("Signature verification failed: {}", e);
+                    continue;
+                }
+                Ok(m) => m,
+            };
 
-            if let RevolutWebhookEvent::OrderCompleted = body.event {
-                if let Err(e) = self.try_complete_payment(&body.order_id).await {
+            if let RevolutWebhookEvent::OrderCompleted = msg.event {
+                if let Err(e) = self.try_complete_payment(&msg.order_id).await {
                     error!("Failed to complete order: {}", e);
                 }
             }
@@ -201,51 +200,4 @@ impl RevolutPaymentHandler {
         );
         Ok(())
     }
-}
-
-type HmacSha256 = Hmac<sha2::Sha256>;
-fn verify_webhook(secret: &str, msg: &WebhookMessage) -> Result<()> {
-    let sig = msg
-        .headers
-        .get("revolut-signature")
-        .ok_or_else(|| anyhow!("Missing Revolut-Signature header"))?;
-    let timestamp = msg
-        .headers
-        .get("revolut-request-timestamp")
-        .ok_or_else(|| anyhow!("Missing Revolut-Request-Timestamp header"))?;
-
-    // check if any signatures match
-    for sig in sig.split(",") {
-        let mut sig_split = sig.split("=");
-        let (version, code) = (
-            sig_split.next().context("Invalid signature format")?,
-            sig_split.next().context("Invalid signature format")?,
-        );
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())?;
-        mac.update(version.as_bytes());
-        mac.update(b".");
-        mac.update(timestamp.as_bytes());
-        mac.update(b".");
-        mac.update(msg.body.as_slice());
-        let result = mac.finalize().into_bytes();
-
-        if hex::encode(result) == code {
-            return Ok(());
-        } else {
-            warn!(
-                "Invalid signature found {} != {}",
-                code,
-                hex::encode(result)
-            );
-        }
-    }
-
-    bail!("No valid signature found!");
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct RevolutWebhook {
-    pub event: RevolutWebhookEvent,
-    pub order_id: String,
-    pub merchant_order_ext_ref: Option<String>,
 }

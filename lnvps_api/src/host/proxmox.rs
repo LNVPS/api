@@ -976,6 +976,28 @@ impl VmHostClient for ProxmoxClient {
     async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()> {
         let vm_id = cfg.vm.id.into();
 
+        // Check and fix cloud-init IP config if it doesn't match expected
+        let current_config = self.get_vm_config(&self.node, vm_id).await?;
+        let expected_config = self.make_config(cfg)?;
+        if current_config.config.ip_config != expected_config.ip_config {
+            info!(
+                "IP config mismatch for VM {}: current={:?}, expected={:?}",
+                cfg.vm.id, current_config.config.ip_config, expected_config.ip_config
+            );
+            self.configure_vm(ConfigureVm {
+                node: self.node.clone(),
+                vm_id,
+                current: None,
+                snapshot: None,
+                digest: Some(current_config.digest),
+                config: VmConfig {
+                    ip_config: expected_config.ip_config,
+                    ..Default::default()
+                },
+            })
+            .await?;
+        }
+
         // disable fw if not enabled, otherwise configure fw
         let fw_enabled = self
             .config
@@ -1026,7 +1048,7 @@ impl VmHostClient for ProxmoxClient {
                 vm_id,
                 CreateVmIpsetRequest {
                     name: "ipfilter-net0".to_string(),
-                    comment: Some("Allowed IPv4 addresses for net0".to_string()),
+                    comment: Some("Allowed addresses for net0".to_string()),
                     digest: None,
                     rename: None,
                 },

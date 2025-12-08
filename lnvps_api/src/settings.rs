@@ -1,12 +1,12 @@
 use crate::dns::DnsServer;
 use crate::exchange::ExchangeRateService;
-use crate::fiat::FiatPaymentService;
-use crate::lightning::LightningNode;
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Result;
 use isocountry::CountryCode;
 use lnvps_api_common::RedisConfig;
 use lnvps_db::LNVpsDb;
+use payments_rs::fiat::FiatPaymentService;
+use payments_rs::lightning::LightningNode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,7 +46,7 @@ pub struct Settings {
     pub nostr: Option<NostrConfig>,
 
     /// Config for accepting revolut payments
-    pub revolut: Option<RevolutConfig>,
+    pub revolut: Option<payments_rs::fiat::RevolutConfig>,
 
     #[serde(default)]
     /// Tax rates to change per country as a percent of the amount
@@ -193,15 +193,6 @@ pub struct FirewallConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct RevolutConfig {
-    pub url: Option<String>,
-    pub api_version: String,
-    pub token: String,
-    pub public_key: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub struct EncryptionConfig {
     /// Path to the encryption key file
     pub key_file: PathBuf,
@@ -241,8 +232,27 @@ impl Settings {
     pub fn get_revolut(&self) -> Result<Option<Arc<dyn FiatPaymentService>>> {
         match &self.revolut {
             #[cfg(feature = "revolut")]
-            Some(c) => Ok(Some(Arc::new(crate::fiat::RevolutApi::new(c.clone())?))),
+            Some(c) => Ok(Some(Arc::new(payments_rs::fiat::RevolutApi::new(
+                c.clone(),
+            )?))),
             _ => Ok(None),
+        }
+    }
+
+    pub async fn get_node(&self) -> Result<Arc<dyn LightningNode>> {
+        match &self.lightning {
+            #[cfg(feature = "lnd")]
+            LightningConfig::LND {
+                url,
+                cert,
+                macaroon,
+            } => Ok(Arc::new(payments_rs::lightning::LndNode::new(url, cert, macaroon).await?)),
+            #[cfg(feature = "bitvora")]
+            LightningConfig::Bitvora {
+                token,
+                webhook_secret,
+            } => Ok(Arc::new(payments_rs::lightning::BitvoraNode::new(token, webhook_secret, "/api/v1/webhook/bitvora"))),
+            _ => anyhow::bail!("Unsupported lightning config!"),
         }
     }
 }

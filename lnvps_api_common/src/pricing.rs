@@ -1,5 +1,5 @@
 use crate::{
-    ConvertedCurrencyAmount, Currency, CurrencyAmount, ExchangeRateService, Ticker, TickerRate,
+    ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate,
     UpgradeConfig,
 };
 use anyhow::{anyhow, bail, ensure, Result};
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
+use payments_rs::currency::{Currency, CurrencyAmount};
 
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]

@@ -1,7 +1,5 @@
 use crate::dns::{BasicRecord, DnsServer};
-use crate::fiat::FiatPaymentService;
 use crate::host::{get_host_client, FullVmInfo};
-use crate::lightning::{AddInvoiceRequest, LightningNode};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{bail, ensure, Context, Result};
@@ -12,7 +10,7 @@ use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
-use lnvps_api_common::{Currency, CurrencyAmount, ExchangeRateService};
+use lnvps_api_common::{ExchangeRateService};
 use lnvps_db::{AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate};
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -21,6 +19,9 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use payments_rs::currency::{Currency, CurrencyAmount};
+use payments_rs::fiat::FiatPaymentService;
+use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
 
 /// Main provisioner class for LNVPS
 ///
@@ -624,7 +625,7 @@ impl LNVpsProvisioner {
                             })
                             .await?;
                         VmPayment {
-                            id: hex::decode(invoice.payment_hash)?,
+                            id: hex::decode(invoice.parsed_invoice.payment_hash())?,
                             vm_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
@@ -636,7 +637,7 @@ impl LNVpsProvisioner {
                             time_value: p.time_value,
                             is_paid: false,
                             rate: p.rate.rate,
-                            external_data: invoice.pr.into(),
+                            external_data: invoice.parsed_invoice.to_string().into(),
                             external_id: invoice.external_id,
                             upgrade_params,
                         }

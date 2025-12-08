@@ -1,4 +1,3 @@
-use crate::lightning::{InvoiceUpdate, LightningNode};
 use crate::payments::handle_upgrade;
 use anyhow::Result;
 use chrono::Utc;
@@ -6,6 +5,7 @@ use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType, VmPayment};
 use log::{error, info, warn};
+use payments_rs::lightning::{InvoiceUpdate, LightningNode};
 use rocket::futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -152,9 +152,10 @@ impl NodeInvoiceHandler {
                 InvoiceUpdate::Settled {
                     payment_hash,
                     external_id,
+                    ..
                 } => {
-                    if let Some(h) = payment_hash {
-                        let r_hash = hex::decode(h)?;
+                    if !payment_hash.is_empty() {
+                        let r_hash = hex::decode(&payment_hash)?;
                         if let Err(e) = self.mark_paid(&r_hash).await {
                             error!("{}", e);
                         }

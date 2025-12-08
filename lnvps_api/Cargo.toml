@@ -29,10 +29,10 @@ nostr-domain = ["lnvps_db/nostr-domain"]
 nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
-lnd = ["dep:fedimint-tonic-lnd"]
-bitvora = ["dep:reqwest", "dep:tokio-stream"]
+lnd = ["payments-rs/method-lnd"]
+bitvora = ["payments-rs/method-bitvora", "payments-rs/rocket"]
 cloudflare = ["dep:reqwest"]
-revolut = ["dep:reqwest", "dep:sha2", "dep:hmac"]
+revolut = ["payments-rs/method-revolut", "payments-rs/rocket"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
@@ -47,6 +47,7 @@ serde.workspace = true
 serde_json.workspace = true
 rocket.workspace = true
 hex.workspace = true
+payments-rs.workspace = true
 rocket_okapi = { version = "0.9.0", features = ["swagger"] }
 schemars = { version = "0.8.22", features = ["chrono"] }
 chrono = { version = "0.4.38", features = ["serde"] }
@@ -68,10 +69,10 @@ hickory-resolver = "0.25.2"
 humantime = "2.2.0"
 
 #nostr-dm
-nostr-sdk = { version = "0.43.0", optional = true, default-features = false }
+nostr-sdk = { version = "0.44", optional = true, default-features = false }
 
 #nostr-nwc
-nwc = { version = "0.43.0", optional = true }
+nwc = { version = "0.44", optional = true }
 
 #proxmox
 tokio-tungstenite = { version = "^0.21", features = ["native-tls"], optional = true }
@@ -83,13 +84,3 @@ virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
 #virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}/
 uuid = { version = "1.16.0", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.37.3", features = ["serde", "serialize"], optional = true }
-
-#lnd
-fedimint-tonic-lnd = { version = "0.2.0", default-features = false, features = ["invoicesrpc"], optional = true }
-
-#bitvora
-tokio-stream = { version = "0.1.17", features = ["sync"], optional = true }
-
-#revolut
-sha2 = { version = "0.10.8", optional = true }
-hmac = { version = "0.12.1", optional = true }

@@ -3,12 +3,11 @@ use anyhow::{anyhow, bail, Context};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    async_trait, AccessPolicy, AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, Company,
+    async_trait, AccessPolicy, Company,
     DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, RegionStats, Router, User, UserSshKey, Vm, VmCostPlan,
+    NostrDomainHandle, OsDistribution, Router, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmPaymentWithCompany, VmTemplate,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use std::collections::HashMap;
 use std::ops::Add;
@@ -414,7 +413,7 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_host_disks(&self, host_id: u64) -> anyhow::Result<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, TB: u64) -> anyhow::Result<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
         Ok(disks.values().filter(|d| d.enabled).cloned().collect())
     }
@@ -784,7 +783,7 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
-    async fn list_custom_pricing(&self, region_id: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
+    async fn list_custom_pricing(&self, TB: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().filter(|p| p.enabled).cloned().collect())
     }

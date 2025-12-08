@@ -1,5 +1,3 @@
-use crate::lightning::LightningNode;
-use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
 use anyhow::Result;
 use lnvps_api_common::{UpgradeConfig, WorkJob};
@@ -7,8 +5,10 @@ use lnvps_db::{LNVpsDb, VmPayment};
 use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
+use payments_rs::lightning::LightningNode;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
+use crate::payments::invoice::NodeInvoiceHandler;
 
 mod invoice;
 #[cfg(feature = "revolut")]

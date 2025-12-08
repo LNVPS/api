@@ -1,11 +1,11 @@
 // Re-export common API models
 pub use lnvps_api_common::*;
 
-use crate::exchange::{alt_prices, ExchangeRateService};
+use crate::exchange::{ExchangeRateService, alt_prices};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use humantime::format_duration;
-use lnvps_api_common::{ApiDiskInterface, ApiDiskType, Currency, CurrencyAmount};
+use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use payments_rs::currency::{Currency, CurrencyAmount};
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ApiCustomVmOrder {
@@ -36,10 +37,10 @@ impl ApiTemplatesResponse {
 
         for template in &mut self.templates {
             let list_price =
-                CurrencyAmount::from_f32(template.cost_plan.currency, template.cost_plan.amount);
+                CurrencyAmount::from_f32(template.cost_plan.currency.into(), template.cost_plan.amount);
             for alt_price in alt_prices(&rates, list_price) {
                 template.cost_plan.other_price.push(ApiPrice {
-                    currency: alt_price.currency(),
+                    currency: alt_price.currency().into(),
                     amount: alt_price.value_f32(),
                 });
             }
@@ -47,7 +48,6 @@ impl ApiTemplatesResponse {
         Ok(())
     }
 }
-
 
 // Models that are only used in lnvps_api (moved from common)
 
@@ -208,9 +208,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             is_upgrade: value.payment_type == PaymentType::Upgrade,
             upgrade_params: value.upgrade_params.clone(),
             data: match &value.payment_method {
-                PaymentMethod::Lightning => {
-                    ApiPaymentData::Lightning(value.external_data.into())
-                }
+                PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
                 PaymentMethod::Revolut => {
                     #[derive(Deserialize)]
                     struct RevolutData {
@@ -235,7 +233,7 @@ pub struct ApiPaymentInfo {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
 
-    pub currencies: Vec<Currency>,
+    pub currencies: Vec<ApiCurrency>,
 }
 
 /// Payment data related to the payment method
@@ -258,7 +256,7 @@ pub enum ApiPaymentMethod {
     Lightning,
     Revolut,
     Paypal,
-    NWC
+    NWC,
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {

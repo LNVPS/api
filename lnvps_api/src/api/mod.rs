@@ -13,6 +13,3 @@ pub fn routes() -> Vec<Route> {
     r.append(&mut nostr_domain::routes());
     r
 }
-
-pub use webhook::WebhookMessage;
-pub use webhook::WEBHOOK_BRIDGE;

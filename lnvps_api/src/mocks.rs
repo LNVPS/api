@@ -3,20 +3,21 @@ use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
-use crate::lightning::{AddInvoiceRequest, AddInvoiceResult, InvoiceUpdate, LightningNode};
 use crate::router::{ArpEntry, Router};
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{Context, anyhow, bail, ensure};
 use chrono::{DateTime, TimeDelta, Utc};
-use fedimint_tonic_lnd::tonic::codegen::tokio_stream::Stream;
+use futures::Stream;
 use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    async_trait, AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
-    LNVpsDb, NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
+    AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
+    NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    async_trait,
 };
+use payments_rs::lightning::{AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
@@ -113,7 +114,7 @@ impl MockNode {
 
 #[async_trait]
 impl LightningNode for MockNode {
-    async fn add_invoice(&self, req: AddInvoiceRequest) -> anyhow::Result<AddInvoiceResult> {
+    async fn add_invoice(&self, req: AddInvoiceRequest) -> anyhow::Result<AddInvoiceResponse> {
         let mut invoices = self.invoices.lock().await;
         let id: [u8; 32] = rand::random();
         let hex_id = hex::encode(id);
@@ -126,11 +127,7 @@ impl LightningNode for MockNode {
                 is_paid: false,
             },
         );
-        Ok(AddInvoiceResult {
-            pr: format!("lnrt1{}", hex_id),
-            payment_hash: hex_id.clone(),
-            external_id: None,
-        })
+        AddInvoiceResponse::from_invoice(&format!("lnrt1{}", hex_id), None)
     }
 
     async fn cancel_invoice(&self, id: &Vec<u8>) -> anyhow::Result<()> {
