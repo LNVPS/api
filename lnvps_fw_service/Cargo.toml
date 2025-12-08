@@ -4,12 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["time", "signal", "fs"] }
+lnvps_ebpf = { path = "../lnvps_ebpf" }
+tokio = { version = "1.47.1", features = ["macros", "time"] }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 aya = "0.13.1"
+aya-ebpf = { version = "0.1.1" }
 aya-log = "0.2.1"
+sudo = "0.6.0"
+ctrlc = { version = "3.5.0", features = ["termination"] }
 
 [build-dependencies]
 aya-build = "0.1.2"
