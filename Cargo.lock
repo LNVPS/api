@@ -2871,6 +2871,7 @@ dependencies = [
  "lnvps_common",
  "lnvps_db",
  "log 0.4.27",
+ "payments-rs",
  "rand 0.9.2",
  "rocket",
  "rocket_ws",

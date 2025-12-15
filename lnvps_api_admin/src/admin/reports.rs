@@ -1,8 +1,8 @@
 use crate::admin::auth::AdminAuth;
 use chrono::NaiveDate;
-use lnvps_api_common::{ApiData, ApiResult, Currency};
+use lnvps_api_common::{ApiData, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::{get, State};
+use rocket::{State, get};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -87,7 +87,7 @@ pub async fn admin_time_series_report(
     // Validate currency if provided
     if let Some(ref currency_str) = currency {
         currency_str
-            .parse::<Currency>()
+            .parse::<payments_rs::currency::Currency>()
             .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency_str))?;
     }
 
@@ -140,7 +140,9 @@ pub async fn admin_time_series_report(
     ApiData::ok(report)
 }
 
-#[get("/api/admin/v1/reports/referral-usage/time-series?<start_date>&<end_date>&<company_id>&<ref_code>")]
+#[get(
+    "/api/admin/v1/reports/referral-usage/time-series?<start_date>&<end_date>&<company_id>&<ref_code>"
+)]
 pub async fn admin_referral_time_series_report(
     auth: AdminAuth,
     start_date: String,

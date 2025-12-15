@@ -79,8 +79,7 @@ pub async fn admin_create_company(
             "EUR".to_string()
         } else {
             // Validate currency by parsing it with the Currency enum
-            use lnvps_api_common::Currency;
-            match currency.parse::<Currency>() {
+            match currency.parse::<payments_rs::currency::Currency>() {
                 Ok(_) => {}, // Valid currency
                 Err(_) => return ApiData::err("Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC"),
             }
@@ -241,8 +240,7 @@ pub async fn admin_update_company(
             return ApiData::err("Base currency cannot be empty");
         } else {
             // Validate currency by parsing it with the Currency enum
-            use lnvps_api_common::Currency;
-            match currency.parse::<Currency>() {
+            match currency.parse::<payments_rs::currency::Currency>() {
                 Ok(_) => {}, // Valid currency
                 Err(_) => return ApiData::err("Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC"),
             }
