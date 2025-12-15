@@ -7,6 +7,32 @@ use rocket::serde::json::Json;
 use rocket::{get, patch, State};
 use std::sync::Arc;
 
+/// Get a specific user's information
+#[get("/api/admin/v1/users/<id>")]
+pub async fn admin_get_user(
+    auth: AdminAuth,
+    db: &State<Arc<dyn LNVpsDb>>,
+    id: u64,
+) -> ApiResult<AdminUserInfo> {
+    // Check permission
+    auth.require_permission(AdminResource::Users, AdminAction::View)?;
+
+    // Get the user directly from the database
+    let user = db.get_user(id).await?;
+    
+    // Create a basic AdminUserInfo with the user data
+    let mut result = AdminUserInfo::from(user);
+
+    // Check if user has admin role
+    result.is_admin = db.is_admin_user(result.id).await.unwrap_or(false);
+
+    // Get the user's VM count - a simple approach by querying for their VMs
+    let vms = db.list_user_vms(result.id).await.unwrap_or_default();
+    result.vm_count = vms.len() as u64;
+
+    ApiData::ok(result)
+}
+
 /// List all users with pagination and filtering
 #[get("/api/admin/v1/users?<limit>&<offset>&<search>")]
 pub async fn admin_list_users(

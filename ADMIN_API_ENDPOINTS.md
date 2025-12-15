@@ -42,6 +42,14 @@ Query Parameters:
 
 Required Permission: `users::view`
 
+#### Get User Details
+```
+GET /api/admin/v1/users/{id}
+```
+Required Permission: `users::view`
+
+Returns complete user information including VM count and admin status.
+
 #### Update User
 ```
 PATCH /api/admin/v1/users/{id}
