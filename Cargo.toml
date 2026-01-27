@@ -8,8 +8,6 @@ members = [
     "lnvps_nostr",
     "lnvps_common",
     "lnvps_operator",
-    "lnvps_ebpf",
-    "lnvps_fw_service"
 ]
 
 [workspace.package]

@@ -1,11 +1,13 @@
 use crate::{
-    AccessPolicy, AdminVmHost, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType,
-    ReferralCostUsage, RegionStats, Router, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
+    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType,
+    ReferralCostUsage, RegionStats, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentType, SubscriptionPaymentWithCompany, User,
+    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
-use crate::{AdminDb, AdminRole, AdminRoleAssignment};
+use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 #[cfg(feature = "nostr-domain")]
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
 use anyhow::{bail, Error, Result};
@@ -998,6 +1000,325 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
 
         Ok(users)
+    }
+
+    // ========================================================================
+    // Subscription Billing System Implementations
+    // ========================================================================
+
+    // Subscriptions
+    async fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
+        sqlx::query_as("SELECT * FROM subscription")
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_subscriptions_by_user(&self, user_id: u64) -> Result<Vec<Subscription>> {
+        sqlx::query_as("SELECT * FROM subscription WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_subscriptions_active(&self, user_id: u64) -> Result<Vec<Subscription>> {
+        sqlx::query_as("SELECT * FROM subscription WHERE user_id = ? AND is_active = 1")
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_subscription(&self, id: u64) -> Result<Subscription> {
+        sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_subscription_by_ext_id(&self, external_id: &str) -> Result<Subscription> {
+        sqlx::query_as("SELECT * FROM subscription WHERE external_id = ?")
+            .bind(external_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_subscription(&self, subscription: &Subscription) -> Result<u64> {
+        let res = sqlx::query(
+            "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(subscription.user_id)
+        .bind(&subscription.name)
+        .bind(&subscription.description)
+        .bind(subscription.created)
+        .bind(subscription.expires)
+        .bind(subscription.is_active)
+        .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
+        .bind(subscription.setup_fee)
+        .bind(subscription.auto_renewal_enabled)
+        .bind(&subscription.external_id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_subscription(&self, subscription: &Subscription) -> Result<()> {
+        sqlx::query(
+            "UPDATE subscription SET user_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
+        )
+        .bind(subscription.user_id)
+        .bind(&subscription.name)
+        .bind(&subscription.description)
+        .bind(subscription.expires)
+        .bind(subscription.is_active)
+        .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
+        .bind(subscription.setup_fee)
+        .bind(subscription.auto_renewal_enabled)
+        .bind(&subscription.external_id)
+        .bind(subscription.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    async fn delete_subscription(&self, id: u64) -> Result<()> {
+        sqlx::query("DELETE FROM subscription WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    async fn get_subscription_base_currency(&self, subscription_id: u64) -> Result<String> {
+        let result: (String,) = sqlx::query_as(
+            "SELECT c.base_currency 
+             FROM subscription s
+             JOIN users u ON s.user_id = u.id
+             JOIN company c ON u.id = c.id
+             WHERE s.id = ?"
+        )
+        .bind(subscription_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(result.0)
+    }
+
+    // Subscription Line Items
+    async fn list_subscription_line_items(&self, subscription_id: u64) -> Result<Vec<SubscriptionLineItem>> {
+        sqlx::query_as("SELECT * FROM subscription_line_item WHERE subscription_id = ?")
+            .bind(subscription_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_subscription_line_item(&self, id: u64) -> Result<SubscriptionLineItem> {
+        sqlx::query_as("SELECT * FROM subscription_line_item WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn insert_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<u64> {
+        let res = sqlx::query(
+            "INSERT INTO subscription_line_item (subscription_id, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        .bind(line_item.subscription_id)
+        .bind(&line_item.name)
+        .bind(&line_item.description)
+        .bind(line_item.amount)
+        .bind(line_item.setup_amount)
+        .bind(&line_item.configuration)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<()> {
+        sqlx::query(
+            "UPDATE subscription_line_item SET subscription_id = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ? WHERE id = ?"
+        )
+        .bind(line_item.subscription_id)
+        .bind(&line_item.name)
+        .bind(&line_item.description)
+        .bind(line_item.amount)
+        .bind(line_item.setup_amount)
+        .bind(&line_item.configuration)
+        .bind(line_item.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    async fn delete_subscription_line_item(&self, id: u64) -> Result<()> {
+        sqlx::query("DELETE FROM subscription_line_item WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    // Subscription Payments
+    async fn list_subscription_payments(&self, subscription_id: u64) -> Result<Vec<SubscriptionPayment>> {
+        sqlx::query_as("SELECT * FROM subscription_payment WHERE subscription_id = ?")
+            .bind(subscription_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn list_subscription_payments_by_user(&self, user_id: u64) -> Result<Vec<SubscriptionPayment>> {
+        sqlx::query_as("SELECT * FROM subscription_payment WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_subscription_payment(&self, id: &Vec<u8>) -> Result<SubscriptionPayment> {
+        sqlx::query_as("SELECT * FROM subscription_payment WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_subscription_payment_by_ext_id(&self, external_id: &str) -> Result<SubscriptionPayment> {
+        sqlx::query_as("SELECT * FROM subscription_payment WHERE external_id = ?")
+            .bind(external_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(Error::new)
+    }
+
+    async fn get_subscription_payment_with_company(&self, id: &Vec<u8>) -> Result<SubscriptionPaymentWithCompany> {
+        sqlx::query_as(
+            "SELECT sp.*, c.base_currency as company_base_currency
+             FROM subscription_payment sp
+             JOIN subscription s ON sp.subscription_id = s.id
+             JOIN users u ON s.user_id = u.id
+             JOIN company c ON u.id = c.id
+             WHERE sp.id = ?"
+        )
+        .bind(id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(Error::new)
+    }
+
+    async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, time_value, tax) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&payment.id)
+        .bind(payment.subscription_id)
+        .bind(payment.user_id)
+        .bind(payment.created)
+        .bind(payment.expires)
+        .bind(payment.amount)
+        .bind(&payment.currency)
+        .bind(payment.payment_method)
+        .bind(payment.payment_type)
+        .bind(&payment.external_data)
+        .bind(&payment.external_id)
+        .bind(payment.is_paid)
+        .bind(payment.rate)
+        .bind(payment.time_value)
+        .bind(payment.tax)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+        sqlx::query(
+            "UPDATE subscription_payment SET subscription_id = ?, user_id = ?, created = ?, expires = ?, amount = ?, currency = ?, payment_method = ?, payment_type = ?, external_data = ?, external_id = ?, is_paid = ?, rate = ?, time_value = ?, tax = ? WHERE id = ?"
+        )
+        .bind(payment.subscription_id)
+        .bind(payment.user_id)
+        .bind(payment.created)
+        .bind(payment.expires)
+        .bind(payment.amount)
+        .bind(&payment.currency)
+        .bind(payment.payment_method)
+        .bind(payment.payment_type)
+        .bind(&payment.external_data)
+        .bind(&payment.external_id)
+        .bind(payment.is_paid)
+        .bind(payment.rate)
+        .bind(payment.time_value)
+        .bind(payment.tax)
+        .bind(&payment.id)
+        .execute(&self.db)
+        .await
+        .map_err(Error::new)?;
+
+        Ok(())
+    }
+
+    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> Result<()> {
+        // Mark payment as paid
+        sqlx::query("UPDATE subscription_payment SET is_paid = 1 WHERE id = ?")
+            .bind(&payment.id)
+            .execute(&self.db)
+            .await
+            .map_err(Error::new)?;
+
+        // If payment has time_value, extend the subscription expiration
+        if let Some(time_value) = payment.time_value {
+            if time_value > 0 {
+                sqlx::query(
+                    "UPDATE subscription SET expires = DATE_ADD(COALESCE(expires, NOW()), INTERVAL ? SECOND), is_active = 1 WHERE id = ?"
+                )
+                .bind(time_value)
+                .bind(payment.subscription_id)
+                .execute(&self.db)
+                .await
+                .map_err(Error::new)?;
+            }
+        } else {
+            // For one-time purchases without expiration, just activate the subscription
+            sqlx::query("UPDATE subscription SET is_active = 1 WHERE id = ?")
+                .bind(payment.subscription_id)
+                .execute(&self.db)
+                .await
+                .map_err(Error::new)?;
+        }
+
+        Ok(())
+    }
+
+    async fn last_paid_subscription_invoice(&self) -> Result<Option<SubscriptionPayment>> {
+        sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE is_paid = 1 ORDER BY created DESC LIMIT 1"
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Error::new)
     }
 }
 

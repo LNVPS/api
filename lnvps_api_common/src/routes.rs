@@ -1,15 +1,11 @@
 use rocket::serde::json::Json;
 use rocket::Responder;
-use rocket_okapi::r#gen::OpenApiGenerator;
-use rocket_okapi::okapi::openapi3::Responses;
-use rocket_okapi::response::OpenApiResponderInner;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
 pub type ApiPaginatedResult<T> = Result<Json<ApiPaginatedData<T>>, ApiError>;
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiData<T: Serialize> {
     pub data: T,
 }
@@ -24,7 +20,7 @@ impl<T: Serialize> ApiData<T> {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiPaginatedData<T: Serialize> {
     pub data: Vec<T>,
     pub total: u64,
@@ -58,11 +54,5 @@ impl<T: ToString> From<T> for ApiError {
         Self {
             error: value.to_string(),
         }
-    }
-}
-
-impl OpenApiResponderInner for ApiError {
-    fn responses(_gen: &mut OpenApiGenerator) -> rocket_okapi::Result<Responses> {
-        Ok(Responses::default())
     }
 }

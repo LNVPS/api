@@ -6,7 +6,6 @@ use lnvps_db::{LNVpsDb, NostrDomain, NostrDomainHandle};
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
 use rocket::{delete, get, post, routes, Route, State};
-use rocket_okapi::{openapi, JsonSchema};
 use std::sync::Arc;
 
 pub fn routes() -> Vec<Route> {
@@ -19,7 +18,6 @@ pub fn routes() -> Vec<Route> {
     ]
 }
 
-#[openapi(tag = "NIP05")]
 #[get("/api/v1/nostr/domain")]
 async fn v1_nostr_domains(
     auth: Nip98Auth,
@@ -36,7 +34,6 @@ async fn v1_nostr_domains(
     })
 }
 
-#[openapi(tag = "NIP05")]
 #[post("/api/v1/nostr/domain", format = "json", data = "<data>")]
 async fn v1_create_nostr_domain(
     auth: Nip98Auth,
@@ -57,7 +54,6 @@ async fn v1_create_nostr_domain(
     ApiData::ok(dom.into())
 }
 
-#[openapi(tag = "NIP05")]
 #[get("/api/v1/nostr/domain/<dom>/handle")]
 async fn v1_list_nostr_domain_handles(
     auth: Nip98Auth,
@@ -76,7 +72,6 @@ async fn v1_list_nostr_domain_handles(
     ApiData::ok(handles.into_iter().map(|h| h.into()).collect())
 }
 
-#[openapi(tag = "NIP05")]
 #[post("/api/v1/nostr/domain/<dom>/handle", format = "json", data = "<data>")]
 async fn v1_create_nostr_domain_handle(
     auth: Nip98Auth,
@@ -109,7 +104,6 @@ async fn v1_create_nostr_domain_handle(
     ApiData::ok(handle.into())
 }
 
-#[openapi(tag = "NIP05")]
 #[delete("/api/v1/nostr/domain/<dom>/handle/<handle>")]
 async fn v1_delete_nostr_domain_handle(
     auth: Nip98Auth,
@@ -128,18 +122,18 @@ async fn v1_delete_nostr_domain_handle(
     ApiData::ok(())
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 struct NameRequest {
     pub name: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
 struct HandleRequest {
     pub pubkey: String,
     pub name: String,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct ApiNostrDomain {
     pub id: u64,
     pub name: String,
@@ -166,7 +160,7 @@ impl From<NostrDomain> for ApiNostrDomain {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct ApiNostrDomainHandle {
     pub id: u64,
     pub domain_id: u64,
@@ -193,7 +187,7 @@ impl From<NostrDomainHandle> for ApiNostrDomainHandle {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct ApiDomainsResponse {
     pub domains: Vec<ApiNostrDomain>,
     pub cname: String,

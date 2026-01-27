@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
-use schemars::JsonSchema;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use payments_rs::currency::{Currency, CurrencyAmount};
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiCustomVmOrder {
     #[serde(flatten)]
     pub spec: ApiCustomVmRequest,
@@ -24,7 +24,7 @@ pub struct ApiCustomVmOrder {
     pub ref_code: Option<String>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiTemplatesResponse {
     pub templates: Vec<ApiVmTemplate>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -51,7 +51,7 @@ impl ApiTemplatesResponse {
 
 // Models that are only used in lnvps_api (moved from common)
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct VMPatchRequest {
     /// SSH key assigned to vm
     pub ssh_key_id: Option<u64>,
@@ -62,7 +62,7 @@ pub struct VMPatchRequest {
     pub auto_renewal_enabled: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct AccountPatchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -108,7 +108,7 @@ impl From<lnvps_db::User> for AccountPatchRequest {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct CreateVmRequest {
     pub template_id: u64,
     pub image_id: u64,
@@ -116,13 +116,13 @@ pub struct CreateVmRequest {
     pub ref_code: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct CreateSshKey {
     pub name: String,
     pub key_data: String,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiVmPayment {
     pub id: String,
     pub vm_id: u64,
@@ -139,7 +139,7 @@ pub struct ApiVmPayment {
     pub upgrade_params: Option<String>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiInvoiceItem {
     /// Raw amount in smallest currency unit (cents for fiat, millisats for BTC)
     pub amount: u64,
@@ -221,12 +221,21 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
                 PaymentMethod::Paypal => {
                     todo!()
                 }
+                PaymentMethod::Stripe => {
+                    #[derive(Deserialize)]
+                    struct StripeData {
+                        pub session_id: String,
+                    }
+                    let data: StripeData =
+                        serde_json::from_str(&value.external_data.as_str()).unwrap();
+                    ApiPaymentData::Stripe { session_id: data.session_id }
+                }
             },
         }
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiPaymentInfo {
     pub name: ApiPaymentMethod,
 
@@ -237,7 +246,7 @@ pub struct ApiPaymentInfo {
 }
 
 /// Payment data related to the payment method
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiPaymentData {
     /// Just an LN invoice
@@ -247,15 +256,21 @@ pub enum ApiPaymentData {
         /// Order token
         token: String,
     },
+    /// Stripe checkout session
+    Stripe {
+        /// Stripe checkout session ID
+        session_id: String,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiPaymentMethod {
     #[default]
     Lightning,
     Revolut,
     Paypal,
+    Stripe,
     NWC,
 }
 
@@ -265,11 +280,12 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Lightning => ApiPaymentMethod::Lightning,
             PaymentMethod::Revolut => ApiPaymentMethod::Revolut,
             PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
+            PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
         }
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiCompany {
     pub id: u64,
     pub name: String,
@@ -311,7 +327,7 @@ impl From<lnvps_db::Company> for ApiCompany {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiVmHistoryInitiator {
     /// Action initiated by the VM owner
@@ -322,7 +338,7 @@ pub enum ApiVmHistoryInitiator {
     Other,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiVmHistory {
     /// Unique history entry ID
     pub id: u64,
@@ -373,7 +389,7 @@ impl ApiVmHistory {
 }
 
 // Simplified versions without complex dependencies
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiCustomVmRequest {
     pub pricing_id: u64,
     pub cpu: u16,
@@ -397,16 +413,163 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiVmUpgradeRequest {
     pub cpu: Option<u16>,
     pub memory: Option<u64>,
     pub disk: Option<u64>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiVmUpgradeQuote {
     pub cost_difference: ApiPrice,
     pub new_renewal_cost: ApiPrice,
     pub discount: ApiPrice,
 }
+
+// ============================================================================
+// Subscription Models
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct ApiSubscription {
+    pub id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub currency: ApiCurrency,
+    pub interval_amount: u64,
+    pub interval_type: ApiVmCostPlanIntervalType,
+    pub setup_fee: u64,
+    pub auto_renewal_enabled: bool,
+    pub line_items: Vec<ApiSubscriptionLineItem>,
+}
+
+impl ApiSubscription {
+    pub async fn from_subscription(
+        db: &dyn lnvps_db::LNVpsDbBase,
+        subscription: lnvps_db::Subscription,
+    ) -> anyhow::Result<Self> {
+        let line_items = db
+            .list_subscription_line_items(subscription.id)
+            .await?
+            .into_iter()
+            .map(ApiSubscriptionLineItem::from)
+            .collect();
+
+        let currency = match subscription.currency.to_uppercase().as_str() {
+            "EUR" => ApiCurrency::EUR,
+            "BTC" => ApiCurrency::BTC,
+            "USD" => ApiCurrency::USD,
+            "GBP" => ApiCurrency::GBP,
+            "CAD" => ApiCurrency::CAD,
+            "CHF" => ApiCurrency::CHF,
+            "AUD" => ApiCurrency::AUD,
+            "JPY" => ApiCurrency::JPY,
+            _ => ApiCurrency::USD,
+        };
+
+        Ok(Self {
+            id: subscription.id,
+            name: subscription.name,
+            description: subscription.description,
+            created: subscription.created,
+            expires: subscription.expires,
+            is_active: subscription.is_active,
+            currency,
+            interval_amount: subscription.interval_amount,
+            interval_type: ApiVmCostPlanIntervalType::from(subscription.interval_type),
+            setup_fee: subscription.setup_fee,
+            auto_renewal_enabled: subscription.auto_renewal_enabled,
+            line_items,
+        })
+    }
+}
+
+#[derive(Serialize)]
+pub struct ApiSubscriptionLineItem {
+    pub id: u64,
+    pub subscription_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub amount: u64,
+    pub setup_amount: u64,
+    pub configuration: Option<serde_json::Value>,
+}
+
+impl From<lnvps_db::SubscriptionLineItem> for ApiSubscriptionLineItem {
+    fn from(line_item: lnvps_db::SubscriptionLineItem) -> Self {
+        Self {
+            id: line_item.id,
+            subscription_id: line_item.subscription_id,
+            name: line_item.name,
+            description: line_item.description,
+            amount: line_item.amount,
+            setup_amount: line_item.setup_amount,
+            configuration: line_item.configuration,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ApiSubscriptionPayment {
+    pub id: String, // Hex encoded
+    pub subscription_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: ApiCurrency,
+    pub payment_method: ApiPaymentMethod,
+    pub payment_type: ApiSubscriptionPaymentType,
+    pub is_paid: bool,
+    pub time_value: Option<u64>,
+    pub tax: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum ApiSubscriptionPaymentType {
+    Purchase,
+    Renewal,
+}
+
+impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
+    fn from(payment_type: lnvps_db::SubscriptionPaymentType) -> Self {
+        match payment_type {
+            lnvps_db::SubscriptionPaymentType::Purchase => ApiSubscriptionPaymentType::Purchase,
+            lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
+        }
+    }
+}
+
+impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
+    fn from(payment: lnvps_db::SubscriptionPayment) -> Self {
+        let currency = match payment.currency.to_uppercase().as_str() {
+            "EUR" => ApiCurrency::EUR,
+            "BTC" => ApiCurrency::BTC,
+            "USD" => ApiCurrency::USD,
+            "GBP" => ApiCurrency::GBP,
+            "CAD" => ApiCurrency::CAD,
+            "CHF" => ApiCurrency::CHF,
+            "AUD" => ApiCurrency::AUD,
+            "JPY" => ApiCurrency::JPY,
+            _ => ApiCurrency::USD,
+        };
+
+        Self {
+            id: hex::encode(&payment.id),
+            subscription_id: payment.subscription_id,
+            created: payment.created,
+            expires: payment.expires,
+            amount: payment.amount,
+            currency,
+            payment_method: ApiPaymentMethod::from(payment.payment_method),
+            payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
+            is_paid: payment.is_paid,
+            time_value: payment.time_value,
+            tax: payment.tax,
+        }
+    }
+}
+

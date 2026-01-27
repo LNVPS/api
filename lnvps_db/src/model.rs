@@ -142,7 +142,7 @@ pub enum DiskType {
 pub struct AdminVmHost {
     #[sqlx(flatten)]
     pub host: VmHost,
-    
+
     // Region fields with prefixed names to avoid conflicts
     pub region_id: u64,
     #[sqlx(rename = "region_name")]
@@ -151,11 +151,11 @@ pub struct AdminVmHost {
     pub region_enabled: bool,
     #[sqlx(rename = "region_company_id")]
     pub region_company_id: Option<u64>,
-    
+
     // Disk information (populated separately, not from SQL)
     #[sqlx(skip)]
     pub disks: Vec<VmHostDisk>,
-    
+
     // Additional calculated data that can be populated by the database function
     pub active_vm_count: i64,
 }
@@ -360,7 +360,7 @@ pub enum NetworkAccessPolicy {
     StaticArp = 0,
 }
 
-#[derive(Clone, Copy, Debug, sqlx::Type)]
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum VmCostPlanIntervalType {
     Day = 0,
@@ -551,7 +551,6 @@ pub struct ReferralCostUsage {
     pub base_currency: String,
 }
 
-
 /// VM Payment with company information for time-series reporting
 #[derive(FromRow, Clone, Debug)]
 pub struct VmPaymentWithCompany {
@@ -582,13 +581,14 @@ pub struct VmPaymentWithCompany {
     pub company_base_currency: String,
 }
 
-#[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum PaymentMethod {
     #[default]
     Lightning,
     Revolut,
     Paypal,
+    Stripe,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -605,6 +605,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Lightning => write!(f, "Lightning"),
             PaymentMethod::Revolut => write!(f, "Revolut"),
             PaymentMethod::Paypal => write!(f, "PayPal"),
+            PaymentMethod::Stripe => write!(f, "Stripe"),
         }
     }
 }
@@ -617,6 +618,7 @@ impl FromStr for PaymentMethod {
             "lightning" => Ok(PaymentMethod::Lightning),
             "revolut" => Ok(PaymentMethod::Revolut),
             "paypal" => Ok(PaymentMethod::Paypal),
+            "stripe" => Ok(PaymentMethod::Stripe),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -814,6 +816,9 @@ pub enum AdminResource {
     VmOsImage = 14,
     VmPayment = 15,
     VmTemplate = 16,
+    Subscriptions = 17,
+    SubscriptionLineItems = 18,
+    SubscriptionPayments = 19,
 }
 
 /// Actions that can be performed on administrative resources
@@ -846,6 +851,9 @@ impl Display for AdminResource {
             AdminResource::VmOsImage => write!(f, "vm_os_image"),
             AdminResource::VmPayment => write!(f, "vm_payment"),
             AdminResource::VmTemplate => write!(f, "vm_template"),
+            AdminResource::Subscriptions => write!(f, "subscriptions"),
+            AdminResource::SubscriptionLineItems => write!(f, "subscription_line_items"),
+            AdminResource::SubscriptionPayments => write!(f, "subscription_payments"),
         }
     }
 }
@@ -872,6 +880,9 @@ impl FromStr for AdminResource {
             "vm_os_image" => Ok(AdminResource::VmOsImage),
             "vm_payment" => Ok(AdminResource::VmPayment),
             "vm_template" => Ok(AdminResource::VmTemplate),
+            "subscriptions" => Ok(AdminResource::Subscriptions),
+            "subscription_line_items" => Ok(AdminResource::SubscriptionLineItems),
+            "subscription_payments" => Ok(AdminResource::SubscriptionPayments),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -899,6 +910,9 @@ impl TryFrom<u16> for AdminResource {
             14 => Ok(AdminResource::VmOsImage),
             15 => Ok(AdminResource::VmPayment),
             16 => Ok(AdminResource::VmTemplate),
+            17 => Ok(AdminResource::Subscriptions),
+            18 => Ok(AdminResource::SubscriptionLineItems),
+            19 => Ok(AdminResource::SubscriptionPayments),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -925,6 +939,9 @@ impl AdminResource {
             AdminResource::VmOsImage,
             AdminResource::VmPayment,
             AdminResource::VmTemplate,
+            AdminResource::Subscriptions,
+            AdminResource::SubscriptionLineItems,
+            AdminResource::SubscriptionPayments,
         ]
     }
 }
@@ -978,4 +995,99 @@ impl AdminAction {
             AdminAction::Delete,
         ]
     }
+}
+
+// ============================================================================
+// Subscription Billing System - Recurring services (LIR, ASN, etc.)
+// ============================================================================
+
+/// Subscription payment type (Purchase or Renewal)
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[repr(u16)]
+pub enum SubscriptionPaymentType {
+    /// Initial purchase including setup fees
+    #[default]
+    Purchase = 0,
+    /// Recurring renewal payment
+    Renewal = 1,
+}
+
+impl Display for SubscriptionPaymentType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubscriptionPaymentType::Purchase => write!(f, "Purchase"),
+            SubscriptionPaymentType::Renewal => write!(f, "Renewal"),
+        }
+    }
+}
+
+/// Subscription for a recurring service
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct Subscription {
+    pub id: u64,
+    pub user_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: VmCostPlanIntervalType,
+    pub setup_fee: u64,
+    pub auto_renewal_enabled: bool,
+    pub external_id: Option<String>,
+}
+
+/// Line item within a subscription
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct SubscriptionLineItem {
+    pub id: u64,
+    pub subscription_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub amount: u64,
+    pub setup_amount: u64,
+    pub configuration: Option<serde_json::Value>,
+}
+
+/// Subscription payment
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct SubscriptionPayment {
+    pub id: Vec<u8>,
+    pub subscription_id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    pub payment_type: SubscriptionPaymentType,
+    pub external_data: EncryptedString,
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub rate: f32,
+    pub time_value: Option<u64>,
+    pub tax: u64,
+}
+
+/// Subscription payment with company info (for admin views)
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct SubscriptionPaymentWithCompany {
+    pub id: Vec<u8>,
+    pub subscription_id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    pub payment_type: SubscriptionPaymentType,
+    pub external_data: EncryptedString,
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub rate: f32,
+    pub time_value: Option<u64>,
+    pub tax: u64,
+    pub company_base_currency: String,
 }

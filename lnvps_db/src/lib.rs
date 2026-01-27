@@ -295,6 +295,39 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get all active customers with their contact preferences for bulk messaging
     /// Returns users who have at least one non-deleted VM and at least one contact method enabled
     async fn get_active_customers_with_contact_prefs(&self) -> Result<Vec<crate::User>>;
+
+    // ========================================================================
+    // Subscription Billing System Methods
+    // ========================================================================
+
+    // Subscriptions
+    async fn list_subscriptions(&self) -> Result<Vec<Subscription>>;
+    async fn list_subscriptions_by_user(&self, user_id: u64) -> Result<Vec<Subscription>>;
+    async fn list_subscriptions_active(&self, user_id: u64) -> Result<Vec<Subscription>>;
+    async fn get_subscription(&self, id: u64) -> Result<Subscription>;
+    async fn get_subscription_by_ext_id(&self, external_id: &str) -> Result<Subscription>;
+    async fn insert_subscription(&self, subscription: &Subscription) -> Result<u64>;
+    async fn update_subscription(&self, subscription: &Subscription) -> Result<()>;
+    async fn delete_subscription(&self, id: u64) -> Result<()>;
+    async fn get_subscription_base_currency(&self, subscription_id: u64) -> Result<String>;
+
+    // Subscription Line Items
+    async fn list_subscription_line_items(&self, subscription_id: u64) -> Result<Vec<SubscriptionLineItem>>;
+    async fn get_subscription_line_item(&self, id: u64) -> Result<SubscriptionLineItem>;
+    async fn insert_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<u64>;
+    async fn update_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<()>;
+    async fn delete_subscription_line_item(&self, id: u64) -> Result<()>;
+
+    // Subscription Payments
+    async fn list_subscription_payments(&self, subscription_id: u64) -> Result<Vec<SubscriptionPayment>>;
+    async fn list_subscription_payments_by_user(&self, user_id: u64) -> Result<Vec<SubscriptionPayment>>;
+    async fn get_subscription_payment(&self, id: &Vec<u8>) -> Result<SubscriptionPayment>;
+    async fn get_subscription_payment_by_ext_id(&self, external_id: &str) -> Result<SubscriptionPayment>;
+    async fn get_subscription_payment_with_company(&self, id: &Vec<u8>) -> Result<SubscriptionPaymentWithCompany>;
+    async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()>;
+    async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()>;
+    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> Result<()>;
+    async fn last_paid_subscription_invoice(&self) -> Result<Option<SubscriptionPayment>>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

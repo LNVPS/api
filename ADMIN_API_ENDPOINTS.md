@@ -8,7 +8,7 @@ Admin API request/response format reference for LLM consumption.
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
 **VmRunningStates**: `"running"`, `"stopped"`, `"starting"`, `"deleting"`
 **AdminVmHistoryActionType**: `"created"`, `"started"`, `"stopped"`, `"restarted"`, `"deleted"`, `"expired"`, `"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`
-**AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`
+**AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`, `"stripe"`
 **VmHostKind**: `"proxmox"`, `"libvirt"`
 **CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
 **ApiOsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`, `"redhatenterprise"`
@@ -17,6 +17,7 @@ Admin API request/response format reference for LLM consumption.
 **RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
+**SubscriptionPaymentType**: `"purchase"`, `"renewal"`
 
 ## Authentication
 ```
@@ -326,6 +327,183 @@ Required Permission: `payments::view`
 GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}
 ```
 Required Permission: `payments::view`
+
+### Subscription Management
+
+#### List Subscriptions
+```
+GET /api/admin/v1/subscriptions
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `user_id`: number (optional) - filter by user ID
+
+Required Permission: `subscriptions::view`
+
+Returns paginated list of subscriptions with embedded line items and payment count.
+
+#### Get Subscription Details
+```
+GET /api/admin/v1/subscriptions/{id}
+```
+Required Permission: `subscriptions::view`
+
+Returns complete subscription information including all line items and payment count.
+
+#### Create Subscription
+```
+POST /api/admin/v1/subscriptions
+```
+Required Permission: `subscriptions::create`
+
+Request body:
+```json
+{
+  "user_id": number,
+  "name": string,
+  "description": string (optional),
+  "expires": string (optional, ISO 8601 datetime),
+  "is_active": boolean,
+  "currency": string, // "USD", "EUR", "BTC", etc.
+  "interval_amount": number,
+  "interval_type": "day" | "month" | "year",
+  "setup_fee": number, // in cents/millisats
+  "auto_renewal_enabled": boolean,
+  "external_id": string (optional)
+}
+```
+
+Response: Subscription with line items
+
+#### Update Subscription
+```
+PATCH /api/admin/v1/subscriptions/{id}
+```
+Required Permission: `subscriptions::update`
+
+Request body (all fields optional):
+```json
+{
+  "name": string,
+  "description": string,
+  "expires": string (ISO 8601 datetime) or null,
+  "is_active": boolean,
+  "currency": string,
+  "interval_amount": number,
+  "interval_type": "day" | "month" | "year",
+  "setup_fee": number,
+  "auto_renewal_enabled": boolean,
+  "external_id": string
+}
+```
+
+Response: Updated subscription with line items
+
+#### Delete Subscription
+```
+DELETE /api/admin/v1/subscriptions/{id}
+```
+Required Permission: `subscriptions::delete`
+
+**Note:** Cannot delete subscriptions with paid payments. Returns error if paid payments exist.
+
+Response:
+```json
+{
+  "data": {
+    "deleted": true
+  }
+}
+```
+
+#### List Subscription Line Items
+```
+GET /api/admin/v1/subscriptions/{subscription_id}/line_items
+```
+Required Permission: `subscription_line_items::view`
+
+Returns all line items for a specific subscription. Note that line items are also included in subscription responses.
+
+#### Get Subscription Line Item
+```
+GET /api/admin/v1/subscription_line_items/{id}
+```
+Required Permission: `subscription_line_items::view`
+
+#### Create Subscription Line Item
+```
+POST /api/admin/v1/subscription_line_items
+```
+Required Permission: `subscription_line_items::create`
+
+Request body:
+```json
+{
+  "subscription_id": number,
+  "name": string,
+  "description": string (optional),
+  "amount": number, // recurring cost in cents/millisats
+  "setup_amount": number, // one-time setup fee in cents/millisats
+  "configuration": object (optional) // service-specific JSON config
+}
+```
+
+Response: Created line item
+
+#### Update Subscription Line Item
+```
+PATCH /api/admin/v1/subscription_line_items/{id}
+```
+Required Permission: `subscription_line_items::update`
+
+Request body (all fields optional):
+```json
+{
+  "name": string,
+  "description": string,
+  "amount": number,
+  "setup_amount": number,
+  "configuration": object
+}
+```
+
+Response: Updated line item
+
+#### Delete Subscription Line Item
+```
+DELETE /api/admin/v1/subscription_line_items/{id}
+```
+Required Permission: `subscription_line_items::delete`
+
+Response:
+```json
+{
+  "data": {
+    "deleted": true
+  }
+}
+```
+
+#### List Subscription Payments
+```
+GET /api/admin/v1/subscriptions/{subscription_id}/payments
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+
+Required Permission: `subscription_payments::view`
+
+Returns paginated list of payments for a specific subscription.
+
+#### Get Subscription Payment
+```
+GET /api/admin/v1/subscription_payments/{hex_id}
+```
+Required Permission: `subscription_payments::view`
+
+Returns detailed payment information including company details if available.
 
 ### Role Management
 
@@ -1766,6 +1944,9 @@ The RBAC system uses the following permission format: `resource::action`
 - `vm_os_image` - VM operating system images
 - `vm_payment` - VM-specific payment management
 - `vm_template` - VM template management
+- `subscriptions` - Subscription management
+- `subscription_line_items` - Subscription line item management
+- `subscription_payments` - Subscription payment management
 
 ### Actions:
 - `create` - Create new resources
@@ -1784,6 +1965,10 @@ The RBAC system uses the following permission format: `resource::action`
 - `ip_range::update` - Modify IP address ranges
 - `vm_custom_pricing::delete` - Remove custom pricing models
 - `company::view` - View company information
+- `subscriptions::view` - View subscriptions
+- `subscriptions::create` - Create new subscriptions
+- `subscription_line_items::update` - Modify subscription line items
+- `subscription_payments::view` - View subscription payments
 
 ## Response Models
 
@@ -2007,10 +2192,77 @@ The RBAC system uses the following permission format: `resource::action`
   "expires": "string (ISO 8601)",         // When payment expires
   "amount": number,                       // Amount in smallest currency unit (satoshis, cents)
   "currency": "string",                   // Currency code (e.g., "EUR", "USD", "BTC")
-  "payment_method": "lightning",          // AdminPaymentMethod enum: "lightning", "revolut", "paypal"
+  "payment_method": "lightning",          // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe"
   "external_id": "string | null",         // External payment provider ID
   "is_paid": boolean,                     // Whether payment has been completed
   "rate": number                          // Exchange rate to base currency (EUR)
+}
+```
+
+### AdminSubscriptionInfo
+```json
+{
+  "id": number,
+  "user_id": number,
+  "name": "string",
+  "description": "string | null",
+  "created": "string (ISO 8601)",
+  "expires": "string (ISO 8601) | null",
+  "is_active": boolean,
+  "currency": "string",                     // "USD", "EUR", "BTC", "GBP", "CAD", "CHF", "AUD", "JPY"
+  "interval_amount": number,                // Billing cycle multiplier (e.g., 1, 3, 12)
+  "interval_type": "day" | "month" | "year",
+  "setup_fee": number,                      // One-time setup fee in cents/millisats
+  "auto_renewal_enabled": boolean,
+  "external_id": "string | null",          // External payment processor ID (Stripe, PayPal, etc.)
+  "line_items": [                          // All services included in this subscription
+    {
+      "id": number,
+      "subscription_id": number,
+      "name": "string",
+      "description": "string | null",
+      "amount": number,                     // Recurring cost per billing cycle in cents/millisats
+      "setup_amount": number,               // One-time setup fee in cents/millisats
+      "configuration": object               // Service-specific JSON configuration
+    }
+  ],
+  "payment_count": number                   // Total number of payments for this subscription
+}
+```
+
+### AdminSubscriptionLineItemInfo
+```json
+{
+  "id": number,
+  "subscription_id": number,
+  "name": "string",
+  "description": "string | null",
+  "amount": number,                        // Recurring cost per billing cycle in cents/millisats
+  "setup_amount": number,                  // One-time setup fee in cents/millisats
+  "configuration": object | null           // Service-specific JSON configuration
+}
+```
+
+### AdminSubscriptionPaymentInfo
+```json
+{
+  "id": "string",                          // Hex-encoded payment ID
+  "subscription_id": number,
+  "user_id": number,
+  "created": "string (ISO 8601)",
+  "expires": "string (ISO 8601) | null",
+  "amount": number,                        // Total amount in cents/millisats
+  "currency": "string",                    // "USD", "EUR", "BTC", etc.
+  "payment_method": "lightning" | "revolut" | "paypal" | "stripe",
+  "payment_type": "purchase" | "renewal",  // SubscriptionPaymentType enum
+  "is_paid": boolean,
+  "rate": number | null,                   // Exchange rate if applicable
+  "time_value": number,                    // Duration purchased in seconds
+  "tax": number,                           // Tax amount in cents/millisats
+  "external_id": "string | null",         // External payment processor ID
+  "company_id": number | null,            // Associated company ID
+  "company_name": "string | null",        // Associated company name
+  "company_base_currency": "string | null" // Company's base currency
 }
 ```
 

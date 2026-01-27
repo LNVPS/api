@@ -15,7 +15,6 @@ use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
 use log::{error, info};
 use nostr_sdk::{Client, Keys};
 use rocket::http::Method;
-use rocket_okapi::swagger_ui::{make_swagger_ui, SwaggerUIConfig};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -181,13 +180,6 @@ async fn main() -> Result<(), Error> {
         .manage(vm_history.clone())
         .manage(sender)
         .mount("/", api::routes())
-        .mount(
-            "/swagger",
-            make_swagger_ui(&SwaggerUIConfig {
-                url: "../openapi.json".to_owned(),
-                ..Default::default()
-            }),
-        )
         .attach(CORS)
         .mount(
             "/",

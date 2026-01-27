@@ -28,7 +28,6 @@ use nostr_sdk::{ToBech32, Url};
 use rocket::http::ContentType;
 use rocket::serde::json::Json;
 use rocket::{Route, State, get, patch, post, routes};
-use rocket_okapi::{openapi, openapi_get_routes};
 use serde::Serialize;
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
@@ -40,9 +39,9 @@ use payments_rs::currency::{Currency, CurrencyAmount};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 
 pub fn routes() -> Vec<Route> {
-    let mut routes = vec![];
-
-    let mut api_routes = openapi_get_routes![
+    routes![
+        openapi_spec,
+        swagger_ui,
         v1_get_account,
         v1_patch_account,
         v1_list_vms,
@@ -67,21 +66,14 @@ pub fn routes() -> Vec<Route> {
         v1_get_vm_history,
         v1_vm_upgrade_quote,
         v1_vm_upgrade,
-    ];
-    routes.append(&mut api_routes);
-
-    routes.append(&mut routes![
         v1_terminal_proxy,
         v1_lnurlp,
         v1_renew_vm_lnurlp,
         v1_get_payment_invoice
-    ]);
-
-    routes
+    ]
 }
 
 /// Update user account
-#[openapi(tag = "Account")]
 #[patch("/api/v1/account", format = "json", data = "<req>")]
 async fn v1_patch_account(
     auth: Nip98Auth,
@@ -130,7 +122,6 @@ async fn v1_patch_account(
 }
 
 /// Get user account detail
-#[openapi(tag = "Account")]
 #[get("/api/v1/account")]
 async fn v1_get_account(
     auth: Nip98Auth,
@@ -144,7 +135,6 @@ async fn v1_get_account(
 }
 
 /// List VMs belonging to user
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm")]
 async fn v1_list_vms(
     auth: Nip98Auth,
@@ -164,7 +154,6 @@ async fn v1_list_vms(
 }
 
 /// Get status of a VM
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>")]
 async fn v1_get_vm(
     auth: Nip98Auth,
@@ -182,7 +171,6 @@ async fn v1_get_vm(
 }
 
 /// Update a VM config
-#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>", data = "<data>", format = "json")]
 async fn v1_patch_vm(
     auth: Nip98Auth,
@@ -247,7 +235,6 @@ async fn v1_patch_vm(
 }
 
 /// List available VM OS images
-#[openapi(tag = "Image")]
 #[get("/api/v1/image")]
 async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmOsImage>> {
     let images = db.list_os_image().await?;
@@ -260,7 +247,6 @@ async fn v1_list_vm_images(db: &State<Arc<dyn LNVpsDb>>) -> ApiResult<Vec<ApiVmO
 }
 
 /// List available VM templates (Offers)
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm/templates")]
 async fn v1_list_vm_templates(
     db: &State<Arc<dyn LNVpsDb>>,
@@ -342,7 +328,6 @@ async fn v1_list_vm_templates(
 }
 
 /// Get a price for a custom order
-#[openapi(tag = "VM")]
 #[post("/api/v1/vm/custom-template/price", data = "<req>", format = "json")]
 async fn v1_custom_template_calc(
     db: &State<Arc<dyn LNVpsDb>>,
@@ -364,7 +349,6 @@ async fn v1_custom_template_calc(
 /// VM's are initially created in "expired" state
 ///
 /// Unpaid VM orders will be deleted after 24hrs
-#[openapi(tag = "VM")]
 #[post("/api/v1/vm/custom-template", data = "<req>", format = "json")]
 async fn v1_create_custom_vm_order(
     auth: Nip98Auth,
@@ -390,7 +374,6 @@ async fn v1_create_custom_vm_order(
 }
 
 /// List user SSH keys
-#[openapi(tag = "Account")]
 #[get("/api/v1/ssh-key")]
 async fn v1_list_ssh_keys(
     auth: Nip98Auth,
@@ -407,7 +390,6 @@ async fn v1_list_ssh_keys(
 }
 
 /// Add new SSH key to account
-#[openapi(tag = "Account")]
 #[post("/api/v1/ssh-key", data = "<req>", format = "json")]
 async fn v1_add_ssh_key(
     auth: Nip98Auth,
@@ -440,7 +422,6 @@ async fn v1_add_ssh_key(
 /// VM's are initially created in "expired" state
 ///
 /// Unpaid VM orders will be deleted after 24hrs
-#[openapi(tag = "VM")]
 #[post("/api/v1/vm", data = "<req>", format = "json")]
 async fn v1_create_vm_order(
     auth: Nip98Auth,
@@ -470,7 +451,6 @@ async fn v1_create_vm_order(
 }
 
 /// Renew(Extend) a VM
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>/renew?<method>")]
 async fn v1_renew_vm(
     auth: Nip98Auth,
@@ -566,7 +546,6 @@ async fn v1_lnurlp(
 }
 
 /// Start a VM
-#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/start")]
 async fn v1_start_vm(
     auth: Nip98Auth,
@@ -594,7 +573,6 @@ async fn v1_start_vm(
 }
 
 /// Stop a VM
-#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/stop")]
 async fn v1_stop_vm(
     auth: Nip98Auth,
@@ -623,7 +601,6 @@ async fn v1_stop_vm(
 }
 
 /// Restart a VM
-#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/restart")]
 async fn v1_restart_vm(
     auth: Nip98Auth,
@@ -652,7 +629,6 @@ async fn v1_restart_vm(
 }
 
 /// Re-install a VM
-#[openapi(tag = "VM")]
 #[patch("/api/v1/vm/<id>/re-install")]
 async fn v1_reinstall_vm(
     auth: Nip98Auth,
@@ -684,7 +660,6 @@ async fn v1_reinstall_vm(
     ApiData::ok(())
 }
 
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>/time-series")]
 async fn v1_time_series(
     auth: Nip98Auth,
@@ -812,7 +787,6 @@ async fn v1_terminal_proxy(
     }))
 }
 
-#[openapi(tag = "Payment")]
 #[get("/api/v1/payment/methods")]
 async fn v1_get_payment_methods(settings: &State<Settings>) -> ApiResult<Vec<ApiPaymentInfo>> {
     let mut ret = vec![ApiPaymentInfo {
@@ -839,7 +813,6 @@ async fn v1_get_payment_methods(settings: &State<Settings>) -> ApiResult<Vec<Api
 }
 
 /// Get payment status (for polling)
-#[openapi(tag = "Payment")]
 #[get("/api/v1/payment/<id>")]
 async fn v1_get_payment(
     auth: Nip98Auth,
@@ -996,7 +969,6 @@ async fn v1_get_payment_invoice(
 }
 
 /// List payment history of a VM
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>/payments")]
 async fn v1_payment_history(
     auth: Nip98Auth,
@@ -1015,7 +987,6 @@ async fn v1_payment_history(
 }
 
 /// List action history of a VM
-#[openapi(tag = "VM")]
 #[get("/api/v1/vm/<id>/history?<limit>&<offset>")]
 async fn v1_get_vm_history(
     auth: Nip98Auth,
@@ -1045,7 +1016,6 @@ async fn v1_get_vm_history(
 }
 
 /// Get a quote for upgrading a VM
-#[openapi(tag = "VM")]
 #[post(
     "/api/v1/vm/<id>/upgrade/quote?<method>",
     data = "<req>",
@@ -1094,7 +1064,6 @@ async fn v1_vm_upgrade_quote(
 }
 
 /// Upgrade a VM (requires payment first)
-#[openapi(tag = "VM")]
 #[post("/api/v1/vm/<id>/upgrade?<method>", data = "<req>", format = "json")]
 async fn v1_vm_upgrade(
     auth: Nip98Auth,
@@ -1131,4 +1100,39 @@ async fn v1_vm_upgrade(
 
     // Note: The actual upgrade happens after payment is confirmed
     ApiData::ok(payment.into())
+}
+
+/// Serve OpenAPI 3.0 specification
+#[get("/api/v1/openapi.json")]
+fn openapi_spec() -> (ContentType, &'static str) {
+    (ContentType::JSON, include_str!("openapi.json"))
+}
+
+/// Redirect to Swagger UI
+#[get("/swagger")]
+fn swagger_ui() -> (ContentType, &'static str) {
+    (
+        ContentType::HTML,
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LNVPS API Documentation</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+<script>
+  window.onload = () => {
+    window.ui = SwaggerUIBundle({
+      url: '/api/v1/openapi.json',
+      dom_id: '#swagger-ui',
+    });
+  };
+</script>
+</body>
+</html>"#,
+    )
 }

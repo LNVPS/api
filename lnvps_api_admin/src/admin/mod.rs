@@ -37,6 +37,13 @@ use crate::admin::routers::{
     admin_create_router, admin_delete_router, admin_get_router, admin_list_routers,
     admin_update_router,
 };
+use crate::admin::subscriptions::{
+    admin_create_subscription, admin_create_subscription_line_item, admin_delete_subscription,
+    admin_delete_subscription_line_item, admin_get_subscription,
+    admin_get_subscription_line_item, admin_get_subscription_payment,
+    admin_list_subscription_line_items, admin_list_subscription_payments, admin_list_subscriptions,
+    admin_update_subscription, admin_update_subscription_line_item,
+};
 use crate::admin::users::{admin_list_users, admin_update_user};
 use crate::admin::vm_ip_assignments::{
     admin_create_vm_ip_assignment, admin_delete_vm_ip_assignment, admin_get_vm_ip_assignment,
@@ -70,6 +77,7 @@ pub mod regions;
 pub mod reports;
 pub mod roles;
 pub mod routers;
+pub mod subscriptions;
 pub mod users;
 pub mod vm_ip_assignments;
 pub mod vm_os_images;
@@ -184,6 +192,21 @@ pub fn admin_routes() -> Vec<Route> {
         // Reports
         admin_time_series_report,
         admin_referral_time_series_report,
+        // Subscription management
+        admin_list_subscriptions,
+        admin_get_subscription,
+        admin_create_subscription,
+        admin_update_subscription,
+        admin_delete_subscription,
+        // Subscription Line Items
+        admin_list_subscription_line_items,
+        admin_get_subscription_line_item,
+        admin_create_subscription_line_item,
+        admin_update_subscription_line_item,
+        admin_delete_subscription_line_item,
+        // Subscription Payments
+        admin_list_subscription_payments,
+        admin_get_subscription_payment,
         // WebSocket endpoints
         admin_job_feedback_websocket,
     ]

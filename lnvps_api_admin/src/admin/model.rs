@@ -1584,6 +1584,7 @@ pub enum AdminPaymentMethod {
     Lightning,
     Revolut,
     Paypal,
+    Stripe,
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -1592,6 +1593,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Lightning => AdminPaymentMethod::Lightning,
             PaymentMethod::Revolut => AdminPaymentMethod::Revolut,
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
+            PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
         }
     }
 }
@@ -1743,3 +1745,237 @@ pub struct AdminCreateVmRequest {
     pub ref_code: Option<String>,
     pub reason: Option<String>,
 }
+
+// ============================================================================
+// Subscription Models
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct AdminSubscriptionInfo {
+    pub id: u64,
+    pub user_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiVmCostPlanIntervalType,
+    pub setup_fee: u64,
+    pub auto_renewal_enabled: bool,
+    pub external_id: Option<String>,
+    pub line_items: Vec<AdminSubscriptionLineItemInfo>,
+    pub payment_count: u64,
+}
+
+#[derive(Deserialize)]
+pub struct AdminCreateSubscriptionRequest {
+    pub user_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub expires: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiVmCostPlanIntervalType,
+    pub setup_fee: u64,
+    pub auto_renewal_enabled: bool,
+    pub external_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AdminUpdateSubscriptionRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub expires: Option<Option<DateTime<Utc>>>,
+    pub is_active: Option<bool>,
+    pub currency: Option<String>,
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiVmCostPlanIntervalType>,
+    pub setup_fee: Option<u64>,
+    pub auto_renewal_enabled: Option<bool>,
+    pub external_id: Option<Option<String>>,
+}
+
+impl From<lnvps_db::Subscription> for AdminSubscriptionInfo {
+    fn from(subscription: lnvps_db::Subscription) -> Self {
+        Self {
+            id: subscription.id,
+            user_id: subscription.user_id,
+            name: subscription.name,
+            description: subscription.description,
+            created: subscription.created,
+            expires: subscription.expires,
+            is_active: subscription.is_active,
+            currency: subscription.currency,
+            interval_amount: subscription.interval_amount,
+            interval_type: ApiVmCostPlanIntervalType::from(subscription.interval_type),
+            setup_fee: subscription.setup_fee,
+            auto_renewal_enabled: subscription.auto_renewal_enabled,
+            external_id: subscription.external_id,
+            line_items: vec![],
+            payment_count: 0,
+        }
+    }
+}
+
+impl AdminCreateSubscriptionRequest {
+    pub fn to_subscription(&self) -> anyhow::Result<lnvps_db::Subscription> {
+        if self.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("Subscription name cannot be empty"));
+        }
+
+        if self.currency.trim().is_empty() {
+            return Err(anyhow::anyhow!("Currency cannot be empty"));
+        }
+
+        if self.interval_amount == 0 {
+            return Err(anyhow::anyhow!("Interval amount cannot be zero"));
+        }
+
+        Ok(lnvps_db::Subscription {
+            id: 0,
+            user_id: self.user_id,
+            name: self.name.trim().to_string(),
+            description: self.description.clone(),
+            created: chrono::Utc::now(),
+            expires: self.expires,
+            is_active: self.is_active,
+            currency: self.currency.trim().to_uppercase(),
+            interval_amount: self.interval_amount,
+            interval_type: self.interval_type.into(),
+            setup_fee: self.setup_fee,
+            auto_renewal_enabled: self.auto_renewal_enabled,
+            external_id: self.external_id.clone(),
+        })
+    }
+}
+
+// Subscription Line Item Models
+#[derive(Serialize)]
+pub struct AdminSubscriptionLineItemInfo {
+    pub id: u64,
+    pub subscription_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub amount: u64,
+    pub setup_amount: u64,
+    pub configuration: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct AdminCreateSubscriptionLineItemRequest {
+    pub subscription_id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub amount: u64,
+    pub setup_amount: u64,
+    pub configuration: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct AdminUpdateSubscriptionLineItemRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub amount: Option<u64>,
+    pub setup_amount: Option<u64>,
+    pub configuration: Option<serde_json::Value>,
+}
+
+impl From<lnvps_db::SubscriptionLineItem> for AdminSubscriptionLineItemInfo {
+    fn from(line_item: lnvps_db::SubscriptionLineItem) -> Self {
+        Self {
+            id: line_item.id,
+            subscription_id: line_item.subscription_id,
+            name: line_item.name,
+            description: line_item.description,
+            amount: line_item.amount,
+            setup_amount: line_item.setup_amount,
+            configuration: line_item.configuration,
+        }
+    }
+}
+
+impl AdminCreateSubscriptionLineItemRequest {
+    pub fn to_line_item(&self) -> anyhow::Result<lnvps_db::SubscriptionLineItem> {
+        if self.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("Line item name cannot be empty"));
+        }
+
+        Ok(lnvps_db::SubscriptionLineItem {
+            id: 0,
+            subscription_id: self.subscription_id,
+            name: self.name.trim().to_string(),
+            description: self.description.clone(),
+            amount: self.amount,
+            setup_amount: self.setup_amount,
+            configuration: self.configuration.clone(),
+        })
+    }
+}
+
+// Subscription Payment Models
+#[derive(Serialize)]
+pub struct AdminSubscriptionPaymentInfo {
+    pub id: String, // Hex encoded
+    pub subscription_id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: AdminPaymentMethod,
+    pub payment_type: ApiSubscriptionPaymentType,
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub rate: f32,
+    pub time_value: Option<u64>,
+    pub tax: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum ApiSubscriptionPaymentType {
+    Purchase,
+    Renewal,
+}
+
+impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
+    fn from(payment_type: lnvps_db::SubscriptionPaymentType) -> Self {
+        match payment_type {
+            lnvps_db::SubscriptionPaymentType::Purchase => ApiSubscriptionPaymentType::Purchase,
+            lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
+        }
+    }
+}
+
+impl From<ApiSubscriptionPaymentType> for lnvps_db::SubscriptionPaymentType {
+    fn from(payment_type: ApiSubscriptionPaymentType) -> Self {
+        match payment_type {
+            ApiSubscriptionPaymentType::Purchase => lnvps_db::SubscriptionPaymentType::Purchase,
+            ApiSubscriptionPaymentType::Renewal => lnvps_db::SubscriptionPaymentType::Renewal,
+        }
+    }
+}
+
+impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
+    fn from(payment: lnvps_db::SubscriptionPayment) -> Self {
+        Self {
+            id: hex::encode(&payment.id),
+            subscription_id: payment.subscription_id,
+            user_id: payment.user_id,
+            created: payment.created,
+            expires: payment.expires,
+            amount: payment.amount,
+            currency: payment.currency,
+            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
+            external_id: payment.external_id,
+            is_paid: payment.is_paid,
+            rate: payment.rate,
+            time_value: payment.time_value,
+            tax: payment.tax,
+        }
+    }
+}
+

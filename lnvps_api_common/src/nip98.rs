@@ -7,9 +7,6 @@ use rocket::http::uri::{Absolute, Uri};
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome};
 use rocket::{async_trait, Request};
-use rocket_okapi::r#gen::OpenApiGenerator;
-use rocket_okapi::okapi::openapi3::{SecurityRequirement, SecurityScheme, SecuritySchemeData};
-use rocket_okapi::request::{OpenApiFromRequest, RequestHeaderInput};
 
 pub struct Nip98Auth {
     pub event: Event,
@@ -107,29 +104,5 @@ impl<'r> FromRequest<'r> for Nip98Auth {
         } else {
             Outcome::Error((Status::new(403), "Auth header not found".to_string()))
         }
-    }
-}
-
-impl OpenApiFromRequest<'_> for Nip98Auth {
-    fn from_request_input(
-        _gen: &mut OpenApiGenerator,
-        _name: String,
-        _required: bool,
-    ) -> rocket_okapi::Result<RequestHeaderInput> {
-        let security_scheme = SecurityScheme {
-            description: Some("Requires an Bearer token to access".to_owned()),
-            data: SecuritySchemeData::Http {
-                scheme: "Nostr".to_owned(),
-                bearer_format: Some("base64-encoded-auth-event".to_owned()),
-            },
-            extensions: Default::default(),
-        };
-        let mut security_req = SecurityRequirement::new();
-        security_req.insert("NostrAuth".to_owned(), Vec::new());
-        Ok(RequestHeaderInput::Security(
-            "NostrAuth".to_owned(),
-            security_scheme,
-            security_req,
-        ))
     }
 }

@@ -6,7 +6,6 @@ use lnvps_db::{
     async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
     VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
 };
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -225,7 +224,7 @@ pub struct VmResources {
     pub disk_size: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeSeriesData {
     pub timestamp: u64,
     pub cpu: f32,

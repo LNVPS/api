@@ -1,14 +1,18 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    async_trait, AccessPolicy, Company,
-    DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, Router, User, UserSshKey, Vm, VmCostPlan,
+    AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase,
+    NostrDomain, NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    async_trait,
 };
+
+#[cfg(feature = "admin")]
+use lnvps_db::{AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats, VmPaymentWithCompany};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
@@ -35,6 +39,9 @@ pub struct MockDb {
     pub access_policy: Arc<Mutex<HashMap<u64, AccessPolicy>>>,
     pub companies: Arc<Mutex<HashMap<u64, Company>>>,
     pub vm_history: Arc<Mutex<HashMap<u64, VmHistory>>>,
+    pub subscriptions: Arc<Mutex<HashMap<u64, Subscription>>>,
+    pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
+    pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
 }
 
 impl MockDb {
@@ -221,6 +228,9 @@ impl Default for MockDb {
                 companies
             })),
             vm_history: Arc::new(Default::default()),
+            subscriptions: Arc::new(Default::default()),
+            subscription_line_items: Arc::new(Default::default()),
+            subscription_payments: Arc::new(Default::default()),
         }
     }
 }
@@ -947,7 +957,11 @@ impl LNVpsDbBase for MockDb {
         Ok(0)
     }
 
-    async fn execute_query_with_string_params(&self, _query: &str, _params: Vec<String>) -> anyhow::Result<u64> {
+    async fn execute_query_with_string_params(
+        &self,
+        _query: &str,
+        _params: Vec<String>,
+    ) -> anyhow::Result<u64> {
         // Mock implementation - always returns success
         Ok(0)
     }
@@ -960,14 +974,14 @@ impl LNVpsDbBase for MockDb {
     async fn get_active_customers_with_contact_prefs(&self) -> anyhow::Result<Vec<User>> {
         let users = self.users.lock().await;
         let vms = self.vms.lock().await;
-        
+
         // Find users who have non-deleted VMs and contact preferences enabled
         let mut active_customers = Vec::new();
-        
+
         for user in users.values() {
             // Check if user has at least one non-deleted VM
             let has_active_vm = vms.values().any(|vm| vm.user_id == user.id && !vm.deleted);
-            
+
             if has_active_vm && (user.contact_email || user.contact_nip17) {
                 // For email: check if they have an email address
                 // For nip17: they should have a pubkey (which all users do)
@@ -976,8 +990,268 @@ impl LNVpsDbBase for MockDb {
                 }
             }
         }
-        
+
         Ok(active_customers)
+    }
+
+    // Subscription methods
+    async fn list_subscriptions(&self) -> anyhow::Result<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions.values().cloned().collect())
+    }
+
+    async fn list_subscriptions_by_user(&self, user_id: u64) -> anyhow::Result<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_subscriptions_active(&self, user_id: u64) -> anyhow::Result<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| s.is_active && s.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_subscription(&self, id: u64) -> anyhow::Result<Subscription> {
+        let subscriptions = self.subscriptions.lock().await;
+        subscriptions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Subscription not found: {}", id))
+    }
+
+    async fn get_subscription_by_ext_id(&self, ext_id: &str) -> anyhow::Result<Subscription> {
+        let subscriptions = self.subscriptions.lock().await;
+        subscriptions
+            .values()
+            .find(|s| s.external_id.as_deref() == Some(ext_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("Subscription not found with external_id: {}", ext_id))
+    }
+
+    async fn insert_subscription(&self, subscription: &Subscription) -> anyhow::Result<u64> {
+        let mut subscriptions = self.subscriptions.lock().await;
+        let max_id = subscriptions.keys().max().unwrap_or(&0);
+        let new_id = max_id + 1;
+        let mut new_subscription = subscription.clone();
+        new_subscription.id = new_id;
+        subscriptions.insert(new_id, new_subscription);
+        Ok(new_id)
+    }
+
+    async fn update_subscription(&self, subscription: &Subscription) -> anyhow::Result<()> {
+        let mut subscriptions = self.subscriptions.lock().await;
+        if subscriptions.contains_key(&subscription.id) {
+            subscriptions.insert(subscription.id, subscription.clone());
+            Ok(())
+        } else {
+            bail!("Subscription not found: {}", subscription.id)
+        }
+    }
+
+    async fn delete_subscription(&self, id: u64) -> anyhow::Result<()> {
+        let mut subscriptions = self.subscriptions.lock().await;
+        subscriptions.remove(&id);
+        Ok(())
+    }
+
+    async fn get_subscription_base_currency(&self, subscription_id: u64) -> anyhow::Result<String> {
+        // Get currency from the subscription itself
+        let subscriptions = self.subscriptions.lock().await;
+        if let Some(subscription) = subscriptions.get(&subscription_id) {
+            Ok(subscription.currency.clone())
+        } else {
+            Ok("EUR".to_string()) // Default fallback
+        }
+    }
+
+    // Subscription line item methods
+    async fn list_subscription_line_items(
+        &self,
+        subscription_id: u64,
+    ) -> anyhow::Result<Vec<SubscriptionLineItem>> {
+        let line_items = self.subscription_line_items.lock().await;
+        Ok(line_items
+            .values()
+            .filter(|item| item.subscription_id == subscription_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_subscription_line_item(&self, id: u64) -> anyhow::Result<SubscriptionLineItem> {
+        let line_items = self.subscription_line_items.lock().await;
+        line_items
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Subscription line item not found: {}", id))
+    }
+
+    async fn insert_subscription_line_item(
+        &self,
+        line_item: &SubscriptionLineItem,
+    ) -> anyhow::Result<u64> {
+        let mut line_items = self.subscription_line_items.lock().await;
+        let max_id = line_items.keys().max().unwrap_or(&0);
+        let new_id = max_id + 1;
+        let mut new_line_item = line_item.clone();
+        new_line_item.id = new_id;
+        line_items.insert(new_id, new_line_item);
+        Ok(new_id)
+    }
+
+    async fn update_subscription_line_item(
+        &self,
+        line_item: &SubscriptionLineItem,
+    ) -> anyhow::Result<()> {
+        let mut line_items = self.subscription_line_items.lock().await;
+        if line_items.contains_key(&line_item.id) {
+            line_items.insert(line_item.id, line_item.clone());
+            Ok(())
+        } else {
+            bail!("Subscription line item not found: {}", line_item.id)
+        }
+    }
+
+    async fn delete_subscription_line_item(&self, id: u64) -> anyhow::Result<()> {
+        let mut line_items = self.subscription_line_items.lock().await;
+        line_items.remove(&id);
+        Ok(())
+    }
+
+    // Subscription payment methods
+    async fn list_subscription_payments(
+        &self,
+        subscription_id: u64,
+    ) -> anyhow::Result<Vec<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        Ok(payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_subscription_payments_by_user(
+        &self,
+        user_id: u64,
+    ) -> anyhow::Result<Vec<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        Ok(payments
+            .iter()
+            .filter(|p| p.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_subscription_payment(&self, id: &Vec<u8>) -> anyhow::Result<SubscriptionPayment> {
+        let payments = self.subscription_payments.lock().await;
+        payments
+            .iter()
+            .find(|p| &p.id == id)
+            .cloned()
+            .context("Subscription payment not found")
+    }
+
+    async fn get_subscription_payment_by_ext_id(
+        &self,
+        ext_id: &str,
+    ) -> anyhow::Result<SubscriptionPayment> {
+        let payments = self.subscription_payments.lock().await;
+        payments
+            .iter()
+            .find(|p| p.external_id.as_deref() == Some(ext_id))
+            .cloned()
+            .context("Subscription payment not found")
+    }
+
+    async fn get_subscription_payment_with_company(
+        &self,
+        id: &Vec<u8>,
+    ) -> anyhow::Result<SubscriptionPaymentWithCompany> {
+        let payments = self.subscription_payments.lock().await;
+        let payment = payments
+            .iter()
+            .find(|p| &p.id == id)
+            .cloned()
+            .context("Subscription payment not found")?;
+
+        // For mock, we'll just use EUR as the base currency
+        Ok(SubscriptionPaymentWithCompany {
+            id: payment.id,
+            subscription_id: payment.subscription_id,
+            user_id: payment.user_id,
+            created: payment.created,
+            expires: payment.expires,
+            amount: payment.amount,
+            currency: payment.currency,
+            payment_method: payment.payment_method,
+            payment_type: payment.payment_type,
+            external_data: payment.external_data,
+            external_id: payment.external_id,
+            is_paid: payment.is_paid,
+            rate: payment.rate,
+            time_value: payment.time_value,
+            tax: payment.tax,
+            company_base_currency: "EUR".to_string(),
+        })
+    }
+
+    async fn insert_subscription_payment(
+        &self,
+        payment: &SubscriptionPayment,
+    ) -> anyhow::Result<()> {
+        let mut payments = self.subscription_payments.lock().await;
+        payments.push(payment.clone());
+        Ok(())
+    }
+
+    async fn update_subscription_payment(
+        &self,
+        payment: &SubscriptionPayment,
+    ) -> anyhow::Result<()> {
+        let mut payments = self.subscription_payments.lock().await;
+        if let Some(p) = payments.iter_mut().find(|p| p.id == payment.id) {
+            p.is_paid = payment.is_paid;
+            Ok(())
+        } else {
+            bail!("Subscription payment not found")
+        }
+    }
+
+    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> anyhow::Result<()> {
+        // Mark payment as paid
+        self.update_subscription_payment(payment).await?;
+
+        // Extend subscription expiration if time_value is present
+        if let Some(time_value) = payment.time_value {
+            let mut subscriptions = self.subscriptions.lock().await;
+            if let Some(subscription) = subscriptions.get_mut(&payment.subscription_id) {
+                if let Some(expires) = subscription.expires {
+                    subscription.expires = Some(expires.add(TimeDelta::seconds(time_value as i64)));
+                } else {
+                    // If no expiration yet, set it from now
+                    subscription.expires =
+                        Some(Utc::now().add(TimeDelta::seconds(time_value as i64)));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn last_paid_subscription_invoice(&self) -> anyhow::Result<Option<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        Ok(payments
+            .iter()
+            .filter(|p| p.is_paid)
+            .max_by(|a, b| a.created.cmp(&b.created))
+            .cloned())
     }
 }
 
@@ -1140,7 +1414,6 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((paginated_users, total))
     }
 
-
     async fn admin_list_regions(
         &self,
         limit: u64,
@@ -1226,13 +1499,15 @@ impl lnvps_db::AdminDb for MockDb {
         limit: u64,
         offset: u64,
     ) -> anyhow::Result<(Vec<AdminVmHost>, u64)> {
-        let (host_region_pairs, total) = self.list_hosts_with_regions_paginated(limit, offset).await?;
-        
+        let (host_region_pairs, total) = self
+            .list_hosts_with_regions_paginated(limit, offset)
+            .await?;
+
         let mut admin_hosts = Vec::new();
         for (host, region) in host_region_pairs {
             let disks = self.list_host_disks(host.id).await?;
             let active_vm_count = self.count_active_vms_on_host(host.id).await.unwrap_or(0);
-            
+
             let admin_host = AdminVmHost {
                 host,
                 region_id: region.id,
@@ -1244,7 +1519,7 @@ impl lnvps_db::AdminDb for MockDb {
             };
             admin_hosts.push(admin_host);
         }
-        
+
         Ok((admin_hosts, total))
     }
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<u64> {
@@ -1322,14 +1597,6 @@ impl lnvps_db::AdminDb for MockDb {
         new_template.id = max_id;
         template_map.insert(max_id, new_template);
         Ok(max_id)
-    }
-
-    async fn get_custom_template(&self, id: u64) -> anyhow::Result<VmCustomTemplate> {
-        let template_map = self.custom_template.lock().await;
-        template_map
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| anyhow!("Custom template not found: {}", id))
     }
 
     async fn update_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
@@ -1703,17 +1970,26 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((vec![], 0))
     }
 
-    async fn admin_get_vm_ip_assignment(&self, _assignment_id: u64) -> anyhow::Result<lnvps_db::VmIpAssignment> {
+    async fn admin_get_vm_ip_assignment(
+        &self,
+        _assignment_id: u64,
+    ) -> anyhow::Result<lnvps_db::VmIpAssignment> {
         // Mock implementation
         Ok(lnvps_db::VmIpAssignment::default())
     }
 
-    async fn admin_create_vm_ip_assignment(&self, _assignment: &lnvps_db::VmIpAssignment) -> anyhow::Result<u64> {
+    async fn admin_create_vm_ip_assignment(
+        &self,
+        _assignment: &lnvps_db::VmIpAssignment,
+    ) -> anyhow::Result<u64> {
         // Mock implementation
         Ok(1)
     }
 
-    async fn admin_update_vm_ip_assignment(&self, _assignment: &lnvps_db::VmIpAssignment) -> anyhow::Result<()> {
+    async fn admin_update_vm_ip_assignment(
+        &self,
+        _assignment: &lnvps_db::VmIpAssignment,
+    ) -> anyhow::Result<()> {
         // Mock implementation
         Ok(())
     }

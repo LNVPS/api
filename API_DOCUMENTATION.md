@@ -189,16 +189,68 @@ interface VmPayment {
 
 type PaymentData = 
   | { lightning: string } // Lightning Network invoice
-  | { revolut: { token: string } }; // Revolut payment token
+  | { revolut: { token: string } } // Revolut payment token
+  | { stripe: { session_id: string } }; // Stripe checkout session
 
 interface PaymentType {
   type: 'new' | 'renew' | 'upgrade';
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'revolut' | 'paypal' | 'nwc';
+  name: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc';
   metadata: Record<string, string>;
   currencies: ('BTC' | 'EUR' | 'USD')[];
+}
+```
+
+### Subscriptions
+
+```typescript
+interface Subscription {
+  id: number;
+  name: string;
+  description?: string;
+  created: string; // ISO 8601 datetime
+  expires?: string; // ISO 8601 datetime
+  is_active: boolean;
+  currency: 'BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY';
+  interval_amount: number; // Billing cycle multiplier (e.g., 1 for monthly, 3 for quarterly)
+  interval_type: 'day' | 'month' | 'year';
+  setup_fee: number; // One-time setup fee in smallest currency unit (cents/millisats)
+  auto_renewal_enabled: boolean;
+  line_items: SubscriptionLineItem[]; // Services included in this subscription
+}
+
+interface SubscriptionLineItem {
+  id: number;
+  subscription_id: number;
+  name: string;
+  description?: string;
+  amount: number; // Recurring cost per billing cycle in smallest currency unit (cents/millisats)
+  setup_amount: number; // One-time setup fee in smallest currency unit (cents/millisats)
+  configuration?: any; // Service-specific configuration (JSON)
+}
+
+interface SubscriptionPayment {
+  id: string; // Hex-encoded payment ID
+  subscription_id: number;
+  created: string; // ISO 8601 datetime
+  expires?: string; // ISO 8601 datetime
+  amount: number; // Total amount in smallest currency unit (cents/millisats)
+  currency: 'BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY';
+  payment_method: 'lightning' | 'revolut' | 'paypal' | 'stripe';
+  payment_type: 'purchase' | 'renewal'; // 0=Purchase, 1=Renewal
+  is_paid: boolean;
+  rate?: number; // Exchange rate if applicable
+  time_value: number; // Duration purchased in seconds
+  tax: number; // Tax amount in smallest currency unit (cents/millisats)
+  external_id?: string; // External payment processor ID (e.g., Stripe, PayPal)
+}
+
+interface SubscriptionSummary {
+  active_subscriptions: number; // Count of active subscriptions
+  total_monthly_cost: number; // Total monthly cost across all active subscriptions
+  currency: string; // Currency code
 }
 ```
 
@@ -457,6 +509,74 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **Auth**: Query parameter
 - **Response**: PDF file (Content-Type: text/html)
 
+### Subscription Management
+
+#### List User Subscriptions
+- **GET** `/api/v1/subscriptions?limit={limit}&offset={offset}`
+- **Auth**: Required
+- **Query Params**:
+  - `limit`: Optional (default: 50, max: 100)
+  - `offset`: Optional (default: 0)
+- **Response**: Paginated list of subscriptions with embedded line items
+```typescript
+interface PaginatedResponse<T> {
+  data: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+// Returns: PaginatedResponse<Subscription>
+```
+
+#### Get Subscription Details
+- **GET** `/api/v1/subscriptions/{id}`
+- **Auth**: Required
+- **Response**: `Subscription` (includes all line items)
+
+#### Get Subscription Summary
+- **GET** `/api/v1/subscriptions/summary`
+- **Auth**: Required
+- **Response**: `SubscriptionSummary`
+- **Description**: Returns aggregated statistics including active subscription count and total monthly cost across all active subscriptions
+
+#### List Subscription Line Items
+- **GET** `/api/v1/subscriptions/{subscription_id}/line_items`
+- **Auth**: Required
+- **Response**: `SubscriptionLineItem[]`
+- **Note**: Line items are also included in subscription responses, so this endpoint is primarily for backward compatibility
+
+#### Get Subscription Line Item
+- **GET** `/api/v1/subscription_line_items/{id}`
+- **Auth**: Required
+- **Response**: `SubscriptionLineItem`
+
+#### List Subscription Payments
+- **GET** `/api/v1/subscriptions/{subscription_id}/payments?limit={limit}&offset={offset}`
+- **Auth**: Required
+- **Query Params**:
+  - `limit`: Optional (default: 50, max: 100)
+  - `offset`: Optional (default: 0)
+- **Response**: Paginated list of payments for a specific subscription
+```typescript
+// Returns: PaginatedResponse<SubscriptionPayment>
+```
+
+#### Get Subscription Payment
+- **GET** `/api/v1/subscription_payments/{hex_id}`
+- **Auth**: Required
+- **Response**: `SubscriptionPayment`
+
+#### List All User Subscription Payments
+- **GET** `/api/v1/subscription_payments?limit={limit}&offset={offset}`
+- **Auth**: Required
+- **Query Params**:
+  - `limit`: Optional (default: 50, max: 100)
+  - `offset`: Optional (default: 0)
+- **Response**: Paginated list of all subscription payments for the authenticated user
+```typescript
+// Returns: PaginatedResponse<SubscriptionPayment>
+```
+
 ### Monitoring and History
 
 #### Get VM Time Series Data
@@ -542,24 +662,27 @@ function isApiSuccess<T>(response: ApiResult<T>): response is ApiResponse<T> {
 5. **VM States**: VM states are string enums representing current operational status
 6. **Error Handling**: Always check for error responses before accessing data
 7. **Pagination**: Some endpoints support optional pagination with `limit` and `offset` parameters
+8. **Subscriptions**: Subscription responses now include all line items embedded. The standalone line item endpoints are still available for backward compatibility.
+9. **Billing Cycles**: Subscriptions have a single billing cycle (interval_amount + interval_type) that applies to all line items. Total recurring cost is the sum of all line item amounts.
+10. **Setup Fees**: Both subscriptions and individual line items can have one-time setup fees that are charged only on initial purchase.
 
 ### VM Upgrade Process
 
-8. **Upgrade Eligibility**: All VMs can be upgraded, including both standard template VMs and custom template VMs. For standard template VMs, upgrades transition them to custom templates. For custom template VMs, upgrades modify the existing custom template specifications.
-9. **Pro-rated Billing**: Upgrade costs are calculated based on the remaining time until VM expiration. The cost represents the difference between current and new specifications, pro-rated for the remaining billing period. The system calculates: (new_rate_per_second * seconds_remaining) - (old_rate_per_second * seconds_remaining). The discount field shows the value of remaining time at the old rate. The system respects the actual billing interval of the cost plan (daily, monthly, yearly) rather than assuming monthly billing.
-10. **Billing Interval Handling**: 
+11. **Upgrade Eligibility**: All VMs can be upgraded, including both standard template VMs and custom template VMs. For standard template VMs, upgrades transition them to custom templates. For custom template VMs, upgrades modify the existing custom template specifications.
+12. **Pro-rated Billing**: Upgrade costs are calculated based on the remaining time until VM expiration. The cost represents the difference between current and new specifications, pro-rated for the remaining billing period. The system calculates: (new_rate_per_second * seconds_remaining) - (old_rate_per_second * seconds_remaining). The discount field shows the value of remaining time at the old rate. The system respects the actual billing interval of the cost plan (daily, monthly, yearly) rather than assuming monthly billing.
+13. **Billing Interval Handling**: 
     - Standard template VMs: Use their cost plan's actual interval (interval_type and interval_amount)
     - Custom template VMs: Always use monthly billing for pro-rating calculations
     - Examples: A cost plan with interval_type="day" and interval_amount=7 bills every 7 days
-11. **Upgrade Payment Flow**: 
+14. **Upgrade Payment Flow**: 
     - First, get a quote using `/api/v1/vm/{id}/upgrade/quote`
     - Then, create an upgrade payment using `/api/v1/vm/{id}/upgrade`
-    - Complete the payment (Lightning Network, Revolut, or PayPal)
+    - Complete the payment (Lightning Network, Revolut, PayPal, or Stripe)
     - The upgrade is automatically applied after payment confirmation
     - **VM Restart**: Running VMs are automatically stopped, upgraded, and restarted to apply hardware changes
-12. **Specification Requirements**: All upgrade values must be greater than or equal to current values (no downgrades allowed)
-13. **Minimum Billing**: Even very short upgrade periods (e.g., VMs expiring soon) have a minimum billing of 1 hour
-14. **Payment Method Support**: Upgrades support multiple payment methods (Lightning Network, Revolut, PayPal) specified via the optional `method` query parameter
+15. **Specification Requirements**: All upgrade values must be greater than or equal to current values (no downgrades allowed)
+16. **Minimum Billing**: Even very short upgrade periods (e.g., VMs expiring soon) have a minimum billing of 1 hour
+17. **Payment Method Support**: Upgrades support multiple payment methods (Lightning Network, Revolut, PayPal, Stripe) specified via the optional `method` query parameter
 
 ### Example: VM Upgrade Flow
 

@@ -678,6 +678,7 @@ impl LNVpsProvisioner {
                         }
                     }
                     PaymentMethod::Paypal => todo!(),
+                    PaymentMethod::Stripe => todo!("Stripe payment integration not yet implemented"),
                 };
 
                 self.db.insert_vm_payment(&vm_payment).await?;

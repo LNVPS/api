@@ -9,7 +9,6 @@ use lnvps_db::{
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use rocket::futures::future::join_all;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -151,7 +150,7 @@ impl ApiVmTemplate {
 }
 
 // Main API's full ApiVmStatus (moved from common)
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiVmStatus {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
@@ -216,7 +215,7 @@ pub async fn vm_to_status(
     })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VmState {
     Pending,
@@ -237,7 +236,7 @@ impl From<crate::status::VmRunningStates> for VmState {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiVmIpAssignment {
     pub id: u64,
     pub ip: String,
@@ -263,7 +262,7 @@ impl ApiVmIpAssignment {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiDiskType {
     HDD = 0,
@@ -288,7 +287,7 @@ impl From<ApiDiskType> for lnvps_db::DiskType {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiDiskInterface {
     SATA = 0,
@@ -316,7 +315,7 @@ impl From<ApiDiskInterface> for lnvps_db::DiskInterface {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiVmTemplate {
     pub id: u64,
     pub name: String,
@@ -332,7 +331,7 @@ pub struct ApiVmTemplate {
     pub region: ApiVmHostRegion,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiVmCostPlanIntervalType {
     Day = 0,
@@ -360,7 +359,7 @@ impl From<ApiVmCostPlanIntervalType> for lnvps_db::VmCostPlanIntervalType {
     }
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub enum ApiCurrency {
     EUR,
     BTC,
@@ -402,7 +401,7 @@ impl Into<Currency> for ApiCurrency {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiVmCostPlan {
     pub id: u64,
     pub name: String,
@@ -413,14 +412,14 @@ pub struct ApiVmCostPlan {
     pub interval_type: ApiVmCostPlanIntervalType,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ApiVmHostRegion {
     pub id: u64,
     pub name: String,
 }
 
 // Shared models used by ApiVmStatus
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiOsDistribution {
     Ubuntu = 0,
@@ -463,7 +462,7 @@ impl From<ApiOsDistribution> for lnvps_db::OsDistribution {
     }
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize)]
 pub struct ApiVmOsImage {
     pub id: u64,
     pub distribution: ApiOsDistribution,
@@ -486,7 +485,7 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
     }
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 pub struct ApiUserSshKey {
     pub id: u64,
     pub name: String,
@@ -503,7 +502,7 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
     }
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct ApiPrice {
     pub currency: ApiCurrency,
     pub amount: f32,
@@ -518,7 +517,7 @@ impl From<CurrencyAmount> for ApiPrice {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeConfig {
     pub new_cpu: Option<u16>,
     pub new_memory: Option<u64>,
@@ -535,7 +534,7 @@ impl UpgradeConfig {
     }
 }
 
-#[derive(Serialize, JsonSchema, Clone)]
+#[derive(Serialize, Clone)]
 pub struct ApiCustomTemplateParams {
     pub id: u64,
     pub name: String,
@@ -578,7 +577,7 @@ impl ApiCustomTemplateParams {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiCustomTemplateDiskParam {
     pub min_disk: u64,
     pub max_disk: u64,

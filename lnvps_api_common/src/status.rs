@@ -2,14 +2,14 @@ use anyhow::Result;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
 use rocket::serde::Deserialize;
-use schemars::JsonSchema;
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-#[derive(Clone, Serialize, Deserialize, Default, JsonSchema, PartialEq, Debug)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum VmRunningStates {
     Running,
@@ -19,7 +19,7 @@ pub enum VmRunningStates {
     Deleting,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct VmRunningState {
     pub timestamp: u64,
     pub state: VmRunningStates,

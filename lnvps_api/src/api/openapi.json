@@ -1,0 +1,715 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "LNVPS API",
+    "description": "Lightning Network VPS Service API - Manage virtual machines with Bitcoin Lightning Network payments",
+    "version": "1.0.0",
+    "contact": {
+      "name": "LNVPS Support",
+      "url": "https://lnvps.com"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api.lnvps.com",
+      "description": "Production server"
+    }
+  ],
+  "security": [
+    {
+      "NIP98": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "NIP98": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "NIP-98 Nostr authentication - Base64 encoded Nostr event in Authorization header"
+      }
+    },
+    "schemas": {
+      "Currency": {
+        "type": "string",
+        "enum": ["BTC", "EUR", "USD", "GBP", "CAD", "CHF", "AUD", "JPY"]
+      },
+      "PaymentMethod": {
+        "type": "string",
+        "enum": ["lightning", "revolut", "paypal", "stripe", "nwc"]
+      },
+      "VmState": {
+        "type": "string",
+        "enum": ["running", "stopped", "pending", "error", "unknown"]
+      },
+      "IntervalType": {
+        "type": "string",
+        "enum": ["day", "month", "year"]
+      },
+      "AccountInfo": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "contact_nip17": {
+            "type": "boolean"
+          },
+          "contact_email": {
+            "type": "boolean"
+          },
+          "country_code": {
+            "type": "string",
+            "description": "ISO 3166-1 alpha-3 country code"
+          },
+          "name": {
+            "type": "string"
+          },
+          "address_1": {
+            "type": "string"
+          },
+          "address_2": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "postcode": {
+            "type": "string"
+          },
+          "tax_id": {
+            "type": "string"
+          },
+          "nwc_connection_string": {
+            "type": "string",
+            "description": "Nostr Wallet Connect URI for automatic renewals"
+          }
+        }
+      },
+      "VmStatus": {
+        "type": "object",
+        "required": ["id", "created", "expires", "mac_address", "status"],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "created": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "mac_address": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/VmState"
+          },
+          "auto_renewal_enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Subscription": {
+        "type": "object",
+        "required": ["id", "name", "created", "is_active", "currency", "interval_amount", "interval_type", "setup_fee", "auto_renewal_enabled", "line_items"],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "created": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "interval_amount": {
+            "type": "integer",
+            "description": "Billing cycle multiplier"
+          },
+          "interval_type": {
+            "$ref": "#/components/schemas/IntervalType"
+          },
+          "setup_fee": {
+            "type": "integer",
+            "description": "One-time setup fee in smallest currency unit (cents/millisats)"
+          },
+          "auto_renewal_enabled": {
+            "type": "boolean"
+          },
+          "line_items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionLineItem"
+            }
+          }
+        }
+      },
+      "SubscriptionLineItem": {
+        "type": "object",
+        "required": ["id", "subscription_id", "name", "amount", "setup_amount"],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "subscription_id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "amount": {
+            "type": "integer",
+            "description": "Recurring cost per billing cycle in smallest currency unit"
+          },
+          "setup_amount": {
+            "type": "integer",
+            "description": "One-time setup fee in smallest currency unit"
+          },
+          "configuration": {
+            "type": "object",
+            "nullable": true,
+            "description": "Service-specific configuration"
+          }
+        }
+      },
+      "SubscriptionPayment": {
+        "type": "object",
+        "required": ["id", "subscription_id", "created", "amount", "currency", "payment_method", "payment_type", "is_paid", "time_value", "tax"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Hex-encoded payment ID"
+          },
+          "subscription_id": {
+            "type": "integer"
+          },
+          "created": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "amount": {
+            "type": "integer",
+            "description": "Amount in smallest currency unit"
+          },
+          "currency": {
+            "$ref": "#/components/schemas/Currency"
+          },
+          "payment_method": {
+            "type": "string",
+            "enum": ["lightning", "revolut", "paypal", "stripe"]
+          },
+          "payment_type": {
+            "type": "string",
+            "enum": ["purchase", "renewal"]
+          },
+          "is_paid": {
+            "type": "boolean"
+          },
+          "rate": {
+            "type": "number",
+            "nullable": true
+          },
+          "time_value": {
+            "type": "integer",
+            "description": "Duration purchased in seconds"
+          },
+          "tax": {
+            "type": "integer",
+            "description": "Tax amount in smallest currency unit"
+          },
+          "external_id": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "SubscriptionSummary": {
+        "type": "object",
+        "required": ["active_subscriptions", "total_monthly_cost", "currency"],
+        "properties": {
+          "active_subscriptions": {
+            "type": "integer"
+          },
+          "total_monthly_cost": {
+            "type": "integer",
+            "description": "Total monthly cost in smallest currency unit"
+          },
+          "currency": {
+            "type": "string"
+          }
+        }
+      },
+      "PaginatedResponse": {
+        "type": "object",
+        "required": ["data", "total", "limit", "offset"],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {}
+          },
+          "total": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
+        }
+      },
+      "ApiResponse": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": {
+            "type": "object"
+          }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/v1/account": {
+      "get": {
+        "summary": "Get account information",
+        "tags": ["Account"],
+        "security": [{"NIP98": []}],
+        "responses": {
+          "200": {
+            "description": "Account information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/ApiResponse"},
+                    {
+                      "properties": {
+                        "data": {"$ref": "#/components/schemas/AccountInfo"}
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update account information",
+        "tags": ["Account"],
+        "security": [{"NIP98": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountInfo"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Account updated successfully"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions": {
+      "get": {
+        "summary": "List user subscriptions",
+        "tags": ["Subscriptions"],
+        "security": [{"NIP98": []}],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of subscriptions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/PaginatedResponse"},
+                    {
+                      "properties": {
+                        "data": {
+                          "type": "array",
+                          "items": {"$ref": "#/components/schemas/Subscription"}
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}": {
+      "get": {
+        "summary": "Get subscription details",
+        "tags": ["Subscriptions"],
+        "security": [{"NIP98": []}],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscription details with line items",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/ApiResponse"},
+                    {
+                      "properties": {
+                        "data": {"$ref": "#/components/schemas/Subscription"}
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/summary": {
+      "get": {
+        "summary": "Get subscription summary",
+        "tags": ["Subscriptions"],
+        "security": [{"NIP98": []}],
+        "responses": {
+          "200": {
+            "description": "Aggregated subscription statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/ApiResponse"},
+                    {
+                      "properties": {
+                        "data": {"$ref": "#/components/schemas/SubscriptionSummary"}
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{subscription_id}/payments": {
+      "get": {
+        "summary": "List subscription payments",
+        "tags": ["Subscriptions"],
+        "security": [{"NIP98": []}],
+        "parameters": [
+          {
+            "name": "subscription_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of payments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/PaginatedResponse"},
+                    {
+                      "properties": {
+                        "data": {
+                          "type": "array",
+                          "items": {"$ref": "#/components/schemas/SubscriptionPayment"}
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/subscription_payments/{hex_id}": {
+      "get": {
+        "summary": "Get subscription payment details",
+        "tags": ["Subscriptions"],
+        "security": [{"NIP98": []}],
+        "parameters": [
+          {
+            "name": "hex_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Payment details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/ApiResponse"},
+                    {
+                      "properties": {
+                        "data": {"$ref": "#/components/schemas/SubscriptionPayment"}
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/vms": {
+      "get": {
+        "summary": "List user VMs",
+        "tags": ["Virtual Machines"],
+        "security": [{"NIP98": []}],
+        "responses": {
+          "200": {
+            "description": "List of VMs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/ApiResponse"},
+                    {
+                      "properties": {
+                        "data": {
+                          "type": "array",
+                          "items": {"$ref": "#/components/schemas/VmStatus"}
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/vms/{id}": {
+      "get": {
+        "summary": "Get VM details",
+        "tags": ["Virtual Machines"],
+        "security": [{"NIP98": []}],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "VM details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {"$ref": "#/components/schemas/ApiResponse"},
+                    {
+                      "properties": {
+                        "data": {"$ref": "#/components/schemas/VmStatus"}
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "Unauthorized": {
+        "description": "Unauthorized - Invalid or missing NIP-98 authentication",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "Bad request - Validation error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            }
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Account",
+      "description": "User account management"
+    },
+    {
+      "name": "Subscriptions",
+      "description": "Subscription billing and management"
+    },
+    {
+      "name": "Virtual Machines",
+      "description": "VM management and operations"
+    },
+    {
+      "name": "Payments",
+      "description": "Payment processing and history"
+    }
+  ]
+}

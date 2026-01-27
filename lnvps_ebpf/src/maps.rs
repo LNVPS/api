@@ -36,7 +36,7 @@ impl Bucket {
         let rate = unsafe { V4_SYN_RATE_LIMITS.get(&ip.dst_addr) }.unwrap_or(&DEFAULT_LIMITS);
 
         let now = unsafe { bpf_ktime_get_ns() } as u64;
-        if let Some(b) = V4_SYN_RATE.get(&ip.dst_addr) {
+        if let Some(b) = V4_SYN_RATE.get_ptr_mut(&ip.dst_addr)  {
             let bucket = unsafe { &mut *b };
             bucket.tick(now, rate);
             if bucket.tokens >= 1 {
