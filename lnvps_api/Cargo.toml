@@ -75,7 +75,7 @@ nwc = { version = "0.44", optional = true }
 #proxmox
 tokio-tungstenite = { version = "^0.21", features = ["native-tls"], optional = true }
 ssh2 = { version = "0.9.4", optional = true }
-reqwest = { version = "0.12.8", optional = true }
+reqwest = { version = "0.12.8", features = ["json"], optional = true }
 
 #libvirt
 virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }

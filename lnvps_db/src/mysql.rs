@@ -1320,6 +1320,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await
         .map_err(Error::new)
     }
+
+    async fn list_admin_user_ids(&self) -> Result<Vec<u64>> {
+        let query = r#"
+            SELECT DISTINCT user_id
+            FROM admin_role_assignments
+            WHERE expires_at IS NULL OR expires_at > NOW()
+            ORDER BY user_id
+        "#;
+
+        let user_ids = sqlx::query_scalar::<_, u64>(query)
+            .fetch_all(&self.db)
+            .await?;
+
+        Ok(user_ids)
+    }
 }
 
 #[cfg(feature = "nostr-domain")]

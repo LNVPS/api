@@ -23,3 +23,8 @@ provisioner:
       cpu: "host"
       vlan: 100
       kvm: false
+# Captcha is used in various places to prevent spam
+captcha:
+  # Turnstile is a Cloudflare captcha product
+  turnstile:
+    secret-key: "1x0000000000000000000000000000000AA"

@@ -724,4 +724,90 @@ const payment: ApiResponse<VmPayment> = await paymentResponse.json();
 // After payment confirmation, the upgrade is automatically applied
 ```
 
+---
+
+## Contact Form Submission
+
+### Endpoint: `POST /api/v1/contact`
+
+**Authentication**: None (Public endpoint)
+
+**Description**: Submit a contact form message to the administrators. This endpoint is rate-limited and requires Cloudflare Turnstile verification.
+
+**Request Body**:
+
+```typescript
+interface ContactFormRequest {
+  subject: string;           // Required: Message subject
+  message: string;           // Required: Message content
+  email: string;             // Required: Sender's email address
+  name: string;              // Required: Sender's name
+  user_pubkey?: string;      // Optional: User's Nostr public key (npub or hex)
+  timestamp: string;         // Required: ISO 8601 timestamp of submission
+  turnstile_token: string;   // Required: Cloudflare Turnstile verification token
+}
+```
+
+**Response**:
+
+```typescript
+interface ContactFormResponse {
+  data: null;
+}
+```
+
+**Error Responses**:
+
+- `"Subject is required"` - Subject field is empty
+- `"Message is required"` - Message field is empty
+- `"Name is required"` - Name field is empty
+- `"Email is required"` - Email field is empty
+- `"Invalid email address"` - Email format is invalid
+- `"Captcha verification failed"` - Turnstile token is invalid or expired
+- `"Failed to verify captcha"` - Server error during Turnstile verification
+- `"Captcha not configured"` - Server is not configured with Turnstile
+- `"Email notifications are not configured"` - Server SMTP is not configured
+- `"Admin notifications are not configured"` - No admin user configured
+- `"Failed to send notification"` - Failed to queue the notification
+
+**Example Request**:
+
+```typescript
+const contactForm: ContactFormRequest = {
+  subject: "Question about VM hosting",
+  message: "I would like to know more about your VM hosting plans...",
+  email: "user@example.com",
+  name: "John Doe",
+  user_pubkey: "npub1xyz...",  // Optional
+  timestamp: new Date().toISOString(),
+  turnstile_token: "0.ABC123..."  // From Cloudflare Turnstile widget
+};
+
+const response = await fetch('/api/v1/contact', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify(contactForm)
+});
+
+const result: ApiResponse<null> = await response.json();
+
+if (result.error) {
+  console.error('Contact form submission failed:', result.error);
+} else {
+  console.log('Contact form submitted successfully');
+}
+```
+
+**Notes**:
+
+1. This endpoint does not require authentication, making it accessible to all users
+2. All fields except `user_pubkey` are required and will be validated
+3. The Turnstile token must be obtained from the Cloudflare Turnstile widget on the frontend
+4. The message will be sent to the configured admin email address
+5. Email addresses are validated with basic format checking (contains @ and .)
+6. The admin will receive an email containing all the form data including a reply-to address
+
+
 This documentation is optimized for LLM code generation and provides all necessary type definitions and endpoint specifications for building TypeScript frontend applications.

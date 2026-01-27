@@ -296,6 +296,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Returns users who have at least one non-deleted VM and at least one contact method enabled
     async fn get_active_customers_with_contact_prefs(&self) -> Result<Vec<crate::User>>;
 
+    /// Get all user IDs that have admin privileges (active role assignments)
+    async fn list_admin_user_ids(&self) -> Result<Vec<u64>>;
+
     // ========================================================================
     // Subscription Billing System Methods
     // ========================================================================

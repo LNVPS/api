@@ -1253,6 +1253,10 @@ impl LNVpsDbBase for MockDb {
             .max_by(|a, b| a.created.cmp(&b.created))
             .cloned())
     }
+
+    async fn list_admin_user_ids(&self) -> anyhow::Result<Vec<u64>> {
+        Ok(vec![])
+    }
 }
 
 pub struct MockExchangeRate {

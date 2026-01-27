@@ -28,6 +28,12 @@ pub enum WorkJob {
         message: String,
         title: Option<String>,
     },
+    /// Send a notification to all admin users
+    /// This job looks up all admin users in the database and creates individual SendNotification jobs for each
+    SendAdminNotification {
+        message: String,
+        title: Option<String>,
+    },
     /// Send bulk message to all active customers based on their contact preferences
     BulkMessage {
         subject: String,
@@ -104,6 +110,7 @@ impl fmt::Display for WorkJob {
             WorkJob::CheckVms => write!(f, "CheckVms"),
             WorkJob::CheckVm { .. } => write!(f, "CheckVm"),
             WorkJob::SendNotification { .. } => write!(f, "SendNotification"),
+            WorkJob::SendAdminNotification { .. } => write!(f, "SendAdminNotification"),
             WorkJob::BulkMessage { .. } => write!(f, "BulkMessage"),
             WorkJob::DeleteVm { .. } => write!(f, "DeleteVm"),
             WorkJob::StartVm { .. } => write!(f, "StartVm"),

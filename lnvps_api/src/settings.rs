@@ -60,6 +60,16 @@ pub struct Settings {
 
     /// Database encryption configuration
     pub encryption: Option<EncryptionConfig>,
+
+    /// Captcha config
+    pub captcha: Option<CaptchaConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptchaConfig {
+    #[serde(rename_all = "kebab-case")]
+    Turnstile { secret_key: String },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -246,12 +256,18 @@ impl Settings {
                 url,
                 cert,
                 macaroon,
-            } => Ok(Arc::new(payments_rs::lightning::LndNode::new(url, cert, macaroon).await?)),
+            } => Ok(Arc::new(
+                payments_rs::lightning::LndNode::new(url, cert, macaroon).await?,
+            )),
             #[cfg(feature = "bitvora")]
             LightningConfig::Bitvora {
                 token,
                 webhook_secret,
-            } => Ok(Arc::new(payments_rs::lightning::BitvoraNode::new(token, webhook_secret, "/api/v1/webhook/bitvora"))),
+            } => Ok(Arc::new(payments_rs::lightning::BitvoraNode::new(
+                token,
+                webhook_secret,
+                "/api/v1/webhook/bitvora",
+            ))),
             _ => anyhow::bail!("Unsupported lightning config!"),
         }
     }
@@ -299,5 +315,6 @@ pub fn mock_settings() -> Settings {
         nostr_address_host: None,
         redis: None,
         encryption: None,
+        captcha: None,
     }
 }

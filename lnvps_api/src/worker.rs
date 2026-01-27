@@ -567,9 +567,10 @@ impl Worker {
     }
 
     fn queue_admin_notification(&self, message: String, title: Option<String>) -> Result<()> {
-        if let Some(a) = self.settings.smtp.as_ref().and_then(|s| s.admin) {
-            self.queue_notification(a, message, title)?;
-        }
+        self.tx.send(WorkJob::SendAdminNotification {
+            message,
+            title,
+        })?;
         Ok(())
     }
 
@@ -1009,6 +1010,26 @@ impl Worker {
                     error!("Failed to send notification {}: {}", user_id, e);
                     // queue again for sending
                     self.queue_notification(*user_id, message.clone(), title.clone())?;
+                }
+            }
+            WorkJob::SendAdminNotification { message, title } => {
+                // Look up all admin users and queue individual notifications
+                match self.db.list_admin_user_ids().await {
+                    Ok(admin_ids) => {
+                        if admin_ids.is_empty() {
+                            warn!("No admin users found to send notification to");
+                        } else {
+                            info!("Sending admin notification to {} admin(s)", admin_ids.len());
+                            for admin_id in admin_ids {
+                                if let Err(e) = self.queue_notification(admin_id, message.clone(), title.clone()) {
+                                    error!("Failed to queue notification for admin {}: {}", admin_id, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to list admin users: {}", e);
+                    }
                 }
             }
             WorkJob::BulkMessage {
