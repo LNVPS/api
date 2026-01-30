@@ -5,6 +5,7 @@ use crate::host::{
 };
 use crate::router::{ArpEntry, Router};
 use anyhow::{Context, anyhow, bail, ensure};
+use async_trait::async_trait;
 use bitcoin::hashes::Hash;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::Stream;
@@ -21,7 +22,6 @@ use lnvps_db::{
     NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
-    async_trait,
 };
 use nostr_sdk::Timestamp;
 use payments_rs::lightning::{AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode};
@@ -256,6 +256,11 @@ impl VmHostClient for MockVmHost {
         todo!()
     }
 
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+        // Mock implementation - just return Ok for testing
+        Ok(())
+    }
+
     async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmRunningState> {
         let vms = self.vms.lock().await;
         if let Some(vm) = vms.get(&vm.id) {
@@ -317,11 +322,6 @@ impl VmHostClient for MockVmHost {
 
     async fn connect_terminal(&self, vm: &Vm) -> anyhow::Result<TerminalStream> {
         todo!()
-    }
-
-    async fn resize_disk(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
-        // Mock implementation - just return Ok for testing
-        Ok(())
     }
 }
 

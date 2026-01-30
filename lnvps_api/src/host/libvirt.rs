@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use lnvps_api_common::VmRunningState;
 use lnvps_api_common::VmRunningStates;
-use lnvps_db::{LNVpsDb, Vm, VmOsImage, async_trait};
+use lnvps_db::{LNVpsDb, Vm, VmOsImage};
 use log::info;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -124,7 +124,7 @@ impl LibVirtHost {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl VmHostClient for LibVirtHost {
     async fn get_info(&self) -> Result<VmHostInfo> {
         let info = self.connection.get_node_info()?;

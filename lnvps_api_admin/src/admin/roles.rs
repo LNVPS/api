@@ -374,8 +374,9 @@ async fn admin_get_my_roles(
 ) -> ApiResult<Vec<UserRoleInfo>> {
     let user_id = auth.user_id;
 
+    #[allow(unused_mut)]
     // Get user's role assignments
-    let role_assignments = this.db.get_user_role_assignments(user_id).await?;
+    let mut role_assignments = this.db.get_user_role_assignments(user_id).await?;
 
     #[cfg(feature = "demo")]
     {

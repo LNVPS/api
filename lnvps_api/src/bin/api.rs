@@ -194,14 +194,18 @@ async fn main() -> Result<(), Error> {
         router = router
             .route(
                 "/openapi.json",
-                get(|| {
-                    use axum::http::header::CONTENT_TYPE;
-                    ([(CONTENT_TYPE, "application/json")], openapi::OPENAPI_JSON)
+                axum::routing::get(async || {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        openapi::OPENAPI_JSON,
+                    )
                 }),
             )
             .route(
                 "/swagger",
-                get(async move || Html(include_str!("../api/swagger.html"))),
+                axum::routing::get(async move || {
+                    axum::response::Html(include_str!("../api/swagger.html"))
+                }),
             );
     }
     #[cfg(feature = "nostr-domain")]
