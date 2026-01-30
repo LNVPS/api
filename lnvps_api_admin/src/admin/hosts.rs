@@ -1,56 +1,75 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminHostDisk, AdminHostInfo, AdminVmHostKind};
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_api_common::{
     ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
 };
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{get, patch, post, State};
+use lnvps_db::{AdminAction, AdminResource};
 use serde::Deserialize;
-use std::sync::Arc;
 
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/hosts",
+            get(admin_list_hosts).post(admin_create_host),
+        )
+        .route(
+            "/api/admin/v1/hosts/{id}",
+            get(admin_get_host).patch(admin_update_host),
+        )
+        // Host disk management
+        .route(
+            "/api/admin/v1/hosts/{id}/disks",
+            get(admin_list_host_disks).post(admin_create_host_disk),
+        )
+        .route(
+            "/api/admin/v1/hosts/{id}/disks/{disk_id}",
+            get(admin_get_host_disk).patch(admin_update_host_disk),
+        )
+}
 
 /// List all VM hosts with pagination
-#[get("/api/admin/v1/hosts?<limit>&<offset>")]
-pub async fn admin_list_hosts(
+async fn admin_list_hosts(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(page): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminHostInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = page.limit.unwrap_or(50).min(100);
+    let offset = page.offset.unwrap_or(0);
 
     // Get paginated hosts with all data from database (including disabled hosts for admin)
-    let (admin_hosts, total) = db
+    let (admin_hosts, total) = this
+        .db
         .admin_list_hosts_with_regions_paginated(limit, offset)
         .await?;
 
     // Convert to API model with calculated load data
     let mut hosts = Vec::new();
     for admin_host in admin_hosts {
-        hosts.push(AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await);
+        hosts.push(AdminHostInfo::from_admin_vm_host_with_capacity(&this.db, admin_host).await);
     }
 
     ApiPaginatedData::ok(hosts, total, limit, offset)
 }
 
 /// Get detailed information about a specific host
-#[get("/api/admin/v1/hosts/<id>")]
-pub async fn admin_get_host(
+async fn admin_get_host(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminHostInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
 
-    let host = db.get_host(id).await?;
-    let region = db.get_host_region(host.region_id).await?;
-    let disks = db.list_host_disks(id).await?;
+    let host = this.db.get_host(id).await?;
+    let region = this.db.get_host_region(host.region_id).await?;
+    let disks = this.db.list_host_disks(id).await?;
 
     // Create admin host manually since we don't have the unified query for a single host
     let admin_host = lnvps_db::AdminVmHost {
@@ -60,25 +79,24 @@ pub async fn admin_get_host(
         region_enabled: region.enabled,
         region_company_id: region.company_id,
         disks,
-        active_vm_count: db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
+        active_vm_count: this.db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
     };
-    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await;
+    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(&this.db, admin_host).await;
     ApiData::ok(host_info)
 }
 
 /// Update host configuration
-#[patch("/api/admin/v1/hosts/<id>", data = "<req>")]
-pub async fn admin_update_host(
+async fn admin_update_host(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    req: Json<AdminHostUpdateRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminHostUpdateRequest>,
 ) -> ApiResult<AdminHostInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Update)?;
 
     // Get existing host
-    let mut host = db.get_host(id).await?;
+    let mut host = this.db.get_host(id).await?;
 
     // Update fields if provided
     if let Some(name) = &req.name {
@@ -113,12 +131,12 @@ pub async fn admin_update_host(
     }
 
     // Save changes
-    db.update_host(&host).await?;
+    this.db.update_host(&host).await?;
 
     // Return updated host with calculated load data
-    let updated_host = db.get_host(id).await?;
-    let region = db.get_host_region(updated_host.region_id).await?;
-    let disks = db.list_host_disks(id).await?;
+    let updated_host = this.db.get_host(id).await?;
+    let region = this.db.get_host_region(updated_host.region_id).await?;
+    let disks = this.db.list_host_disks(id).await?;
 
     // Create admin host manually
     let admin_host = lnvps_db::AdminVmHost {
@@ -128,24 +146,23 @@ pub async fn admin_update_host(
         region_enabled: region.enabled,
         region_company_id: region.company_id,
         disks,
-        active_vm_count: db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
+        active_vm_count: this.db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
     };
-    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await;
+    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(&this.db, admin_host).await;
     ApiData::ok(host_info)
 }
 
 /// Create a new host
-#[post("/api/admin/v1/hosts", data = "<req>")]
-pub async fn admin_create_host(
+async fn admin_create_host(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    req: Json<AdminHostCreateRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminHostCreateRequest>,
 ) -> ApiResult<AdminHostInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Create)?;
 
     // Validate region exists
-    let _region = db.get_host_region(req.region_id).await?;
+    let _region = this.db.get_host_region(req.region_id).await?;
 
     // Create new host object
     let new_host = lnvps_db::VmHost {
@@ -165,12 +182,12 @@ pub async fn admin_create_host(
     };
 
     // Create host in database
-    let host_id = db.create_host(&new_host).await?;
+    let host_id = this.db.create_host(&new_host).await?;
 
     // Return the created host with calculated load data
-    let created_host = db.get_host(host_id).await?;
-    let region = db.get_host_region(created_host.region_id).await?;
-    let disks = db.list_host_disks(host_id).await?;
+    let created_host = this.db.get_host(host_id).await?;
+    let region = this.db.get_host_region(created_host.region_id).await?;
+    let disks = this.db.list_host_disks(host_id).await?;
 
     // Create admin host manually
     let admin_host = lnvps_db::AdminVmHost {
@@ -182,7 +199,7 @@ pub async fn admin_create_host(
         disks,
         active_vm_count: 0, // New host has no VMs
     };
-    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(db.inner(), admin_host).await;
+    let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(&this.db, admin_host).await;
     ApiData::ok(host_info)
 }
 
@@ -217,44 +234,38 @@ pub struct AdminHostCreateRequest {
 }
 
 /// List host disks
-#[get("/api/admin/v1/hosts/<host_id>/disks")]
-pub async fn admin_list_host_disks(
+async fn admin_list_host_disks(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    host_id: u64,
+    State(this): State<RouterState>,
+    Path(host_id): Path<u64>,
 ) -> ApiResult<Vec<AdminHostDisk>> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
 
     // Check that host exists
-    let _host = db.get_host(host_id).await?;
+    let _host = this.db.get_host(host_id).await?;
 
     // Get host disks
-    let disks = db.list_host_disks(host_id).await?;
-    let admin_disks: Vec<AdminHostDisk> = disks
-        .into_iter()
-        .map(|disk| disk.into())
-        .collect();
+    let disks = this.db.list_host_disks(host_id).await?;
+    let admin_disks: Vec<AdminHostDisk> = disks.into_iter().map(|disk| disk.into()).collect();
 
     ApiData::ok(admin_disks)
 }
 
 /// Get specific host disk details
-#[get("/api/admin/v1/hosts/<host_id>/disks/<disk_id>")]
-pub async fn admin_get_host_disk(
+async fn admin_get_host_disk(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    host_id: u64,
-    disk_id: u64,
+    State(this): State<RouterState>,
+    Path((host_id, disk_id)): Path<(u64, u64)>,
 ) -> ApiResult<AdminHostDisk> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
 
     // Check that host exists
-    let _host = db.get_host(host_id).await?;
+    let _host = this.db.get_host(host_id).await?;
 
     // Get disk details
-    let disk = db.get_host_disk(disk_id).await?;
+    let disk = this.db.get_host_disk(disk_id).await?;
 
     // Verify disk belongs to this host
     if disk.host_id != host_id {
@@ -265,22 +276,20 @@ pub async fn admin_get_host_disk(
 }
 
 /// Update host disk configuration
-#[patch("/api/admin/v1/hosts/<host_id>/disks/<disk_id>", data = "<req>")]
-pub async fn admin_update_host_disk(
+async fn admin_update_host_disk(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    host_id: u64,
-    disk_id: u64,
-    req: Json<AdminHostDiskUpdateRequest>,
+    State(this): State<RouterState>,
+    Path((host_id, disk_id)): Path<(u64, u64)>,
+    Json(req): Json<AdminHostDiskUpdateRequest>,
 ) -> ApiResult<AdminHostDisk> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Update)?;
 
     // Check that host exists
-    let _host = db.get_host(host_id).await?;
+    let _host = this.db.get_host(host_id).await?;
 
     // Get existing disk
-    let mut disk = db.get_host_disk(disk_id).await?;
+    let mut disk = this.db.get_host_disk(disk_id).await?;
 
     // Verify disk belongs to this host
     if disk.host_id != host_id {
@@ -305,25 +314,24 @@ pub async fn admin_update_host_disk(
     }
 
     // Save changes
-    db.update_host_disk(&disk).await?;
+    this.db.update_host_disk(&disk).await?;
 
     // Return updated disk
     ApiData::ok(disk.into())
 }
 
 /// Create a new host disk
-#[post("/api/admin/v1/hosts/<host_id>/disks", data = "<req>")]
-pub async fn admin_create_host_disk(
+async fn admin_create_host_disk(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    host_id: u64,
-    req: Json<AdminHostDiskCreateRequest>,
+    State(this): State<RouterState>,
+    Path(host_id): Path<u64>,
+    Json(req): Json<AdminHostDiskCreateRequest>,
 ) -> ApiResult<AdminHostDisk> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Update)?;
 
     // Check that host exists
-    let _host = db.get_host(host_id).await?;
+    let _host = this.db.get_host(host_id).await?;
 
     // Create new host disk object
     let new_disk = lnvps_db::VmHostDisk {
@@ -337,10 +345,10 @@ pub async fn admin_create_host_disk(
     };
 
     // Create disk in database
-    let disk_id = db.create_host_disk(&new_disk).await?;
+    let disk_id = this.db.create_host_disk(&new_disk).await?;
 
     // Return the created disk
-    let created_disk = db.get_host_disk(disk_id).await?;
+    let created_disk = this.db.get_host_disk(disk_id).await?;
     ApiData::ok(created_disk.into())
 }
 

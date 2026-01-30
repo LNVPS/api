@@ -1,29 +1,40 @@
+use crate::api::RouterState;
+use axum::Router;
+use axum::extract::Request;
+use axum::routing::any;
+use futures::StreamExt;
 use payments_rs::webhook::{WEBHOOK_BRIDGE, WebhookMessage};
-use rocket::http::Status;
-use rocket::{Route, post, routes};
 
-pub fn routes() -> Vec<Route> {
-    let mut routes = vec![];
+pub fn router() -> Router<RouterState> {
+    let mut router = Router::new();
 
     #[cfg(feature = "bitvora")]
-    routes.append(&mut routes![bitvora_webhook]);
+    {
+        router = router.route("/api/v1/webhook/bitvora", any(send_webhook));
+    }
 
     #[cfg(feature = "revolut")]
-    routes.append(&mut routes![revolut_webhook]);
+    {
+        router = router.route("/api/v1/webhook/revolut", any(send_webhook));
+    }
 
-    routes
+    router
 }
 
-#[cfg(feature = "bitvora")]
-#[post("/api/v1/webhook/bitvora", data = "<req>")]
-async fn bitvora_webhook(req: WebhookMessage) -> Status {
-    WEBHOOK_BRIDGE.send(req);
-    Status::Ok
-}
+async fn send_webhook(req: Request) {
+    let mut msg = WebhookMessage {
+        endpoint: req.uri().path().to_string(),
+        body: Vec::new(),
+        headers: req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+            .collect(),
+    };
+    let mut s = req.into_body().into_data_stream();
+    while let Some(Ok(f)) = s.next().await {
+        msg.body.extend_from_slice(&f);
+    }
 
-#[cfg(feature = "revolut")]
-#[post("/api/v1/webhook/revolut", data = "<req>")]
-async fn revolut_webhook(req: WebhookMessage) -> Status {
-    WEBHOOK_BRIDGE.send(req);
-    Status::Ok
+    WEBHOOK_BRIDGE.send(msg);
 }

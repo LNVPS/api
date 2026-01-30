@@ -59,10 +59,8 @@ impl DataMigration for ArpRefFixerDataMigration {
 
                                                 if needs_update {
                                                     info!(
-                                                        "Updating ARP ref for IP {} from {:?} to {}", 
-                                                        assignment.ip, 
-                                                        assignment.arp_ref, 
-                                                        arp_id
+                                                        "Updating ARP ref for IP {} from {:?} to {}",
+                                                        assignment.ip, assignment.arp_ref, arp_id
                                                     );
                                                     assignment.arp_ref = Some(arp_id.clone());
 
@@ -71,7 +69,10 @@ impl DataMigration for ArpRefFixerDataMigration {
                                                         .update_vm_ip_assignment(&assignment)
                                                         .await
                                                     {
-                                                        warn!("Failed to update ARP ref for IP {}: {}", assignment.ip, e);
+                                                        warn!(
+                                                            "Failed to update ARP ref for IP {}: {}",
+                                                            assignment.ip, e
+                                                        );
                                                     } else {
                                                         fixed_count += 1;
                                                     }

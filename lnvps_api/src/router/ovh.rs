@@ -1,13 +1,12 @@
 use crate::json_api::{JsonApi, TokenGen};
 use crate::router::{ArpEntry, Router};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lnvps_db::async_trait;
 use log::{info, warn};
-use nostr_sdk::hashes::{sha1, Hash};
+use nostr_sdk::hashes::{Hash, sha1};
 use reqwest::{Method, RequestBuilder, Url};
-use rocket::serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ops::Sub;
 
 /// This router is not really a router, but it allows
@@ -142,20 +141,20 @@ impl OvhDedicatedServerVMacRouter {
                     return Err(anyhow!(
                         "Task was cancelled: {}",
                         status.comment.unwrap_or_default()
-                    ))
+                    ));
                 }
                 OvhTaskStatus::CustomerError => {
                     return Err(anyhow!(
                         "Task failed: {}",
                         status.comment.unwrap_or_default()
-                    ))
+                    ));
                 }
                 OvhTaskStatus::Done => return Ok(status),
                 OvhTaskStatus::OvhError => {
                     return Err(anyhow!(
                         "Task failed: {}",
                         status.comment.unwrap_or_default()
-                    ))
+                    ));
                 }
                 _ => {}
             }

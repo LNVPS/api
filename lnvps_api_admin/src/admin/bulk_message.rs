@@ -1,18 +1,26 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{BulkMessageRequest, BulkMessageResponse};
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use lnvps_api_common::{ApiData, ApiResult, WorkCommander, WorkJob};
-use rocket::serde::json::Json;
-use rocket::{post, State};
-use log::{info, warn, error};
+use log::{error, info, warn};
 
-#[post("/api/admin/v1/users/bulk-message", data = "<req>")]
-pub async fn admin_bulk_message(
+pub fn router() -> Router<RouterState> {
+    Router::new().route("/api/admin/v1/users/bulk-message", post(admin_bulk_message))
+}
+
+async fn admin_bulk_message(
     auth: AdminAuth,
-    work_commander: &State<Option<WorkCommander>>,
-    req: Json<BulkMessageRequest>,
+    State(work_commander): State<Option<WorkCommander>>,
+    Json(req): Json<BulkMessageRequest>,
 ) -> ApiResult<BulkMessageResponse> {
     // Check permission - require admin access to users
-    auth.require_permission(lnvps_db::AdminResource::Users, lnvps_db::AdminAction::Update)?;
+    auth.require_permission(
+        lnvps_db::AdminResource::Users,
+        lnvps_db::AdminAction::Update,
+    )?;
 
     // Validate input
     if req.subject.trim().is_empty() {
@@ -23,7 +31,7 @@ pub async fn admin_bulk_message(
     }
 
     // Dispatch work job for async processing
-    match work_commander.inner() {
+    match work_commander {
         Some(commander) => {
             let job = WorkJob::BulkMessage {
                 subject: req.subject.clone(),
@@ -33,7 +41,11 @@ pub async fn admin_bulk_message(
 
             match commander.send_job(job).await {
                 Ok(job_id) => {
-                    info!("Bulk message job dispatched with ID: {} for subject: '{}'", job_id, req.subject.trim());
+                    info!(
+                        "Bulk message job dispatched with ID: {} for subject: '{}'",
+                        job_id,
+                        req.subject.trim()
+                    );
                     ApiData::ok(BulkMessageResponse {
                         job_dispatched: true,
                         job_id: Some(job_id),

@@ -73,7 +73,12 @@ pub trait AdminDb: Send + Sync {
     ) -> Result<(Vec<crate::VmHostRegion>, u64)>;
 
     /// Create a new region
-    async fn admin_create_region(&self, name: &str, enabled: bool, company_id: Option<u64>) -> Result<u64>;
+    async fn admin_create_region(
+        &self,
+        name: &str,
+        enabled: bool,
+        company_id: Option<u64>,
+    ) -> Result<u64>;
 
     /// Update region information
     async fn admin_update_region(&self, region: &crate::VmHostRegion) -> Result<()>;
@@ -334,13 +339,18 @@ pub trait AdminDb: Send + Sync {
     ) -> Result<(Vec<crate::VmIpAssignment>, u64)>;
 
     /// Get VM IP assignment by ID
-    async fn admin_get_vm_ip_assignment(&self, assignment_id: u64) -> Result<crate::VmIpAssignment>;
+    async fn admin_get_vm_ip_assignment(&self, assignment_id: u64)
+    -> Result<crate::VmIpAssignment>;
 
     /// Create a new VM IP assignment
-    async fn admin_create_vm_ip_assignment(&self, assignment: &crate::VmIpAssignment) -> Result<u64>;
+    async fn admin_create_vm_ip_assignment(
+        &self,
+        assignment: &crate::VmIpAssignment,
+    ) -> Result<u64>;
 
     /// Update VM IP assignment
-    async fn admin_update_vm_ip_assignment(&self, assignment: &crate::VmIpAssignment) -> Result<()>;
+    async fn admin_update_vm_ip_assignment(&self, assignment: &crate::VmIpAssignment)
+    -> Result<()>;
 
     /// Delete VM IP assignment (soft delete)
     async fn admin_delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()>;

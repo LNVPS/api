@@ -11,16 +11,17 @@ admin = []
 
 [dependencies]
 anyhow.workspace = true
-sqlx = { version = "0.8.2", features = ["chrono", "migrate", "runtime-tokio"] }
-chrono = { version = "0.4.38", features = ["serde"] }
-async-trait.workspace = true
-url = "2.5.4"
 serde.workspace = true
 serde_json.workspace = true
-aes-gcm = "0.10"
-zeroize = { version = "1.8.1", features = ["derive"] }
-base64 = "0.22"
 log.workspace = true
+async-trait.workspace = true
+
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "macros", "chrono", "migrate", "runtime-tokio", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2.5"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3.13"

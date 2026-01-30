@@ -1,10 +1,13 @@
+use crate::admin::RouterState;
 use crate::admin::model::Permission;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
+use axum::extract::FromRef;
+use axum::{
+    extract::FromRequestParts,
+    http::{StatusCode, request::Parts},
+};
 use lnvps_api_common::Nip98Auth;
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::http::Status;
-use rocket::request::{FromRequest, Outcome};
-use rocket::{async_trait, Request, State};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -79,45 +82,42 @@ impl AdminAuth {
     }
 }
 
-#[async_trait]
-impl<'r> FromRequest<'r> for AdminAuth {
-    type Error = String;
+// Define state type for Admin API
+pub struct AdminState {
+    pub db: Arc<dyn LNVpsDb>,
+}
 
-    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        // First get the regular NIP-98 auth
-        let nip98_auth = match Nip98Auth::from_request(request).await {
-            Outcome::Success(auth) => auth,
-            Outcome::Error((status, msg)) => return Outcome::Error((status, msg)),
-            Outcome::Forward(forward) => return Outcome::Forward(forward),
-        };
+impl<S> FromRequestParts<S> for AdminAuth
+where
+    S: Send + Sync,
+    RouterState: axum::extract::FromRef<S>,
+{
+    type Rejection = (StatusCode, String);
 
-        // Get database connection
-        let db = match request.guard::<&State<Arc<dyn LNVpsDb>>>().await {
-            Outcome::Success(db) => db,
-            Outcome::Error(_) => {
-                return Outcome::Error((
-                    Status::InternalServerError,
-                    "Database connection unavailable".to_string(),
-                ));
-            }
-            Outcome::Forward(_) => {
-                return Outcome::Error((
-                    Status::InternalServerError,
-                    "Database connection unavailable".to_string(),
-                ));
-            }
-        };
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
+        Box::pin(async {
+            // First get the regular NIP-98 auth
+            let nip98_auth = Nip98Auth::from_request_parts(parts, state)
+                .await
+                .map_err(|(status, msg)| (status, msg))?;
 
-        // Check admin privileges
-        match AdminAuth::from_nip98_auth(nip98_auth, db.inner()).await {
-            Ok(admin_auth) => Outcome::Success(admin_auth),
-            Err(e) => Outcome::Error((Status::Forbidden, e.to_string())),
-        }
+            let state = RouterState::from_ref(state);
+            // Check admin privileges
+            AdminAuth::from_nip98_auth(nip98_auth, &state.db)
+                .await
+                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))
+        })
     }
 }
 
 /// Verify admin authentication from a query parameter auth token
-pub async fn verify_admin_auth_from_token(auth_token: &str, db: &Arc<dyn LNVpsDb>) -> Result<AdminAuth> {
+pub async fn verify_admin_auth_from_token(
+    auth_token: &str,
+    db: &Arc<dyn LNVpsDb>,
+) -> Result<AdminAuth> {
     let nip98_auth = Nip98Auth::from_base64(auth_token)?;
     AdminAuth::from_nip98_auth(nip98_auth, db).await
 }

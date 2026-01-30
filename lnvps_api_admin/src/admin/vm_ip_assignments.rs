@@ -1,46 +1,64 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminVmIpAssignmentInfo, CreateVmIpAssignmentRequest, JobResponse, UpdateVmIpAssignmentRequest,
 };
-use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkCommander,
-    WorkJob,
-};
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{State, delete, get, patch, post};
-use std::net::IpAddr;
-use std::sync::Arc;
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::Utc;
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkJob,
+};
+use lnvps_db::{AdminAction, AdminResource};
+use serde::Deserialize;
+use std::net::IpAddr;
 
-/// List all VM IP assignments with pagination and optional filtering
-#[get(
-    "/api/admin/v1/vm_ip_assignments?<limit>&<offset>&<vm_id>&<ip_range_id>&<ip>&<include_deleted>"
-)]
-pub async fn admin_list_vm_ip_assignments(
-    auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/vm_ip_assignments",
+            get(admin_list_vm_ip_assignments).post(admin_create_vm_ip_assignment),
+        )
+        .route(
+            "/api/admin/v1/vm_ip_assignments/{id}",
+            get(admin_get_vm_ip_assignment)
+                .patch(admin_update_vm_ip_assignment)
+                .delete(admin_delete_vm_ip_assignment),
+        )
+}
+
+#[derive(Deserialize)]
+struct VmIpAssignmentQuery {
     limit: Option<u64>,
     offset: Option<u64>,
     vm_id: Option<u64>,
     ip_range_id: Option<u64>,
     ip: Option<String>,
     include_deleted: Option<bool>,
+}
+
+/// List all VM IP assignments with pagination and optional filtering
+async fn admin_list_vm_ip_assignments(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<VmIpAssignmentQuery>,
 ) -> ApiPaginatedResult<AdminVmIpAssignmentInfo> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let offset = params.offset.unwrap_or(0);
 
-    let (db_assignments, total) = db
+    let (db_assignments, total) = this
+        .db
         .admin_list_vm_ip_assignments(
             limit,
             offset,
-            vm_id,
-            ip_range_id,
-            ip.as_deref(),
-            include_deleted,
+            params.vm_id,
+            params.ip_range_id,
+            params.ip.as_deref(),
+            params.include_deleted,
         )
         .await?;
 
@@ -48,7 +66,8 @@ pub async fn admin_list_vm_ip_assignments(
     let mut assignments = Vec::new();
     for assignment in db_assignments {
         let admin_assignment =
-            AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(db, &assignment).await?;
+            AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(&this.db, &assignment)
+                .await?;
         assignments.push(admin_assignment);
     }
 
@@ -56,35 +75,32 @@ pub async fn admin_list_vm_ip_assignments(
 }
 
 /// Get a specific VM IP assignment by ID
-#[get("/api/admin/v1/vm_ip_assignments/<id>")]
-pub async fn admin_get_vm_ip_assignment(
+async fn admin_get_vm_ip_assignment(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminVmIpAssignmentInfo> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::View)?;
 
-    let assignment = db.admin_get_vm_ip_assignment(id).await?;
+    let assignment = this.db.admin_get_vm_ip_assignment(id).await?;
     let admin_assignment =
-        AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(db, &assignment).await?;
+        AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(&this.db, &assignment).await?;
 
     ApiData::ok(admin_assignment)
 }
 
 /// Create a new VM IP assignment
-#[post("/api/admin/v1/vm_ip_assignments", data = "<req>")]
-pub async fn admin_create_vm_ip_assignment(
+async fn admin_create_vm_ip_assignment(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    req: Json<CreateVmIpAssignmentRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<CreateVmIpAssignmentRequest>,
 ) -> ApiResult<AdminVmIpAssignmentInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Validate VM exists
-    let vm = db.get_vm(req.vm_id).await?;
+    let vm = this.db.get_vm(req.vm_id).await?;
     if vm.deleted {
         return ApiData::err("Cannot assign IP to a deleted VM");
     }
@@ -98,7 +114,7 @@ pub async fn admin_create_vm_ip_assignment(
     }
 
     // Validate IP range exists and is enabled
-    let ip_range = db.admin_get_ip_range(req.ip_range_id).await?;
+    let ip_range = this.db.admin_get_ip_range(req.ip_range_id).await?;
     if !ip_range.enabled {
         return ApiData::err("Cannot assign IP from a disabled IP range");
     }
@@ -127,7 +143,7 @@ pub async fn admin_create_vm_ip_assignment(
         ip.trim().to_string()
     } else {
         // Auto-assign IP from the range using NetworkProvisioner
-        let network_provisioner = NetworkProvisioner::new(db.inner().clone());
+        let network_provisioner = NetworkProvisioner::new(this.db.clone());
         match network_provisioner.pick_ip_from_range(&ip_range).await {
             Ok(available_ip) => available_ip.ip.ip().to_string(),
             Err(e) => {
@@ -138,7 +154,7 @@ pub async fn admin_create_vm_ip_assignment(
 
     // Send AssignVmIp job to handle the assignment using the provisioner
     // This will create the IP assignment and handle all additional setup
-    if let Some(work_commander) = work_commander.inner() {
+    if let Some(work_commander) = &this.work_commander {
         if let Err(e) = work_commander
             .send_job(WorkJob::AssignVmIp {
                 vm_id: req.vm_id,
@@ -179,18 +195,16 @@ pub async fn admin_create_vm_ip_assignment(
 }
 
 /// Update VM IP assignment information
-#[patch("/api/admin/v1/vm_ip_assignments/<id>", data = "<req>")]
-pub async fn admin_update_vm_ip_assignment(
+async fn admin_update_vm_ip_assignment(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    id: u64,
-    req: Json<UpdateVmIpAssignmentRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<UpdateVmIpAssignmentRequest>,
 ) -> ApiResult<AdminVmIpAssignmentInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
-    let mut assignment = db.admin_get_vm_ip_assignment(id).await?;
+    let mut assignment = this.db.admin_get_vm_ip_assignment(id).await?;
 
     // Update IP if provided
     if let Some(ip) = &req.ip {
@@ -203,7 +217,7 @@ pub async fn admin_update_vm_ip_assignment(
         }
 
         // Validate IP is within the range
-        let ip_range = db.admin_get_ip_range(assignment.ip_range_id).await?;
+        let ip_range = this.db.admin_get_ip_range(assignment.ip_range_id).await?;
         let cidr = ip_range
             .cidr
             .parse::<ipnetwork::IpNetwork>()
@@ -236,14 +250,14 @@ pub async fn admin_update_vm_ip_assignment(
     }
 
     // Update assignment in database
-    db.admin_update_vm_ip_assignment(&assignment).await?;
+    this.db.admin_update_vm_ip_assignment(&assignment).await?;
 
     // Return updated assignment
     let admin_assignment =
-        AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(db, &assignment).await?;
+        AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(&this.db, &assignment).await?;
 
     // Send ConfigureVm job to update VM network configuration
-    if let Some(work_commander) = work_commander.inner() {
+    if let Some(work_commander) = &this.work_commander {
         if let Err(e) = work_commander
             .send_job(WorkJob::UpdateVmIp {
                 assignment_id: assignment.id,
@@ -263,22 +277,20 @@ pub async fn admin_update_vm_ip_assignment(
 }
 
 /// Delete a VM IP assignment (soft delete)
-#[delete("/api/admin/v1/vm_ip_assignments/<id>")]
-pub async fn admin_delete_vm_ip_assignment(
+async fn admin_delete_vm_ip_assignment(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify assignment exists
-    let _assignment = db.admin_get_vm_ip_assignment(id).await?;
+    let _assignment = this.db.admin_get_vm_ip_assignment(id).await?;
 
     // Send UnassignVmIp job to handle the unassignment using the provisioner
     // This will handle all cleanup (ARP, DNS, access policies) and then delete the assignment
-    if let Some(work_commander) = work_commander.inner() {
+    if let Some(work_commander) = &this.work_commander {
         match work_commander
             .send_job(WorkJob::UnassignVmIp {
                 assignment_id: id,

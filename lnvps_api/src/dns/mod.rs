@@ -1,5 +1,6 @@
-use anyhow::{bail, Context, Result};
-use lnvps_db::{async_trait, VmIpAssignment};
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use lnvps_db::VmIpAssignment;
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;

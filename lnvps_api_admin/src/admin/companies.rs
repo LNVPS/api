@@ -1,32 +1,46 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminCompanyInfo, CreateCompanyRequest, UpdateCompanyRequest};
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::Utc;
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, Company, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
-use std::sync::Arc;
+use lnvps_db::{AdminAction, AdminResource, Company};
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/companies",
+            get(admin_list_companies).post(admin_create_company),
+        )
+        .route(
+            "/api/admin/v1/companies/{id}",
+            get(admin_get_company)
+                .patch(admin_update_company)
+                .delete(admin_delete_company),
+        )
+}
 
 /// List all companies with pagination
-#[get("/api/admin/v1/companies?<limit>&<offset>")]
-pub async fn admin_list_companies(
+async fn admin_list_companies(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(params): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminCompanyInfo> {
     // Check permission
     auth.require_permission(AdminResource::Company, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let offset = params.offset.unwrap_or(0);
 
-    let (db_companies, total) = db.admin_list_companies(limit, offset).await?;
+    let (db_companies, total) = this.db.admin_list_companies(limit, offset).await?;
 
     // Convert to API format with region counts
     let mut companies = Vec::new();
     for company in db_companies {
-        let region_count = db
+        let region_count = this
+            .db
             .admin_count_company_regions(company.id)
             .await
             .unwrap_or(0);
@@ -39,17 +53,16 @@ pub async fn admin_list_companies(
 }
 
 /// Get a specific company by ID
-#[get("/api/admin/v1/companies/<id>")]
-pub async fn admin_get_company(
+async fn admin_get_company(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminCompanyInfo> {
     // Check permission
     auth.require_permission(AdminResource::Company, AdminAction::View)?;
 
-    let company = db.admin_get_company(id).await?;
-    let region_count = db.admin_count_company_regions(id).await.unwrap_or(0);
+    let company = this.db.admin_get_company(id).await?;
+    let region_count = this.db.admin_count_company_regions(id).await.unwrap_or(0);
 
     let mut admin_company = AdminCompanyInfo::from(company);
     admin_company.region_count = region_count;
@@ -58,11 +71,10 @@ pub async fn admin_get_company(
 }
 
 /// Create a new company
-#[post("/api/admin/v1/companies", data = "<req>")]
-pub async fn admin_create_company(
+async fn admin_create_company(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    req: Json<CreateCompanyRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<CreateCompanyRequest>,
 ) -> ApiResult<AdminCompanyInfo> {
     // Check permission
     auth.require_permission(AdminResource::Company, AdminAction::Create)?;
@@ -80,8 +92,12 @@ pub async fn admin_create_company(
         } else {
             // Validate currency by parsing it with the Currency enum
             match currency.parse::<payments_rs::currency::Currency>() {
-                Ok(_) => {}, // Valid currency
-                Err(_) => return ApiData::err("Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC"),
+                Ok(_) => {} // Valid currency
+                Err(_) => {
+                    return ApiData::err(
+                        "Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC",
+                    );
+                }
             }
             currency
         }
@@ -142,27 +158,26 @@ pub async fn admin_create_company(
         base_currency,
     };
 
-    let company_id = db.admin_create_company(&company).await?;
+    let company_id = this.db.admin_create_company(&company).await?;
 
     // Fetch the created company to return
-    let created_company = db.admin_get_company(company_id).await?;
+    let created_company = this.db.admin_get_company(company_id).await?;
     let admin_company = AdminCompanyInfo::from(created_company);
 
     ApiData::ok(admin_company)
 }
 
 /// Update company information
-#[patch("/api/admin/v1/companies/<id>", data = "<req>")]
-pub async fn admin_update_company(
+async fn admin_update_company(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    req: Json<UpdateCompanyRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<UpdateCompanyRequest>,
 ) -> ApiResult<AdminCompanyInfo> {
     // Check permission
     auth.require_permission(AdminResource::Company, AdminAction::Update)?;
 
-    let mut company = db.admin_get_company(id).await?;
+    let mut company = this.db.admin_get_company(id).await?;
 
     // Update company fields if provided
     if let Some(name) = &req.name {
@@ -241,18 +256,22 @@ pub async fn admin_update_company(
         } else {
             // Validate currency by parsing it with the Currency enum
             match currency.parse::<payments_rs::currency::Currency>() {
-                Ok(_) => {}, // Valid currency
-                Err(_) => return ApiData::err("Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC"),
+                Ok(_) => {} // Valid currency
+                Err(_) => {
+                    return ApiData::err(
+                        "Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC",
+                    );
+                }
             }
             company.base_currency = currency;
         }
     }
 
     // Update company in database
-    db.admin_update_company(&company).await?;
+    this.db.admin_update_company(&company).await?;
 
     // Return updated company
-    let region_count = db.admin_count_company_regions(id).await.unwrap_or(0);
+    let region_count = this.db.admin_count_company_regions(id).await.unwrap_or(0);
     let mut admin_company = AdminCompanyInfo::from(company);
     admin_company.region_count = region_count;
 
@@ -260,17 +279,16 @@ pub async fn admin_update_company(
 }
 
 /// Delete a company
-#[delete("/api/admin/v1/companies/<id>")]
-pub async fn admin_delete_company(
+async fn admin_delete_company(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<()> {
     // Check permission
     auth.require_permission(AdminResource::Company, AdminAction::Delete)?;
 
     // This will fail if there are regions assigned to the company
-    db.admin_delete_company(id).await?;
+    this.db.admin_delete_company(id).await?;
 
     ApiData::ok(())
 }

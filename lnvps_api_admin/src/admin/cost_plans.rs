@@ -2,11 +2,27 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCostPlanInfo, AdminCreateCostPlanRequest, AdminUpdateCostPlanRequest,
 };
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCostPlan};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
 use std::sync::Arc;
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/cost_plans",
+            get(admin_list_cost_plans).post(admin_create_cost_plan),
+        )
+        .route(
+            "/api/admin/v1/cost_plans/{id}",
+            get(admin_get_cost_plan)
+                .patch(admin_update_cost_plan)
+                .delete(admin_delete_cost_plan),
+        )
+}
 
 impl AdminCostPlanInfo {
     pub async fn from_cost_plan(
@@ -27,20 +43,18 @@ impl AdminCostPlanInfo {
 }
 
 /// List cost plans
-#[get("/api/admin/v1/cost_plans?<limit>&<offset>")]
-pub async fn admin_list_cost_plans(
+async fn admin_list_cost_plans(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(params): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminCostPlanInfo> {
     // Check permission - using VmTemplate resource as cost plans are tightly coupled to templates
     auth.require_permission(AdminResource::VmTemplate, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
 
-    let all_cost_plans = db.list_cost_plans().await?;
+    let all_cost_plans = this.db.list_cost_plans().await?;
     let total = all_cost_plans.len() as u64;
 
     let cost_plans = all_cost_plans
@@ -51,7 +65,7 @@ pub async fn admin_list_cost_plans(
 
     let mut cost_plan_infos = Vec::new();
     for cost_plan in cost_plans {
-        match AdminCostPlanInfo::from_cost_plan(db, &cost_plan).await {
+        match AdminCostPlanInfo::from_cost_plan(&this.db, &cost_plan).await {
             Ok(info) => cost_plan_infos.push(info),
             Err(_) => continue,
         }
@@ -61,54 +75,48 @@ pub async fn admin_list_cost_plans(
 }
 
 /// Get cost plan details
-#[get("/api/admin/v1/cost_plans/<id>")]
-pub async fn admin_get_cost_plan(
+async fn admin_get_cost_plan(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminCostPlanInfo> {
     // Check permission - using VmTemplate resource as cost plans are tightly coupled to templates
     auth.require_permission(AdminResource::VmTemplate, AdminAction::View)?;
 
-    let cost_plan = db.get_cost_plan(id).await?;
-    let info = AdminCostPlanInfo::from_cost_plan(db, &cost_plan).await?;
+    let cost_plan = this.db.get_cost_plan(id).await?;
+    let info = AdminCostPlanInfo::from_cost_plan(&this.db, &cost_plan).await?;
     ApiData::ok(info)
 }
 
 /// Create cost plan
-#[post("/api/admin/v1/cost_plans", data = "<request>")]
-pub async fn admin_create_cost_plan(
+async fn admin_create_cost_plan(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    request: Json<AdminCreateCostPlanRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminCreateCostPlanRequest>,
 ) -> ApiResult<AdminCostPlanInfo> {
     // Check permission - using VmTemplate resource as cost plans are tightly coupled to templates
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Create)?;
 
-    let req = request.into_inner();
     let cost_plan = req.to_cost_plan()?;
 
-    let cost_plan_id = db.insert_cost_plan(&cost_plan).await?;
-    let created_cost_plan = db.get_cost_plan(cost_plan_id).await?;
-    let info = AdminCostPlanInfo::from_cost_plan(db, &created_cost_plan).await?;
+    let cost_plan_id = this.db.insert_cost_plan(&cost_plan).await?;
+    let created_cost_plan = this.db.get_cost_plan(cost_plan_id).await?;
+    let info = AdminCostPlanInfo::from_cost_plan(&this.db, &created_cost_plan).await?;
     ApiData::ok(info)
 }
 
 /// Update cost plan
-#[patch("/api/admin/v1/cost_plans/<id>", data = "<request>")]
-pub async fn admin_update_cost_plan(
+async fn admin_update_cost_plan(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    request: Json<AdminUpdateCostPlanRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminUpdateCostPlanRequest>,
 ) -> ApiResult<AdminCostPlanInfo> {
     // Check permission - using VmTemplate resource as cost plans are tightly coupled to templates
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Update)?;
 
-    let req = request.into_inner();
-
     // Get existing cost plan
-    let mut cost_plan = db.get_cost_plan(id).await?;
+    let mut cost_plan = this.db.get_cost_plan(id).await?;
 
     // Update fields if provided
     if let Some(name) = req.name {
@@ -139,26 +147,25 @@ pub async fn admin_update_cost_plan(
         cost_plan.interval_type = interval_type.into();
     }
 
-    db.update_cost_plan(&cost_plan).await?;
-    let info = AdminCostPlanInfo::from_cost_plan(db, &cost_plan).await?;
+    this.db.update_cost_plan(&cost_plan).await?;
+    let info = AdminCostPlanInfo::from_cost_plan(&this.db, &cost_plan).await?;
     ApiData::ok(info)
 }
 
 /// Delete cost plan
-#[delete("/api/admin/v1/cost_plans/<id>")]
-pub async fn admin_delete_cost_plan(
+async fn admin_delete_cost_plan(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<serde_json::Value> {
     // Check permission - using VmTemplate resource as cost plans are tightly coupled to templates
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Delete)?;
 
     // Check if cost plan exists
-    let _cost_plan = db.get_cost_plan(id).await?;
+    let _cost_plan = this.db.get_cost_plan(id).await?;
 
     // Check if cost plan is being used by any VM templates
-    let all_templates = db.list_vm_templates().await?;
+    let all_templates = this.db.list_vm_templates().await?;
     let template_count = all_templates
         .iter()
         .filter(|template| template.cost_plan_id == id)
@@ -172,7 +179,7 @@ pub async fn admin_delete_cost_plan(
         .into());
     }
 
-    db.delete_cost_plan(id).await?;
+    this.db.delete_cost_plan(id).await?;
     ApiData::ok(serde_json::json!({
         "success": true,
         "message": "Cost plan deleted successfully"

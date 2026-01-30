@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb};
 use log::warn;
-use rand::prelude::SliceRandom;
 use rand::Rng;
+use rand::prelude::SliceRandom;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -64,7 +64,7 @@ impl NetworkProvisioner {
                 match (net, &kind) {
                     (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
                     (Ok(IpNetwork::V6(_)), Some(IpAddrKind::IPv6)) => true,
-                    (Err(_),_) => false,
+                    (Err(_), _) => false,
                     _ => true,
                 }
             })

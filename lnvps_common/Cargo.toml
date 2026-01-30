@@ -1,7 +1,0 @@
-[package]
-name = "lnvps_common"
-version = "0.1.0"
-edition.workspace = true
-
-[dependencies]
-rocket.workspace = true

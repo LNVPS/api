@@ -1,12 +1,12 @@
 use crate::Template;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::Utc;
+use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
     DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
     VmIpAssignment, VmTemplate,
 };
-use rocket::futures::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

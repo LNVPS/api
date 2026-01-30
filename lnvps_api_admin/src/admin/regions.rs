@@ -1,33 +1,46 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminRegionInfo, CreateRegionRequest, UpdateRegionRequest};
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
+use lnvps_db::{AdminAction, AdminResource};
 use serde::Serialize;
-use std::sync::Arc;
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/regions",
+            get(admin_list_regions).post(admin_create_region),
+        )
+        .route(
+            "/api/admin/v1/regions/{id}",
+            get(admin_get_region)
+                .patch(admin_update_region)
+                .delete(admin_delete_region),
+        )
+}
 
 /// List all regions with pagination
-#[get("/api/admin/v1/regions?<limit>&<offset>")]
-pub async fn admin_list_regions(
+async fn admin_list_regions(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(page): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminRegionInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = page.limit.unwrap_or(50).min(100);
+    let offset = page.offset.unwrap_or(0);
 
     // Get paginated regions from database
-    let (regions, total) = db.admin_list_regions(limit, offset).await?;
+    let (regions, total) = this.db.admin_list_regions(limit, offset).await?;
 
     // Convert to API model with comprehensive statistics
     let mut region_infos = Vec::new();
     for region in regions {
-        let stats = db.admin_get_region_stats(region.id).await?;
+        let stats = this.db.admin_get_region_stats(region.id).await?;
         region_infos.push(AdminRegionInfo {
             id: region.id,
             name: region.name,
@@ -45,17 +58,16 @@ pub async fn admin_list_regions(
 }
 
 /// Get detailed information about a specific region
-#[get("/api/admin/v1/regions/<id>")]
-pub async fn admin_get_region(
+async fn admin_get_region(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminRegionInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
 
-    let region = db.get_host_region(id).await?;
-    let stats = db.admin_get_region_stats(id).await?;
+    let region = this.db.get_host_region(id).await?;
+    let stats = this.db.admin_get_region_stats(id).await?;
 
     let region_info = AdminRegionInfo {
         id: region.id,
@@ -73,19 +85,21 @@ pub async fn admin_get_region(
 }
 
 /// Create a new region
-#[post("/api/admin/v1/regions", data = "<req>")]
-pub async fn admin_create_region(
+async fn admin_create_region(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    req: Json<CreateRegionRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<CreateRegionRequest>,
 ) -> ApiResult<AdminRegionInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Create)?;
 
-    let region_id = db.admin_create_region(&req.name, req.enabled, req.company_id).await?;
+    let region_id = this
+        .db
+        .admin_create_region(&req.name, req.enabled, req.company_id)
+        .await?;
 
     // Get the created region
-    let region = db.get_host_region(region_id).await?;
+    let region = this.db.get_host_region(region_id).await?;
     let region_info = AdminRegionInfo {
         id: region.id,
         name: region.name,
@@ -102,18 +116,17 @@ pub async fn admin_create_region(
 }
 
 /// Update region information
-#[patch("/api/admin/v1/regions/<id>", data = "<req>")]
-pub async fn admin_update_region(
+async fn admin_update_region(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    req: Json<UpdateRegionRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<UpdateRegionRequest>,
 ) -> ApiResult<AdminRegionInfo> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Update)?;
 
     // Get existing region
-    let mut region = db.get_host_region(id).await?;
+    let mut region = this.db.get_host_region(id).await?;
 
     // Update fields if provided
     if let Some(name) = &req.name {
@@ -127,10 +140,10 @@ pub async fn admin_update_region(
     }
 
     // Save changes
-    db.admin_update_region(&region).await?;
+    this.db.admin_update_region(&region).await?;
 
     // Return updated region
-    let stats = db.admin_get_region_stats(id).await?;
+    let stats = this.db.admin_get_region_stats(id).await?;
     let region_info = AdminRegionInfo {
         id: region.id,
         name: region.name,
@@ -147,16 +160,15 @@ pub async fn admin_update_region(
 }
 
 /// Delete/disable region
-#[delete("/api/admin/v1/regions/<id>")]
-pub async fn admin_delete_region(
+async fn admin_delete_region(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<RegionDeleteResponse> {
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Delete)?;
 
-    db.admin_delete_region(id).await?;
+    this.db.admin_delete_region(id).await?;
 
     ApiData::ok(RegionDeleteResponse {
         success: true,
@@ -165,7 +177,7 @@ pub async fn admin_delete_region(
 }
 
 #[derive(Serialize)]
-pub struct RegionDeleteResponse {
-    pub success: bool,
-    pub message: String,
+struct RegionDeleteResponse {
+    success: bool,
+    message: String,
 }

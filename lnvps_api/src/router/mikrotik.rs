@@ -1,11 +1,11 @@
 use crate::json_api::JsonApi;
 use crate::router::{ArpEntry, Router};
-use anyhow::{ensure, Context, Result};
-use base64::engine::general_purpose::STANDARD;
+use anyhow::{Context, Result, ensure};
+use async_trait::async_trait;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use log::debug;
 use reqwest::Method;
-use rocket::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub struct MikrotikRouter {

@@ -1,48 +1,72 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminIpRangeAllocationMode, AdminIpRangeInfo, CreateIpRangeRequest, UpdateIpRangeRequest,
 };
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{State, delete, get, patch, post};
+use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode};
+use serde::Deserialize;
 use std::net::IpAddr;
-use std::sync::Arc;
 
-/// List all IP ranges with pagination and optional region filtering
-#[get("/api/admin/v1/ip_ranges?<limit>&<offset>&<region_id>")]
-pub async fn admin_list_ip_ranges(
-    auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/ip_ranges",
+            get(admin_list_ip_ranges).post(admin_create_ip_range),
+        )
+        .route(
+            "/api/admin/v1/ip_ranges/{id}",
+            get(admin_get_ip_range)
+                .patch(admin_update_ip_range)
+                .delete(admin_delete_ip_range),
+        )
+}
+
+#[derive(Deserialize)]
+struct IpRangeQuery {
     limit: Option<u64>,
     offset: Option<u64>,
     region_id: Option<u64>,
+}
+
+/// List all IP ranges with pagination and optional region filtering
+async fn admin_list_ip_ranges(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<IpRangeQuery>,
 ) -> ApiPaginatedResult<AdminIpRangeInfo> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let offset = params.offset.unwrap_or(0);
 
-    let (db_ip_ranges, total) = db.admin_list_ip_ranges(limit, offset, region_id).await?;
+    let (db_ip_ranges, total) = this
+        .db
+        .admin_list_ip_ranges(limit, offset, params.region_id)
+        .await?;
 
     // Convert to API format with enriched data
     let mut ip_ranges = Vec::new();
     for ip_range in db_ip_ranges {
-        let assignment_count = db
+        let assignment_count = this
+            .db
             .admin_count_ip_range_assignments(ip_range.id)
             .await
             .unwrap_or(0);
 
         // Get region name
-        let region_name = match db.get_host_region(ip_range.region_id).await {
+        let region_name = match this.db.get_host_region(ip_range.region_id).await {
             Ok(region) => Some(region.name),
             Err(_) => None,
         };
 
         // Get access policy name if set
         let access_policy_name = if let Some(policy_id) = ip_range.access_policy_id {
-            match db.get_access_policy(policy_id).await {
+            match this.db.get_access_policy(policy_id).await {
                 Ok(policy) => Some(policy.name),
                 Err(_) => None,
             }
@@ -61,27 +85,30 @@ pub async fn admin_list_ip_ranges(
 }
 
 /// Get a specific IP range by ID
-#[get("/api/admin/v1/ip_ranges/<id>")]
-pub async fn admin_get_ip_range(
+async fn admin_get_ip_range(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminIpRangeInfo> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::View)?;
 
-    let ip_range = db.admin_get_ip_range(id).await?;
-    let assignment_count = db.admin_count_ip_range_assignments(id).await.unwrap_or(0);
+    let ip_range = this.db.admin_get_ip_range(id).await?;
+    let assignment_count = this
+        .db
+        .admin_count_ip_range_assignments(id)
+        .await
+        .unwrap_or(0);
 
     // Get region name
-    let region_name = match db.get_host_region(ip_range.region_id).await {
+    let region_name = match this.db.get_host_region(ip_range.region_id).await {
         Ok(region) => Some(region.name),
         Err(_) => None,
     };
 
     // Get access policy name if set
     let access_policy_name = if let Some(policy_id) = ip_range.access_policy_id {
-        match db.get_access_policy(policy_id).await {
+        match this.db.get_access_policy(policy_id).await {
             Ok(policy) => Some(policy.name),
             Err(_) => None,
         }
@@ -98,11 +125,10 @@ pub async fn admin_get_ip_range(
 }
 
 /// Create a new IP range
-#[post("/api/admin/v1/ip_ranges", data = "<req>")]
-pub async fn admin_create_ip_range(
+async fn admin_create_ip_range(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    req: Json<CreateIpRangeRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<CreateIpRangeRequest>,
 ) -> ApiResult<AdminIpRangeInfo> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::Create)?;
@@ -126,13 +152,13 @@ pub async fn admin_create_ip_range(
     }
 
     // Validate region exists
-    if let Err(_) = db.get_host_region(req.region_id).await {
+    if let Err(_) = this.db.get_host_region(req.region_id).await {
         return ApiData::err("Specified region does not exist");
     }
 
     // Validate access policy if provided
     if let Some(policy_id) = req.access_policy_id {
-        if let Err(_) = db.get_access_policy(policy_id).await {
+        if let Err(_) = this.db.get_access_policy(policy_id).await {
             return ApiData::err("Specified access policy does not exist");
         }
     }
@@ -140,20 +166,20 @@ pub async fn admin_create_ip_range(
     // Create IP range object
     let ip_range = req.to_ip_range()?;
 
-    let ip_range_id = db.admin_create_ip_range(&ip_range).await?;
+    let ip_range_id = this.db.admin_create_ip_range(&ip_range).await?;
 
     // Fetch the created IP range to return
-    let created_ip_range = db.admin_get_ip_range(ip_range_id).await?;
+    let created_ip_range = this.db.admin_get_ip_range(ip_range_id).await?;
 
     // Get region name
-    let region_name = match db.get_host_region(created_ip_range.region_id).await {
+    let region_name = match this.db.get_host_region(created_ip_range.region_id).await {
         Ok(region) => Some(region.name),
         Err(_) => None,
     };
 
     // Get access policy name if set
     let access_policy_name = if let Some(policy_id) = created_ip_range.access_policy_id {
-        match db.get_access_policy(policy_id).await {
+        match this.db.get_access_policy(policy_id).await {
             Ok(policy) => Some(policy.name),
             Err(_) => None,
         }
@@ -170,17 +196,16 @@ pub async fn admin_create_ip_range(
 }
 
 /// Update IP range information
-#[patch("/api/admin/v1/ip_ranges/<id>", data = "<req>")]
-pub async fn admin_update_ip_range(
+async fn admin_update_ip_range(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    req: Json<UpdateIpRangeRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<UpdateIpRangeRequest>,
 ) -> ApiResult<AdminIpRangeInfo> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::Update)?;
 
-    let mut ip_range = db.admin_get_ip_range(id).await?;
+    let mut ip_range = this.db.admin_get_ip_range(id).await?;
 
     // Update IP range fields if provided
     if let Some(cidr) = &req.cidr {
@@ -211,7 +236,7 @@ pub async fn admin_update_ip_range(
 
     if let Some(region_id) = req.region_id {
         // Validate region exists
-        if let Err(_) = db.get_host_region(region_id).await {
+        if let Err(_) = this.db.get_host_region(region_id).await {
             return ApiData::err("Specified region does not exist");
         }
         ip_range.region_id = region_id;
@@ -227,7 +252,7 @@ pub async fn admin_update_ip_range(
     if let Some(access_policy_id) = &req.access_policy_id {
         if let Some(policy_id) = access_policy_id {
             // Validate access policy exists
-            if let Err(_) = db.get_access_policy(*policy_id).await {
+            if let Err(_) = this.db.get_access_policy(*policy_id).await {
                 return ApiData::err("Specified access policy does not exist");
             }
         }
@@ -248,20 +273,24 @@ pub async fn admin_update_ip_range(
     }
 
     // Update IP range in database
-    db.admin_update_ip_range(&ip_range).await?;
+    this.db.admin_update_ip_range(&ip_range).await?;
 
     // Return updated IP range
-    let assignment_count = db.admin_count_ip_range_assignments(id).await.unwrap_or(0);
+    let assignment_count = this
+        .db
+        .admin_count_ip_range_assignments(id)
+        .await
+        .unwrap_or(0);
 
     // Get region name
-    let region_name = match db.get_host_region(ip_range.region_id).await {
+    let region_name = match this.db.get_host_region(ip_range.region_id).await {
         Ok(region) => Some(region.name),
         Err(_) => None,
     };
 
     // Get access policy name if set
     let access_policy_name = if let Some(policy_id) = ip_range.access_policy_id {
-        match db.get_access_policy(policy_id).await {
+        match this.db.get_access_policy(policy_id).await {
             Ok(policy) => Some(policy.name),
             Err(_) => None,
         }
@@ -278,17 +307,16 @@ pub async fn admin_update_ip_range(
 }
 
 /// Delete an IP range
-#[delete("/api/admin/v1/ip_ranges/<id>")]
-pub async fn admin_delete_ip_range(
+async fn admin_delete_ip_range(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<()> {
     // Check permission
     auth.require_permission(AdminResource::IpRange, AdminAction::Delete)?;
 
     // This will fail if there are active IP assignments in the range
-    db.admin_delete_ip_range(id).await?;
+    this.db.admin_delete_ip_range(id).await?;
 
     ApiData::ok(())
 }

@@ -27,10 +27,10 @@ pub async fn run_data_migrations(
     settings: &Settings,
 ) -> Result<()> {
     let mut migrations: Vec<Box<dyn DataMigration>> = vec![];
-    
+
     // Add encryption migration first (should run before other migrations)
     migrations.push(Box::new(EncryptionDataMigration::new(db.clone())));
-    
+
     migrations.push(Box::new(Ip6InitDataMigration::new(
         db.clone(),
         lnvps.clone(),

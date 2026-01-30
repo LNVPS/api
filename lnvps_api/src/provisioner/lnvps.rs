@@ -1,27 +1,30 @@
 use crate::dns::{BasicRecord, DnsServer};
-use crate::host::{get_host_client, FullVmInfo};
+use crate::host::{FullVmInfo, get_host_client};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
+use lnvps_api_common::ExchangeRateService;
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
-use lnvps_api_common::{ExchangeRateService};
-use lnvps_db::{AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate};
+use lnvps_db::{
+    AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod,
+    PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate,
+};
 use log::{debug, info, warn};
+use payments_rs::currency::{Currency, CurrencyAmount};
+use payments_rs::fiat::FiatPaymentService;
+use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use payments_rs::currency::{Currency, CurrencyAmount};
-use payments_rs::fiat::FiatPaymentService;
-use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
 
 /// Main provisioner class for LNVPS
 ///
@@ -226,7 +229,11 @@ impl LNVpsProvisioner {
     }
 
     /// Delete ip assignment
-    pub async fn delete_ip_assignment(&self, ip: &mut VmIpAssignment, range: &IpRange) -> Result<()> {
+    pub async fn delete_ip_assignment(
+        &self,
+        ip: &mut VmIpAssignment,
+        range: &IpRange,
+    ) -> Result<()> {
         if let Some(ap) = range.access_policy_id {
             let ap = self.db.get_access_policy(ap).await?;
             // remove access policy
@@ -247,7 +254,8 @@ impl LNVpsProvisioner {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
         // Validate provided IP format and range
-        let provided_ip = assignment.ip
+        let provided_ip = assignment
+            .ip
             .trim()
             .parse::<IpAddr>()
             .context("Invalid IP address format")?;
@@ -271,7 +279,11 @@ impl LNVpsProvisioner {
     }
 
     /// Update access policy and dns
-    pub async fn update_ip_assignment_policy(&self, assignment: &mut VmIpAssignment, range: &IpRange) -> Result<()> {
+    pub async fn update_ip_assignment_policy(
+        &self,
+        assignment: &mut VmIpAssignment,
+        range: &IpRange,
+    ) -> Result<()> {
         if let Some(ap) = range.access_policy_id {
             let ap = self.db.get_access_policy(ap).await?;
             // apply access policy
@@ -517,18 +529,19 @@ impl LNVpsProvisioner {
         Ok(new_vm)
     }
 
-
     #[cfg(feature = "nostr-nwc")]
     /// Attempt automatic renewal via Nostr Wallet Connect
-    pub async fn auto_renew_via_nwc(&self, vm_id: u64, nwc_connection_string: &str) -> Result<VmPayment> {
+    pub async fn auto_renew_via_nwc(
+        &self,
+        vm_id: u64,
+        nwc_connection_string: &str,
+    ) -> Result<VmPayment> {
         use nostr_sdk::prelude::*;
 
         debug!("Attempting automatic renewal for VM {} via NWC", vm_id);
 
         // Use existing renew method to create the payment/invoice
-        let vm_payment = self
-            .renew(vm_id, PaymentMethod::Lightning)
-            .await?;
+        let vm_payment = self.renew(vm_id, PaymentMethod::Lightning).await?;
 
         // Extract the invoice from external_data
         let invoice: String = vm_payment.external_data.clone().into();
@@ -556,7 +569,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         let price = pe.get_vm_cost(vm_id, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -574,7 +587,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -678,7 +691,9 @@ impl LNVpsProvisioner {
                         }
                     }
                     PaymentMethod::Paypal => todo!(),
-                    PaymentMethod::Stripe => todo!("Stripe payment integration not yet implemented"),
+                    PaymentMethod::Stripe => {
+                        todo!("Stripe payment integration not yet implemented")
+                    }
                 };
 
                 self.db.insert_vm_payment(&vm_payment).await?;
@@ -760,7 +775,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         pe.calculate_upgrade_cost(vm_id, cfg, method).await
     }
 
@@ -810,7 +825,7 @@ impl LNVpsProvisioner {
             PaymentType::Upgrade,
             Some(upgrade_params_json),
         )
-            .await
+        .await
     }
 
     /// Create a new custom template using a vm's existing standard template

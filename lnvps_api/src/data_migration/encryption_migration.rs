@@ -37,35 +37,45 @@ impl DataMigration for EncryptionDataMigration {
             let mut total_encrypted = 0;
 
             // Migrate user email addresses using raw SQL to avoid EncryptedString decode issues
-            let email_rows = db.fetch_raw_strings("SELECT id, email FROM users WHERE email IS NOT NULL AND email != ''").await?;
+            let email_rows = db
+                .fetch_raw_strings(
+                    "SELECT id, email FROM users WHERE email IS NOT NULL AND email != ''",
+                )
+                .await?;
             for (user_id, email) in email_rows {
                 if !EncryptionContext::is_encrypted(&email) {
                     info!("Encrypting email for user {}", user_id);
                     let encrypted_email = encryption_context.encrypt(&email)?;
                     db.execute_query_with_string_params(
                         "UPDATE users SET email = ? WHERE id = ?",
-                        vec![encrypted_email, user_id.to_string()]
-                    ).await?;
+                        vec![encrypted_email, user_id.to_string()],
+                    )
+                    .await?;
                     total_encrypted += 1;
                 }
             }
 
             // Migrate VM host API tokens using raw SQL
-            let token_rows = db.fetch_raw_strings("SELECT id, api_token FROM vm_host WHERE api_token != ''").await?;
+            let token_rows = db
+                .fetch_raw_strings("SELECT id, api_token FROM vm_host WHERE api_token != ''")
+                .await?;
             for (host_id, token) in token_rows {
                 if !EncryptionContext::is_encrypted(&token) {
                     info!("Encrypting API token for host {}", host_id);
                     let encrypted_token = encryption_context.encrypt(&token)?;
                     db.execute_query_with_string_params(
                         "UPDATE vm_host SET api_token = ? WHERE id = ?",
-                        vec![encrypted_token, host_id.to_string()]
-                    ).await?;
+                        vec![encrypted_token, host_id.to_string()],
+                    )
+                    .await?;
                     total_encrypted += 1;
                 }
             }
 
             // Migrate user SSH keys using raw SQL
-            let ssh_key_rows = db.fetch_raw_strings("SELECT id, key_data FROM user_ssh_key WHERE key_data != ''").await?;
+            let ssh_key_rows = db
+                .fetch_raw_strings("SELECT id, key_data FROM user_ssh_key WHERE key_data != ''")
+                .await?;
             let mut ssh_keys_encrypted = 0;
             for (ssh_key_id, key_data) in ssh_key_rows {
                 if !EncryptionContext::is_encrypted(&key_data) {
@@ -73,14 +83,17 @@ impl DataMigration for EncryptionDataMigration {
                     let encrypted_key_data = encryption_context.encrypt(&key_data)?;
                     db.execute_query_with_string_params(
                         "UPDATE user_ssh_key SET key_data = ? WHERE id = ?",
-                        vec![encrypted_key_data, ssh_key_id.to_string()]
-                    ).await?;
+                        vec![encrypted_key_data, ssh_key_id.to_string()],
+                    )
+                    .await?;
                     ssh_keys_encrypted += 1;
                 }
             }
 
             // Migrate router tokens using raw SQL
-            let router_rows = db.fetch_raw_strings("SELECT id, token FROM router WHERE token != ''").await?;
+            let router_rows = db
+                .fetch_raw_strings("SELECT id, token FROM router WHERE token != ''")
+                .await?;
             let mut routers_encrypted = 0;
             for (router_id, token) in router_rows {
                 if !EncryptionContext::is_encrypted(&token) {
@@ -88,8 +101,9 @@ impl DataMigration for EncryptionDataMigration {
                     let encrypted_token = encryption_context.encrypt(&token)?;
                     db.execute_query_with_string_params(
                         "UPDATE router SET token = ? WHERE id = ?",
-                        vec![encrypted_token, router_id.to_string()]
-                    ).await?;
+                        vec![encrypted_token, router_id.to_string()],
+                    )
+                    .await?;
                     routers_encrypted += 1;
                 }
             }

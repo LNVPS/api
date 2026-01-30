@@ -21,7 +21,9 @@ default = [
     "bitvora",
     "tokio/sync",
     "tokio/io-util",
+    "payments-rs/tls-ring"
 ]
+openapi = ["dep:openapi-build-gen"]
 mikrotik = ["dep:reqwest"]
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
@@ -30,13 +32,12 @@ nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
-bitvora = ["payments-rs/method-bitvora", "payments-rs/rocket"]
+bitvora = ["payments-rs/method-bitvora"]
 cloudflare = ["dep:reqwest"]
-revolut = ["payments-rs/method-revolut", "payments-rs/rocket"]
+revolut = ["payments-rs/method-revolut"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
-lnvps_common = { path = "../lnvps_common" }
 lnvps_api_common = { path = "../lnvps_api_common" }
 anyhow.workspace = true
 log.workspace = true
@@ -45,26 +46,26 @@ tokio.workspace = true
 config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rocket.workspace = true
+axum.workspace = true
+tower-http.workspace = true
 hex.workspace = true
+async-trait.workspace = true
 payments-rs.workspace = true
-chrono = { version = "0.4.38", features = ["serde"] }
-base64 = { version = "0.22.1", features = ["alloc"] }
-urlencoding = "2.1.3"
 ipnetwork.workspace = true
-rand = "0.9.0"
-clap = { version = "4.5.21", features = ["derive"] }
-ssh-key = "0.6.7"
-lettre = { version = "0.11.10", features = ["tokio1-native-tls"] }
-ws = { package = "rocket_ws", version = "0.1.1" }
-native-tls = "0.2.12"
-lnurl-rs = { version = "0.9.0", default-features = false }
-mustache = "0.9.0"
+futures.workspace = true
 
-futures = "0.3.31"
-isocountry = "0.3.2"
-hickory-resolver = "0.25.2"
-humantime = "2.2.0"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = { version = "0.22", features = ["alloc"] }
+urlencoding = "2.1"
+rand = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+ssh-key = "0.6"
+lettre = { version = "0.11", features = ["tokio1-native-tls"] }
+lnurl-rs = { version = "0.9", default-features = false }
+mustache = "0.9"
+isocountry = "0.3"
+hickory-resolver = "0.25"
+humantime = "2.2"
 
 #nostr-dm
 nostr-sdk = { version = "0.44", optional = true, default-features = false }
@@ -73,16 +74,19 @@ nostr-sdk = { version = "0.44", optional = true, default-features = false }
 nwc = { version = "0.44", optional = true }
 
 #proxmox
-tokio-tungstenite = { version = "^0.21", features = ["native-tls"], optional = true }
-ssh2 = { version = "0.9.4", optional = true }
-reqwest = { version = "0.12.8", features = ["json"], optional = true }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
+ssh2 = { version = "0.9", optional = true }
+reqwest = { version = "0.13", features = ["json"], optional = true }
 
 #libvirt
 virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
 #virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}/
-uuid = { version = "1.16.0", features = ["v4", "serde"], optional = true }
-quick-xml = { version = "0.37.3", features = ["serde", "serialize"], optional = true }
+uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
+quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
 lightning-invoice = "0.34"
 bitcoin = "0.32"
+
+[build-dependencies]
+openapi-build-gen = { git = "https://github.com/v0l/openapi-build-gen.git", rev = "b4c946ca891d22c5ab16ce13f17b1bf81c91587c", optional = true }

@@ -1,8 +1,5 @@
-use crate::{
-    ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate,
-    UpgradeConfig,
-};
-use anyhow::{anyhow, bail, ensure, Result};
+use crate::{ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate, UpgradeConfig};
+use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
@@ -10,11 +7,11 @@ use lnvps_db::{
     DiskInterface, DiskType, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomTemplate, VmPayment,
 };
+use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
-use payments_rs::currency::{Currency, CurrencyAmount};
 
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
@@ -398,11 +395,9 @@ impl PricingEngine {
     }
 
     /// Get remaining time and pro-rated cost information for a VM
-    pub async fn get_remaining_time_info(
-        &self,
-        vm_id: u64,
-    ) -> Result<RemainingTimeInfo> {
-        self.get_remaining_time_info_from_date(vm_id, Utc::now()).await
+    pub async fn get_remaining_time_info(&self, vm_id: u64) -> Result<RemainingTimeInfo> {
+        self.get_remaining_time_info_from_date(vm_id, Utc::now())
+            .await
     }
 
     /// Get remaining time and pro-rated cost information for a VM from a specific date
@@ -414,7 +409,10 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
 
         ensure!(!vm.deleted, "Can't calculate for deleted VM");
-        ensure!(vm.expires > from_date, "Can't calculate for expired VM from the specified date");
+        ensure!(
+            vm.expires > from_date,
+            "Can't calculate for expired VM from the specified date"
+        );
 
         // Get current VM pricing information
         let (current_cost, current_time_value) = if let Some(tid) = vm.template_id {
@@ -449,7 +447,8 @@ impl PricingEngine {
         let seconds_remaining = (vm.expires - from_date).num_seconds();
         let cost_per_second = current_cost.value() as f64 / current_time_value as f64;
         let prorated_amount = seconds_remaining as f64 * cost_per_second;
-        let prorated_cost = CurrencyAmount::from_u64(current_cost.currency(), prorated_amount as u64);
+        let prorated_cost =
+            CurrencyAmount::from_u64(current_cost.currency(), prorated_amount as u64);
 
         Ok(RemainingTimeInfo {
             seconds_remaining,
@@ -467,10 +466,13 @@ impl PricingEngine {
         method: PaymentMethod,
         from_date: DateTime<Utc>,
     ) -> Result<ConvertedCurrencyAmount> {
-        let remaining_info = self.get_remaining_time_info_from_date(vm_id, from_date).await?;
-        
+        let remaining_info = self
+            .get_remaining_time_info_from_date(vm_id, from_date)
+            .await?;
+
         // Convert to the requested payment method currency
-        self.get_amount_and_rate(remaining_info.prorated_cost, method).await
+        self.get_amount_and_rate(remaining_info.prorated_cost, method)
+            .await
     }
 
     /// Calculate both the upgrade cost and new renewal cost for a VM

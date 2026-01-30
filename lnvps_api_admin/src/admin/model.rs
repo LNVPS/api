@@ -134,10 +134,16 @@ pub enum AdminUserRole {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebSocketMessage {
-    Connected { message: String },
+    Connected {
+        message: String,
+    },
     Pong,
-    Error { error: String },
-    JobFeedback { feedback: lnvps_api_common::JobFeedback },
+    Error {
+        error: String,
+    },
+    JobFeedback {
+        feedback: lnvps_api_common::JobFeedback,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1978,4 +1984,3 @@ impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
         }
     }
 }
-

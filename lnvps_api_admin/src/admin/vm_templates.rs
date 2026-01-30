@@ -2,12 +2,28 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateVmTemplateRequest, AdminUpdateVmTemplateRequest, AdminVmTemplateInfo,
 };
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::Utc;
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmTemplate};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
 use std::sync::Arc;
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/vm_templates",
+            get(admin_list_vm_templates).post(admin_create_vm_template),
+        )
+        .route(
+            "/api/admin/v1/vm_templates/{id}",
+            get(admin_get_vm_template)
+                .patch(admin_update_vm_template)
+                .delete(admin_delete_vm_template),
+        )
+}
 
 impl AdminVmTemplateInfo {
     pub async fn from_vm_template(
@@ -45,25 +61,24 @@ impl AdminVmTemplateInfo {
 }
 
 /// List VM templates
-#[get("/api/admin/v1/vm_templates?<limit>&<offset>")]
-pub async fn admin_list_vm_templates(
+async fn admin_list_vm_templates(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(params): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminVmTemplateInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmTemplate, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
 
-    let (templates, total) = db
+    let (templates, total) = this
+        .db
         .list_vm_templates_paginated(limit as i64, offset as i64)
         .await?;
     let mut template_infos = Vec::new();
     for template in templates {
-        match AdminVmTemplateInfo::from_vm_template(db, &template).await {
+        match AdminVmTemplateInfo::from_vm_template(&this.db, &template).await {
             Ok(info) => template_infos.push(info),
             Err(_) => continue,
         }
@@ -73,39 +88,35 @@ pub async fn admin_list_vm_templates(
 }
 
 /// Get VM template details
-#[get("/api/admin/v1/vm_templates/<id>")]
-pub async fn admin_get_vm_template(
+async fn admin_get_vm_template(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminVmTemplateInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmTemplate, AdminAction::View)?;
 
-    let template = db.get_vm_template(id).await?;
-    let info = AdminVmTemplateInfo::from_vm_template(db, &template).await?;
+    let template = this.db.get_vm_template(id).await?;
+    let info = AdminVmTemplateInfo::from_vm_template(&this.db, &template).await?;
     ApiData::ok(info)
 }
 
 /// Create VM template
-#[post("/api/admin/v1/vm_templates", data = "<request>")]
-pub async fn admin_create_vm_template(
+async fn admin_create_vm_template(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    request: Json<AdminCreateVmTemplateRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminCreateVmTemplateRequest>,
 ) -> ApiResult<AdminVmTemplateInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Create)?;
 
-    let req = request.into_inner();
-
     // Validate that region exists
-    let _region = db.get_host_region(req.region_id).await?;
+    let _region = this.db.get_host_region(req.region_id).await?;
 
     // Handle cost plan creation or validation
     let cost_plan_id = if let Some(existing_cost_plan_id) = req.cost_plan_id {
         // Validate that the provided cost plan exists
-        let _cost_plan = db.get_cost_plan(existing_cost_plan_id).await?;
+        let _cost_plan = this.db.get_cost_plan(existing_cost_plan_id).await?;
         existing_cost_plan_id
     } else {
         // Auto-create a new cost plan for this template
@@ -140,7 +151,7 @@ pub async fn admin_create_vm_template(
             interval_type: cost_plan_interval_type.into(),
         };
 
-        db.insert_cost_plan(&new_cost_plan).await?
+        this.db.insert_cost_plan(&new_cost_plan).await?
     };
 
     let template = VmTemplate {
@@ -158,27 +169,24 @@ pub async fn admin_create_vm_template(
         region_id: req.region_id,
     };
 
-    let template_id = db.insert_vm_template(&template).await?;
-    let created_template = db.get_vm_template(template_id).await?;
-    let info = AdminVmTemplateInfo::from_vm_template(db, &created_template).await?;
+    let template_id = this.db.insert_vm_template(&template).await?;
+    let created_template = this.db.get_vm_template(template_id).await?;
+    let info = AdminVmTemplateInfo::from_vm_template(&this.db, &created_template).await?;
     ApiData::ok(info)
 }
 
 /// Update VM template
-#[patch("/api/admin/v1/vm_templates/<id>", data = "<request>")]
-pub async fn admin_update_vm_template(
+async fn admin_update_vm_template(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    request: Json<AdminUpdateVmTemplateRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminUpdateVmTemplateRequest>,
 ) -> ApiResult<AdminVmTemplateInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Update)?;
 
-    let req = request.into_inner();
-
     // Get existing template
-    let mut template = db.get_vm_template(id).await?;
+    let mut template = this.db.get_vm_template(id).await?;
 
     // Update fields if provided
     if let Some(name) = req.name {
@@ -207,7 +215,7 @@ pub async fn admin_update_vm_template(
     }
     if let Some(cost_plan_id) = req.cost_plan_id {
         // Validate that cost plan exists
-        let _cost_plan = db.get_cost_plan(cost_plan_id).await?;
+        let _cost_plan = this.db.get_cost_plan(cost_plan_id).await?;
         template.cost_plan_id = cost_plan_id;
     }
 
@@ -220,7 +228,7 @@ pub async fn admin_update_vm_template(
 
     if has_cost_plan_updates {
         // Get the current cost plan for this template
-        let mut cost_plan = db.get_cost_plan(template.cost_plan_id).await?;
+        let mut cost_plan = this.db.get_cost_plan(template.cost_plan_id).await?;
 
         // Update cost plan fields if provided
         if let Some(cost_plan_name) = req.cost_plan_name {
@@ -252,34 +260,33 @@ pub async fn admin_update_vm_template(
         }
 
         // Update the cost plan
-        db.update_cost_plan(&cost_plan).await?;
+        this.db.update_cost_plan(&cost_plan).await?;
     }
     if let Some(region_id) = req.region_id {
         // Validate that region exists
-        let _region = db.get_host_region(region_id).await?;
+        let _region = this.db.get_host_region(region_id).await?;
         template.region_id = region_id;
     }
 
-    db.update_vm_template(&template).await?;
-    let info = AdminVmTemplateInfo::from_vm_template(db, &template).await?;
+    this.db.update_vm_template(&template).await?;
+    let info = AdminVmTemplateInfo::from_vm_template(&this.db, &template).await?;
     ApiData::ok(info)
 }
 
 /// Delete VM template
-#[delete("/api/admin/v1/vm_templates/<id>")]
-pub async fn admin_delete_vm_template(
+async fn admin_delete_vm_template(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<serde_json::Value> {
     // Check permission
     auth.require_permission(AdminResource::VmTemplate, AdminAction::Delete)?;
 
     // Check if template exists
-    let template = db.get_vm_template(id).await?;
+    let template = this.db.get_vm_template(id).await?;
 
     // Check if template is being used by any VMs
-    let vm_count = db.check_vm_template_usage(id).await?;
+    let vm_count = this.db.check_vm_template_usage(id).await?;
     if vm_count > 0 {
         return Err(anyhow::anyhow!(
             "Cannot delete VM template: {} VMs are using this template",
@@ -289,18 +296,18 @@ pub async fn admin_delete_vm_template(
     }
 
     // Check if the cost plan is used by other templates
-    let all_templates = db.list_vm_templates().await?;
+    let all_templates = this.db.list_vm_templates().await?;
     let cost_plan_usage_count = all_templates
         .iter()
         .filter(|t| t.cost_plan_id == template.cost_plan_id && t.id != id)
         .count();
 
     // Delete the template first
-    db.delete_vm_template(id).await?;
+    this.db.delete_vm_template(id).await?;
 
     // If this was the only template using the cost plan, delete the cost plan too
     if cost_plan_usage_count == 0 {
-        match db.delete_cost_plan(template.cost_plan_id).await {
+        match this.db.delete_cost_plan(template.cost_plan_id).await {
             Ok(_) => ApiData::ok(serde_json::json!({
                 "success": true,
                 "message": "VM template and associated cost plan deleted successfully"

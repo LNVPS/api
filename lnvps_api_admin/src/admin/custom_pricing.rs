@@ -1,16 +1,45 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCustomPricingDisk, AdminCustomPricingInfo, CopyCustomPricingRequest,
     CreateCustomPricingRequest, UpdateCustomPricingRequest,
 };
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCustomPricing, VmCustomPricingDisk};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
+use serde::Deserialize;
 use std::sync::Arc;
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/custom_pricing",
+            get(admin_list_custom_pricing).post(admin_create_custom_pricing),
+        )
+        .route(
+            "/api/admin/v1/custom_pricing/{id}",
+            get(admin_get_custom_pricing)
+                .patch(admin_update_custom_pricing)
+                .delete(admin_delete_custom_pricing),
+        )
+        .route(
+            "/api/admin/v1/custom_pricing/{id}/copy",
+            post(admin_copy_custom_pricing),
+        )
+}
+
+#[derive(Deserialize)]
+struct CustomPricingQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
+    region_id: Option<u64>,
+    enabled: Option<bool>,
+}
 
 impl AdminCustomPricingInfo {
     pub async fn from_custom_pricing(
@@ -63,26 +92,23 @@ impl AdminCustomPricingInfo {
 }
 
 /// List custom pricing models
-#[get("/api/admin/v1/custom_pricing?<limit>&<offset>&<region_id>&<enabled>")]
-pub async fn admin_list_custom_pricing(
+async fn admin_list_custom_pricing(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    region_id: Option<u64>,
-    enabled: Option<bool>,
+    State(this): State<RouterState>,
+    Query(params): Query<CustomPricingQuery>,
 ) -> ApiPaginatedResult<AdminCustomPricingInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
 
     // For now, get all and filter manually - ideally this would be done in the database
-    let all_regions = if let Some(region_id) = region_id {
+    let all_regions = if let Some(region_id) = params.region_id {
         vec![region_id]
     } else {
-        db.list_host_region()
+        this.db
+            .list_host_region()
             .await?
             .into_iter()
             .map(|r| r.id)
@@ -91,12 +117,12 @@ pub async fn admin_list_custom_pricing(
 
     let mut all_pricing = Vec::new();
     for region in all_regions {
-        let region_pricing = db.list_custom_pricing(region).await?;
+        let region_pricing = this.db.list_custom_pricing(region).await?;
         all_pricing.extend(region_pricing);
     }
 
     // Apply enabled filter if provided
-    if let Some(enabled_filter) = enabled {
+    if let Some(enabled_filter) = params.enabled {
         all_pricing.retain(|p| p.enabled == enabled_filter);
     }
 
@@ -111,7 +137,7 @@ pub async fn admin_list_custom_pricing(
 
     let mut pricing_infos = Vec::new();
     for pricing in paginated_pricing {
-        match AdminCustomPricingInfo::from_custom_pricing(db, &pricing).await {
+        match AdminCustomPricingInfo::from_custom_pricing(&this.db, &pricing).await {
             Ok(info) => pricing_infos.push(info),
             Err(_) => continue,
         }
@@ -121,34 +147,30 @@ pub async fn admin_list_custom_pricing(
 }
 
 /// Get custom pricing model details
-#[get("/api/admin/v1/custom_pricing/<id>")]
-pub async fn admin_get_custom_pricing(
+async fn admin_get_custom_pricing(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminCustomPricingInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::View)?;
 
-    let pricing = db.get_custom_pricing(id).await?;
-    let info = AdminCustomPricingInfo::from_custom_pricing(db, &pricing).await?;
+    let pricing = this.db.get_custom_pricing(id).await?;
+    let info = AdminCustomPricingInfo::from_custom_pricing(&this.db, &pricing).await?;
     ApiData::ok(info)
 }
 
 /// Create custom pricing model
-#[post("/api/admin/v1/custom_pricing", data = "<request>")]
-pub async fn admin_create_custom_pricing(
+async fn admin_create_custom_pricing(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    request: Json<CreateCustomPricingRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<CreateCustomPricingRequest>,
 ) -> ApiResult<AdminCustomPricingInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::Create)?;
 
-    let req = request.into_inner();
-
     // Validate that region exists
-    let _region = db.get_host_region(req.region_id).await?;
+    let _region = this.db.get_host_region(req.region_id).await?;
 
     let pricing = VmCustomPricing {
         id: 0, // Will be set by database
@@ -168,7 +190,7 @@ pub async fn admin_create_custom_pricing(
         max_memory: req.max_memory,
     };
 
-    let pricing_id = db.insert_custom_pricing(&pricing).await?;
+    let pricing_id = this.db.insert_custom_pricing(&pricing).await?;
 
     // Insert disk pricing configurations
     for disk_config in req.disk_pricing {
@@ -185,29 +207,26 @@ pub async fn admin_create_custom_pricing(
             max_disk_size: disk_config.max_disk_size,
         };
 
-        db.insert_custom_pricing_disk(&disk_pricing).await?;
+        this.db.insert_custom_pricing_disk(&disk_pricing).await?;
     }
 
-    let created_pricing = db.get_custom_pricing(pricing_id).await?;
-    let info = AdminCustomPricingInfo::from_custom_pricing(db, &created_pricing).await?;
+    let created_pricing = this.db.get_custom_pricing(pricing_id).await?;
+    let info = AdminCustomPricingInfo::from_custom_pricing(&this.db, &created_pricing).await?;
     ApiData::ok(info)
 }
 
 /// Update custom pricing model
-#[patch("/api/admin/v1/custom_pricing/<id>", data = "<request>")]
-pub async fn admin_update_custom_pricing(
+async fn admin_update_custom_pricing(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    request: Json<UpdateCustomPricingRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<UpdateCustomPricingRequest>,
 ) -> ApiResult<AdminCustomPricingInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::Update)?;
 
-    let req = request.into_inner();
-
     // Get existing pricing
-    let mut pricing = db.get_custom_pricing(id).await?;
+    let mut pricing = this.db.get_custom_pricing(id).await?;
 
     // Update fields if provided
     if let Some(name) = req.name {
@@ -221,7 +240,7 @@ pub async fn admin_update_custom_pricing(
     }
     if let Some(region_id) = req.region_id {
         // Validate that region exists
-        let _region = db.get_host_region(region_id).await?;
+        let _region = this.db.get_host_region(region_id).await?;
         pricing.region_id = region_id;
     }
     if let Some(currency) = req.currency {
@@ -252,12 +271,12 @@ pub async fn admin_update_custom_pricing(
         pricing.max_memory = max_memory;
     }
 
-    db.update_custom_pricing(&pricing).await?;
+    this.db.update_custom_pricing(&pricing).await?;
 
     // Update disk pricing if provided
     if let Some(disk_pricing_configs) = req.disk_pricing {
         // Delete existing disk pricing configurations
-        db.delete_custom_pricing_disks(id).await?;
+        this.db.delete_custom_pricing_disks(id).await?;
 
         // Insert new configurations
         for disk_config in disk_pricing_configs {
@@ -274,33 +293,32 @@ pub async fn admin_update_custom_pricing(
                 max_disk_size: disk_config.max_disk_size,
             };
 
-            db.insert_custom_pricing_disk(&disk_pricing).await?;
+            this.db.insert_custom_pricing_disk(&disk_pricing).await?;
         }
     }
 
-    let info = AdminCustomPricingInfo::from_custom_pricing(db, &pricing).await?;
+    let info = AdminCustomPricingInfo::from_custom_pricing(&this.db, &pricing).await?;
     ApiData::ok(info)
 }
 
 /// Delete custom pricing model
-#[delete("/api/admin/v1/custom_pricing/<id>")]
-pub async fn admin_delete_custom_pricing(
+async fn admin_delete_custom_pricing(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<serde_json::Value> {
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::Delete)?;
 
     // Check if pricing model exists
-    let mut pricing = db.get_custom_pricing(id).await?;
+    let mut pricing = this.db.get_custom_pricing(id).await?;
 
     // Check if pricing model is being used by any custom templates
-    let template_count = db.count_custom_templates_by_pricing(id).await?;
+    let template_count = this.db.count_custom_templates_by_pricing(id).await?;
     if template_count > 0 {
         // Instead of deleting, disable the pricing model to preserve billing consistency
         pricing.enabled = false;
-        db.update_custom_pricing(&pricing).await?;
+        this.db.update_custom_pricing(&pricing).await?;
 
         return ApiData::ok(serde_json::json!({
             "success": true,
@@ -309,10 +327,10 @@ pub async fn admin_delete_custom_pricing(
     }
 
     // Delete disk pricing configurations first
-    db.delete_custom_pricing_disks(id).await?;
+    this.db.delete_custom_pricing_disks(id).await?;
 
     // Delete the pricing model
-    db.delete_custom_pricing(id).await?;
+    this.db.delete_custom_pricing(id).await?;
 
     ApiData::ok(serde_json::json!({
         "success": true,
@@ -321,26 +339,23 @@ pub async fn admin_delete_custom_pricing(
 }
 
 /// Copy custom pricing model
-#[post("/api/admin/v1/custom_pricing/<id>/copy", data = "<request>")]
-pub async fn admin_copy_custom_pricing(
+async fn admin_copy_custom_pricing(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    request: Json<CopyCustomPricingRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<CopyCustomPricingRequest>,
 ) -> ApiResult<AdminCustomPricingInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::Create)?;
 
-    let req = request.into_inner();
-
     // Get source pricing model
-    let source_pricing = db.get_custom_pricing(id).await?;
-    let source_disk_pricing = db.list_custom_pricing_disk(id).await?;
+    let source_pricing = this.db.get_custom_pricing(id).await?;
+    let source_disk_pricing = this.db.list_custom_pricing_disk(id).await?;
 
     let target_region_id = req.region_id.unwrap_or(source_pricing.region_id);
 
     // Validate that target region exists
-    let _region = db.get_host_region(target_region_id).await?;
+    let _region = this.db.get_host_region(target_region_id).await?;
 
     // Create new pricing model
     let new_pricing = VmCustomPricing {
@@ -361,7 +376,7 @@ pub async fn admin_copy_custom_pricing(
         max_memory: source_pricing.max_memory,
     };
 
-    let new_pricing_id = db.insert_custom_pricing(&new_pricing).await?;
+    let new_pricing_id = this.db.insert_custom_pricing(&new_pricing).await?;
 
     // Copy disk pricing configurations
     for disk_config in source_disk_pricing {
@@ -375,10 +390,12 @@ pub async fn admin_copy_custom_pricing(
             max_disk_size: disk_config.max_disk_size,
         };
 
-        db.insert_custom_pricing_disk(&new_disk_pricing).await?;
+        this.db
+            .insert_custom_pricing_disk(&new_disk_pricing)
+            .await?;
     }
 
-    let created_pricing = db.get_custom_pricing(new_pricing_id).await?;
-    let info = AdminCustomPricingInfo::from_custom_pricing(db, &created_pricing).await?;
+    let created_pricing = this.db.get_custom_pricing(new_pricing_id).await?;
+    let info = AdminCustomPricingInfo::from_custom_pricing(&this.db, &created_pricing).await?;
     ApiData::ok(info)
 }

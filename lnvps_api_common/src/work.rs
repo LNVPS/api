@@ -1,16 +1,17 @@
 use crate::model::UpgradeConfig;
 use anyhow::{Result, bail};
 use chrono::Utc;
+use futures::{Stream, StreamExt};
 use redis::aio::MultiplexedConnection;
 use redis::{
     AsyncCommands, FromRedisValue, Value,
     streams::{StreamReadOptions, StreamReadReply},
 };
-use rocket::futures::{Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WorkJob {
@@ -384,5 +385,21 @@ impl WorkCommander {
         reason: Option<String>,
     ) -> JobFeedback {
         JobFeedback::new(job_id, job_type, JobFeedbackStatus::Cancelled { reason })
+    }
+}
+
+#[derive(Clone)]
+pub struct WorkSender {
+    sender: UnboundedSender<WorkJob>,
+}
+
+impl WorkSender {
+    pub fn new(sender: UnboundedSender<WorkJob>) -> Self {
+        Self { sender }
+    }
+
+    pub fn send(&self, job: WorkJob) -> Result<()> {
+        self.sender.send(job)?;
+        Ok(())
     }
 }

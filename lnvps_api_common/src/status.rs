@@ -1,7 +1,7 @@
 use anyhow::Result;
 use redis::AsyncCommands;
 use redis::aio::MultiplexedConnection;
-use rocket::serde::Deserialize;
+use serde::Deserialize;
 
 use serde::Serialize;
 use std::collections::HashMap;

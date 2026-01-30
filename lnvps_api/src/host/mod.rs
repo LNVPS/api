@@ -1,10 +1,11 @@
 use crate::settings::ProvisionerConfig;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
+use async_trait::async_trait;
 use futures::future::join_all;
 use lnvps_api_common::VmRunningState;
 use lnvps_db::{
-    async_trait, IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk,
-    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
+    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind,
+    VmIpAssignment, VmOsImage, VmTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

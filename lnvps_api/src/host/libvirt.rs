@@ -1,14 +1,14 @@
+use crate::KB;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
 };
 use crate::settings::QemuConfig;
-use crate::KB;
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use lnvps_api_common::VmRunningState;
 use lnvps_api_common::VmRunningStates;
-use lnvps_db::{async_trait, LNVpsDb, Vm, VmOsImage};
+use lnvps_db::{LNVpsDb, Vm, VmOsImage, async_trait};
 use log::info;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::sys::{
-    virDomainCreate, VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE, VIR_DOMAIN_START_VALIDATE,
+    VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE, VIR_DOMAIN_START_VALIDATE, virDomainCreate,
 };
 
 #[derive(Debug)]

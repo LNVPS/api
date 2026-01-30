@@ -1,24 +1,28 @@
 use anyhow::Error;
 use clap::Parser;
 use config::{Config, File};
-use lnvps_api::api;
+use lnvps_api::ExchangeRateService;
 use lnvps_api::data_migration::run_data_migrations;
 use lnvps_api::dvm::start_dvms;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
 use lnvps_api::worker::Worker;
-use lnvps_api::ExchangeRateService;
-use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::{InMemoryRateCache, RedisExchangeRateService, VmStateCache, WorkJob};
-use lnvps_common::CORS;
+use lnvps_api_common::{VmHistoryLogger, WorkSender};
+
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
 use log::{error, info};
 use nostr_sdk::{Client, Keys};
-use rocket::http::Method;
+
+use axum::Router;
+use lnvps_api::api::*;
+use payments_rs::lightning::setup_crypto_provider;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -32,9 +36,10 @@ struct Args {
     log: Option<PathBuf>,
 }
 
-#[rocket::main]
+#[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
+    setup_crypto_provider();
 
     let args = Args::parse();
 
@@ -79,9 +84,12 @@ async fn main() -> Result<(), Error> {
             Ok(redis_service) => {
                 info!("Using Redis exchange rate service");
                 Arc::new(redis_service)
-            },
+            }
             Err(e) => {
-                error!("Failed to initialize Redis exchange rate service: {}, falling back to in-memory cache", e);
+                error!(
+                    "Failed to initialize Redis exchange rate service: {}, falling back to in-memory cache",
+                    e
+                );
                 Arc::new(InMemoryRateCache::default())
             }
         }
@@ -109,7 +117,8 @@ async fn main() -> Result<(), Error> {
         &settings,
         status.clone(),
         nostr_client.clone(),
-    ).await?;
+    )
+    .await?;
 
     worker.spawn_check_loop();
     let sender = worker.sender();
@@ -163,38 +172,56 @@ async fn main() -> Result<(), Error> {
     // request for host info to be patched
     sender.send(WorkJob::PatchHosts)?;
 
-    let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
         None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000),
     };
-    config.address = ip.ip();
-    config.port = ip.port();
+    let listener = TcpListener::bind(ip).await?;
+    info!("Listening on {}", ip);
+    let work_sender = WorkSender::new(sender);
+    let mut router = Router::new()
+        .merge(main_router())
+        .merge(contacts_router())
+        .merge(webhook_router())
+        .merge(subscriptions_router());
 
-    if let Err(e) = rocket::Rocket::custom(config)
-        .manage(db.clone())
-        .manage(provisioner.clone())
-        .manage(status.clone())
-        .manage(exchange.clone())
-        .manage(settings.clone())
-        .manage(vm_history.clone())
-        .manage(sender)
-        .mount("/", api::routes())
-        .attach(CORS)
-        .mount(
-            "/",
-            vec![rocket::Route::ranked(
-                isize::MAX,
-                Method::Options,
-                "/<catch_all_options_route..>",
-                CORS,
-            )],
-        )
-        .launch()
-        .await
+    #[cfg(feature = "openapi")]
     {
-        error!("{:?}", e);
-    }
+        mod openapi {
+            include!(concat!(env!("OUT_DIR"), "/openapi.rs"));
+        }
 
+        router = router
+            .route(
+                "/openapi.json",
+                get(|| {
+                    use axum::http::header::CONTENT_TYPE;
+                    ([(CONTENT_TYPE, "application/json")], openapi::OPENAPI_JSON)
+                }),
+            )
+            .route(
+                "/swagger",
+                get(async move || Html(include_str!("../api/swagger.html"))),
+            );
+    }
+    #[cfg(feature = "nostr-domain")]
+    {
+        router = router.merge(nostr_domain_router());
+    }
+    axum::serve(
+        listener,
+        router
+            .layer(CorsLayer::permissive())
+            .with_state(RouterState {
+                db,
+                state: status,
+                provisioner,
+                history: vm_history,
+                settings,
+                rates: exchange,
+                work_sender,
+            }),
+    )
+    .await?;
     Ok(())
 }

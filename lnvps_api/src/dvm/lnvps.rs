@@ -1,16 +1,16 @@
-use crate::dvm::{build_status_for_job, DVMHandler, DVMJobRequest};
+use crate::dvm::{DVMHandler, DVMJobRequest, build_status_for_job};
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Context;
 use lnvps_db::{
     DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
 };
+use nostr_sdk::prelude::DataVendingMachineStatus;
 use nostr_sdk::{Client, Tag};
 use ssh_key::PublicKey;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use nostr_sdk::prelude::DataVendingMachineStatus;
 
 pub struct LnvpsDvm {
     client: Client,

@@ -6,11 +6,11 @@ use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use async_trait::async_trait;
 use chrono::Utc;
-use futures::StreamExt;
 use ipnetwork::IpNetwork;
 use lnvps_api_common::{VmRunningState, VmRunningStates};
-use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage, async_trait};
+use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
 use reqwest::{Method, Url};
@@ -1152,7 +1152,7 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream> {
-        let vm_id: ProxmoxVmId = vm.id.into();
+        let _vm_id: ProxmoxVmId = vm.id.into();
 
         let (client_tx, client_rx) = channel::<Vec<u8>>(1024);
         let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);

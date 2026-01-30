@@ -1,5 +1,6 @@
-use rocket::serde::json::Json;
-use rocket::Responder;
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
@@ -12,7 +13,7 @@ pub struct ApiData<T: Serialize> {
 
 impl<T: Serialize> ApiData<T> {
     pub fn ok(data: T) -> ApiResult<T> {
-        Ok(Json::from(ApiData { data }))
+        Ok(Json(ApiData { data }))
     }
 
     pub fn err(msg: &str) -> ApiResult<T> {
@@ -30,7 +31,7 @@ pub struct ApiPaginatedData<T: Serialize> {
 
 impl<T: Serialize> ApiPaginatedData<T> {
     pub fn ok(data: Vec<T>, total: u64, limit: u64, offset: u64) -> ApiPaginatedResult<T> {
-        Ok(Json::from(ApiPaginatedData {
+        Ok(Json(ApiPaginatedData {
             data,
             total,
             limit,
@@ -43,16 +44,27 @@ impl<T: Serialize> ApiPaginatedData<T> {
     }
 }
 
-#[derive(Responder)]
-#[response(status = 500)]
+#[derive(Serialize)]
 pub struct ApiError {
-    pub error: String,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn new(message: impl ToString) -> Self {
+        Self {
+            message: message.to_string(),
+        }
+    }
 }
 
 impl<T: ToString> From<T> for ApiError {
     fn from(value: T) -> Self {
-        Self {
-            error: value.to_string(),
-        }
+        Self::new(value.to_string())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(self.message)).into_response()
     }
 }

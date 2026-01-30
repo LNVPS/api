@@ -410,14 +410,62 @@ async fn create_host_disks(db: &LNVpsDbMysql, hosts: &[VmHost]) -> Result<Vec<Vm
 
 async fn create_os_images(db: &LNVpsDbMysql) -> Result<Vec<VmOsImage>> {
     let images_data = vec![
-        (OsDistribution::Ubuntu, "server", "22.04", years_ago(3) + Duration::days(111), "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"),
-        (OsDistribution::Ubuntu, "server", "24.04", months_ago(4), "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"),
-        (OsDistribution::Ubuntu, "server", "24.10", months_ago(2), "https://cloud-images.ubuntu.com/oracular/current/oracular-server-cloudimg-amd64.img"),
-        (OsDistribution::Debian, "standard", "12", months_ago(14), "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"),
-        (OsDistribution::Debian, "standard", "13", months_ago(7), "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"),
-        (OsDistribution::CentOS, "stream", "9", years_ago(2) + Duration::days(334), "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"),
-        (OsDistribution::ArchLinux, "base", "2024.01", months_ago(7), "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"),
-        (OsDistribution::ArchLinux, "base", "2025.08", days_ago(14), "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"),
+        (
+            OsDistribution::Ubuntu,
+            "server",
+            "22.04",
+            years_ago(3) + Duration::days(111),
+            "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img",
+        ),
+        (
+            OsDistribution::Ubuntu,
+            "server",
+            "24.04",
+            months_ago(4),
+            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+        ),
+        (
+            OsDistribution::Ubuntu,
+            "server",
+            "24.10",
+            months_ago(2),
+            "https://cloud-images.ubuntu.com/oracular/current/oracular-server-cloudimg-amd64.img",
+        ),
+        (
+            OsDistribution::Debian,
+            "standard",
+            "12",
+            months_ago(14),
+            "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2",
+        ),
+        (
+            OsDistribution::Debian,
+            "standard",
+            "13",
+            months_ago(7),
+            "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
+        ),
+        (
+            OsDistribution::CentOS,
+            "stream",
+            "9",
+            years_ago(2) + Duration::days(334),
+            "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
+        ),
+        (
+            OsDistribution::ArchLinux,
+            "base",
+            "2024.01",
+            months_ago(7),
+            "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2",
+        ),
+        (
+            OsDistribution::ArchLinux,
+            "base",
+            "2025.08",
+            days_ago(14),
+            "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2",
+        ),
     ];
 
     let mut os_images = Vec::new();

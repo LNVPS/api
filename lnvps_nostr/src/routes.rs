@@ -1,15 +1,24 @@
+use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::response::Html;
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_db::nostr::LNVPSNostrDb;
 use log::info;
-use rocket::http::ContentType;
-use rocket::request::{FromRequest, Outcome};
-use rocket::serde::json::Json;
-use rocket::{Request, Route, State, routes};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub fn routes() -> Vec<Route> {
-    routes![get_index, nostr_address]
+#[derive(Clone)]
+struct RouterState {
+    db: Arc<dyn LNVPSNostrDb>,
+}
+
+pub fn routes(db: Arc<dyn LNVPSNostrDb>) -> Router {
+    Router::new()
+        .route("/", get(async || Html(include_str!("../index.html"))))
+        .route("/.well-known/nostr.json", get(nostr_address))
+        .with_state(RouterState { db })
 }
 
 #[derive(Serialize)]
@@ -18,42 +27,30 @@ struct NostrJson {
     pub relays: HashMap<String, Vec<String>>,
 }
 
-struct HostInfo<'r> {
-    pub host: Option<&'r str>,
+#[derive(Deserialize)]
+struct NostrAddressQuery {
+    name: Option<String>,
 }
 
-#[rocket::async_trait]
-impl<'r> FromRequest<'r> for HostInfo<'r> {
-    type Error = ();
-
-    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        Outcome::Success(HostInfo {
-            host: request.host().map(|h| h.domain().as_str()),
-        })
-    }
-}
-
-#[rocket::get("/", format = "html")]
-fn get_index() -> (ContentType, &'static str) {
-    const HTML: &str = include_str!("../index.html");
-    (ContentType::HTML, HTML)
-}
-
-#[rocket::get("/.well-known/nostr.json?<name>")]
 async fn nostr_address(
-    host: HostInfo<'_>,
-    db: &State<Arc<dyn LNVPSNostrDb>>,
-    name: Option<&str>,
+    State(this): State<RouterState>,
+    headers: HeaderMap,
+    Query(q): Query<NostrAddressQuery>,
 ) -> Result<Json<NostrJson>, &'static str> {
-    let name = name.unwrap_or("_");
-    let host = host.host.unwrap_or("lnvps.net");
+    let name = q.name.unwrap_or("_".to_string());
+    let host = headers
+        .get("host")
+        .and_then(|s| s.to_str().ok())
+        .unwrap_or("lnvps.net");
     info!("Got request for {} on host {}", name, host);
-    let domain = db
+    let domain = this
+        .db
         .get_domain_by_name(host)
         .await
         .map_err(|_| "Domain not found")?;
-    let handle = db
-        .get_handle_by_name(domain.id, name)
+    let handle = this
+        .db
+        .get_handle_by_name(domain.id, &name)
         .await
         .map_err(|_| "Handle not found")?;
 

@@ -1,6 +1,6 @@
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
+use async_trait::async_trait;
 use lnvps_db::{Vm, VmIpAssignment};
-use rocket::async_trait;
 
 /// Router defines a network device used to access the hosts
 ///

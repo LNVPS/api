@@ -8,12 +8,12 @@ use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
 
+use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use payments_rs::currency::{Currency, CurrencyAmount};
 
 #[derive(Serialize, Deserialize)]
 pub struct ApiCustomVmOrder {
@@ -36,8 +36,10 @@ impl ApiTemplatesResponse {
         let rates = rates.list_rates().await?;
 
         for template in &mut self.templates {
-            let list_price =
-                CurrencyAmount::from_f32(template.cost_plan.currency.into(), template.cost_plan.amount);
+            let list_price = CurrencyAmount::from_f32(
+                template.cost_plan.currency.into(),
+                template.cost_plan.amount,
+            );
             for alt_price in alt_prices(&rates, list_price) {
                 template.cost_plan.other_price.push(ApiPrice {
                     currency: alt_price.currency().into(),
@@ -228,7 +230,9 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
                     }
                     let data: StripeData =
                         serde_json::from_str(&value.external_data.as_str()).unwrap();
-                    ApiPaymentData::Stripe { session_id: data.session_id }
+                    ApiPaymentData::Stripe {
+                        session_id: data.session_id,
+                    }
                 }
             },
         }
@@ -572,4 +576,3 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
         }
     }
 }
-

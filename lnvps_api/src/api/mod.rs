@@ -1,5 +1,3 @@
-use rocket::Route;
-
 mod contact;
 mod model;
 #[cfg(feature = "nostr-domain")]
@@ -8,12 +6,47 @@ mod routes;
 mod subscriptions;
 mod webhook;
 
-pub fn routes() -> Vec<Route> {
-    let mut r = routes::routes();
-    r.append(&mut webhook::routes());
-    r.append(&mut subscriptions::routes());
-    r.append(&mut contact::routes());
-    #[cfg(feature = "nostr-domain")]
-    r.append(&mut nostr_domain::routes());
-    r
+#[derive(Deserialize)]
+pub(crate) struct PageQuery {
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
+
+#[derive(Deserialize)]
+pub(crate) struct PaymentMethodQuery {
+    pub method: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AmountQuery {
+    pub amount: u64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AuthQuery {
+    pub auth: String,
+}
+
+#[derive(Clone)]
+pub struct RouterState {
+    pub db: Arc<dyn LNVpsDb>,
+    pub state: VmStateCache,
+    pub provisioner: Arc<LNVpsProvisioner>,
+    pub history: Arc<VmHistoryLogger>,
+    pub settings: Settings,
+    pub rates: Arc<dyn ExchangeRateService>,
+    pub work_sender: WorkSender,
+}
+
+use crate::provisioner::LNVpsProvisioner;
+use crate::settings::Settings;
+pub use contact::router as contacts_router;
+use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkSender};
+use lnvps_db::LNVpsDb;
+#[cfg(feature = "nostr-domain")]
+pub use nostr_domain::router as nostr_domain_router;
+pub use routes::routes as main_router;
+use serde::Deserialize;
+use std::sync::Arc;
+pub use subscriptions::router as subscriptions_router;
+pub use webhook::router as webhook_router;

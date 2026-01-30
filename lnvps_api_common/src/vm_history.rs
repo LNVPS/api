@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use lnvps_db::{LNVpsDb, Vm, VmHistory, VmHistoryActionType};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn serialize_json_to_bytes(value: Option<Value>) -> Option<Vec<u8>> {

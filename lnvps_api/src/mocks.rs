@@ -5,6 +5,7 @@ use crate::host::{
 };
 use crate::router::{ArpEntry, Router};
 use anyhow::{Context, anyhow, bail, ensure};
+use bitcoin::hashes::Hash;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::Stream;
 use hex::ToHex;
@@ -30,7 +31,6 @@ use std::ops::Add;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use bitcoin::hashes::Hash;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]

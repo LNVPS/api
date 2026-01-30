@@ -1,12 +1,12 @@
 use anyhow::bail;
-use base64::prelude::BASE64_STANDARD;
+use axum::{
+    extract::FromRequestParts,
+    http::{StatusCode, Uri, request::Parts},
+};
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use log::debug;
 use nostr::{Event, JsonUtil, Kind, Timestamp};
-use rocket::http::uri::{Absolute, Uri};
-use rocket::http::Status;
-use rocket::request::{FromRequest, Outcome};
-use rocket::{async_trait, Request};
 
 pub struct Nip98Auth {
     pub event: Event,
@@ -36,8 +36,9 @@ impl Nip98Auth {
                 None
             }
         }) {
-            if let Ok(u_req) = Uri::parse::<Absolute>(&url) {
-                if path != u_req.absolute().unwrap().path() {
+            // Simple path comparison - extract path from URL
+            if let Ok(parsed_uri) = url.parse::<Uri>() {
+                if path != parsed_uri.path() {
                     bail!("U tag does not match");
                 }
             } else {
@@ -84,25 +85,44 @@ impl Nip98Auth {
     }
 }
 
-#[async_trait]
-impl<'r> FromRequest<'r> for Nip98Auth {
-    type Error = String;
+impl<S> FromRequestParts<S> for Nip98Auth
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
 
-    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        if let Some(auth) = request.headers().get_one("authorization") {
-            if !auth.starts_with("Nostr ") {
-                return Outcome::Error((Status::new(403), "Auth scheme must be Nostr".to_string()));
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        Box::pin(async {
+            let auth_header = parts
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .ok_or((StatusCode::FORBIDDEN, "Auth header not found".to_string()))?;
+
+            if !auth_header.starts_with("Nostr ") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Auth scheme must be Nostr".to_string(),
+                ));
             }
-            let auth = Nip98Auth::from_base64(&auth[6..]).unwrap();
-            match auth.check(
-                request.uri().path().to_string().as_str(),
-                request.method().as_str(),
-            ) {
-                Ok(_) => Outcome::Success(auth),
-                Err(e) => Outcome::Error((Status::new(401), e.to_string())),
-            }
-        } else {
-            Outcome::Error((Status::new(403), "Auth header not found".to_string()))
-        }
+
+            let auth = Nip98Auth::from_base64(&auth_header[6..])
+                .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid auth: {}", e)))?;
+
+            let path = parts.uri.path();
+            let method = parts.method.as_str();
+
+            auth.check(path, method).map_err(|e| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    format!("Auth check failed: {}", e),
+                )
+            })?;
+
+            Ok(auth)
+        })
     }
 }

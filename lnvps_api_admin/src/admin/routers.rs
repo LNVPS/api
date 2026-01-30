@@ -2,32 +2,46 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminRouterDetail, AdminRouterKind, CreateRouterRequest, UpdateRouterRequest,
 };
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
-use std::sync::Arc;
+use lnvps_db::{AdminAction, AdminResource};
 
-#[get("/api/admin/v1/routers?<limit>&<offset>")]
-pub async fn admin_list_routers(
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/routers",
+            get(admin_list_routers).post(admin_create_router),
+        )
+        .route(
+            "/api/admin/v1/routers/{id}",
+            get(admin_get_router)
+                .patch(admin_update_router)
+                .delete(admin_delete_router),
+        )
+}
+
+async fn admin_list_routers(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(params): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
 
-    let (routers, total) = db.admin_list_routers_paginated(limit, offset).await?;
+    let (routers, total) = this.db.admin_list_routers_paginated(limit, offset).await?;
 
     // Convert to admin models and populate access policy counts
     let mut admin_routers = Vec::new();
     for router in routers {
         let mut admin_router = AdminRouterDetail::from(router.clone());
-        admin_router.access_policy_count = db
+        admin_router.access_policy_count = this
+            .db
             .admin_count_router_access_policies(router.id)
             .await
             .unwrap_or(0);
@@ -37,19 +51,19 @@ pub async fn admin_list_routers(
     ApiPaginatedData::ok(admin_routers, total, limit, offset)
 }
 
-#[get("/api/admin/v1/routers/<router_id>")]
-pub async fn admin_get_router(
+async fn admin_get_router(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    router_id: u64,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
 ) -> ApiResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::View)?;
 
-    let router = db.admin_get_router(router_id).await?;
+    let router = this.db.admin_get_router(router_id).await?;
 
     let mut admin_router = AdminRouterDetail::from(router.clone());
-    admin_router.access_policy_count = db
+    admin_router.access_policy_count = this
+        .db
         .admin_count_router_access_policies(router.id)
         .await
         .unwrap_or(0);
@@ -57,38 +71,36 @@ pub async fn admin_get_router(
     ApiData::ok(admin_router)
 }
 
-#[post("/api/admin/v1/routers", data = "<request>")]
-pub async fn admin_create_router(
+async fn admin_create_router(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    request: Json<CreateRouterRequest>,
+    State(this): State<RouterState>,
+    Json(request): Json<CreateRouterRequest>,
 ) -> ApiResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::Create)?;
 
     let router = request.to_router()?;
 
-    let router_id = db.admin_create_router(&router).await?;
+    let router_id = this.db.admin_create_router(&router).await?;
 
-    let created_router = db.admin_get_router(router_id).await?;
+    let created_router = this.db.admin_get_router(router_id).await?;
 
     let admin_router = AdminRouterDetail::from(created_router);
 
     ApiData::ok(admin_router)
 }
 
-#[patch("/api/admin/v1/routers/<router_id>", data = "<request>")]
-pub async fn admin_update_router(
+async fn admin_update_router(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    router_id: u64,
-    request: Json<UpdateRouterRequest>,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+    Json(request): Json<UpdateRouterRequest>,
 ) -> ApiResult<AdminRouterDetail> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::Update)?;
 
     // Fetch the existing router
-    let mut router = db.admin_get_router(router_id).await?;
+    let mut router = this.db.admin_get_router(router_id).await?;
 
     // Update fields that are provided
     if let Some(name) = &request.name {
@@ -110,12 +122,13 @@ pub async fn admin_update_router(
         router.token = token.as_str().into();
     }
 
-    db.admin_update_router(&router).await?;
+    this.db.admin_update_router(&router).await?;
 
-    let updated_router = db.admin_get_router(router_id).await?;
+    let updated_router = this.db.admin_get_router(router_id).await?;
 
     let mut admin_router = AdminRouterDetail::from(updated_router.clone());
-    admin_router.access_policy_count = db
+    admin_router.access_policy_count = this
+        .db
         .admin_count_router_access_policies(updated_router.id)
         .await
         .unwrap_or(0);
@@ -123,16 +136,15 @@ pub async fn admin_update_router(
     ApiData::ok(admin_router)
 }
 
-#[delete("/api/admin/v1/routers/<router_id>")]
-pub async fn admin_delete_router(
+async fn admin_delete_router(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    router_id: u64,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
 ) -> ApiResult<()> {
     // Check permission
     auth.require_permission(AdminResource::Router, AdminAction::Delete)?;
 
-    db.admin_delete_router(router_id).await?;
+    this.db.admin_delete_router(router_id).await?;
 
     ApiData::ok(())
 }

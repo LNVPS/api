@@ -1,15 +1,52 @@
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminCreateVmRequest, AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse};
+use crate::admin::model::{
+    AdminCreateVmRequest, AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo,
+    AdminVmPaymentInfo, JobResponse,
+};
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, ExchangeRateService, PricingEngine, VmHistoryLogger, VmRunningState,
-    VmStateCache, WorkCommander, WorkJob,
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PricingEngine, VmHistoryLogger,
+    VmRunningState, VmStateCache, WorkJob,
 };
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
+use lnvps_db::{AdminAction, AdminResource};
 use log::{error, info};
-use rocket::{delete, get, post, put, State};
 use serde::Deserialize;
-use std::sync::Arc;
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/vms",
+            get(admin_list_vms).post(admin_create_vm),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}",
+            get(admin_get_vm).delete(admin_delete_vm),
+        )
+        .route("/api/admin/v1/vms/{id}/start", post(admin_start_vm))
+        .route("/api/admin/v1/vms/{id}/stop", post(admin_stop_vm))
+        .route("/api/admin/v1/vms/{id}/extend", put(admin_extend_vm))
+        .route("/api/admin/v1/vms/{id}/history", get(admin_list_vm_history))
+        .route(
+            "/api/admin/v1/vms/{id}/history/{history_id}",
+            get(admin_get_vm_history),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}/payments",
+            get(admin_list_vm_payments),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}/payments/{payment_id}",
+            get(admin_get_vm_payment),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}/refund",
+            get(admin_calculate_vm_refund).post(admin_process_vm_refund),
+        )
+}
 
 async fn get_vm_state(vm_state_cache: &VmStateCache, vm_id: u64) -> Option<VmRunningState> {
     #[cfg(feature = "demo")]
@@ -34,49 +71,51 @@ async fn get_vm_state(vm_state_cache: &VmStateCache, vm_id: u64) -> Option<VmRun
     vm_running_state
 }
 
-/// List all VMs with pagination and filtering
-#[get(
-    "/api/admin/v1/vms?<limit>&<offset>&<user_id>&<host_id>&<pubkey>&<region_id>&<include_deleted>"
-)]
-pub async fn admin_list_vms(
-    auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    vm_state_cache: &State<VmStateCache>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+#[derive(Deserialize)]
+struct ListVmsQuery {
+    #[serde(flatten)]
+    page: PageQuery,
     user_id: Option<u64>,
     host_id: Option<u64>,
     pubkey: Option<String>,
     region_id: Option<u64>,
     include_deleted: Option<bool>,
+}
+
+/// List all VMs with pagination and filtering
+async fn admin_list_vms(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(query): Query<ListVmsQuery>,
 ) -> ApiPaginatedResult<AdminVmInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
-    let offset = offset.unwrap_or(0);
+    let limit = query.page.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let offset = query.page.offset.unwrap_or(0);
 
     // Use the new filtered database method
-    let (vms, total) = db
+    let (vms, total) = this
+        .db
         .admin_list_vms_filtered(
             limit,
             offset,
-            user_id,
-            host_id,
-            pubkey.as_deref(), // Convert Option<String> to Option<&str>
-            region_id,
-            include_deleted,
+            query.user_id,
+            query.host_id,
+            query.pubkey.as_deref(), // Convert Option<String> to Option<&str>
+            query.region_id,
+            query.include_deleted,
         )
         .await?;
 
     // Load all hosts and regions upfront to avoid N+1 queries
-    let hosts = db.list_hosts().await?;
+    let hosts = this.db.list_hosts().await?;
     let mut host_map = std::collections::HashMap::new();
     for host in hosts {
         host_map.insert(host.id, host);
     }
 
-    let regions = db.list_host_region().await?;
+    let regions = this.db.list_host_region().await?;
     let mut region_map = std::collections::HashMap::new();
     for region in regions {
         region_map.insert(region.id, region);
@@ -85,22 +124,28 @@ pub async fn admin_list_vms(
     let mut admin_vms = Vec::new();
     for vm in vms {
         // Get user info for this VM
-        let user = db.get_user(vm.user_id).await?;
+        let user = this.db.get_user(vm.user_id).await?;
 
         // Get host info from pre-loaded map
-        let host = host_map.get(&vm.host_id)
-            .ok_or_else(|| anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id))?;
+        let host = host_map.get(&vm.host_id).ok_or_else(|| {
+            anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id)
+        })?;
 
         // Get region info from pre-loaded map
-        let region = region_map.get(&host.region_id)
-            .ok_or_else(|| anyhow::anyhow!("Host {} references non-existent region {}", host.id, host.region_id))?;
+        let region = region_map.get(&host.region_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Host {} references non-existent region {}",
+                host.id,
+                host.region_id
+            )
+        })?;
 
         // Get VM running state from cache
-        let vm_running_state = get_vm_state(vm_state_cache, vm.id).await;
+        let vm_running_state = get_vm_state(&this.vm_state_cache, vm.id).await;
 
         // Build the AdminVmInfo with all data
         let admin_vm = AdminVmInfo::from_vm_with_admin_data(
-            db,
+            &this.db,
             &vm,
             vm_running_state,
             vm.host_id,
@@ -122,51 +167,56 @@ pub async fn admin_list_vms(
 }
 
 /// Get detailed information about a specific VM
-#[get("/api/admin/v1/vms/<id>")]
-pub async fn admin_get_vm(
+async fn admin_get_vm(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    vm_state_cache: &State<VmStateCache>,
-    id: u64,
+    State(this): State<RouterState>,
+    State(vm_state_cache): State<VmStateCache>,
+    Path(id): Path<u64>,
 ) -> ApiResult<AdminVmInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
 
-    let vm = db.get_vm(id).await?;
-    let user = db.get_user(vm.user_id).await?;
+    let vm = this.db.get_vm(id).await?;
+    let user = this.db.get_user(vm.user_id).await?;
 
     // Load all hosts and regions upfront for consistency
-    let hosts = db.list_hosts().await?;
+    let hosts = this.db.list_hosts().await?;
     let mut host_map = std::collections::HashMap::new();
     for host in hosts {
         host_map.insert(host.id, host);
     }
 
-    let regions = db.list_host_region().await?;
+    let regions = this.db.list_host_region().await?;
     let mut region_map = std::collections::HashMap::new();
     for region in regions {
         region_map.insert(region.id, region);
     }
 
     // Get host info from pre-loaded map
-    let host = host_map.get(&vm.host_id)
-        .ok_or_else(|| anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id))?;
-    
+    let host = host_map.get(&vm.host_id).ok_or_else(|| {
+        anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id)
+    })?;
+
     let host_name = host.name.clone();
 
     // Get region info from pre-loaded map
-    let region = region_map.get(&host.region_id)
-        .ok_or_else(|| anyhow::anyhow!("Host {} references non-existent region {}", host.id, host.region_id))?;
-    
+    let region = region_map.get(&host.region_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Host {} references non-existent region {}",
+            host.id,
+            host.region_id
+        )
+    })?;
+
     let region_id = region.id;
     let region_name = region.name.clone();
 
     // Get VM running state from cache
-    let vm_running_state = get_vm_state(vm_state_cache, vm.id).await;
+    let vm_running_state = get_vm_state(&vm_state_cache, vm.id).await;
 
     // Build the AdminVmInfo with all data
     let admin_vm = AdminVmInfo::from_vm_with_admin_data(
-        db,
+        &this.db,
         &vm,
         vm_running_state,
         vm.host_id,
@@ -185,25 +235,23 @@ pub async fn admin_get_vm(
 }
 
 /// Start a VM
-#[post("/api/admin/v1/vms/<id>/start")]
-pub async fn admin_start_vm(
+async fn admin_start_vm(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify VM exists
-    let vm = db.get_vm(id).await?;
+    let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
         return ApiData::err("Cannot start a deleted VM");
     }
 
     // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = work_commander.as_ref() {
+    if let Some(commander) = &this.work_commander {
         // Send start job via Redis stream for distributed processing
         let start_job = WorkJob::StartVm {
             vm_id: id,
@@ -228,25 +276,23 @@ pub async fn admin_start_vm(
 }
 
 /// Stop a VM
-#[post("/api/admin/v1/vms/<id>/stop")]
-pub async fn admin_stop_vm(
+async fn admin_stop_vm(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    id: u64,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
 ) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify VM exists
-    let vm = db.get_vm(id).await?;
+    let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
         return ApiData::err("Cannot stop a deleted VM");
     }
 
     // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = work_commander.as_ref() {
+    if let Some(commander) = &this.work_commander {
         // Send stop job via Redis stream for distributed processing
         let stop_job = WorkJob::StopVm {
             vm_id: id,
@@ -271,38 +317,36 @@ pub async fn admin_stop_vm(
 }
 
 #[derive(Deserialize)]
-pub struct AdminDeleteVmRequest {
-    pub reason: Option<String>,
+struct AdminDeleteVmRequest {
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct AdminExtendVmRequest {
-    pub days: u32,
-    pub reason: Option<String>,
+struct AdminExtendVmRequest {
+    days: u32,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct AdminProcessRefundRequest {
-    pub payment_method: Option<String>,
-    pub refund_from_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub reason: Option<String>,
-    pub lightning_invoice: Option<String>,
+struct AdminProcessRefundRequest {
+    payment_method: Option<String>,
+    refund_from_date: Option<DateTime<Utc>>,
+    reason: Option<String>,
+    lightning_invoice: Option<String>,
 }
 
 /// Delete a VM
-#[delete("/api/admin/v1/vms/<id>", data = "<req>")]
-pub async fn admin_delete_vm(
+async fn admin_delete_vm(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    id: u64,
-    req: Option<rocket::serde::json::Json<AdminDeleteVmRequest>>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    req: Option<Json<AdminDeleteVmRequest>>,
 ) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Delete)?;
 
     // Verify VM exists
-    let vm = db.get_vm(id).await?;
+    let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
         return ApiData::err("VM is already deleted");
@@ -312,7 +356,7 @@ pub async fn admin_delete_vm(
     let reason = req.and_then(|r| r.reason.clone());
 
     // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = work_commander.as_ref() {
+    if let Some(commander) = &this.work_commander {
         // Send delete job via Redis stream for distributed processing
         let delete_job = WorkJob::DeleteVm {
             vm_id: id,
@@ -338,18 +382,17 @@ pub async fn admin_delete_vm(
 }
 
 /// Extend a VM's expiration date
-#[put("/api/admin/v1/vms/<id>/extend", data = "<req>")]
-pub async fn admin_extend_vm(
+async fn admin_extend_vm(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    id: u64,
-    req: rocket::serde::json::Json<AdminExtendVmRequest>,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminExtendVmRequest>,
 ) -> ApiResult<()> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify VM exists
-    let mut vm = db.get_vm(id).await?;
+    let mut vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
         return ApiData::err("Cannot extend a deleted VM");
@@ -368,10 +411,10 @@ pub async fn admin_extend_vm(
 
     // Update VM expiration date in database
     vm.expires = new_expires;
-    db.update_vm(&vm).await?;
+    this.db.update_vm(&vm).await?;
 
     // Log the extension in VM history
-    let vm_history_logger = VmHistoryLogger::new(db.inner().clone());
+    let vm_history_logger = VmHistoryLogger::new(this.db.clone());
     let metadata = Some(serde_json::json!({
         "admin_user_id": auth.user_id,
         "admin_action": true
@@ -401,35 +444,36 @@ pub async fn admin_extend_vm(
 }
 
 /// List VM history with pagination
-#[get("/api/admin/v1/vms/<vm_id>/history?<limit>&<offset>")]
-pub async fn admin_list_vm_history(
+async fn admin_list_vm_history(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    vm_id: u64,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Path(vm_id): Path<u64>,
+    Query(page): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminVmHistoryInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
 
     // Verify VM exists
-    let _vm = db.get_vm(vm_id).await?;
+    let _vm = this.db.get_vm(vm_id).await?;
 
-    let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
-    let offset = offset.unwrap_or(0);
+    let limit = page.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let offset = page.offset.unwrap_or(0);
 
     // Get VM history with pagination
-    let history_entries = db.list_vm_history_paginated(vm_id, limit, offset).await?;
+    let history_entries = this
+        .db
+        .list_vm_history_paginated(vm_id, limit, offset)
+        .await?;
 
     // For total count, we'll get all history entries and count them
     // This is not ideal for large datasets, but works for now
-    let all_history = db.list_vm_history(vm_id).await?;
+    let all_history = this.db.list_vm_history(vm_id).await?;
     let total = all_history.len() as u64;
 
     let mut admin_history = Vec::new();
     for history in history_entries {
         let admin_history_info =
-            AdminVmHistoryInfo::from_vm_history_with_admin_data(db, &history).await?;
+            AdminVmHistoryInfo::from_vm_history_with_admin_data(&this.db, &history).await?;
         admin_history.push(admin_history_info);
     }
 
@@ -437,21 +481,19 @@ pub async fn admin_list_vm_history(
 }
 
 /// Get specific VM history entry
-#[get("/api/admin/v1/vms/<vm_id>/history/<history_id>")]
-pub async fn admin_get_vm_history(
+async fn admin_get_vm_history(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    vm_id: u64,
-    history_id: u64,
+    State(this): State<RouterState>,
+    Path((vm_id, history_id)): Path<(u64, u64)>,
 ) -> ApiResult<AdminVmHistoryInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
 
     // Verify VM exists
-    let _vm = db.get_vm(vm_id).await?;
+    let _vm = this.db.get_vm(vm_id).await?;
 
     // Get history entry
-    let history = db.get_vm_history(history_id).await?;
+    let history = this.db.get_vm_history(history_id).await?;
 
     // Verify history entry belongs to this VM
     if history.vm_id != vm_id {
@@ -459,35 +501,36 @@ pub async fn admin_get_vm_history(
     }
 
     let admin_history_info =
-        AdminVmHistoryInfo::from_vm_history_with_admin_data(db, &history).await?;
+        AdminVmHistoryInfo::from_vm_history_with_admin_data(&this.db, &history).await?;
 
     ApiData::ok(admin_history_info)
 }
 
 /// List VM payments with pagination
-#[get("/api/admin/v1/vms/<vm_id>/payments?<limit>&<offset>")]
-pub async fn admin_list_vm_payments(
+async fn admin_list_vm_payments(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    vm_id: u64,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Path(vm_id): Path<u64>,
+    Query(page): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminVmPaymentInfo> {
     // Check permission
     auth.require_permission(AdminResource::Payments, AdminAction::View)?;
 
     // Verify VM exists
-    let _vm = db.get_vm(vm_id).await?;
+    let _vm = this.db.get_vm(vm_id).await?;
 
-    let limit = limit.unwrap_or(50).min(100); // Max 100 items per page
-    let offset = offset.unwrap_or(0);
+    let limit = page.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let offset = page.offset.unwrap_or(0);
 
     // Get VM payments with pagination
-    let payments = db.list_vm_payment_paginated(vm_id, limit, offset).await?;
+    let payments = this
+        .db
+        .list_vm_payment_paginated(vm_id, limit, offset)
+        .await?;
 
     // For total count, we'll get all payments and count them
     // This is not ideal for large datasets, but works for now
-    let all_payments = db.list_vm_payment(vm_id).await?;
+    let all_payments = this.db.list_vm_payment(vm_id).await?;
     let total = all_payments.len() as u64;
 
     let admin_payments: Vec<AdminVmPaymentInfo> = payments
@@ -499,24 +542,22 @@ pub async fn admin_list_vm_payments(
 }
 
 /// Get specific VM payment
-#[get("/api/admin/v1/vms/<vm_id>/payments/<payment_id>")]
-pub async fn admin_get_vm_payment(
+async fn admin_get_vm_payment(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    vm_id: u64,
-    payment_id: String,
+    State(this): State<RouterState>,
+    Path((vm_id, payment_id)): Path<(u64, String)>,
 ) -> ApiResult<AdminVmPaymentInfo> {
     // Check permission
     auth.require_permission(AdminResource::Payments, AdminAction::View)?;
 
     // Verify VM exists
-    let _vm = db.get_vm(vm_id).await?;
+    let _vm = this.db.get_vm(vm_id).await?;
 
     // Decode payment ID from hex
     let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
 
     // Get payment
-    let payment = db.get_vm_payment(&payment_id_bytes).await?;
+    let payment = this.db.get_vm_payment(&payment_id_bytes).await?;
 
     // Verify payment belongs to this VM
     if payment.vm_id != vm_id {
@@ -528,24 +569,27 @@ pub async fn admin_get_vm_payment(
     ApiData::ok(admin_payment_info)
 }
 
+#[derive(Deserialize)]
+struct CalculateRefundQuery {
+    pub method: Option<String>,
+    pub from_date: Option<i64>,
+}
+
 /// Calculate pro-rated refund amount for a VM
-#[get("/api/admin/v1/vms/<vm_id>/refund?<method>&<from_date>")]
-pub async fn admin_calculate_vm_refund(
+async fn admin_calculate_vm_refund(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    exchange: &State<Arc<dyn ExchangeRateService>>,
-    vm_id: u64,
-    method: Option<String>,
-    from_date: Option<i64>,
+    State(this): State<RouterState>,
+    Path(vm_id): Path<u64>,
+    Query(query): Query<CalculateRefundQuery>,
 ) -> ApiResult<AdminRefundAmountInfo> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify VM exists
-    let vm = db.get_vm(vm_id).await?;
+    let vm = this.db.get_vm(vm_id).await?;
 
     // Parse payment method
-    let payment_method = match method.as_deref() {
+    let payment_method = match query.method.as_deref() {
         Some(method_str) => match method_str.parse::<lnvps_db::PaymentMethod>() {
             Ok(method) => method,
             Err(_) => return ApiData::err("Invalid payment method"),
@@ -554,7 +598,7 @@ pub async fn admin_calculate_vm_refund(
     };
 
     // Parse from_date parameter or use current time
-    let calculation_date = if let Some(timestamp) = from_date {
+    let calculation_date = if let Some(timestamp) = query.from_date {
         match DateTime::from_timestamp(timestamp, 0) {
             Some(parsed_date) => parsed_date,
             None => return ApiData::err("Invalid from_date timestamp"),
@@ -565,16 +609,14 @@ pub async fn admin_calculate_vm_refund(
 
     // Create pricing engine instance with real exchange rates
     let tax_rates = std::collections::HashMap::new();
-    
-    let pricing_engine = PricingEngine::new_for_vm(
-        db.inner().clone(),
-        exchange.inner().clone(),
-        tax_rates,
-        vm_id,
-    ).await?;
+
+    let pricing_engine =
+        PricingEngine::new_for_vm(this.db.clone(), this.exchange.clone(), tax_rates, vm_id).await?;
 
     // Calculate the refund amount from the specified date
-    let refund_result = pricing_engine.calculate_refund_amount_from_date(vm_id, payment_method, calculation_date).await?;
+    let refund_result = pricing_engine
+        .calculate_refund_amount_from_date(vm_id, payment_method, calculation_date)
+        .await?;
 
     let refund_info = AdminRefundAmountInfo {
         amount: refund_result.amount.value(),
@@ -588,25 +630,30 @@ pub async fn admin_calculate_vm_refund(
 }
 
 /// Process a refund for a VM automatically via work job
-#[post("/api/admin/v1/vms/<vm_id>/refund", data = "<req>")]
-pub async fn admin_process_vm_refund(
+async fn admin_process_vm_refund(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    vm_id: u64,
-    req: rocket::serde::json::Json<AdminProcessRefundRequest>,
+    State(this): State<RouterState>,
+    Path(vm_id): Path<u64>,
+    Json(req): Json<AdminProcessRefundRequest>,
 ) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify VM exists
-    let _vm = db.get_vm(vm_id).await?;
+    let _vm = this.db.get_vm(vm_id).await?;
 
     // Validate payment method
-    let payment_method = req.payment_method.clone().unwrap_or_else(|| "lightning".to_string());
+    let payment_method = req
+        .payment_method
+        .clone()
+        .unwrap_or_else(|| "lightning".to_string());
     match payment_method.as_str() {
-        "lightning" | "revolut" | "paypal" => {},
-        _ => return ApiData::err("Invalid payment method. Must be 'lightning', 'revolut', or 'paypal'"),
+        "lightning" | "revolut" | "paypal" => {}
+        _ => {
+            return ApiData::err(
+                "Invalid payment method. Must be 'lightning', 'revolut', or 'paypal'",
+            );
+        }
     }
 
     // For lightning payments, require invoice
@@ -616,11 +663,13 @@ pub async fn admin_process_vm_refund(
 
     // For non-lightning payments, ensure invoice is not provided
     if payment_method != "lightning" && req.lightning_invoice.is_some() {
-        return ApiData::err("Lightning invoice should only be provided when payment method is 'lightning'");
+        return ApiData::err(
+            "Lightning invoice should only be provided when payment method is 'lightning'",
+        );
     }
 
     // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = work_commander.as_ref() {
+    if let Some(commander) = &this.work_commander {
         // Send refund job via Redis stream for distributed processing
         let refund_job = WorkJob::ProcessVmRefund {
             vm_id,
@@ -649,34 +698,30 @@ pub async fn admin_process_vm_refund(
 }
 
 /// Create a VM for a specific user (admin action)
-#[post("/api/admin/v1/vms", data = "<req>")]
-pub async fn admin_create_vm(
+async fn admin_create_vm(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    work_commander: &State<Option<WorkCommander>>,
-    req: rocket::serde::json::Json<AdminCreateVmRequest>,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminCreateVmRequest>,
 ) -> ApiResult<JobResponse> {
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Create)?;
 
-    let req = req.into_inner();
-
     // Verify the target user exists
-    let _user = db.get_user(req.user_id).await?;
+    let _user = this.db.get_user(req.user_id).await?;
 
     // Verify template exists
-    let _template = db.get_vm_template(req.template_id).await?;
+    let _template = this.db.get_vm_template(req.template_id).await?;
 
-    // Verify image exists  
-    let _image = db.get_os_image(req.image_id).await?;
+    // Verify image exists
+    let _image = this.db.get_os_image(req.image_id).await?;
 
     // Verify SSH key exists and belongs to the user
-    let ssh_key = db.get_user_ssh_key(req.ssh_key_id).await?;
+    let ssh_key = this.db.get_user_ssh_key(req.ssh_key_id).await?;
     if ssh_key.user_id != req.user_id {
         return ApiData::err("SSH key does not belong to the specified user");
     }
 
     // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = work_commander.as_ref() {
+    if let Some(commander) = &this.work_commander {
         let create_job = WorkJob::CreateVm {
             user_id: req.user_id,
             template_id: req.template_id,
@@ -702,4 +747,3 @@ pub async fn admin_create_vm(
         ApiData::err("VM creation service is not available")
     }
 }
-

@@ -5,13 +5,12 @@ edition.workspace = true
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db", features = ["nostr-domain"] }
-lnvps_common = { path = "../lnvps_common" }
 env_logger.workspace = true
 log.workspace = true
 anyhow.workspace = true
-tokio.workspace = true
 serde.workspace = true
 config.workspace = true
-serde_json.workspace = true
-rocket.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
 hex.workspace = true

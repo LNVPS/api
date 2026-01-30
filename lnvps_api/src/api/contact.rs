@@ -1,24 +1,25 @@
-use lnvps_api_common::{ApiData, ApiResult, WorkJob};
-use rocket::serde::json::Json;
-use rocket::{Route, State, post, routes};
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
-use crate::settings::{CaptchaConfig, Settings};
+use crate::api::RouterState;
+use crate::settings::CaptchaConfig;
 use anyhow::Result;
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
+use lnvps_api_common::{ApiData, ApiResult, WorkJob};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct ContactFormRequest {
-    pub subject: String,
-    pub message: String,
-    pub email: String,
-    pub name: String,
-    pub user_pubkey: Option<String>,
-    pub timestamp: String,
-    pub turnstile_token: String,
+struct ContactFormRequest {
+    subject: String,
+    message: String,
+    email: String,
+    name: String,
+    user_pubkey: Option<String>,
+    timestamp: String,
+    turnstile_token: String,
 }
 
-pub fn routes() -> Vec<Route> {
-    routes![v1_submit_contact_form]
+pub fn router() -> Router<RouterState> {
+    Router::new().route("/api/v1/contact", post(v1_submit_contact_form))
 }
 
 /// Verify Cloudflare Turnstile token
@@ -49,14 +50,12 @@ async fn verify_turnstile(token: &str, secret_key: &str) -> Result<bool> {
 }
 
 /// Submit contact form
-/// 
+///
 /// This endpoint accepts contact form submissions and sends them to the admin.
 /// Requires a valid Cloudflare Turnstile token.
-#[post("/api/v1/contact", format = "json", data = "<req>")]
 async fn v1_submit_contact_form(
-    settings: &State<Settings>,
-    worker: &State<UnboundedSender<WorkJob>>,
-    req: Json<ContactFormRequest>,
+    State(state): State<RouterState>,
+    Json(req): Json<ContactFormRequest>,
 ) -> ApiResult<()> {
     // Validate required fields
     if req.subject.trim().is_empty() {
@@ -78,7 +77,7 @@ async fn v1_submit_contact_form(
     }
 
     // Verify Turnstile token
-    match &settings.captcha {
+    match &state.settings.captcha {
         Some(CaptchaConfig::Turnstile { secret_key }) => {
             match verify_turnstile(&req.turnstile_token, secret_key).await {
                 Ok(true) => {
@@ -124,7 +123,7 @@ async fn v1_submit_contact_form(
     );
 
     // Queue notification to all admins
-    if let Err(e) = worker.send(WorkJob::SendAdminNotification {
+    if let Err(e) = state.work_sender.send(WorkJob::SendAdminNotification {
         message: admin_message,
         title: Some(format!("Contact Form: {}", req.subject)),
     }) {

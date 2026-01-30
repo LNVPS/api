@@ -1,14 +1,14 @@
+use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
 use anyhow::Result;
 use lnvps_api_common::{UpgradeConfig, WorkJob};
 use lnvps_db::{LNVpsDb, VmPayment};
 use log::{error, info, warn};
+use payments_rs::lightning::LightningNode;
 use std::sync::Arc;
 use std::time::Duration;
-use payments_rs::lightning::LightningNode;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
-use crate::payments::invoice::NodeInvoiceHandler;
 
 mod invoice;
 #[cfg(feature = "revolut")]
@@ -57,13 +57,18 @@ pub fn listen_all_payments(
 pub(crate) async fn handle_upgrade(
     payment: &VmPayment,
     tx: &UnboundedSender<WorkJob>,
-    db: Arc<dyn LNVpsDb>,
+    _db: Arc<dyn LNVpsDb>,
 ) -> Result<()> {
     // Parse upgrade parameters from the dedicated upgrade_params field
     if let Some(upgrade_params_json) = &payment.upgrade_params {
         if let Ok(upgrade_params) = serde_json::from_str::<UpgradeConfig>(upgrade_params_json) {
-            info!("Processing upgrade payment for VM {} with params: CPU={:?}, Memory={:?}, Disk={:?}",
-                          payment.vm_id, upgrade_params.new_cpu, upgrade_params.new_memory, upgrade_params.new_disk);
+            info!(
+                "Processing upgrade payment for VM {} with params: CPU={:?}, Memory={:?}, Disk={:?}",
+                payment.vm_id,
+                upgrade_params.new_cpu,
+                upgrade_params.new_memory,
+                upgrade_params.new_disk
+            );
             tx.send(WorkJob::ProcessVmUpgrade {
                 vm_id: payment.vm_id,
                 config: upgrade_params,

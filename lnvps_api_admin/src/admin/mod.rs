@@ -1,213 +1,74 @@
-use crate::admin::access_policies::{
-    admin_create_access_policy, admin_delete_access_policy, admin_get_access_policy,
-    admin_list_access_policies, admin_update_access_policy,
-};
-use crate::admin::bulk_message::admin_bulk_message;
-use crate::admin::companies::{
-    admin_create_company, admin_delete_company, admin_get_company, admin_list_companies,
-    admin_update_company,
-};
-use crate::admin::cost_plans::{
-    admin_create_cost_plan, admin_delete_cost_plan, admin_get_cost_plan, admin_list_cost_plans,
-    admin_update_cost_plan,
-};
-use crate::admin::custom_pricing::{
-    admin_copy_custom_pricing, admin_create_custom_pricing, admin_delete_custom_pricing,
-    admin_get_custom_pricing, admin_list_custom_pricing, admin_update_custom_pricing,
-};
-use crate::admin::hosts::{
-    admin_create_host, admin_create_host_disk, admin_get_host, admin_get_host_disk,
-    admin_list_host_disks, admin_list_hosts, admin_update_host, admin_update_host_disk,
-};
-use crate::admin::ip_ranges::{
-    admin_create_ip_range, admin_delete_ip_range, admin_get_ip_range, admin_list_ip_ranges,
-    admin_update_ip_range,
-};
-use crate::admin::regions::{
-    admin_create_region, admin_delete_region, admin_get_region, admin_list_regions,
-    admin_update_region,
-};
-use crate::admin::reports::{admin_referral_time_series_report, admin_time_series_report};
-use crate::admin::roles::{
-    admin_assign_user_role, admin_create_role, admin_delete_role, admin_get_my_roles,
-    admin_get_role, admin_get_user_roles, admin_list_roles, admin_revoke_user_role,
-    admin_update_role,
-};
-use crate::admin::routers::{
-    admin_create_router, admin_delete_router, admin_get_router, admin_list_routers,
-    admin_update_router,
-};
-use crate::admin::subscriptions::{
-    admin_create_subscription, admin_create_subscription_line_item, admin_delete_subscription,
-    admin_delete_subscription_line_item, admin_get_subscription,
-    admin_get_subscription_line_item, admin_get_subscription_payment,
-    admin_list_subscription_line_items, admin_list_subscription_payments, admin_list_subscriptions,
-    admin_update_subscription, admin_update_subscription_line_item,
-};
-use crate::admin::users::{admin_list_users, admin_update_user};
-use crate::admin::vm_ip_assignments::{
-    admin_create_vm_ip_assignment, admin_delete_vm_ip_assignment, admin_get_vm_ip_assignment,
-    admin_list_vm_ip_assignments, admin_update_vm_ip_assignment,
-};
-use crate::admin::vm_os_images::{
-    admin_create_vm_os_image, admin_delete_vm_os_image, admin_get_vm_os_image,
-    admin_list_vm_os_images, admin_update_vm_os_image,
-};
-use crate::admin::vm_templates::{
-    admin_create_vm_template, admin_delete_vm_template, admin_get_vm_template,
-    admin_list_vm_templates, admin_update_vm_template,
-};
-use crate::admin::vms::{
-    admin_calculate_vm_refund, admin_create_vm, admin_delete_vm, admin_extend_vm, admin_get_vm, admin_get_vm_history, admin_get_vm_payment,
-    admin_list_vm_history, admin_list_vm_payments, admin_list_vms, admin_process_vm_refund, admin_start_vm, admin_stop_vm,
-};
-use crate::admin::websocket::admin_job_feedback_websocket;
-use rocket::{Route, routes};
+use axum::Router;
+use axum::extract::FromRef;
+use lnvps_api_common::{ExchangeRateService, VmStateCache, WorkCommander};
+use lnvps_db::LNVpsDb;
+use serde::Deserialize;
+use std::sync::Arc;
 
-pub mod access_policies;
-pub mod auth;
-pub mod bulk_message;
-pub mod companies;
-pub mod cost_plans;
-pub mod custom_pricing;
-pub mod hosts;
-pub mod ip_ranges;
-pub mod model;
-pub mod regions;
-pub mod reports;
-pub mod roles;
-pub mod routers;
-pub mod subscriptions;
-pub mod users;
-pub mod vm_ip_assignments;
-pub mod vm_os_images;
-pub mod vm_templates;
-pub mod vms;
-pub mod websocket;
+#[derive(Deserialize)]
+pub(crate) struct PageQuery {
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
 
-pub fn admin_routes() -> Vec<Route> {
-    routes![
-        // User management
-        admin_list_users,
-        admin_update_user,
-        admin_bulk_message,
-        // VM management
-        admin_list_vms,
-        admin_get_vm,
-        admin_create_vm,
-        admin_start_vm,
-        admin_stop_vm,
-        admin_delete_vm,
-        admin_extend_vm,
-        // VM History management
-        admin_list_vm_history,
-        admin_get_vm_history,
-        // VM Payment management
-        admin_list_vm_payments,
-        admin_get_vm_payment,
-        admin_calculate_vm_refund,
-        admin_process_vm_refund,
-        // Host management
-        admin_list_hosts,
-        admin_get_host,
-        admin_create_host,
-        admin_update_host,
-        // Host disk management
-        admin_list_host_disks,
-        admin_get_host_disk,
-        admin_create_host_disk,
-        admin_update_host_disk,
-        // Region management
-        admin_list_regions,
-        admin_get_region,
-        admin_create_region,
-        admin_update_region,
-        admin_delete_region,
-        // Role management
-        admin_list_roles,
-        admin_get_role,
-        admin_create_role,
-        admin_update_role,
-        admin_delete_role,
-        // User role assignments
-        admin_get_user_roles,
-        admin_assign_user_role,
-        admin_revoke_user_role,
-        admin_get_my_roles,
-        // VM OS Image management
-        admin_list_vm_os_images,
-        admin_get_vm_os_image,
-        admin_create_vm_os_image,
-        admin_update_vm_os_image,
-        admin_delete_vm_os_image,
-        // VM Template management
-        admin_list_vm_templates,
-        admin_get_vm_template,
-        admin_create_vm_template,
-        admin_update_vm_template,
-        admin_delete_vm_template,
-        // Custom Pricing management
-        admin_list_custom_pricing,
-        admin_get_custom_pricing,
-        admin_create_custom_pricing,
-        admin_update_custom_pricing,
-        admin_delete_custom_pricing,
-        admin_copy_custom_pricing,
-        // Company management
-        admin_list_companies,
-        admin_get_company,
-        admin_create_company,
-        admin_update_company,
-        admin_delete_company,
-        // Cost Plan management
-        admin_list_cost_plans,
-        admin_get_cost_plan,
-        admin_create_cost_plan,
-        admin_update_cost_plan,
-        admin_delete_cost_plan,
-        // IP Range management
-        admin_list_ip_ranges,
-        admin_get_ip_range,
-        admin_create_ip_range,
-        admin_update_ip_range,
-        admin_delete_ip_range,
-        // Access Policy management
-        admin_list_access_policies,
-        admin_get_access_policy,
-        admin_create_access_policy,
-        admin_update_access_policy,
-        admin_delete_access_policy,
-        // Router management (full CRUD)
-        admin_list_routers,
-        admin_get_router,
-        admin_create_router,
-        admin_update_router,
-        admin_delete_router,
-        // VM IP Assignment management
-        admin_list_vm_ip_assignments,
-        admin_get_vm_ip_assignment,
-        admin_create_vm_ip_assignment,
-        admin_update_vm_ip_assignment,
-        admin_delete_vm_ip_assignment,
-        // Reports
-        admin_time_series_report,
-        admin_referral_time_series_report,
-        // Subscription management
-        admin_list_subscriptions,
-        admin_get_subscription,
-        admin_create_subscription,
-        admin_update_subscription,
-        admin_delete_subscription,
-        // Subscription Line Items
-        admin_list_subscription_line_items,
-        admin_get_subscription_line_item,
-        admin_create_subscription_line_item,
-        admin_update_subscription_line_item,
-        admin_delete_subscription_line_item,
-        // Subscription Payments
-        admin_list_subscription_payments,
-        admin_get_subscription_payment,
-        // WebSocket endpoints
-        admin_job_feedback_websocket,
-    ]
+mod access_policies;
+mod auth;
+mod bulk_message;
+mod companies;
+mod cost_plans;
+mod custom_pricing;
+mod hosts;
+mod ip_ranges;
+mod model;
+mod regions;
+mod reports;
+mod roles;
+mod routers;
+mod subscriptions;
+mod users;
+mod vm_ip_assignments;
+mod vm_os_images;
+mod vm_templates;
+mod vms;
+mod websocket;
+
+#[derive(Clone, FromRef)]
+pub(crate) struct RouterState {
+    pub db: Arc<dyn LNVpsDb>,
+    pub work_commander: Option<WorkCommander>,
+    pub vm_state_cache: VmStateCache,
+    pub exchange: Arc<dyn ExchangeRateService>,
+}
+
+pub fn admin_router(
+    db: Arc<dyn LNVpsDb>,
+    work_commander: Option<WorkCommander>,
+    vm_state_cache: VmStateCache,
+    exchange: Arc<dyn ExchangeRateService>,
+) -> Router {
+    Router::new()
+        .merge(users::router())
+        .merge(bulk_message::router())
+        .merge(vms::router())
+        .merge(hosts::router())
+        .merge(regions::router())
+        .merge(roles::router())
+        .merge(vm_os_images::router())
+        .merge(vm_templates::router())
+        .merge(companies::router())
+        .merge(cost_plans::router())
+        .merge(custom_pricing::router())
+        .merge(ip_ranges::router())
+        .merge(access_policies::router())
+        .merge(routers::router())
+        .merge(vm_ip_assignments::router())
+        .merge(subscriptions::router())
+        .merge(reports::router())
+        .merge(websocket::router())
+        .with_state(RouterState {
+            db,
+            work_commander,
+            vm_state_cache,
+            exchange,
+        })
 }

@@ -567,10 +567,8 @@ impl Worker {
     }
 
     fn queue_admin_notification(&self, message: String, title: Option<String>) -> Result<()> {
-        self.tx.send(WorkJob::SendAdminNotification {
-            message,
-            title,
-        })?;
+        self.tx
+            .send(WorkJob::SendAdminNotification { message, title })?;
         Ok(())
     }
 
@@ -974,8 +972,8 @@ impl Worker {
     async fn try_job(
         &mut self,
         job: &WorkJob,
-        stream_id: Option<&str>,
-        commander: Option<&WorkCommander>,
+        _stream_id: Option<&str>,
+        _commander: Option<&WorkCommander>,
     ) -> Result<Option<String>> {
         info!("Starting job: {}", job);
         match job {
@@ -1021,8 +1019,15 @@ impl Worker {
                         } else {
                             info!("Sending admin notification to {} admin(s)", admin_ids.len());
                             for admin_id in admin_ids {
-                                if let Err(e) = self.queue_notification(admin_id, message.clone(), title.clone()) {
-                                    error!("Failed to queue notification for admin {}: {}", admin_id, e);
+                                if let Err(e) = self.queue_notification(
+                                    admin_id,
+                                    message.clone(),
+                                    title.clone(),
+                                ) {
+                                    error!(
+                                        "Failed to queue notification for admin {}: {}",
+                                        admin_id, e
+                                    );
                                 }
                             }
                         }

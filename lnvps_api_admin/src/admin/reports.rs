@@ -1,31 +1,61 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::routing::get;
 use chrono::NaiveDate;
 use lnvps_api_common::{ApiData, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::{State, get};
+use lnvps_db::{AdminAction, AdminResource};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-#[derive(Serialize, Deserialize)]
-pub struct ReferralReport {
-    pub vm_id: u64,
-    pub ref_code: String,
-    pub created: String,
-    pub amount: u64,
-    pub currency: String,
-    pub rate: f32,
-    pub base_currency: String,
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/reports/time-series",
+            get(admin_time_series_report),
+        )
+        .route(
+            "/api/admin/v1/reports/referral-usage/time-series",
+            get(admin_referral_time_series_report),
+        )
+}
+
+#[derive(Deserialize)]
+struct TimeSeriesQuery {
+    start_date: String,
+    end_date: String,
+    company_id: u64,
+    currency: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReferralTimeSeriesQuery {
+    start_date: String,
+    end_date: String,
+    company_id: u64,
+    ref_code: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ReferralTimeSeriesReport {
-    pub start_date: String,
-    pub end_date: String,
-    pub referrals: Vec<ReferralReport>,
+struct ReferralReport {
+    vm_id: u64,
+    ref_code: String,
+    created: String,
+    amount: u64,
+    currency: String,
+    rate: f32,
+    base_currency: String,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TimeSeriesPayment {
+struct ReferralTimeSeriesReport {
+    start_date: String,
+    end_date: String,
+    referrals: Vec<ReferralReport>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TimeSeriesPayment {
     id: String, // Hex-encoded payment ID
     vm_id: u64,
     created: String, // ISO 8601 timestamp
@@ -45,7 +75,7 @@ pub struct TimeSeriesPayment {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TimeSeriesPeriodSummary {
+struct TimeSeriesPeriodSummary {
     period: String,         // Period identifier (e.g., "2025-01", "2025-Q1")
     currency: String,       // Currency for this period summary
     payment_count: u32,     // Number of payments in this period/currency
@@ -56,28 +86,24 @@ pub struct TimeSeriesPeriodSummary {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TimeSeriesReport {
+struct TimeSeriesReport {
     start_date: String,               // Start date of the report period
     end_date: String,                 // End date of the report period
     payments: Vec<TimeSeriesPayment>, // Raw payment data
 }
 
-#[get("/api/admin/v1/reports/time-series?<start_date>&<end_date>&<company_id>&<currency>")]
-pub async fn admin_time_series_report(
+async fn admin_time_series_report(
     auth: AdminAuth,
-    start_date: String,       // ISO 8601 date (e.g., "2025-01-01")
-    end_date: String,         // ISO 8601 date (e.g., "2025-12-31")
-    company_id: u64,          // Required: company ID to generate report for
-    currency: Option<String>, // Optional: filter by specific currency
-    db: &State<Arc<dyn LNVpsDb>>,
+    State(this): State<RouterState>,
+    Query(params): Query<TimeSeriesQuery>,
 ) -> ApiResult<TimeSeriesReport> {
     // Check permissions
     auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
 
     // Parse and validate dates
-    let start_date_parsed = NaiveDate::parse_from_str(&start_date, "%Y-%m-%d")
+    let start_date_parsed = NaiveDate::parse_from_str(&params.start_date, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("Invalid start_date format. Use YYYY-MM-DD"))?;
-    let end_date_parsed = NaiveDate::parse_from_str(&end_date, "%Y-%m-%d")
+    let end_date_parsed = NaiveDate::parse_from_str(&params.end_date, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("Invalid end_date format. Use YYYY-MM-DD"))?;
 
     if start_date_parsed >= end_date_parsed {
@@ -85,7 +111,7 @@ pub async fn admin_time_series_report(
     }
 
     // Validate currency if provided
-    if let Some(ref currency_str) = currency {
+    if let Some(ref currency_str) = params.currency {
         currency_str
             .parse::<payments_rs::currency::Currency>()
             .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency_str))?;
@@ -96,12 +122,13 @@ pub async fn admin_time_series_report(
     let end_datetime = end_date_parsed.and_hms_opt(23, 59, 59).unwrap().and_utc();
 
     // Use the new optimized database query
-    let payments = db
+    let payments = this
+        .db
         .admin_get_payments_with_company_info(
             start_datetime,
             end_datetime,
-            company_id,
-            currency.as_deref(),
+            params.company_id,
+            params.currency.as_deref(),
         )
         .await?;
 
@@ -132,31 +159,25 @@ pub async fn admin_time_series_report(
     time_series_payments.sort_by(|a, b| a.created.cmp(&b.created));
 
     let report = TimeSeriesReport {
-        start_date,
-        end_date,
+        start_date: params.start_date,
+        end_date: params.end_date,
         payments: time_series_payments,
     };
 
     ApiData::ok(report)
 }
 
-#[get(
-    "/api/admin/v1/reports/referral-usage/time-series?<start_date>&<end_date>&<company_id>&<ref_code>"
-)]
-pub async fn admin_referral_time_series_report(
+async fn admin_referral_time_series_report(
     auth: AdminAuth,
-    start_date: String,
-    end_date: String,
-    company_id: u64,
-    ref_code: Option<String>,
-    db: &State<Arc<dyn LNVpsDb>>,
+    State(this): State<RouterState>,
+    Query(params): Query<ReferralTimeSeriesQuery>,
 ) -> ApiResult<ReferralTimeSeriesReport> {
     auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
 
     // Parse and validate dates
-    let start_date_parsed = NaiveDate::parse_from_str(&start_date, "%Y-%m-%d")
+    let start_date_parsed = NaiveDate::parse_from_str(&params.start_date, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("Invalid start_date format. Use YYYY-MM-DD"))?;
-    let end_date_parsed = NaiveDate::parse_from_str(&end_date, "%Y-%m-%d")
+    let end_date_parsed = NaiveDate::parse_from_str(&params.end_date, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("Invalid end_date format. Use YYYY-MM-DD"))?;
 
     if start_date_parsed >= end_date_parsed {
@@ -167,12 +188,13 @@ pub async fn admin_referral_time_series_report(
     let start_datetime = start_date_parsed.and_hms_opt(0, 0, 0).unwrap().and_utc();
     let end_datetime = end_date_parsed.and_hms_opt(23, 59, 59).unwrap().and_utc();
 
-    let referral_data = db
+    let referral_data = this
+        .db
         .admin_get_referral_usage_by_date_range(
             start_datetime,
             end_datetime,
-            company_id,
-            ref_code.as_deref(),
+            params.company_id,
+            params.ref_code.as_deref(),
         )
         .await?;
 
@@ -193,8 +215,8 @@ pub async fn admin_referral_time_series_report(
     referrals.sort_by(|a, b| a.created.cmp(&b.created));
 
     let report = ReferralTimeSeriesReport {
-        start_date,
-        end_date,
+        start_date: params.start_date,
+        end_date: params.end_date,
         referrals,
     };
 

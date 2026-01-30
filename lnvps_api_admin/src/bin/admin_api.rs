@@ -1,18 +1,18 @@
 use anyhow::Error;
 use clap::Parser;
 use config::{Config, File};
-use lnvps_api_admin::admin;
+use lnvps_api_admin::admin::admin_router;
 use lnvps_api_admin::settings::Settings;
 use lnvps_api_common::{
     ExchangeRateService, InMemoryRateCache, RedisExchangeRateService, VmStateCache, WorkCommander,
 };
-use lnvps_common::CORS;
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
 use log::{error, info};
-use rocket::http::Method;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -26,10 +26,9 @@ struct Args {
     log: Option<PathBuf>,
 }
 
-#[rocket::main]
+#[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
-
     let args = Args::parse();
 
     let settings: Settings = Config::builder()
@@ -86,37 +85,14 @@ async fn main() -> Result<(), Error> {
         Arc::new(InMemoryRateCache::default())
     };
 
-    let mut config = rocket::Config::default();
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
-        None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8001),
+        None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000),
     };
-    info!("Starting api server on {}", ip);
-    config.address = ip.ip();
-    config.port = ip.port();
-
-    if let Err(e) = rocket::Rocket::custom(config)
-        .manage(db.clone())
-        .manage(settings.clone())
-        .manage(vm_state_cache.clone())
-        .manage(work_commander)
-        .manage(exchange.clone())
-        .mount("/", admin::admin_routes())
-        .attach(CORS)
-        .mount(
-            "/",
-            vec![rocket::Route::ranked(
-                isize::MAX,
-                Method::Options,
-                "/<catch_all_options_route..>",
-                CORS,
-            )],
-        )
-        .launch()
-        .await
-    {
-        error!("{:?}", e);
-    }
+    let listener = TcpListener::bind(ip).await?;
+    info!("Listening on {}", ip);
+    let router = admin_router(db.clone(), work_commander, vm_state_cache, exchange);
+    axum::serve(listener, router.layer(CorsLayer::permissive())).await?;
 
     Ok(())
 }

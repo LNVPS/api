@@ -1,7 +1,7 @@
 use crate::dns::{BasicRecord, DnsServer};
 use crate::json_api::JsonApi;
 use anyhow::Context;
-use lnvps_db::async_trait;
+use async_trait::async_trait;
 use log::info;
 use serde::{Deserialize, Serialize};
 

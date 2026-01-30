@@ -1,16 +1,15 @@
 use crate::{
-    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType,
-    ReferralCostUsage, RegionStats, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentType, SubscriptionPaymentWithCompany, User,
-    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmPaymentWithCompany, VmTemplate,
+    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage,
+    RegionStats, Router, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 #[cfg(feature = "nostr-domain")]
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
-use anyhow::{bail, Error, Result};
+use anyhow::{Error, Result, bail};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
@@ -1108,7 +1107,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
              FROM subscription s
              JOIN users u ON s.user_id = u.id
              JOIN company c ON u.id = c.id
-             WHERE s.id = ?"
+             WHERE s.id = ?",
         )
         .bind(subscription_id)
         .fetch_one(&self.db)
@@ -1119,7 +1118,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     // Subscription Line Items
-    async fn list_subscription_line_items(&self, subscription_id: u64) -> Result<Vec<SubscriptionLineItem>> {
+    async fn list_subscription_line_items(
+        &self,
+        subscription_id: u64,
+    ) -> Result<Vec<SubscriptionLineItem>> {
         sqlx::query_as("SELECT * FROM subscription_line_item WHERE subscription_id = ?")
             .bind(subscription_id)
             .fetch_all(&self.db)
@@ -1181,7 +1183,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     // Subscription Payments
-    async fn list_subscription_payments(&self, subscription_id: u64) -> Result<Vec<SubscriptionPayment>> {
+    async fn list_subscription_payments(
+        &self,
+        subscription_id: u64,
+    ) -> Result<Vec<SubscriptionPayment>> {
         sqlx::query_as("SELECT * FROM subscription_payment WHERE subscription_id = ?")
             .bind(subscription_id)
             .fetch_all(&self.db)
@@ -1189,7 +1194,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn list_subscription_payments_by_user(&self, user_id: u64) -> Result<Vec<SubscriptionPayment>> {
+    async fn list_subscription_payments_by_user(
+        &self,
+        user_id: u64,
+    ) -> Result<Vec<SubscriptionPayment>> {
         sqlx::query_as("SELECT * FROM subscription_payment WHERE user_id = ?")
             .bind(user_id)
             .fetch_all(&self.db)
@@ -1205,7 +1213,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn get_subscription_payment_by_ext_id(&self, external_id: &str) -> Result<SubscriptionPayment> {
+    async fn get_subscription_payment_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> Result<SubscriptionPayment> {
         sqlx::query_as("SELECT * FROM subscription_payment WHERE external_id = ?")
             .bind(external_id)
             .fetch_one(&self.db)
@@ -1213,14 +1224,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .map_err(Error::new)
     }
 
-    async fn get_subscription_payment_with_company(&self, id: &Vec<u8>) -> Result<SubscriptionPaymentWithCompany> {
+    async fn get_subscription_payment_with_company(
+        &self,
+        id: &Vec<u8>,
+    ) -> Result<SubscriptionPaymentWithCompany> {
         sqlx::query_as(
             "SELECT sp.*, c.base_currency as company_base_currency
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
              JOIN users u ON s.user_id = u.id
              JOIN company c ON u.id = c.id
-             WHERE sp.id = ?"
+             WHERE sp.id = ?",
         )
         .bind(id)
         .fetch_one(&self.db)
@@ -1314,7 +1328,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn last_paid_subscription_invoice(&self) -> Result<Option<SubscriptionPayment>> {
         sqlx::query_as(
-            "SELECT * FROM subscription_payment WHERE is_paid = 1 ORDER BY created DESC LIMIT 1"
+            "SELECT * FROM subscription_payment WHERE is_paid = 1 ORDER BY created DESC LIMIT 1",
         )
         .fetch_optional(&self.db)
         .await
@@ -3132,7 +3146,7 @@ impl AdminDb for LNVpsDbMysql {
     ) -> Result<(Vec<VmIpAssignment>, u64)> {
         let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM vm_ip_assignment");
         let mut data_query = QueryBuilder::new("SELECT * FROM vm_ip_assignment");
-        
+
         let mut has_conditions = false;
 
         // Apply filters
@@ -3229,11 +3243,12 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_create_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> Result<u64> {
         // Check if IP already exists and is not deleted
         if let Ok(_existing) = sqlx::query_as::<_, VmIpAssignment>(
-            "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE"
+            "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE",
         )
         .bind(&assignment.ip)
         .fetch_one(&self.db)
-        .await {
+        .await
+        {
             bail!("IP address {} is already assigned", assignment.ip);
         }
 
@@ -3259,13 +3274,18 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_update_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> Result<()> {
         // Check if IP already exists for a different assignment
         if let Ok(existing) = sqlx::query_as::<_, VmIpAssignment>(
-            "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE AND id != ?"
+            "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE AND id != ?",
         )
         .bind(&assignment.ip)
         .bind(assignment.id)
         .fetch_one(&self.db)
-        .await {
-            bail!("IP address {} is already assigned to assignment {}", assignment.ip, existing.id);
+        .await
+        {
+            bail!(
+                "IP address {} is already assigned to assignment {}",
+                assignment.ip,
+                existing.id
+            );
         }
 
         sqlx::query(

@@ -2,13 +2,13 @@ use crate::VmRunningState;
 use crate::pricing::PricingEngine;
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
     IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmHostRegion, VmTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
-use rocket::futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;

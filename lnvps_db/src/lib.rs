@@ -1,4 +1,6 @@
 use anyhow::Result;
+use async_trait::async_trait;
+
 #[cfg(feature = "admin")]
 mod admin;
 pub mod encrypted_string;
@@ -19,7 +21,6 @@ pub use mysql::*;
 
 #[cfg(feature = "nostr-domain")]
 use crate::nostr::LNVPSNostrDb;
-pub use async_trait::async_trait;
 
 #[async_trait]
 pub trait LNVpsDbBase: Send + Sync {
@@ -315,18 +316,33 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> Result<String>;
 
     // Subscription Line Items
-    async fn list_subscription_line_items(&self, subscription_id: u64) -> Result<Vec<SubscriptionLineItem>>;
+    async fn list_subscription_line_items(
+        &self,
+        subscription_id: u64,
+    ) -> Result<Vec<SubscriptionLineItem>>;
     async fn get_subscription_line_item(&self, id: u64) -> Result<SubscriptionLineItem>;
     async fn insert_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<u64>;
     async fn update_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<()>;
     async fn delete_subscription_line_item(&self, id: u64) -> Result<()>;
 
     // Subscription Payments
-    async fn list_subscription_payments(&self, subscription_id: u64) -> Result<Vec<SubscriptionPayment>>;
-    async fn list_subscription_payments_by_user(&self, user_id: u64) -> Result<Vec<SubscriptionPayment>>;
+    async fn list_subscription_payments(
+        &self,
+        subscription_id: u64,
+    ) -> Result<Vec<SubscriptionPayment>>;
+    async fn list_subscription_payments_by_user(
+        &self,
+        user_id: u64,
+    ) -> Result<Vec<SubscriptionPayment>>;
     async fn get_subscription_payment(&self, id: &Vec<u8>) -> Result<SubscriptionPayment>;
-    async fn get_subscription_payment_by_ext_id(&self, external_id: &str) -> Result<SubscriptionPayment>;
-    async fn get_subscription_payment_with_company(&self, id: &Vec<u8>) -> Result<SubscriptionPaymentWithCompany>;
+    async fn get_subscription_payment_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> Result<SubscriptionPayment>;
+    async fn get_subscription_payment_with_company(
+        &self,
+        id: &Vec<u8>,
+    ) -> Result<SubscriptionPaymentWithCompany>;
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()>;
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()>;
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> Result<()>;

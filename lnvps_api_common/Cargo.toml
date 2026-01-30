@@ -14,16 +14,19 @@ anyhow.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rocket.workspace = true
+axum.workspace = true
 tokio.workspace = true
 hex.workspace = true
 async-trait.workspace = true
 ipnetwork.workspace = true
+futures.workspace = true
 payments-rs = { workspace = true, features = ["fiat"] }
-chrono = { version = "0.4.38", features = ["serde"] }
-base64 = { version = "0.22.1", features = ["alloc"] }
-nostr = { version = "0.43.0", default-features = false, features = ["std"] }
-reqwest = "0.12.22"
-rand = "0.9.2"
-isocountry = "0.3.2"
-redis = { version = "0.32.4", features = ["tokio-comp", "cluster"] }
+
+chrono = { version = "0.4", features = ["serde"] }
+base64 = { version = "0.22", features = ["alloc"] }
+nostr = { version = "0.44", default-features = false, features = ["std"] }
+reqwest = "0.13"
+rand = "0.9"
+isocountry = "0.3"
+redis = { version = "0.32", features = ["tokio-comp", "cluster"] }
+

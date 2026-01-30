@@ -1,12 +1,12 @@
 use crate::payments::handle_upgrade;
 use anyhow::Result;
 use chrono::Utc;
+use futures::StreamExt;
 use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType, VmPayment};
 use log::{error, info, warn};
 use payments_rs::lightning::{InvoiceUpdate, LightningNode};
-use rocket::futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 

@@ -1,15 +1,14 @@
 use crate::payments::handle_upgrade;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use isocountry::CountryCode;
 use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType};
 use log::{error, info, warn};
-use payments_rs::fiat::{RevolutApi, RevolutConfig, RevolutWebhook, RevolutWebhookBody, RevolutWebhookEvent};
+use payments_rs::fiat::{RevolutApi, RevolutConfig, RevolutWebhookBody, RevolutWebhookEvent};
 use payments_rs::webhook::WEBHOOK_BRIDGE;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 

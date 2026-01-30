@@ -8,11 +8,13 @@ use lnvps_db::{
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
-    async_trait,
 };
 
+use async_trait::async_trait;
 #[cfg(feature = "admin")]
-use lnvps_db::{AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats, VmPaymentWithCompany};
+use lnvps_db::{
+    AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats, VmPaymentWithCompany,
+};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
@@ -243,7 +245,7 @@ impl LNVpsDbBase for MockDb {
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> anyhow::Result<u64> {
         let mut users = self.users.lock().await;
-        if let Some(e) = users.iter().find(|(k, u)| u.pubkey == *pubkey) {
+        if let Some(e) = users.iter().find(|(_k, u)| u.pubkey == *pubkey) {
             Ok(*e.0)
         } else {
             let max = *users.keys().max().unwrap_or(&0);
@@ -423,7 +425,7 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_host_disks(&self, TB: u64) -> anyhow::Result<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, _TB: u64) -> anyhow::Result<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
         Ok(disks.values().filter(|d| d.enabled).cloned().collect())
     }
@@ -793,7 +795,7 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
-    async fn list_custom_pricing(&self, TB: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
+    async fn list_custom_pricing(&self, _TB: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().filter(|p| p.enabled).cloned().collect())
     }

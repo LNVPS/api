@@ -1,88 +1,89 @@
-use crate::settings::Settings;
 use crate::Nip98Auth;
+use crate::api::RouterState;
+use axum::extract::{Path, State};
+use axum::routing::{delete, get};
+use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use lnvps_api_common::{ApiData, ApiResult};
-use lnvps_db::{LNVpsDb, NostrDomain, NostrDomainHandle};
-use rocket::serde::json::Json;
-use rocket::serde::{Deserialize, Serialize};
-use rocket::{delete, get, post, routes, Route, State};
-use std::sync::Arc;
+use lnvps_db::{NostrDomain, NostrDomainHandle};
+use serde::{Deserialize, Serialize};
 
-pub fn routes() -> Vec<Route> {
-    routes![
-        v1_nostr_domains,
-        v1_create_nostr_domain,
-        v1_list_nostr_domain_handles,
-        v1_create_nostr_domain_handle,
-        v1_delete_nostr_domain_handle
-    ]
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/v1/nostr/domain",
+            get(v1_nostr_domains).post(v1_create_nostr_domain),
+        )
+        .route(
+            "/api/v1/nostr/domain/<dom>/handle",
+            get(v1_list_nostr_domain_handles).post(v1_create_nostr_domain_handle),
+        )
+        .route(
+            "/api/v1/nostr/domain/<dom>/handle/<handle>",
+            delete(v1_delete_nostr_domain_handle),
+        )
 }
 
-#[get("/api/v1/nostr/domain")]
 async fn v1_nostr_domains(
     auth: Nip98Auth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    settings: &State<Settings>,
+    State(this): State<RouterState>,
 ) -> ApiResult<ApiDomainsResponse> {
     let pubkey = auth.event.pubkey.to_bytes();
-    let uid = db.upsert_user(&pubkey).await?;
+    let uid = this.db.upsert_user(&pubkey).await?;
 
-    let domains = db.list_domains(uid).await?;
+    let domains = this.db.list_domains(uid).await?;
     ApiData::ok(ApiDomainsResponse {
         domains: domains.into_iter().map(|d| d.into()).collect(),
-        cname: settings.nostr_address_host.clone().unwrap_or_default(),
+        cname: this.settings.nostr_address_host.clone().unwrap_or_default(),
     })
 }
 
-#[post("/api/v1/nostr/domain", format = "json", data = "<data>")]
 async fn v1_create_nostr_domain(
     auth: Nip98Auth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    data: Json<NameRequest>,
+    State(this): State<RouterState>,
+    Json(data): Json<NameRequest>,
 ) -> ApiResult<ApiNostrDomain> {
     let pubkey = auth.event.pubkey.to_bytes();
-    let uid = db.upsert_user(&pubkey).await?;
+    let uid = this.db.upsert_user(&pubkey).await?;
 
     let mut dom = NostrDomain {
         owner_id: uid,
         name: data.name.clone(),
         ..Default::default()
     };
-    let dom_id = db.insert_domain(&dom).await?;
+    let dom_id = this.db.insert_domain(&dom).await?;
     dom.id = dom_id;
 
     ApiData::ok(dom.into())
 }
 
-#[get("/api/v1/nostr/domain/<dom>/handle")]
 async fn v1_list_nostr_domain_handles(
     auth: Nip98Auth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    dom: u64,
+    State(this): State<RouterState>,
+    Path(dom): Path<u64>,
 ) -> ApiResult<Vec<ApiNostrDomainHandle>> {
     let pubkey = auth.event.pubkey.to_bytes();
-    let uid = db.upsert_user(&pubkey).await?;
+    let uid = this.db.upsert_user(&pubkey).await?;
 
-    let domain = db.get_domain(dom).await?;
+    let domain = this.db.get_domain(dom).await?;
     if domain.owner_id != uid {
         return ApiData::err("Access denied");
     }
 
-    let handles = db.list_handles(domain.id).await?;
+    let handles = this.db.list_handles(domain.id).await?;
     ApiData::ok(handles.into_iter().map(|h| h.into()).collect())
 }
 
-#[post("/api/v1/nostr/domain/<dom>/handle", format = "json", data = "<data>")]
 async fn v1_create_nostr_domain_handle(
     auth: Nip98Auth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    dom: u64,
+    State(this): State<RouterState>,
+    Path(dom): Path<u64>,
     data: Json<HandleRequest>,
 ) -> ApiResult<ApiNostrDomainHandle> {
     let pubkey = auth.event.pubkey.to_bytes();
-    let uid = db.upsert_user(&pubkey).await?;
+    let uid = this.db.upsert_user(&pubkey).await?;
 
-    let domain = db.get_domain(dom).await?;
+    let domain = this.db.get_domain(dom).await?;
     if domain.owner_id != uid {
         return ApiData::err("Access denied");
     }
@@ -98,27 +99,26 @@ async fn v1_create_nostr_domain_handle(
         pubkey: h_pubkey,
         ..Default::default()
     };
-    let id = db.insert_handle(&handle).await?;
+    let id = this.db.insert_handle(&handle).await?;
     handle.id = id;
 
     ApiData::ok(handle.into())
 }
 
-#[delete("/api/v1/nostr/domain/<dom>/handle/<handle>")]
 async fn v1_delete_nostr_domain_handle(
     auth: Nip98Auth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    dom: u64,
-    handle: u64,
+    State(this): State<RouterState>,
+    Path(dom): Path<u64>,
+    Path(handle): Path<u64>,
 ) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
-    let uid = db.upsert_user(&pubkey).await?;
+    let uid = this.db.upsert_user(&pubkey).await?;
 
-    let domain = db.get_domain(dom).await?;
+    let domain = this.db.get_domain(dom).await?;
     if domain.owner_id != uid {
         return ApiData::err("Access denied");
     }
-    db.delete_handle(handle).await?;
+    this.db.delete_handle(handle).await?;
     ApiData::ok(())
 }
 

@@ -1,55 +1,66 @@
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminVmOsImageInfo, CreateVmOsImageRequest, UpdateVmOsImageRequest};
+use crate::admin::{PageQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
-use rocket::serde::json::Json;
-use rocket::{delete, get, patch, post, State};
-use std::sync::Arc;
+use lnvps_db::{AdminAction, AdminResource};
+
+pub fn router() -> Router<RouterState> {
+    Router::new()
+        .route(
+            "/api/admin/v1/vm_os_images",
+            get(admin_list_vm_os_images).post(admin_create_vm_os_image),
+        )
+        .route(
+            "/api/admin/v1/vm_os_images/{id}",
+            get(admin_get_vm_os_image)
+                .patch(admin_update_vm_os_image)
+                .delete(admin_delete_vm_os_image),
+        )
+}
 
 /// List VM OS images with pagination
-#[get("/api/admin/v1/vm_os_images?<limit>&<offset>")]
-pub async fn admin_list_vm_os_images(
+async fn admin_list_vm_os_images(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    State(this): State<RouterState>,
+    Query(params): Query<PageQuery>,
 ) -> ApiPaginatedResult<AdminVmOsImageInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmOsImage, AdminAction::View)?;
 
-    let limit = limit.unwrap_or(50).min(100);
-    let offset = offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
 
-    let (images, total) = db.admin_list_vm_os_images(limit, offset).await?;
+    let (images, total) = this.db.admin_list_vm_os_images(limit, offset).await?;
     let mut admin_images = Vec::new();
     for image in images {
-        admin_images.push(AdminVmOsImageInfo::from_db_with_vm_count(db, image).await?);
+        admin_images.push(AdminVmOsImageInfo::from_db_with_vm_count(&this.db, image).await?);
     }
 
     ApiPaginatedData::ok(admin_images, total, limit, offset)
 }
 
 /// Get VM OS image details
-#[get("/api/admin/v1/vm_os_images/<image_id>")]
-pub async fn admin_get_vm_os_image(
+async fn admin_get_vm_os_image(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    image_id: u64,
+    State(this): State<RouterState>,
+    Path(image_id): Path<u64>,
 ) -> ApiResult<AdminVmOsImageInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmOsImage, AdminAction::View)?;
 
-    let image = db.admin_get_vm_os_image(image_id).await?;
-    let admin_image = AdminVmOsImageInfo::from_db_with_vm_count(db, image).await?;
+    let image = this.db.admin_get_vm_os_image(image_id).await?;
+    let admin_image = AdminVmOsImageInfo::from_db_with_vm_count(&this.db, image).await?;
     ApiData::ok(admin_image)
 }
 
 /// Create a new VM OS image
-#[post("/api/admin/v1/vm_os_images", data = "<request>")]
-pub async fn admin_create_vm_os_image(
+async fn admin_create_vm_os_image(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    request: Json<CreateVmOsImageRequest>,
+    State(this): State<RouterState>,
+    Json(request): Json<CreateVmOsImageRequest>,
 ) -> ApiResult<AdminVmOsImageInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmOsImage, AdminAction::Create)?;
@@ -58,25 +69,24 @@ pub async fn admin_create_vm_os_image(
     let mut vm_os_image = request.to_vm_os_image()?;
 
     // Create the image in the database
-    let image_id = db.admin_create_vm_os_image(&vm_os_image).await?;
+    let image_id = this.db.admin_create_vm_os_image(&vm_os_image).await?;
     vm_os_image.id = image_id;
 
     ApiData::ok(vm_os_image.into())
 }
 
 /// Update VM OS image
-#[patch("/api/admin/v1/vm_os_images/<image_id>", data = "<request>")]
-pub async fn admin_update_vm_os_image(
+async fn admin_update_vm_os_image(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    image_id: u64,
-    request: Json<UpdateVmOsImageRequest>,
+    State(this): State<RouterState>,
+    Path(image_id): Path<u64>,
+    Json(request): Json<UpdateVmOsImageRequest>,
 ) -> ApiResult<AdminVmOsImageInfo> {
     // Check permission
     auth.require_permission(AdminResource::VmOsImage, AdminAction::Update)?;
 
     // Get existing image
-    let mut image = db.admin_get_vm_os_image(image_id).await?;
+    let mut image = this.db.admin_get_vm_os_image(image_id).await?;
 
     // Update fields if provided
     if let Some(distribution) = &request.distribution {
@@ -108,21 +118,20 @@ pub async fn admin_update_vm_os_image(
     }
 
     // Update in database
-    db.admin_update_vm_os_image(&image).await?;
+    this.db.admin_update_vm_os_image(&image).await?;
 
     ApiData::ok(image.into())
 }
 
 /// Delete VM OS image
-#[delete("/api/admin/v1/vm_os_images/<image_id>")]
-pub async fn admin_delete_vm_os_image(
+async fn admin_delete_vm_os_image(
     auth: AdminAuth,
-    db: &State<Arc<dyn LNVpsDb>>,
-    image_id: u64,
+    State(this): State<RouterState>,
+    Path(image_id): Path<u64>,
 ) -> ApiResult<String> {
     // Check permission
     auth.require_permission(AdminResource::VmOsImage, AdminAction::Delete)?;
 
-    db.admin_delete_vm_os_image(image_id).await?;
+    this.db.admin_delete_vm_os_image(image_id).await?;
     ApiData::ok("VM OS image deleted successfully".to_string())
 }
