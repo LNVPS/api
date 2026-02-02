@@ -1,5 +1,5 @@
 use crate::encrypted_string::EncryptedString;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -819,6 +819,7 @@ pub enum AdminResource {
     Subscriptions = 17,
     SubscriptionLineItems = 18,
     SubscriptionPayments = 19,
+    IpSpace = 20,
 }
 
 /// Actions that can be performed on administrative resources
@@ -854,6 +855,7 @@ impl Display for AdminResource {
             AdminResource::Subscriptions => write!(f, "subscriptions"),
             AdminResource::SubscriptionLineItems => write!(f, "subscription_line_items"),
             AdminResource::SubscriptionPayments => write!(f, "subscription_payments"),
+            AdminResource::IpSpace => write!(f, "ip_space"),
         }
     }
 }
@@ -883,6 +885,7 @@ impl FromStr for AdminResource {
             "subscriptions" => Ok(AdminResource::Subscriptions),
             "subscription_line_items" => Ok(AdminResource::SubscriptionLineItems),
             "subscription_payments" => Ok(AdminResource::SubscriptionPayments),
+            "ip_space" => Ok(AdminResource::IpSpace),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -913,6 +916,7 @@ impl TryFrom<u16> for AdminResource {
             17 => Ok(AdminResource::Subscriptions),
             18 => Ok(AdminResource::SubscriptionLineItems),
             19 => Ok(AdminResource::SubscriptionPayments),
+            20 => Ok(AdminResource::IpSpace),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -942,6 +946,7 @@ impl AdminResource {
             AdminResource::Subscriptions,
             AdminResource::SubscriptionLineItems,
             AdminResource::SubscriptionPayments,
+            AdminResource::IpSpace,
         ]
     }
 }
@@ -1021,7 +1026,7 @@ impl Display for SubscriptionPaymentType {
     }
 }
 
-/// Subscription for a recurring service
+/// Subscription for a recurring service (always monthly billing)
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: u64,
@@ -1032,11 +1037,28 @@ pub struct Subscription {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub currency: String,
-    pub interval_amount: u64,
-    pub interval_type: VmCostPlanIntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
+}
+
+/// Subscription Type - Type of service being sold
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
+#[repr(u16)]
+pub enum SubscriptionType {
+    IpRange = 0,       // IP range allocation/LIR services
+    AsnSponsoring = 1, // ASN sponsoring services
+    DnsHosting = 2,    // DNS hosting services
+}
+
+impl Display for SubscriptionType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubscriptionType::IpRange => write!(f, "IP Range"),
+            SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
+            SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
+        }
+    }
 }
 
 /// Line item within a subscription
@@ -1044,6 +1066,7 @@ pub struct Subscription {
 pub struct SubscriptionLineItem {
     pub id: u64,
     pub subscription_id: u64,
+    pub subscription_type: SubscriptionType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,
@@ -1067,7 +1090,6 @@ pub struct SubscriptionPayment {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
-    pub time_value: Option<u64>,
     pub tax: u64,
 }
 
@@ -1087,7 +1109,72 @@ pub struct SubscriptionPaymentWithCompany {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
-    pub time_value: Option<u64>,
     pub tax: u64,
     pub company_base_currency: String,
+}
+
+/// Internet Registry - Regional Internet Registry
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
+#[repr(u16)]
+pub enum InternetRegistry {
+    ARIN = 0,    // American Registry for Internet Numbers
+    RIPE = 1,    // Réseaux IP Européens Network Coordination Centre
+    APNIC = 2,   // Asia-Pacific Network Information Centre
+    LACNIC = 3,  // Latin America and Caribbean Network Information Centre
+    AFRINIC = 4, // African Network Information Centre
+}
+
+impl Display for InternetRegistry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InternetRegistry::ARIN => write!(f, "ARIN"),
+            InternetRegistry::RIPE => write!(f, "RIPE"),
+            InternetRegistry::APNIC => write!(f, "APNIC"),
+            InternetRegistry::LACNIC => write!(f, "LACNIC"),
+            InternetRegistry::AFRINIC => write!(f, "AFRINIC"),
+        }
+    }
+}
+
+/// Available IP Space - Inventory of IP ranges available for sale
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct AvailableIpSpace {
+    pub id: u64,
+    pub cidr: String,
+    pub min_prefix_size: u16,
+    pub max_prefix_size: u16,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+    pub registry: InternetRegistry,
+    pub external_id: Option<String>,
+    pub is_available: bool,
+    pub is_reserved: bool,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// IP Space Pricing - Pricing for different prefix sizes from an IP block
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct IpSpacePricing {
+    pub id: u64,
+    pub available_ip_space_id: u64,
+    pub prefix_size: u16,
+    pub price_per_month: u64,
+    pub currency: String,
+    pub setup_fee: u64,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+}
+
+/// IP Range Subscription - Stores IP ranges sold to users via subscriptions
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct IpRangeSubscription {
+    pub id: u64,
+    pub subscription_line_item_id: u64,
+    pub available_ip_space_id: u64,
+    pub created: DateTime<Utc>,
+    pub cidr: String,
+    pub is_active: bool,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub metadata: Option<serde_json::Value>,
 }

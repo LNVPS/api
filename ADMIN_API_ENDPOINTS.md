@@ -18,6 +18,8 @@ Admin API request/response format reference for LLM consumption.
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
 **SubscriptionPaymentType**: `"purchase"`, `"renewal"`
+**SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`
+**InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
 
 ## Authentication
 ```
@@ -2605,5 +2607,264 @@ The RBAC system uses the following permission format: `resource::action`
     "ip4_count": number,
     "ip6_count": number
   }
+}
+```
+
+---
+
+## IP Space Management
+
+### List IP Spaces
+```
+GET /api/admin/v1/ip_space
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `is_available`: boolean (optional) - filter by availability
+- `registry`: number (optional) - 0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC
+
+Required Permission: `ip_space::view`
+
+Response: Paginated list of `AdminAvailableIpSpaceInfo`
+
+### Get IP Space
+```
+GET /api/admin/v1/ip_space/{id}
+```
+Required Permission: `ip_space::view`
+
+Response: Single `AdminAvailableIpSpaceInfo`
+
+### Create IP Space
+```
+POST /api/admin/v1/ip_space
+```
+Request Body: `CreateAvailableIpSpaceRequest`
+
+Required Permission: `ip_space::create`
+
+Response: Created `AdminAvailableIpSpaceInfo`
+
+### Update IP Space
+```
+PATCH /api/admin/v1/ip_space/{id}
+```
+Request Body: `UpdateAvailableIpSpaceRequest`
+
+Required Permission: `ip_space::update`
+
+Response: Updated `AdminAvailableIpSpaceInfo`
+
+### Delete IP Space
+```
+DELETE /api/admin/v1/ip_space/{id}
+```
+Required Permission: `ip_space::delete`
+
+Response: Empty success response
+
+Error: `"Cannot delete IP space with active subscriptions. Please cancel subscriptions first."` if active subscriptions exist
+
+### List IP Space Pricing
+```
+GET /api/admin/v1/ip_space/{id}/pricing
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+
+Required Permission: `ip_space::view`
+
+Response: Paginated list of `AdminIpSpacePricingInfo`
+
+### Get IP Space Pricing
+```
+GET /api/admin/v1/ip_space/{space_id}/pricing/{pricing_id}
+```
+Required Permission: `ip_space::view`
+
+Response: Single `AdminIpSpacePricingInfo`
+
+### Create IP Space Pricing
+```
+POST /api/admin/v1/ip_space/{id}/pricing
+```
+Request Body: `CreateIpSpacePricingRequest`
+
+Required Permission: `ip_space::create`
+
+Response: Created `AdminIpSpacePricingInfo`
+
+Errors:
+- `"Prefix size must be between {min} and {max}"` - prefix_size outside space bounds
+- `"Pricing already exists for prefix size /{size}"` - duplicate pricing
+
+### Update IP Space Pricing
+```
+PATCH /api/admin/v1/ip_space/{space_id}/pricing/{pricing_id}
+```
+Request Body: `UpdateIpSpacePricingRequest`
+
+Required Permission: `ip_space::update`
+
+Response: Updated `AdminIpSpacePricingInfo`
+
+Errors:
+- `"Pricing does not belong to the specified IP space"` - mismatched IDs
+- `"Prefix size must be between {min} and {max}"` - prefix_size outside space bounds
+- `"Pricing already exists for prefix size /{size}"` - duplicate pricing
+
+### Delete IP Space Pricing
+```
+DELETE /api/admin/v1/ip_space/{space_id}/pricing/{pricing_id}
+```
+Required Permission: `ip_space::delete`
+
+Response: Empty success response
+
+### List IP Space Subscriptions
+```
+GET /api/admin/v1/ip_space/{id}/subscriptions
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `user_id`: number (optional) - filter by user
+- `is_active`: boolean (optional) - filter by active status
+
+Required Permission: `subscriptions::view`
+
+Response: Paginated list of `AdminIpRangeSubscriptionInfo`
+
+---
+
+## IP Space Data Types
+
+### AdminAvailableIpSpaceInfo
+```json
+{
+  "id": number,
+  "cidr": "string",                      // e.g., "192.168.0.0/22"
+  "min_prefix_size": number,             // e.g., 24 (smallest allocation /24)
+  "max_prefix_size": number,             // e.g., 22 (largest allocation /22)
+  "registry": {
+    "value": number,                     // 0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC
+    "name": "string"                     // "ARIN", "RIPE", etc.
+  },
+  "external_id": "string | null",        // RIR allocation ID (e.g., "NET-192-168-0-0-1")
+  "is_available": boolean,               // Whether space is available for allocation
+  "is_reserved": boolean,                // Whether space is reserved for special use
+  "metadata": object | null,             // JSON metadata (routing requirements, upstream provider, etc.)
+  "pricing_count": number                // Number of pricing tiers configured
+}
+```
+
+### CreateAvailableIpSpaceRequest
+```json
+{
+  "cidr": "string",                      // CIDR notation (validated)
+  "min_prefix_size": number,             // Must be <= max_prefix_size
+  "max_prefix_size": number,             // Must be >= min_prefix_size
+  "registry": number,                    // 0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC
+  "external_id": "string | null",        // Optional RIR allocation ID
+  "is_available": boolean,               // Optional, default: true
+  "is_reserved": boolean,                // Optional, default: false
+  "metadata": object | null              // Optional JSON metadata
+}
+```
+
+### UpdateAvailableIpSpaceRequest
+```json
+{
+  "cidr": "string | null",               // Optional CIDR update (validated)
+  "min_prefix_size": number | null,      // Optional, must be <= max_prefix_size
+  "max_prefix_size": number | null,      // Optional, must be >= min_prefix_size
+  "registry": number | null,             // Optional registry update
+  "external_id": "string | null",        // Optional, null to clear
+  "is_available": boolean | null,        // Optional availability update
+  "is_reserved": boolean | null,         // Optional reserved status update
+  "metadata": object | null              // Optional, null to clear
+}
+```
+
+### AdminIpSpacePricingInfo
+```json
+{
+  "id": number,
+  "available_ip_space_id": number,       // Parent IP space ID
+  "prefix_size": number,                 // e.g., 24 for /24 subnet
+  "price_per_month": number,             // Monthly recurring price in cents/millisats
+  "currency": "string",                  // e.g., "USD", "EUR", "BTC"
+  "setup_fee": number,                   // One-time setup fee in cents/millisats
+  "cidr": "string | null"                // Parent CIDR for context (populated by API)
+}
+```
+
+### CreateIpSpacePricingRequest
+```json
+{
+  "prefix_size": number,                 // Must be within space's min/max bounds
+  "price_per_month": number,             // In cents/millisats (cannot be negative)
+  "currency": "string | null",           // Optional, default: "USD"
+  "setup_fee": number | null             // Optional, default: 0
+}
+```
+
+### UpdateIpSpacePricingRequest
+```json
+{
+  "prefix_size": number | null,          // Optional, must be within space's min/max bounds
+  "price_per_month": number | null,      // Optional (cannot be negative)
+  "currency": "string | null",           // Optional currency update
+  "setup_fee": number | null             // Optional (cannot be negative)
+}
+```
+
+### AdminIpRangeSubscriptionInfo
+```json
+{
+  "id": number,
+  "subscription_line_item_id": number,   // Links to subscription line item
+  "available_ip_space_id": number,       // IP space this was allocated from
+  "cidr": "string",                      // Allocated CIDR e.g., "192.168.1.0/24"
+  "is_active": boolean,                  // Whether subscription is active
+  "started_at": "string",                // ISO 8601 datetime
+  "ended_at": "string | null",           // ISO 8601 datetime or null if active
+  "metadata": object | null,             // JSON metadata (routing info, ASN assignments, etc.)
+  "subscription_id": number | null,      // Subscription ID (enriched)
+  "user_id": number | null,              // User ID (enriched)
+  "parent_cidr": "string | null"         // Parent IP space CIDR (enriched)
+}
+```
+
+### Notes
+
+**IP Space Prefix Sizes:**
+- Smaller prefix numbers = larger networks (e.g., /22 = 1024 IPs)
+- Larger prefix numbers = smaller networks (e.g., /24 = 256 IPs)
+- `min_prefix_size` should be the largest number (smallest allocation)
+- `max_prefix_size` should be the smallest number (largest allocation)
+- Example: min=24, max=22 allows selling /24, /23, and /22 subnets
+
+**Pricing Structure:**
+- Multiple pricing tiers can exist for the same IP space
+- Each tier targets a specific prefix size (e.g., /24, /28, /32)
+- One pricing entry per prefix size per space (enforced uniqueness)
+- Prices are in smallest currency unit (cents for USD, millisats for BTC)
+
+**IP Space Lifecycle:**
+- `is_available=true, is_reserved=false` → Available for customer purchase
+- `is_available=false` → Hidden from customer browsing
+- `is_reserved=true` → Admin reserved, not for sale
+- Cannot delete IP space with active subscriptions
+
+**Metadata Examples:**
+```json
+{
+  "routing_requirements": "BGP announcement required",
+  "upstream_provider": "Cogent",
+  "asn": "AS64512",
+  "notes": "IPv6 PI allocation from ARIN"
 }
 ```

@@ -311,6 +311,11 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_subscription(&self, id: u64) -> Result<Subscription>;
     async fn get_subscription_by_ext_id(&self, external_id: &str) -> Result<Subscription>;
     async fn insert_subscription(&self, subscription: &Subscription) -> Result<u64>;
+    async fn insert_subscription_with_line_items(
+        &self,
+        subscription: &Subscription,
+        line_items: Vec<SubscriptionLineItem>,
+    ) -> Result<u64>;
     async fn update_subscription(&self, subscription: &Subscription) -> Result<()>;
     async fn delete_subscription(&self, id: u64) -> Result<()>;
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> Result<String>;
@@ -347,6 +352,45 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()>;
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> Result<()>;
     async fn last_paid_subscription_invoice(&self) -> Result<Option<SubscriptionPayment>>;
+
+    // Available IP Space
+    async fn list_available_ip_space(&self) -> Result<Vec<AvailableIpSpace>>;
+    async fn get_available_ip_space(&self, id: u64) -> Result<AvailableIpSpace>;
+    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> Result<AvailableIpSpace>;
+    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> Result<u64>;
+    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> Result<()>;
+    async fn delete_available_ip_space(&self, id: u64) -> Result<()>;
+
+    // IP Space Pricing
+    async fn list_ip_space_pricing_by_space(
+        &self,
+        available_ip_space_id: u64,
+    ) -> Result<Vec<IpSpacePricing>>;
+    async fn get_ip_space_pricing(&self, id: u64) -> Result<IpSpacePricing>;
+    async fn get_ip_space_pricing_by_prefix(
+        &self,
+        available_ip_space_id: u64,
+        prefix_size: u16,
+    ) -> Result<IpSpacePricing>;
+    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> Result<u64>;
+    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> Result<()>;
+    async fn delete_ip_space_pricing(&self, id: u64) -> Result<()>;
+
+    // IP Range Subscriptions
+    async fn list_ip_range_subscriptions_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> Result<Vec<IpRangeSubscription>>;
+    async fn list_ip_range_subscriptions_by_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> Result<Vec<IpRangeSubscription>>;
+    async fn list_ip_range_subscriptions_by_user(&self, user_id: u64) -> Result<Vec<IpRangeSubscription>>;
+    async fn get_ip_range_subscription(&self, id: u64) -> Result<IpRangeSubscription>;
+    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> Result<IpRangeSubscription>;
+    async fn insert_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> Result<u64>;
+    async fn update_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> Result<()>;
+    async fn delete_ip_range_subscription(&self, id: u64) -> Result<()>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

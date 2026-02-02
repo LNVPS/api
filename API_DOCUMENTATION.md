@@ -809,5 +809,297 @@ if (result.error) {
 5. Email addresses are validated with basic format checking (contains @ and .)
 6. The admin will receive an email containing all the form data including a reply-to address
 
+---
+
+## IP Space Management
+
+### Data Types
+
+```typescript
+type InternetRegistry = 'arin' | 'ripe' | 'apnic' | 'lacnic' | 'afrinic';
+
+interface AvailableIpSpace {
+  id: number;
+  cidr: string; // e.g., "192.168.0.0/22"
+  min_prefix_size: number; // e.g., 24 (smallest allocation)
+  max_prefix_size: number; // e.g., 22 (largest allocation)
+  registry: InternetRegistry;
+  pricing: IpSpacePricing[];
+}
+
+interface IpSpacePricing {
+  id: number;
+  prefix_size: number; // e.g., 24 for /24
+  price_per_month: number; // In cents for fiat, millisats for BTC
+  currency: 'BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY';
+  setup_fee: number; // In cents for fiat, millisats for BTC
+}
+
+interface IpRangeSubscription {
+  id: number;
+  cidr: string; // The allocated IP range e.g., "192.168.1.0/24"
+  is_active: boolean;
+  started_at: string; // ISO 8601 datetime
+  ended_at?: string; // ISO 8601 datetime
+  parent_cidr: string; // The IP space block this was allocated from
+}
+
+interface AddIpRangeToSubscriptionRequest {
+  ip_space_pricing_id: number; // The pricing tier to use
+}
+```
+
+### List Available IP Spaces
+
+Browse available IP address blocks for purchase.
+
+**Endpoint**: `GET /api/v1/ip_space`
+
+**Authentication**: Not required (public endpoint)
+
+**Query Parameters**:
+- `limit` (optional, number): Maximum number of items to return (default: 50, max: 100)
+- `offset` (optional, number): Number of items to skip (default: 0)
+
+**Response**: `ApiPaginatedResponse<AvailableIpSpace>`
+
+**Example Request**:
+
+```typescript
+const response = await fetch('/api/v1/ip_space?limit=20&offset=0');
+const result: ApiPaginatedResponse<AvailableIpSpace> = await response.json();
+
+if (!result.error) {
+  result.data.forEach(space => {
+    console.log(`${space.cidr} from ${space.registry.toUpperCase()}`);
+    space.pricing.forEach(price => {
+      console.log(`  /${price.prefix_size}: $${price.price_per_month / 100}/month`);
+    });
+  });
+}
+```
+
+**Notes**:
+1. Only shows IP spaces that are available and not reserved
+2. Each IP space includes all available pricing tiers
+3. Pricing is returned in the smallest currency unit (cents/millisats)
+4. Different prefix sizes within the same block can have different prices
+
+### Get IP Space Details
+
+Get detailed information about a specific IP space block.
+
+**Endpoint**: `GET /api/v1/ip_space/{id}`
+
+**Authentication**: Not required (public endpoint)
+
+**Path Parameters**:
+- `id` (number): The IP space ID
+
+**Response**: `ApiResponse<AvailableIpSpace>`
+
+**Error Responses**:
+- `"IP space not available"` - IP space is not available for purchase
+- Not found error if ID doesn't exist
+
+**Example Request**:
+
+```typescript
+const response = await fetch('/api/v1/ip_space/1');
+const result: ApiResponse<AvailableIpSpace> = await response.json();
+
+if (!result.error) {
+  console.log(`Available: ${result.data.cidr}`);
+  console.log(`Prefix sizes: /${result.data.min_prefix_size} to /${result.data.max_prefix_size}`);
+}
+```
+
+### List Subscription IP Ranges
+
+List all IP ranges allocated to a specific subscription.
+
+**Endpoint**: `GET /api/v1/subscriptions/{subscription_id}/ip_ranges`
+
+**Authentication**: Required (NIP-98)
+
+**Path Parameters**:
+- `subscription_id` (number): The subscription ID
+
+**Query Parameters**:
+- `limit` (optional, number): Maximum number of items to return (default: 50, max: 100)
+- `offset` (optional, number): Number of items to skip (default: 0)
+
+**Response**: `ApiPaginatedResponse<IpRangeSubscription>`
+
+**Error Responses**:
+- `"Access denied: not your subscription"` - User doesn't own this subscription
+
+**Example Request**:
+
+```typescript
+const response = await fetch('/api/v1/subscriptions/123/ip_ranges', {
+  headers: {
+    'Authorization': nip98AuthHeader,
+    'Content-Type': 'application/json'
+  }
+});
+
+const result: ApiPaginatedResponse<IpRangeSubscription> = await response.json();
+
+if (!result.error) {
+  result.data.forEach(ipRange => {
+    console.log(`${ipRange.cidr} (from ${ipRange.parent_cidr})`);
+    console.log(`Active: ${ipRange.is_active}`);
+  });
+}
+```
+
+### Add IP Range to Subscription
+
+Purchase an IP range and add it to an existing subscription.
+
+**Endpoint**: `POST /api/v1/subscriptions/{subscription_id}/ip_ranges`
+
+**Authentication**: Required (NIP-98)
+
+**Path Parameters**:
+- `subscription_id` (number): The subscription ID
+
+**Request Body**: `AddIpRangeToSubscriptionRequest`
+
+```typescript
+interface AddIpRangeToSubscriptionRequest {
+  ip_space_pricing_id: number; // ID of the pricing tier to purchase
+}
+```
+
+**Response**: `ApiResponse<IpRangeSubscription>`
+
+**Error Responses**:
+- `"Access denied: not your subscription"` - User doesn't own this subscription
+- `"IP space is not available for allocation"` - IP space is no longer available
+- `"IP range allocation not yet implemented - please contact support to manually allocate IP ranges"` - Feature not yet complete (current status)
+
+**Example Request**:
+
+```typescript
+const request: AddIpRangeToSubscriptionRequest = {
+  ip_space_pricing_id: 5 // ID from the pricing list
+};
+
+const response = await fetch('/api/v1/subscriptions/123/ip_ranges', {
+  method: 'POST',
+  headers: {
+    'Authorization': nip98AuthHeader,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify(request)
+});
+
+const result: ApiResponse<IpRangeSubscription> = await response.json();
+
+if (!result.error) {
+  console.log(`Allocated: ${result.data.cidr}`);
+  console.log(`Started: ${result.data.started_at}`);
+}
+```
+
+**Notes**:
+1. IP allocation logic is not yet implemented - this endpoint currently returns an error
+2. When implemented, the system will:
+   - Find an available subnet of the requested prefix size
+   - Check for conflicts with existing allocations
+   - Create a subscription line item with the monthly and setup fees
+   - Create the IP range subscription record
+   - Return the allocated CIDR
+3. The allocated IP range will be added as a line item to the subscription with recurring billing
+4. Setup fees are charged once, monthly fees recur with the subscription billing cycle
+
+---
+
+## IP Space Administration (Admin API)
+
+These endpoints are only available to administrators with appropriate permissions.
+
+### List IP Spaces (Admin)
+
+**Endpoint**: `GET /api/admin/v1/ip_space`
+
+**Authentication**: Required (Admin with `ip_space::view` permission)
+
+**Query Parameters**:
+- `limit` (optional, number): Maximum items to return (default: 50, max: 100)
+- `offset` (optional, number): Items to skip (default: 0)
+- `is_available` (optional, boolean): Filter by availability status
+- `registry` (optional, number): Filter by registry (0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC)
+
+### Create IP Space (Admin)
+
+**Endpoint**: `POST /api/admin/v1/ip_space`
+
+**Authentication**: Required (Admin with `ip_space::create` permission)
+
+**Request Body**:
+```typescript
+interface CreateAvailableIpSpaceRequest {
+  cidr: string;
+  min_prefix_size: number;
+  max_prefix_size: number;
+  registry: number; // 0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC
+  external_id?: string; // RIR allocation ID
+  is_available?: boolean; // Default: true
+  is_reserved?: boolean; // Default: false
+  metadata?: object; // JSON metadata (routing requirements, etc.)
+}
+```
+
+### Update IP Space (Admin)
+
+**Endpoint**: `PATCH /api/admin/v1/ip_space/{id}`
+
+**Authentication**: Required (Admin with `ip_space::update` permission)
+
+### Delete IP Space (Admin)
+
+**Endpoint**: `DELETE /api/admin/v1/ip_space/{id}`
+
+**Authentication**: Required (Admin with `ip_space::delete` permission)
+
+**Error**: Returns error if there are active subscriptions using this IP space
+
+### Manage IP Space Pricing (Admin)
+
+**List Pricing**: `GET /api/admin/v1/ip_space/{id}/pricing`
+
+**Create Pricing**: `POST /api/admin/v1/ip_space/{id}/pricing`
+
+**Update Pricing**: `PATCH /api/admin/v1/ip_space/{space_id}/pricing/{pricing_id}`
+
+**Delete Pricing**: `DELETE /api/admin/v1/ip_space/{space_id}/pricing/{pricing_id}`
+
+**Request Body** (Create):
+```typescript
+interface CreateIpSpacePricingRequest {
+  prefix_size: number; // e.g., 24 for /24
+  price_per_month: number; // In cents/millisats
+  currency?: string; // Default: "USD"
+  setup_fee?: number; // Default: 0
+}
+```
+
+### List IP Space Subscriptions (Admin)
+
+View all subscriptions for a specific IP space.
+
+**Endpoint**: `GET /api/admin/v1/ip_space/{id}/subscriptions`
+
+**Authentication**: Required (Admin with `subscriptions::view` permission)
+
+**Query Parameters**:
+- `limit`, `offset`: Pagination
+- `user_id` (optional): Filter by user
+- `is_active` (optional): Filter by active status
+
+
 
 This documentation is optimized for LLM code generation and provides all necessary type definitions and endpoint specifications for building TypeScript frontend applications.

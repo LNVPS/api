@@ -13,6 +13,7 @@ use tokio::time::sleep;
 mod invoice;
 #[cfg(feature = "revolut")]
 mod revolut;
+pub mod stripe;
 
 pub fn listen_all_payments(
     settings: &Settings,

@@ -230,7 +230,7 @@ impl PricingEngine {
         })
     }
 
-    async fn get_tax_for_user(&self, user_id: u64, amount: u64) -> Result<u64> {
+    pub async fn get_tax_for_user(&self, user_id: u64, amount: u64) -> Result<u64> {
         let user = self.db.get_user(user_id).await?;
         if let Some(cc) = user
             .country_code
@@ -526,7 +526,7 @@ impl PricingEngine {
         })
     }
 
-    async fn get_amount_and_rate(
+    pub async fn get_amount_and_rate(
         &self,
         list_price: CurrencyAmount,
         method: PaymentMethod,

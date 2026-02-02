@@ -19,6 +19,7 @@ mod cost_plans;
 mod custom_pricing;
 mod hosts;
 mod ip_ranges;
+mod ip_space;
 mod model;
 mod regions;
 mod reports;
@@ -59,6 +60,7 @@ pub fn admin_router(
         .merge(cost_plans::router())
         .merge(custom_pricing::router())
         .merge(ip_ranges::router())
+        .merge(ip_space::router())
         .merge(access_policies::router())
         .merge(routers::router())
         .merge(vm_ip_assignments::router())

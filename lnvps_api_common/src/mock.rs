@@ -2,13 +2,7 @@ use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow, bail};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
-use lnvps_db::{
-    AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase,
-    NostrDomain, NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
-};
+use lnvps_db::{AccessPolicy, AvailableIpSpace, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
 
 use async_trait::async_trait;
 #[cfg(feature = "admin")]
@@ -1038,13 +1032,15 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn insert_subscription(&self, subscription: &Subscription) -> anyhow::Result<u64> {
-        let mut subscriptions = self.subscriptions.lock().await;
-        let max_id = subscriptions.keys().max().unwrap_or(&0);
-        let new_id = max_id + 1;
-        let mut new_subscription = subscription.clone();
-        new_subscription.id = new_id;
-        subscriptions.insert(new_id, new_subscription);
-        Ok(new_id)
+        Ok(0)
+    }
+
+    async fn insert_subscription_with_line_items(
+        &self,
+        _subscription: &Subscription,
+        _line_items: Vec<SubscriptionLineItem>,
+    ) -> anyhow::Result<u64> {
+        Ok(0)
     }
 
     async fn update_subscription(&self, subscription: &Subscription) -> anyhow::Result<()> {
@@ -1198,7 +1194,6 @@ impl LNVpsDbBase for MockDb {
             external_id: payment.external_id,
             is_paid: payment.is_paid,
             rate: payment.rate,
-            time_value: payment.time_value,
             tax: payment.tax,
             company_base_currency: "EUR".to_string(),
         })
@@ -1230,18 +1225,16 @@ impl LNVpsDbBase for MockDb {
         // Mark payment as paid
         self.update_subscription_payment(payment).await?;
 
-        // Extend subscription expiration if time_value is present
-        if let Some(time_value) = payment.time_value {
-            let mut subscriptions = self.subscriptions.lock().await;
-            if let Some(subscription) = subscriptions.get_mut(&payment.subscription_id) {
-                if let Some(expires) = subscription.expires {
-                    subscription.expires = Some(expires.add(TimeDelta::seconds(time_value as i64)));
-                } else {
-                    // If no expiration yet, set it from now
-                    subscription.expires =
-                        Some(Utc::now().add(TimeDelta::seconds(time_value as i64)));
-                }
+        // Extend subscription expiration by 30 days (subscriptions are always monthly)
+        let mut subscriptions = self.subscriptions.lock().await;
+        if let Some(subscription) = subscriptions.get_mut(&payment.subscription_id) {
+            if let Some(expires) = subscription.expires {
+                subscription.expires = Some(expires.add(TimeDelta::days(30)));
+            } else {
+                // If no expiration yet, set it from now
+                subscription.expires = Some(Utc::now().add(TimeDelta::days(30)));
             }
+            subscription.is_active = true;
         }
 
         Ok(())
@@ -1258,6 +1251,86 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_admin_user_ids(&self) -> anyhow::Result<Vec<u64>> {
         Ok(vec![])
+    }
+
+    async fn list_available_ip_space(&self) -> anyhow::Result<Vec<AvailableIpSpace>> {
+        todo!()
+    }
+
+    async fn get_available_ip_space(&self, id: u64) -> anyhow::Result<AvailableIpSpace> {
+        todo!()
+    }
+
+    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> anyhow::Result<AvailableIpSpace> {
+        todo!()
+    }
+
+    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> anyhow::Result<u64> {
+        todo!()
+    }
+
+    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn delete_available_ip_space(&self, id: u64) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn list_ip_space_pricing_by_space(&self, available_ip_space_id: u64) -> anyhow::Result<Vec<IpSpacePricing>> {
+        todo!()
+    }
+
+    async fn get_ip_space_pricing(&self, id: u64) -> anyhow::Result<IpSpacePricing> {
+        todo!()
+    }
+
+    async fn get_ip_space_pricing_by_prefix(&self, available_ip_space_id: u64, prefix_size: u16) -> anyhow::Result<IpSpacePricing> {
+        todo!()
+    }
+
+    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> anyhow::Result<u64> {
+        todo!()
+    }
+
+    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn delete_ip_space_pricing(&self, id: u64) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn list_ip_range_subscriptions_by_line_item(&self, subscription_line_item_id: u64) -> anyhow::Result<Vec<IpRangeSubscription>> {
+        todo!()
+    }
+
+    async fn list_ip_range_subscriptions_by_subscription(&self, subscription_id: u64) -> anyhow::Result<Vec<IpRangeSubscription>> {
+        todo!()
+    }
+
+    async fn list_ip_range_subscriptions_by_user(&self, user_id: u64) -> anyhow::Result<Vec<IpRangeSubscription>> {
+        todo!()
+    }
+
+    async fn get_ip_range_subscription(&self, id: u64) -> anyhow::Result<IpRangeSubscription> {
+        todo!()
+    }
+
+    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> anyhow::Result<IpRangeSubscription> {
+        todo!()
+    }
+
+    async fn insert_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> anyhow::Result<u64> {
+        todo!()
+    }
+
+    async fn update_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn delete_ip_range_subscription(&self, id: u64) -> anyhow::Result<()> {
+        todo!()
     }
 }
 
