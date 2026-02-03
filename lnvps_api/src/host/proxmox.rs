@@ -7,6 +7,7 @@ use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
+use backon::{ExponentialBuilder, Retryable};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use lnvps_api_common::{VmRunningState, VmRunningStates};
@@ -51,6 +52,14 @@ pub struct ProxmoxClient {
 }
 
 impl ProxmoxClient {
+    /// Create a retry policy for Proxmox API operations
+    fn retry_policy() -> ExponentialBuilder {
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(5))
+            .with_max_times(3)
+    }
+
     pub fn new(
         base: Url,
         node: &str,
@@ -81,12 +90,19 @@ impl ProxmoxClient {
     }
 
     pub async fn get_vm_status(&self, node: &str, vm_id: ProxmoxVmId) -> Result<VmInfo> {
-        let rsp: ResponseBase<VmInfo> = self
-            .api
-            .get(&format!(
-                "/api2/json/nodes/{node}/qemu/{vm_id}/status/current"
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<VmInfo> = (|| async {
+            api.get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/status/current",
+                node_str, vm_id
             ))
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(rsp.data)
     }
 
@@ -133,14 +149,20 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
     pub async fn create_vm(&self, req: CreateVm) -> Result<TaskId> {
-        let rsp: ResponseBase<Option<String>> = self
-            .api
-            .post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
-            .await?;
+        let api = &self.api;
+        let node_clone = req.node.clone();
+        
+        let rsp: ResponseBase<Option<String>> = (|| async {
+            api.post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
+                .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         if let Some(id) = rsp.data {
-            Ok(TaskId { id, node: req.node })
+            Ok(TaskId { id, node: node_clone })
         } else {
-            Err(anyhow!("Failed to configure VM"))
+            Err(anyhow!("Failed to create VM"))
         }
     }
 
@@ -148,10 +170,16 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
     pub async fn get_vm_config(&self, node: &str, vm_id: ProxmoxVmId) -> Result<HashedVmConfig> {
-        let rsp: ResponseBase<HashedVmConfig> = self
-            .api
-            .get(&format!("/api2/json/nodes/{}/qemu/{}/config", node, vm_id))
-            .await?;
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<HashedVmConfig> = (|| async {
+            api.get(&format!("/api2/json/nodes/{}/qemu/{}/config", node_str, vm_id))
+                .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(rsp.data)
     }
 
@@ -159,15 +187,21 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
     pub async fn configure_vm(&self, req: ConfigureVm) -> Result<TaskId> {
-        let rsp: ResponseBase<Option<String>> = self
-            .api
-            .post(
+        let api = &self.api;
+        let node_clone = req.node.clone();
+        
+        let rsp: ResponseBase<Option<String>> = (|| async {
+            api.post(
                 &format!("/api2/json/nodes/{}/qemu/{}/config", req.node, req.vm_id),
                 &req,
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         if let Some(id) = rsp.data {
-            Ok(TaskId { id, node: req.node })
+            Ok(TaskId { id, node: node_clone })
         } else {
             Err(anyhow!("Failed to configure VM"))
         }
@@ -177,21 +211,27 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu
     pub async fn delete_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
-        let rsp: ResponseBase<Option<String>> = self
-            .api
-            .req::<_, ()>(
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<Option<String>> = (|| async {
+            api.req::<_, ()>(
                 Method::DELETE,
-                &format!("/api2/json/nodes/{node}/qemu/{vm}"),
+                &format!("/api2/json/nodes/{}/qemu/{}", node_str, vm),
                 None,
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         if let Some(id) = rsp.data {
             Ok(TaskId {
                 id,
-                node: node.to_string(),
+                node: node_str,
             })
         } else {
-            Err(anyhow!("Failed to configure VM"))
+            Err(anyhow!("Failed to delete VM"))
         }
     }
 
@@ -215,13 +255,20 @@ impl ProxmoxClient {
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/tasks/{upid}/status
     pub async fn get_task_status(&self, task: &TaskId) -> Result<TaskStatus> {
-        let rsp: ResponseBase<TaskStatus> = self
-            .api
-            .get(&format!(
+        let api = &self.api;
+        let task_node = task.node.clone();
+        let task_id = task.id.clone();
+        
+        let rsp: ResponseBase<TaskStatus> = (|| async {
+            api.get(&format!(
                 "/api2/json/nodes/{}/tasks/{}/status",
-                task.node, task.id
+                task_node, task_id
             ))
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(rsp.data)
     }
 
@@ -264,19 +311,25 @@ impl ProxmoxClient {
 
     /// Download an image to the host disk
     pub async fn download_image(&self, req: DownloadUrlRequest) -> Result<TaskId> {
-        let rsp: ResponseBase<String> = self
-            .api
-            .post(
+        let api = &self.api;
+        let node_clone = req.node.clone();
+        
+        let rsp: ResponseBase<String> = (|| async {
+            api.post(
                 &format!(
                     "/api2/json/nodes/{}/storage/{}/download-url",
                     req.node, req.storage
                 ),
                 &req,
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(TaskId {
             id: rsp.data,
-            node: req.node,
+            node: node_clone,
         })
     }
 
@@ -284,15 +337,11 @@ impl ProxmoxClient {
         // import the disk
         // TODO: find a way to avoid using SSH
         if let Some(ssh_config) = &self.ssh {
-            let mut ses = SshClient::new()?;
-            ses.connect(
-                (self.api.base().host().unwrap().to_string(), 22),
-                &ssh_config.user,
-                &ssh_config.key,
-            )
-            .await?;
-
-            // Disk import args
+            let ssh_user = ssh_config.user.clone();
+            let ssh_key = ssh_config.key.clone();
+            let host = self.api.base().host().unwrap().to_string();
+            
+            // Prepare command first
             let mut disk_args: HashMap<&str, String> = HashMap::new();
             disk_args.insert(
                 "import-from",
@@ -316,7 +365,16 @@ impl ProxmoxClient {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            let (code, rsp) = ses.execute(cmd.as_str()).await?;
+            
+            // SSH connection and execution with retry
+            let (code, rsp) = (|| async {
+                let mut s = SshClient::new()?;
+                s.connect((host.clone(), 22), &ssh_user, &ssh_key).await?;
+                s.execute(&cmd).await
+            })
+            .retry(Self::retry_policy())
+            .await?;
+            
             info!("{}", rsp);
 
             if code != 0 {
@@ -330,77 +388,107 @@ impl ProxmoxClient {
 
     /// Resize a disk on a VM
     pub async fn resize_disk(&self, req: ResizeDiskRequest) -> Result<TaskId> {
-        let rsp: ResponseBase<String> = self
-            .api
-            .req(
+        let api = &self.api;
+        let node_clone = req.node.clone();
+        
+        let rsp: ResponseBase<String> = (|| async {
+            api.req(
                 Method::PUT,
                 &format!("/api2/json/nodes/{}/qemu/{}/resize", &req.node, &req.vm_id),
                 Some(&req),
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(TaskId {
             id: rsp.data,
-            node: req.node,
+            node: node_clone,
         })
     }
 
     /// Start a VM
     pub async fn start_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
-        let rsp: ResponseBase<String> = self
-            .api
-            .post(
-                &format!("/api2/json/nodes/{}/qemu/{}/status/start", node, vm),
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<String> = (|| async {
+            api.post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/start", node_str, vm),
                 (),
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(TaskId {
             id: rsp.data,
-            node: node.to_string(),
+            node: node_str,
         })
     }
 
     /// Stop a VM
     pub async fn stop_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
-        let rsp: ResponseBase<String> = self
-            .api
-            .post(
-                &format!("/api2/json/nodes/{}/qemu/{}/status/stop", node, vm),
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<String> = (|| async {
+            api.post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/stop", node_str, vm),
                 (),
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(TaskId {
             id: rsp.data,
-            node: node.to_string(),
+            node: node_str,
         })
     }
 
     /// Stop a VM
     pub async fn shutdown_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
-        let rsp: ResponseBase<String> = self
-            .api
-            .post(
-                &format!("/api2/json/nodes/{}/qemu/{}/status/shutdown", node, vm),
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<String> = (|| async {
+            api.post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/shutdown", node_str, vm),
                 (),
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(TaskId {
             id: rsp.data,
-            node: node.to_string(),
+            node: node_str,
         })
     }
 
     /// Stop a VM
     pub async fn reset_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
-        let rsp: ResponseBase<String> = self
-            .api
-            .post(
-                &format!("/api2/json/nodes/{}/qemu/{}/status/reset", node, vm),
+        let api = &self.api;
+        let node_str = node.to_string();
+        
+        let rsp: ResponseBase<String> = (|| async {
+            api.post(
+                &format!("/api2/json/nodes/{}/qemu/{}/status/reset", node_str, vm),
                 (),
             )
-            .await?;
+            .await
+        })
+        .retry(Self::retry_policy())
+        .await?;
+        
         Ok(TaskId {
             id: rsp.data,
-            node: node.to_string(),
+            node: node_str,
         })
     }
 

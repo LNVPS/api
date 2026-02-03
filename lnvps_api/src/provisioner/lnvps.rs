@@ -3,6 +3,7 @@ use crate::host::{FullVmInfo, get_host_client};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{Context, Result, bail, ensure};
+use backon::{ExponentialBuilder, Retryable};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
@@ -47,6 +48,11 @@ pub struct LNVpsProvisioner {
 }
 
 impl LNVpsProvisioner {
+    /// Create a retry policy for network operations (DNS, Router, Host)
+    fn retry_policy() -> ExponentialBuilder {
+        ExponentialBuilder::default()
+    }
+
     pub fn new(
         settings: Settings,
         db: Arc<dyn LNVpsDb>,
@@ -107,11 +113,20 @@ impl LNVpsProvisioner {
                 .await?;
             let vm = self.db.get_vm(assignment.vm_id).await?;
             let entry = ArpEntry::new(&vm, assignment, policy.interface.clone())?;
-            let arp = if let Some(_id) = &assignment.arp_ref {
-                router.update_arp_entry(&entry).await?
-            } else {
-                router.add_arp_entry(&entry).await?
-            };
+
+            let has_arp_ref = assignment.arp_ref.is_some();
+            let entry_clone = entry.clone();
+
+            let arp = (|| async {
+                if has_arp_ref {
+                    router.update_arp_entry(&entry_clone).await
+                } else {
+                    router.add_arp_entry(&entry_clone).await
+                }
+            })
+                .retry(Self::retry_policy())
+                .await?;
+
             ensure!(arp.id.is_some(), "ARP id was empty");
             assignment.arp_ref = arp.id;
         }
@@ -138,7 +153,11 @@ impl LNVpsProvisioner {
             } else {
                 warn!("ARP REF not found, using arp list");
 
-                let ent = router.list_arp_entry().await?;
+                let router_clone = router.clone();
+                let ent = (|| async { router_clone.list_arp_entry().await })
+                    .retry(Self::retry_policy())
+                    .await?;
+
                 if let Some(ent) = ent.iter().find(|e| e.address == assignment.ip) {
                     ent.id.clone()
                 } else {
@@ -148,8 +167,14 @@ impl LNVpsProvisioner {
             };
 
             if let Some(id) = id {
-                if let Err(e) = router.remove_arp_entry(&id).await {
-                    warn!("Failed to remove arp entry, skipping: {}", e);
+                let router_clone = router.clone();
+                let id_clone = id.clone();
+
+                if let Err(e) = (|| async { router_clone.remove_arp_entry(&id_clone).await })
+                    .retry(Self::retry_policy())
+                    .await
+                {
+                    warn!("Failed to remove arp entry after retries, skipping: {}", e);
                 }
             }
             assignment.arp_ref = None;
@@ -165,16 +190,34 @@ impl LNVpsProvisioner {
 
             if let (Some(z), Some(_ref)) = (&range.reverse_zone_id, &assignment.dns_reverse_ref) {
                 let rev = BasicRecord::reverse(assignment)?;
-                if let Err(e) = dns.delete_record(z, &rev).await {
-                    warn!("Failed to delete reverse record: {}", e);
+                let dns_clone = dns.clone();
+                let z_clone = z.clone();
+                let rev_clone = rev.clone();
+
+                if let Err(e) = (|| async {
+                    dns_clone.delete_record(&z_clone, &rev_clone).await
+                })
+                    .retry(Self::retry_policy())
+                    .await
+                {
+                    warn!("Failed to delete reverse record after retries: {}", e);
                 }
                 assignment.dns_reverse_ref = None;
                 assignment.dns_reverse = None;
             }
             if let (Some(z), Some(_ref)) = (&self.forward_zone_id, &assignment.dns_forward_ref) {
                 let rev = BasicRecord::forward(assignment)?;
-                if let Err(e) = dns.delete_record(z, &rev).await {
-                    warn!("Failed to delete forward record: {}", e);
+                let dns_clone = dns.clone();
+                let z_clone = z.clone();
+                let rev_clone = rev.clone();
+
+                if let Err(e) = (|| async {
+                    dns_clone.delete_record(&z_clone, &rev_clone).await
+                })
+                    .retry(Self::retry_policy())
+                    .await
+                {
+                    warn!("Failed to delete forward record after retries: {}", e);
                 }
                 assignment.dns_forward_ref = None;
                 assignment.dns_forward = None;
@@ -187,11 +230,20 @@ impl LNVpsProvisioner {
     pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
         if let (Some(z), Some(dns)) = (&self.forward_zone_id, &self.dns) {
             let fwd = BasicRecord::forward(assignment)?;
-            let ret_fwd = if fwd.id.is_some() {
-                dns.update_record(z, &fwd).await?
-            } else {
-                dns.add_record(z, &fwd).await?
-            };
+            let dns_clone = dns.clone();
+            let z_clone = z.clone();
+            let fwd_clone = fwd.clone();
+
+            let ret_fwd = (|| async {
+                if fwd_clone.id.is_some() {
+                    dns_clone.update_record(&z_clone, &fwd_clone).await
+                } else {
+                    dns_clone.add_record(&z_clone, &fwd_clone).await
+                }
+            })
+                .retry(Self::retry_policy())
+                .await?;
+
             assignment.dns_forward = Some(ret_fwd.name);
             assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
         }
@@ -203,13 +255,25 @@ impl LNVpsProvisioner {
         if let Some(dns) = &self.dns {
             let range = self.db.get_ip_range(assignment.ip_range_id).await?;
             if let Some(z) = &range.reverse_zone_id {
-                let ret_rev = if assignment.dns_reverse_ref.is_some() {
-                    dns.update_record(z, &BasicRecord::reverse(assignment)?)
-                        .await?
+                let dns_clone = dns.clone();
+                let z_clone = z.clone();
+                let has_ref = assignment.dns_reverse_ref.is_some();
+                let rev_record = if has_ref {
+                    BasicRecord::reverse(assignment)?
                 } else {
-                    dns.add_record(z, &BasicRecord::reverse_to_fwd(assignment)?)
-                        .await?
+                    BasicRecord::reverse_to_fwd(assignment)?
                 };
+
+                let ret_rev = (|| async {
+                    if has_ref {
+                        dns_clone.update_record(&z_clone, &rev_record).await
+                    } else {
+                        dns_clone.add_record(&z_clone, &rev_record).await
+                    }
+                })
+                    .retry(Self::retry_policy())
+                    .await?;
+
                 assignment.dns_reverse = Some(ret_rev.value);
                 assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
             }
@@ -569,7 +633,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         let price = pe.get_vm_cost(vm_id, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -587,7 +651,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -707,7 +771,14 @@ impl LNVpsProvisioner {
     pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> Result<()> {
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let client = get_host_client(&info.host, &self.provisioner_config)?;
-        client.configure_vm(&info).await
+
+        (|| async {
+            let client_clone = client.clone();
+            let info_clone = &info;
+            client_clone.configure_vm(info_clone).await
+        })
+            .retry(Self::retry_policy())
+            .await
     }
 
     /// Create a vm on the host as configured by the template
@@ -715,14 +786,71 @@ impl LNVpsProvisioner {
         if self.read_only {
             bail!("Cant spawn VM's in read-only mode")
         }
+
+        // Track if we allocated IPs in this call (for rollback)
+        let mut allocated_ips = false;
+
         // setup network by allocating some IP space
-        self.allocate_ips(vm_id).await?;
+        let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
+        if existing_ips.is_empty() {
+            match self.allocate_ips(vm_id).await {
+                Ok(_) => allocated_ips = true,
+                Err(e) => {
+                    // No rollback needed - IP allocation failed before committing anything
+                    return Err(e.context("Failed to allocate IPs"));
+                }
+            }
+        }
 
         // load full info
-        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let client = get_host_client(&info.host, &self.provisioner_config)?;
-        client.create_vm(&info).await?;
+        let info = match FullVmInfo::load(vm_id, self.db.clone()).await {
+            Ok(i) => i,
+            Err(e) => {
+                if allocated_ips {
+                    warn!("Failed to load VM info after allocating IPs, attempting rollback");
+                    if let Err(rollback_err) = self.rollback_ip_allocation(vm_id).await {
+                        warn!("Failed to rollback IP allocation: {}", rollback_err);
+                    }
+                }
+                return Err(e.context("Failed to load VM info"));
+            }
+        };
 
+        let client = get_host_client(&info.host, &self.provisioner_config)?;
+
+        // Attempt to create the VM with retry logic
+        let create_result = (|| async {
+            let client_clone = client.clone();
+            let info_clone = &info;
+            client_clone.create_vm(info_clone).await
+        })
+            .retry(Self::retry_policy())
+            .await;
+
+        match create_result {
+            Ok(_) => {
+                info!("Successfully spawned VM {}", vm_id);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to create VM {} on host after retries, attempting rollback", vm_id);
+                if allocated_ips {
+                    if let Err(rollback_err) = self.rollback_ip_allocation(vm_id).await {
+                        warn!("Failed to rollback IP allocation for VM {}: {}", vm_id, rollback_err);
+                    } else {
+                        info!("Successfully rolled back IP allocation for VM {}", vm_id);
+                    }
+                }
+                Err(e.context("Failed to create VM on host"))
+            }
+        }
+    }
+
+    /// Rollback IP allocation by deleting all IP assignments
+    /// This is called when VM creation fails after IPs have been allocated
+    async fn rollback_ip_allocation(&self, vm_id: u64) -> Result<()> {
+        info!("Rolling back IP allocation for VM {}", vm_id);
+        self.delete_all_ip_assignments(vm_id).await?;
         Ok(())
     }
 
@@ -732,8 +860,16 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        if let Err(e) = client.delete_vm(&vm).await {
-            warn!("Failed to delete VM: {}", e);
+        let vm_clone = vm.clone();
+
+        if let Err(e) = (|| async {
+            let client_clone = client.clone();
+            client_clone.delete_vm(&vm_clone).await
+        })
+            .retry(Self::retry_policy())
+            .await
+        {
+            warn!("Failed to delete VM from host after retries: {}", e);
         }
 
         self.delete_all_ip_assignments(vm_id).await?;
@@ -748,7 +884,15 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        client.start_vm(&vm).await?;
+        let vm_clone = vm.clone();
+
+        (|| async {
+            let client_clone = client.clone();
+            client_clone.start_vm(&vm_clone).await
+        })
+            .retry(Self::retry_policy())
+            .await?;
+
         Ok(())
     }
 
@@ -758,7 +902,15 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        client.stop_vm(&vm).await?;
+        let vm_clone = vm.clone();
+
+        (|| async {
+            let client_clone = client.clone();
+            client_clone.stop_vm(&vm_clone).await
+        })
+            .retry(Self::retry_policy())
+            .await?;
+
         Ok(())
     }
 
@@ -775,7 +927,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         pe.calculate_upgrade_cost(vm_id, cfg, method).await
     }
 
@@ -825,7 +977,7 @@ impl LNVpsProvisioner {
             PaymentType::Upgrade,
             Some(upgrade_params_json),
         )
-        .await
+            .await
     }
 
     /// Create a new custom template using a vm's existing standard template
