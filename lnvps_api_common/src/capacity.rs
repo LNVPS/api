@@ -147,7 +147,7 @@ impl HostCapacityService {
         // remove templates with 0 max cpu/ram/disk
         Ok(templates
             .into_iter()
-            .filter(|t| t.max_cpu > 0 && t.max_memory > 0 && t.disks.len() > 0)
+            .filter(|t| t.max_cpu > 0 && t.max_memory > 0 && !t.disks.is_empty())
             .collect())
     }
 

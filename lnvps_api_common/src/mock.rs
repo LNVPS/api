@@ -1049,8 +1049,8 @@ impl LNVpsDbBase for MockDb {
 
     async fn update_subscription(&self, subscription: &Subscription) -> anyhow::Result<()> {
         let mut subscriptions = self.subscriptions.lock().await;
-        if subscriptions.contains_key(&subscription.id) {
-            subscriptions.insert(subscription.id, subscription.clone());
+        if let std::collections::hash_map::Entry::Occupied(mut e) = subscriptions.entry(subscription.id) {
+            e.insert(subscription.clone());
             Ok(())
         } else {
             bail!("Subscription not found: {}", subscription.id)
@@ -1112,8 +1112,8 @@ impl LNVpsDbBase for MockDb {
         line_item: &SubscriptionLineItem,
     ) -> anyhow::Result<()> {
         let mut line_items = self.subscription_line_items.lock().await;
-        if line_items.contains_key(&line_item.id) {
-            line_items.insert(line_item.id, line_item.clone());
+        if let std::collections::hash_map::Entry::Occupied(mut e) = line_items.entry(line_item.id) {
+            e.insert(line_item.clone());
             Ok(())
         } else {
             bail!("Subscription line item not found: {}", line_item.id)

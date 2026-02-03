@@ -381,7 +381,7 @@ impl Worker {
             if !is_new_vm {
                 vms_by_host
                     .entry(vm.host_id)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(vm);
             }
 
@@ -435,8 +435,8 @@ impl Worker {
         title: Option<String>,
     ) -> Result<()> {
         let user = self.db.get_user(user_id).await?;
-        if let Some(smtp) = self.settings.smtp.as_ref() {
-            if user.contact_email && user.email.is_some() {
+        if let Some(smtp) = self.settings.smtp.as_ref()
+            && user.contact_email && user.email.is_some() {
                 // send email
                 let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
                 if let Some(t) = title {
@@ -465,9 +465,8 @@ impl Worker {
 
                 sender.send(msg).await?;
             }
-        }
-        if user.contact_nip17 {
-            if let Some(c) = self.nostr.as_ref() {
+        if user.contact_nip17
+            && let Some(c) = self.nostr.as_ref() {
                 let sig = c.signer().await?;
                 let ev = EventBuilder::private_msg(
                     &sig,
@@ -478,7 +477,6 @@ impl Worker {
                 .await?;
                 c.send_event(&ev).await?;
             }
-        }
         Ok(())
     }
 

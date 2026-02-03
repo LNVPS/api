@@ -157,11 +157,10 @@ async fn admin_create_ip_range(
     }
 
     // Validate access policy if provided
-    if let Some(policy_id) = req.access_policy_id {
-        if let Err(_) = this.db.get_access_policy(policy_id).await {
+    if let Some(policy_id) = req.access_policy_id
+        && let Err(_) = this.db.get_access_policy(policy_id).await {
             return ApiData::err("Specified access policy does not exist");
         }
-    }
 
     // Create IP range object
     let ip_range = req.to_ip_range()?;

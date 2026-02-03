@@ -111,11 +111,10 @@ pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<Curren
     let mut ret2 = vec![];
     for y in rates.iter() {
         for x in ret.iter() {
-            if let Ok(r1) = y.convert(*x) {
-                if r1.currency() != source.currency() {
+            if let Ok(r1) = y.convert(*x)
+                && r1.currency() != source.currency() {
                     ret2.push(r1);
                 }
-            }
         }
     }
     ret.append(&mut ret2);
@@ -261,7 +260,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), usd, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), usd, self.cache_ttl.as_secs())
                 .await?;
         }
         if let Some(eur) = rates.eur {
@@ -270,7 +269,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), eur, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), eur, self.cache_ttl.as_secs())
                 .await?;
         }
         if let Some(gbp) = rates.gbp {
@@ -279,7 +278,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), gbp, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), gbp, self.cache_ttl.as_secs())
                 .await?;
         }
         if let Some(cad) = rates.cad {
@@ -288,7 +287,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), cad, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), cad, self.cache_ttl.as_secs())
                 .await?;
         }
         if let Some(chf) = rates.chf {
@@ -297,7 +296,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), chf, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), chf, self.cache_ttl.as_secs())
                 .await?;
         }
         if let Some(aud) = rates.aud {
@@ -306,7 +305,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), aud, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), aud, self.cache_ttl.as_secs())
                 .await?;
         }
         if let Some(jpy) = rates.jpy {
@@ -315,7 +314,7 @@ impl RedisExchangeRateService {
             ret.push(ticker_rate);
 
             let _: () = conn
-                .set_ex(&self.ticker_key(&ticker), jpy, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), jpy, self.cache_ttl.as_secs())
                 .await?;
         }
 
@@ -334,17 +333,16 @@ impl ExchangeRateService for RedisExchangeRateService {
         trace!("{}: {}", &ticker, amount);
         if let Ok(mut conn) = self.redis_client.get_multiplexed_async_connection().await {
             let _: Result<(), redis::RedisError> = conn
-                .set_ex(&self.ticker_key(&ticker), amount, self.cache_ttl.as_secs())
+                .set_ex(self.ticker_key(&ticker), amount, self.cache_ttl.as_secs())
                 .await;
         }
     }
 
     async fn get_rate(&self, ticker: Ticker) -> Option<f32> {
-        if let Ok(mut conn) = self.redis_client.get_multiplexed_async_connection().await {
-            if let Ok(rate) = conn.get::<_, f32>(&self.ticker_key(&ticker)).await {
+        if let Ok(mut conn) = self.redis_client.get_multiplexed_async_connection().await
+            && let Ok(rate) = conn.get::<_, f32>(&self.ticker_key(&ticker)).await {
                 return Some(rate);
             }
-        }
         None
     }
 

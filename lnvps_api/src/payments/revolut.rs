@@ -71,11 +71,10 @@ impl RevolutPaymentHandler {
                 Ok(m) => m,
             };
 
-            if let RevolutWebhookEvent::OrderCompleted = msg.event {
-                if let Err(e) = self.try_complete_payment(&msg.order_id).await {
+            if let RevolutWebhookEvent::OrderCompleted = msg.event
+                && let Err(e) = self.try_complete_payment(&msg.order_id).await {
                     error!("Failed to complete order: {}", e);
                 }
-            }
         }
         Ok(())
     }
@@ -133,8 +132,8 @@ impl RevolutPaymentHandler {
         }
 
         // Log VM renewal if this extends the expiration
-        if payment.time_value > 0 {
-            if let Err(e) = self
+        if payment.time_value > 0
+            && let Err(e) = self
                 .vm_history_logger
                 .log_vm_renewed(
                     payment.vm_id,
@@ -152,7 +151,6 @@ impl RevolutPaymentHandler {
             {
                 warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
             }
-        }
 
         // Handle upgrade payments differently - trigger upgrade processing instead of just checking VM
         if payment.payment_type == lnvps_db::PaymentType::Upgrade {

@@ -792,7 +792,7 @@ impl ProxmoxClient {
             scsi_hw: Some("virtio-scsi-pci".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
-            ssh_keys: Some(urlencoding::encode(&value.ssh_key.key_data.as_str()).to_string()),
+            ssh_keys: Some(urlencoding::encode(value.ssh_key.key_data.as_str()).to_string()),
             efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
             ..Default::default()
         })
@@ -941,11 +941,10 @@ impl VmHostClient for ProxmoxClient {
         self.patch_firewall(req).await?;
 
         // try start, otherwise ignore error (maybe its already running)
-        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
-            if let Err(e) = self.wait_for_task(&j_start).await {
+        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
+            && let Err(e) = self.wait_for_task(&j_start).await {
                 warn!("Failed to start vm: {}", e);
             }
-        }
 
         Ok(())
     }
@@ -983,11 +982,10 @@ impl VmHostClient for ProxmoxClient {
         let vm_id = req.vm.id.into();
 
         // try stop, otherwise ignore error (maybe its already running)
-        if let Ok(j_stop) = self.stop_vm(&self.node, vm_id).await {
-            if let Err(e) = self.wait_for_task(&j_stop).await {
+        if let Ok(j_stop) = self.stop_vm(&self.node, vm_id).await
+            && let Err(e) = self.wait_for_task(&j_stop).await {
                 warn!("Failed to stop vm: {}", e);
             }
-        }
 
         // unlink the existing main disk
         self.unlink_disk(&self.node, vm_id, vec!["scsi0".to_string()], true)
@@ -997,11 +995,10 @@ impl VmHostClient for ProxmoxClient {
         self.import_template_disk(req).await?;
 
         // try start, otherwise ignore error (maybe its already running)
-        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
-            if let Err(e) = self.wait_for_task(&j_start).await {
+        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
+            && let Err(e) = self.wait_for_task(&j_start).await {
                 warn!("Failed to start vm: {}", e);
             }
-        }
 
         Ok(())
     }

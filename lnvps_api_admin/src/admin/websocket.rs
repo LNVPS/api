@@ -119,12 +119,11 @@ async fn handle_socket(socket: WebSocket, this: RouterState, params: WebSocketQu
         }
     };
 
-    if let Ok(json) = serde_json::to_string(&connection_message) {
-        if let Err(e) = sender.send(Message::Text(json.into())).await {
+    if let Ok(json) = serde_json::to_string(&connection_message)
+        && let Err(e) = sender.send(Message::Text(json.into())).await {
             warn!("Failed to send connection confirmation: {}", e);
             return;
         }
-    }
 
     loop {
         select! {

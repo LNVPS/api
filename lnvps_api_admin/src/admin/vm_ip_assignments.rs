@@ -173,7 +173,7 @@ async fn admin_create_vm_ip_assignment(
         }
 
         // Return a success response indicating the job has been queued
-        return ApiData::ok(AdminVmIpAssignmentInfo {
+        ApiData::ok(AdminVmIpAssignmentInfo {
             id: 0, // Will be assigned by worker
             vm_id: req.vm_id,
             ip_range_id: req.ip_range_id,
@@ -188,9 +188,9 @@ async fn admin_create_vm_ip_assignment(
             dns_reverse_ref: None,
             ip_range_cidr: None,
             region_name: None,
-        });
+        })
     } else {
-        return ApiData::err("Work commander not configured - cannot assign IP via provisioner");
+        ApiData::err("Work commander not configured - cannot assign IP via provisioner")
     }
 }
 
@@ -257,8 +257,8 @@ async fn admin_update_vm_ip_assignment(
         AdminVmIpAssignmentInfo::from_ip_assignment_with_admin_data(&this.db, &assignment).await?;
 
     // Send ConfigureVm job to update VM network configuration
-    if let Some(work_commander) = &this.work_commander {
-        if let Err(e) = work_commander
+    if let Some(work_commander) = &this.work_commander
+        && let Err(e) = work_commander
             .send_job(WorkJob::UpdateVmIp {
                 assignment_id: assignment.id,
                 admin_user_id: Some(auth.user_id),
@@ -272,7 +272,6 @@ async fn admin_update_vm_ip_assignment(
                 e
             );
         }
-    }
     ApiData::ok(admin_assignment)
 }
 

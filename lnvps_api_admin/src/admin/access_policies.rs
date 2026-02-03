@@ -116,11 +116,10 @@ async fn admin_create_access_policy(
     }
 
     // Validate router exists if provided
-    if let Some(router_id) = req.router_id {
-        if let Err(_) = this.db.get_router(router_id).await {
+    if let Some(router_id) = req.router_id
+        && let Err(_) = this.db.get_router(router_id).await {
             return ApiData::err("Specified router does not exist");
         }
-    }
 
     // Create access policy object
     let access_policy = req.to_access_policy()?;

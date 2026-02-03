@@ -535,7 +535,7 @@ async fn admin_list_vm_payments(
 
     let admin_payments: Vec<AdminVmPaymentInfo> = payments
         .iter()
-        .map(|payment| AdminVmPaymentInfo::from_vm_payment(payment))
+        .map(AdminVmPaymentInfo::from_vm_payment)
         .collect();
 
     ApiPaginatedData::ok(admin_payments, total, limit, offset)

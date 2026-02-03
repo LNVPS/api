@@ -217,7 +217,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
                         pub token: String,
                     }
                     let data: RevolutData =
-                        serde_json::from_str(&value.external_data.as_str()).unwrap();
+                        serde_json::from_str(value.external_data.as_str()).unwrap();
                     ApiPaymentData::Revolut { token: data.token }
                 }
                 PaymentMethod::Paypal => {
@@ -229,7 +229,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
                         pub session_id: String,
                     }
                     let data: StripeData =
-                        serde_json::from_str(&value.external_data.as_str()).unwrap();
+                        serde_json::from_str(value.external_data.as_str()).unwrap();
                     ApiPaymentData::Stripe {
                         session_id: data.session_id,
                     }

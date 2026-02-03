@@ -120,7 +120,7 @@ fn load_or_generate_key<P: AsRef<Path>>(
     } else if auto_generate {
         // Generate new key
         let mut key_bytes = [0u8; 32];
-        let mut rng = OsRng::default();
+        let mut rng = OsRng;
         rng.fill_bytes(&mut key_bytes);
 
         // Create directory if it doesn't exist
@@ -130,7 +130,7 @@ fn load_or_generate_key<P: AsRef<Path>>(
         }
 
         // Write key to file with restrictive permissions
-        fs::write(key_path, &key_bytes)
+        fs::write(key_path, key_bytes)
             .map_err(|e| anyhow!("Failed to write encryption key file: {}", e))?;
 
         // Set file permissions to 600 (owner read/write only)

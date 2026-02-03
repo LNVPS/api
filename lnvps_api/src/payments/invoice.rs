@@ -72,8 +72,8 @@ impl NodeInvoiceHandler {
         }
 
         // Log VM renewal if this extends the expiration
-        if payment.time_value > 0 {
-            if let Err(e) = self
+        if payment.time_value > 0
+            && let Err(e) = self
                 .vm_history_logger
                 .log_vm_renewed(
                     payment.vm_id,
@@ -91,7 +91,6 @@ impl NodeInvoiceHandler {
             {
                 warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
             }
-        }
 
         info!(
             "VM payment {} for {}, paid",

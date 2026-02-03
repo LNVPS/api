@@ -264,8 +264,8 @@ impl WorkCommander {
 
         for stream_key in results.keys {
             for stream_id in stream_key.ids {
-                if let Some(job_value) = stream_id.map.get("job") {
-                    if let Ok(job_str) = String::from_redis_value(job_value) {
+                if let Some(job_value) = stream_id.map.get("job")
+                    && let Ok(job_str) = String::from_redis_value(job_value) {
                         match serde_json::from_str::<WorkJob>(&job_str) {
                             Ok(job) => {
                                 jobs.push((stream_id.id.clone(), job));
@@ -275,7 +275,6 @@ impl WorkCommander {
                             }
                         }
                     }
-                }
             }
         }
 
@@ -300,7 +299,7 @@ impl WorkCommander {
 
         // Also publish to global feedback channel for monitoring
         let _: u64 = conn
-            .publish(&JobFeedback::global_channel_name(), &feedback_json)
+            .publish(JobFeedback::global_channel_name(), &feedback_json)
             .await?;
 
         Ok(())

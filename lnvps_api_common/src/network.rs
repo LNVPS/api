@@ -57,9 +57,7 @@ impl NetworkProvisioner {
         }
 
         // filter by kind
-        ip_ranges = ip_ranges
-            .into_iter()
-            .filter(|r| {
+        ip_ranges.retain(|r| {
                 let net = r.cidr.parse();
                 match (net, &kind) {
                     (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
@@ -67,8 +65,7 @@ impl NetworkProvisioner {
                     (Err(_), _) => false,
                     _ => true,
                 }
-            })
-            .collect();
+            });
 
         // Randomize the order of IP ranges for even distribution
         ip_ranges.shuffle(&mut rand::rng());

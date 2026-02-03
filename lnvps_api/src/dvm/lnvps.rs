@@ -140,7 +140,7 @@ impl DVMHandler for LnvpsDvm {
             payment = payment.tag(Tag::parse([
                 "amount",
                 invoice.amount.to_string().as_str(),
-                &invoice.external_data.as_str(),
+                invoice.external_data.as_str(),
             ])?);
             client.send_event_builder(payment).await?;
 

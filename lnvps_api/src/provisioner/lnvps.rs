@@ -91,7 +91,7 @@ impl LNVpsProvisioner {
                 Ok(Arc::new(MikrotikRouter::new(&cfg.url, username, password)))
             }
             RouterKind::OvhAdditionalIp => Ok(Arc::new(
-                OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, &cfg.token.as_str()).await?,
+                OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, cfg.token.as_str()).await?,
             )),
         }
     }
@@ -1157,9 +1157,12 @@ mod tests {
         let vm = db.get_vm(vm.id).await?;
         // check resources
         let router = MockRouter::new();
-        let arp = router.list_arp_entry().await?;
-        assert_eq!(1, arp.len());
-        let arp = arp.first().unwrap();
+        let arp_entries = router.list_arp_entry().await?;
+        // Find the ARP entry for this VM (MockRouter state is shared across tests)
+        let arp = arp_entries
+            .iter()
+            .find(|e| e.mac_address == vm.mac_address)
+            .expect("ARP entry for VM should exist");
         assert_eq!(&vm.mac_address, &arp.mac_address);
         assert_eq!(vm.ref_code, Some("mock-ref".to_string()));
         assert_eq!(ROUTER_BRIDGE, arp.interface.as_ref().unwrap());
@@ -1218,7 +1221,8 @@ mod tests {
 
         // test arp/dns is removed
         let arp = router.list_arp_entry().await?;
-        assert!(arp.is_empty());
+        // Verify this specific VM's ARP entry was removed (MockRouter state is shared)
+        assert!(!arp.iter().any(|e| e.mac_address == vm.mac_address));
 
         // test dns entries are deleted
         {

@@ -235,11 +235,9 @@ impl PricingEngine {
         if let Some(cc) = user
             .country_code
             .and_then(|c| CountryCode::for_alpha3(&c).ok())
-        {
-            if let Some(c) = self.tax_rates.get(&cc) {
+            && let Some(c) = self.tax_rates.get(&cc) {
                 return Ok((amount as f64 * (*c as f64 / 100f64)).floor() as u64);
             }
-        }
         Ok(0)
     }
 

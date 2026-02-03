@@ -313,7 +313,7 @@ async fn v1_list_vm_templates(State(this): State<RouterState>) -> ApiResult<ApiT
                 })
                 .collect();
 
-            Some(hc.apply_host_capacity_limits(&mut api_templates).await?)
+            Some(hc.apply_host_capacity_limits(&api_templates).await?)
         },
     };
     rsp.expand_pricing(&this.rates).await?;
@@ -453,7 +453,7 @@ async fn v1_renew_vm(
     let user = this.db.get_user(uid).await?;
 
     // handle "nwc" payments automatically
-    let rsp = if q.method.as_ref().map(|s| s.as_str()) == Some("nwc")
+    let rsp = if q.method.as_deref() == Some("nwc")
         && user.nwc_connection_string.is_some()
     {
         this.provisioner
