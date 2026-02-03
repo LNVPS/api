@@ -379,10 +379,7 @@ impl Worker {
 
             // only check spawned vms
             if !is_new_vm {
-                vms_by_host
-                    .entry(vm.host_id)
-                    .or_default()
-                    .push(vm);
+                vms_by_host.entry(vm.host_id).or_default().push(vm);
             }
 
             // delete vm if not paid (in new state)
@@ -436,47 +433,50 @@ impl Worker {
     ) -> Result<()> {
         let user = self.db.get_user(user_id).await?;
         if let Some(smtp) = self.settings.smtp.as_ref()
-            && user.contact_email && user.email.is_some() {
-                // send email
-                let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
-                if let Some(t) = title {
-                    b = b.subject(t);
-                }
-                if let Some(f) = &smtp.from {
-                    b = b.from(f.parse()?);
-                }
-                let template = include_str!("../email.html");
-                let html = MultiPart::alternative_plain_html(
-                    message.clone(),
-                    template
-                        .replace("%%_MESSAGE_%%", &message)
-                        .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
-                );
-
-                let msg = b.multipart(html)?;
-
-                let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
-                    .credentials(Credentials::new(
-                        smtp.username.to_string(),
-                        smtp.password.to_string(),
-                    ))
-                    .timeout(Some(Duration::from_secs(10)))
-                    .build();
-
-                sender.send(msg).await?;
+            && user.contact_email
+            && user.email.is_some()
+        {
+            // send email
+            let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
+            if let Some(t) = title {
+                b = b.subject(t);
             }
+            if let Some(f) = &smtp.from {
+                b = b.from(f.parse()?);
+            }
+            let template = include_str!("../email.html");
+            let html = MultiPart::alternative_plain_html(
+                message.clone(),
+                template
+                    .replace("%%_MESSAGE_%%", &message)
+                    .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
+            );
+
+            let msg = b.multipart(html)?;
+
+            let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+                .credentials(Credentials::new(
+                    smtp.username.to_string(),
+                    smtp.password.to_string(),
+                ))
+                .timeout(Some(Duration::from_secs(10)))
+                .build();
+
+            sender.send(msg).await?;
+        }
         if user.contact_nip17
-            && let Some(c) = self.nostr.as_ref() {
-                let sig = c.signer().await?;
-                let ev = EventBuilder::private_msg(
-                    &sig,
-                    PublicKey::from_slice(&user.pubkey)?,
-                    message,
-                    None,
-                )
-                .await?;
-                c.send_event(&ev).await?;
-            }
+            && let Some(c) = self.nostr.as_ref()
+        {
+            let sig = c.signer().await?;
+            let ev = EventBuilder::private_msg(
+                &sig,
+                PublicKey::from_slice(&user.pubkey)?,
+                message,
+                None,
+            )
+            .await?;
+            c.send_event(&ev).await?;
+        }
         Ok(())
     }
 
@@ -1710,56 +1710,46 @@ impl Worker {
                     }
                 }
                 // Handle Redis stream jobs (only if Redis is configured)
-                redis_result = async {
-                    self.work_commander.as_ref().unwrap().listen_for_jobs().await
-                }, if self.work_commander.is_some() => {
+                Ok(jobs) = self.work_commander.as_ref().unwrap().listen_for_jobs(), if self.work_commander.is_some() => {
                     let commander = self.work_commander.as_ref().unwrap().clone();
-                    match redis_result {
-                        Ok(jobs) => {
-                            for (stream_id, job) in jobs {
-                                let job_type = job.to_string();
+                    for (stream_id, job) in jobs {
+                        let job_type = job.to_string();
 
-                                // Create feedback messages first
-                                commander.publish_feedback(&commander.create_job_started_feedback(stream_id.clone(), job_type.clone())).await?;
+                        // Create feedback messages first
+                        commander.publish_feedback(&commander.create_job_started_feedback(stream_id.clone(), job_type.clone())).await?;
 
-                                // Execute the job
-                                let job_result = self.try_job(&job, Some(&stream_id), Some(&commander)).await;
+                        // Execute the job
+                        let job_result = self.try_job(&job, Some(&stream_id), Some(&commander)).await;
 
-                                // Handle feedback based on result
-                                    match job_result {
-                                        Ok(desc) => {
-                                            let feedback = commander.create_job_completed_feedback(
-                                                stream_id.to_string(),
-                                                job_type.clone(),
-                                                desc,
-                                            );
-                                            if let Err(e) = commander.publish_feedback(&feedback).await {
-                                                warn!("Failed to publish UpdateVmIp job feedback: {}", e);
-                                            }
-                                        }
-                                        Err(ref e) => {
-                                            error!("Failed to process Redis stream job: {:?} {}", job, e);
-                                            let failed_feedback = commander.create_job_failed_feedback(
-                                                stream_id.clone(),
-                                                job_type.clone(),
-                                                e.to_string()
-                                            );
-                                            if let Err(feedback_err) = commander.publish_feedback(&failed_feedback).await {
-                                                warn!("Failed to publish job failed feedback for {}: {}", stream_id, feedback_err);
-                                            }
-                                        }
+                        // Handle feedback based on result
+                            match job_result {
+                                Ok(desc) => {
+                                    let feedback = commander.create_job_completed_feedback(
+                                        stream_id.to_string(),
+                                        job_type.clone(),
+                                        desc,
+                                    );
+                                    if let Err(e) = commander.publish_feedback(&feedback).await {
+                                        warn!("Failed to publish UpdateVmIp job feedback: {}", e);
                                     }
-
-                                    // Always try to acknowledge the job
-                                    if let Err(e) = commander.acknowledge_job(&stream_id).await {
-                                        error!("Failed to acknowledge job {}: {}", stream_id, e);
+                                }
+                                Err(ref e) => {
+                                    error!("Failed to process Redis stream job: {:?} {}", job, e);
+                                    let failed_feedback = commander.create_job_failed_feedback(
+                                        stream_id.clone(),
+                                        job_type.clone(),
+                                        e.to_string()
+                                    );
+                                    if let Err(feedback_err) = commander.publish_feedback(&failed_feedback).await {
+                                        warn!("Failed to publish job failed feedback for {}: {}", stream_id, feedback_err);
                                     }
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to listen for Redis stream jobs: {}", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+
+                            // Always try to acknowledge the job
+                            if let Err(e) = commander.acknowledge_job(&stream_id).await {
+                                error!("Failed to acknowledge job {}: {}", stream_id, e);
+                            }
                     }
                 }
             }
