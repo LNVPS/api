@@ -23,12 +23,17 @@ use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 
+// Retry configuration constants
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+const DEFAULT_INITIAL_DELAY_SECS: u64 = 2;
+const MAX_RETRY_DELAY_SECS: u64 = 30;
+
 /// Retry an async operation with exponential backoff
 /// 
 /// # Arguments
 /// * `operation_name` - Name of the operation for logging
-/// * `max_attempts` - Maximum number of retry attempts (default: 3)
-/// * `initial_delay` - Initial delay between retries in seconds (default: 2)
+/// * `max_attempts` - Maximum number of retry attempts
+/// * `initial_delay` - Initial delay between retries in seconds
 /// * `f` - The async operation to retry
 async fn retry_with_backoff<F, Fut, T>(
     operation_name: &str,
@@ -62,7 +67,8 @@ where
                 );
                 sleep(Duration::from_secs(delay)).await;
                 attempt += 1;
-                delay *= 2; // Exponential backoff
+                // Exponential backoff with maximum cap
+                delay = (delay * 2).min(MAX_RETRY_DELAY_SECS);
             }
         }
     }
@@ -765,8 +771,8 @@ impl ProxmoxClient {
         // import primary disk from image (scsi0) with retry
         retry_with_backoff(
             &format!("Import disk image for VM {}", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async {
                 self.import_disk_image(ImportDiskImageRequest {
                     vm_id,
@@ -784,8 +790,8 @@ impl ProxmoxClient {
         // resize disk to match template with retry
         let j_resize = retry_with_backoff(
             &format!("Resize disk for VM {}", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async {
                 self.resize_disk(ResizeDiskRequest {
                     node: self.node.clone(),
@@ -801,8 +807,8 @@ impl ProxmoxClient {
         // wait for resize task to complete with retry
         retry_with_backoff(
             &format!("Wait for disk resize task for VM {}", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async { self.wait_for_task(&j_resize).await },
         )
         .await?;
@@ -911,8 +917,8 @@ impl VmHostClient for ProxmoxClient {
         // create VM with retry
         let t_create = retry_with_backoff(
             &format!("Create VM {}", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async {
                 self.create_vm(CreateVm {
                     node: self.node.clone(),
@@ -927,8 +933,8 @@ impl VmHostClient for ProxmoxClient {
         // wait for create task with retry
         retry_with_backoff(
             &format!("Wait for VM {} creation task", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async { self.wait_for_task(&t_create).await },
         )
         .await?;
@@ -939,8 +945,8 @@ impl VmHostClient for ProxmoxClient {
         // apply firewall config and manage IPsets using patch_firewall with retry
         retry_with_backoff(
             &format!("Patch firewall for VM {}", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async { self.patch_firewall(req).await },
         )
         .await?;
@@ -948,16 +954,16 @@ impl VmHostClient for ProxmoxClient {
         // try start with retry, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = retry_with_backoff(
             &format!("Start VM {}", req.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async { self.start_vm(&self.node, vm_id).await },
         )
         .await
         {
             if let Err(e) = retry_with_backoff(
                 &format!("Wait for VM {} start task", req.vm.id),
-                3,
-                2,
+                DEFAULT_MAX_ATTEMPTS,
+                DEFAULT_INITIAL_DELAY_SECS,
                 || async { self.wait_for_task(&j_start).await },
             )
             .await
@@ -1031,8 +1037,8 @@ impl VmHostClient for ProxmoxClient {
         // resize disk with retry
         let task = retry_with_backoff(
             &format!("Resize disk for VM {}", cfg.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async {
                 self.resize_disk(ResizeDiskRequest {
                     node: self.node.clone(),
@@ -1048,8 +1054,8 @@ impl VmHostClient for ProxmoxClient {
         // wait for task with retry
         retry_with_backoff(
             &format!("Wait for disk resize task for VM {}", cfg.vm.id),
-            3,
-            2,
+            DEFAULT_MAX_ATTEMPTS,
+            DEFAULT_INITIAL_DELAY_SECS,
             || async { self.wait_for_task(&task).await },
         )
         .await?;
