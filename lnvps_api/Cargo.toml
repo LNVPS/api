@@ -18,7 +18,6 @@ default = [
     "lnd",
     "cloudflare",
     "revolut",
-    "bitvora",
     "tokio/sync",
     "tokio/io-util",
     "payments-rs/tls-ring"
@@ -85,7 +84,6 @@ uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
-lightning-invoice = "0.34"
 bitcoin = "0.32"
 
 [build-dependencies]

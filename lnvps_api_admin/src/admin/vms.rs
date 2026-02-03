@@ -8,6 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
+use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PricingEngine, VmHistoryLogger,
     VmRunningState, VmStateCache, WorkJob,
@@ -15,6 +16,7 @@ use lnvps_api_common::{
 use lnvps_db::{AdminAction, AdminResource};
 use log::{error, info};
 use serde::Deserialize;
+use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -666,6 +668,83 @@ async fn admin_process_vm_refund(
         return ApiData::err(
             "Lightning invoice should only be provided when payment method is 'lightning'",
         );
+    }
+
+    // For lightning payments, validate that the invoice amount matches the calculated refund amount
+    if payment_method == "lightning" {
+        if let Some(ref invoice_str) = req.lightning_invoice {
+            // Parse the lightning invoice
+            let invoice = match Bolt11Invoice::from_str(invoice_str) {
+                Ok(inv) => inv,
+                Err(e) => {
+                    return ApiData::err(&format!("Invalid lightning invoice: {}", e));
+                }
+            };
+
+            // Calculate the expected refund amount
+            let calculation_date = req.refund_from_date.unwrap_or_else(Utc::now);
+            let method = lnvps_db::PaymentMethod::Lightning;
+            let tax_rates = std::collections::HashMap::new();
+
+            let pe = match PricingEngine::new_for_vm(
+                this.db.clone(),
+                this.exchange.clone(),
+                tax_rates,
+                vm_id,
+            )
+            .await
+            {
+                Ok(engine) => engine,
+                Err(e) => {
+                    error!("Failed to create pricing engine for refund validation: {}", e);
+                    return ApiData::err("Failed to calculate refund amount");
+                }
+            };
+
+            let refund_result = match pe
+                .calculate_refund_amount_from_date(vm_id, method, calculation_date)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Failed to calculate refund amount: {}", e);
+                    return ApiData::err("Failed to calculate refund amount");
+                }
+            };
+
+            let calculated_refund_msats = refund_result.amount.value();
+
+            // Get the invoice amount (in millisatoshis)
+            let invoice_amount_msats = match invoice.amount_milli_satoshis() {
+                Some(amount) => amount,
+                None => {
+                    return ApiData::err(
+                        "Lightning invoice must have an amount specified (amountless invoices are not supported for refunds)",
+                    );
+                }
+            };
+
+            // Validate that the invoice amount matches the calculated refund amount
+            // Allow a tolerance of 100 sats (100,000 msats) for rounding differences
+            let tolerance_msats = 100_000u64; // 100 sats
+            let diff = if invoice_amount_msats > calculated_refund_msats {
+                invoice_amount_msats - calculated_refund_msats
+            } else {
+                calculated_refund_msats - invoice_amount_msats
+            };
+
+            if diff > tolerance_msats {
+                return ApiData::err(&format!(
+                    "Invoice amount ({} msats) does not match calculated refund amount ({} msats). The amounts must be within 100 sats of each other.",
+                    invoice_amount_msats, calculated_refund_msats
+                ));
+            }
+
+            info!(
+                "Invoice amount validation passed: invoice={} msats, calculated={} msats",
+                invoice_amount_msats, calculated_refund_msats
+            );
+        }
     }
 
     // Check if WorkCommander is available for distributed processing

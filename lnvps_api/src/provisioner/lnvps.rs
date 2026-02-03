@@ -420,6 +420,21 @@ impl LNVpsProvisioner {
         self.db.clone()
     }
 
+    /// Get exchange rate service
+    pub fn rates(&self) -> Arc<dyn ExchangeRateService> {
+        self.rates.clone()
+    }
+
+    /// Get tax rates
+    pub fn tax_rates(&self) -> &HashMap<CountryCode, f32> {
+        &self.tax_rates
+    }
+
+    /// Get lightning node
+    pub fn node(&self) -> Arc<dyn LightningNode> {
+        self.node.clone()
+    }
+
     /// Provision a new VM for a user on the database
     ///
     /// Note:
@@ -669,6 +684,7 @@ impl LNVpsProvisioner {
                             .create_order(
                                 &desc,
                                 CurrencyAmount::from_u64(p.currency, p.amount + p.tax),
+                                None,
                             )
                             .await?;
                         let new_id: [u8; 32] = rand::random();

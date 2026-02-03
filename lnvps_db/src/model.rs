@@ -1,5 +1,5 @@
 use crate::encrypted_string::EncryptedString;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -707,6 +707,7 @@ pub enum VmHistoryActionType {
     StateChanged = 8,
     PaymentReceived = 9,
     ConfigurationChanged = 10,
+    RefundProcessed = 11,
 }
 
 impl Display for VmHistoryActionType {
@@ -723,6 +724,7 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::StateChanged => write!(f, "state_changed"),
             VmHistoryActionType::PaymentReceived => write!(f, "payment_received"),
             VmHistoryActionType::ConfigurationChanged => write!(f, "configuration_changed"),
+            VmHistoryActionType::RefundProcessed => write!(f, "refund_processed"),
         }
     }
 }
@@ -743,6 +745,7 @@ impl FromStr for VmHistoryActionType {
             "state_changed" => Ok(VmHistoryActionType::StateChanged),
             "payment_received" => Ok(VmHistoryActionType::PaymentReceived),
             "configuration_changed" => Ok(VmHistoryActionType::ConfigurationChanged),
+            "refund_processed" => Ok(VmHistoryActionType::RefundProcessed),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }

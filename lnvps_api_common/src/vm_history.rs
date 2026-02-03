@@ -393,4 +393,47 @@ impl VmHistoryLogger {
             .list_vm_history_paginated(vm_id, limit, offset)
             .await
     }
+
+    pub async fn log_vm_refund_processed(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        refund_amount: &str,
+        payment_method: &str,
+        reason: Option<&str>,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let mut meta = metadata.unwrap_or_else(|| json!({}));
+        meta["refund_amount"] = json!(refund_amount);
+        meta["payment_method"] = json!(payment_method);
+        if let Some(r) = reason {
+            meta["reason"] = json!(r);
+        }
+
+        let description = match reason {
+            Some(r) => format!(
+                "VM {} refund processed: {} via {} - Reason: {}",
+                vm_id, refund_amount, payment_method, r
+            ),
+            None => format!(
+                "VM {} refund processed: {} via {}",
+                vm_id, refund_amount, payment_method
+            ),
+        };
+
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::RefundProcessed,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: None,
+            new_state: None,
+            metadata: serialize_json_to_bytes(Some(meta)),
+            description: Some(description),
+        };
+
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
 }

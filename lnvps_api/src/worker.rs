@@ -15,6 +15,8 @@ use lnvps_api_common::{
 use lnvps_db::{LNVpsDb, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
+use payments_rs::currency::CurrencyAmount;
+use payments_rs::lightning::PayInvoiceRequest;
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
@@ -162,7 +164,7 @@ impl Worker {
                                 self.tx.send(WorkJob::SendNotification {
                                     user_id: vm.user_id,
                                     title: Some(format!("[VM{}] Auto-Renewed", vm.id)),
-                                    message: format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id)
+                                    message: format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id),
                                 })?;
                             }
                             Err(e) => {
@@ -216,10 +218,10 @@ impl Worker {
                 warn!("Failed to log VM {} expiration: {}", vm.id, e);
             }
             self.tx.send(WorkJob::SendNotification {
-                    user_id: vm.user_id,
-                    title: Some(format!("[VM{}] Expired", vm.id)),
-                    message: format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", vm.id, self.settings.delete_after)
-                })?;
+                user_id: vm.user_id,
+                title: Some(format!("[VM{}] Expired", vm.id)),
+                message: format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", vm.id, self.settings.delete_after),
+            })?;
         }
 
         // Delete VM if expired > self.settings.delete_after days
@@ -763,7 +765,7 @@ impl Worker {
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
                                     format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}",
-                                           domain.name, domain.id, e),
+                                            domain.name, domain.id, e),
                                     Some(format!("Domain Activation Failed: {}", domain.name)),
                                 ) {
                                     error!("Failed to queue admin notification: {}", notification_err);
@@ -818,7 +820,7 @@ impl Worker {
                                 // Send admin notification about the failure
                                 if let Err(notification_err) = self.queue_admin_notification(
                                     format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}",
-                                           domain.name, domain.id, e),
+                                            domain.name, domain.id, e),
                                     Some(format!("Domain Deactivation Failed: {}", domain.name)),
                                 ) {
                                     error!("Failed to queue admin notification: {}", notification_err);
@@ -886,7 +888,7 @@ impl Worker {
                                     // Send admin notification about the failure
                                     if let Err(notification_err) = self.queue_admin_notification(
                                         format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}",
-                                               domain.name, domain.id, domain.last_status_change, e),
+                                                domain.name, domain.id, domain.last_status_change, e),
                                         Some(format!("Domain Deletion Failed: {}", domain.name)),
                                     ) {
                                         error!("Failed to queue admin notification: {}", notification_err);
@@ -1268,15 +1270,119 @@ impl Worker {
                 return Ok(Some("IP configuration updated successfully".to_string()));
             }
             WorkJob::ProcessVmRefund {
-                vm_id: _,
-                admin_user_id: _,
-                refund_from_date: _,
-                reason: _,
-                payment_method: _,
-                lightning_invoice: _,
+                vm_id,
+                admin_user_id,
+                refund_from_date,
+                reason,
+                payment_method,
+                lightning_invoice,
             } => {
-                // TODO: Implement the actual refund processing logic
-                bail!("Refund processing is not yet implemented");
+                info!(
+                    "Admin {} processing refund for VM {} via {}",
+                    admin_user_id, vm_id, payment_method
+                );
+
+                // Get VM to verify it exists
+                let vm = self.db.get_vm(*vm_id).await?;
+
+                // Determine the calculation date (from_date or current date)
+                let calculation_date = refund_from_date.unwrap_or_else(Utc::now);
+
+                // Process the refund based on payment method
+                let amt = match payment_method.as_str() {
+                    "lightning" => {
+                        // Lightning refunds require an invoice to be provided
+                        if let Some(invoice) = lightning_invoice {
+                            let rsp = self
+                                .provisioner
+                                .node()
+                                .pay_invoice(PayInvoiceRequest {
+                                    invoice: invoice.clone(),
+                                    timeout_seconds: None,
+                                })
+                                .await?;
+                            CurrencyAmount::millisats(rsp.amount_msat).to_string()
+                        } else {
+                            bail!("Lightning invoice is required for lightning refunds");
+                        }
+                    }
+                    _ => bail!("Unsupported payment method: {}", payment_method),
+                };
+
+                // Log the refund in VM history
+                if let Err(e) = self
+                    .vm_history_logger
+                    .log_vm_refund_processed(
+                        *vm_id,
+                        Some(*admin_user_id),
+                        &amt,
+                        payment_method,
+                        reason.as_deref(),
+                        Some(serde_json::json!({
+                            "refund_from_date": calculation_date,
+                            "admin_action": true,
+                            "lightning_invoice": lightning_invoice,
+                        })),
+                    )
+                    .await
+                {
+                    error!("Failed to log refund for VM {}: {}", vm_id, e);
+                }
+
+                // Delete the VM after refund is processed
+                info!("Deleting VM {} after refund processing", vm_id);
+                if let Err(e) = self.provisioner.delete_vm(*vm_id).await {
+                    error!("Failed to delete VM {} after refund: {}", vm_id, e);
+                    bail!("Refund processed but VM deletion failed: {}", e);
+                }
+
+                // Send notification to user
+                let user_notification = format!(
+                    "Your VM #{} has been refunded and deleted.\nRefund amount: {} {}\nReason: {}",
+                    vm_id,
+                    refund_amount,
+                    refund_currency,
+                    reason
+                        .as_deref()
+                        .unwrap_or("Refund processed by administrator")
+                );
+                if let Err(e) = self.queue_notification(
+                    vm.user_id,
+                    user_notification,
+                    Some(format!("[VM{}] Refunded and Deleted", vm_id)),
+                ) {
+                    warn!(
+                        "Failed to queue user notification for VM {} refund: {}",
+                        vm_id, e
+                    );
+                }
+
+                // Send notification to admin
+                let admin_notification = format!(
+                    "VM {} has been successfully refunded and deleted.\nUser ID: {}\nRefund amount: {} {}\nReason: {}",
+                    vm_id,
+                    vm.user_id,
+                    refund_amount,
+                    refund_currency,
+                    reason.as_deref().unwrap_or("N/A")
+                );
+                if let Err(e) = self.queue_admin_notification(
+                    admin_notification,
+                    Some(format!("[VM{}] Refund Complete", vm_id)),
+                ) {
+                    warn!(
+                        "Failed to queue admin notification for VM {} refund: {}",
+                        vm_id, e
+                    );
+                }
+
+                let result_message = format!(
+                    "Refund processed and VM deleted: {} {} via {}. VM {} has been removed.",
+                    refund_amount, refund_currency, payment_method, vm_id
+                );
+
+                info!("{}", result_message);
+                return Ok(Some(result_message));
             }
             WorkJob::CreateVm {
                 user_id,
