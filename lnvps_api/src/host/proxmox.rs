@@ -23,6 +23,51 @@ use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 
+/// Retry an async operation with exponential backoff
+/// 
+/// # Arguments
+/// * `operation_name` - Name of the operation for logging
+/// * `max_attempts` - Maximum number of retry attempts (default: 3)
+/// * `initial_delay` - Initial delay between retries in seconds (default: 2)
+/// * `f` - The async operation to retry
+async fn retry_with_backoff<F, Fut, T>(
+    operation_name: &str,
+    max_attempts: u32,
+    initial_delay: u64,
+    mut f: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 1;
+    let mut delay = initial_delay;
+    
+    loop {
+        match f().await {
+            Ok(result) => {
+                if attempt > 1 {
+                    info!("{} succeeded on attempt {}/{}", operation_name, attempt, max_attempts);
+                }
+                return Ok(result);
+            }
+            Err(e) if attempt >= max_attempts => {
+                warn!("{} failed after {} attempts: {}", operation_name, max_attempts, e);
+                return Err(e);
+            }
+            Err(e) => {
+                warn!(
+                    "{} failed on attempt {}/{}: {}. Retrying in {}s...",
+                    operation_name, attempt, max_attempts, e, delay
+                );
+                sleep(Duration::from_secs(delay)).await;
+                attempt += 1;
+                delay *= 2; // Exponential backoff
+            }
+        }
+    }
+}
+
 // Custom deserializer to handle Proxmox's integer-to-boolean conversion for KVM field
 fn deserialize_int_to_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
@@ -713,29 +758,54 @@ impl ProxmoxClient {
     /// Import main disk image from the template
     async fn import_template_disk(&self, req: &FullVmInfo) -> Result<()> {
         let vm_id = req.vm.id.into();
+        let disk_size = req.resources()?.disk_size.to_string();
+        let image_filename = req.image.filename()?;
+        let is_ssd = matches!(req.disk.kind, DiskType::SSD);
 
-        // import primary disk from image (scsi0)
-        self.import_disk_image(ImportDiskImageRequest {
-            vm_id,
-            node: self.node.clone(),
-            storage: req.disk.name.clone(),
-            disk: "scsi0".to_string(),
-            image: req.image.filename()?,
-            is_ssd: matches!(req.disk.kind, DiskType::SSD),
-        })
+        // import primary disk from image (scsi0) with retry
+        retry_with_backoff(
+            &format!("Import disk image for VM {}", req.vm.id),
+            3,
+            2,
+            || async {
+                self.import_disk_image(ImportDiskImageRequest {
+                    vm_id,
+                    node: self.node.clone(),
+                    storage: req.disk.name.clone(),
+                    disk: "scsi0".to_string(),
+                    image: image_filename.clone(),
+                    is_ssd,
+                })
+                .await
+            },
+        )
         .await?;
 
-        // resize disk to match template
-        let j_resize = self
-            .resize_disk(ResizeDiskRequest {
-                node: self.node.clone(),
-                vm_id,
-                disk: "scsi0".to_string(),
-                size: req.resources()?.disk_size.to_string(),
-            })
-            .await?;
-        // TODO: rollback
-        self.wait_for_task(&j_resize).await?;
+        // resize disk to match template with retry
+        let j_resize = retry_with_backoff(
+            &format!("Resize disk for VM {}", req.vm.id),
+            3,
+            2,
+            || async {
+                self.resize_disk(ResizeDiskRequest {
+                    node: self.node.clone(),
+                    vm_id,
+                    disk: "scsi0".to_string(),
+                    size: disk_size.clone(),
+                })
+                .await
+            },
+        )
+        .await?;
+
+        // wait for resize task to complete with retry
+        retry_with_backoff(
+            &format!("Wait for disk resize task for VM {}", req.vm.id),
+            3,
+            2,
+            || async { self.wait_for_task(&j_resize).await },
+        )
+        .await?;
 
         Ok(())
     }
@@ -837,24 +907,61 @@ impl VmHostClient for ProxmoxClient {
     async fn create_vm(&self, req: &FullVmInfo) -> Result<()> {
         let config = self.make_config(req)?;
         let vm_id = req.vm.id.into();
-        let t_create = self
-            .create_vm(CreateVm {
-                node: self.node.clone(),
-                vm_id,
-                config,
-            })
-            .await?;
-        self.wait_for_task(&t_create).await?;
 
-        // import template image
+        // create VM with retry
+        let t_create = retry_with_backoff(
+            &format!("Create VM {}", req.vm.id),
+            3,
+            2,
+            || async {
+                self.create_vm(CreateVm {
+                    node: self.node.clone(),
+                    vm_id,
+                    config: config.clone(),
+                })
+                .await
+            },
+        )
+        .await?;
+
+        // wait for create task with retry
+        retry_with_backoff(
+            &format!("Wait for VM {} creation task", req.vm.id),
+            3,
+            2,
+            || async { self.wait_for_task(&t_create).await },
+        )
+        .await?;
+
+        // import template image (has retry logic inside)
         self.import_template_disk(req).await?;
 
-        // apply firewall config and manage IPsets using patch_firewall
-        self.patch_firewall(req).await?;
+        // apply firewall config and manage IPsets using patch_firewall with retry
+        retry_with_backoff(
+            &format!("Patch firewall for VM {}", req.vm.id),
+            3,
+            2,
+            || async { self.patch_firewall(req).await },
+        )
+        .await?;
 
-        // try start, otherwise ignore error (maybe its already running)
-        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await {
-            if let Err(e) = self.wait_for_task(&j_start).await {
+        // try start with retry, otherwise ignore error (maybe its already running)
+        if let Ok(j_start) = retry_with_backoff(
+            &format!("Start VM {}", req.vm.id),
+            3,
+            2,
+            || async { self.start_vm(&self.node, vm_id).await },
+        )
+        .await
+        {
+            if let Err(e) = retry_with_backoff(
+                &format!("Wait for VM {} start task", req.vm.id),
+                3,
+                2,
+                || async { self.wait_for_task(&j_start).await },
+            )
+            .await
+            {
                 warn!("Failed to start vm: {}", e);
             }
         }
@@ -919,15 +1026,34 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn resize_disk(&self, cfg: &FullVmInfo) -> Result<()> {
-        let task = self
-            .resize_disk(ResizeDiskRequest {
-                node: self.node.clone(),
-                vm_id: cfg.vm.id.into(),
-                disk: "scsi0".to_string(),
-                size: cfg.resources()?.disk_size.to_string(),
-            })
-            .await?;
-        self.wait_for_task(&task).await?;
+        let disk_size = cfg.resources()?.disk_size.to_string();
+
+        // resize disk with retry
+        let task = retry_with_backoff(
+            &format!("Resize disk for VM {}", cfg.vm.id),
+            3,
+            2,
+            || async {
+                self.resize_disk(ResizeDiskRequest {
+                    node: self.node.clone(),
+                    vm_id: cfg.vm.id.into(),
+                    disk: "scsi0".to_string(),
+                    size: disk_size.clone(),
+                })
+                .await
+            },
+        )
+        .await?;
+
+        // wait for task with retry
+        retry_with_backoff(
+            &format!("Wait for disk resize task for VM {}", cfg.vm.id),
+            3,
+            2,
+            || async { self.wait_for_task(&task).await },
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -1513,7 +1639,7 @@ pub struct HashedVmConfig {
     pub config: VmConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct VmConfig {
     #[serde(rename = "onboot")]
     #[serde(skip_serializing_if = "Option::is_none")]
