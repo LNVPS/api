@@ -108,6 +108,20 @@ pub enum WorkJob {
     },
 }
 
+impl WorkJob {
+    /// If this job can be skipped on failure
+    pub fn can_skip(&self) -> bool {
+        match self {
+            Self::CheckNostrDomains { .. } => true,
+            Self::StopVm { .. } => true,
+            Self::StartVm { .. } => true,
+            Self::CheckVm { .. } => true,
+            Self::CheckVms => true,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for WorkJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

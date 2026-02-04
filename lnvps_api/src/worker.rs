@@ -1746,6 +1746,9 @@ impl Worker {
                 if let Err(e) = commander.publish_feedback(&feedback).await {
                     warn!("Failed to publish UpdateVmIp job feedback: {}", e);
                 }
+                if let Err(e) = commander.acknowledge_job(&msg).await {
+                    error!("Failed to acknowledge job {}: {}", stream_id, e);
+                }
             }
             Err(ref e) => {
                 error!("Failed to process Redis stream job: {:?} {}", job, e);
@@ -1760,12 +1763,13 @@ impl Worker {
                         stream_id, feedback_err
                     );
                 }
+                // if job can be skipped, just acknowledge job
+                if msg.job.can_skip() {
+                    if let Err(e) = commander.acknowledge_job(&msg).await {
+                        error!("Failed to acknowledge job {}: {}", stream_id, e);
+                    }
+                }
             }
-        }
-
-        // Always try to acknowledge the job
-        if let Err(e) = commander.acknowledge_job(&msg).await {
-            error!("Failed to acknowledge job {}: {}", stream_id, e);
         }
         Ok(())
     }
