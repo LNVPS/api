@@ -10,7 +10,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
     NetworkProvisioner, RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState,
-    VmRunningStates, VmStateCache, WorkCommander, WorkJob,
+    VmRunningStates, VmStateCache, WorkCommander, WorkJob, WorkJobMessage,
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Primary background worker logic
@@ -35,7 +36,7 @@ pub struct Worker {
     tx: UnboundedSender<WorkJob>,
     rx: UnboundedReceiver<WorkJob>,
     work_commander: Option<WorkCommander>,
-    last_check_vms: DateTime<Utc>,
+    last_check_vms: Arc<Mutex<DateTime<Utc>>>,
 }
 
 pub struct WorkerSettings {
@@ -88,7 +89,7 @@ impl Worker {
             tx,
             rx,
             work_commander,
-            last_check_vms: Utc::now(),
+            last_check_vms: Arc::new(Mutex::new(Utc::now())),
         })
     }
 
@@ -107,12 +108,12 @@ impl Worker {
             let date = DateTime::from_timestamp(timestamp as _, 0).unwrap();
             Ok(date)
         } else {
-            Ok(self.last_check_vms)
+            Ok(self.last_check_vms.lock().await.clone())
         }
     }
 
-    pub async fn set_last_check_vms(&mut self, last_check_vms: DateTime<Utc>) -> Result<()> {
-        self.last_check_vms = last_check_vms;
+    pub async fn set_last_check_vms(&self, last_check_vms: DateTime<Utc>) -> Result<()> {
+        *self.last_check_vms.lock().await = last_check_vms;
         if let Some(w) = &self.work_commander {
             let t = last_check_vms.timestamp() as u64;
             w.store_key("worker-last-check-vms", &t.to_le_bytes())
@@ -353,7 +354,7 @@ impl Worker {
         });
     }
 
-    pub async fn check_vms(&mut self) -> Result<()> {
+    pub async fn check_vms(&self) -> Result<()> {
         // Check if enough time has passed since last check to prevent rapid back-to-back calls
         let last_check = self.get_last_check_vms().await?;
         let time_since_last_check = Utc::now().signed_duration_since(last_check);
@@ -968,7 +969,7 @@ impl Worker {
     }
 
     async fn try_job(
-        &mut self,
+        &self,
         job: &WorkJob,
         _stream_id: Option<&str>,
         _commander: Option<&WorkCommander>,
@@ -1712,47 +1713,60 @@ impl Worker {
                 // Handle Redis stream jobs (only if Redis is configured)
                 Ok(jobs) = self.work_commander.as_ref().unwrap().listen_for_jobs(), if self.work_commander.is_some() => {
                     let commander = self.work_commander.as_ref().unwrap().clone();
-                    for (stream_id, job) in jobs {
-                        let job_type = job.to_string();
-
-                        // Create feedback messages first
-                        commander.publish_feedback(&commander.create_job_started_feedback(stream_id.clone(), job_type.clone())).await?;
-
-                        // Execute the job
-                        let job_result = self.try_job(&job, Some(&stream_id), Some(&commander)).await;
-
-                        // Handle feedback based on result
-                            match job_result {
-                                Ok(desc) => {
-                                    let feedback = commander.create_job_completed_feedback(
-                                        stream_id.to_string(),
-                                        job_type.clone(),
-                                        desc,
-                                    );
-                                    if let Err(e) = commander.publish_feedback(&feedback).await {
-                                        warn!("Failed to publish UpdateVmIp job feedback: {}", e);
-                                    }
-                                }
-                                Err(ref e) => {
-                                    error!("Failed to process Redis stream job: {:?} {}", job, e);
-                                    let failed_feedback = commander.create_job_failed_feedback(
-                                        stream_id.clone(),
-                                        job_type.clone(),
-                                        e.to_string()
-                                    );
-                                    if let Err(feedback_err) = commander.publish_feedback(&failed_feedback).await {
-                                        warn!("Failed to publish job failed feedback for {}: {}", stream_id, feedback_err);
-                                    }
-                                }
-                            }
-
-                            // Always try to acknowledge the job
-                            if let Err(e) = commander.acknowledge_job(&stream_id).await {
-                                error!("Failed to acknowledge job {}: {}", stream_id, e);
-                            }
+                    for msg in jobs {
+                        self.handle_job(&commander, msg).await?;
                     }
                 }
             }
         }
+    }
+
+    async fn handle_job(&self, commander: &WorkCommander, msg: WorkJobMessage) -> Result<()> {
+        let job = &msg.job;
+        let stream_id = &msg.id;
+        let job_type = job.to_string();
+
+        commander
+            .publish_feedback(
+                &commander.create_job_started_feedback(stream_id.clone(), job_type.clone()),
+            )
+            .await?;
+
+        // Execute the job
+        let job_result = self.try_job(&job, Some(&stream_id), Some(&commander)).await;
+
+        // Handle feedback based on result
+        match job_result {
+            Ok(desc) => {
+                let feedback = commander.create_job_completed_feedback(
+                    stream_id.to_string(),
+                    job_type.clone(),
+                    desc,
+                );
+                if let Err(e) = commander.publish_feedback(&feedback).await {
+                    warn!("Failed to publish UpdateVmIp job feedback: {}", e);
+                }
+            }
+            Err(ref e) => {
+                error!("Failed to process Redis stream job: {:?} {}", job, e);
+                let failed_feedback = commander.create_job_failed_feedback(
+                    stream_id.clone(),
+                    job_type.clone(),
+                    e.to_string(),
+                );
+                if let Err(feedback_err) = commander.publish_feedback(&failed_feedback).await {
+                    warn!(
+                        "Failed to publish job failed feedback for {}: {}",
+                        stream_id, feedback_err
+                    );
+                }
+            }
+        }
+
+        // Always try to acknowledge the job
+        if let Err(e) = commander.acknowledge_job(&msg).await {
+            error!("Failed to acknowledge job {}: {}", stream_id, e);
+        }
+        Ok(())
     }
 }

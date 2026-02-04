@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use redis::aio::MultiplexedConnection;
+use redis::streams::{StreamAutoClaimOptions, StreamAutoClaimReply, StreamId};
 use redis::{
     AsyncCommands, FromRedisValue, Value,
     streams::{StreamReadOptions, StreamReadReply},
@@ -129,6 +130,13 @@ impl fmt::Display for WorkJob {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkJobMessage {
+    pub id: String,
+    pub job: WorkJob,
+    pub is_pending: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum JobFeedbackStatus {
     Started,
     Progress {
@@ -247,43 +255,81 @@ impl WorkCommander {
         Ok(stream_id)
     }
 
-    pub async fn listen_for_jobs(&self) -> Result<Vec<(String, WorkJob)>> {
+    pub async fn listen_for_jobs(&self) -> Result<Vec<WorkJobMessage>> {
         let mut conn = self.conn.clone();
+
+        let pending = self.claim_pending_jobs().await?;
+        if !pending.is_empty() {
+            return Ok(pending);
+        }
 
         // Ensure the consumer group exists
         self.ensure_group_exists(&mut conn).await?;
-
         let opts = StreamReadOptions::default()
             .count(10)
             .block(100)
             .group(&self.group_name, &self.consumer_name);
 
         let results: StreamReadReply = conn.xread_options(&["worker"], &[">"], &opts).await?;
-
         let mut jobs = Vec::new();
-
         for stream_key in results.keys {
-            for stream_id in stream_key.ids {
-                if let Some(job_value) = stream_id.map.get("job")
-                    && let Ok(job_str) = String::from_redis_value(job_value) {
-                        match serde_json::from_str::<WorkJob>(&job_str) {
-                            Ok(job) => {
-                                jobs.push((stream_id.id.clone(), job));
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to deserialize job from stream: {}", e);
-                            }
-                        }
-                    }
-            }
+            jobs.extend(stream_key.ids.iter().filter_map(Self::map_work_job));
         }
-
         Ok(jobs)
     }
 
-    pub async fn acknowledge_job(&self, stream_id: &str) -> Result<()> {
+    /// Check for pending jobs in the consumer group and claim old ones
+    pub async fn claim_pending_jobs(&self) -> Result<Vec<WorkJobMessage>> {
         let mut conn = self.conn.clone();
-        let _: u64 = conn.xack("worker", &self.group_name, &[stream_id]).await?;
+
+        let opts = StreamAutoClaimOptions::default();
+
+        // Parse pending messages and claim them
+        let jobs: StreamAutoClaimReply = conn
+            .xautoclaim_options(
+                "worker",
+                &self.group_name,
+                &self.consumer_name,
+                10,
+                "0-0",
+                opts,
+            )
+            .await?;
+        Ok(jobs
+            .claimed
+            .iter()
+            .filter_map(|j| {
+                Self::map_work_job(j).map(|mut x| {
+                    x.is_pending = true;
+                    x
+                })
+            })
+            .collect())
+    }
+
+    fn map_work_job(stream_id: &StreamId) -> Option<WorkJobMessage> {
+        if let Some(job_value) = stream_id.map.get("job")
+            && let Ok(job_str) = String::from_redis_value(job_value)
+        {
+            match serde_json::from_str::<WorkJob>(&job_str) {
+                Ok(job) => {
+                    return Some(WorkJobMessage {
+                        id: stream_id.id.to_string(),
+                        job,
+                        is_pending: false,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Failed to deserialize job from stream: {}", e);
+                }
+            }
+        }
+        None
+    }
+
+    pub async fn acknowledge_job(&self, job: &WorkJobMessage) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: u64 = conn.xack("worker", &self.group_name, &[&job.id]).await?;
         Ok(())
     }
 
