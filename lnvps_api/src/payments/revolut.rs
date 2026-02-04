@@ -2,20 +2,19 @@ use crate::payments::handle_upgrade;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use isocountry::CountryCode;
-use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
+use lnvps_api_common::{VmHistoryLogger, WorkCommander};
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType};
 use log::{error, info, warn};
 use payments_rs::fiat::{RevolutApi, RevolutConfig, RevolutWebhookBody, RevolutWebhookEvent};
 use payments_rs::webhook::WEBHOOK_BRIDGE;
 use reqwest::Url;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 
 pub struct RevolutPaymentHandler {
     api: RevolutApi,
     db: Arc<dyn LNVpsDb>,
-    tx: UnboundedSender<WorkJob>,
+    tx: Arc<dyn WorkCommander>,
     public_url: String,
     vm_history_logger: VmHistoryLogger,
 }
@@ -25,7 +24,7 @@ impl RevolutPaymentHandler {
         settings: RevolutConfig,
         public_url: &str,
         db: Arc<dyn LNVpsDb>,
-        sender: UnboundedSender<WorkJob>,
+        sender: Arc<dyn WorkCommander>,
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         Ok(Self {
@@ -72,9 +71,10 @@ impl RevolutPaymentHandler {
             };
 
             if let RevolutWebhookEvent::OrderCompleted = msg.event
-                && let Err(e) = self.try_complete_payment(&msg.order_id).await {
-                    error!("Failed to complete order: {}", e);
-                }
+                && let Err(e) = self.try_complete_payment(&msg.order_id).await
+            {
+                error!("Failed to complete order: {}", e);
+            }
         }
         Ok(())
     }
@@ -148,9 +148,9 @@ impl RevolutPaymentHandler {
                     })),
                 )
                 .await
-            {
-                warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
-            }
+        {
+            warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
+        }
 
         // Handle upgrade payments differently - trigger upgrade processing instead of just checking VM
         if payment.payment_type == lnvps_db::PaymentType::Upgrade {
@@ -185,9 +185,11 @@ impl RevolutPaymentHandler {
             }
         } else {
             // Regular renewal payment - just check the VM
-            self.tx.send(WorkJob::CheckVm {
-                vm_id: payment.vm_id,
-            })?;
+            self.tx
+                .send(WorkJob::CheckVm {
+                    vm_id: payment.vm_id,
+                })
+                .await?;
         }
 
         info!(

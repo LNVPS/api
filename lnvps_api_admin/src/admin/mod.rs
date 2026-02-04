@@ -1,15 +1,8 @@
 use axum::Router;
 use axum::extract::FromRef;
-use lnvps_api_common::{ExchangeRateService, VmStateCache, WorkCommander};
+use lnvps_api_common::{ExchangeRateService, RedisWorkFeedback, VmStateCache, WorkCommander};
 use lnvps_db::LNVpsDb;
-use serde::Deserialize;
 use std::sync::Arc;
-
-#[derive(Deserialize)]
-pub(crate) struct PageQuery {
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
-}
 
 mod access_policies;
 mod auth;
@@ -35,16 +28,18 @@ mod websocket;
 #[derive(Clone, FromRef)]
 pub(crate) struct RouterState {
     pub db: Arc<dyn LNVpsDb>,
-    pub work_commander: Option<WorkCommander>,
+    pub work_commander: Arc<dyn WorkCommander>,
+    pub feedback: Option<RedisWorkFeedback>,
     pub vm_state_cache: VmStateCache,
     pub exchange: Arc<dyn ExchangeRateService>,
 }
 
 pub fn admin_router(
     db: Arc<dyn LNVpsDb>,
-    work_commander: Option<WorkCommander>,
+    work_commander: Arc<dyn WorkCommander>,
     vm_state_cache: VmStateCache,
     exchange: Arc<dyn ExchangeRateService>,
+    feedback: Option<RedisWorkFeedback>,
 ) -> Router {
     Router::new()
         .merge(users::router())
@@ -69,6 +64,7 @@ pub fn admin_router(
             db,
             work_commander,
             vm_state_cache,
+            feedback,
             exchange,
         })
 }

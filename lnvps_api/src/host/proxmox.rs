@@ -811,7 +811,8 @@ impl ProxmoxClient {
             image: req.image.filename()?,
             is_ssd: matches!(req.disk.kind, DiskType::SSD),
         })
-        .await?;
+        .await
+        .context("Failed to import disk image")?;
 
         // resize disk to match template
         let j_resize = self
@@ -821,9 +822,11 @@ impl ProxmoxClient {
                 disk: "scsi0".to_string(),
                 size: req.resources()?.disk_size.to_string(),
             })
-            .await?;
+            .await
+            .context("Failed to start disk resize")?;
         // TODO: rollback
-        self.wait_for_task(&j_resize).await?;
+        self.wait_for_task(&j_resize).await
+            .context("Disk resize task failed")?;
 
         Ok(())
     }
@@ -923,7 +926,7 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn create_vm(&self, req: &FullVmInfo) -> Result<()> {
-        let config = self.make_config(req)?;
+        let config = self.make_config(req).context("Failed to generate VM config")?;
         let vm_id = req.vm.id.into();
         let t_create = self
             .create_vm(CreateVm {
@@ -931,14 +934,18 @@ impl VmHostClient for ProxmoxClient {
                 vm_id,
                 config,
             })
-            .await?;
-        self.wait_for_task(&t_create).await?;
+            .await
+            .context("Failed to create VM on Proxmox")?;
+        self.wait_for_task(&t_create).await
+            .context("VM creation task failed")?;
 
         // import template image
-        self.import_template_disk(req).await?;
+        self.import_template_disk(req).await
+            .context("Failed to import template disk")?;
 
         // apply firewall config and manage IPsets using patch_firewall
-        self.patch_firewall(req).await?;
+        self.patch_firewall(req).await
+            .context("Failed to patch firewall configuration")?;
 
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
@@ -1062,8 +1069,10 @@ impl VmHostClient for ProxmoxClient {
         let vm_id = cfg.vm.id.into();
 
         // Check and fix cloud-init IP config if it doesn't match expected
-        let current_config = self.get_vm_config(&self.node, vm_id).await?;
-        let expected_config = self.make_config(cfg)?;
+        let current_config = self.get_vm_config(&self.node, vm_id).await
+            .context("Failed to get current VM config")?;
+        let expected_config = self.make_config(cfg)
+            .context("Failed to generate expected config")?;
         if current_config.config.ip_config != expected_config.ip_config {
             info!(
                 "IP config mismatch for VM {}: current={:?}, expected={:?}",
@@ -1080,7 +1089,8 @@ impl VmHostClient for ProxmoxClient {
                     ..Default::default()
                 },
             })
-            .await?;
+            .await
+            .context("Failed to update VM IP config")?;
         }
 
         // disable fw if not enabled, otherwise configure fw
@@ -1099,7 +1109,8 @@ impl VmHostClient for ProxmoxClient {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+            .context("Failed to disable VM firewall")?;
             return Ok(());
         }
 
@@ -1120,7 +1131,8 @@ impl VmHostClient for ProxmoxClient {
 
         // Re-apply firewall configuration
         self.configure_vm_firewall(&self.node, vm_id, firewall_config)
-            .await?;
+            .await
+            .context("Failed to configure VM firewall")?;
 
         // Only manage IPsets and rules if firewall is enabled
         // Ensure ipfilter-net0 IPset exists
@@ -1138,13 +1150,15 @@ impl VmHostClient for ProxmoxClient {
                     rename: None,
                 },
             )
-            .await?;
+            .await
+            .context("Failed to create ipfilter-net0 IPset")?;
         }
 
         // Get existing entries to avoid duplicates
         let existing_entries = self
             .list_vm_ipset_entries(&self.node, vm_id, "ipfilter-net0")
-            .await?;
+            .await
+            .context("Failed to list VM IPset entries")?;
         let existing_cidrs: std::collections::HashSet<String> = existing_entries
             .iter()
             .map(|entry| entry.cidr.clone())

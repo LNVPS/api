@@ -25,10 +25,14 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct IpRangeQuery {
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     limit: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     offset: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     region_id: Option<u64>,
 }
 

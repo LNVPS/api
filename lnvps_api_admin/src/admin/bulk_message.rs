@@ -4,8 +4,8 @@ use crate::admin::model::{BulkMessageRequest, BulkMessageResponse};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiResult, WorkCommander, WorkJob};
-use log::{error, info, warn};
+use lnvps_api_common::{ApiData, ApiResult, WorkJob};
+use log::{error, info};
 
 pub fn router() -> Router<RouterState> {
     Router::new().route("/api/admin/v1/users/bulk-message", post(admin_bulk_message))
@@ -13,7 +13,7 @@ pub fn router() -> Router<RouterState> {
 
 async fn admin_bulk_message(
     auth: AdminAuth,
-    State(work_commander): State<Option<WorkCommander>>,
+    State(state): State<RouterState>,
     Json(req): Json<BulkMessageRequest>,
 ) -> ApiResult<BulkMessageResponse> {
     // Check permission - require admin access to users
@@ -31,35 +31,27 @@ async fn admin_bulk_message(
     }
 
     // Dispatch work job for async processing
-    match work_commander {
-        Some(commander) => {
-            let job = WorkJob::BulkMessage {
-                subject: req.subject.clone(),
-                message: req.message.clone(),
-                admin_user_id: auth.user_id,
-            };
+    let job = WorkJob::BulkMessage {
+        subject: req.subject.clone(),
+        message: req.message.clone(),
+        admin_user_id: auth.user_id,
+    };
 
-            match commander.send_job(job).await {
-                Ok(job_id) => {
-                    info!(
-                        "Bulk message job dispatched with ID: {} for subject: '{}'",
-                        job_id,
-                        req.subject.trim()
-                    );
-                    ApiData::ok(BulkMessageResponse {
-                        job_dispatched: true,
-                        job_id: Some(job_id),
-                    })
-                }
-                Err(e) => {
-                    error!("Failed to dispatch bulk message job: {}", e);
-                    ApiData::err("Failed to dispatch message job")
-                }
-            }
+    match state.work_commander.send(job).await {
+        Ok(job_id) => {
+            info!(
+                "Bulk message job dispatched with ID: {} for subject: '{}'",
+                job_id,
+                req.subject.trim()
+            );
+            ApiData::ok(BulkMessageResponse {
+                job_dispatched: true,
+                job_id: Some(job_id),
+            })
         }
-        None => {
-            warn!("WorkCommander not available - cannot process bulk message");
-            ApiData::err("Message processing system not available")
+        Err(e) => {
+            error!("Failed to dispatch bulk message job: {}", e);
+            ApiData::err("Failed to dispatch message job")
         }
     }
 }

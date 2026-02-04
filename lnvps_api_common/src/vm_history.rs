@@ -8,6 +8,7 @@ fn serialize_json_to_bytes(value: Option<Value>) -> Option<Vec<u8>> {
     value.and_then(|v| serde_json::to_vec(&v).ok())
 }
 
+#[derive(Clone)]
 pub struct VmHistoryLogger {
     db: Arc<dyn LNVpsDb>,
 }

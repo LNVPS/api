@@ -28,5 +28,5 @@ nostr = { version = "0.44", default-features = false, features = ["std"] }
 reqwest = "0.13"
 rand = "0.9"
 isocountry = "0.3"
-redis = { version = "0.32", features = ["tokio-comp", "cluster"] }
+redis = { version = "1", features = ["tokio-comp", "cluster"] }
 

@@ -201,7 +201,7 @@ pub async fn vm_to_status(
         image: image.into(),
         template,
         ssh_key: ssh_key.into(),
-        status: state.map(|s| s).unwrap_or_default(),
+        status: state.unwrap_or_default(),
         ip_assignments: ips
             .into_iter()
             .map(|i| {

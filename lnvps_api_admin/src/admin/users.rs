@@ -1,4 +1,3 @@
-use crate::admin::PageQuery;
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminUserInfo, AdminUserRole, AdminUserUpdateRequest};
@@ -6,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use isocountry::CountryCode;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource};
 use serde::Deserialize;
 

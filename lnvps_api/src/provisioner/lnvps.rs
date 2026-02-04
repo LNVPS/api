@@ -771,14 +771,7 @@ impl LNVpsProvisioner {
     pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> Result<()> {
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let client = get_host_client(&info.host, &self.provisioner_config)?;
-
-        (|| async {
-            let client_clone = client.clone();
-            let info_clone = &info;
-            client_clone.configure_vm(info_clone).await
-        })
-            .retry(Self::retry_policy())
-            .await
+        client.configure_vm(&info).await
     }
 
     /// Create a vm on the host as configured by the template
@@ -822,7 +815,13 @@ impl LNVpsProvisioner {
         let create_result = (|| async {
             let client_clone = client.clone();
             let info_clone = &info;
-            client_clone.create_vm(info_clone).await
+            match client_clone.create_vm(info_clone).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    warn!("VM {} creation attempt failed: {:#}", vm_id, e);
+                    Err(e)
+                }
+            }
         })
             .retry(Self::retry_policy())
             .await;
@@ -860,18 +859,8 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        let vm_clone = vm.clone();
 
-        if let Err(e) = (|| async {
-            let client_clone = client.clone();
-            client_clone.delete_vm(&vm_clone).await
-        })
-            .retry(Self::retry_policy())
-            .await
-        {
-            warn!("Failed to delete VM from host after retries: {}", e);
-        }
-
+        client.delete_vm(&vm).await?;
         self.delete_all_ip_assignments(vm_id).await?;
         self.db.delete_vm(vm_id).await?;
 
@@ -884,15 +873,7 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        let vm_clone = vm.clone();
-
-        (|| async {
-            let client_clone = client.clone();
-            client_clone.start_vm(&vm_clone).await
-        })
-            .retry(Self::retry_policy())
-            .await?;
-
+        client.start_vm(&vm).await?;
         Ok(())
     }
 
@@ -902,15 +883,7 @@ impl LNVpsProvisioner {
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        let vm_clone = vm.clone();
-
-        (|| async {
-            let client_clone = client.clone();
-            client_clone.stop_vm(&vm_clone).await
-        })
-            .retry(Self::retry_policy())
-            .await?;
-
+        client.stop_vm(&vm).await?;
         Ok(())
     }
 
