@@ -217,7 +217,7 @@ async fn main() -> Result<(), Error> {
             if let Err(e) = axum::serve(
                 listener,
                 router
-                    .layer(CorsLayer::permissive())
+                    .layer(CorsLayer::very_permissive())
                     .with_state(RouterState {
                         db,
                         state: status,

@@ -88,7 +88,7 @@ async fn main() -> Result<(), Error> {
         exchange,
         feedback,
     );
-    axum::serve(listener, router.layer(CorsLayer::permissive())).await?;
+    axum::serve(listener, router.layer(CorsLayer::very_permissive())).await?;
 
     Ok(())
 }
