@@ -3,7 +3,10 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::{Stream, StreamExt};
 use redis::aio::MultiplexedConnection;
-use redis::streams::{StreamAutoClaimOptions, StreamAutoClaimReply, StreamId};
+use redis::streams::{
+    StreamAddOptions, StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamTrimStrategy,
+    StreamTrimmingMode,
+};
 use redis::{
     AsyncCommands, FromRedisValue, Value,
     streams::{StreamReadOptions, StreamReadReply},
@@ -251,7 +254,9 @@ impl WorkCommander {
         let fields = &[("job", job_json.as_str())];
 
         let mut conn = self.conn.clone();
-        let stream_id: String = conn.xadd("worker", "*", fields).await?;
+        let opts = StreamAddOptions::default()
+            .trim(StreamTrimStrategy::maxlen(StreamTrimmingMode::Approx, 1000));
+        let stream_id: String = conn.xadd_options("worker", "*", fields, &opts).await?;
         Ok(stream_id)
     }
 
