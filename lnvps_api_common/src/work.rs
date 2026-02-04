@@ -2,6 +2,7 @@ use crate::model::UpgradeConfig;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::{Stream, StreamExt};
+use log::info;
 use redis::aio::MultiplexedConnection;
 use redis::streams::{
     StreamAddOptions, StreamAutoClaimOptions, StreamAutoClaimReply, StreamId, StreamTrimStrategy,
@@ -279,6 +280,7 @@ impl WorkCommander {
 
         let pending = self.claim_pending_jobs().await?;
         if !pending.is_empty() {
+            info!("Got {} pending jobs", pending.len());
             return Ok(pending);
         }
 
