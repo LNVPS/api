@@ -7,9 +7,9 @@ use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
-use backon::{ExponentialBuilder, Retryable};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
+use lnvps_api_common::retry::{OpError, OpResult};
 use lnvps_api_common::{VmRunningState, VmRunningStates};
 use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
@@ -52,14 +52,6 @@ pub struct ProxmoxClient {
 }
 
 impl ProxmoxClient {
-    /// Create a retry policy for Proxmox API operations
-    fn retry_policy() -> ExponentialBuilder {
-        ExponentialBuilder::default()
-            .with_min_delay(Duration::from_millis(100))
-            .with_max_delay(Duration::from_secs(5))
-            .with_max_times(3)
-    }
-
     pub fn new(
         base: Url,
         node: &str,
@@ -92,17 +84,14 @@ impl ProxmoxClient {
     pub async fn get_vm_status(&self, node: &str, vm_id: ProxmoxVmId) -> Result<VmInfo> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<VmInfo> = (|| async {
-            api.get(&format!(
+
+        let rsp: ResponseBase<VmInfo> = api
+            .get(&format!(
                 "/api2/json/nodes/{}/qemu/{}/status/current",
                 node_str, vm_id
             ))
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(rsp.data)
     }
 
@@ -151,16 +140,16 @@ impl ProxmoxClient {
     pub async fn create_vm(&self, req: CreateVm) -> Result<TaskId> {
         let api = &self.api;
         let node_clone = req.node.clone();
-        
-        let rsp: ResponseBase<Option<String>> = (|| async {
-            api.post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
-                .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+
+        let rsp: ResponseBase<Option<String>> = api
+            .post(&format!("/api2/json/nodes/{}/qemu", req.node), &req)
+            .await?;
+
         if let Some(id) = rsp.data {
-            Ok(TaskId { id, node: node_clone })
+            Ok(TaskId {
+                id,
+                node: node_clone,
+            })
         } else {
             Err(anyhow!("Failed to create VM"))
         }
@@ -172,14 +161,14 @@ impl ProxmoxClient {
     pub async fn get_vm_config(&self, node: &str, vm_id: ProxmoxVmId) -> Result<HashedVmConfig> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<HashedVmConfig> = (|| async {
-            api.get(&format!("/api2/json/nodes/{}/qemu/{}/config", node_str, vm_id))
-                .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+
+        let rsp: ResponseBase<HashedVmConfig> = api
+            .get(&format!(
+                "/api2/json/nodes/{}/qemu/{}/config",
+                node_str, vm_id
+            ))
+            .await?;
+
         Ok(rsp.data)
     }
 
@@ -189,19 +178,19 @@ impl ProxmoxClient {
     pub async fn configure_vm(&self, req: ConfigureVm) -> Result<TaskId> {
         let api = &self.api;
         let node_clone = req.node.clone();
-        
-        let rsp: ResponseBase<Option<String>> = (|| async {
-            api.post(
+
+        let rsp: ResponseBase<Option<String>> = api
+            .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/config", req.node, req.vm_id),
                 &req,
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         if let Some(id) = rsp.data {
-            Ok(TaskId { id, node: node_clone })
+            Ok(TaskId {
+                id,
+                node: node_clone,
+            })
         } else {
             Err(anyhow!("Failed to configure VM"))
         }
@@ -213,23 +202,17 @@ impl ProxmoxClient {
     pub async fn delete_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<Option<String>> = (|| async {
-            api.req::<_, ()>(
+
+        let rsp: ResponseBase<Option<String>> = api
+            .req::<_, ()>(
                 Method::DELETE,
                 &format!("/api2/json/nodes/{}/qemu/{}", node_str, vm),
                 None,
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         if let Some(id) = rsp.data {
-            Ok(TaskId {
-                id,
-                node: node_str,
-            })
+            Ok(TaskId { id, node: node_str })
         } else {
             Err(anyhow!("Failed to delete VM"))
         }
@@ -258,17 +241,14 @@ impl ProxmoxClient {
         let api = &self.api;
         let task_node = task.node.clone();
         let task_id = task.id.clone();
-        
-        let rsp: ResponseBase<TaskStatus> = (|| async {
-            api.get(&format!(
+
+        let rsp: ResponseBase<TaskStatus> = api
+            .get(&format!(
                 "/api2/json/nodes/{}/tasks/{}/status",
                 task_node, task_id
             ))
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(rsp.data)
     }
 
@@ -313,20 +293,17 @@ impl ProxmoxClient {
     pub async fn download_image(&self, req: DownloadUrlRequest) -> Result<TaskId> {
         let api = &self.api;
         let node_clone = req.node.clone();
-        
-        let rsp: ResponseBase<String> = (|| async {
-            api.post(
+
+        let rsp: ResponseBase<String> = api
+            .post(
                 &format!(
                     "/api2/json/nodes/{}/storage/{}/download-url",
                     req.node, req.storage
                 ),
                 &req,
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(TaskId {
             id: rsp.data,
             node: node_clone,
@@ -340,7 +317,7 @@ impl ProxmoxClient {
             let ssh_user = ssh_config.user.clone();
             let ssh_key = ssh_config.key.clone();
             let host = self.api.base().host().unwrap().to_string();
-            
+
             // Prepare command first
             let mut disk_args: HashMap<&str, String> = HashMap::new();
             disk_args.insert(
@@ -365,16 +342,11 @@ impl ProxmoxClient {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            
+
             // SSH connection and execution with retry
-            let (code, rsp) = (|| async {
-                let mut s = SshClient::new()?;
-                s.connect((host.clone(), 22), &ssh_user, &ssh_key).await?;
-                s.execute(&cmd).await
-            })
-            .retry(Self::retry_policy())
-            .await?;
-            
+            let mut s = SshClient::new()?;
+            s.connect((host.clone(), 22), &ssh_user, &ssh_key).await?;
+            let (code, rsp) = s.execute(&cmd).await?;
             info!("{}", rsp);
 
             if code != 0 {
@@ -390,18 +362,15 @@ impl ProxmoxClient {
     pub async fn resize_disk(&self, req: ResizeDiskRequest) -> Result<TaskId> {
         let api = &self.api;
         let node_clone = req.node.clone();
-        
-        let rsp: ResponseBase<String> = (|| async {
-            api.req(
+
+        let rsp: ResponseBase<String> = api
+            .req(
                 Method::PUT,
                 &format!("/api2/json/nodes/{}/qemu/{}/resize", &req.node, &req.vm_id),
                 Some(&req),
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(TaskId {
             id: rsp.data,
             node: node_clone,
@@ -412,17 +381,14 @@ impl ProxmoxClient {
     pub async fn start_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<String> = (|| async {
-            api.post(
+
+        let rsp: ResponseBase<String> = api
+            .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/start", node_str, vm),
                 (),
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(TaskId {
             id: rsp.data,
             node: node_str,
@@ -433,17 +399,14 @@ impl ProxmoxClient {
     pub async fn stop_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<String> = (|| async {
-            api.post(
+
+        let rsp: ResponseBase<String> = api
+            .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/stop", node_str, vm),
                 (),
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(TaskId {
             id: rsp.data,
             node: node_str,
@@ -454,17 +417,14 @@ impl ProxmoxClient {
     pub async fn shutdown_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<String> = (|| async {
-            api.post(
+
+        let rsp: ResponseBase<String> = api
+            .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/shutdown", node_str, vm),
                 (),
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(TaskId {
             id: rsp.data,
             node: node_str,
@@ -475,17 +435,14 @@ impl ProxmoxClient {
     pub async fn reset_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
-        
-        let rsp: ResponseBase<String> = (|| async {
-            api.post(
+
+        let rsp: ResponseBase<String> = api
+            .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/reset", node_str, vm),
                 (),
             )
-            .await
-        })
-        .retry(Self::retry_policy())
-        .await?;
-        
+            .await?;
+
         Ok(TaskId {
             id: rsp.data,
             node: node_str,
@@ -825,7 +782,8 @@ impl ProxmoxClient {
             .await
             .context("Failed to start disk resize")?;
         // TODO: rollback
-        self.wait_for_task(&j_resize).await
+        self.wait_for_task(&j_resize)
+            .await
             .context("Disk resize task failed")?;
 
         Ok(())
@@ -907,15 +865,25 @@ impl VmHostClient for ProxmoxClient {
         ))
     }
 
-    async fn start_vm(&self, vm: &Vm) -> Result<()> {
-        let task = self.start_vm(&self.node, vm.id.into()).await?;
-        self.wait_for_task(&task).await?;
+    async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
+        let task = self
+            .start_vm(&self.node, vm.id.into())
+            .await
+            .map_err(OpError::Transient)?;
+        self.wait_for_task(&task)
+            .await
+            .map_err(OpError::Transient)?;
         Ok(())
     }
 
-    async fn stop_vm(&self, vm: &Vm) -> Result<()> {
-        let task = self.stop_vm(&self.node, vm.id.into()).await?;
-        self.wait_for_task(&task).await?;
+    async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
+        let task = self
+            .stop_vm(&self.node, vm.id.into())
+            .await
+            .map_err(OpError::Transient)?;
+        self.wait_for_task(&task)
+            .await
+            .map_err(OpError::Transient)?;
         Ok(())
     }
 
@@ -925,8 +893,11 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
-    async fn create_vm(&self, req: &FullVmInfo) -> Result<()> {
-        let config = self.make_config(req).context("Failed to generate VM config")?;
+    async fn create_vm(&self, req: &FullVmInfo) -> OpResult<()> {
+        let config = self
+            .make_config(req)
+            .context("Failed to generate VM config")
+            .map_err(OpError::Fatal)?;
         let vm_id = req.vm.id.into();
         let t_create = self
             .create_vm(CreateVm {
@@ -935,28 +906,36 @@ impl VmHostClient for ProxmoxClient {
                 config,
             })
             .await
-            .context("Failed to create VM on Proxmox")?;
-        self.wait_for_task(&t_create).await
-            .context("VM creation task failed")?;
+            .context("Failed to create VM on Proxmox")
+            .map_err(OpError::Transient)?;
+        self.wait_for_task(&t_create)
+            .await
+            .context("VM creation task failed")
+            .map_err(OpError::Transient)?;
 
         // import template image
-        self.import_template_disk(req).await
-            .context("Failed to import template disk")?;
+        self.import_template_disk(req)
+            .await
+            .context("Failed to import template disk")
+            .map_err(OpError::Transient)?;
 
         // apply firewall config and manage IPsets using patch_firewall
-        self.patch_firewall(req).await
-            .context("Failed to patch firewall configuration")?;
+        self.patch_firewall(req)
+            .await
+            .context("Failed to patch firewall configuration")
+            .map_err(OpError::Transient)?;
 
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
-            && let Err(e) = self.wait_for_task(&j_start).await {
-                warn!("Failed to start vm: {}", e);
-            }
+            && let Err(e) = self.wait_for_task(&j_start).await
+        {
+            warn!("Failed to start vm: {}", e);
+        }
 
         Ok(())
     }
 
-    async fn delete_vm(&self, vm: &Vm) -> Result<()> {
+    async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
         let vm_id: ProxmoxVmId = vm.id.into();
 
         // NOT IMPLEMENTED
@@ -967,19 +946,27 @@ impl VmHostClient for ProxmoxClient {
         self.stop_vm(&self.node, vm_id).await.ok();
 
         if let Some(ssh) = &self.ssh {
-            let mut ses = SshClient::new()?;
+            let mut ses = SshClient::new().map_err(OpError::Transient)?;
             ses.connect(
                 (self.api.base().host().unwrap().to_string(), 22),
                 &ssh.user,
                 &ssh.key,
             )
-            .await?;
+            .await
+            .map_err(OpError::Transient)?;
 
             let cmd = format!("/usr/sbin/qm destroy {}", vm_id,);
-            let (code, rsp) = ses.execute(cmd.as_str()).await?;
+            let (code, rsp) = ses
+                .execute(cmd.as_str())
+                .await
+                .map_err(OpError::Transient)?;
             info!("{}", rsp);
             if code != 0 {
-                bail!("Failed to destroy vm, exit-code {}, {}", code, rsp);
+                return Err(OpError::Fatal(anyhow::anyhow!(
+                    "Failed to destroy vm, exit-code {}, {}",
+                    code,
+                    rsp
+                )));
             }
         }
         Ok(())
@@ -990,9 +977,10 @@ impl VmHostClient for ProxmoxClient {
 
         // try stop, otherwise ignore error (maybe its already running)
         if let Ok(j_stop) = self.stop_vm(&self.node, vm_id).await
-            && let Err(e) = self.wait_for_task(&j_stop).await {
-                warn!("Failed to stop vm: {}", e);
-            }
+            && let Err(e) = self.wait_for_task(&j_stop).await
+        {
+            warn!("Failed to stop vm: {}", e);
+        }
 
         // unlink the existing main disk
         self.unlink_disk(&self.node, vm_id, vec!["scsi0".to_string()], true)
@@ -1003,9 +991,10 @@ impl VmHostClient for ProxmoxClient {
 
         // try start, otherwise ignore error (maybe its already running)
         if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
-            && let Err(e) = self.wait_for_task(&j_start).await {
-                warn!("Failed to start vm: {}", e);
-            }
+            && let Err(e) = self.wait_for_task(&j_start).await
+        {
+            warn!("Failed to start vm: {}", e);
+        }
 
         Ok(())
     }
@@ -1069,9 +1058,12 @@ impl VmHostClient for ProxmoxClient {
         let vm_id = cfg.vm.id.into();
 
         // Check and fix cloud-init IP config if it doesn't match expected
-        let current_config = self.get_vm_config(&self.node, vm_id).await
+        let current_config = self
+            .get_vm_config(&self.node, vm_id)
+            .await
             .context("Failed to get current VM config")?;
-        let expected_config = self.make_config(cfg)
+        let expected_config = self
+            .make_config(cfg)
             .context("Failed to generate expected config")?;
         if current_config.config.ip_config != expected_config.ip_config {
             info!(

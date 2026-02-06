@@ -3,6 +3,7 @@ use crate::router::{ArpEntry, Router};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use lnvps_api_common::retry::{OpError, OpResult};
 use log::{info, warn};
 use nostr_sdk::hashes::{Hash, sha1};
 use reqwest::{Method, RequestBuilder, Url};
@@ -186,11 +187,12 @@ impl Router for OvhDedicatedServerVMacRouter {
         Ok(e.into_iter().find(|e| e.address == ip))
     }
 
-    async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
         let rsp: Vec<String> = self
             .api
             .get(&format!("v1/dedicated/server/{}/virtualMac", &self.name))
-            .await?;
+            .await
+            .map_err(OpError::Transient)?;
 
         let mut ret = vec![];
         for mac in rsp {
@@ -200,7 +202,8 @@ impl Router for OvhDedicatedServerVMacRouter {
                     "v1/dedicated/server/{}/virtualMac/{}/virtualAddress",
                     &self.name, mac
                 ))
-                .await?;
+                .await
+                .map_err(OpError::Transient)?;
 
             for addr in rsp2 {
                 ret.push(ArpEntry {
@@ -216,7 +219,7 @@ impl Router for OvhDedicatedServerVMacRouter {
         Ok(ret)
     }
 
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         info!(
             "[OVH] Adding mac ip: {} {}",
             entry.mac_address, entry.address
@@ -241,8 +244,10 @@ impl Router for OvhDedicatedServerVMacRouter {
                     comment: entry.comment.clone().unwrap_or_default(),
                 },
             )
-            .await?;
-        self.wait_for_task_result(task.task_id).await?;
+            .await
+            .map_err(OpError::Transient)?;
+        self.wait_for_task_result(task.task_id).await
+            .map_err(OpError::Transient)?;
 
         Ok(ArpEntry {
             id: Some(id),
@@ -253,7 +258,7 @@ impl Router for OvhDedicatedServerVMacRouter {
         })
     }
 
-    async fn remove_arp_entry(&self, id: &str) -> Result<()> {
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
         let entries = self.list_arp_entry().await?;
         if let Some(this_entry) = entries.into_iter().find(|e| e.id == Some(id.to_string())) {
             info!(
@@ -270,15 +275,17 @@ impl Router for OvhDedicatedServerVMacRouter {
                     ),
                     None,
                 )
-                .await?;
-            self.wait_for_task_result(task.task_id).await?;
+                .await
+                .map_err(OpError::Transient)?;
+            self.wait_for_task_result(task.task_id).await
+                .map_err(OpError::Transient)?;
             Ok(())
         } else {
-            bail!("Cannot remove arp entry, not found")
+            Err(OpError::Fatal(anyhow::anyhow!("Cannot remove arp entry, not found")))
         }
     }
 
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         // cant patch just return the entry
         warn!("[OVH] Updating virtual mac is not supported");
         Ok(entry.clone())

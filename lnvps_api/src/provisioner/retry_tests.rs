@@ -13,6 +13,7 @@ mod tests {
     use crate::settings::mock_settings;
     use anyhow::{anyhow, bail, Result};
     use async_trait::async_trait;
+    use lnvps_api_common::retry::{OpError, OpResult};
     use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate};
     use lnvps_db::{
         AccessPolicy, IpRange, LNVpsDb, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
@@ -58,29 +59,29 @@ mod tests {
 
     #[async_trait]
     impl DnsServer for FailingDnsServer {
-        async fn add_record(&self, zone: &str, record: &BasicRecord) -> Result<BasicRecord> {
+        async fn add_record(&self, zone: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
             let fails = self.add_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.add_record_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated DNS add failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated DNS add failure (remaining: {})", fails - 1)));
             }
             self.inner.add_record(zone, record).await
         }
 
-        async fn update_record(&self, zone: &str, record: &BasicRecord) -> Result<BasicRecord> {
+        async fn update_record(&self, zone: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
             let fails = self.update_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.update_record_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated DNS update failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated DNS update failure (remaining: {})", fails - 1)));
             }
             self.inner.update_record(zone, record).await
         }
 
-        async fn delete_record(&self, zone: &str, record: &BasicRecord) -> Result<()> {
+        async fn delete_record(&self, zone: &str, record: &BasicRecord) -> OpResult<()> {
             let fails = self.delete_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.delete_record_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated DNS delete failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated DNS delete failure (remaining: {})", fails - 1)));
             }
             self.inner.delete_record(zone, record).await
         }
@@ -122,38 +123,38 @@ mod tests {
             self.inner.generate_mac(ip, comment).await
         }
 
-        async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
+        async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
             let fails = self.list_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.list_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated router list failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated router list failure (remaining: {})", fails - 1)));
             }
             self.inner.list_arp_entry().await
         }
 
-        async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+        async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
             let fails = self.add_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.add_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated router add failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated router add failure (remaining: {})", fails - 1)));
             }
             self.inner.add_arp_entry(entry).await
         }
 
-        async fn remove_arp_entry(&self, id: &str) -> Result<()> {
+        async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
             let fails = self.remove_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.remove_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated router remove failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated router remove failure (remaining: {})", fails - 1)));
             }
             self.inner.remove_arp_entry(id).await
         }
 
-        async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+        async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
             let fails = self.update_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.update_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated router update failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow!("Simulated router update failure (remaining: {})", fails - 1)));
             }
             self.inner.update_arp_entry(entry).await
         }

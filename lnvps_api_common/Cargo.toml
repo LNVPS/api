@@ -10,6 +10,7 @@ admin = ["lnvps_db/admin"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
+try-procedure = { path = "../try-procedure" }
 anyhow.workspace = true
 log.workspace = true
 serde.workspace = true

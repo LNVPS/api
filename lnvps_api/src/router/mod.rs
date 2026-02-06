@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
+use lnvps_api_common::retry::OpResult;
 use lnvps_db::{Vm, VmIpAssignment};
 
 /// Router defines a network device used to access the hosts
@@ -13,10 +14,10 @@ use lnvps_db::{Vm, VmIpAssignment};
 pub trait Router: Send + Sync {
     /// Generate mac address for a given IP address
     async fn generate_mac(&self, ip: &str, comment: &str) -> Result<Option<ArpEntry>>;
-    async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>>;
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
-    async fn remove_arp_entry(&self, id: &str) -> Result<()>;
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>>;
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()>;
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
 }
 
 #[derive(Debug, Clone)]

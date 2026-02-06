@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use lnvps_api_common::retry::OpResult;
 use lnvps_db::VmIpAssignment;
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
@@ -14,13 +15,13 @@ pub use cloudflare::*;
 #[async_trait]
 pub trait DnsServer: Send + Sync {
     /// Add PTR record to the reverse zone
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> Result<BasicRecord>;
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord>;
 
     /// Delete PTR record from the reverse zone
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> Result<()>;
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()>;
 
     /// Update a record
-    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> Result<BasicRecord>;
+    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord>;
 }
 
 #[derive(Clone, Debug)]

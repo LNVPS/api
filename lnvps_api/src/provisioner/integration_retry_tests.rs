@@ -8,6 +8,7 @@ mod tests {
     use crate::mocks::MockVmHost;
     use anyhow::{bail, Result};
     use async_trait::async_trait;
+    use lnvps_api_common::retry::{OpError, OpResult};
     use lnvps_api_common::{MockDb, VmRunningState};
     use lnvps_db::{LNVpsDbBase, User, UserSshKey, Vm};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -70,20 +71,20 @@ mod tests {
             self.inner.generate_mac(vm).await
         }
 
-        async fn start_vm(&self, vm: &Vm) -> Result<()> {
+        async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
             let fails = self.start_vm_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.start_vm_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated VM start failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow::anyhow!("Simulated VM start failure (remaining: {})", fails - 1)));
             }
             self.inner.start_vm(vm).await
         }
 
-        async fn stop_vm(&self, vm: &Vm) -> Result<()> {
+        async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
             let fails = self.stop_vm_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.stop_vm_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated VM stop failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow::anyhow!("Simulated VM stop failure (remaining: {})", fails - 1)));
             }
             self.inner.stop_vm(vm).await
         }
@@ -92,20 +93,20 @@ mod tests {
             self.inner.reset_vm(vm).await
         }
 
-        async fn create_vm(&self, req: &crate::host::FullVmInfo) -> Result<()> {
+        async fn create_vm(&self, req: &crate::host::FullVmInfo) -> OpResult<()> {
             let fails = self.create_vm_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.create_vm_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated VM create failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow::anyhow!("Simulated VM create failure (remaining: {})", fails - 1)));
             }
             self.inner.create_vm(req).await
         }
 
-        async fn delete_vm(&self, vm: &Vm) -> Result<()> {
+        async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
             let fails = self.delete_vm_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.delete_vm_fail_count.fetch_sub(1, Ordering::SeqCst);
-                bail!("Simulated VM delete failure (remaining: {})", fails - 1);
+                return Err(OpError::Transient(anyhow::anyhow!("Simulated VM delete failure (remaining: {})", fails - 1)));
             }
             self.inner.delete_vm(vm).await
         }

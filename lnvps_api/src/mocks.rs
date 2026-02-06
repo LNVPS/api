@@ -14,6 +14,7 @@ use lightning_invoice::{
     Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret, PositiveTimestamp, RawBolt11Invoice,
     RawDataPart, RawHrp, SignedRawBolt11Invoice, TaggedField,
 };
+use lnvps_api_common::retry::{OpError, OpResult};
 use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
@@ -60,15 +61,15 @@ impl Router for MockRouter {
         Ok(None)
     }
 
-    async fn list_arp_entry(&self) -> anyhow::Result<Vec<ArpEntry>> {
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
         let arp = self.arp.lock().await;
         Ok(arp.values().cloned().collect())
     }
 
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> anyhow::Result<ArpEntry> {
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         let mut arp = self.arp.lock().await;
         if arp.iter().any(|(k, v)| v.address == entry.address) {
-            bail!("Address is already in use");
+            return Err(OpError::Fatal(anyhow::anyhow!("Address is already in use")));
         }
         let max_id = *arp.keys().max().unwrap_or(&0);
         let e = ArpEntry {
@@ -79,16 +80,19 @@ impl Router for MockRouter {
         Ok(e)
     }
 
-    async fn remove_arp_entry(&self, id: &str) -> anyhow::Result<()> {
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
         let mut arp = self.arp.lock().await;
-        arp.remove(&id.parse::<u64>()?);
+        arp.remove(&id.parse::<u64>().map_err(|e| OpError::Fatal(e.into()))?);
         Ok(())
     }
 
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> anyhow::Result<ArpEntry> {
-        ensure!(entry.id.is_some(), "id is missing");
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
+        if entry.id.is_none() {
+            return Err(OpError::Fatal(anyhow::anyhow!("id is missing")));
+        }
         let mut arp = self.arp.lock().await;
-        if let Some(mut a) = arp.get_mut(&entry.id.as_ref().unwrap().parse::<u64>()?) {
+        if let Some(mut a) = arp.get_mut(&entry.id.as_ref().unwrap().parse::<u64>()
+            .map_err(|e| OpError::Fatal(e.into()))?) {
             a.mac_address = entry.mac_address.clone();
             a.address = entry.address.clone();
             a.interface = entry.interface.clone();
@@ -210,7 +214,7 @@ impl VmHostClient for MockVmHost {
         ))
     }
 
-    async fn start_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
             vm.state = VmRunningStates::Running;
@@ -218,7 +222,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn stop_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
             vm.state = VmRunningStates::Stopped;
@@ -234,7 +238,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn create_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         let max_id = *vms.keys().max().unwrap_or(&0);
         vms.insert(
@@ -246,7 +250,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn delete_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         vms.remove(&vm.id);
         Ok(())
@@ -352,7 +356,7 @@ impl MockDnsServer {
 }
 #[async_trait]
 impl DnsServer for MockDnsServer {
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t
@@ -365,7 +369,7 @@ impl DnsServer for MockDnsServer {
             .values()
             .any(|v| v.name == record.name && v.kind == record.kind.to_string())
         {
-            bail!("Duplicate record with name {}", record.name);
+            return Err(OpError::Fatal(anyhow::anyhow!("Duplicate record with name {}", record.name)));
         }
 
         let rnd_id: [u8; 12] = rand::random();
@@ -389,7 +393,7 @@ impl DnsServer for MockDnsServer {
         })
     }
 
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<()> {
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t
@@ -397,7 +401,9 @@ impl DnsServer for MockDnsServer {
             zones.insert(zone_id.to_string(), HashMap::new());
             zones.get_mut(zone_id).unwrap()
         };
-        ensure!(record.id.is_some(), "Id is missing");
+        if record.id.is_none() {
+            return Err(OpError::Fatal(anyhow::anyhow!("Id is missing")));
+        }
         table.remove(record.id.as_ref().unwrap());
         Ok(())
     }
@@ -406,7 +412,7 @@ impl DnsServer for MockDnsServer {
         &self,
         zone_id: &str,
         record: &BasicRecord,
-    ) -> anyhow::Result<BasicRecord> {
+    ) -> OpResult<BasicRecord> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t
@@ -414,7 +420,9 @@ impl DnsServer for MockDnsServer {
             zones.insert(zone_id.to_string(), HashMap::new());
             zones.get_mut(zone_id).unwrap()
         };
-        ensure!(record.id.is_some(), "Id is missing");
+        if record.id.is_none() {
+            return Err(OpError::Fatal(anyhow::anyhow!("Id is missing")));
+        }
         if let Some(mut r) = table.get_mut(record.id.as_ref().unwrap()) {
             r.name = record.name.clone();
             r.value = record.value.clone();

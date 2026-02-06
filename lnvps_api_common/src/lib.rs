@@ -6,6 +6,7 @@ mod model;
 mod network;
 mod nip98;
 mod pricing;
+pub mod retry;
 mod routes;
 mod status;
 mod vm_history;

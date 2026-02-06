@@ -5,6 +5,7 @@ use crate::host::{
 };
 use crate::settings::QemuConfig;
 use anyhow::{Context, Result, bail, ensure};
+use lnvps_api_common::retry::{OpError, OpResult};
 use chrono::Utc;
 use lnvps_api_common::VmRunningState;
 use lnvps_api_common::VmRunningStates;
@@ -162,11 +163,11 @@ impl VmHostClient for LibVirtHost {
         ))
     }
 
-    async fn start_vm(&self, vm: &Vm) -> Result<()> {
+    async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
         Ok(())
     }
 
-    async fn stop_vm(&self, vm: &Vm) -> Result<()> {
+    async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
         Ok(())
     }
 
@@ -174,15 +175,16 @@ impl VmHostClient for LibVirtHost {
         Ok(())
     }
 
-    async fn create_vm(&self, cfg: &FullVmInfo) -> Result<()> {
-        let domain = self.create_domain_xml(cfg)?;
-        let xml = quick_xml::se::to_string(&domain)?;
-        let domain = Domain::create_xml(&self.connection, &xml, VIR_DOMAIN_START_VALIDATE)?;
+    async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
+        let domain = self.create_domain_xml(cfg).map_err(OpError::Transient)?;
+        let xml = quick_xml::se::to_string(&domain).map_err(|e| OpError::Fatal(e.into()))?;
+        let domain = Domain::create_xml(&self.connection, &xml, VIR_DOMAIN_START_VALIDATE)
+            .map_err(|e| OpError::Transient(e.into()))?;
 
         Ok(())
     }
 
-    async fn delete_vm(&self, vm: &Vm) -> Result<()> {
+    async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
         todo!()
     }
 

@@ -2,6 +2,7 @@ use crate::dns::{BasicRecord, DnsServer};
 use crate::json_api::JsonApi;
 use anyhow::Context;
 use async_trait::async_trait;
+use lnvps_api_common::retry::{OpError, OpResult};
 use log::info;
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +42,7 @@ impl Cloudflare {
 
 #[async_trait]
 impl DnsServer for Cloudflare {
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         info!(
             "Adding record: [{}] {} => {}",
             record.kind, record.name, record.value
@@ -57,8 +58,9 @@ impl DnsServer for Cloudflare {
                     id: None,
                 },
             )
-            .await?;
-        Self::bail_error(&id_response)?;
+            .await
+            .map_err(OpError::Transient)?;
+        Self::bail_error(&id_response).map_err(OpError::Transient)?;
         Ok(BasicRecord {
             name: id_response.result.name,
             value: id_response.result.content,
@@ -67,8 +69,9 @@ impl DnsServer for Cloudflare {
         })
     }
 
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<()> {
-        let record_id = record.id.as_ref().context("record id missing")?;
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()> {
+        let record_id = record.id.as_ref().context("record id missing")
+            .map_err(OpError::Fatal)?;
         info!(
             "Deleting record: [{}] {} => {}",
             record.kind, record.name, record.value
@@ -85,8 +88,9 @@ impl DnsServer for Cloudflare {
                     id: None,
                 }),
             )
-            .await?;
-        Self::bail_error(&res)?;
+            .await
+            .map_err(OpError::Transient)?;
+        Self::bail_error(&res).map_err(OpError::Transient)?;
         Ok(())
     }
 
@@ -94,12 +98,13 @@ impl DnsServer for Cloudflare {
         &self,
         zone_id: &str,
         record: &BasicRecord,
-    ) -> anyhow::Result<BasicRecord> {
+    ) -> OpResult<BasicRecord> {
         info!(
             "Updating record: [{}] {} => {}",
             record.kind, record.name, record.value
         );
-        let record_id = record.id.as_ref().context("record id missing")?;
+        let record_id = record.id.as_ref().context("record id missing")
+            .map_err(OpError::Fatal)?;
         let id_response: CfResult<CfRecord> = self
             .api
             .req(
@@ -112,8 +117,9 @@ impl DnsServer for Cloudflare {
                     id: Some(record_id.to_string()),
                 }),
             )
-            .await?;
-        Self::bail_error(&id_response)?;
+            .await
+            .map_err(OpError::Transient)?;
+        Self::bail_error(&id_response).map_err(OpError::Transient)?;
         Ok(BasicRecord {
             name: id_response.result.name,
             value: id_response.result.content,

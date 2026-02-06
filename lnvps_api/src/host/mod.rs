@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use futures::future::join_all;
 use lnvps_api_common::VmRunningState;
+use lnvps_api_common::retry::OpResult;
 use lnvps_db::{
     IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind,
     VmIpAssignment, VmOsImage, VmTemplate,
@@ -34,19 +35,19 @@ pub trait VmHostClient: Send + Sync {
     async fn generate_mac(&self, vm: &Vm) -> Result<String>;
 
     /// Start a VM
-    async fn start_vm(&self, vm: &Vm) -> Result<()>;
+    async fn start_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Stop a VM
-    async fn stop_vm(&self, vm: &Vm) -> Result<()>;
+    async fn stop_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Reset VM (Hard)
     async fn reset_vm(&self, vm: &Vm) -> Result<()>;
 
     /// Spawn a VM
-    async fn create_vm(&self, cfg: &FullVmInfo) -> Result<()>;
+    async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Delete a VM
-    async fn delete_vm(&self, vm: &Vm) -> Result<()>;
+    async fn delete_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Re-install a vm OS
     async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()>;
