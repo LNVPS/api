@@ -1,13 +1,13 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateVmTemplateRequest, AdminUpdateVmTemplateRequest, AdminVmTemplateInfo,
 };
-use crate::admin::{PageQuery, RouterState};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmTemplate};
 use std::sync::Arc;
 

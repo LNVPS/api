@@ -1,13 +1,13 @@
 use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
 use anyhow::Result;
-use lnvps_api_common::{UpgradeConfig, WorkJob};
+use lnvps_api_common::{UpgradeConfig, WorkCommander, WorkJob};
 use lnvps_db::{LNVpsDb, VmPayment};
 use log::{error, info, warn};
 use payments_rs::lightning::LightningNode;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 mod invoice;
@@ -19,17 +19,18 @@ pub fn listen_all_payments(
     settings: &Settings,
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
-    sender: UnboundedSender<WorkJob>,
-) -> Result<()> {
+    sender: Arc<dyn WorkCommander>,
+) -> Result<Vec<JoinHandle<()>>> {
+    let mut ret = Vec::new();
     let mut handler = NodeInvoiceHandler::new(node.clone(), db.clone(), sender.clone());
-    tokio::spawn(async move {
+    ret.push(tokio::spawn(async move {
         loop {
             if let Err(e) = handler.listen().await {
                 error!("invoice-error: {}", e);
             }
             sleep(Duration::from_secs(10)).await;
         }
-    });
+    }));
 
     #[cfg(feature = "revolut")]
     {
@@ -41,23 +42,23 @@ pub fn listen_all_payments(
                 db.clone(),
                 sender.clone(),
             )?;
-            tokio::spawn(async move {
+            ret.push(tokio::spawn(async move {
                 loop {
                     if let Err(e) = handler.listen().await {
                         error!("revolut-error: {}", e);
                     }
                     sleep(Duration::from_secs(30)).await;
                 }
-            });
+            }));
         }
     }
 
-    Ok(())
+    Ok(ret)
 }
 
 pub(crate) async fn handle_upgrade(
     payment: &VmPayment,
-    tx: &UnboundedSender<WorkJob>,
+    tx: &Arc<dyn WorkCommander>,
     _db: Arc<dyn LNVpsDb>,
 ) -> Result<()> {
     // Parse upgrade parameters from the dedicated upgrade_params field
@@ -73,7 +74,8 @@ pub(crate) async fn handle_upgrade(
             tx.send(WorkJob::ProcessVmUpgrade {
                 vm_id: payment.vm_id,
                 config: upgrade_params,
-            })?;
+            })
+            .await?;
         } else {
             warn!(
                 "Upgrade payment {} has invalid upgrade parameters JSON",

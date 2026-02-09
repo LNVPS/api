@@ -140,7 +140,7 @@ impl DVMHandler for LnvpsDvm {
             payment = payment.tag(Tag::parse([
                 "amount",
                 invoice.amount.to_string().as_str(),
-                &invoice.external_data.as_str(),
+                invoice.external_data.as_str(),
             ])?);
             client.send_event_builder(payment).await?;
 
@@ -210,6 +210,7 @@ mod tests {
             db.clone(),
             node.clone(),
             exch.clone(),
+            None,
         ));
         let keys = Keys::generate();
         let empty_client = Client::new(keys.clone());

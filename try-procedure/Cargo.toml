@@ -1,0 +1,17 @@
+[package]
+name = "try-procedure"
+version = "0.1.0"
+edition = "2024"
+description = "Retry with error classification (transient vs fatal) and step-based rollback pipelines"
+license = "MIT"
+repository = "https://github.com/v0l/try-procedure"
+keywords = ["retry", "rollback", "pipeline", "async", "error-handling"]
+categories = ["asynchronous", "rust-patterns"]
+
+[dependencies]
+log = "0.4"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+anyhow = "1"

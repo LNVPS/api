@@ -2,18 +2,17 @@ use crate::payments::handle_upgrade;
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
-use lnvps_api_common::VmHistoryLogger;
 use lnvps_api_common::WorkJob;
+use lnvps_api_common::{VmHistoryLogger, WorkCommander};
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType, VmPayment};
 use log::{error, info, warn};
 use payments_rs::lightning::{InvoiceUpdate, LightningNode};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 
 pub struct NodeInvoiceHandler {
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
-    tx: UnboundedSender<WorkJob>,
+    tx: Arc<dyn WorkCommander>,
     vm_history_logger: VmHistoryLogger,
 }
 
@@ -21,7 +20,7 @@ impl NodeInvoiceHandler {
     pub fn new(
         node: Arc<dyn LightningNode>,
         db: Arc<dyn LNVpsDb>,
-        tx: UnboundedSender<WorkJob>,
+        tx: Arc<dyn WorkCommander>,
     ) -> Self {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         Self {
@@ -72,8 +71,8 @@ impl NodeInvoiceHandler {
         }
 
         // Log VM renewal if this extends the expiration
-        if payment.time_value > 0 {
-            if let Err(e) = self
+        if payment.time_value > 0
+            && let Err(e) = self
                 .vm_history_logger
                 .log_vm_renewed(
                     payment.vm_id,
@@ -88,9 +87,8 @@ impl NodeInvoiceHandler {
                     })),
                 )
                 .await
-            {
-                warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
-            }
+        {
+            warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
         }
 
         info!(
@@ -128,9 +126,11 @@ impl NodeInvoiceHandler {
             }
         } else {
             // Regular renewal payment - just check the VM
-            self.tx.send(WorkJob::CheckVm {
-                vm_id: payment.vm_id,
-            })?;
+            self.tx
+                .send(WorkJob::CheckVm {
+                    vm_id: payment.vm_id,
+                })
+                .await?;
         }
 
         Ok(())

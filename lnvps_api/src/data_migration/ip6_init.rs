@@ -46,7 +46,12 @@ impl DataMigration for Ip6InitDataMigration {
                     let ips_pick = net.pick_ip_for_region(host.region_id).await?;
                     if let Some(mut v6) = ips_pick.ip6 {
                         info!("Assigning ip {} to vm {}", v6.ip, vm.id);
-                        provisioner.assign_available_v6_to_vm(&vm, &mut v6).await?;
+                        let mut assignment =
+                            LNVpsProvisioner::v6_to_allocation(&mut v6, vm.id, &vm.mac_address)?;
+                        provisioner
+                            .network
+                            .save_ip_assignment(&mut assignment)
+                            .await?;
                         provisioner.apply_vm_config_to_host(vm.id).await?;
                     }
                 }

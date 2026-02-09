@@ -7,7 +7,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
-use lnvps_api_common::JobFeedback;
+use lnvps_api_common::WorkFeedback;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use tokio::select;
@@ -65,11 +65,11 @@ async fn handle_socket(socket: WebSocket, this: RouterState, params: WebSocketQu
         user_id, channel_type
     );
 
-    // Check if work commander is available
-    let commander = match &this.work_commander {
+    // Check if work feedback is available
+    let feedback = match &this.feedback {
         Some(c) => c.clone(),
         None => {
-            warn!("Work commander not available for job feedback WebSocket");
+            warn!("Redis feedback not available!");
             let error_msg = WebSocketMessage::Error {
                 error: "Job feedback service is not available".to_string(),
             };
@@ -88,10 +88,7 @@ async fn handle_socket(socket: WebSocket, this: RouterState, params: WebSocketQu
     };
 
     // Subscribe to the appropriate feedback channel
-    let mut feedback_stream = match commander
-        .subscribe_channel_message::<JobFeedback>(&channel_name)
-        .await
-    {
+    let mut feedback_stream = match feedback.subscribe(&channel_name).await {
         Ok(stream) => stream,
         Err(e) => {
             error!(
@@ -119,11 +116,11 @@ async fn handle_socket(socket: WebSocket, this: RouterState, params: WebSocketQu
         }
     };
 
-    if let Ok(json) = serde_json::to_string(&connection_message) {
-        if let Err(e) = sender.send(Message::Text(json.into())).await {
-            warn!("Failed to send connection confirmation: {}", e);
-            return;
-        }
+    if let Ok(json) = serde_json::to_string(&connection_message)
+        && let Err(e) = sender.send(Message::Text(json.into())).await
+    {
+        warn!("Failed to send connection confirmation: {}", e);
+        return;
     }
 
     loop {

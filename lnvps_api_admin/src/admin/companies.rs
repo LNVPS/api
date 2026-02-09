@@ -1,11 +1,11 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminCompanyInfo, CreateCompanyRequest, UpdateCompanyRequest};
-use crate::admin::{PageQuery, RouterState};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource, Company};
 
 pub fn router() -> Router<RouterState> {

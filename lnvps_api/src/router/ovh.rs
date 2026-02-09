@@ -1,8 +1,10 @@
 use crate::json_api::{JsonApi, TokenGen};
 use crate::router::{ArpEntry, Router};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use lnvps_api_common::op_transient;
+use lnvps_api_common::retry::{OpError, OpResult};
 use log::{info, warn};
 use nostr_sdk::hashes::{Hash, sha1};
 use reqwest::{Method, RequestBuilder, Url};
@@ -111,19 +113,24 @@ impl TokenGen for OvhTokenGen {
 }
 
 impl OvhDedicatedServerVMacRouter {
-    pub async fn new(url: &str, name: &str, token: &str) -> Result<Self> {
+    pub async fn new(url: &str, name: &str, token: &str) -> OpResult<Self> {
         // load API time delta
-        let time_api = JsonApi::new(url)?;
+        let time_api = JsonApi::new(url).map_err(OpError::Fatal)?;
         let time = time_api.get::<i64>("v1/auth/time").await?;
         let delta: i64 = Utc::now().timestamp().sub(time);
 
         Ok(Self {
             name: name.to_string(),
-            api: JsonApi::token_gen(url, false, OvhTokenGen::new(delta, token)?)?,
+            api: JsonApi::token_gen(
+                url,
+                false,
+                OvhTokenGen::new(delta, token).map_err(OpError::Fatal)?,
+            )
+            .map_err(OpError::Fatal)?,
         })
     }
 
-    async fn get_task(&self, task_id: i64) -> Result<OvhTaskResponse> {
+    async fn get_task(&self, task_id: i64) -> OpResult<OvhTaskResponse> {
         self.api
             .get(&format!(
                 "v1/dedicated/server/{}/task/{}",
@@ -133,28 +140,20 @@ impl OvhDedicatedServerVMacRouter {
     }
 
     /// Poll a task until it completes
-    async fn wait_for_task_result(&self, task_id: i64) -> Result<OvhTaskResponse> {
+    async fn wait_for_task_result(&self, task_id: i64) -> OpResult<OvhTaskResponse> {
         loop {
             let status = self.get_task(task_id).await?;
             match status.status {
                 OvhTaskStatus::Cancelled => {
-                    return Err(anyhow!(
-                        "Task was cancelled: {}",
-                        status.comment.unwrap_or_default()
-                    ));
+                    op_transient!("Task was cancelled: {}", status.comment.unwrap_or_default());
                 }
                 OvhTaskStatus::CustomerError => {
-                    return Err(anyhow!(
-                        "Task failed: {}",
-                        status.comment.unwrap_or_default()
-                    ));
+                    // TODO: check error codes
+                    op_transient!("Task failed: {}", status.comment.unwrap_or_default());
                 }
                 OvhTaskStatus::Done => return Ok(status),
                 OvhTaskStatus::OvhError => {
-                    return Err(anyhow!(
-                        "Task failed: {}",
-                        status.comment.unwrap_or_default()
-                    ));
+                    op_transient!("Task failed: {}", status.comment.unwrap_or_default());
                 }
                 _ => {}
             }
@@ -186,7 +185,7 @@ impl Router for OvhDedicatedServerVMacRouter {
         Ok(e.into_iter().find(|e| e.address == ip))
     }
 
-    async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
         let rsp: Vec<String> = self
             .api
             .get(&format!("v1/dedicated/server/{}/virtualMac", &self.name))
@@ -216,7 +215,7 @@ impl Router for OvhDedicatedServerVMacRouter {
         Ok(ret)
     }
 
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         info!(
             "[OVH] Adding mac ip: {} {}",
             entry.mac_address, entry.address
@@ -253,7 +252,7 @@ impl Router for OvhDedicatedServerVMacRouter {
         })
     }
 
-    async fn remove_arp_entry(&self, id: &str) -> Result<()> {
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
         let entries = self.list_arp_entry().await?;
         if let Some(this_entry) = entries.into_iter().find(|e| e.id == Some(id.to_string())) {
             info!(
@@ -274,11 +273,13 @@ impl Router for OvhDedicatedServerVMacRouter {
             self.wait_for_task_result(task.task_id).await?;
             Ok(())
         } else {
-            bail!("Cannot remove arp entry, not found")
+            Err(OpError::Fatal(anyhow::anyhow!(
+                "Cannot remove arp entry, not found"
+            )))
         }
     }
 
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         // cant patch just return the entry
         warn!("[OVH] Updating virtual mac is not supported");
         Ok(entry.clone())

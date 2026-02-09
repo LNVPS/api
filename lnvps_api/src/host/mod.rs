@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use futures::future::join_all;
 use lnvps_api_common::VmRunningState;
+use lnvps_api_common::retry::OpResult;
 use lnvps_db::{
     IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind,
     VmIpAssignment, VmOsImage, VmTemplate,
@@ -25,56 +26,56 @@ pub struct TerminalStream {
 /// Generic type for creating VM's
 #[async_trait]
 pub trait VmHostClient: Send + Sync {
-    async fn get_info(&self) -> Result<VmHostInfo>;
+    async fn get_info(&self) -> OpResult<VmHostInfo>;
 
     /// Download OS image to the host
-    async fn download_os_image(&self, image: &VmOsImage) -> Result<()>;
+    async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()>;
 
     /// Create a random MAC address for the NIC
-    async fn generate_mac(&self, vm: &Vm) -> Result<String>;
+    async fn generate_mac(&self, vm: &Vm) -> OpResult<String>;
 
     /// Start a VM
-    async fn start_vm(&self, vm: &Vm) -> Result<()>;
+    async fn start_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Stop a VM
-    async fn stop_vm(&self, vm: &Vm) -> Result<()>;
+    async fn stop_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Reset VM (Hard)
-    async fn reset_vm(&self, vm: &Vm) -> Result<()>;
+    async fn reset_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Spawn a VM
-    async fn create_vm(&self, cfg: &FullVmInfo) -> Result<()>;
+    async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Delete a VM
-    async fn delete_vm(&self, vm: &Vm) -> Result<()>;
+    async fn delete_vm(&self, vm: &Vm) -> OpResult<()>;
 
     /// Re-install a vm OS
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()>;
+    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Resize the primary disk of a VM
-    async fn resize_disk(&self, cfg: &FullVmInfo) -> Result<()>;
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Get the running status of a VM
-    async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState>;
+    async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState>;
 
     /// Get the running status of all VMs on this host
-    async fn get_all_vm_states(&self) -> Result<Vec<(u64, VmRunningState)>>;
+    async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>>;
 
     /// Apply vm configuration (patch)
-    async fn configure_vm(&self, cfg: &FullVmInfo) -> Result<()>;
+    async fn configure_vm(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Update VM firewall configuration and IPsets
-    async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()>;
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Get resource usage data
     async fn get_time_series_data(
         &self,
         vm: &Vm,
         series: TimeSeries,
-    ) -> Result<Vec<TimeSeriesData>>;
+    ) -> OpResult<Vec<TimeSeriesData>>;
 
     /// Connect to terminal serial port
-    async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream>;
+    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream>;
 }
 
 pub async fn get_vm_host_client(

@@ -2,6 +2,8 @@ use crate::dns::{BasicRecord, DnsServer};
 use crate::json_api::JsonApi;
 use anyhow::Context;
 use async_trait::async_trait;
+use lnvps_api_common::op_transient;
+use lnvps_api_common::retry::OpResult;
 use log::info;
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +23,10 @@ impl Cloudflare {
         }
     }
 
-    fn bail_error<T>(rsp: &CfResult<T>) -> anyhow::Result<()> {
+    fn bail_error<T>(rsp: &CfResult<T>) -> OpResult<()> {
         if !rsp.success {
-            anyhow::bail!(
+            // TODO: map error codes
+            op_transient!(
                 "Error updating record: {:?}",
                 rsp.errors
                     .as_ref()
@@ -41,7 +44,7 @@ impl Cloudflare {
 
 #[async_trait]
 impl DnsServer for Cloudflare {
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         info!(
             "Adding record: [{}] {} => {}",
             record.kind, record.name, record.value
@@ -67,7 +70,7 @@ impl DnsServer for Cloudflare {
         })
     }
 
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<()> {
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()> {
         let record_id = record.id.as_ref().context("record id missing")?;
         info!(
             "Deleting record: [{}] {} => {}",
@@ -90,11 +93,7 @@ impl DnsServer for Cloudflare {
         Ok(())
     }
 
-    async fn update_record(
-        &self,
-        zone_id: &str,
-        record: &BasicRecord,
-    ) -> anyhow::Result<BasicRecord> {
+    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         info!(
             "Updating record: [{}] {} => {}",
             record.kind, record.name, record.value

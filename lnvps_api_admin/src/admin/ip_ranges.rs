@@ -25,10 +25,14 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct IpRangeQuery {
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     limit: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     offset: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     region_id: Option<u64>,
 }
 
@@ -157,10 +161,10 @@ async fn admin_create_ip_range(
     }
 
     // Validate access policy if provided
-    if let Some(policy_id) = req.access_policy_id {
-        if let Err(_) = this.db.get_access_policy(policy_id).await {
-            return ApiData::err("Specified access policy does not exist");
-        }
+    if let Some(policy_id) = req.access_policy_id
+        && let Err(_) = this.db.get_access_policy(policy_id).await
+    {
+        return ApiData::err("Specified access policy does not exist");
     }
 
     // Create IP range object

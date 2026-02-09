@@ -1,5 +1,5 @@
 use crate::data_migration::DataMigration;
-use crate::provisioner::LNVpsProvisioner;
+use crate::router::get_router;
 use anyhow::Result;
 use lnvps_db::LNVpsDb;
 use log::{info, warn};
@@ -9,19 +9,17 @@ use std::sync::Arc;
 
 pub struct ArpRefFixerDataMigration {
     db: Arc<dyn LNVpsDb>,
-    provisioner: Arc<LNVpsProvisioner>,
 }
 
 impl ArpRefFixerDataMigration {
-    pub fn new(db: Arc<dyn LNVpsDb>, provisioner: Arc<LNVpsProvisioner>) -> Self {
-        Self { db, provisioner }
+    pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
+        Self { db }
     }
 }
 
 impl DataMigration for ArpRefFixerDataMigration {
     fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
         let db = self.db.clone();
-        let provisioner = self.provisioner.clone();
         Box::pin(async move {
             info!("Starting ARP reference fixer migration");
 
@@ -32,7 +30,7 @@ impl DataMigration for ArpRefFixerDataMigration {
             for router in routers {
                 info!("Processing router {} ({})", router.id, router.name);
 
-                match provisioner.get_router(router.id).await {
+                match get_router(&db, router.id).await {
                     Ok(router_client) => {
                         match router_client.list_arp_entry().await {
                             Ok(arp_entries) => {

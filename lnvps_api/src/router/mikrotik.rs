@@ -1,10 +1,11 @@
 use crate::json_api::JsonApi;
 use crate::router::{ArpEntry, Router};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use log::debug;
+use lnvps_api_common::op_fatal;
+use lnvps_api_common::retry::{OpError, OpResult};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +32,7 @@ impl Router for MikrotikRouter {
         Ok(None)
     }
 
-    async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>> {
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
         let rsp: Vec<MikrotikArpEntry> = self
             .api
             .req::<_, ()>(Method::GET, "/rest/ip/arp", None)
@@ -39,24 +40,24 @@ impl Router for MikrotikRouter {
         Ok(rsp.into_iter().filter_map(|e| e.try_into().ok()).collect())
     }
 
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         let req: MikrotikArpEntry = entry.clone().into();
         let rsp: MikrotikArpEntry = self.api.req(Method::PUT, "/rest/ip/arp", Some(req)).await?;
-        debug!("{:?}", rsp);
-        Ok(rsp.try_into()?)
+        rsp.try_into().map_err(OpError::Fatal)
     }
 
-    async fn remove_arp_entry(&self, id: &str) -> Result<()> {
-        let rsp: MikrotikArpEntry = self
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
+        let _rsp: MikrotikArpEntry = self
             .api
             .req::<_, ()>(Method::DELETE, &format!("/rest/ip/arp/{}", id), None)
             .await?;
-        debug!("{:?}", rsp);
         Ok(())
     }
 
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry> {
-        ensure!(entry.id.is_some(), "Cannot update an arp entry without ID");
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
+        if entry.id.is_none() {
+            op_fatal!("Cannot update an arp entry without ID");
+        }
         let req: MikrotikArpEntry = entry.clone().into();
         let rsp: MikrotikArpEntry = self
             .api
@@ -66,8 +67,7 @@ impl Router for MikrotikRouter {
                 Some(req),
             )
             .await?;
-        debug!("{:?}", rsp);
-        Ok(rsp.try_into()?)
+        rsp.try_into().map_err(OpError::Fatal)
     }
 }
 

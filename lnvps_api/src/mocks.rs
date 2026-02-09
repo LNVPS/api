@@ -14,7 +14,8 @@ use lightning_invoice::{
     Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret, PositiveTimestamp, RawBolt11Invoice,
     RawDataPart, RawHrp, SignedRawBolt11Invoice, TaggedField,
 };
-use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates};
+use lnvps_api_common::retry::{OpError, OpResult};
+use lnvps_api_common::{op_fatal, ExchangeRateService, VmRunningState, VmRunningStates};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
@@ -54,21 +55,25 @@ impl MockRouter {
         }
     }
 }
+
 #[async_trait]
 impl Router for MockRouter {
     async fn generate_mac(&self, ip: &str, comment: &str) -> anyhow::Result<Option<ArpEntry>> {
         Ok(None)
     }
 
-    async fn list_arp_entry(&self) -> anyhow::Result<Vec<ArpEntry>> {
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
         let arp = self.arp.lock().await;
         Ok(arp.values().cloned().collect())
     }
 
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> anyhow::Result<ArpEntry> {
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         let mut arp = self.arp.lock().await;
         if arp.iter().any(|(k, v)| v.address == entry.address) {
-            bail!("Address is already in use");
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Address is already in use {:?}",
+                entry
+            )));
         }
         let max_id = *arp.keys().max().unwrap_or(&0);
         let e = ArpEntry {
@@ -79,16 +84,25 @@ impl Router for MockRouter {
         Ok(e)
     }
 
-    async fn remove_arp_entry(&self, id: &str) -> anyhow::Result<()> {
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
         let mut arp = self.arp.lock().await;
-        arp.remove(&id.parse::<u64>()?);
+        arp.remove(&id.parse::<u64>().map_err(|e| OpError::Fatal(e.into()))?);
         Ok(())
     }
 
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> anyhow::Result<ArpEntry> {
-        ensure!(entry.id.is_some(), "id is missing");
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
+        if entry.id.is_none() {
+            return Err(OpError::Fatal(anyhow::anyhow!("id is missing")));
+        }
         let mut arp = self.arp.lock().await;
-        if let Some(mut a) = arp.get_mut(&entry.id.as_ref().unwrap().parse::<u64>()?) {
+        if let Some(mut a) = arp.get_mut(
+            &entry
+                .id
+                .as_ref()
+                .unwrap()
+                .parse::<u64>()
+                .map_err(|e| OpError::Fatal(e.into()))?,
+        ) {
             a.mac_address = entry.mac_address.clone();
             a.address = entry.address.clone();
             a.interface = entry.interface.clone();
@@ -193,15 +207,15 @@ impl MockVmHost {
 
 #[async_trait]
 impl VmHostClient for MockVmHost {
-    async fn get_info(&self) -> anyhow::Result<VmHostInfo> {
+    async fn get_info(&self) -> OpResult<VmHostInfo> {
         todo!()
     }
 
-    async fn download_os_image(&self, image: &VmOsImage) -> anyhow::Result<()> {
+    async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
         Ok(())
     }
 
-    async fn generate_mac(&self, vm: &Vm) -> anyhow::Result<String> {
+    async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
         Ok(format!(
             "ff:ff:ff:{}:{}:{}",
             hex::encode([rand::random::<u8>()]),
@@ -210,7 +224,7 @@ impl VmHostClient for MockVmHost {
         ))
     }
 
-    async fn start_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
             vm.state = VmRunningStates::Running;
@@ -218,7 +232,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn stop_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
             vm.state = VmRunningStates::Stopped;
@@ -226,7 +240,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn reset_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
             vm.state = VmRunningStates::Running;
@@ -234,7 +248,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn create_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         let max_id = *vms.keys().max().unwrap_or(&0);
         vms.insert(
@@ -246,22 +260,22 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn delete_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         vms.remove(&vm.id);
         Ok(())
     }
 
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
-    async fn resize_disk(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
         // Mock implementation - just return Ok for testing
         Ok(())
     }
 
-    async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmRunningState> {
+    async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
         let vms = self.vms.lock().await;
         if let Some(vm) = vms.get(&vm.id) {
             Ok(VmRunningState {
@@ -276,11 +290,11 @@ impl VmHostClient for MockVmHost {
                 disk_read: 69,
             })
         } else {
-            bail!("No vm with id {}", vm.id)
+            op_fatal!("No vm with id {}", vm.id)
         }
     }
 
-    async fn get_all_vm_states(&self) -> anyhow::Result<Vec<(u64, VmRunningState)>> {
+    async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
         let vms = self.vms.lock().await;
         let states = vms
             .iter()
@@ -304,11 +318,11 @@ impl VmHostClient for MockVmHost {
         Ok(states)
     }
 
-    async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {
+    async fn configure_vm(&self, vm: &FullVmInfo) -> OpResult<()> {
         Ok(())
     }
 
-    async fn patch_firewall(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
@@ -316,15 +330,16 @@ impl VmHostClient for MockVmHost {
         &self,
         vm: &Vm,
         series: TimeSeries,
-    ) -> anyhow::Result<Vec<TimeSeriesData>> {
+    ) -> OpResult<Vec<TimeSeriesData>> {
         Ok(vec![])
     }
 
-    async fn connect_terminal(&self, vm: &Vm) -> anyhow::Result<TerminalStream> {
+    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
         todo!()
     }
 }
 
+#[derive(Clone)]
 pub struct MockDnsServer {
     pub zones: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>,
 }
@@ -343,16 +358,14 @@ impl Default for MockDnsServer {
 
 impl MockDnsServer {
     pub fn new() -> Self {
-        static LAZY_ZONES: LazyLock<Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
         Self {
-            zones: LAZY_ZONES.clone(),
+            zones: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 #[async_trait]
 impl DnsServer for MockDnsServer {
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<BasicRecord> {
+    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t
@@ -365,7 +378,10 @@ impl DnsServer for MockDnsServer {
             .values()
             .any(|v| v.name == record.name && v.kind == record.kind.to_string())
         {
-            bail!("Duplicate record with name {}", record.name);
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Duplicate record with name {}",
+                record.name
+            )));
         }
 
         let rnd_id: [u8; 12] = rand::random();
@@ -389,7 +405,7 @@ impl DnsServer for MockDnsServer {
         })
     }
 
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> anyhow::Result<()> {
+    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t
@@ -397,16 +413,14 @@ impl DnsServer for MockDnsServer {
             zones.insert(zone_id.to_string(), HashMap::new());
             zones.get_mut(zone_id).unwrap()
         };
-        ensure!(record.id.is_some(), "Id is missing");
+        if record.id.is_none() {
+            return Err(OpError::Fatal(anyhow::anyhow!("Id is missing")));
+        }
         table.remove(record.id.as_ref().unwrap());
         Ok(())
     }
 
-    async fn update_record(
-        &self,
-        zone_id: &str,
-        record: &BasicRecord,
-    ) -> anyhow::Result<BasicRecord> {
+    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t
@@ -414,7 +428,9 @@ impl DnsServer for MockDnsServer {
             zones.insert(zone_id.to_string(), HashMap::new());
             zones.get_mut(zone_id).unwrap()
         };
-        ensure!(record.id.is_some(), "Id is missing");
+        if record.id.is_none() {
+            return Err(OpError::Fatal(anyhow::anyhow!("Id is missing")));
+        }
         if let Some(mut r) = table.get_mut(record.id.as_ref().unwrap()) {
             r.name = record.name.clone();
             r.value = record.value.clone();

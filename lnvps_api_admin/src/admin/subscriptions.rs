@@ -1,14 +1,14 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateSubscriptionLineItemRequest, AdminCreateSubscriptionRequest, AdminSubscriptionInfo,
     AdminSubscriptionLineItemInfo, AdminSubscriptionPaymentInfo,
     AdminUpdateSubscriptionLineItemRequest, AdminUpdateSubscriptionRequest,
 };
-use crate::admin::{PageQuery, RouterState};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -49,10 +49,14 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct SubscriptionQuery {
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     limit: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     offset: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     user_id: Option<u64>,
 }
 

@@ -20,18 +20,22 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct TimeSeriesQuery {
     start_date: String,
     end_date: String,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str")]
     company_id: u64,
     currency: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct ReferralTimeSeriesQuery {
     start_date: String,
     end_date: String,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str")]
     company_id: u64,
     ref_code: Option<String>,
 }

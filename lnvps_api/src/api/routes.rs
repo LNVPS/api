@@ -5,7 +5,7 @@ use crate::api::model::{
     ApiVmPayment, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmRequest,
     VMPatchRequest, vm_to_status,
 };
-use crate::api::{AmountQuery, AuthQuery, PageQuery, PaymentMethodQuery, RouterState};
+use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, PricingEngine};
 use anyhow::Result;
@@ -19,7 +19,7 @@ use futures::future::join_all;
 use isocountry::CountryCode;
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
-use lnvps_api_common::{ApiCurrency, ApiError};
+use lnvps_api_common::{ApiCurrency, ApiError, PageQuery};
 use lnvps_api_common::{ApiData, ApiResult, Nip98Auth, UpgradeConfig, WorkJob};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{
@@ -201,7 +201,7 @@ async fn v1_patch_vm(
         let mut ips = this.db.list_vm_ip_assignments(vm.id).await?;
         for ip in ips.iter_mut() {
             ip.dns_reverse = Some(ptr.to_string());
-            this.provisioner.update_reverse_ip_dns(ip).await?;
+            this.provisioner.network.update_reverse_ip_dns(ip).await?;
             this.db.update_vm_ip_assignment(ip).await?;
         }
     }
@@ -301,7 +301,7 @@ async fn v1_list_vm_templates(State(this): State<RouterState>) -> ApiResult<ApiT
         custom_template: if custom_templates.is_empty() {
             None
         } else {
-            let mut api_templates: Vec<ApiCustomTemplateParams> = custom_templates
+            let api_templates: Vec<ApiCustomTemplateParams> = custom_templates
                 .into_iter()
                 .filter_map(|t| {
                     let region = regions.get(&t.region_id)?;
@@ -313,7 +313,7 @@ async fn v1_list_vm_templates(State(this): State<RouterState>) -> ApiResult<ApiT
                 })
                 .collect();
 
-            Some(hc.apply_host_capacity_limits(&mut api_templates).await?)
+            Some(hc.apply_host_capacity_limits(&api_templates).await?)
         },
     };
     rsp.expand_pricing(&this.rates).await?;
@@ -453,9 +453,7 @@ async fn v1_renew_vm(
     let user = this.db.get_user(uid).await?;
 
     // handle "nwc" payments automatically
-    let rsp = if q.method.as_ref().map(|s| s.as_str()) == Some("nwc")
-        && user.nwc_connection_string.is_some()
-    {
+    let rsp = if q.method.as_deref() == Some("nwc") && user.nwc_connection_string.is_some() {
         this.provisioner
             .auto_renew_via_nwc(id, user.nwc_connection_string.unwrap().as_str())
             .await?
@@ -543,7 +541,9 @@ async fn v1_start_vm(
     // Log VM start
     this.history.log_vm_started(id, Some(uid), None).await.ok();
 
-    this.work_sender.send(WorkJob::CheckVm { vm_id: id })?;
+    this.work_sender
+        .send(WorkJob::CheckVm { vm_id: id })
+        .await?;
     ApiData::ok(())
 }
 
@@ -561,7 +561,9 @@ async fn v1_stop_vm(
     // Log VM stop
     this.history.log_vm_stopped(id, Some(uid), None).await.ok();
 
-    this.work_sender.send(WorkJob::CheckVm { vm_id: id })?;
+    this.work_sender
+        .send(WorkJob::CheckVm { vm_id: id })
+        .await?;
     ApiData::ok(())
 }
 
@@ -582,7 +584,9 @@ async fn v1_restart_vm(
         .await
         .ok();
 
-    this.work_sender.send(WorkJob::CheckVm { vm_id: id })?;
+    this.work_sender
+        .send(WorkJob::CheckVm { vm_id: id })
+        .await?;
     ApiData::ok(())
 }
 
@@ -605,7 +609,9 @@ async fn v1_reinstall_vm(
         .await
         .ok();
 
-    this.work_sender.send(WorkJob::CheckVm { vm_id: id })?;
+    this.work_sender
+        .send(WorkJob::CheckVm { vm_id: id })
+        .await?;
     ApiData::ok(())
 }
 

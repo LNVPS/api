@@ -1,6 +1,8 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use lnvps_db::{Vm, VmIpAssignment};
+use lnvps_api_common::retry::OpResult;
+use lnvps_db::{LNVpsDb, RouterKind, Vm, VmIpAssignment};
+use std::sync::Arc;
 
 /// Router defines a network device used to access the hosts
 ///
@@ -13,10 +15,10 @@ use lnvps_db::{Vm, VmIpAssignment};
 pub trait Router: Send + Sync {
     /// Generate mac address for a given IP address
     async fn generate_mac(&self, ip: &str, comment: &str) -> Result<Option<ArpEntry>>;
-    async fn list_arp_entry(&self) -> Result<Vec<ArpEntry>>;
-    async fn add_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
-    async fn remove_arp_entry(&self, id: &str) -> Result<()>;
-    async fn update_arp_entry(&self, entry: &ArpEntry) -> Result<ArpEntry>;
+    async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>>;
+    async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
+    async fn remove_arp_entry(&self, id: &str) -> OpResult<()>;
+    async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
 }
 
 #[derive(Debug, Clone)]
@@ -51,3 +53,29 @@ mod ovh;
 #[cfg(feature = "mikrotik")]
 pub use mikrotik::MikrotikRouter;
 pub use ovh::OvhDedicatedServerVMacRouter;
+
+pub async fn get_router(db: &Arc<dyn LNVpsDb>, router_id: u64) -> OpResult<Arc<dyn Router>> {
+    let cfg = db.get_router(router_id).await?;
+    match cfg.kind {
+        RouterKind::Mikrotik => {
+            let mut t_split = cfg.token.as_str().split(":");
+            let (username, password) = (
+                t_split.next().context("Invalid username:password")?,
+                t_split.next().context("Invalid username:password")?,
+            );
+            Ok(Arc::new(MikrotikRouter::new(&cfg.url, username, password)))
+        }
+        RouterKind::OvhAdditionalIp => Ok(Arc::new(
+            OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, cfg.token.as_str()).await?,
+        )),
+        RouterKind::MockRouter => {
+            #[cfg(test)]
+            return Ok(Arc::new(crate::mocks::MockRouter::new()));
+            #[cfg(not(test))]
+            {
+                #[allow(unreachable_code)]
+                panic!("Cant use mock router outside tests!")
+            }
+        }
+    }
+}

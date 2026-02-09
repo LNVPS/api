@@ -1,26 +1,27 @@
-use crate::dns::{BasicRecord, DnsServer};
-use crate::host::{FullVmInfo, get_host_client};
-use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
+use crate::dns::DnsServer;
+use crate::host::{FullVmInfo, VmHostClient, get_host_client};
+use crate::provisioner::LNVpsNetworkProvisioner;
+use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
-use lnvps_api_common::ExchangeRateService;
+use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
+use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
-    AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod,
-    PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate,
+    IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCustomTemplate,
+    VmIpAssignment, VmPayment, VmTemplate,
 };
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,372 +30,50 @@ use std::time::Duration;
 /// Main provisioner class for LNVPS
 ///
 /// Does all the hard work and logic for creating / expiring VM's
+#[derive(Clone)]
 pub struct LNVpsProvisioner {
     read_only: bool,
-
     db: Arc<dyn LNVpsDb>,
     node: Arc<dyn LightningNode>,
+    revolut: Option<Arc<dyn FiatPaymentService>>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
-
-    dns: Option<Arc<dyn DnsServer>>,
-    revolut: Option<Arc<dyn FiatPaymentService>>,
-
-    /// Forward zone ID used for all VM's
-    /// passed to the DNSServer type
-    forward_zone_id: Option<String>,
+    pub network: LNVpsNetworkProvisioner,
     provisioner_config: ProvisionerConfig,
 }
 
 impl LNVpsProvisioner {
+    /// Create a retry policy for network operations (DNS, Router, Host)
+    fn retry_policy() -> RetryPolicy {
+        RetryPolicy::default()
+    }
+
     pub fn new(
         settings: Settings,
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
         rates: Arc<dyn ExchangeRateService>,
+        dns: Option<Arc<dyn DnsServer>>,
     ) -> Self {
         Self {
-            db,
-            node,
-            rates,
-            dns: settings.get_dns().expect("dns config"),
+            network: LNVpsNetworkProvisioner::new(
+                db.clone(),
+                dns,
+                settings.dns.as_ref().map(|z| z.forward_zone_id.to_string()),
+                Self::retry_policy(),
+            ),
             revolut: settings.get_revolut().expect("revolut config"),
             tax_rates: settings.tax_rate,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
-            forward_zone_id: settings.dns.map(|z| z.forward_zone_id),
+            db,
+            node,
+            rates,
         }
     }
 
     pub fn config(&self) -> &ProvisionerConfig {
         &self.provisioner_config
-    }
-
-    pub async fn get_router(&self, router_id: u64) -> Result<Arc<dyn Router>> {
-        #[cfg(test)]
-        return Ok(Arc::new(crate::mocks::MockRouter::new()));
-
-        let cfg = self.db.get_router(router_id).await?;
-        match cfg.kind {
-            RouterKind::Mikrotik => {
-                let mut t_split = cfg.token.as_str().split(":");
-                let (username, password) = (
-                    t_split.next().context("Invalid username:password")?,
-                    t_split.next().context("Invalid username:password")?,
-                );
-                Ok(Arc::new(MikrotikRouter::new(&cfg.url, username, password)))
-            }
-            RouterKind::OvhAdditionalIp => Ok(Arc::new(
-                OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, &cfg.token.as_str()).await?,
-            )),
-        }
-    }
-
-    /// Create or Update access policy for a given ip assignment, does not save to database!
-    pub async fn update_access_policy(
-        &self,
-        assignment: &mut VmIpAssignment,
-        policy: &AccessPolicy,
-    ) -> Result<()> {
-        let ip = IpNetwork::from_str(&assignment.ip)?;
-        if matches!(policy.kind, NetworkAccessPolicy::StaticArp) && ip.is_ipv4() {
-            let router = self
-                .get_router(
-                    policy
-                        .router_id
-                        .context("Cannot apply static arp policy with no router")?,
-                )
-                .await?;
-            let vm = self.db.get_vm(assignment.vm_id).await?;
-            let entry = ArpEntry::new(&vm, assignment, policy.interface.clone())?;
-            let arp = if let Some(_id) = &assignment.arp_ref {
-                router.update_arp_entry(&entry).await?
-            } else {
-                router.add_arp_entry(&entry).await?
-            };
-            ensure!(arp.id.is_some(), "ARP id was empty");
-            assignment.arp_ref = arp.id;
-        }
-        Ok(())
-    }
-
-    /// Remove an access policy for a given ip assignment, does not save to database!
-    pub async fn remove_access_policy(
-        &self,
-        assignment: &mut VmIpAssignment,
-        policy: &AccessPolicy,
-    ) -> Result<()> {
-        let ip = IpNetwork::from_str(&assignment.ip)?;
-        if matches!(policy.kind, NetworkAccessPolicy::StaticArp) && ip.is_ipv4() {
-            let router = self
-                .get_router(
-                    policy
-                        .router_id
-                        .context("Cannot apply static arp policy with no router")?,
-                )
-                .await?;
-            let id = if let Some(id) = &assignment.arp_ref {
-                Some(id.clone())
-            } else {
-                warn!("ARP REF not found, using arp list");
-
-                let ent = router.list_arp_entry().await?;
-                if let Some(ent) = ent.iter().find(|e| e.address == assignment.ip) {
-                    ent.id.clone()
-                } else {
-                    warn!("ARP entry not found, skipping");
-                    None
-                }
-            };
-
-            if let Some(id) = id {
-                if let Err(e) = router.remove_arp_entry(&id).await {
-                    warn!("Failed to remove arp entry, skipping: {}", e);
-                }
-            }
-            assignment.arp_ref = None;
-        }
-        Ok(())
-    }
-
-    /// Delete DNS on the dns server, does not save to database!
-    pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        // Delete forward/reverse dns
-        if let Some(dns) = &self.dns {
-            let range = self.db.get_ip_range(assignment.ip_range_id).await?;
-
-            if let (Some(z), Some(_ref)) = (&range.reverse_zone_id, &assignment.dns_reverse_ref) {
-                let rev = BasicRecord::reverse(assignment)?;
-                if let Err(e) = dns.delete_record(z, &rev).await {
-                    warn!("Failed to delete reverse record: {}", e);
-                }
-                assignment.dns_reverse_ref = None;
-                assignment.dns_reverse = None;
-            }
-            if let (Some(z), Some(_ref)) = (&self.forward_zone_id, &assignment.dns_forward_ref) {
-                let rev = BasicRecord::forward(assignment)?;
-                if let Err(e) = dns.delete_record(z, &rev).await {
-                    warn!("Failed to delete forward record: {}", e);
-                }
-                assignment.dns_forward_ref = None;
-                assignment.dns_forward = None;
-            }
-        }
-        Ok(())
-    }
-
-    /// Update DNS on the dns server, does not save to database!
-    pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        if let (Some(z), Some(dns)) = (&self.forward_zone_id, &self.dns) {
-            let fwd = BasicRecord::forward(assignment)?;
-            let ret_fwd = if fwd.id.is_some() {
-                dns.update_record(z, &fwd).await?
-            } else {
-                dns.add_record(z, &fwd).await?
-            };
-            assignment.dns_forward = Some(ret_fwd.name);
-            assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
-        }
-        Ok(())
-    }
-
-    /// Update DNS on the dns server, does not save to database!
-    pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        if let Some(dns) = &self.dns {
-            let range = self.db.get_ip_range(assignment.ip_range_id).await?;
-            if let Some(z) = &range.reverse_zone_id {
-                let ret_rev = if assignment.dns_reverse_ref.is_some() {
-                    dns.update_record(z, &BasicRecord::reverse(assignment)?)
-                        .await?
-                } else {
-                    dns.add_record(z, &BasicRecord::reverse_to_fwd(assignment)?)
-                        .await?
-                };
-                assignment.dns_reverse = Some(ret_rev.value);
-                assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
-            }
-        }
-        Ok(())
-    }
-
-    /// Delete all ip assignments for a given vm
-    pub async fn delete_all_ip_assignments(&self, vm_id: u64) -> Result<()> {
-        let ips = self.db.list_vm_ip_assignments(vm_id).await?;
-        for mut ip in ips {
-            let range = self.db.get_ip_range(ip.ip_range_id).await?;
-            self.delete_ip_assignment(&mut ip, &range).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Delete ip assignment
-    pub async fn delete_ip_assignment(
-        &self,
-        ip: &mut VmIpAssignment,
-        range: &IpRange,
-    ) -> Result<()> {
-        if let Some(ap) = range.access_policy_id {
-            let ap = self.db.get_access_policy(ap).await?;
-            // remove access policy
-            self.remove_access_policy(ip, &ap).await?;
-        }
-        // remove dns
-        self.remove_ip_dns(ip).await?;
-        // save arp/dns changes
-        self.db.update_vm_ip_assignment(ip).await?;
-        // mark as deleted
-        self.db.delete_vm_ip_assignment(ip.id).await?;
-
-        Ok(())
-    }
-
-    pub async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> Result<()> {
-        // load range info to check access policy
-        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
-
-        // Validate provided IP format and range
-        let provided_ip = assignment
-            .ip
-            .trim()
-            .parse::<IpAddr>()
-            .context("Invalid IP address format")?;
-
-        let cidr = range
-            .cidr
-            .parse::<IpNetwork>()
-            .context("Invalid CIDR format in IP range")?;
-
-        ensure!(
-            cidr.contains(provided_ip),
-            "IP address is not within the specified IP range"
-        );
-
-        // Update access policy / dns
-        self.update_ip_assignment_policy(assignment, &range).await?;
-
-        // save to db
-        self.db.insert_vm_ip_assignment(assignment).await?;
-        Ok(())
-    }
-
-    /// Update access policy and dns
-    pub async fn update_ip_assignment_policy(
-        &self,
-        assignment: &mut VmIpAssignment,
-        range: &IpRange,
-    ) -> Result<()> {
-        if let Some(ap) = range.access_policy_id {
-            let ap = self.db.get_access_policy(ap).await?;
-            // apply access policy
-            self.update_access_policy(assignment, &ap).await?;
-        }
-
-        // Add DNS records
-        self.update_forward_ip_dns(assignment).await?;
-        self.update_reverse_ip_dns(assignment).await?;
-        Ok(())
-    }
-
-    async fn get_mac_for_assignment(
-        &self,
-        host: &VmHost,
-        vm: &Vm,
-        assignment: &VmIpAssignment,
-    ) -> Result<ArpEntry> {
-        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
-
-        // ask router first if it wants to set the MAC
-        if let Some(ap) = range.access_policy_id {
-            let ap = self.db.get_access_policy(ap).await?;
-            if let Some(rid) = ap.router_id {
-                let router = self.get_router(rid).await?;
-
-                if let Some(mac) = router
-                    .generate_mac(&assignment.ip, &format!("VM{}", assignment.vm_id))
-                    .await?
-                {
-                    return Ok(mac);
-                }
-            }
-        }
-
-        // ask the host next to generate the mac
-        let client = get_host_client(host, &self.provisioner_config)?;
-        let mac = client.generate_mac(vm).await?;
-        Ok(ArpEntry {
-            id: None,
-            address: assignment.ip.clone(),
-            mac_address: mac,
-            interface: None,
-            comment: None,
-        })
-    }
-
-    pub async fn assign_available_v6_to_vm(
-        &self,
-        vm: &Vm,
-        v6: &mut AvailableIp,
-    ) -> Result<VmIpAssignment> {
-        match v6.mode {
-            // it's a bit awkward, but we need to update the IP AFTER its been picked
-            // simply because sometimes we don't know the MAC of the NIC yet
-            IpRangeAllocationMode::SlaacEui64 => {
-                let mac = NetworkProvisioner::parse_mac(&vm.mac_address)?;
-                let addr = NetworkProvisioner::calculate_eui64(&mac, &v6.ip)?;
-                v6.ip = IpNetwork::new(addr, v6.ip.prefix())?;
-            }
-            _ => {}
-        }
-        let mut assignment = VmIpAssignment {
-            vm_id: vm.id,
-            ip_range_id: v6.range_id,
-            ip: v6.ip.ip().to_string(),
-            ..Default::default()
-        };
-        self.save_ip_assignment(&mut assignment).await?;
-        Ok(assignment)
-    }
-
-    async fn allocate_ips(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        let mut vm = self.db.get_vm(vm_id).await?;
-        let existing_ips = self.db.list_vm_ip_assignments(vm_id).await?;
-        if !existing_ips.is_empty() {
-            return Ok(existing_ips);
-        }
-
-        // Use random network provisioner
-        let network = NetworkProvisioner::new(self.db.clone());
-
-        let host = self.db.get_host(vm.host_id).await?;
-        let ip = network.pick_ip_for_region(host.region_id).await?;
-        let mut assignments = vec![];
-        match ip.ip4 {
-            Some(v4) => {
-                let mut assignment = VmIpAssignment {
-                    vm_id: vm.id,
-                    ip_range_id: v4.range_id,
-                    ip: v4.ip.ip().to_string(),
-                    ..Default::default()
-                };
-
-                //generate mac address from ip assignment
-                let mac = self.get_mac_for_assignment(&host, &vm, &assignment).await?;
-                vm.mac_address = mac.mac_address;
-                assignment.arp_ref = mac.id; // store ref if we got one
-                self.db.update_vm(&vm).await?;
-
-                self.save_ip_assignment(&mut assignment).await?;
-                assignments.push(assignment);
-            }
-            /// TODO: add expected number of IPS per templates
-            None => bail!("Cannot provision VM without an IPv4 address"),
-        }
-        if let Some(mut v6) = ip.ip6 {
-            assignments.push(self.assign_available_v6_to_vm(&vm, &mut v6).await?);
-        }
-
-        Ok(assignments)
     }
 
     /// Do any necessary initialization
@@ -863,46 +542,97 @@ impl LNVpsProvisioner {
     }
 
     /// Apply vm config to host
-    pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> Result<()> {
+    pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> OpResult<()> {
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let client = get_host_client(&info.host, &self.provisioner_config)?;
         client.configure_vm(&info).await
     }
 
-    /// Create a vm on the host as configured by the template
-    pub async fn spawn_vm(&self, vm_id: u64) -> Result<()> {
+    /// Create the pipeline instance for spawning this vm
+    pub async fn spawn_vm_pipeline(
+        &self,
+        vm_id: u64,
+    ) -> Result<Pipeline<'_, SpawnVmContext, anyhow::Error>> {
         if self.read_only {
             bail!("Cant spawn VM's in read-only mode")
         }
-        // setup network by allocating some IP space
-        self.allocate_ips(vm_id).await?;
 
-        // load full info
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let client = get_host_client(&info.host, &self.provisioner_config)?;
-        client.create_vm(&info).await?;
 
-        Ok(())
+        let ctx = SpawnVmContext {
+            db: self.db.clone(),
+            network: self.network.clone(),
+            host_client: get_host_client(&info.host, &self.provisioner_config)?,
+            generated_mac: None,
+            info,
+        };
+        Ok(Pipeline::new(ctx)
+            .step_with_rollback(
+                "ip_allocation",
+                |ctx| Box::pin(async move { ctx.assign_ips().await }),
+                |ctx| {
+                    Box::pin(async move {
+                        // rollback any remote resources as we didn't save the assignments to the database yet
+                        ctx.rollback_assign_ips().await
+                    })
+                },
+            )
+            .step_with_rollback(
+                "host_spawn",
+                |ctx| Box::pin(async move { ctx.host_client.create_vm(&ctx.info).await }),
+                |ctx| Box::pin(async move { ctx.host_client.delete_vm(&ctx.info.vm).await }),
+            )
+            .step_with_rollback(
+                "save_vm",
+                |ctx| {
+                    Box::pin(async move {
+                        ctx.db.update_vm(&ctx.info.vm).await?;
+                        for ip in &mut ctx.info.ips {
+                            if ip.id != 0 {
+                                // IP already inserted, skip
+                                continue;
+                            }
+                            ctx.network.save_ip_assignment(ip).await?;
+                        }
+                        Ok(())
+                    })
+                },
+                |ctx| {
+                    Box::pin(async move {
+                        ctx.network
+                            .delete_all_ip_assignments(ctx.info.vm.id)
+                            .await?;
+                        // we can hard delete ips here because they were never used, so there is no need
+                        // to soft-delete
+                        Ok(ctx
+                            .db
+                            .hard_delete_vm_ip_assignments_by_vm_id(ctx.info.vm.id)
+                            .await?)
+                    })
+                },
+            ))
     }
 
     /// Delete a VM and its associated resources
-    pub async fn delete_vm(&self, vm_id: u64) -> Result<()> {
+    pub async fn delete_vm(&self, vm_id: u64) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
-        if let Err(e) = client.delete_vm(&vm).await {
-            warn!("Failed to delete VM: {}", e);
-        }
-
-        self.delete_all_ip_assignments(vm_id).await?;
-        self.db.delete_vm(vm_id).await?;
-
+        let pipeline = Pipeline::new((self.db.clone(), client, self.network.clone()))
+            .step("host_delete_vm", |ctx| Box::pin(ctx.1.delete_vm(&vm)))
+            .step("delete_ips", |ctx| {
+                Box::pin(ctx.2.delete_all_ip_assignments(vm_id))
+            })
+            .step("delete_vm_db", |ctx| {
+                Box::pin(async { Ok(ctx.0.delete_vm(vm_id).await?) })
+            });
+        pipeline.execute().await?;
         Ok(())
     }
 
     /// Start a VM
-    pub async fn start_vm(&self, vm_id: u64) -> Result<()> {
+    pub async fn start_vm(&self, vm_id: u64) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
@@ -912,7 +642,7 @@ impl LNVpsProvisioner {
     }
 
     /// Stop a running VM
-    pub async fn stop_vm(&self, vm_id: u64) -> Result<()> {
+    pub async fn stop_vm(&self, vm_id: u64) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
@@ -1029,7 +759,7 @@ impl LNVpsProvisioner {
         let custom_pricing = compatible_pricing
             .ok_or_else(|| anyhow::anyhow!(
                 "No custom pricing available for this region that supports disk type {:?} with interface {:?}", 
-                current_template.disk_type, 
+                current_template.disk_type,
                 current_template.disk_interface
             ))?;
 
@@ -1060,6 +790,155 @@ impl LNVpsProvisioner {
 
         Ok((vm, current_template, new_custom_template))
     }
+
+    pub fn v6_to_allocation(
+        v6: &mut AvailableIp,
+        vm_id: u64,
+        mac_address: &str,
+    ) -> OpResult<VmIpAssignment> {
+        match v6.mode {
+            // it's a bit awkward, but we need to update the IP AFTER its been picked
+            // simply because sometimes we don't know the MAC of the NIC yet
+            IpRangeAllocationMode::SlaacEui64 => {
+                let mac = NetworkProvisioner::parse_mac(mac_address)?;
+                let addr = NetworkProvisioner::calculate_eui64(&mac, &v6.ip)?;
+                v6.ip =
+                    IpNetwork::new(addr, v6.ip.prefix()).context("failed to parse IPv6 address")?;
+            }
+            _ => {}
+        }
+        Ok(VmIpAssignment {
+            vm_id,
+            ip_range_id: v6.range_id,
+            ip: v6.ip.ip().to_string(),
+            ..Default::default()
+        })
+    }
+}
+
+/// Context object for spawning vms using [Pipeline]
+pub struct SpawnVmContext {
+    db: Arc<dyn LNVpsDb>,
+    /// Vm to be spawned
+    info: FullVmInfo,
+    /// The client impl to provision this vm on the host
+    host_client: Arc<dyn VmHostClient>,
+    /// Network provisioner access
+    network: LNVpsNetworkProvisioner,
+
+    /// Generated mac address, can be rolled back if the entry has an ID
+    generated_mac: Option<ArpEntry>,
+}
+
+impl SpawnVmContext {
+    async fn get_range_router(&self, range: &IpRange) -> OpResult<Option<Arc<dyn Router>>> {
+        if let Some(ap) = range.access_policy_id {
+            let ap = self.db.get_access_policy(ap).await?;
+            if let Some(rid) = ap.router_id {
+                return Ok(Some(get_router(&self.db, rid).await?));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn assign_mac(&mut self, assignment: &mut VmIpAssignment) -> OpResult<()> {
+        if let Some(mac) = self.generated_mac.as_ref() {
+            self.info.vm.mac_address = mac.mac_address.to_string();
+            return Ok(());
+        }
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+        if !self.info.ranges.iter().any(|r| r.id == range.id) {
+            self.info.ranges.push(range.clone()); // always push the ranges, even if assignment fails
+        }
+
+        // ask router first if it wants to set the MAC
+        if let Some(router) = self.get_range_router(&range).await?
+            && let Some(mac) = router
+                .generate_mac(&assignment.ip, &format!("VM{}", assignment.vm_id))
+                .await?
+        {
+            self.info.vm.mac_address = mac.address.clone();
+            assignment.arp_ref = mac.id.clone();
+            self.generated_mac = Some(mac);
+            return Ok(());
+        }
+
+        // ask the host next to generate the mac
+        let mac = self.host_client.generate_mac(&self.info.vm).await?;
+        self.info.vm.mac_address = mac.clone();
+        self.generated_mac = Some(ArpEntry {
+            id: None,
+            address: assignment.ip.clone(),
+            mac_address: mac,
+            interface: None,
+            comment: None,
+        });
+        Ok(())
+    }
+
+    async fn assign_ips(&mut self) -> OpResult<()> {
+        if !self.info.ips.is_empty() {
+            info!(
+                "VM {} already has {} ips, skipping",
+                self.info.vm.id,
+                self.info.ips.len()
+            );
+            // TODO: we should try to fill any missing assignments here too
+            return Ok(());
+        }
+
+        let network = NetworkProvisioner::new(self.db.clone());
+        let ip = network.pick_ip_for_region(self.info.host.region_id).await?;
+        match ip.ip4 {
+            Some(v4) => {
+                let mut assignment = VmIpAssignment {
+                    vm_id: self.info.vm.id,
+                    ip_range_id: v4.range_id,
+                    ip: v4.ip.ip().to_string(),
+                    ..Default::default()
+                };
+
+                //generate mac address from ip assignment
+                self.assign_mac(&mut assignment).await?;
+                self.info.ips.push(assignment);
+            }
+            None => op_fatal!("Cannot provision VM without an IPv4 address"),
+        }
+        if let Some(mut v6) = ip.ip6 {
+            let assignment = LNVpsProvisioner::v6_to_allocation(
+                &mut v6,
+                self.info.vm.id,
+                &self.info.vm.mac_address,
+            )?;
+            self.info.ips.push(assignment);
+            if !self.info.ranges.iter().any(|r| r.id == v6.range_id) {
+                self.info
+                    .ranges
+                    .push(self.db.get_ip_range(v6.range_id).await?);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn rollback_assign_ips(&mut self) -> OpResult<()> {
+        for ip in &self.info.ips {
+            let range = self
+                .info
+                .ranges
+                .iter()
+                .find(|r| r.id == ip.ip_range_id)
+                .context("Missing range in collection")?;
+            // rollback MAC assignment if remotely assigned
+            if let Some(mac) = self.generated_mac.as_ref()
+                && let Some(arp_id) = mac.id.as_ref()
+                && let Some(router) = self.get_range_router(range).await?
+            {
+                router.remove_arp_entry(arp_id).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1068,7 +947,10 @@ mod tests {
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
     use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate, Ticker};
-    use lnvps_db::{DiskInterface, DiskType, LNVpsDbBase, User, UserSshKey, VmTemplate};
+    use lnvps_db::{
+        AccessPolicy, DiskInterface, DiskType, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
+        UserSshKey, VmTemplate,
+    };
     use std::net::IpAddr;
     use std::str::FromStr;
 
@@ -1096,6 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic() -> Result<()> {
+        env_logger::try_init().ok();
         let settings = settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -1112,7 +995,7 @@ mod tests {
                     id: 1,
                     name: "mock-router".to_string(),
                     enabled: true,
-                    kind: RouterKind::Mikrotik,
+                    kind: RouterKind::MockRouter,
                     url: "https://localhost".to_string(),
                     token: "username:password".into(),
                 },
@@ -1137,7 +1020,13 @@ mod tests {
         }
 
         let dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner = LNVpsProvisioner::new(
+            settings,
+            db.clone(),
+            node.clone(),
+            rates.clone(),
+            Some(Arc::new(dns.clone())),
+        );
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -1159,14 +1048,18 @@ mod tests {
         }
 
         // spawn vm
-        provisioner.spawn_vm(vm.id).await?;
+        let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
+        pipeline.execute().await?;
 
         let vm = db.get_vm(vm.id).await?;
         // check resources
         let router = MockRouter::new();
-        let arp = router.list_arp_entry().await?;
-        assert_eq!(1, arp.len());
-        let arp = arp.first().unwrap();
+        let arp_entries = router.list_arp_entry().await?;
+        // Find the ARP entry for this VM (MockRouter state is shared across tests)
+        let arp = arp_entries
+            .iter()
+            .find(|e| e.mac_address == vm.mac_address)
+            .expect("ARP entry for VM should exist");
         assert_eq!(&vm.mac_address, &arp.mac_address);
         assert_eq!(vm.ref_code, Some("mock-ref".to_string()));
         assert_eq!(ROUTER_BRIDGE, arp.interface.as_ref().unwrap());
@@ -1225,7 +1118,8 @@ mod tests {
 
         // test arp/dns is removed
         let arp = router.list_arp_entry().await?;
-        assert!(arp.is_empty());
+        // Verify this specific VM's ARP entry was removed (MockRouter state is shared)
+        assert!(!arp.iter().any(|e| e.mac_address == vm.mac_address));
 
         // test dns entries are deleted
         {
@@ -1251,11 +1145,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_capacity() -> Result<()> {
+        env_logger::try_init().ok();
         let settings = settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(InMemoryRateCache::default());
-        let prov = LNVpsProvisioner::new(settings.clone(), db.clone(), node.clone(), rates.clone());
+        let prov = LNVpsProvisioner::new(
+            settings.clone(),
+            db.clone(),
+            node.clone(),
+            rates.clone(),
+            None,
+        );
 
         let large_template = VmTemplate {
             id: 0,

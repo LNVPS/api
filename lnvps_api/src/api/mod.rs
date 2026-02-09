@@ -8,18 +8,13 @@ mod subscriptions;
 mod webhook;
 
 #[derive(Deserialize)]
-pub(crate) struct PageQuery {
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
-}
-
-#[derive(Deserialize)]
 pub(crate) struct PaymentMethodQuery {
     pub method: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct AmountQuery {
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str")]
     pub amount: u64,
 }
 
@@ -36,14 +31,14 @@ pub struct RouterState {
     pub history: Arc<VmHistoryLogger>,
     pub settings: Settings,
     pub rates: Arc<dyn ExchangeRateService>,
-    pub work_sender: WorkSender,
+    pub work_sender: Arc<dyn WorkCommander>,
 }
 
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::Settings;
 pub use contact::router as contacts_router;
 pub use ip_space::router as ip_space_router;
-use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkSender};
+use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander};
 use lnvps_db::LNVpsDb;
 #[cfg(feature = "nostr-domain")]
 pub use nostr_domain::router as nostr_domain_router;

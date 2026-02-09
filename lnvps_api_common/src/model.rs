@@ -139,7 +139,7 @@ impl ApiVmTemplate {
                     .into(),
                 other_price: vec![], //filled externally
                 interval_amount: cost_plan.interval_amount,
-                interval_type: cost_plan.interval_type.clone().into(),
+                interval_type: cost_plan.interval_type.into(),
             },
             region: ApiVmHostRegion {
                 id: region.id,
@@ -201,7 +201,7 @@ pub async fn vm_to_status(
         image: image.into(),
         template,
         ssh_key: ssh_key.into(),
-        status: state.map(|s| s.into()).unwrap_or_default(),
+        status: state.unwrap_or_default(),
         ip_assignments: ips
             .into_iter()
             .map(|i| {
@@ -386,9 +386,9 @@ impl From<Currency> for ApiCurrency {
     }
 }
 
-impl Into<Currency> for ApiCurrency {
-    fn into(self) -> Currency {
-        match self {
+impl From<ApiCurrency> for Currency {
+    fn from(val: ApiCurrency) -> Self {
+        match val {
             ApiCurrency::EUR => Currency::EUR,
             ApiCurrency::BTC => Currency::BTC,
             ApiCurrency::USD => Currency::USD,

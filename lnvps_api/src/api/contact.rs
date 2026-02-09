@@ -123,10 +123,14 @@ async fn v1_submit_contact_form(
     );
 
     // Queue notification to all admins
-    if let Err(e) = state.work_sender.send(WorkJob::SendAdminNotification {
-        message: admin_message,
-        title: Some(format!("Contact Form: {}", req.subject)),
-    }) {
+    if let Err(e) = state
+        .work_sender
+        .send(WorkJob::SendAdminNotification {
+            message: admin_message,
+            title: Some(format!("Contact Form: {}", req.subject)),
+        })
+        .await
+    {
         log::error!("Failed to queue admin notification: {}", e);
         return ApiData::err("Failed to send notification");
     }

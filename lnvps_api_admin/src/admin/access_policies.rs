@@ -1,12 +1,12 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminAccessPolicyDetail, CreateAccessPolicyRequest, UpdateAccessPolicyRequest,
 };
-use crate::admin::{PageQuery, RouterState};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource, NetworkAccessPolicy};
 
 pub fn router() -> Router<RouterState> {
@@ -116,10 +116,10 @@ async fn admin_create_access_policy(
     }
 
     // Validate router exists if provided
-    if let Some(router_id) = req.router_id {
-        if let Err(_) = this.db.get_router(router_id).await {
-            return ApiData::err("Specified router does not exist");
-        }
+    if let Some(router_id) = req.router_id
+        && let Err(_) = this.db.get_router(router_id).await
+    {
+        return ApiData::err("Specified router does not exist");
     }
 
     // Create access policy object

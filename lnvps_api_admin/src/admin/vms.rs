@@ -1,16 +1,16 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateVmRequest, AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo,
     AdminVmPaymentInfo, JobResponse,
 };
-use crate::admin::{PageQuery, RouterState};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PricingEngine, VmHistoryLogger,
-    VmRunningState, VmStateCache, WorkJob,
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
+    VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource};
 use log::{error, info};
@@ -71,13 +71,17 @@ async fn get_vm_state(vm_state_cache: &VmStateCache, vm_id: u64) -> Option<VmRun
     vm_running_state
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct ListVmsQuery {
     #[serde(flatten)]
     page: PageQuery,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     user_id: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     host_id: Option<u64>,
     pubkey: Option<String>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     region_id: Option<u64>,
     include_deleted: Option<bool>,
 }
@@ -250,28 +254,21 @@ async fn admin_start_vm(
         return ApiData::err("Cannot start a deleted VM");
     }
 
-    // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = &this.work_commander {
-        // Send start job via Redis stream for distributed processing
-        let start_job = WorkJob::StartVm {
-            vm_id: id,
-            admin_user_id: Some(auth.user_id),
-        };
+    // Send start job via Redis stream for distributed processing
+    let start_job = WorkJob::StartVm {
+        vm_id: id,
+        admin_user_id: Some(auth.user_id),
+    };
 
-        match commander.send_job(start_job).await {
-            Ok(stream_id) => {
-                info!("VM start job queued with stream ID: {}", stream_id);
-                ApiData::ok(JobResponse { job_id: stream_id })
-            }
-            Err(e) => {
-                error!("Failed to queue VM start job: {}", e);
-                ApiData::err("Failed to queue VM start job")
-            }
+    match this.work_commander.send(start_job).await {
+        Ok(stream_id) => {
+            info!("VM start job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
         }
-    } else {
-        // WorkCommander not available - cannot process start
-        error!("WorkCommander not configured - cannot process VM start");
-        ApiData::err("VM start service is not available")
+        Err(e) => {
+            error!("Failed to queue VM start job: {}", e);
+            ApiData::err("Failed to queue VM start job")
+        }
     }
 }
 
@@ -291,32 +288,26 @@ async fn admin_stop_vm(
         return ApiData::err("Cannot stop a deleted VM");
     }
 
-    // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = &this.work_commander {
-        // Send stop job via Redis stream for distributed processing
-        let stop_job = WorkJob::StopVm {
-            vm_id: id,
-            admin_user_id: Some(auth.user_id),
-        };
+    // Send stop job via Redis stream for distributed processing
+    let stop_job = WorkJob::StopVm {
+        vm_id: id,
+        admin_user_id: Some(auth.user_id),
+    };
 
-        match commander.send_job(stop_job).await {
-            Ok(stream_id) => {
-                info!("VM stop job queued with stream ID: {}", stream_id);
-                ApiData::ok(JobResponse { job_id: stream_id })
-            }
-            Err(e) => {
-                error!("Failed to queue VM stop job: {}", e);
-                ApiData::err("Failed to queue VM stop job")
-            }
+    match this.work_commander.send(stop_job).await {
+        Ok(stream_id) => {
+            info!("VM stop job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
         }
-    } else {
-        // WorkCommander not available - cannot process stop
-        error!("WorkCommander not configured - cannot process VM stop");
-        ApiData::err("VM stop service is not available")
+        Err(e) => {
+            error!("Failed to queue VM stop job: {}", e);
+            ApiData::err("Failed to queue VM stop job")
+        }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct AdminDeleteVmRequest {
     reason: Option<String>,
 }
@@ -340,7 +331,7 @@ async fn admin_delete_vm(
     auth: AdminAuth,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
-    req: Option<Json<AdminDeleteVmRequest>>,
+    req: Json<AdminDeleteVmRequest>,
 ) -> ApiResult<JobResponse> {
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Delete)?;
@@ -352,32 +343,22 @@ async fn admin_delete_vm(
         return ApiData::err("VM is already deleted");
     }
 
-    // Extract reason from request
-    let reason = req.and_then(|r| r.reason.clone());
+    // Send delete job via Redis stream for distributed processing
+    let delete_job = WorkJob::DeleteVm {
+        vm_id: id,
+        reason: req.reason.clone(),
+        admin_user_id: Some(auth.user_id),
+    };
 
-    // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = &this.work_commander {
-        // Send delete job via Redis stream for distributed processing
-        let delete_job = WorkJob::DeleteVm {
-            vm_id: id,
-            reason,
-            admin_user_id: Some(auth.user_id),
-        };
-
-        match commander.send_job(delete_job).await {
-            Ok(stream_id) => {
-                info!("VM deletion job queued with stream ID: {}", stream_id);
-                ApiData::ok(JobResponse { job_id: stream_id })
-            }
-            Err(e) => {
-                error!("Failed to queue VM deletion job: {}", e);
-                ApiData::err("Failed to queue VM deletion job")
-            }
+    match this.work_commander.send(delete_job).await {
+        Ok(stream_id) => {
+            info!("VM deletion job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
         }
-    } else {
-        // WorkCommander not available - cannot process deletion
-        error!("WorkCommander not configured - cannot process VM deletion");
-        ApiData::err("VM deletion service is not available")
+        Err(e) => {
+            error!("Failed to queue VM deletion job: {}", e);
+            ApiData::err("Failed to queue VM deletion job")
+        }
     }
 }
 
@@ -535,7 +516,7 @@ async fn admin_list_vm_payments(
 
     let admin_payments: Vec<AdminVmPaymentInfo> = payments
         .iter()
-        .map(|payment| AdminVmPaymentInfo::from_vm_payment(payment))
+        .map(AdminVmPaymentInfo::from_vm_payment)
         .collect();
 
     ApiPaginatedData::ok(admin_payments, total, limit, offset)
@@ -569,9 +550,11 @@ async fn admin_get_vm_payment(
     ApiData::ok(admin_payment_info)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 struct CalculateRefundQuery {
     pub method: Option<String>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     pub from_date: Option<i64>,
 }
 
@@ -668,32 +651,25 @@ async fn admin_process_vm_refund(
         );
     }
 
-    // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = &this.work_commander {
-        // Send refund job via Redis stream for distributed processing
-        let refund_job = WorkJob::ProcessVmRefund {
-            vm_id,
-            admin_user_id: auth.user_id,
-            refund_from_date: req.refund_from_date,
-            reason: req.reason.clone(),
-            payment_method,
-            lightning_invoice: req.lightning_invoice.clone(),
-        };
+    // Send refund job via Redis stream for distributed processing
+    let refund_job = WorkJob::ProcessVmRefund {
+        vm_id,
+        admin_user_id: auth.user_id,
+        refund_from_date: req.refund_from_date,
+        reason: req.reason.clone(),
+        payment_method,
+        lightning_invoice: req.lightning_invoice.clone(),
+    };
 
-        match commander.send_job(refund_job).await {
-            Ok(stream_id) => {
-                info!("VM refund job queued with stream ID: {}", stream_id);
-                ApiData::ok(JobResponse { job_id: stream_id })
-            }
-            Err(e) => {
-                error!("Failed to queue VM refund job: {}", e);
-                ApiData::err("Failed to queue VM refund job")
-            }
+    match this.work_commander.send(refund_job).await {
+        Ok(stream_id) => {
+            info!("VM refund job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
         }
-    } else {
-        // WorkCommander not available - cannot process refund
-        error!("WorkCommander not configured - cannot process VM refund");
-        ApiData::err("VM refund service is not available")
+        Err(e) => {
+            error!("Failed to queue VM refund job: {}", e);
+            ApiData::err("Failed to queue VM refund job")
+        }
     }
 }
 
@@ -720,30 +696,24 @@ async fn admin_create_vm(
         return ApiData::err("SSH key does not belong to the specified user");
     }
 
-    // Check if WorkCommander is available for distributed processing
-    if let Some(commander) = &this.work_commander {
-        let create_job = WorkJob::CreateVm {
-            user_id: req.user_id,
-            template_id: req.template_id,
-            image_id: req.image_id,
-            ssh_key_id: req.ssh_key_id,
-            ref_code: req.ref_code,
-            admin_user_id: auth.user_id,
-            reason: req.reason,
-        };
+    let create_job = WorkJob::CreateVm {
+        user_id: req.user_id,
+        template_id: req.template_id,
+        image_id: req.image_id,
+        ssh_key_id: req.ssh_key_id,
+        ref_code: req.ref_code,
+        admin_user_id: auth.user_id,
+        reason: req.reason,
+    };
 
-        match commander.send_job(create_job).await {
-            Ok(stream_id) => {
-                info!("VM creation job queued with stream ID: {}", stream_id);
-                ApiData::ok(JobResponse { job_id: stream_id })
-            }
-            Err(e) => {
-                error!("Failed to queue VM creation job: {}", e);
-                ApiData::err("Failed to queue VM creation job")
-            }
+    match this.work_commander.send(create_job).await {
+        Ok(stream_id) => {
+            info!("VM creation job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
         }
-    } else {
-        error!("WorkCommander not configured - cannot process VM creation");
-        ApiData::err("VM creation service is not available")
+        Err(e) => {
+            error!("Failed to queue VM creation job: {}", e);
+            ApiData::err("Failed to queue VM creation job")
+        }
     }
 }

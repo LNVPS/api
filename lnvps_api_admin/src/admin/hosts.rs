@@ -1,11 +1,12 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{AdminHostDisk, AdminHostInfo, AdminVmHostKind};
-use crate::admin::{PageQuery, RouterState};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use lnvps_api_common::{
     ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
+    PageQuery,
 };
 use lnvps_db::{AdminAction, AdminResource};
 use serde::Deserialize;
@@ -112,7 +113,7 @@ async fn admin_update_host(
         host.region_id = region_id;
     }
     if let Some(kind) = &req.kind {
-        host.kind = kind.clone().into();
+        host.kind = (*kind).into();
     }
     if let Some(vlan_id) = req.vlan_id {
         host.vlan_id = vlan_id;
@@ -167,7 +168,7 @@ async fn admin_create_host(
     // Create new host object
     let new_host = lnvps_db::VmHost {
         id: 0, // Will be set by database
-        kind: req.kind.clone().into(),
+        kind: req.kind.into(),
         region_id: req.region_id,
         name: req.name.clone(),
         ip: req.ip.clone(),

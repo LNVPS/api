@@ -8,6 +8,7 @@ fn serialize_json_to_bytes(value: Option<Value>) -> Option<Vec<u8>> {
     value.and_then(|v| serde_json::to_vec(&v).ok())
 }
 
+#[derive(Clone)]
 pub struct VmHistoryLogger {
     db: Arc<dyn LNVpsDb>,
 }
@@ -380,7 +381,7 @@ impl VmHistoryLogger {
     }
 
     pub async fn get_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>> {
-        self.db.list_vm_history(vm_id).await
+        Ok(self.db.list_vm_history(vm_id).await?)
     }
 
     pub async fn get_vm_history_paginated(
@@ -389,8 +390,9 @@ impl VmHistoryLogger {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<VmHistory>> {
-        self.db
+        Ok(self
+            .db
             .list_vm_history_paginated(vm_id, limit, offset)
-            .await
+            .await?)
     }
 }

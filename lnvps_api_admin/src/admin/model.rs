@@ -102,6 +102,7 @@ impl From<RouterKind> for AdminRouterKind {
         match router_kind {
             RouterKind::Mikrotik => AdminRouterKind::Mikrotik,
             RouterKind::OvhAdditionalIp => AdminRouterKind::OvhAdditionalIp,
+            _ => panic!("Invalid router kind"),
         }
     }
 }
@@ -1562,11 +1563,11 @@ impl AdminVmHistoryInfo {
         let mut initiated_by_user_email = None;
 
         // Get user info if available
-        if let Some(user_id) = history.initiated_by_user {
-            if let Ok(user) = db.get_user(user_id).await {
-                initiated_by_user_pubkey = Some(hex::encode(&user.pubkey));
-                initiated_by_user_email = user.email.map(|e| e.into());
-            }
+        if let Some(user_id) = history.initiated_by_user
+            && let Ok(user) = db.get_user(user_id).await
+        {
+            initiated_by_user_pubkey = Some(hex::encode(&user.pubkey));
+            initiated_by_user_email = user.email.map(|e| e.into());
         }
 
         Ok(Self {

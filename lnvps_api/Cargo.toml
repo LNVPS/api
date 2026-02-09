@@ -39,6 +39,8 @@ revolut = ["payments-rs/method-revolut"]
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
 lnvps_api_common = { path = "../lnvps_api_common" }
+try-procedure = { path = "../try-procedure" }
+
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -85,6 +87,7 @@ uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
+env_logger = "0.11"
 lightning-invoice = "0.34"
 bitcoin = "0.32"
 

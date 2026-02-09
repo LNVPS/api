@@ -9,8 +9,10 @@ use lettre::message::{MessageBuilder, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
-    NetworkProvisioner, RedisConfig, UpgradeConfig, VmHistoryLogger, VmRunningState,
-    VmRunningStates, VmStateCache, WorkCommander, WorkJob,
+    BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
+    NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
+    UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
+    WorkFeedback, WorkJob, WorkJobMessage,
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
@@ -19,25 +21,24 @@ use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::task::JoinHandle;
 
 /// Primary background worker logic
 /// Handles deleting expired VMs and sending notifications
+#[derive(Clone)]
 pub struct Worker {
     settings: WorkerSettings,
-
     db: Arc<dyn LNVpsDb>,
     provisioner: Arc<LNVpsProvisioner>,
     nostr: Option<Client>,
     vm_history_logger: VmHistoryLogger,
-
     vm_state_cache: VmStateCache,
-    tx: UnboundedSender<WorkJob>,
-    rx: UnboundedReceiver<WorkJob>,
-    work_commander: Option<WorkCommander>,
-    last_check_vms: DateTime<Utc>,
+    work_commander: Arc<dyn WorkCommander>,
+    feedback: Arc<dyn WorkFeedback>,
+    kv: Arc<dyn KeyValueStore>,
 }
 
+#[derive(Clone)]
 pub struct WorkerSettings {
     pub delete_after: u16,
     pub smtp: Option<SmtpConfig>,
@@ -68,56 +69,65 @@ impl Worker {
         vm_state_cache: VmStateCache,
         nostr: Option<Client>,
     ) -> Result<Self> {
-        let (tx, rx) = unbounded_channel();
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         let settings = settings.into();
 
-        let work_commander = if let Some(redis_config) = &settings.redis {
-            Some(WorkCommander::new(&redis_config.url, "workers", "api-worker").await?)
+        let work_commander: Arc<dyn WorkCommander> = if let Some(redis_config) = &settings.redis {
+            Arc::new(RedisWorkCommander::new(&redis_config.url, "workers", "api-worker").await?)
         } else {
-            None
+            Arc::new(ChannelWorkCommander::new())
         };
 
+        let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
+            Arc::new(RedisKeyValueStore::new(&c.url).await?)
+        } else {
+            Arc::new(InMemoryKeyValueStore::new())
+        };
+
+        let feedback: Arc<dyn WorkFeedback> = if let Some(c) = &settings.redis {
+            Arc::new(RedisWorkFeedback::new(&c.url).await?)
+        } else {
+            Arc::new(BlackholeWorkFeedback)
+        };
         Ok(Self {
             db,
             provisioner,
             vm_state_cache,
             nostr,
+            kv,
+            feedback,
             vm_history_logger,
             settings,
-            tx,
-            rx,
             work_commander,
-            last_check_vms: Utc::now(),
         })
     }
 
-    pub fn sender(&self) -> UnboundedSender<WorkJob> {
-        self.tx.clone()
+    pub fn commander(&self) -> Arc<dyn WorkCommander> {
+        self.work_commander.clone()
+    }
+
+    pub fn feedback(&self) -> Arc<dyn WorkFeedback> {
+        self.feedback.clone()
     }
 
     pub async fn get_last_check_vms(&self) -> Result<DateTime<Utc>> {
-        if let Some(w) = &self.work_commander {
-            let v = w.get_key("worker-last-check-vms").await?;
-            let timestamp = if v.len() == 8 {
-                u64::from_le_bytes(v.as_slice().try_into()?)
-            } else {
-                0
-            };
-            let date = DateTime::from_timestamp(timestamp as _, 0).unwrap();
-            Ok(date)
+        let Some(v) = self.kv.get("worker-last-check-vms").await? else {
+            return Ok(DateTime::UNIX_EPOCH);
+        };
+        let timestamp = if v.len() == 8 {
+            u64::from_le_bytes(v.as_slice().try_into()?)
         } else {
-            Ok(self.last_check_vms)
-        }
+            0
+        };
+        let date = DateTime::from_timestamp(timestamp as _, 0).unwrap();
+        Ok(date)
     }
 
-    pub async fn set_last_check_vms(&mut self, last_check_vms: DateTime<Utc>) -> Result<()> {
-        self.last_check_vms = last_check_vms;
-        if let Some(w) = &self.work_commander {
-            let t = last_check_vms.timestamp() as u64;
-            w.store_key("worker-last-check-vms", &t.to_le_bytes())
-                .await?;
-        }
+    pub async fn set_last_check_vms(&self, last_check_vms: DateTime<Utc>) -> Result<()> {
+        let t = last_check_vms.timestamp() as u64;
+        self.kv
+            .store("worker-last-check-vms", &t.to_le_bytes())
+            .await?;
         Ok(())
     }
 
@@ -159,11 +169,7 @@ impl Worker {
                             Ok(_) => {
                                 renewal_successful = true;
                                 info!("Successfully auto-renewed VM {} via NWC", vm.id);
-                                self.tx.send(WorkJob::SendNotification {
-                                    user_id: vm.user_id,
-                                    title: Some(format!("[VM{}] Auto-Renewed", vm.id)),
-                                    message: format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id)
-                                })?;
+                                self.queue_notification(vm.user_id,format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id), Some(format!("[VM{}] Auto-Renewed", vm.id))).await;
                             }
                             Err(e) => {
                                 warn!("Auto-renewal error for VM {}: {}", vm.id, e);
@@ -199,11 +205,12 @@ impl Worker {
                     )
                 };
 
-                self.tx.send(WorkJob::SendNotification {
-                    user_id: vm.user_id,
-                    title: Some(format!("[VM{}] Expiring Soon", vm.id)),
+                self.queue_notification(
+                    vm.user_id,
                     message,
-                })?;
+                    Some(format!("[VM{}] Expiring Soon", vm.id)),
+                )
+                .await;
             }
         }
 
@@ -215,11 +222,11 @@ impl Worker {
             } else if let Err(e) = self.vm_history_logger.log_vm_expired(vm.id, None).await {
                 warn!("Failed to log VM {} expiration: {}", vm.id, e);
             }
-            self.tx.send(WorkJob::SendNotification {
-                    user_id: vm.user_id,
-                    title: Some(format!("[VM{}] Expired", vm.id)),
-                    message: format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", vm.id, self.settings.delete_after)
-                })?;
+            self.queue_notification(
+                vm.user_id,
+                format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", vm.id, self.settings.delete_after),
+                Some(format!("[VM{}] Expired", vm.id))
+            ).await;
         }
 
         // Delete VM if expired > self.settings.delete_after days
@@ -238,12 +245,14 @@ impl Worker {
             }
 
             let title = Some(format!("[VM{}] Deleted", vm.id));
-            self.tx.send(WorkJob::SendNotification {
-                user_id: vm.user_id,
-                title: title.clone(),
-                message: format!("Your VM #{} has been deleted!", vm.id),
-            })?;
-            self.queue_admin_notification(format!("VM{} is ready for deletion", vm.id), title)?;
+            self.queue_notification(
+                vm.user_id,
+                format!("Your VM #{} has been deleted!", vm.id),
+                title.clone(),
+            )
+            .await;
+            self.queue_admin_notification(format!("VM{} is ready for deletion", vm.id), title)
+                .await;
         }
 
         Ok(())
@@ -298,7 +307,8 @@ impl Worker {
 
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
-        self.provisioner.spawn_vm(vm.id).await?;
+        let pipeline = self.provisioner.spawn_vm_pipeline(vm.id).await?;
+        pipeline.execute().await?;
 
         // Log VM created
         if let Err(e) = self
@@ -332,28 +342,47 @@ impl Worker {
                 .join("\n"),
             PublicKey::from_slice(&user.pubkey)?.to_bech32()?
         );
-        self.tx.send(WorkJob::SendNotification {
-            user_id: vm.user_id,
-            title: Some(format!("[VM{}] Created", vm.id)),
-            message: format!("Your {}", &msg),
-        })?;
-        self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))?;
+        self.queue_notification(
+            vm.user_id,
+            format!("Your {}", &msg),
+            Some(format!("[VM{}] Created", vm.id)),
+        )
+        .await;
+        self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))
+            .await;
         Ok(())
     }
 
-    pub fn spawn_check_loop(&self) {
-        let sender_clone = self.sender();
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = sender_clone.send(WorkJob::CheckVms) {
-                    error!("failed to send check vm: {}", e);
-                }
-                tokio::time::sleep(Duration::from_secs(Self::CHECK_VMS_SECONDS)).await;
-            }
-        });
+    pub async fn send(&self, job: WorkJob) -> Result<()> {
+        self.work_commander.send(job).await?;
+        Ok(())
     }
 
-    pub async fn check_vms(&mut self) -> Result<()> {
+    pub fn spawn_job_interval(&self, job: WorkJob, interval: Duration) -> JoinHandle<()> {
+        let sender = self.work_commander.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = sender.send(job.clone()).await {
+                    error!("failed to send check vm: {}", e);
+                }
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+
+    pub fn spawn_handler_loop(&self) -> JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = this.handle().await {
+                    error!("Worker handler failed: {}", e);
+                }
+                error!("Worker thread exited!")
+            }
+        })
+    }
+
+    pub async fn check_vms(&self) -> Result<()> {
         // Check if enough time has passed since last check to prevent rapid back-to-back calls
         let last_check = self.get_last_check_vms().await?;
         let time_since_last_check = Utc::now().signed_duration_since(last_check);
@@ -379,10 +408,7 @@ impl Worker {
 
             // only check spawned vms
             if !is_new_vm {
-                vms_by_host
-                    .entry(vm.host_id)
-                    .or_insert_with(Vec::new)
-                    .push(vm);
+                vms_by_host.entry(vm.host_id).or_default().push(vm);
             }
 
             // delete vm if not paid (in new state)
@@ -396,12 +422,11 @@ impl Worker {
             info!("Deleting unpaid VM {}", vm.id);
             if let Err(e) = self.provisioner.delete_vm(vm.id).await {
                 error!("Failed to delete unpaid VM {}: {}", vm.id, e);
-                if let Err(notification_err) = self.queue_admin_notification(
+                self.queue_admin_notification(
                     format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
                     Some(format!("VM {} Deletion Failed", vm.id)),
-                ) {
-                    error!("Failed to queue admin notification: {}", notification_err);
-                }
+                )
+                .await
             }
         }
 
@@ -413,12 +438,11 @@ impl Worker {
                 for vm in vms {
                     if let Err(e) = self.check_vm(vm).await {
                         error!("Failed to check VM {}: {}", vm.id, e);
-                        if let Err(notification_err) = self.queue_admin_notification(
+                        self.queue_admin_notification(
                             format!("Failed to check VM {}:\n{}", vm.id, e),
                             Some(format!("VM {} Check Failed", vm.id)),
-                        ) {
-                            error!("Failed to queue admin notification: {}", notification_err);
-                        }
+                        )
+                        .await
                     }
                 }
             }
@@ -435,65 +459,66 @@ impl Worker {
         title: Option<String>,
     ) -> Result<()> {
         let user = self.db.get_user(user_id).await?;
-        if let Some(smtp) = self.settings.smtp.as_ref() {
-            if user.contact_email && user.email.is_some() {
-                // send email
-                let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
-                if let Some(t) = title {
-                    b = b.subject(t);
-                }
-                if let Some(f) = &smtp.from {
-                    b = b.from(f.parse()?);
-                }
-                let template = include_str!("../email.html");
-                let html = MultiPart::alternative_plain_html(
-                    message.clone(),
-                    template
-                        .replace("%%_MESSAGE_%%", &message)
-                        .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
-                );
-
-                let msg = b.multipart(html)?;
-
-                let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
-                    .credentials(Credentials::new(
-                        smtp.username.to_string(),
-                        smtp.password.to_string(),
-                    ))
-                    .timeout(Some(Duration::from_secs(10)))
-                    .build();
-
-                sender.send(msg).await?;
+        if let Some(smtp) = self.settings.smtp.as_ref()
+            && user.contact_email
+            && user.email.is_some()
+        {
+            // send email
+            let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
+            if let Some(t) = title {
+                b = b.subject(t);
             }
+            if let Some(f) = &smtp.from {
+                b = b.from(f.parse()?);
+            }
+            let template = include_str!("../email.html");
+            let html = MultiPart::alternative_plain_html(
+                message.clone(),
+                template
+                    .replace("%%_MESSAGE_%%", &message)
+                    .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
+            );
+
+            let msg = b.multipart(html)?;
+
+            let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+                .credentials(Credentials::new(
+                    smtp.username.to_string(),
+                    smtp.password.to_string(),
+                ))
+                .timeout(Some(Duration::from_secs(10)))
+                .build();
+
+            sender.send(msg).await?;
         }
-        if user.contact_nip17 {
-            if let Some(c) = self.nostr.as_ref() {
-                let sig = c.signer().await?;
-                let ev = EventBuilder::private_msg(
-                    &sig,
-                    PublicKey::from_slice(&user.pubkey)?,
-                    message,
-                    None,
-                )
-                .await?;
-                c.send_event(&ev).await?;
-            }
+        if user.contact_nip17
+            && let Some(c) = self.nostr.as_ref()
+        {
+            let sig = c.signer().await?;
+            let ev = EventBuilder::private_msg(
+                &sig,
+                PublicKey::from_slice(&user.pubkey)?,
+                message,
+                None,
+            )
+            .await?;
+            c.send_event(&ev).await?;
         }
         Ok(())
     }
 
-    fn queue_notification(
-        &self,
-        user_id: u64,
-        message: String,
-        title: Option<String>,
-    ) -> Result<()> {
-        self.tx.send(WorkJob::SendNotification {
-            user_id,
-            message,
-            title,
-        })?;
-        Ok(())
+    async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
+        if let Err(e) = self
+            .work_commander
+            .send(WorkJob::SendNotification {
+                user_id,
+                message,
+                title,
+            })
+            .await
+        {
+            error!("Failed to queue notification: {}", e);
+        }
     }
 
     async fn process_bulk_message(
@@ -561,15 +586,20 @@ impl Worker {
                 subject, sent_count, failed_count, total_customers
             ),
             Some("Bulk Message Complete".to_string()),
-        )?;
+        )
+        .await;
 
         Ok(())
     }
 
-    fn queue_admin_notification(&self, message: String, title: Option<String>) -> Result<()> {
-        self.tx
-            .send(WorkJob::SendAdminNotification { message, title })?;
-        Ok(())
+    async fn queue_admin_notification(&self, message: String, title: Option<String>) {
+        if let Err(e) = self
+            .work_commander
+            .send(WorkJob::SendAdminNotification { message, title })
+            .await
+        {
+            warn!("Failed to send admin notification: {}", e);
+        }
     }
 
     async fn patch_host(&self, host: &mut VmHost) -> Result<()> {
@@ -740,19 +770,12 @@ impl Worker {
                                     domain.name, expected_hostname
                                 );
 
-                                if let Err(e) = self.tx.send(WorkJob::SendNotification {
-                                    user_id: domain.owner_id,
-                                    title: Some(format!(
-                                        "Nostr Domain '{}' Activated",
-                                        domain.name
-                                    )),
-                                    message: notification_message,
-                                }) {
-                                    error!(
-                                        "Failed to queue user notification for domain {}: {}",
-                                        domain.name, e
-                                    );
-                                }
+                                self.queue_notification(
+                                    domain.owner_id,
+                                    notification_message,
+                                    Some(format!("Nostr Domain '{}' Activated", domain.name)),
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 error!(
@@ -761,13 +784,11 @@ impl Worker {
                                 );
 
                                 // Send admin notification about the failure
-                                if let Err(notification_err) = self.queue_admin_notification(
+                                self.queue_admin_notification(
                                     format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}",
-                                           domain.name, domain.id, e),
+                                            domain.name, domain.id, e),
                                     Some(format!("Domain Activation Failed: {}", domain.name)),
-                                ) {
-                                    error!("Failed to queue admin notification: {}", notification_err);
-                                }
+                                ).await;
                             }
                         }
                     }
@@ -795,19 +816,12 @@ impl Worker {
                                     domain.name, expected_hostname
                                 );
 
-                                if let Err(e) = self.tx.send(WorkJob::SendNotification {
-                                    user_id: domain.owner_id,
-                                    title: Some(format!(
-                                        "Nostr Domain '{}' Deactivated",
-                                        domain.name
-                                    )),
-                                    message: notification_message,
-                                }) {
-                                    error!(
-                                        "Failed to queue user notification for domain {}: {}",
-                                        domain.name, e
-                                    );
-                                }
+                                self.queue_notification(
+                                    domain.owner_id,
+                                    notification_message,
+                                    Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 error!(
@@ -816,13 +830,11 @@ impl Worker {
                                 );
 
                                 // Send admin notification about the failure
-                                if let Err(notification_err) = self.queue_admin_notification(
+                                self.queue_admin_notification(
                                     format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}",
-                                           domain.name, domain.id, e),
+                                            domain.name, domain.id, e),
                                     Some(format!("Domain Deactivation Failed: {}", domain.name)),
-                                ) {
-                                    error!("Failed to queue admin notification: {}", notification_err);
-                                }
+                                ).await;
                             }
                         }
                     }
@@ -863,19 +875,12 @@ impl Worker {
                                         domain.name
                                     );
 
-                                    if let Err(e) = self.tx.send(WorkJob::SendNotification {
-                                        user_id: domain.owner_id,
-                                        title: Some(format!(
-                                            "Nostr Domain '{}' Deleted",
-                                            domain.name
-                                        )),
-                                        message: notification_message,
-                                    }) {
-                                        error!(
-                                            "Failed to queue user notification for deleted domain {}: {}",
-                                            domain.name, e
-                                        );
-                                    }
+                                    self.queue_notification(
+                                        domain.owner_id,
+                                        notification_message,
+                                        Some(format!("Nostr Domain '{}' Deleted", domain.name)),
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     error!(
@@ -884,13 +889,11 @@ impl Worker {
                                     );
 
                                     // Send admin notification about the failure
-                                    if let Err(notification_err) = self.queue_admin_notification(
+                                    self.queue_admin_notification(
                                         format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}",
-                                               domain.name, domain.id, domain.last_status_change, e),
+                                                domain.name, domain.id, domain.last_status_change, e),
                                         Some(format!("Domain Deletion Failed: {}", domain.name)),
-                                    ) {
-                                        error!("Failed to queue admin notification: {}", notification_err);
-                                    }
+                                    ).await;
                                 }
                             }
                         }
@@ -956,10 +959,8 @@ impl Worker {
             );
 
             info!("{}", message.replace('\n', " | "));
-            self.queue_admin_notification(
-                message,
-                Some("Nostr Domains Status Update".to_string()),
-            )?;
+            self.queue_admin_notification(message, Some("Nostr Domains Status Update".to_string()))
+                .await;
         } else {
             info!(
                 "No nostr domain changes required - all domains have correct DNS configuration and no old disabled domains to delete"
@@ -969,46 +970,27 @@ impl Worker {
         Ok(())
     }
 
-    async fn try_job(
-        &mut self,
-        job: &WorkJob,
-        _stream_id: Option<&str>,
-        _commander: Option<&WorkCommander>,
-    ) -> Result<Option<String>> {
+    async fn try_job(&self, job: &WorkJob) -> Result<Option<String>> {
         info!("Starting job: {}", job);
         match job {
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
                 for host in &mut hosts {
                     info!("Patching host {}", host.name);
-                    if let Err(e) = self.patch_host(host).await {
-                        error!("Failed to patch host {}: {}", host.name, e);
-                    }
+                    self.patch_host(host).await?;
                 }
             }
             WorkJob::CheckVm { vm_id } => {
                 let vm = self.db.get_vm(*vm_id).await?;
-                if let Err(e) = self.check_vm(&vm).await {
-                    error!("Failed to check VM {}: {}", vm_id, e);
-                    self.queue_admin_notification(
-                        format!("Failed to check VM {}:\n{:?}\n{}", vm_id, &job, e),
-                        Some("Job Failed".to_string()),
-                    )?
-                }
+                self.check_vm(&vm).await?;
             }
             WorkJob::SendNotification {
                 user_id,
                 message,
                 title,
             } => {
-                if let Err(e) = self
-                    .send_notification(*user_id, message.clone(), title.clone())
-                    .await
-                {
-                    error!("Failed to send notification {}: {}", user_id, e);
-                    // queue again for sending
-                    self.queue_notification(*user_id, message.clone(), title.clone())?;
-                }
+                self.send_notification(*user_id, message.clone(), title.clone())
+                    .await?;
             }
             WorkJob::SendAdminNotification { message, title } => {
                 // Look up all admin users and queue individual notifications
@@ -1019,16 +1001,8 @@ impl Worker {
                         } else {
                             info!("Sending admin notification to {} admin(s)", admin_ids.len());
                             for admin_id in admin_ids {
-                                if let Err(e) = self.queue_notification(
-                                    admin_id,
-                                    message.clone(),
-                                    title.clone(),
-                                ) {
-                                    error!(
-                                        "Failed to queue notification for admin {}: {}",
-                                        admin_id, e
-                                    );
-                                }
+                                self.queue_notification(admin_id, message.clone(), title.clone())
+                                    .await;
                             }
                         }
                     }
@@ -1051,13 +1025,7 @@ impl Worker {
                 )));
             }
             WorkJob::CheckVms => {
-                if let Err(e) = self.check_vms().await {
-                    error!("Failed to check VMs: {}", e);
-                    self.queue_admin_notification(
-                        format!("Failed to check VMs:\n{:?}\n{}", &job, e),
-                        Some("CheckVms Job Failed".to_string()),
-                    )?
-                }
+                self.check_vms().await?;
             }
             WorkJob::DeleteVm {
                 vm_id,
@@ -1100,7 +1068,8 @@ impl Worker {
                         vm_id, reason_text
                     ),
                     title.clone(),
-                )?;
+                )
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1109,7 +1078,8 @@ impl Worker {
                         vm_id, vm.user_id, reason_text
                     ),
                     title,
-                )?;
+                )
+                .await;
 
                 return Ok(Some(format!("VM {} deleted successfully", vm_id)));
             }
@@ -1157,7 +1127,8 @@ impl Worker {
                     vm.user_id,
                     format!("Your VM #{} has been started by an administrator.", vm_id),
                     title.clone(),
-                )?;
+                )
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1166,7 +1137,8 @@ impl Worker {
                         vm_id, vm.user_id
                     ),
                     title,
-                )?;
+                )
+                .await;
 
                 return Ok(Some(format!("VM {} started successfully", vm_id)));
             }
@@ -1205,7 +1177,8 @@ impl Worker {
                     vm.user_id,
                     format!("Your VM #{} has been stopped by an administrator.", vm_id),
                     title.clone(),
-                )?;
+                )
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1214,7 +1187,8 @@ impl Worker {
                         vm_id, vm.user_id
                     ),
                     title,
-                )?;
+                )
+                .await;
 
                 return Ok(Some(format!("VM {} stopped successfully", vm_id)));
             }
@@ -1228,14 +1202,7 @@ impl Worker {
                 self.configure_vm(*vm_id, *admin_user_id).await?;
             }
             WorkJob::CheckNostrDomains => {
-                info!("Processing check nostr domains job");
-                if let Err(e) = self.check_nostr_domains().await {
-                    error!("Failed to check nostr domains: {}", e);
-                    self.queue_admin_notification(
-                        format!("Failed to check nostr domains:\n{}", e),
-                        Some("Nostr Domains Check Failed".to_string()),
-                    )?
-                }
+                self.check_nostr_domains().await?;
             }
             WorkJob::AssignVmIp {
                 vm_id,
@@ -1480,14 +1447,14 @@ impl Worker {
             "Your VM was not running during the upgrade."
         };
 
-        self.tx.send(WorkJob::SendNotification {
-            user_id: full_info.vm.user_id,
-            title: Some(format!("[VM{}] Upgrade Complete", vm_id)),
-            message: format!(
-                "Your VM #{} has been successfully upgraded. The new specifications are now active. {}",
-                vm_id, restart_message
-            ),
-        })?;
+        self.queue_notification(
+            full_info.vm.user_id,
+                                format!(
+            "Your VM #{} has been successfully upgraded. The new specifications are now active. {}",
+            vm_id, restart_message
+        ),
+            Some(format!("[VM{}] Upgrade Complete", vm_id)),
+        ).await;
 
         info!("Successfully completed upgrade for VM {}", vm_id);
         Ok(())
@@ -1562,7 +1529,10 @@ impl Worker {
             dns_reverse_ref: None,
         };
 
-        self.provisioner.save_ip_assignment(&mut assignment).await?;
+        self.provisioner
+            .network
+            .save_ip_assignment(&mut assignment)
+            .await?;
 
         // Log the assignment
         let metadata = if let Some(admin_id) = admin_user_id {
@@ -1589,10 +1559,12 @@ impl Worker {
         }
 
         // Send ConfigureVm job to update VM network configuration
-        self.tx.send(WorkJob::ConfigureVm {
-            vm_id,
-            admin_user_id,
-        })?;
+        self.work_commander
+            .send(WorkJob::ConfigureVm {
+                vm_id,
+                admin_user_id,
+            })
+            .await?;
 
         info!(
             "Successfully assigned IP {} to VM {} from range {}",
@@ -1613,6 +1585,7 @@ impl Worker {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
         self.provisioner
+            .network
             .delete_ip_assignment(&mut assignment, &range)
             .await?;
 
@@ -1645,10 +1618,12 @@ impl Worker {
         }
 
         // Send ConfigureVm job to update VM network configuration
-        self.tx.send(WorkJob::ConfigureVm {
-            vm_id: vm.id,
-            admin_user_id,
-        })?;
+        self.work_commander
+            .send(WorkJob::ConfigureVm {
+                vm_id: vm.id,
+                admin_user_id,
+            })
+            .await?;
 
         info!(
             "Successfully unassigned IP {} (assignment {}) from VM {}",
@@ -1665,6 +1640,7 @@ impl Worker {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
         self.provisioner
+            .network
             .update_ip_assignment_policy(&mut assignment, &range)
             .await?;
 
@@ -1681,10 +1657,12 @@ impl Worker {
         }
 
         // Send ConfigureVm job to update VM network configuration
-        self.tx.send(WorkJob::ConfigureVm {
-            vm_id: vm.id,
-            admin_user_id,
-        })?;
+        self.work_commander
+            .send(WorkJob::ConfigureVm {
+                vm_id: vm.id,
+                admin_user_id,
+            })
+            .await?;
 
         info!(
             "Successfully unassigned IP {} (assignment {}) from VM {}",
@@ -1693,78 +1671,72 @@ impl Worker {
         Ok(())
     }
 
-    pub async fn handle(&mut self) -> Result<()> {
+    pub async fn handle(&self) -> Result<()> {
         loop {
-            tokio::select! {
-                // Handle local channel jobs
-                Some(job) = self.rx.recv() => {
-                    if let Some(w) = &self.work_commander {
-                        debug!("Forwarding job to work queue: {}", job);
-                        // send internal commands to work queue on redis
-                        if let Err(e) = w.send_job(job).await {
-                            error!("Failed to send job to worker: {}", e);
-                        }
-                    } else {
-                        // handle job directly if redis is not used
-                        if let Err(e) = self.try_job(&job, None, None).await {
-                            error!("Job failed to execute: {:?} {}", job, e);
-                        }
+            match self.work_commander.recv().await {
+                Ok(jobs) => {
+                    for msg in jobs {
+                        self.handle_job(msg).await?;
                     }
                 }
-                // Handle Redis stream jobs (only if Redis is configured)
-                redis_result = async {
-                    self.work_commander.as_ref().unwrap().listen_for_jobs().await
-                }, if self.work_commander.is_some() => {
-                    let commander = self.work_commander.as_ref().unwrap().clone();
-                    match redis_result {
-                        Ok(jobs) => {
-                            for (stream_id, job) in jobs {
-                                let job_type = job.to_string();
-
-                                // Create feedback messages first
-                                commander.publish_feedback(&commander.create_job_started_feedback(stream_id.clone(), job_type.clone())).await?;
-
-                                // Execute the job
-                                let job_result = self.try_job(&job, Some(&stream_id), Some(&commander)).await;
-
-                                // Handle feedback based on result
-                                    match job_result {
-                                        Ok(desc) => {
-                                            let feedback = commander.create_job_completed_feedback(
-                                                stream_id.to_string(),
-                                                job_type.clone(),
-                                                desc,
-                                            );
-                                            if let Err(e) = commander.publish_feedback(&feedback).await {
-                                                warn!("Failed to publish UpdateVmIp job feedback: {}", e);
-                                            }
-                                        }
-                                        Err(ref e) => {
-                                            error!("Failed to process Redis stream job: {:?} {}", job, e);
-                                            let failed_feedback = commander.create_job_failed_feedback(
-                                                stream_id.clone(),
-                                                job_type.clone(),
-                                                e.to_string()
-                                            );
-                                            if let Err(feedback_err) = commander.publish_feedback(&failed_feedback).await {
-                                                warn!("Failed to publish job failed feedback for {}: {}", stream_id, feedback_err);
-                                            }
-                                        }
-                                    }
-
-                                    // Always try to acknowledge the job
-                                    if let Err(e) = commander.acknowledge_job(&stream_id).await {
-                                        error!("Failed to acknowledge job {}: {}", stream_id, e);
-                                    }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to listen for Redis stream jobs: {}", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
+                Err(e) => {
+                    error!("Failed to listen on commander channel: {}", e);
                 }
             }
         }
+    }
+
+    async fn handle_job(&self, msg: WorkJobMessage) -> Result<()> {
+        let job = &msg.job;
+        let stream_id = &msg.id;
+        let job_type = job.to_string();
+
+        self.feedback
+            .publish(JobFeedback::create_job_started_feedback(
+                stream_id.clone(),
+                job_type.clone(),
+            ))
+            .await?;
+
+        // Execute the job
+        let job_result = self.try_job(job).await;
+
+        // Handle feedback based on result
+        match job_result {
+            Ok(desc) => {
+                let feedback = JobFeedback::create_job_completed_feedback(
+                    stream_id.to_string(),
+                    job_type.clone(),
+                    desc,
+                );
+                if let Err(e) = self.feedback.publish(feedback).await {
+                    warn!("Failed to publish UpdateVmIp job feedback: {}", e);
+                }
+                if let Err(e) = self.work_commander.ack(&msg.id).await {
+                    error!("Failed to acknowledge job {}: {}", stream_id, e);
+                }
+            }
+            Err(ref e) => {
+                error!("Failed to process Redis stream job: {:?} {}", job, e);
+                let failed_feedback = JobFeedback::create_job_failed_feedback(
+                    stream_id.clone(),
+                    job_type.clone(),
+                    e.to_string(),
+                );
+                if let Err(feedback_err) = self.feedback.publish(failed_feedback).await {
+                    warn!(
+                        "Failed to publish job failed feedback for {}: {}",
+                        stream_id, feedback_err
+                    );
+                }
+                // if job can be skipped, just acknowledge job
+                if msg.job.can_skip()
+                    && let Err(e) = self.work_commander.ack(&msg.id).await
+                {
+                    error!("Failed to acknowledge job {}: {}", stream_id, e);
+                }
+            }
+        }
+        Ok(())
     }
 }

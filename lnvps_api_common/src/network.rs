@@ -57,18 +57,15 @@ impl NetworkProvisioner {
         }
 
         // filter by kind
-        ip_ranges = ip_ranges
-            .into_iter()
-            .filter(|r| {
-                let net = r.cidr.parse();
-                match (net, &kind) {
-                    (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
-                    (Ok(IpNetwork::V6(_)), Some(IpAddrKind::IPv6)) => true,
-                    (Err(_), _) => false,
-                    _ => true,
-                }
-            })
-            .collect();
+        ip_ranges.retain(|r| {
+            let net = r.cidr.parse();
+            match (net, &kind) {
+                (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
+                (Ok(IpNetwork::V6(_)), Some(IpAddrKind::IPv6)) => true,
+                (Err(_), _) => false,
+                _ => true,
+            }
+        });
 
         // Randomize the order of IP ranges for even distribution
         ip_ranges.shuffle(&mut rand::rng());
@@ -143,7 +140,7 @@ impl NetworkProvisioner {
                             if !ips.contains(&addr) {
                                 break IpNetwork::new(addr, range_cidr.prefix()).ok();
                             } else {
-                                break None;
+                                continue;
                             }
                         },
                         IpNetwork::V6(v6) => loop {
@@ -152,7 +149,7 @@ impl NetworkProvisioner {
                             if !ips.contains(&addr) {
                                 break IpNetwork::new(addr, range_cidr.prefix()).ok();
                             } else {
-                                break None;
+                                continue;
                             }
                         },
                     }
@@ -232,10 +229,14 @@ mod tests {
 
     #[tokio::test]
     async fn pick_seq_ip_for_region_test() {
-        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        if let Some(r) = db.ip_range.lock().await.get_mut(&1) {
+            r.allocation_mode = IpRangeAllocationMode::Sequential;
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let mgr = NetworkProvisioner::new(db.clone());
 
-        let mac: [u8; 6] = [0xff, 0xff, 0xff, 0xfa, 0xfb, 0xfc];
         let gateway = IpNetwork::from_str("10.0.0.1/8").unwrap();
         let first = IpAddr::from_str("10.0.0.2").unwrap();
         let second = IpAddr::from_str("10.0.0.3").unwrap();
@@ -265,13 +266,26 @@ mod tests {
 
     #[tokio::test]
     async fn pick_rng_ip_for_region_test() {
+        env_logger::try_init().ok();
         let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
         let mgr = NetworkProvisioner::new(db);
 
-        let mac: [u8; 6] = [0xff, 0xff, 0xff, 0xfa, 0xfb, 0xfc];
         let ip = mgr.pick_ip_for_region(1).await.expect("No ip found in db");
         let v4 = ip.ip4.unwrap();
         let v6 = ip.ip6.unwrap();
         assert_eq!(1, v4.region_id);
+        assert_eq!(1, v6.region_id);
+    }
+
+    #[tokio::test]
+    async fn pick_rng_always_ok() {
+        env_logger::try_init().ok();
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let mgr = NetworkProvisioner::new(db);
+        for _ in 0..1_000 {
+            let ips = mgr.pick_ip_for_region(1).await.expect("No ips found in db");
+            assert!(ips.ip4.is_some());
+            assert!(ips.ip6.is_some());
+        }
     }
 }

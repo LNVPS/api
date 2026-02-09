@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
-    DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
+    DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
     VmIpAssignment, VmTemplate,
 };
 use std::collections::{HashMap, HashSet};
@@ -147,7 +147,7 @@ impl HostCapacityService {
         // remove templates with 0 max cpu/ram/disk
         Ok(templates
             .into_iter()
-            .filter(|t| t.max_cpu > 0 && t.max_memory > 0 && t.disks.len() > 0)
+            .filter(|t| t.max_cpu > 0 && t.max_memory > 0 && !t.disks.is_empty())
             .collect())
     }
 
@@ -179,7 +179,7 @@ impl HostCapacityService {
 
         // load templates
         let templates = self.db.list_vm_templates().await?;
-        let custom_templates: Vec<Result<VmCustomTemplate>> = join_all(
+        let custom_templates: Vec<DbResult<VmCustomTemplate>> = join_all(
             vms.iter()
                 .filter(|v| v.custom_template_id.is_some() && v.expires > Utc::now())
                 .map(|v| {
