@@ -6,7 +6,7 @@
 mod tests {
     use crate::host::VmHostClient;
     use crate::mocks::MockVmHost;
-    use anyhow::{Result, bail};
+    use anyhow::Result;
     use async_trait::async_trait;
     use lnvps_api_common::retry::{OpError, OpResult};
     use lnvps_api_common::{MockDb, VmRunningState};

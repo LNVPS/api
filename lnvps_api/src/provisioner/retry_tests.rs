@@ -6,22 +6,16 @@
 #[cfg(test)]
 mod tests {
     use crate::dns::{BasicRecord, DnsServer, RecordType};
-    use crate::host::FullVmInfo;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
-    use crate::provisioner::LNVpsProvisioner;
     use crate::router::{ArpEntry, Router};
     use crate::settings::mock_settings;
-    use anyhow::{Result, anyhow, bail};
+    use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use lnvps_api_common::retry::{OpError, OpResult};
-    use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate};
-    use lnvps_db::{
-        AccessPolicy, IpRange, LNVpsDb, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
-        UserSshKey, VmIpAssignment,
-    };
+    use lnvps_api_common::{InMemoryRateCache, MockDb};
+    use lnvps_db::{LNVpsDbBase, User, UserSshKey};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use tokio::sync::Mutex;
 
     /// Mock DNS server that fails N times before succeeding
     pub struct FailingDnsServer {

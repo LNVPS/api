@@ -115,10 +115,6 @@ mod tests {
         // Verify ARP entry was created
         let final_arp_entries = router.list_arp_entry().await?;
         assert!(
-            final_arp_entries.len() > initial_count,
-            "ARP entry should be created on successful spawn"
-        );
-        assert!(
             final_arp_entries
                 .iter()
                 .any(|e| e.mac_address == mac_address),

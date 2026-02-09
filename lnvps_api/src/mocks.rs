@@ -55,6 +55,7 @@ impl MockRouter {
         }
     }
 }
+
 #[async_trait]
 impl Router for MockRouter {
     async fn generate_mac(&self, ip: &str, comment: &str) -> anyhow::Result<Option<ArpEntry>> {
