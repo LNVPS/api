@@ -9,21 +9,11 @@ use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
 
 use payments_rs::currency::{Currency, CurrencyAmount};
-use serde::{Deserialize, Serialize, Deserializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-
-// Custom deserializer that distinguishes between missing field and explicit null
-// Used for PATCH endpoints to allow clearing optional fields
-fn deserialize_nullable_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::deserialize(deserializer)?))
-}
 
 #[derive(Serialize, Deserialize)]
 pub struct ApiCustomVmOrder {

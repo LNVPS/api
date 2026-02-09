@@ -91,6 +91,21 @@ where
     }
 }
 
+/// Custom deserializer that distinguishes between missing field and explicit null
+/// Used for PATCH endpoints to allow clearing optional fields
+/// 
+/// Returns:
+/// - `None` when field is not present in JSON (due to `#[serde(default)]`)
+/// - `Some(None)` when field is present with `null` value
+/// - `Some(Some(value))` when field is present with a value
+pub fn deserialize_nullable_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
 
 // Custom deserializer to handle Proxmox's integer-to-boolean conversion for KVM field
 pub fn deserialize_int_to_bool<'de, D>(deserializer: D) -> anyhow::Result<Option<bool>, D::Error>
