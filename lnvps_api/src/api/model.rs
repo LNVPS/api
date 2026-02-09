@@ -66,28 +66,28 @@ pub struct VMPatchRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct AccountPatchRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub email: Option<Option<String>>,
     pub contact_nip17: bool,
     pub contact_email: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub country_code: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub name: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub address_1: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub address_2: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub state: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub city: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub postcode: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub tax_id: Option<Option<String>>,
     /// Nostr Wallet Connect connection string for automatic VM renewals
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
     pub nwc_connection_string: Option<Option<String>>,
 }
 
