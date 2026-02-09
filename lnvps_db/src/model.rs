@@ -312,6 +312,8 @@ pub enum RouterKind {
     Mikrotik = 0,
     /// A pseudo-router which allows adding virtual mac addresses to a dedicated server
     OvhAdditionalIp = 1,
+    /// Mock router access in tests
+    MockRouter = u16::MAX,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

@@ -87,6 +87,12 @@ impl LNVpsProvisioner {
             RouterKind::OvhAdditionalIp => Ok(Arc::new(
                 OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, cfg.token.as_str()).await?,
             )),
+            RouterKind::MockRouter => {
+                #[cfg(test)]
+                return Ok(Arc::new(crate::mocks::MockRouter::new()));
+                #[cfg(not(test))]
+                panic!("Cant use mock router outside tests!")
+            }
         }
     }
 
@@ -1038,7 +1044,7 @@ mod tests {
                     id: 1,
                     name: "mock-router".to_string(),
                     enabled: true,
-                    kind: RouterKind::Mikrotik,
+                    kind: RouterKind::MockRouter,
                     url: "https://localhost".to_string(),
                     token: "username:password".into(),
                 },
