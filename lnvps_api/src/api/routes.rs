@@ -101,7 +101,7 @@ async fn v1_patch_account(
 
     // validate nwc string
     #[cfg(feature = "nostr-nwc")]
-    if let Some(nwc) = &req.nwc_connection_string {
+    if let Some(Some(nwc)) = &req.nwc_connection_string {
         match nwc::prelude::NostrWalletConnectURI::parse(nwc) {
             Ok(s) => {
                 // test connection
@@ -115,22 +115,42 @@ async fn v1_patch_account(
         }
     }
 
-    user.email = req.email.clone().map(|s| s.into());
+    // Update fields only if they are present in the request
+    if let Some(email) = &req.email {
+        user.email = email.clone().map(|s| s.into());
+    }
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
-    user.country_code = req
-        .country_code
-        .as_ref()
-        .and_then(|c| CountryCode::for_alpha3(c).ok())
-        .map(|c| c.alpha3().to_string());
-    user.billing_name = req.name.clone();
-    user.billing_address_1 = req.address_1.clone();
-    user.billing_address_2 = req.address_2.clone();
-    user.billing_city = req.city.clone();
-    user.billing_state = req.state.clone();
-    user.billing_postcode = req.postcode.clone();
-    user.billing_tax_id = req.tax_id.clone();
-    user.nwc_connection_string = req.nwc_connection_string.clone().map(|s| s.into());
+    if let Some(country_code) = &req.country_code {
+        user.country_code = country_code
+            .as_ref()
+            .and_then(|c| CountryCode::for_alpha3(c).ok())
+            .map(|c| c.alpha3().to_string());
+    }
+    if let Some(name) = &req.name {
+        user.billing_name = name.clone();
+    }
+    if let Some(address_1) = &req.address_1 {
+        user.billing_address_1 = address_1.clone();
+    }
+    if let Some(address_2) = &req.address_2 {
+        user.billing_address_2 = address_2.clone();
+    }
+    if let Some(city) = &req.city {
+        user.billing_city = city.clone();
+    }
+    if let Some(state) = &req.state {
+        user.billing_state = state.clone();
+    }
+    if let Some(postcode) = &req.postcode {
+        user.billing_postcode = postcode.clone();
+    }
+    if let Some(tax_id) = &req.tax_id {
+        user.billing_tax_id = tax_id.clone();
+    }
+    if let Some(nwc_connection_string) = &req.nwc_connection_string {
+        user.nwc_connection_string = nwc_connection_string.clone().map(|s| s.into());
+    }
 
     this.db.update_user(&user).await?;
     ApiData::ok(())

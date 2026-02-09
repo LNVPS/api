@@ -9,11 +9,21 @@ use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
 
 use payments_rs::currency::{Currency, CurrencyAmount};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+
+// Custom deserializer that distinguishes between missing field and explicit null
+// Used for PATCH endpoints to allow clearing optional fields
+fn deserialize_nullable_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct ApiCustomVmOrder {
@@ -66,46 +76,46 @@ pub struct VMPatchRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct AccountPatchRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub email: Option<Option<String>>,
     pub contact_nip17: bool,
     pub contact_email: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub country_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub address_1: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub address_2: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub city: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub postcode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tax_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub country_code: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub name: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub address_1: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub address_2: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub state: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub city: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub postcode: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub tax_id: Option<Option<String>>,
     /// Nostr Wallet Connect connection string for automatic VM renewals
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nwc_connection_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_nullable_option")]
+    pub nwc_connection_string: Option<Option<String>>,
 }
 
 impl From<lnvps_db::User> for AccountPatchRequest {
     fn from(user: lnvps_db::User) -> Self {
         AccountPatchRequest {
-            email: user.email.map(|e| e.into()),
+            email: Some(user.email.map(|e| e.into())),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
-            country_code: user.country_code,
-            name: user.billing_name,
-            address_1: user.billing_address_1,
-            address_2: user.billing_address_2,
-            state: user.billing_state,
-            city: user.billing_city,
-            postcode: user.billing_postcode,
-            tax_id: user.billing_tax_id,
-            nwc_connection_string: user.nwc_connection_string.map(|nwc| nwc.into()),
+            country_code: Some(user.country_code),
+            name: Some(user.billing_name),
+            address_1: Some(user.billing_address_1),
+            address_2: Some(user.billing_address_2),
+            state: Some(user.billing_state),
+            city: Some(user.billing_city),
+            postcode: Some(user.billing_postcode),
+            tax_id: Some(user.billing_tax_id),
+            nwc_connection_string: Some(user.nwc_connection_string.map(|nwc| nwc.into())),
         }
     }
 }
