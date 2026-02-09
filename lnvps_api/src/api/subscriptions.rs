@@ -1,9 +1,11 @@
-use crate::api::model::{ApiSubscription, ApiSubscriptionPayment};
 use crate::api::RouterState;
+use crate::api::model::{ApiSubscription, ApiSubscriptionPayment};
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
+};
 
 pub fn router() -> Router<RouterState> {
     Router::new()

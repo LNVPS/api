@@ -60,7 +60,9 @@ where
     }
 
     match Option::<StringOrValue<T>>::deserialize(deserializer)? {
-        Some(StringOrValue::String(s)) => s.parse::<T>().map(Some).map_err(serde::de::Error::custom),
+        Some(StringOrValue::String(s)) => {
+            s.parse::<T>().map(Some).map_err(serde::de::Error::custom)
+        }
         Some(StringOrValue::Value(v)) => Ok(Some(v)),
         None => Ok(None),
     }

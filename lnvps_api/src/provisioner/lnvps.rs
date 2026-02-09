@@ -1,17 +1,22 @@
-use crate::host::{FullVmInfo, get_host_client, VmHostClient};
-use crate::router::{get_router, ArpEntry, Router};
+use crate::dns::DnsServer;
+use crate::host::{FullVmInfo, VmHostClient, get_host_client};
+use crate::provisioner::LNVpsNetworkProvisioner;
+use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{Context, Result, bail, ensure};
-use lnvps_api_common::retry::{RetryPolicy, OpResult, Pipeline};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
-use lnvps_api_common::{op_fatal, ExchangeRateService};
+use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
-use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCustomTemplate, VmIpAssignment, VmPayment, VmTemplate};
+use lnvps_api_common::{ExchangeRateService, op_fatal};
+use lnvps_db::{
+    IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCustomTemplate,
+    VmIpAssignment, VmPayment, VmTemplate,
+};
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
@@ -21,8 +26,6 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::dns::DnsServer;
-use crate::provisioner::LNVpsNetworkProvisioner;
 
 /// Main provisioner class for LNVPS
 ///
@@ -245,7 +248,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         let price = pe.get_vm_cost(vm_id, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -263,7 +266,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -387,7 +390,10 @@ impl LNVpsProvisioner {
     }
 
     /// Create the pipeline instance for spawning this vm
-    pub async fn spawn_vm_pipeline(&self, vm_id: u64) -> Result<Pipeline<'_, SpawnVmContext, anyhow::Error>> {
+    pub async fn spawn_vm_pipeline(
+        &self,
+        vm_id: u64,
+    ) -> Result<Pipeline<'_, SpawnVmContext, anyhow::Error>> {
         if self.read_only {
             bail!("Cant spawn VM's in read-only mode")
         }
@@ -402,45 +408,50 @@ impl LNVpsProvisioner {
             info,
         };
         Ok(Pipeline::new(ctx)
-            .step_with_rollback("ip_allocation", |ctx| {
-                Box::pin(async move {
-                    ctx.assign_ips().await
-                })
-            }, |ctx| {
-                Box::pin(async move {
-                    // rollback any remote resources as we didn't save the assignments to the database yet
-                    ctx.rollback_assign_ips().await
-                })
-            })
-            .step_with_rollback("host_spawn", |ctx| {
-                Box::pin(async move {
-                    ctx.host_client.create_vm(&ctx.info).await
-                })
-            }, |ctx| {
-                Box::pin(async move {
-                    ctx.host_client.delete_vm(&ctx.info.vm).await
-                })
-            })
-            .step_with_rollback("save_vm", |ctx| {
-                Box::pin(async move {
-                    ctx.db.update_vm(&ctx.info.vm).await?;
-                    for ip in &mut ctx.info.ips {
-                        if ip.id != 0 {
-                            // IP already inserted, skip
-                            continue;
+            .step_with_rollback(
+                "ip_allocation",
+                |ctx| Box::pin(async move { ctx.assign_ips().await }),
+                |ctx| {
+                    Box::pin(async move {
+                        // rollback any remote resources as we didn't save the assignments to the database yet
+                        ctx.rollback_assign_ips().await
+                    })
+                },
+            )
+            .step_with_rollback(
+                "host_spawn",
+                |ctx| Box::pin(async move { ctx.host_client.create_vm(&ctx.info).await }),
+                |ctx| Box::pin(async move { ctx.host_client.delete_vm(&ctx.info.vm).await }),
+            )
+            .step_with_rollback(
+                "save_vm",
+                |ctx| {
+                    Box::pin(async move {
+                        ctx.db.update_vm(&ctx.info.vm).await?;
+                        for ip in &mut ctx.info.ips {
+                            if ip.id != 0 {
+                                // IP already inserted, skip
+                                continue;
+                            }
+                            ctx.network.save_ip_assignment(ip).await?;
                         }
-                        ctx.network.save_ip_assignment(ip).await?;
-                    }
-                    Ok(())
-                })
-            }, |ctx| {
-                Box::pin(async move {
-                    ctx.network.delete_all_ip_assignments(ctx.info.vm.id).await?;
-                    // we can hard delete ips here because they were never used, so there is no need
-                    // to soft-delete
-                    Ok(ctx.db.hard_delete_vm_ip_assignments_by_vm_id(ctx.info.vm.id).await?)
-                })
-            }))
+                        Ok(())
+                    })
+                },
+                |ctx| {
+                    Box::pin(async move {
+                        ctx.network
+                            .delete_all_ip_assignments(ctx.info.vm.id)
+                            .await?;
+                        // we can hard delete ips here because they were never used, so there is no need
+                        // to soft-delete
+                        Ok(ctx
+                            .db
+                            .hard_delete_vm_ip_assignments_by_vm_id(ctx.info.vm.id)
+                            .await?)
+                    })
+                },
+            ))
     }
 
     /// Delete a VM and its associated resources
@@ -450,16 +461,12 @@ impl LNVpsProvisioner {
 
         let client = get_host_client(&host, &self.provisioner_config)?;
         let pipeline = Pipeline::new((self.db.clone(), client, self.network.clone()))
-            .step("host_delete_vm", |ctx| {
-                Box::pin(ctx.1.delete_vm(&vm))
-            })
+            .step("host_delete_vm", |ctx| Box::pin(ctx.1.delete_vm(&vm)))
             .step("delete_ips", |ctx| {
                 Box::pin(ctx.2.delete_all_ip_assignments(vm_id))
             })
             .step("delete_vm_db", |ctx| {
-                Box::pin(async {
-                    Ok(ctx.0.delete_vm(vm_id).await?)
-                })
+                Box::pin(async { Ok(ctx.0.delete_vm(vm_id).await?) })
             });
         pipeline.execute().await?;
         Ok(())
@@ -498,7 +505,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         pe.calculate_upgrade_cost(vm_id, cfg, method).await
     }
 
@@ -548,7 +555,7 @@ impl LNVpsProvisioner {
             PaymentType::Upgrade,
             Some(upgrade_params_json),
         )
-            .await
+        .await
     }
 
     /// Create a new custom template using a vm's existing standard template
@@ -593,7 +600,7 @@ impl LNVpsProvisioner {
         let custom_pricing = compatible_pricing
             .ok_or_else(|| anyhow::anyhow!(
                 "No custom pricing available for this region that supports disk type {:?} with interface {:?}", 
-                current_template.disk_type, 
+                current_template.disk_type,
                 current_template.disk_interface
             ))?;
 
@@ -625,14 +632,19 @@ impl LNVpsProvisioner {
         Ok((vm, current_template, new_custom_template))
     }
 
-    pub fn v6_to_allocation(v6: &mut AvailableIp, vm_id: u64, mac_address: &str) -> OpResult<VmIpAssignment> {
+    pub fn v6_to_allocation(
+        v6: &mut AvailableIp,
+        vm_id: u64,
+        mac_address: &str,
+    ) -> OpResult<VmIpAssignment> {
         match v6.mode {
             // it's a bit awkward, but we need to update the IP AFTER its been picked
             // simply because sometimes we don't know the MAC of the NIC yet
             IpRangeAllocationMode::SlaacEui64 => {
                 let mac = NetworkProvisioner::parse_mac(mac_address)?;
                 let addr = NetworkProvisioner::calculate_eui64(&mac, &v6.ip)?;
-                v6.ip = IpNetwork::new(addr, v6.ip.prefix()).context("failed to parse IPv6 address")?;
+                v6.ip =
+                    IpNetwork::new(addr, v6.ip.prefix()).context("failed to parse IPv6 address")?;
             }
             _ => {}
         }
@@ -644,7 +656,6 @@ impl LNVpsProvisioner {
         })
     }
 }
-
 
 /// Context object for spawning vms using [Pipeline]
 pub(crate) struct SpawnVmContext {
@@ -684,8 +695,8 @@ impl SpawnVmContext {
         // ask router first if it wants to set the MAC
         if let Some(router) = self.get_range_router(&range).await?
             && let Some(mac) = router
-            .generate_mac(&assignment.ip, &format!("VM{}", assignment.vm_id))
-            .await?
+                .generate_mac(&assignment.ip, &format!("VM{}", assignment.vm_id))
+                .await?
         {
             self.info.vm.mac_address = mac.address.clone();
             assignment.arp_ref = mac.id.clone();
@@ -708,7 +719,11 @@ impl SpawnVmContext {
 
     async fn assign_ips(&mut self) -> OpResult<()> {
         if !self.info.ips.is_empty() {
-            info!("VM {} already has {} ips, skipping", self.info.vm.id, self.info.ips.len());
+            info!(
+                "VM {} already has {} ips, skipping",
+                self.info.vm.id,
+                self.info.ips.len()
+            );
             // TODO: we should try to fill any missing assignments here too
             return Ok(());
         }
@@ -731,10 +746,16 @@ impl SpawnVmContext {
             None => op_fatal!("Cannot provision VM without an IPv4 address"),
         }
         if let Some(mut v6) = ip.ip6 {
-            let assignment = LNVpsProvisioner::v6_to_allocation(&mut v6, self.info.vm.id, &self.info.vm.mac_address)?;
+            let assignment = LNVpsProvisioner::v6_to_allocation(
+                &mut v6,
+                self.info.vm.id,
+                &self.info.vm.mac_address,
+            )?;
             self.info.ips.push(assignment);
             if !self.info.ranges.iter().any(|r| r.id == v6.range_id) {
-                self.info.ranges.push(self.db.get_ip_range(v6.range_id).await?);
+                self.info
+                    .ranges
+                    .push(self.db.get_ip_range(v6.range_id).await?);
             }
         }
 
@@ -743,10 +764,17 @@ impl SpawnVmContext {
 
     async fn rollback_assign_ips(&mut self) -> OpResult<()> {
         for ip in &self.info.ips {
-            let range = self.info.ranges.iter().find(|r| r.id == ip.ip_range_id).context("Missing range in collection")?;
+            let range = self
+                .info
+                .ranges
+                .iter()
+                .find(|r| r.id == ip.ip_range_id)
+                .context("Missing range in collection")?;
             // rollback MAC assignment if remotely assigned
-            if let Some(mac) = self.generated_mac.as_ref() && let Some(arp_id) = mac.id.as_ref()
-                && let Some(router) = self.get_range_router(range).await? {
+            if let Some(mac) = self.generated_mac.as_ref()
+                && let Some(arp_id) = mac.id.as_ref()
+                && let Some(router) = self.get_range_router(range).await?
+            {
                 router.remove_arp_entry(arp_id).await?;
             }
         }
@@ -760,7 +788,10 @@ mod tests {
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
     use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate, Ticker};
-    use lnvps_db::{AccessPolicy, DiskInterface, DiskType, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User, UserSshKey, VmTemplate};
+    use lnvps_db::{
+        AccessPolicy, DiskInterface, DiskType, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
+        UserSshKey, VmTemplate,
+    };
     use std::net::IpAddr;
     use std::str::FromStr;
 
@@ -830,7 +861,13 @@ mod tests {
         }
 
         let dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(Arc::new(dns.clone())));
+        let provisioner = LNVpsProvisioner::new(
+            settings,
+            db.clone(),
+            node.clone(),
+            rates.clone(),
+            Some(Arc::new(dns.clone())),
+        );
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -954,7 +991,13 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(InMemoryRateCache::default());
-        let prov = LNVpsProvisioner::new(settings.clone(), db.clone(), node.clone(), rates.clone(), None);
+        let prov = LNVpsProvisioner::new(
+            settings.clone(),
+            db.clone(),
+            node.clone(),
+            rates.clone(),
+            None,
+        );
 
         let large_template = VmTemplate {
             id: 0,

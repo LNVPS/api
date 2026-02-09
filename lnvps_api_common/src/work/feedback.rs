@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::stream;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
-use futures::stream;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, Value};
 use serde::de::DeserializeOwned;

@@ -6,12 +6,12 @@
 #[cfg(test)]
 mod tests {
     use crate::dns::{BasicRecord, DnsServer, RecordType};
-    use crate::host::{FullVmInfo};
+    use crate::host::FullVmInfo;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::provisioner::LNVpsProvisioner;
     use crate::router::{ArpEntry, Router};
     use crate::settings::mock_settings;
-    use anyhow::{anyhow, bail, Result};
+    use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
     use lnvps_api_common::retry::{OpError, OpResult};
     use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate};
@@ -19,8 +19,8 @@ mod tests {
         AccessPolicy, IpRange, LNVpsDb, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
         UserSshKey, VmIpAssignment,
     };
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::Mutex;
 
     /// Mock DNS server that fails N times before succeeding
@@ -63,7 +63,10 @@ mod tests {
             let fails = self.add_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.add_record_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated DNS add failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated DNS add failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.add_record(zone, record).await
         }
@@ -72,7 +75,10 @@ mod tests {
             let fails = self.update_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.update_record_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated DNS update failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated DNS update failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.update_record(zone, record).await
         }
@@ -81,7 +87,10 @@ mod tests {
             let fails = self.delete_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.delete_record_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated DNS delete failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated DNS delete failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.delete_record(zone, record).await
         }
@@ -127,7 +136,10 @@ mod tests {
             let fails = self.list_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.list_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated router list failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated router list failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.list_arp_entry().await
         }
@@ -136,7 +148,10 @@ mod tests {
             let fails = self.add_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.add_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated router add failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated router add failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.add_arp_entry(entry).await
         }
@@ -145,7 +160,10 @@ mod tests {
             let fails = self.remove_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.remove_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated router remove failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated router remove failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.remove_arp_entry(id).await
         }
@@ -154,7 +172,10 @@ mod tests {
             let fails = self.update_arp_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.update_arp_fail_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(OpError::Transient(anyhow!("Simulated router update failure (remaining: {})", fails - 1)));
+                return Err(OpError::Transient(anyhow!(
+                    "Simulated router update failure (remaining: {})",
+                    fails - 1
+                )));
             }
             self.inner.update_arp_entry(entry).await
         }
@@ -186,23 +207,24 @@ mod tests {
         let failing_dns = Arc::new(FailingDnsServer::new(2, 0, 0));
 
         let (user, ssh_key) = add_user(&db).await?;
-        let vm = db.insert_vm(&lnvps_db::Vm {
-            id: 0,
-            host_id: 1,
-            user_id: user.id,
-            image_id: 1,
-            template_id: Some(1),
-            custom_template_id: None,
-            ssh_key_id: ssh_key.id,
-            created: chrono::Utc::now(),
-            expires: chrono::Utc::now(),
-            disk_id: 1,
-            mac_address: "bc:24:11:00:00:01".to_string(),
-            deleted: false,
-            ref_code: None,
-            auto_renewal_enabled: false,
-        })
-        .await?;
+        let vm = db
+            .insert_vm(&lnvps_db::Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: Some(1),
+                custom_template_id: None,
+                ssh_key_id: ssh_key.id,
+                created: chrono::Utc::now(),
+                expires: chrono::Utc::now(),
+                disk_id: 1,
+                mac_address: "bc:24:11:00:00:01".to_string(),
+                deleted: false,
+                ref_code: None,
+                auto_renewal_enabled: false,
+            })
+            .await?;
 
         // Should fail 2 times and succeed on 3rd attempt
         assert_eq!(failing_dns.add_failures_remaining(), 2);
@@ -267,12 +289,12 @@ mod tests {
             let result = failing_dns
                 .add_record(
                     "test-zone",
-                &BasicRecord {
-                    id: None,
-                    name: "test.example.com".to_string(),
-                    value: "10.0.0.100".to_string(),
-                    kind: RecordType::A,
-                },
+                    &BasicRecord {
+                        id: None,
+                        name: "test.example.com".to_string(),
+                        value: "10.0.0.100".to_string(),
+                        kind: RecordType::A,
+                    },
                 )
                 .await;
             assert!(result.is_err(), "Attempt {} should fail", i + 1);
@@ -415,12 +437,16 @@ mod tests {
         // First update should fail
         let mut updated_record = record.clone();
         updated_record.value = "10.0.0.101".to_string();
-        let result = failing_dns.update_record("test-zone", &updated_record).await;
+        let result = failing_dns
+            .update_record("test-zone", &updated_record)
+            .await;
         assert!(result.is_err());
         assert_eq!(failing_dns.update_failures_remaining(), 0);
 
         // Second update should succeed
-        let result = failing_dns.update_record("test-zone", &updated_record).await;
+        let result = failing_dns
+            .update_record("test-zone", &updated_record)
+            .await;
         assert!(result.is_ok());
 
         Ok(())

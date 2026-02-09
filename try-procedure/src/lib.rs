@@ -391,7 +391,8 @@ type StepFn<'a, Ctx, E> =
     Box<dyn FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a>;
 
 /// Type-erased rollback function. Uses `FnMut` so it can be retried on transient failures.
-type RollbackFn<'a, Ctx, E> = Box<dyn FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a>;
+type RollbackFn<'a, Ctx, E> =
+    Box<dyn FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a>;
 
 /// A step in the pipeline: an action and an optional rollback.
 struct PipelineStep<'a, Ctx, E> {

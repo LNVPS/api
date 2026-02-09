@@ -100,8 +100,7 @@ where
     ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
         Box::pin(async {
             // First get the regular NIP-98 auth
-            let nip98_auth = Nip98Auth::from_request_parts(parts, state)
-                .await?;
+            let nip98_auth = Nip98Auth::from_request_parts(parts, state).await?;
 
             let state = RouterState::from_ref(state);
             // Check admin privileges

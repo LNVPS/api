@@ -11,5 +11,5 @@ mod integration_retry_tests;
 mod rollback_tests;
 
 pub use lnvps::*;
-pub use lnvps_network::*;
 pub use lnvps_api_common::{HostCapacityService, NetworkProvisioner, PricingEngine};
+pub use lnvps_network::*;

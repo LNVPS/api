@@ -5,7 +5,7 @@
 //! specify the error type parameter.
 
 // Re-export the core crate
-pub use try_procedure::{retry_async, OpError, Pipeline, RetryOp, RetryPolicy, Retryable};
+pub use try_procedure::{OpError, Pipeline, RetryOp, RetryPolicy, Retryable, retry_async};
 
 /// Convenience type alias that defaults the error to [`anyhow::Error`].
 ///
