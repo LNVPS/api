@@ -21,6 +21,7 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use crate::dns::DnsServer;
 use crate::provisioner::LNVpsNetworkProvisioner;
 
 /// Main provisioner class for LNVPS
@@ -49,11 +50,12 @@ impl LNVpsProvisioner {
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
         rates: Arc<dyn ExchangeRateService>,
+        dns: Option<Arc<dyn DnsServer>>,
     ) -> Self {
         Self {
             network: LNVpsNetworkProvisioner::new(
                 db.clone(),
-                settings.get_dns().expect("dns config"),
+                dns,
                 settings.dns.as_ref().map(|z| z.forward_zone_id.to_string()),
                 Self::retry_policy(),
             ),
@@ -786,6 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic() -> Result<()> {
+        env_logger::try_init().ok();
         let settings = settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -827,7 +830,7 @@ mod tests {
         }
 
         let dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(Arc::new(dns.clone())));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -946,11 +949,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_capacity() -> Result<()> {
+        env_logger::try_init().ok();
         let settings = settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(InMemoryRateCache::default());
-        let prov = LNVpsProvisioner::new(settings.clone(), db.clone(), node.clone(), rates.clone());
+        let prov = LNVpsProvisioner::new(settings.clone(), db.clone(), node.clone(), rates.clone(), None);
 
         let large_template = VmTemplate {
             id: 0,

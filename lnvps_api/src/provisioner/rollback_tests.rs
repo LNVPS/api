@@ -17,7 +17,6 @@ mod tests {
     use anyhow::Result;
     use lnvps_api_common::{ExchangeRateService, MockDb, MockExchangeRate, Ticker};
     use lnvps_db::{AccessPolicy, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User, UserSshKey};
-    use serial_test::serial;
     use std::sync::Arc;
 
     const ROUTER_BRIDGE: &str = "bridge1";
@@ -81,18 +80,19 @@ mod tests {
     /// Test that when host_spawn step fails, the ip_allocation step is rolled back
     /// This should remove any ARP entries that were created
     #[tokio::test]
-    #[serial]
     async fn test_rollback_ip_allocation_on_host_spawn_failure() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -106,8 +106,7 @@ mod tests {
 
         // Execute the spawn pipeline
         let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
-        let result = pipeline.execute().await;
-        assert!(result.is_ok(), "Pipeline should succeed with mock clients");
+        pipeline.execute().await?;
 
         // Get the VM's MAC address before any cleanup
         let vm_after_spawn = db.get_vm(vm.id).await?;
@@ -120,7 +119,9 @@ mod tests {
             "ARP entry should be created on successful spawn"
         );
         assert!(
-            final_arp_entries.iter().any(|e| e.mac_address == mac_address),
+            final_arp_entries
+                .iter()
+                .any(|e| e.mac_address == mac_address),
             "ARP entry for VM should exist"
         );
 
@@ -130,7 +131,9 @@ mod tests {
         // Verify ARP entry for this VM was removed
         let cleanup_arp_entries = router.list_arp_entry().await?;
         assert!(
-            !cleanup_arp_entries.iter().any(|e| e.mac_address == mac_address),
+            !cleanup_arp_entries
+                .iter()
+                .any(|e| e.mac_address == mac_address),
             "ARP entry should be removed after delete_vm"
         );
 
@@ -139,18 +142,19 @@ mod tests {
 
     /// Test that when save_vm step fails, both host_spawn and ip_allocation are rolled back
     #[tokio::test]
-    #[serial]
     async fn test_rollback_chain_on_save_vm_failure() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -210,19 +214,24 @@ mod tests {
 
     /// Test that DNS records are properly rolled back (deleted) when VM is deleted
     #[tokio::test]
-    #[serial]
     async fn test_rollback_dns_records_on_delete() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = MockDnsServer::new();
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner = LNVpsProvisioner::new(
+            settings,
+            db.clone(),
+            node.clone(),
+            rates.clone(),
+            Some(Arc::new(dns.clone())),
+        );
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -291,18 +300,19 @@ mod tests {
 
     /// Test that IP assignments are properly managed during spawn and delete
     #[tokio::test]
-    #[serial]
     async fn test_ip_assignments_hard_deleted_on_rollback() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -349,18 +359,19 @@ mod tests {
 
     /// Test that skipping already assigned IPs works correctly during re-spawn attempts
     #[tokio::test]
-    #[serial]
     async fn test_skip_already_assigned_ips() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -388,18 +399,19 @@ mod tests {
 
     /// Test that MAC address rollback works when router generates the MAC
     #[tokio::test]
-    #[serial]
     async fn test_mac_address_rollback_with_router_generated_mac() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -435,19 +447,20 @@ mod tests {
 
     /// Test the delete_vm pipeline executes all cleanup steps
     #[tokio::test]
-    #[serial]
     async fn test_delete_vm_pipeline_complete_cleanup() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
         let _dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -477,7 +490,7 @@ mod tests {
         // Verify complete cleanup:
         // Note: MockDb hard-deletes VMs, so we can't verify VM.deleted flag
         // In production, the VM would be soft-deleted (deleted = true)
-        
+
         // 1. VM should no longer be accessible (MockDb hard-delete)
         let vm_get_result = db.get_vm(vm_id).await;
         assert!(vm_get_result.is_err(), "VM should be deleted from MockDb");
@@ -487,8 +500,14 @@ mod tests {
         for ip in ips_after {
             assert!(ip.deleted, "IP should be marked as deleted");
             assert!(ip.arp_ref.is_none(), "ARP ref should be cleared");
-            assert!(ip.dns_forward_ref.is_none(), "DNS forward ref should be cleared");
-            assert!(ip.dns_reverse_ref.is_none(), "DNS reverse ref should be cleared");
+            assert!(
+                ip.dns_forward_ref.is_none(),
+                "DNS forward ref should be cleared"
+            );
+            assert!(
+                ip.dns_reverse_ref.is_none(),
+                "DNS reverse ref should be cleared"
+            );
         }
 
         // 3. ARP entry is removed
@@ -503,18 +522,19 @@ mod tests {
 
     /// Test that the pipeline handles cleanup correctly for all resources
     #[tokio::test]
-    #[serial]
     async fn test_pipeline_handles_complete_cleanup() -> Result<()> {
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone());
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner

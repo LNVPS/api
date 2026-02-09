@@ -87,9 +87,9 @@ uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
+env_logger = "0.11"
 lightning-invoice = "0.34"
 bitcoin = "0.32"
-serial_test = "3.2"
 
 [build-dependencies]
 openapi-build-gen = { git = "https://github.com/v0l/openapi-build-gen.git", rev = "b4c946ca891d22c5ab16ce13f17b1bf81c91587c", optional = true }

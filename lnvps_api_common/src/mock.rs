@@ -125,6 +125,7 @@ impl Default for MockDb {
                 gateway: "10.0.0.1/8".to_string(),
                 enabled: true,
                 region_id: 1,
+                allocation_mode: IpRangeAllocationMode::Random, // use random due to race conditions
                 ..Default::default()
             },
         );

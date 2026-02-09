@@ -210,6 +210,7 @@ mod tests {
             db.clone(),
             node.clone(),
             exch.clone(),
+            None,
         ));
         let keys = Keys::generate();
         let empty_client = Client::new(keys.clone());

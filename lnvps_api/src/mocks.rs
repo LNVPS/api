@@ -69,7 +69,10 @@ impl Router for MockRouter {
     async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry> {
         let mut arp = self.arp.lock().await;
         if arp.iter().any(|(k, v)| v.address == entry.address) {
-            return Err(OpError::Fatal(anyhow::anyhow!("Address is already in use")));
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Address is already in use {:?}",
+                entry
+            )));
         }
         let max_id = *arp.keys().max().unwrap_or(&0);
         let e = ArpEntry {
@@ -91,8 +94,14 @@ impl Router for MockRouter {
             return Err(OpError::Fatal(anyhow::anyhow!("id is missing")));
         }
         let mut arp = self.arp.lock().await;
-        if let Some(mut a) = arp.get_mut(&entry.id.as_ref().unwrap().parse::<u64>()
-            .map_err(|e| OpError::Fatal(e.into()))?) {
+        if let Some(mut a) = arp.get_mut(
+            &entry
+                .id
+                .as_ref()
+                .unwrap()
+                .parse::<u64>()
+                .map_err(|e| OpError::Fatal(e.into()))?,
+        ) {
             a.mac_address = entry.mac_address.clone();
             a.address = entry.address.clone();
             a.interface = entry.interface.clone();
@@ -329,6 +338,7 @@ impl VmHostClient for MockVmHost {
     }
 }
 
+#[derive(Clone)]
 pub struct MockDnsServer {
     pub zones: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>,
 }
@@ -347,10 +357,8 @@ impl Default for MockDnsServer {
 
 impl MockDnsServer {
     pub fn new() -> Self {
-        static LAZY_ZONES: LazyLock<Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
         Self {
-            zones: LAZY_ZONES.clone(),
+            zones: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -369,7 +377,10 @@ impl DnsServer for MockDnsServer {
             .values()
             .any(|v| v.name == record.name && v.kind == record.kind.to_string())
         {
-            return Err(OpError::Fatal(anyhow::anyhow!("Duplicate record with name {}", record.name)));
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Duplicate record with name {}",
+                record.name
+            )));
         }
 
         let rnd_id: [u8; 12] = rand::random();
@@ -408,11 +419,7 @@ impl DnsServer for MockDnsServer {
         Ok(())
     }
 
-    async fn update_record(
-        &self,
-        zone_id: &str,
-        record: &BasicRecord,
-    ) -> OpResult<BasicRecord> {
+    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
         let mut zones = self.zones.lock().await;
         let table = if let Some(t) = zones.get_mut(zone_id) {
             t

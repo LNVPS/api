@@ -31,3 +31,6 @@ rand = "0.9"
 isocountry = "0.3"
 redis = { version = "1", features = ["tokio-comp", "cluster"] }
 
+[dev-dependencies]
+env_logger = "0.11"
+

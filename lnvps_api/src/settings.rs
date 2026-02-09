@@ -217,25 +217,24 @@ impl Settings {
         node: Arc<dyn LightningNode>,
         exchange: Arc<dyn ExchangeRateService>,
     ) -> Arc<LNVpsProvisioner> {
-        Arc::new(LNVpsProvisioner::new(self.clone(), db, node, exchange))
+        Arc::new(LNVpsProvisioner::new(
+            self.clone(),
+            db,
+            node,
+            exchange,
+            self.get_dns().expect("DNS server config"),
+        ))
     }
 
     pub fn get_dns(&self) -> Result<Option<Arc<dyn DnsServer>>> {
-        #[cfg(test)]
-        {
-            Ok(Some(Arc::new(crate::mocks::MockDnsServer::new())))
-        }
-        #[cfg(not(test))]
-        {
-            match &self.dns {
-                None => Ok(None),
-                Some(c) => match &c.api {
-                    #[cfg(feature = "cloudflare")]
-                    DnsServerApi::Cloudflare { token } => {
-                        Ok(Some(Arc::new(crate::dns::Cloudflare::new(token))))
-                    }
-                },
-            }
+        match &self.dns {
+            None => Ok(None),
+            Some(c) => match &c.api {
+                #[cfg(feature = "cloudflare")]
+                DnsServerApi::Cloudflare { token } => {
+                    Ok(Some(Arc::new(crate::dns::Cloudflare::new(token))))
+                }
+            },
         }
     }
 
