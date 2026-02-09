@@ -1,10 +1,10 @@
 use crate::{
-    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage, RegionStats, Router,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
-    User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmPaymentWithCompany, VmTemplate,
+    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage, RegionStats,
+    Router, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -978,10 +978,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(users)
     }
 
-    // ========================================================================
-    // Subscription Billing System Implementations
-    // ========================================================================
-
     async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>> {
         let query = r#"
             SELECT DISTINCT user_id
@@ -996,6 +992,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         Ok(user_ids)
     }
+
+    // ========================================================================
+    // Subscription Billing System Implementations
+    // ========================================================================
 
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
@@ -1062,7 +1062,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         subscription: &Subscription,
         mut line_items: Vec<SubscriptionLineItem>,
-    ) -> Result<u64> {
+    ) -> DbResult<u64> {
         let mut tx = self.db.begin().await?;
 
         // Insert subscription
@@ -1080,15 +1080,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
         .execute(&mut *tx)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         let subscription_id = res.last_insert_id();
 
         // Insert all line items with the subscription_id
         for line_item in &mut line_items {
             line_item.subscription_id = subscription_id;
-            
+
             sqlx::query(
                 "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
@@ -1100,8 +1099,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(line_item.setup_amount)
             .bind(&line_item.configuration)
             .execute(&mut *tx)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         }
 
         tx.commit().await?;
@@ -1350,46 +1348,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .bind(payment.subscription_id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn last_paid_subscription_invoice(&self) -> Result<Option<SubscriptionPayment>> {
-        sqlx::query_as(
+    async fn last_paid_subscription_invoice(&self) -> DbResult<Option<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
             "SELECT * FROM subscription_payment WHERE is_paid = 1 ORDER BY created DESC LIMIT 1",
         )
         .fetch_optional(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
     // Available IP Space
-    async fn list_available_ip_space(&self) -> Result<Vec<AvailableIpSpace>> {
-        sqlx::query_as("SELECT * FROM available_ip_space ORDER BY created DESC")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM available_ip_space ORDER BY created DESC")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_available_ip_space(&self, id: u64) -> Result<AvailableIpSpace> {
-        sqlx::query_as("SELECT * FROM available_ip_space WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
+        Ok(
+            sqlx::query_as("SELECT * FROM available_ip_space WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> Result<AvailableIpSpace> {
-        sqlx::query_as("SELECT * FROM available_ip_space WHERE cidr = ?")
-            .bind(cidr)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace> {
+        Ok(
+            sqlx::query_as("SELECT * FROM available_ip_space WHERE cidr = ?")
+                .bind(cidr)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> Result<u64> {
+    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64> {
         let result = sqlx::query(
             "INSERT INTO available_ip_space (cidr, min_prefix_size, max_prefix_size, registry, external_id, is_available, is_reserved, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
@@ -1402,13 +1401,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(space.is_reserved)
         .bind(&space.metadata)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> Result<()> {
+    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<()> {
         sqlx::query(
             "UPDATE available_ip_space SET cidr = ?, min_prefix_size = ?, max_prefix_size = ?, registry = ?, external_id = ?, is_available = ?, is_reserved = ?, metadata = ? WHERE id = ?"
         )
@@ -1422,18 +1420,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&space.metadata)
         .bind(space.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn delete_available_ip_space(&self, id: u64) -> Result<()> {
+    async fn delete_available_ip_space(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM available_ip_space WHERE id = ?")
             .bind(id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
@@ -1442,38 +1438,39 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_ip_space_pricing_by_space(
         &self,
         available_ip_space_id: u64,
-    ) -> Result<Vec<IpSpacePricing>> {
-        sqlx::query_as("SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ?")
-            .bind(available_ip_space_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    ) -> DbResult<Vec<IpSpacePricing>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ?")
+                .bind(available_ip_space_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_ip_space_pricing(&self, id: u64) -> Result<IpSpacePricing> {
-        sqlx::query_as("SELECT * FROM ip_space_pricing WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_space_pricing WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
     async fn get_ip_space_pricing_by_prefix(
         &self,
         available_ip_space_id: u64,
         prefix_size: u16,
-    ) -> Result<IpSpacePricing> {
-        sqlx::query_as(
-            "SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ? AND prefix_size = ?"
+    ) -> DbResult<IpSpacePricing> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ? AND prefix_size = ?",
         )
         .bind(available_ip_space_id)
         .bind(prefix_size)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> Result<u64> {
+    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<u64> {
         let result = sqlx::query(
             "INSERT INTO ip_space_pricing (available_ip_space_id, prefix_size, price_per_month, currency, setup_fee) VALUES (?, ?, ?, ?, ?)"
         )
@@ -1483,13 +1480,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&pricing.currency)
         .bind(pricing.setup_fee)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> Result<()> {
+    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<()> {
         sqlx::query(
             "UPDATE ip_space_pricing SET available_ip_space_id = ?, prefix_size = ?, price_per_month = ?, currency = ?, setup_fee = ? WHERE id = ?"
         )
@@ -1500,38 +1496,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(pricing.setup_fee)
         .bind(pricing.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn delete_ip_space_pricing(&self, id: u64) -> Result<()> {
+    async fn delete_ip_space_pricing(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM ip_space_pricing WHERE id = ?")
             .bind(id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
-        // If payment has time_value, extend the subscription expiration
-        if let Some(time_value) = payment.time_value {
-            if time_value > 0 {
-                sqlx::query(
-                    "UPDATE subscription SET expires = DATE_ADD(COALESCE(expires, NOW()), INTERVAL ? SECOND), is_active = 1 WHERE id = ?"
-                )
-                .bind(time_value)
-                .bind(payment.subscription_id)
-                .execute(tx.as_mut())
-                .await?;
-            }
-        } else {
-            // For one-time purchases without expiration, just activate the subscription
-            sqlx::query("UPDATE subscription SET is_active = 1 WHERE id = ?")
-                .bind(payment.subscription_id)
-                .execute(tx.as_mut())
-                .await?;
-        }
-
-        tx.commit().await?;
+            .await?;
         Ok(())
     }
 
@@ -1539,61 +1513,66 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_ip_range_subscriptions_by_line_item(
         &self,
         subscription_line_item_id: u64,
-    ) -> Result<Vec<IpRangeSubscription>> {
-        sqlx::query_as("SELECT * FROM ip_range_subscription WHERE subscription_line_item_id = ?")
-            .bind(subscription_line_item_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM ip_range_subscription WHERE subscription_line_item_id = ?",
+        )
+        .bind(subscription_line_item_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
         subscription_id: u64,
-    ) -> Result<Vec<IpRangeSubscription>> {
-        sqlx::query_as(
-            "SELECT ips.* FROM ip_range_subscription ips 
-             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id 
-             WHERE sli.subscription_id = ?"
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT ips.* FROM ip_range_subscription ips
+             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id
+             WHERE sli.subscription_id = ?",
         )
         .bind(subscription_id)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn list_ip_range_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<IpRangeSubscription>> {
+    async fn list_ip_range_subscriptions_by_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
         Ok(sqlx::query_as(
-            "SELECT ips.* FROM ip_range_subscription ips 
-             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id 
-             INNER JOIN subscription s ON sli.subscription_id = s.id 
-             WHERE s.user_id = ?"
+            "SELECT ips.* FROM ip_range_subscription ips
+             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id
+             INNER JOIN subscription s ON sli.subscription_id = s.id
+             WHERE s.user_id = ?",
         )
-        .fetch_optional(&self.db)
-        .await?)
         .bind(user_id)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn get_ip_range_subscription(&self, id: u64) -> Result<IpRangeSubscription> {
-        sqlx::query_as("SELECT * FROM ip_range_subscription WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_range_subscription WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> Result<IpRangeSubscription> {
-        sqlx::query_as("SELECT * FROM ip_range_subscription WHERE cidr = ?")
-            .bind(cidr)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_range_subscription WHERE cidr = ?")
+                .bind(cidr)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> Result<u64> {
+    async fn insert_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<u64> {
         let result = sqlx::query(
             "INSERT INTO ip_range_subscription (subscription_line_item_id, available_ip_space_id, cidr, is_active, started_at, ended_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
@@ -1605,13 +1584,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.ended_at)
         .bind(&subscription.metadata)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn update_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> Result<()> {
+    async fn update_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<()> {
         sqlx::query(
             "UPDATE ip_range_subscription SET subscription_line_item_id = ?, available_ip_space_id = ?, cidr = ?, is_active = ?, started_at = ?, ended_at = ?, metadata = ? WHERE id = ?"
         )
@@ -1624,35 +1605,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&subscription.metadata)
         .bind(subscription.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn delete_ip_range_subscription(&self, id: u64) -> Result<()> {
+    async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM ip_range_subscription WHERE id = ?")
             .bind(id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
-
-        Ok(())
-    }
-
-    async fn list_admin_user_ids(&self) -> Result<Vec<u64>> {
-        let query = r#"
-            SELECT DISTINCT user_id
-            FROM admin_role_assignments
-            WHERE expires_at IS NULL OR expires_at > NOW()
-            ORDER BY user_id
-        "#;
-
-        let user_ids = sqlx::query_scalar::<_, u64>(query)
-            .fetch_all(&self.db)
             .await?;
 
-        Ok(user_ids)
+        Ok(())
     }
 }
 

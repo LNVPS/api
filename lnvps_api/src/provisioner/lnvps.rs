@@ -400,7 +400,7 @@ impl LNVpsProvisioner {
                     converted.amount.currency(),
                     converted.amount.value() + tax,
                 );
-                let order = rev.create_order(&desc, order_amount).await?;
+                let order = rev.create_order(&desc, order_amount, None).await?;
 
                 let new_id: [u8; 32] = rand::random();
                 SubscriptionPayment {
@@ -507,6 +507,7 @@ impl LNVpsProvisioner {
                             .create_order(
                                 &desc,
                                 CurrencyAmount::from_u64(p.currency, p.amount + p.tax),
+                                None
                             )
                             .await?;
                         let new_id: [u8; 32] = rand::random();

@@ -1830,22 +1830,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyper-tls"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
-dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "native-tls",
- "tokio",
- "tokio-native-tls",
- "tower-service",
-]
-
-[[package]]
 name = "hyper-util"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2437,33 +2421,13 @@ dependencies = [
 
 [[package]]
 name = "lightning-invoice"
-version = "0.33.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11209f386879b97198b2bfc9e9c1e5d42870825c6bd4376f17f95357244d6600"
-dependencies = [
- "bech32",
- "bitcoin",
- "lightning-types 0.2.0",
-]
-
-[[package]]
-name = "lightning-invoice"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b85e5e14bcdb30d746e9785b04f27938292e8944f78f26517e01e91691f6b3f2"
 dependencies = [
  "bech32",
  "bitcoin",
- "lightning-types 0.3.0",
-]
-
-[[package]]
-name = "lightning-types"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2cd84d4e71472035903e43caded8ecc123066ce466329ccd5ae537a8d5488c7"
-dependencies = [
- "bitcoin",
+ "lightning-types",
 ]
 
 [[package]]
@@ -2525,7 +2489,7 @@ dependencies = [
  "ipnetwork",
  "isocountry",
  "lettre",
- "lightning-invoice 0.34.0",
+ "lightning-invoice",
  "lnurl-rs",
  "lnvps_api_common",
  "lnvps_db",
@@ -2537,7 +2501,7 @@ dependencies = [
  "payments-rs",
  "quick-xml",
  "rand 0.9.2",
- "reqwest 0.13.1",
+ "reqwest",
  "serde",
  "serde_json",
  "ssh-key",
@@ -2597,7 +2561,7 @@ dependencies = [
  "payments-rs",
  "rand 0.9.2",
  "redis",
- "reqwest 0.13.1",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -3202,7 +3166,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 [[package]]
 name = "payments-rs"
 version = "0.2.0"
-source = "git+https://github.com/v0l/payments-rs.git?rev=ac367cd6ad3b37a11a0e4df4a46a89bfd3e186ed#ac367cd6ad3b37a11a0e4df4a46a89bfd3e186ed"
+source = "git+https://github.com/v0l/payments-rs.git?rev=c749877cdcf1fa989c6797690a0d9ac8815aaf33#c749877cdcf1fa989c6797690a0d9ac8815aaf33"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3211,10 +3175,11 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
- "lightning-invoice 0.33.2",
+ "lightning-invoice",
  "log 0.4.27",
- "reqwest 0.12.22",
+ "reqwest",
  "serde",
+ "serde_html_form",
  "serde_json",
  "sha2",
  "tokio",
@@ -3763,46 +3728,6 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
 name = "reqwest"
-version = "0.12.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbc931937e6ca3a06e3b6c0aa7841849b160a90351d6ab467a8b9b9959767531"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "encoding_rs",
- "futures-core",
- "h2",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-tls",
- "hyper-util",
- "js-sys",
- "log 0.4.27",
- "mime",
- "native-tls",
- "percent-encoding",
- "pin-project-lite",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-native-tls",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04e9018c9d814e5f30cc16a0f03271aeab3571e609612d9fe78c1aa8d11c2f62"
@@ -4269,6 +4194,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_html_form"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0946d52b4b7e28823148aebbeceb901012c595ad737920d504fa8634bb099e6f"
+dependencies = [
+ "form_urlencoded",
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde_core",
 ]
 
 [[package]]

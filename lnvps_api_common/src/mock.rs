@@ -2,8 +2,14 @@ use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
-use lnvps_db::{AccessPolicy, AvailableIpSpace, Company, DbResult, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate};
+use lnvps_db::{
+    AccessPolicy, AvailableIpSpace, Company, DbResult, DiskInterface, DiskType, IpRange,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
+    NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+};
 
 use async_trait::async_trait;
 #[cfg(feature = "admin")]
@@ -1047,7 +1053,7 @@ impl LNVpsDbBase for MockDb {
         &self,
         _subscription: &Subscription,
         _line_items: Vec<SubscriptionLineItem>,
-    ) -> anyhow::Result<u64> {
+    ) -> DbResult<u64> {
         Ok(0)
     }
 
@@ -1253,87 +1259,105 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
-    async fn list_admin_user_ids(&self) -> anyhow::Result<Vec<u64>> {
-        Ok(vec![])
-    }
-
-    async fn list_available_ip_space(&self) -> anyhow::Result<Vec<AvailableIpSpace>> {
+    async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>> {
         todo!()
     }
 
-    async fn get_available_ip_space(&self, id: u64) -> anyhow::Result<AvailableIpSpace> {
+    async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
         todo!()
     }
 
-    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> anyhow::Result<AvailableIpSpace> {
+    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace> {
         todo!()
     }
 
-    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> anyhow::Result<u64> {
+    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64> {
         todo!()
     }
 
-    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> anyhow::Result<()> {
+    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<()> {
         todo!()
     }
 
-    async fn delete_available_ip_space(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_available_ip_space(&self, id: u64) -> DbResult<()> {
         todo!()
     }
 
-    async fn list_ip_space_pricing_by_space(&self, available_ip_space_id: u64) -> anyhow::Result<Vec<IpSpacePricing>> {
+    async fn list_ip_space_pricing_by_space(
+        &self,
+        available_ip_space_id: u64,
+    ) -> DbResult<Vec<IpSpacePricing>> {
         todo!()
     }
 
-    async fn get_ip_space_pricing(&self, id: u64) -> anyhow::Result<IpSpacePricing> {
+    async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing> {
         todo!()
     }
 
-    async fn get_ip_space_pricing_by_prefix(&self, available_ip_space_id: u64, prefix_size: u16) -> anyhow::Result<IpSpacePricing> {
+    async fn get_ip_space_pricing_by_prefix(
+        &self,
+        available_ip_space_id: u64,
+        prefix_size: u16,
+    ) -> DbResult<IpSpacePricing> {
         todo!()
     }
 
-    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> anyhow::Result<u64> {
+    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<u64> {
         todo!()
     }
 
-    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> anyhow::Result<()> {
+    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<()> {
         todo!()
     }
 
-    async fn delete_ip_space_pricing(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_ip_space_pricing(&self, id: u64) -> DbResult<()> {
         todo!()
     }
 
-    async fn list_ip_range_subscriptions_by_line_item(&self, subscription_line_item_id: u64) -> anyhow::Result<Vec<IpRangeSubscription>> {
+    async fn list_ip_range_subscriptions_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
         todo!()
     }
 
-    async fn list_ip_range_subscriptions_by_subscription(&self, subscription_id: u64) -> anyhow::Result<Vec<IpRangeSubscription>> {
+    async fn list_ip_range_subscriptions_by_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
         todo!()
     }
 
-    async fn list_ip_range_subscriptions_by_user(&self, user_id: u64) -> anyhow::Result<Vec<IpRangeSubscription>> {
+    async fn list_ip_range_subscriptions_by_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
         todo!()
     }
 
-    async fn get_ip_range_subscription(&self, id: u64) -> anyhow::Result<IpRangeSubscription> {
+    async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
         todo!()
     }
 
-    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> anyhow::Result<IpRangeSubscription> {
+    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription> {
         todo!()
     }
 
-    async fn insert_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> anyhow::Result<u64> {
+    async fn insert_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<u64> {
         todo!()
     }
 
-    async fn update_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> anyhow::Result<()> {
+    async fn update_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<()> {
         todo!()
     }
 
-    async fn delete_ip_range_subscription(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         todo!()
     }
 }

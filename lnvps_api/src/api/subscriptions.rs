@@ -1,21 +1,22 @@
-use crate::api::RouterState;
-use crate::api::model::{ApiSubscription, ApiSubscriptionPayment};
-use crate::api::model::{ApiSubscription, ApiSubscriptionPayment, ApiCreateSubscriptionRequest};
-use crate::api::{PageQuery, PaymentMethodQuery, RouterState};
+use crate::api::model::{ApiCreateSubscriptionRequest, ApiSubscription, ApiSubscriptionPayment};
+use crate::api::{PaymentMethodQuery, RouterState};
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
-use axum::Json;
+use axum::routing::get;
+use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
 };
-use lnvps_db::{SubscriptionType, Subscription, SubscriptionLineItem, PaymentMethod, SubscriptionPaymentType};
-use chrono::Utc;
+use lnvps_db::{PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
 use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
-        .route("/api/v1/subscriptions", get(v1_list_subscriptions).post(v1_create_subscription))
+        .route(
+            "/api/v1/subscriptions",
+            get(v1_list_subscriptions).post(v1_create_subscription),
+        )
         .route("/api/v1/subscriptions/{id}", get(v1_get_subscription))
         .route(
             "/api/v1/subscriptions/{id}/payments",
@@ -115,10 +116,10 @@ pub async fn v1_list_subscription_payments(
 // ============================================================================
 
 /// Create a new subscription with one or more line items (IP ranges, ASN sponsoring, DNS hosting, etc.)
-/// 
+///
 /// This creates the subscription and line items in an INACTIVE state.
 /// Resources (IP ranges, ASNs, etc.) are NOT allocated until the first payment is made.
-/// 
+///
 /// Workflow:
 /// 1. User creates subscription with line items (this endpoint)
 /// 2. User makes payment via subscription payment endpoint
@@ -149,11 +150,16 @@ async fn v1_create_subscription(
     // Process each line item to validate and calculate pricing
     for item in &req.line_items {
         use crate::api::model::ApiCreateSubscriptionLineItemRequest;
-        
+
         match item {
-            ApiCreateSubscriptionLineItemRequest::IpRange { ip_space_pricing_id } => {
+            ApiCreateSubscriptionLineItemRequest::IpRange {
+                ip_space_pricing_id,
+            } => {
                 let pricing = this.db.get_ip_space_pricing(*ip_space_pricing_id).await?;
-                let ip_space = this.db.get_available_ip_space(pricing.available_ip_space_id).await?;
+                let ip_space = this
+                    .db
+                    .get_available_ip_space(pricing.available_ip_space_id)
+                    .await?;
 
                 // Verify IP space is available
                 if !ip_space.is_available || ip_space.is_reserved {
@@ -165,7 +171,10 @@ async fn v1_create_subscription(
 
                 line_items_to_create.push((
                     format!("IP Range: /{} from {}", pricing.prefix_size, ip_space.cidr),
-                    Some(format!("/{} IP range from {} block", pricing.prefix_size, ip_space.cidr)),
+                    Some(format!(
+                        "/{} IP range from {} block",
+                        pricing.prefix_size, ip_space.cidr
+                    )),
                     pricing.price_per_month as u64,
                     pricing.setup_fee as u64,
                     SubscriptionType::IpRange,
@@ -196,7 +205,7 @@ async fn v1_create_subscription(
         name: req.name.unwrap_or_else(|| "Subscription".to_string()),
         description: req.description,
         created: Utc::now(),
-        expires: None, // Will be set after first payment
+        expires: None,    // Will be set after first payment
         is_active: false, // Inactive until first payment
         currency,
         setup_fee: total_setup_fee,
@@ -207,22 +216,27 @@ async fn v1_create_subscription(
     // Build line items (will get subscription_id after insert)
     let line_items: Vec<SubscriptionLineItem> = line_items_to_create
         .into_iter()
-        .map(|(name, description, amount, setup_amount, subscription_type, configuration)| {
-            SubscriptionLineItem {
-                id: 0,
-                subscription_id: 0, // Will be set below
-                subscription_type,
-                name,
-                description,
-                amount,
-                setup_amount,
-                configuration,
-            }
-        })
+        .map(
+            |(name, description, amount, setup_amount, subscription_type, configuration)| {
+                SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0, // Will be set below
+                    subscription_type,
+                    name,
+                    description,
+                    amount,
+                    setup_amount,
+                    configuration,
+                }
+            },
+        )
         .collect();
 
     // Insert subscription and line items in a single transaction
-    let subscription_id = this.db.insert_subscription_with_line_items(&subscription, line_items).await?;
+    let subscription_id = this
+        .db
+        .insert_subscription_with_line_items(&subscription, line_items)
+        .await?;
 
     // Fetch and return the created subscription
     let created_subscription = this.db.get_subscription(subscription_id).await?;
@@ -234,7 +248,7 @@ async fn v1_create_subscription(
 // ============================================================================
 
 /// Renew a subscription - generates payment invoice
-/// 
+///
 /// Similar to VM renewal, this generates a payment invoice for the subscription.
 /// The payment amount is calculated from the line items.
 /// - First payment: Monthly cost + setup fees
@@ -261,7 +275,8 @@ async fn v1_renew_subscription(
         .unwrap_or(PaymentMethod::Lightning);
 
     // Generate payment via provisioner
-    let payment = this.provisioner
+    let payment = this
+        .provisioner
         .renew_subscription(id, method)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;

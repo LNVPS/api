@@ -25,7 +25,7 @@ use lnvps_db::{
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use nostr_sdk::Timestamp;
-use payments_rs::lightning::{AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode};
+use payments_rs::lightning::{AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode, PayInvoiceRequest, PayInvoiceResponse};
 use ssh2::HashType::Sha256;
 use std::collections::HashMap;
 use std::ops::Add;
@@ -168,6 +168,10 @@ impl LightningNode for MockNode {
     }
 
     async fn cancel_invoice(&self, id: &Vec<u8>) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    async fn pay_invoice(&self, req: PayInvoiceRequest) -> anyhow::Result<PayInvoiceResponse> {
         todo!()
     }
 
