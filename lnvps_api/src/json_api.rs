@@ -141,9 +141,7 @@ impl JsonApi {
         path: &str,
         body: Option<R>,
     ) -> OpResult<T> {
-        let req = self
-            .build_req(method.clone(), path, body)
-            .map_err(|e| OpError::Fatal(anyhow!(e)))?;
+        let req = self.build_req(method.clone(), path, body)?;
         let rsp = match self.client.execute(req).await {
             Ok(rsp) => rsp,
             Err(e) => {
@@ -158,10 +156,7 @@ impl JsonApi {
         };
 
         let status = rsp.status();
-        let text = rsp
-            .text()
-            .await
-            .map_err(|e| OpError::Transient(anyhow!(e)))?;
+        let text = rsp.text().await.map_err(|e| OpError::Fatal(anyhow!(e)))?;
         #[cfg(debug_assertions)]
         debug!("<< {}", text);
         if status.is_success() {
@@ -172,6 +167,7 @@ impl JsonApi {
                 }
             }
         } else {
+            // TODO: handle status codes as fatal/transient
             op_transient!("{} {}: {}: {}", method, path, status, &text);
         }
     }

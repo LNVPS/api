@@ -15,7 +15,7 @@ use lightning_invoice::{
     RawDataPart, RawHrp, SignedRawBolt11Invoice, TaggedField,
 };
 use lnvps_api_common::retry::{OpError, OpResult};
-use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates};
+use lnvps_api_common::{op_fatal, ExchangeRateService, VmRunningState, VmRunningStates};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
@@ -207,15 +207,15 @@ impl MockVmHost {
 
 #[async_trait]
 impl VmHostClient for MockVmHost {
-    async fn get_info(&self) -> anyhow::Result<VmHostInfo> {
+    async fn get_info(&self) -> OpResult<VmHostInfo> {
         todo!()
     }
 
-    async fn download_os_image(&self, image: &VmOsImage) -> anyhow::Result<()> {
+    async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
         Ok(())
     }
 
-    async fn generate_mac(&self, vm: &Vm) -> anyhow::Result<String> {
+    async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
         Ok(format!(
             "ff:ff:ff:{}:{}:{}",
             hex::encode([rand::random::<u8>()]),
@@ -240,7 +240,7 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn reset_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(mut vm) = vms.get_mut(&vm.id) {
             vm.state = VmRunningStates::Running;
@@ -266,16 +266,16 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
-    async fn resize_disk(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
         // Mock implementation - just return Ok for testing
         Ok(())
     }
 
-    async fn get_vm_state(&self, vm: &Vm) -> anyhow::Result<VmRunningState> {
+    async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
         let vms = self.vms.lock().await;
         if let Some(vm) = vms.get(&vm.id) {
             Ok(VmRunningState {
@@ -290,11 +290,11 @@ impl VmHostClient for MockVmHost {
                 disk_read: 69,
             })
         } else {
-            bail!("No vm with id {}", vm.id)
+            op_fatal!("No vm with id {}", vm.id)
         }
     }
 
-    async fn get_all_vm_states(&self) -> anyhow::Result<Vec<(u64, VmRunningState)>> {
+    async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
         let vms = self.vms.lock().await;
         let states = vms
             .iter()
@@ -318,11 +318,11 @@ impl VmHostClient for MockVmHost {
         Ok(states)
     }
 
-    async fn configure_vm(&self, vm: &FullVmInfo) -> anyhow::Result<()> {
+    async fn configure_vm(&self, vm: &FullVmInfo) -> OpResult<()> {
         Ok(())
     }
 
-    async fn patch_firewall(&self, cfg: &FullVmInfo) -> anyhow::Result<()> {
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
@@ -330,11 +330,11 @@ impl VmHostClient for MockVmHost {
         &self,
         vm: &Vm,
         series: TimeSeries,
-    ) -> anyhow::Result<Vec<TimeSeriesData>> {
+    ) -> OpResult<Vec<TimeSeriesData>> {
         Ok(vec![])
     }
 
-    async fn connect_terminal(&self, vm: &Vm) -> anyhow::Result<TerminalStream> {
+    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
         todo!()
     }
 }

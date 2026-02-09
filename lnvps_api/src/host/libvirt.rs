@@ -127,11 +127,15 @@ impl LibVirtHost {
 
 #[async_trait::async_trait]
 impl VmHostClient for LibVirtHost {
-    async fn get_info(&self) -> Result<VmHostInfo> {
-        let info = self.connection.get_node_info()?;
+    async fn get_info(&self) -> OpResult<VmHostInfo> {
+        let info = self
+            .connection
+            .get_node_info()
+            .map_err(|e| OpError::Fatal(anyhow::anyhow!(e)))?;
         let storage = self
             .connection
-            .list_all_storage_pools(VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE)?;
+            .list_all_storage_pools(VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE)
+            .map_err(|e| OpError::Fatal(anyhow::anyhow!(e)))?;
         Ok(VmHostInfo {
             cpu: info.cpus as u16,
             memory: info.memory * KB,
@@ -149,12 +153,12 @@ impl VmHostClient for LibVirtHost {
         })
     }
 
-    async fn download_os_image(&self, image: &VmOsImage) -> Result<()> {
+    async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
         // TODO: download ISO images to host (somehow, ssh?)
         Ok(())
     }
 
-    async fn generate_mac(&self, _vm: &Vm) -> Result<String> {
+    async fn generate_mac(&self, _vm: &Vm) -> OpResult<String> {
         Ok(format!(
             "52:54:00:{}:{}:{}",
             hex::encode([random::<u8>()]),
@@ -171,7 +175,7 @@ impl VmHostClient for LibVirtHost {
         Ok(())
     }
 
-    async fn reset_vm(&self, vm: &Vm) -> Result<()> {
+    async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
         Ok(())
     }
 
@@ -188,15 +192,15 @@ impl VmHostClient for LibVirtHost {
         todo!()
     }
 
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> Result<()> {
+    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
-    async fn resize_disk(&self, cfg: &FullVmInfo) -> Result<()> {
+    async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
-    async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState> {
+    async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
         Ok(VmRunningState {
             timestamp: Utc::now().timestamp() as u64,
             state: VmRunningStates::Stopped,
@@ -210,17 +214,17 @@ impl VmHostClient for LibVirtHost {
         })
     }
 
-    async fn get_all_vm_states(&self) -> Result<Vec<(u64, VmRunningState)>> {
+    async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
         // For libvirt, this is a stub implementation
         // In a real implementation, this would list all VMs and get their states
         Ok(Vec::new())
     }
 
-    async fn configure_vm(&self, vm: &FullVmInfo) -> Result<()> {
+    async fn configure_vm(&self, vm: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 
-    async fn patch_firewall(&self, cfg: &FullVmInfo) -> Result<()> {
+    async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
         // LibVirt doesn't have native firewall/IPset support like Proxmox
         // This would typically be handled by the host's iptables/firewalld
         Ok(())
@@ -230,11 +234,11 @@ impl VmHostClient for LibVirtHost {
         &self,
         vm: &Vm,
         series: TimeSeries,
-    ) -> Result<Vec<TimeSeriesData>> {
+    ) -> OpResult<Vec<TimeSeriesData>> {
         todo!()
     }
 
-    async fn connect_terminal(&self, vm: &Vm) -> Result<TerminalStream> {
+    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
         todo!()
     }
 }

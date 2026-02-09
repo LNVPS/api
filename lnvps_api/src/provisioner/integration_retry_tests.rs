@@ -59,15 +59,15 @@ mod tests {
 
     #[async_trait]
     impl VmHostClient for FailingVmHostClient {
-        async fn get_info(&self) -> Result<crate::host::VmHostInfo> {
+        async fn get_info(&self) -> OpResult<crate::host::VmHostInfo> {
             self.inner.get_info().await
         }
 
-        async fn download_os_image(&self, image: &lnvps_db::VmOsImage) -> Result<()> {
+        async fn download_os_image(&self, image: &lnvps_db::VmOsImage) -> OpResult<()> {
             self.inner.download_os_image(image).await
         }
 
-        async fn generate_mac(&self, vm: &Vm) -> Result<String> {
+        async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
             self.inner.generate_mac(vm).await
         }
 
@@ -95,7 +95,7 @@ mod tests {
             self.inner.stop_vm(vm).await
         }
 
-        async fn reset_vm(&self, vm: &Vm) -> Result<()> {
+        async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
             self.inner.reset_vm(vm).await
         }
 
@@ -123,27 +123,27 @@ mod tests {
             self.inner.delete_vm(vm).await
         }
 
-        async fn reinstall_vm(&self, req: &crate::host::FullVmInfo) -> Result<()> {
+        async fn reinstall_vm(&self, req: &crate::host::FullVmInfo) -> OpResult<()> {
             self.inner.reinstall_vm(req).await
         }
 
-        async fn resize_disk(&self, cfg: &crate::host::FullVmInfo) -> Result<()> {
+        async fn resize_disk(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
             self.inner.resize_disk(cfg).await
         }
 
-        async fn get_vm_state(&self, vm: &Vm) -> Result<VmRunningState> {
+        async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
             self.inner.get_vm_state(vm).await
         }
 
-        async fn get_all_vm_states(&self) -> Result<Vec<(u64, VmRunningState)>> {
+        async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
             self.inner.get_all_vm_states().await
         }
 
-        async fn configure_vm(&self, cfg: &crate::host::FullVmInfo) -> Result<()> {
+        async fn configure_vm(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
             self.inner.configure_vm(cfg).await
         }
 
-        async fn patch_firewall(&self, cfg: &crate::host::FullVmInfo) -> Result<()> {
+        async fn patch_firewall(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
             self.inner.patch_firewall(cfg).await
         }
 
@@ -151,16 +151,16 @@ mod tests {
             &self,
             vm: &Vm,
             series: crate::host::TimeSeries,
-        ) -> Result<Vec<crate::host::TimeSeriesData>> {
+        ) -> OpResult<Vec<crate::host::TimeSeriesData>> {
             self.inner.get_time_series_data(vm, series).await
         }
 
-        async fn connect_terminal(&self, vm: &Vm) -> Result<crate::host::TerminalStream> {
+        async fn connect_terminal(&self, vm: &Vm) -> OpResult<crate::host::TerminalStream> {
             self.inner.connect_terminal(vm).await
         }
     }
 
-    async fn add_user(db: &Arc<MockDb>) -> Result<(User, UserSshKey)> {
+    async fn add_user(db: &Arc<MockDb>) -> OpResult<(User, UserSshKey)> {
         let pubkey: [u8; 32] = rand::random();
         let user_id = db.upsert_user(&pubkey).await?;
         let mut new_key = UserSshKey {

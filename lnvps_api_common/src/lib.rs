@@ -21,7 +21,7 @@ pub use network::*;
 pub use nip98::*;
 pub use pricing::*;
 pub use routes::*;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 pub use status::*;
 pub use vm_history::*;
 pub use work::*;
@@ -90,3 +90,24 @@ where
         StringOrValue::Value(v) => Ok(v),
     }
 }
+
+
+// Custom deserializer to handle Proxmox's integer-to-boolean conversion for KVM field
+pub fn deserialize_int_to_bool<'de, D>(deserializer: D) -> anyhow::Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrBool {
+        Int(i32),
+        Bool(bool),
+    }
+
+    match IntOrBool::deserialize(deserializer) {
+        Ok(IntOrBool::Int(i)) => Ok(Some(i != 0)),
+        Ok(IntOrBool::Bool(b)) => Ok(Some(b)),
+        Err(_) => Ok(None), // Return None for missing/invalid values, serde default will handle it
+    }
+}
+

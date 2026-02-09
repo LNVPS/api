@@ -383,7 +383,7 @@ impl LNVpsProvisioner {
     }
 
     /// Apply vm config to host
-    pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> Result<()> {
+    pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> OpResult<()> {
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let client = get_host_client(&info.host, &self.provisioner_config)?;
         client.configure_vm(&info).await
@@ -658,7 +658,7 @@ impl LNVpsProvisioner {
 }
 
 /// Context object for spawning vms using [Pipeline]
-pub(crate) struct SpawnVmContext {
+pub struct SpawnVmContext {
     db: Arc<dyn LNVpsDb>,
     /// Vm to be spawned
     info: FullVmInfo,
