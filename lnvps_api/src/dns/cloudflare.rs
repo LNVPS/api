@@ -3,7 +3,7 @@ use crate::json_api::JsonApi;
 use anyhow::Context;
 use async_trait::async_trait;
 use lnvps_api_common::op_transient;
-use lnvps_api_common::retry::{OpError, OpResult};
+use lnvps_api_common::retry::OpResult;
 use log::info;
 use serde::{Deserialize, Serialize};
 

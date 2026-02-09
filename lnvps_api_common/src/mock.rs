@@ -1,5 +1,5 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
@@ -689,6 +689,12 @@ impl LNVpsDbBase for MockDb {
                 ip_assignment.deleted = true;
             }
         }
+        Ok(())
+    }
+
+    async fn hard_delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> DbResult<()> {
+        let mut ip_assignments = self.ip_assignments.lock().await;
+        ip_assignments.retain(|_, v| v.vm_id != vm_id);
         Ok(())
     }
 

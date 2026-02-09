@@ -610,6 +610,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn hard_delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> DbResult<()> {
+        sqlx::query("delete from vm_ip_assignment where vm_id = ?")
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
         sqlx::query("update vm_ip_assignment set deleted = 1 where id = ?")
             .bind(assignment_id)

@@ -201,7 +201,7 @@ async fn v1_patch_vm(
         let mut ips = this.db.list_vm_ip_assignments(vm.id).await?;
         for ip in ips.iter_mut() {
             ip.dns_reverse = Some(ptr.to_string());
-            this.provisioner.update_reverse_ip_dns(ip).await?;
+            this.provisioner.network.update_reverse_ip_dns(ip).await?;
             this.db.update_vm_ip_assignment(ip).await?;
         }
     }

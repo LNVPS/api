@@ -307,7 +307,8 @@ impl Worker {
 
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
-        self.provisioner.spawn_vm(vm.id).await?;
+        let pipeline = self.provisioner.spawn_vm_pipeline(vm.id).await?;
+        pipeline.execute().await?;
 
         // Log VM created
         if let Err(e) = self
@@ -1528,7 +1529,10 @@ impl Worker {
             dns_reverse_ref: None,
         };
 
-        self.provisioner.save_ip_assignment(&mut assignment).await?;
+        self.provisioner
+            .network
+            .save_ip_assignment(&mut assignment)
+            .await?;
 
         // Log the assignment
         let metadata = if let Some(admin_id) = admin_user_id {
@@ -1581,6 +1585,7 @@ impl Worker {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
         self.provisioner
+            .network
             .delete_ip_assignment(&mut assignment, &range)
             .await?;
 
@@ -1635,6 +1640,7 @@ impl Worker {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
         self.provisioner
+            .network
             .update_ip_assignment_policy(&mut assignment, &range)
             .await?;
 
@@ -1725,9 +1731,10 @@ impl Worker {
                 }
                 // if job can be skipped, just acknowledge job
                 if msg.job.can_skip()
-                    && let Err(e) = self.work_commander.ack(&msg.id).await {
-                        error!("Failed to acknowledge job {}: {}", stream_id, e);
-                    }
+                    && let Err(e) = self.work_commander.ack(&msg.id).await
+                {
+                    error!("Failed to acknowledge job {}: {}", stream_id, e);
+                }
             }
         }
         Ok(())

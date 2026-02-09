@@ -40,10 +40,7 @@ pub async fn run_data_migrations(
         migrations.push(Box::new(d));
     }
 
-    migrations.push(Box::new(ArpRefFixerDataMigration::new(
-        db.clone(),
-        lnvps.clone(),
-    )));
+    migrations.push(Box::new(ArpRefFixerDataMigration::new(db.clone())));
 
     info!("Running {} data migrations", migrations.len());
     for migration in migrations {

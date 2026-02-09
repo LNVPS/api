@@ -1,10 +1,10 @@
 use crate::json_api::{JsonApi, TokenGen};
 use crate::router::{ArpEntry, Router};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lnvps_api_common::retry::{OpError, OpResult};
-use lnvps_api_common::{op_fatal, op_transient};
+use lnvps_api_common::op_transient;
 use log::{info, warn};
 use nostr_sdk::hashes::{Hash, sha1};
 use reqwest::{Method, RequestBuilder, Url};

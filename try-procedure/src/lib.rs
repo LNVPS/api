@@ -390,8 +390,8 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type StepFn<'a, Ctx, E> =
     Box<dyn FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a>;
 
-/// Type-erased rollback function. Runs at most once, so it is `FnOnce`.
-type RollbackFn<'a, Ctx, E> = Box<dyn FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'a>;
+/// Type-erased rollback function. Uses `FnMut` so it can be retried on transient failures.
+type RollbackFn<'a, Ctx, E> = Box<dyn FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a>;
 
 /// A step in the pipeline: an action and an optional rollback.
 struct PipelineStep<'a, Ctx, E> {
@@ -407,7 +407,8 @@ struct PipelineStep<'a, Ctx, E> {
 ///
 /// Step actions return [`OpResult`] so the pipeline can distinguish transient
 /// (retryable) from fatal errors. Use [`with_retry_policy`](Pipeline::with_retry_policy)
-/// to enable automatic retries on transient failures.
+/// to enable automatic retries on transient failures for both step actions and
+/// rollback functions.
 ///
 /// The pipeline operates on a shared mutable context `Ctx` that steps can
 /// read from and write to, allowing later steps to access data produced
@@ -484,14 +485,14 @@ where
         }
     }
 
-    /// Set the retry policy for transient step failures.
+    /// Set the retry policy for transient step and rollback failures.
     ///
-    /// When set, steps that return [`OpError::Transient`] are retried according
-    /// to this policy. Steps that return [`OpError::Fatal`] trigger an immediate
-    /// rollback with no retries.
+    /// When set, steps and rollbacks that return [`OpError::Transient`] are retried
+    /// according to this policy. [`OpError::Fatal`] errors trigger an immediate
+    /// rollback (for steps) or are logged and skipped (for rollbacks).
     ///
     /// When no policy is set, all errors (transient or fatal) trigger immediate
-    /// rollback.
+    /// rollback, and rollback failures are logged without retries.
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = Some(policy);
         self
@@ -518,12 +519,13 @@ where
     ///
     /// The action returns [`OpResult`] for retry classification.
     /// The rollback runs only if this step succeeded and a later step fails.
-    /// Rollbacks return plain `Result` since they are not retried.
+    /// Rollbacks return [`OpResult`] and are retried on transient failures
+    /// when a retry policy is set.
     pub fn step_with_rollback(
         mut self,
         name: impl Into<String>,
         action: impl FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a,
-        rollback: impl FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'a,
+        rollback: impl FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a,
     ) -> Self {
         self.steps.push(PipelineStep {
             name: name.into(),
@@ -597,9 +599,45 @@ where
                     );
 
                     // Rollback in reverse order
-                    for rollback in completed_rollbacks.into_iter().rev() {
-                        if let Err(rb_err) = (rollback)(&mut self.ctx).await {
-                            warn!("Rollback failed: {}", rb_err);
+                    for mut rollback in completed_rollbacks.into_iter().rev() {
+                        match &self.retry_policy {
+                            Some(policy) => {
+                                let mut attempt = 0u32;
+                                loop {
+                                    match (rollback)(&mut self.ctx).await {
+                                        Ok(()) => break,
+                                        Err(OpError::Fatal(e)) => {
+                                            warn!("Rollback failed (fatal): {}", e);
+                                            break;
+                                        }
+                                        Err(OpError::Transient(e)) => {
+                                            if attempt >= policy.max_retries {
+                                                warn!(
+                                                    "Rollback failed after {} retries: {}",
+                                                    policy.max_retries, e
+                                                );
+                                                break;
+                                            }
+                                            let delay = policy.delay_for_attempt(attempt);
+                                            warn!(
+                                                "Rollback transient error (attempt {}/{}), \
+                                                 retrying in {:?}: {}",
+                                                attempt + 1,
+                                                policy.max_retries,
+                                                delay,
+                                                e
+                                            );
+                                            sleep(delay).await;
+                                            attempt += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                if let Err(rb_err) = (rollback)(&mut self.ctx).await {
+                                    warn!("Rollback failed: {}", rb_err);
+                                }
+                            }
                         }
                     }
 
@@ -1219,5 +1257,108 @@ mod tests {
                 "https://example.com/api/resources/123/config",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_rollback_retries_transient_errors() {
+        let rollback_attempts = Arc::new(AtomicU32::new(0));
+        let ra = rollback_attempts.clone();
+
+        let result = Pipeline::<(), anyhow::Error>::new(())
+            .with_retry_policy(
+                RetryPolicy::default()
+                    .with_min_delay(Duration::from_millis(1))
+                    .with_max_retries(3),
+            )
+            .step_with_rollback(
+                "step1",
+                |_ctx| Box::pin(async { Ok(()) }),
+                move |_ctx| {
+                    let ra = ra.clone();
+                    Box::pin(async move {
+                        let attempt = ra.fetch_add(1, Ordering::SeqCst);
+                        if attempt < 2 {
+                            Err(OpError::Transient(anyhow::anyhow!("rollback transient")))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                },
+            )
+            .step("step2_fails", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("step2 failed"))) })
+            })
+            .execute()
+            .await;
+
+        assert!(result.is_err());
+        // Rollback should have been attempted 3 times (2 transient + 1 success)
+        assert_eq!(rollback_attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn pipeline_rollback_stops_on_fatal_error() {
+        let rollback_attempts = Arc::new(AtomicU32::new(0));
+        let ra = rollback_attempts.clone();
+
+        let result = Pipeline::<(), anyhow::Error>::new(())
+            .with_retry_policy(
+                RetryPolicy::default()
+                    .with_min_delay(Duration::from_millis(1))
+                    .with_max_retries(5),
+            )
+            .step_with_rollback(
+                "step1",
+                |_ctx| Box::pin(async { Ok(()) }),
+                move |_ctx| {
+                    let ra = ra.clone();
+                    Box::pin(async move {
+                        ra.fetch_add(1, Ordering::SeqCst);
+                        Err(OpError::Fatal(anyhow::anyhow!("rollback fatal")))
+                    })
+                },
+            )
+            .step("step2_fails", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("step2 failed"))) })
+            })
+            .execute()
+            .await;
+
+        assert!(result.is_err());
+        // Rollback should only be attempted once -- fatal error stops retry
+        assert_eq!(rollback_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_rollback_exhausts_retries() {
+        let rollback_attempts = Arc::new(AtomicU32::new(0));
+        let ra = rollback_attempts.clone();
+
+        let result = Pipeline::<(), anyhow::Error>::new(())
+            .with_retry_policy(
+                RetryPolicy::default()
+                    .with_min_delay(Duration::from_millis(1))
+                    .with_max_retries(2),
+            )
+            .step_with_rollback(
+                "step1",
+                |_ctx| Box::pin(async { Ok(()) }),
+                move |_ctx| {
+                    let ra = ra.clone();
+                    Box::pin(async move {
+                        ra.fetch_add(1, Ordering::SeqCst);
+                        Err(OpError::Transient(anyhow::anyhow!("always fails")))
+                    })
+                },
+            )
+            .step("step2_fails", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("step2 failed"))) })
+            })
+            .execute()
+            .await;
+
+        assert!(result.is_err());
+        // 1 initial attempt + 2 retries = 3 total
+        assert_eq!(rollback_attempts.load(Ordering::SeqCst), 3);
     }
 }

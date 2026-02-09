@@ -1,12 +1,11 @@
 use crate::json_api::JsonApi;
 use crate::router::{ArpEntry, Router};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use lnvps_api_common::op_fatal;
 use lnvps_api_common::retry::{OpError, OpResult};
-use log::debug;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
