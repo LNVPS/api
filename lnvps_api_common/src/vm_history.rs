@@ -381,7 +381,7 @@ impl VmHistoryLogger {
     }
 
     pub async fn get_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>> {
-        self.db.list_vm_history(vm_id).await
+        Ok(self.db.list_vm_history(vm_id).await?)
     }
 
     pub async fn get_vm_history_paginated(
@@ -390,8 +390,9 @@ impl VmHistoryLogger {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<VmHistory>> {
-        self.db
+        Ok(self
+            .db
             .list_vm_history_paginated(vm_id, limit, offset)
-            .await
+            .await?)
     }
 }

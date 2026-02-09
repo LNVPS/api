@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lnvps_api_common::retry::{OpError, OpResult};
+use lnvps_api_common::{op_fatal, op_transient};
 use log::{info, warn};
 use nostr_sdk::hashes::{Hash, sha1};
 use reqwest::{Method, RequestBuilder, Url};
@@ -112,19 +113,24 @@ impl TokenGen for OvhTokenGen {
 }
 
 impl OvhDedicatedServerVMacRouter {
-    pub async fn new(url: &str, name: &str, token: &str) -> Result<Self> {
+    pub async fn new(url: &str, name: &str, token: &str) -> OpResult<Self> {
         // load API time delta
-        let time_api = JsonApi::new(url)?;
+        let time_api = JsonApi::new(url).map_err(OpError::Fatal)?;
         let time = time_api.get::<i64>("v1/auth/time").await?;
         let delta: i64 = Utc::now().timestamp().sub(time);
 
         Ok(Self {
             name: name.to_string(),
-            api: JsonApi::token_gen(url, false, OvhTokenGen::new(delta, token)?)?,
+            api: JsonApi::token_gen(
+                url,
+                false,
+                OvhTokenGen::new(delta, token).map_err(OpError::Fatal)?,
+            )
+            .map_err(OpError::Fatal)?,
         })
     }
 
-    async fn get_task(&self, task_id: i64) -> Result<OvhTaskResponse> {
+    async fn get_task(&self, task_id: i64) -> OpResult<OvhTaskResponse> {
         self.api
             .get(&format!(
                 "v1/dedicated/server/{}/task/{}",
@@ -134,28 +140,20 @@ impl OvhDedicatedServerVMacRouter {
     }
 
     /// Poll a task until it completes
-    async fn wait_for_task_result(&self, task_id: i64) -> Result<OvhTaskResponse> {
+    async fn wait_for_task_result(&self, task_id: i64) -> OpResult<OvhTaskResponse> {
         loop {
             let status = self.get_task(task_id).await?;
             match status.status {
                 OvhTaskStatus::Cancelled => {
-                    return Err(anyhow!(
-                        "Task was cancelled: {}",
-                        status.comment.unwrap_or_default()
-                    ));
+                    op_transient!("Task was cancelled: {}", status.comment.unwrap_or_default());
                 }
                 OvhTaskStatus::CustomerError => {
-                    return Err(anyhow!(
-                        "Task failed: {}",
-                        status.comment.unwrap_or_default()
-                    ));
+                    // TODO: check error codes
+                    op_transient!("Task failed: {}", status.comment.unwrap_or_default());
                 }
                 OvhTaskStatus::Done => return Ok(status),
                 OvhTaskStatus::OvhError => {
-                    return Err(anyhow!(
-                        "Task failed: {}",
-                        status.comment.unwrap_or_default()
-                    ));
+                    op_transient!("Task failed: {}", status.comment.unwrap_or_default());
                 }
                 _ => {}
             }
@@ -191,8 +189,7 @@ impl Router for OvhDedicatedServerVMacRouter {
         let rsp: Vec<String> = self
             .api
             .get(&format!("v1/dedicated/server/{}/virtualMac", &self.name))
-            .await
-            .map_err(OpError::Transient)?;
+            .await?;
 
         let mut ret = vec![];
         for mac in rsp {
@@ -202,8 +199,7 @@ impl Router for OvhDedicatedServerVMacRouter {
                     "v1/dedicated/server/{}/virtualMac/{}/virtualAddress",
                     &self.name, mac
                 ))
-                .await
-                .map_err(OpError::Transient)?;
+                .await?;
 
             for addr in rsp2 {
                 ret.push(ArpEntry {
@@ -244,10 +240,8 @@ impl Router for OvhDedicatedServerVMacRouter {
                     comment: entry.comment.clone().unwrap_or_default(),
                 },
             )
-            .await
-            .map_err(OpError::Transient)?;
-        self.wait_for_task_result(task.task_id).await
-            .map_err(OpError::Transient)?;
+            .await?;
+        self.wait_for_task_result(task.task_id).await?;
 
         Ok(ArpEntry {
             id: Some(id),
@@ -275,13 +269,13 @@ impl Router for OvhDedicatedServerVMacRouter {
                     ),
                     None,
                 )
-                .await
-                .map_err(OpError::Transient)?;
-            self.wait_for_task_result(task.task_id).await
-                .map_err(OpError::Transient)?;
+                .await?;
+            self.wait_for_task_result(task.task_id).await?;
             Ok(())
         } else {
-            Err(OpError::Fatal(anyhow::anyhow!("Cannot remove arp entry, not found")))
+            Err(OpError::Fatal(anyhow::anyhow!(
+                "Cannot remove arp entry, not found"
+            )))
         }
     }
 

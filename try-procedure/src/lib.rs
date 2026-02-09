@@ -38,16 +38,27 @@
 //!
 //! # Pipeline
 //!
+//! Steps return [`OpResult`] so the pipeline can distinguish transient from
+//! fatal errors. With a [`RetryPolicy`], transient step failures are retried
+//! automatically. Rollbacks run on fatal errors or after retries are exhausted.
+//!
+//! Both [`retry_async`] and [`Pipeline`] use lifetime parameters so closures
+//! can borrow from the caller's scope without `Arc` or `'static` bounds.
+//!
 //! ```ignore
-//! use try_procedure::Pipeline;
+//! use try_procedure::{Pipeline, OpError, RetryPolicy};
 //!
 //! struct Ctx { resource_id: Option<u64> }
 //!
 //! let ctx = Pipeline::new(Ctx { resource_id: None })
+//!     .with_retry_policy(RetryPolicy::default())
 //!     .step_with_rollback("create_resource",
 //!         |ctx| Box::pin(async move {
-//!             ctx.resource_id = Some(create().await?);
-//!             Ok(())
+//!             match create().await {
+//!                 Ok(id) => { ctx.resource_id = Some(id); Ok(()) }
+//!                 Err(e) if e.is_timeout() => Err(OpError::Transient(e.into())),
+//!                 Err(e) => Err(OpError::Fatal(e.into())),
+//!             }
 //!         }),
 //!         |ctx| Box::pin(async move {
 //!             if let Some(id) = ctx.resource_id {
@@ -125,6 +136,12 @@ impl<E: fmt::Display> fmt::Display for OpError<E> {
 }
 
 impl<E: fmt::Display + fmt::Debug> std::error::Error for OpError<E> {}
+
+impl<E> From<E> for OpError<E> {
+    fn from(e: E) -> Self {
+        OpError::Fatal(e)
+    }
+}
 
 /// Convenience type alias for operations that return retryable results.
 ///
@@ -366,14 +383,21 @@ where
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Type-erased step function that operates on a mutable context
-type StepFn<Ctx, E> = Box<dyn FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send>;
+/// Type-erased step function that operates on a mutable context.
+///
+/// Returns [`OpResult`] so the pipeline can distinguish transient (retryable)
+/// from fatal errors. Uses `FnMut` to allow retries on transient failures.
+type StepFn<'a, Ctx, E> =
+    Box<dyn FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a>;
+
+/// Type-erased rollback function. Runs at most once, so it is `FnOnce`.
+type RollbackFn<'a, Ctx, E> = Box<dyn FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'a>;
 
 /// A step in the pipeline: an action and an optional rollback.
-struct PipelineStep<Ctx, E> {
+struct PipelineStep<'a, Ctx, E> {
     name: String,
-    action: StepFn<Ctx, E>,
-    rollback: Option<StepFn<Ctx, E>>,
+    action: StepFn<'a, Ctx, E>,
+    rollback: Option<RollbackFn<'a, Ctx, E>>,
 }
 
 /// A pipeline of steps that execute in order with automatic rollback on failure.
@@ -381,28 +405,36 @@ struct PipelineStep<Ctx, E> {
 /// Each step is an `(action, rollback)` pair. If step N fails, rollbacks for
 /// steps 0..N-1 are executed in reverse order.
 ///
+/// Step actions return [`OpResult`] so the pipeline can distinguish transient
+/// (retryable) from fatal errors. Use [`with_retry_policy`](Pipeline::with_retry_policy)
+/// to enable automatic retries on transient failures.
+///
 /// The pipeline operates on a shared mutable context `Ctx` that steps can
 /// read from and write to, allowing later steps to access data produced
 /// by earlier steps.
 ///
 /// # Example
 /// ```ignore
+/// use try_procedure::{Pipeline, OpError, RetryPolicy};
+///
 /// struct MyCtx {
 ///     ip_allocated: bool,
 ///     vm_id: u64,
 /// }
 ///
 /// let result = Pipeline::new(MyCtx { ip_allocated: false, vm_id: 42 })
+///     .with_retry_policy(RetryPolicy::default())
 ///     .step("allocate_ip",
 ///         |ctx| Box::pin(async move {
-///             allocate_ip(ctx.vm_id).await?;
-///             ctx.ip_allocated = true;
-///             Ok(())
+///             allocate_ip(ctx.vm_id).await
+///                 .map(|_| { ctx.ip_allocated = true; })
+///                 .map_err(OpError::Transient)
 ///         }),
 ///     )
 ///     .step_with_rollback("create_vm",
 ///         |ctx| Box::pin(async move {
 ///             create_vm(ctx.vm_id).await
+///                 .map_err(OpError::Transient)
 ///         }),
 ///         |ctx| Box::pin(async move {
 ///             delete_vm(ctx.vm_id).await
@@ -411,28 +443,68 @@ struct PipelineStep<Ctx, E> {
 ///     .execute()
 ///     .await;
 /// ```
-pub struct Pipeline<Ctx, E = Box<dyn std::error::Error + Send + Sync>> {
+///
+/// ## Borrowing from the caller
+///
+/// Because `Pipeline<'a>` uses a lifetime parameter, step closures can borrow
+/// local variables from the caller's scope without `Arc` or cloning:
+///
+/// ```ignore
+/// let api_url = String::from("https://api.example.com");
+/// let log = std::sync::Mutex::new(Vec::new());
+///
+/// let ctx = Pipeline::new(MyCtx { vm_id: 42, ip_allocated: false })
+///     .step("setup", |ctx| {
+///         // borrow api_url by reference — no Arc needed
+///         let url = format!("{}/vms/{}", api_url, ctx.vm_id);
+///         log.lock().unwrap().push(url);
+///         Box::pin(async move { Ok(()) })
+///     })
+///     .execute()
+///     .await?;
+///
+/// // api_url is still accessible here
+/// ```
+pub struct Pipeline<'a, Ctx, E = Box<dyn std::error::Error + Send + Sync>> {
     ctx: Ctx,
-    steps: Vec<PipelineStep<Ctx, E>>,
+    steps: Vec<PipelineStep<'a, Ctx, E>>,
+    retry_policy: Option<RetryPolicy>,
 }
 
-impl<Ctx, E> Pipeline<Ctx, E>
+impl<'a, Ctx, E> Pipeline<'a, Ctx, E>
 where
-    Ctx: Send + 'static,
-    E: fmt::Display + fmt::Debug + Send + 'static,
+    Ctx: Send + 'a,
+    E: fmt::Display + fmt::Debug + Send + 'a,
 {
     pub fn new(ctx: Ctx) -> Self {
         Self {
             ctx,
             steps: Vec::new(),
+            retry_policy: None,
         }
     }
 
+    /// Set the retry policy for transient step failures.
+    ///
+    /// When set, steps that return [`OpError::Transient`] are retried according
+    /// to this policy. Steps that return [`OpError::Fatal`] trigger an immediate
+    /// rollback with no retries.
+    ///
+    /// When no policy is set, all errors (transient or fatal) trigger immediate
+    /// rollback.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
+        self
+    }
+
     /// Add a step with only an action (no rollback).
+    ///
+    /// The action returns [`OpResult`] so the pipeline can distinguish transient
+    /// (retryable) from fatal errors.
     pub fn step(
         mut self,
         name: impl Into<String>,
-        action: impl FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'static,
+        action: impl FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a,
     ) -> Self {
         self.steps.push(PipelineStep {
             name: name.into(),
@@ -444,12 +516,14 @@ where
 
     /// Add a step with both an action and a rollback.
     ///
+    /// The action returns [`OpResult`] for retry classification.
     /// The rollback runs only if this step succeeded and a later step fails.
+    /// Rollbacks return plain `Result` since they are not retried.
     pub fn step_with_rollback(
         mut self,
         name: impl Into<String>,
-        action: impl FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'static,
-        rollback: impl FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'static,
+        action: impl FnMut(&mut Ctx) -> BoxFuture<'_, Result<(), OpError<E>>> + Send + 'a,
+        rollback: impl FnOnce(&mut Ctx) -> BoxFuture<'_, Result<(), E>> + Send + 'a,
     ) -> Self {
         self.steps.push(PipelineStep {
             name: name.into(),
@@ -459,17 +533,56 @@ where
         self
     }
 
-    /// Execute all steps in order. On failure, rollback completed steps in reverse.
+    /// Execute all steps in order with retry on transient errors.
+    ///
+    /// On fatal failure (or transient failure after exhausting retries),
+    /// rollback completed steps in reverse order.
     ///
     /// Returns the context on success so the caller can extract results from it.
     pub async fn execute(mut self) -> Result<Ctx, E> {
-        let mut completed_rollbacks: Vec<StepFn<Ctx, E>> = Vec::new();
+        let mut completed_rollbacks: Vec<RollbackFn<'a, Ctx, E>> = Vec::new();
 
         // Drain steps so we can take ownership of each one
-        let steps: Vec<PipelineStep<Ctx, E>> = self.steps.drain(..).collect();
+        let steps: Vec<PipelineStep<'a, Ctx, E>> = self.steps.drain(..).collect();
 
-        for step in steps {
-            match (step.action)(&mut self.ctx).await {
+        for mut step in steps {
+            let result = match &self.retry_policy {
+                Some(policy) => {
+                    let mut attempt = 0u32;
+                    loop {
+                        match (step.action)(&mut self.ctx).await {
+                            Ok(()) => break Ok(()),
+                            Err(OpError::Fatal(e)) => break Err(e),
+                            Err(OpError::Transient(e)) => {
+                                if attempt >= policy.max_retries {
+                                    break Err(e);
+                                }
+                                let delay = policy.delay_for_attempt(attempt);
+                                warn!(
+                                    "Pipeline step '{}' transient error (attempt {}/{}), \
+                                     retrying in {:?}: {}",
+                                    step.name,
+                                    attempt + 1,
+                                    policy.max_retries,
+                                    delay,
+                                    e
+                                );
+                                sleep(delay).await;
+                                attempt += 1;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // No retry policy: any error is terminal
+                    match (step.action)(&mut self.ctx).await {
+                        Ok(()) => Ok(()),
+                        Err(op_err) => Err(op_err.into_inner()),
+                    }
+                }
+            };
+
+            match result {
                 Ok(()) => {
                     if let Some(rollback) = step.rollback {
                         completed_rollbacks.push(rollback);
@@ -499,7 +612,7 @@ where
     }
 }
 
-impl<Ctx, E> IntoFuture for Pipeline<Ctx, E>
+impl<Ctx, E> IntoFuture for Pipeline<'static, Ctx, E>
 where
     Ctx: Send + 'static,
     E: fmt::Display + fmt::Debug + Send + 'static,
@@ -515,8 +628,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[tokio::test]
     async fn retry_op_succeeds_first_attempt() {
@@ -761,7 +874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_rollback_on_failure() {
+    async fn pipeline_rollback_on_fatal_failure() {
         let rolled_back = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let r1 = rolled_back.clone();
         let r2 = rolled_back.clone();
@@ -789,10 +902,9 @@ mod tests {
                     })
                 },
             )
-            .step(
-                "step3_fails",
-                |_ctx| Box::pin(async { Err(anyhow::anyhow!("step 3 failed")) }),
-            )
+            .step("step3_fails", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("step 3 failed"))) })
+            })
             .execute()
             .await;
 
@@ -831,10 +943,9 @@ mod tests {
                     })
                 },
             )
-            .step(
-                "step3_fails",
-                |_ctx| Box::pin(async { Err(anyhow::anyhow!("boom")) }),
-            )
+            .step("step3_fails", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("boom"))) })
+            })
             .execute()
             .await;
 
@@ -851,7 +962,9 @@ mod tests {
         let result = Pipeline::<(), anyhow::Error>::new(())
             .step_with_rollback(
                 "step1_fails",
-                |_ctx| Box::pin(async { Err(anyhow::anyhow!("immediate failure")) }),
+                |_ctx| {
+                    Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("immediate failure"))) })
+                },
                 move |_ctx| {
                     let rr = rr.clone();
                     Box::pin(async move {
@@ -875,26 +988,20 @@ mod tests {
         let e2 = executed.clone();
 
         let _ctx: () = Pipeline::<(), anyhow::Error>::new(())
-            .step(
-                "step1",
-                move |_ctx| {
-                    let e = e1.clone();
-                    Box::pin(async move {
-                        e.lock().await.push("step1".into());
-                        Ok(())
-                    })
-                },
-            )
-            .step(
-                "step2",
-                move |_ctx| {
-                    let e = e2.clone();
-                    Box::pin(async move {
-                        e.lock().await.push("step2".into());
-                        Ok(())
-                    })
-                },
-            )
+            .step("step1", move |_ctx| {
+                let e = e1.clone();
+                Box::pin(async move {
+                    e.lock().await.push("step1".into());
+                    Ok(())
+                })
+            })
+            .step("step2", move |_ctx| {
+                let e = e2.clone();
+                Box::pin(async move {
+                    e.lock().await.push("step2".into());
+                    Ok(())
+                })
+            })
             .await
             .unwrap();
 
@@ -908,27 +1015,209 @@ mod tests {
         }
 
         let ctx = Pipeline::<Ctx, anyhow::Error>::new(Ctx { value: 0 })
-            .step(
-                "set_value",
-                |ctx| {
-                    Box::pin(async move {
-                        ctx.value = 42;
-                        Ok(())
-                    })
-                },
-            )
-            .step(
-                "double_value",
-                |ctx| {
-                    Box::pin(async move {
-                        ctx.value *= 2;
-                        Ok(())
-                    })
-                },
-            )
+            .step("set_value", |ctx| {
+                Box::pin(async move {
+                    ctx.value = 42;
+                    Ok(())
+                })
+            })
+            .step("double_value", |ctx| {
+                Box::pin(async move {
+                    ctx.value *= 2;
+                    Ok(())
+                })
+            })
             .await
             .unwrap();
 
         assert_eq!(ctx.value, 84);
+    }
+
+    #[tokio::test]
+    async fn pipeline_retries_transient_errors() {
+        struct Ctx {
+            attempts: u32,
+            value: String,
+        }
+
+        let ctx = Pipeline::<Ctx, anyhow::Error>::new(Ctx {
+            attempts: 0,
+            value: String::new(),
+        })
+        .with_retry_policy(
+            RetryPolicy::default()
+                .with_min_delay(Duration::from_millis(1))
+                .with_max_retries(3),
+        )
+        .step("flaky_step", |ctx| {
+            Box::pin(async move {
+                ctx.attempts += 1;
+                if ctx.attempts < 3 {
+                    Err(OpError::Transient(anyhow::anyhow!("transient failure")))
+                } else {
+                    ctx.value = "done".into();
+                    Ok(())
+                }
+            })
+        })
+        .execute()
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.attempts, 3);
+        assert_eq!(ctx.value, "done");
+    }
+
+    #[tokio::test]
+    async fn pipeline_fatal_error_skips_retry() {
+        struct Ctx {
+            setup_complete: bool,
+            fatal_attempts: u32,
+            rolled_back: bool,
+        }
+
+        let result = Pipeline::<Ctx, anyhow::Error>::new(Ctx {
+            setup_complete: false,
+            fatal_attempts: 0,
+            rolled_back: false,
+        })
+        .with_retry_policy(
+            RetryPolicy::default()
+                .with_min_delay(Duration::from_millis(1))
+                .with_max_retries(3),
+        )
+        .step_with_rollback(
+            "setup",
+            |ctx| {
+                Box::pin(async move {
+                    ctx.setup_complete = true;
+                    Ok(())
+                })
+            },
+            |ctx| {
+                Box::pin(async move {
+                    ctx.rolled_back = true;
+                    Ok(())
+                })
+            },
+        )
+        .step("fatal_step", |ctx| {
+            Box::pin(async move {
+                ctx.fatal_attempts += 1;
+                Err(OpError::Fatal(anyhow::anyhow!("fatal failure")))
+            })
+        })
+        .execute()
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_exhausts_retries_then_rolls_back() {
+        struct Ctx {
+            resource_id: Option<u64>,
+            attempts: u32,
+            cleaned_up: bool,
+        }
+
+        let result = Pipeline::<Ctx, anyhow::Error>::new(Ctx {
+            resource_id: None,
+            attempts: 0,
+            cleaned_up: false,
+        })
+        .with_retry_policy(
+            RetryPolicy::default()
+                .with_min_delay(Duration::from_millis(1))
+                .with_max_retries(2),
+        )
+        .step_with_rollback(
+            "allocate_resource",
+            |ctx| {
+                Box::pin(async move {
+                    ctx.resource_id = Some(42);
+                    Ok(())
+                })
+            },
+            |ctx| {
+                Box::pin(async move {
+                    ctx.resource_id = None;
+                    ctx.cleaned_up = true;
+                    Ok(())
+                })
+            },
+        )
+        .step("always_transient", |ctx| {
+            Box::pin(async move {
+                ctx.attempts += 1;
+                Err(OpError::Transient(anyhow::anyhow!("always fails")))
+            })
+        })
+        .execute()
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_no_retry_without_policy() {
+        struct Ctx {
+            attempts: u32,
+        }
+
+        let result = Pipeline::<Ctx, anyhow::Error>::new(Ctx { attempts: 0 })
+            .step("transient_step", |ctx| {
+                Box::pin(async move {
+                    ctx.attempts += 1;
+                    Err(OpError::Transient(anyhow::anyhow!("transient")))
+                })
+            })
+            .execute()
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_steps_can_borrow_from_caller() {
+        // Demonstrates that steps can borrow local variables without Arc/clone,
+        // since Pipeline<''a> only requires closures to live as long as the pipeline.
+        let api_url = String::from("https://example.com/api");
+        let request_log = std::sync::Mutex::new(Vec::<String>::new());
+
+        struct Ctx {
+            resource_id: Option<u64>,
+        }
+
+        let ctx = Pipeline::<Ctx, anyhow::Error>::new(Ctx { resource_id: None })
+            .step("create_resource", |ctx| {
+                // Borrow api_url and request_log by reference — no Arc, no clone
+                let url = format!("{}/resources", api_url);
+                request_log.lock().unwrap().push(url);
+                Box::pin(async move {
+                    ctx.resource_id = Some(123);
+                    Ok(())
+                })
+            })
+            .step("configure_resource", |ctx| {
+                let url = format!("{}/resources/{}/config", api_url, ctx.resource_id.unwrap());
+                request_log.lock().unwrap().push(url);
+                Box::pin(async move { Ok(()) })
+            })
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.resource_id, Some(123));
+        // api_url is still accessible — it was borrowed, not moved
+        assert_eq!(api_url, "https://example.com/api");
+        let log = request_log.into_inner().unwrap();
+        assert_eq!(
+            log,
+            vec![
+                "https://example.com/api/resources",
+                "https://example.com/api/resources/123/config",
+            ]
+        );
     }
 }

@@ -1,15 +1,15 @@
 use crate::{
-    AccessPolicy, Company, IpRange, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage,
-    RegionStats, Router, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
+    AccessPolicy, Company, DbError, DbResult, IpRange, LNVpsDbBase, PaymentMethod, PaymentType,
+    ReferralCostUsage, RegionStats, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 #[cfg(feature = "nostr-domain")]
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
-use anyhow::{Error, Result, bail};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
@@ -19,51 +19,49 @@ pub struct LNVpsDbMysql {
 }
 
 impl LNVpsDbMysql {
-    pub async fn new(conn: &str) -> Result<Self> {
+    pub async fn new(conn: &str) -> DbResult<Self> {
         let db = MySqlPool::connect(conn).await?;
         Ok(Self { db })
     }
 
-    pub async fn execute(&self, sql: &str) -> Result<()> {
-        self.db.execute(sql).await.map_err(Error::new)?;
+    pub async fn execute(&self, sql: &str) -> DbResult<()> {
+        self.db.execute(sql).await?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl LNVpsDbBase for LNVpsDbMysql {
-    async fn migrate(&self) -> Result<()> {
+    async fn migrate(&self) -> DbResult<()> {
         let migrator = sqlx::migrate!();
-        migrator.run(&self.db).await.map_err(Error::new)?;
+        migrator.run(&self.db).await?;
         Ok(())
     }
 
-    async fn upsert_user(&self, pubkey: &[u8; 32]) -> Result<u64> {
+    async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
         let res =
             sqlx::query("insert ignore into users(pubkey,contact_nip17) values(?,1) returning id")
                 .bind(pubkey.as_slice())
                 .fetch_optional(&self.db)
                 .await?;
-        match res {
+        Ok(match res {
             None => sqlx::query("select id from users where pubkey = ?")
                 .bind(pubkey.as_slice())
                 .fetch_one(&self.db)
                 .await?
-                .try_get(0)
-                .map_err(Error::new),
-            Some(res) => res.try_get(0).map_err(Error::new),
-        }
+                .try_get(0)?,
+            Some(res) => res.try_get(0)?,
+        })
     }
 
-    async fn get_user(&self, id: u64) -> Result<User> {
-        sqlx::query_as("select * from users where id=?")
+    async fn get_user(&self, id: u64) -> DbResult<User> {
+        Ok(sqlx::query_as("select * from users where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn update_user(&self, user: &User) -> Result<()> {
+    async fn update_user(&self, user: &User) -> DbResult<()> {
         sqlx::query(
             "update users set email=?, contact_nip17=?, contact_email=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
         )
@@ -85,35 +83,36 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn delete_user(&self, _id: u64) -> Result<()> {
-        bail!("Deleting users is not supported")
+    async fn delete_user(&self, _id: u64) -> DbResult<()> {
+        Err(DbError::Source(
+            anyhow!("Deleting users is not supported").into_boxed_dyn_error(),
+        ))
     }
 
-    async fn list_users(&self) -> Result<Vec<User>> {
-        sqlx::query_as("select * from users")
+    async fn list_users(&self) -> DbResult<Vec<User>> {
+        Ok(sqlx::query_as("select * from users")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_users_paginated(&self, limit: u64, offset: u64) -> Result<Vec<User>> {
-        sqlx::query_as("select * from users order by id limit ? offset ?")
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_users_paginated(&self, limit: u64, offset: u64) -> DbResult<Vec<User>> {
+        Ok(
+            sqlx::query_as("select * from users order by id limit ? offset ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn count_users(&self) -> Result<u64> {
-        sqlx::query("select count(*) as count from users")
+    async fn count_users(&self) -> DbResult<u64> {
+        Ok(sqlx::query("select count(*) as count from users")
             .fetch_one(&self.db)
             .await?
-            .try_get(0)
-            .map_err(Error::new)
+            .try_get(0)?)
     }
 
-    async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> Result<u64> {
+    async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> DbResult<u64> {
         Ok(sqlx::query(
             "insert into user_ssh_key(name,user_id,key_data) values(?, ?, ?) returning id",
         )
@@ -121,69 +120,67 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(new_key.user_id)
         .bind(&new_key.key_data)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?
+        .await?
         .try_get(0)?)
     }
 
-    async fn get_user_ssh_key(&self, id: u64) -> Result<UserSshKey> {
-        sqlx::query_as("select * from user_ssh_key where id=?")
+    async fn get_user_ssh_key(&self, id: u64) -> DbResult<UserSshKey> {
+        Ok(sqlx::query_as("select * from user_ssh_key where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn delete_user_ssh_key(&self, _id: u64) -> Result<()> {
+    async fn delete_user_ssh_key(&self, _id: u64) -> DbResult<()> {
         todo!()
     }
 
-    async fn list_user_ssh_key(&self, user_id: u64) -> Result<Vec<UserSshKey>> {
-        sqlx::query_as("select * from user_ssh_key where user_id = ?")
-            .bind(user_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_user_ssh_key(&self, user_id: u64) -> DbResult<Vec<UserSshKey>> {
+        Ok(
+            sqlx::query_as("select * from user_ssh_key where user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn list_host_region(&self) -> Result<Vec<VmHostRegion>> {
-        sqlx::query_as("select * from vm_host_region where enabled=1")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_host_region(&self) -> DbResult<Vec<VmHostRegion>> {
+        Ok(
+            sqlx::query_as("select * from vm_host_region where enabled=1")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_host_region(&self, id: u64) -> Result<VmHostRegion> {
-        sqlx::query_as("select * from vm_host_region where id=?")
+    async fn get_host_region(&self, id: u64) -> DbResult<VmHostRegion> {
+        Ok(sqlx::query_as("select * from vm_host_region where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_host_region_by_name(&self, name: &str) -> Result<VmHostRegion> {
-        sqlx::query_as("select * from vm_host_region where name like ?")
-            .bind(name)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_host_region_by_name(&self, name: &str) -> DbResult<VmHostRegion> {
+        Ok(
+            sqlx::query_as("select * from vm_host_region where name like ?")
+                .bind(name)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn list_hosts(&self) -> Result<Vec<VmHost>> {
-        sqlx::query_as("select h.* from vm_host h,vm_host_region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
+    async fn list_hosts(&self) -> DbResult<Vec<VmHost>> {
+        Ok(sqlx::query_as("select h.* from vm_host h,vm_host_region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> Result<(Vec<VmHost>, u64)> {
+    async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         // Get paginated results
         let hosts = sqlx::query_as(
@@ -192,8 +189,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok((hosts, total as u64))
     }
@@ -202,14 +198,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    ) -> DbResult<(Vec<(VmHost, VmHostRegion)>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         // Get paginated results with region info
         let rows = sqlx::query(
@@ -221,8 +216,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -255,15 +249,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok((results, total as u64))
     }
 
-    async fn get_host(&self, id: u64) -> Result<VmHost> {
-        sqlx::query_as("select * from vm_host where id = ?")
+    async fn get_host(&self, id: u64) -> DbResult<VmHost> {
+        Ok(sqlx::query_as("select * from vm_host where id = ?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn update_host(&self, host: &VmHost) -> Result<()> {
+    async fn update_host(&self, host: &VmHost) -> DbResult<()> {
         sqlx::query("update vm_host set kind = ?, region_id = ?, name = ?, ip = ?, cpu = ?, memory = ?, enabled = ?, api_token = ?, load_cpu = ?, load_memory = ?, load_disk = ?, vlan_id = ? where id = ?")
             .bind(&host.kind)
             .bind(host.region_id)
@@ -283,7 +276,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn create_host(&self, host: &VmHost) -> Result<u64> {
+    async fn create_host(&self, host: &VmHost) -> DbResult<u64> {
         let result = sqlx::query("insert into vm_host (kind, region_id, name, ip, cpu, memory, enabled, api_token, load_cpu, load_memory, load_disk, vlan_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&host.kind)
             .bind(host.region_id)
@@ -302,23 +295,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(result.last_insert_id())
     }
 
-    async fn list_host_disks(&self, host_id: u64) -> Result<Vec<VmHostDisk>> {
-        sqlx::query_as("select * from vm_host_disk where host_id = ? and enabled = 1")
-            .bind(host_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_host_disks(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>> {
+        Ok(
+            sqlx::query_as("select * from vm_host_disk where host_id = ? and enabled = 1")
+                .bind(host_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_host_disk(&self, disk_id: u64) -> Result<VmHostDisk> {
-        sqlx::query_as("select * from vm_host_disk where id = ?")
+    async fn get_host_disk(&self, disk_id: u64) -> DbResult<VmHostDisk> {
+        Ok(sqlx::query_as("select * from vm_host_disk where id = ?")
             .bind(disk_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn update_host_disk(&self, disk: &VmHostDisk) -> Result<()> {
+    async fn update_host_disk(&self, disk: &VmHostDisk) -> DbResult<()> {
         sqlx::query(
             "update vm_host_disk set name=?,size=?,kind=?,interface=?,enabled=? where id=?",
         )
@@ -329,12 +322,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(disk.enabled)
         .bind(disk.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
         Ok(())
     }
 
-    async fn create_host_disk(&self, disk: &VmHostDisk) -> Result<u64> {
+    async fn create_host_disk(&self, disk: &VmHostDisk) -> DbResult<u64> {
         let result = sqlx::query("insert into vm_host_disk (host_id,name,size,kind,interface,enabled) values (?,?,?,?,?,?)")
             .bind(disk.host_id)
             .bind(&disk.name)
@@ -343,65 +335,61 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(disk.interface)
             .bind(disk.enabled)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(result.last_insert_id())
     }
 
-    async fn get_os_image(&self, id: u64) -> Result<VmOsImage> {
-        sqlx::query_as("select * from vm_os_image where id=?")
+    async fn get_os_image(&self, id: u64) -> DbResult<VmOsImage> {
+        Ok(sqlx::query_as("select * from vm_os_image where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_os_image(&self) -> Result<Vec<VmOsImage>> {
-        sqlx::query_as("select * from vm_os_image")
+    async fn list_os_image(&self) -> DbResult<Vec<VmOsImage>> {
+        Ok(sqlx::query_as("select * from vm_os_image")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_ip_range(&self, id: u64) -> Result<IpRange> {
-        sqlx::query_as("select * from ip_range where id=?")
+    async fn get_ip_range(&self, id: u64) -> DbResult<IpRange> {
+        Ok(sqlx::query_as("select * from ip_range where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_ip_range(&self) -> Result<Vec<IpRange>> {
-        sqlx::query_as("select * from ip_range where enabled = 1")
+    async fn list_ip_range(&self) -> DbResult<Vec<IpRange>> {
+        Ok(sqlx::query_as("select * from ip_range where enabled = 1")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_ip_range_in_region(&self, region_id: u64) -> Result<Vec<IpRange>> {
-        sqlx::query_as("select * from ip_range where region_id = ? and enabled = 1")
-            .bind(region_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_ip_range_in_region(&self, region_id: u64) -> DbResult<Vec<IpRange>> {
+        Ok(
+            sqlx::query_as("select * from ip_range where region_id = ? and enabled = 1")
+                .bind(region_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_cost_plan(&self, id: u64) -> Result<VmCostPlan> {
-        sqlx::query_as("select * from vm_cost_plan where id=?")
+    async fn get_cost_plan(&self, id: u64) -> DbResult<VmCostPlan> {
+        Ok(sqlx::query_as("select * from vm_cost_plan where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_cost_plans(&self) -> Result<Vec<VmCostPlan>> {
-        sqlx::query_as("select * from vm_cost_plan order by created desc")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_cost_plans(&self) -> DbResult<Vec<VmCostPlan>> {
+        Ok(
+            sqlx::query_as("select * from vm_cost_plan order by created desc")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> Result<u64> {
+    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_cost_plan(name,created,amount,currency,interval_amount,interval_type) values(?,?,?,?,?,?) returning id")
             .bind(&cost_plan.name)
             .bind(cost_plan.created)
@@ -410,12 +398,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(cost_plan.interval_amount)
             .bind(cost_plan.interval_type)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?)
     }
 
-    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> Result<()> {
+    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<()> {
         sqlx::query("update vm_cost_plan set name=?,amount=?,currency=?,interval_amount=?,interval_type=? where id=?")
             .bind(&cost_plan.name)
             .bind(cost_plan.amount)
@@ -424,36 +411,34 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(cost_plan.interval_type)
             .bind(cost_plan.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn delete_cost_plan(&self, id: u64) -> Result<()> {
+    async fn delete_cost_plan(&self, id: u64) -> DbResult<()> {
         sqlx::query("delete from vm_cost_plan where id=?")
             .bind(id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn get_vm_template(&self, id: u64) -> Result<VmTemplate> {
-        sqlx::query_as("select * from vm_template where id=?")
+    async fn get_vm_template(&self, id: u64) -> DbResult<VmTemplate> {
+        Ok(sqlx::query_as("select * from vm_template where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_vm_templates(&self) -> Result<Vec<VmTemplate>> {
-        sqlx::query_as("select * from vm_template where enabled = 1")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_vm_templates(&self) -> DbResult<Vec<VmTemplate>> {
+        Ok(
+            sqlx::query_as("select * from vm_template where enabled = 1")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_vm_template(&self, template: &VmTemplate) -> Result<u64> {
+    async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(&template.name)
             .bind(template.enabled)
@@ -467,60 +452,59 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.cost_plan_id)
             .bind(template.region_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?)
     }
 
-    async fn list_vms(&self) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm where deleted = 0")
+    async fn list_vms(&self) -> DbResult<Vec<Vm>> {
+        Ok(sqlx::query_as("select * from vm where deleted = 0")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_vms_on_host(&self, host_id: u64) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm where deleted = 0 and host_id = ?")
-            .bind(host_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_vms_on_host(&self, host_id: u64) -> DbResult<Vec<Vm>> {
+        Ok(
+            sqlx::query_as("select * from vm where deleted = 0 and host_id = ?")
+                .bind(host_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn count_active_vms_on_host(&self, host_id: u64) -> Result<u64> {
+    async fn count_active_vms_on_host(&self, host_id: u64) -> DbResult<u64> {
         let result: (i64,) =
             sqlx::query_as("select count(*) from vm where deleted = 0 and host_id = ?")
                 .bind(host_id)
                 .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .await?;
         Ok(result.0 as u64)
     }
 
-    async fn list_expired_vms(&self) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_expired_vms(&self) -> DbResult<Vec<Vm>> {
+        Ok(
+            sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn list_user_vms(&self, id: u64) -> Result<Vec<Vm>> {
-        sqlx::query_as("select * from vm where user_id = ? and deleted = 0")
-            .bind(id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
+        Ok(
+            sqlx::query_as("select * from vm where user_id = ? and deleted = 0")
+                .bind(id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_vm(&self, vm_id: u64) -> Result<Vm> {
-        sqlx::query_as("select * from vm where id = ?")
+    async fn get_vm(&self, vm_id: u64) -> DbResult<Vm> {
+        Ok(sqlx::query_as("select * from vm where id = ?")
             .bind(vm_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn insert_vm(&self, vm: &Vm) -> Result<u64> {
+    async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
@@ -535,21 +519,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&vm.ref_code)
             .bind(vm.auto_renewal_enabled)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?)
     }
 
-    async fn delete_vm(&self, vm_id: u64) -> Result<()> {
+    async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
         sqlx::query("update vm set deleted = 1 where id = ?")
             .bind(vm_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn update_vm(&self, vm: &Vm) -> Result<()> {
+    async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
             "update vm set image_id=?,template_id=?,custom_template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=? where id=?",
         )
@@ -563,12 +545,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.auto_renewal_enabled)
             .bind(vm.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<u64> {
+    async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
         Ok(sqlx::query(
             "insert into vm_ip_assignment(vm_id,ip_range_id,ip,arp_ref,dns_forward,dns_forward_ref,dns_reverse,dns_reverse_ref) values(?,?,?,?,?,?,?,?) returning id",
         )
@@ -581,12 +562,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&ip_assignment.dns_reverse)
             .bind(&ip_assignment.dns_reverse_ref)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?)
     }
 
-    async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> Result<()> {
+    async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<()> {
         sqlx::query(
             "update vm_ip_assignment set arp_ref = ?, dns_forward = ?, dns_forward_ref = ?, dns_reverse = ?, dns_reverse_ref = ? where id = ?",
         )
@@ -597,28 +577,32 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&ip_assignment.dns_reverse_ref)
             .bind(ip_assignment.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn list_vm_ip_assignments(&self, vm_id: u64) -> Result<Vec<VmIpAssignment>> {
-        sqlx::query_as("select * from vm_ip_assignment where vm_id = ? and deleted = 0")
-            .bind(vm_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_vm_ip_assignments(&self, vm_id: u64) -> DbResult<Vec<VmIpAssignment>> {
+        Ok(
+            sqlx::query_as("select * from vm_ip_assignment where vm_id = ? and deleted = 0")
+                .bind(vm_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn list_vm_ip_assignments_in_range(&self, range_id: u64) -> Result<Vec<VmIpAssignment>> {
-        sqlx::query_as("select * from vm_ip_assignment where ip_range_id = ? and deleted = 0")
-            .bind(range_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_vm_ip_assignments_in_range(
+        &self,
+        range_id: u64,
+    ) -> DbResult<Vec<VmIpAssignment>> {
+        Ok(
+            sqlx::query_as("select * from vm_ip_assignment where ip_range_id = ? and deleted = 0")
+                .bind(range_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> Result<()> {
+    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> DbResult<()> {
         sqlx::query("update vm_ip_assignment set deleted = 1 where vm_id = ?")
             .bind(vm_id)
             .execute(&self.db)
@@ -626,7 +610,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()> {
+    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
         sqlx::query("update vm_ip_assignment set deleted = 1 where id = ?")
             .bind(assignment_id)
             .execute(&self.db)
@@ -634,12 +618,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn list_vm_payment(&self, vm_id: u64) -> Result<Vec<VmPayment>> {
-        sqlx::query_as("select * from vm_payment where vm_id = ?")
+    async fn list_vm_payment(&self, vm_id: u64) -> DbResult<Vec<VmPayment>> {
+        Ok(sqlx::query_as("select * from vm_payment where vm_id = ?")
             .bind(vm_id)
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
     async fn list_vm_payment_paginated(
@@ -647,16 +630,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         vm_id: u64,
         limit: u64,
         offset: u64,
-    ) -> Result<Vec<VmPayment>> {
-        sqlx::query_as(
+    ) -> DbResult<Vec<VmPayment>> {
+        Ok(sqlx::query_as(
             "select * from vm_payment where vm_id = ? order by created desc limit ? offset ?",
         )
         .bind(vm_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
     async fn list_vm_payment_by_method_and_type(
@@ -664,19 +646,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         vm_id: u64,
         method: PaymentMethod,
         payment_type: PaymentType,
-    ) -> Result<Vec<VmPayment>> {
-        sqlx::query_as(
+    ) -> DbResult<Vec<VmPayment>> {
+        Ok(sqlx::query_as(
             "select * from vm_payment where vm_id = ? and payment_method = ? and payment_type = ? and expires > NOW() and is_paid = false order by created desc",
         )
         .bind(vm_id)
         .bind(method)
         .bind(payment_type)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
+    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
         sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
             .bind(vm_payment.vm_id)
@@ -694,40 +675,40 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&vm_payment.external_data)
             .bind(&vm_payment.upgrade_params)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn get_vm_payment(&self, id: &Vec<u8>) -> Result<VmPayment> {
-        sqlx::query_as("select * from vm_payment where id=?")
+    async fn get_vm_payment(&self, id: &Vec<u8>) -> DbResult<VmPayment> {
+        Ok(sqlx::query_as("select * from vm_payment where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_vm_payment_by_ext_id(&self, id: &str) -> Result<VmPayment> {
-        sqlx::query_as("select * from vm_payment where external_id=?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_vm_payment_by_ext_id(&self, id: &str) -> DbResult<VmPayment> {
+        Ok(
+            sqlx::query_as("select * from vm_payment where external_id=?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> Result<()> {
+    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
         sqlx::query("update vm_payment set is_paid = ? where id = ?")
             .bind(vm_payment.is_paid)
             .bind(&vm_payment.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn vm_payment_paid(&self, vm_payment: &VmPayment) -> Result<()> {
+    async fn vm_payment_paid(&self, vm_payment: &VmPayment) -> DbResult<()> {
         if vm_payment.is_paid {
-            bail!("Invoice already paid");
+            return Err(DbError::Source(
+                anyhow!("Invoice already paid").into_boxed_dyn_error(),
+            ));
         }
 
         let mut tx = self.db.begin().await?;
@@ -748,40 +729,40 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn last_paid_invoice(&self) -> Result<Option<VmPayment>> {
-        sqlx::query_as(
+    async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>> {
+        Ok(sqlx::query_as(
             "select * from vm_payment where is_paid = true order by created desc limit 1",
         )
         .fetch_optional(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn list_custom_pricing(&self, region_id: u64) -> Result<Vec<VmCustomPricing>> {
-        sqlx::query_as("select * from vm_custom_pricing where region_id = ? and enabled = 1")
-            .bind(region_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>> {
+        Ok(
+            sqlx::query_as("select * from vm_custom_pricing where region_id = ? and enabled = 1")
+                .bind(region_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_custom_pricing(&self, id: u64) -> Result<VmCustomPricing> {
-        sqlx::query_as("select * from vm_custom_pricing where id=?")
+    async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
+        Ok(sqlx::query_as("select * from vm_custom_pricing where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_custom_vm_template(&self, id: u64) -> Result<VmCustomTemplate> {
-        sqlx::query_as("select * from vm_custom_template where id=?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_custom_vm_template(&self, id: u64) -> DbResult<VmCustomTemplate> {
+        Ok(
+            sqlx::query_as("select * from vm_custom_template where id=?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<u64> {
+    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id) values(?,?,?,?,?,?) returning id")
             .bind(template.cpu)
             .bind(template.memory)
@@ -790,12 +771,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.disk_interface)
             .bind(template.pricing_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?)
     }
 
-    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> Result<()> {
+    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
         sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=? where id=?")
             .bind(template.cpu)
             .bind(template.memory)
@@ -805,67 +785,66 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.pricing_id)
             .bind(template.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn list_custom_pricing_disk(&self, pricing_id: u64) -> Result<Vec<VmCustomPricingDisk>> {
-        sqlx::query_as("select * from vm_custom_pricing_disk where pricing_id=?")
-            .bind(pricing_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_custom_pricing_disk(
+        &self,
+        pricing_id: u64,
+    ) -> DbResult<Vec<VmCustomPricingDisk>> {
+        Ok(
+            sqlx::query_as("select * from vm_custom_pricing_disk where pricing_id=?")
+                .bind(pricing_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_router(&self, router_id: u64) -> Result<Router> {
-        sqlx::query_as("select * from router where id=?")
+    async fn get_router(&self, router_id: u64) -> DbResult<Router> {
+        Ok(sqlx::query_as("select * from router where id=?")
             .bind(router_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_routers(&self) -> Result<Vec<Router>> {
-        sqlx::query_as("select * from router")
+    async fn list_routers(&self) -> DbResult<Vec<Router>> {
+        Ok(sqlx::query_as("select * from router")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_vm_ip_assignment(&self, id: u64) -> Result<VmIpAssignment> {
-        sqlx::query_as("select * from vm_ip_assignment where id=?")
+    async fn get_vm_ip_assignment(&self, id: u64) -> DbResult<VmIpAssignment> {
+        Ok(sqlx::query_as("select * from vm_ip_assignment where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> Result<VmIpAssignment> {
-        sqlx::query_as("select * from vm_ip_assignment where ip=? and deleted=0")
-            .bind(ip)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> DbResult<VmIpAssignment> {
+        Ok(
+            sqlx::query_as("select * from vm_ip_assignment where ip=? and deleted=0")
+                .bind(ip)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy> {
-        sqlx::query_as("select * from access_policy where id=?")
+    async fn get_access_policy(&self, access_policy_id: u64) -> DbResult<AccessPolicy> {
+        Ok(sqlx::query_as("select * from access_policy where id=?")
             .bind(access_policy_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_company(&self, company_id: u64) -> Result<Company> {
-        sqlx::query_as("select * from company where id=?")
+    async fn get_company(&self, company_id: u64) -> DbResult<Company> {
+        Ok(sqlx::query_as("select * from company where id=?")
             .bind(company_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_vm_base_currency(&self, vm_id: u64) -> Result<String> {
+    async fn get_vm_base_currency(&self, vm_id: u64) -> DbResult<String> {
         let currency = sqlx::query_scalar::<_, String>(
             "SELECT COALESCE(c.base_currency, 'EUR') as base_currency 
              FROM vm v
@@ -876,12 +855,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .bind(vm_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
         Ok(currency)
     }
 
-    async fn insert_vm_history(&self, history: &VmHistory) -> Result<u64> {
+    async fn insert_vm_history(&self, history: &VmHistory) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_history(vm_id,action_type,initiated_by_user,previous_state,new_state,metadata,description) values(?,?,?,?,?,?,?) returning id")
             .bind(history.vm_id)
             .bind(&history.action_type)
@@ -891,17 +869,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&history.metadata)
             .bind(&history.description)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?)
     }
 
-    async fn list_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>> {
-        sqlx::query_as("select * from vm_history where vm_id = ? order by timestamp desc")
-            .bind(vm_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_vm_history(&self, vm_id: u64) -> DbResult<Vec<VmHistory>> {
+        Ok(
+            sqlx::query_as("select * from vm_history where vm_id = ? order by timestamp desc")
+                .bind(vm_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
     async fn list_vm_history_paginated(
@@ -909,31 +887,26 @@ impl LNVpsDbBase for LNVpsDbMysql {
         vm_id: u64,
         limit: u64,
         offset: u64,
-    ) -> Result<Vec<VmHistory>> {
-        sqlx::query_as(
+    ) -> DbResult<Vec<VmHistory>> {
+        Ok(sqlx::query_as(
             "select * from vm_history where vm_id = ? order by timestamp desc limit ? offset ?",
         )
         .bind(vm_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn get_vm_history(&self, id: u64) -> Result<VmHistory> {
-        sqlx::query_as("select * from vm_history where id = ?")
+    async fn get_vm_history(&self, id: u64) -> DbResult<VmHistory> {
+        Ok(sqlx::query_as("select * from vm_history where id = ?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn execute_query(&self, query: &str) -> Result<u64> {
-        let result = sqlx::query(query)
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+    async fn execute_query(&self, query: &str) -> DbResult<u64> {
+        let result = sqlx::query(query).execute(&self.db).await?;
         Ok(result.rows_affected())
     }
 
@@ -941,31 +914,28 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         query: &str,
         params: Vec<String>,
-    ) -> Result<u64> {
+    ) -> DbResult<u64> {
         let mut query_builder = sqlx::query(query);
         for param in params {
             query_builder = query_builder.bind(param);
         }
-        let result = query_builder.execute(&self.db).await.map_err(Error::new)?;
+        let result = query_builder.execute(&self.db).await?;
         Ok(result.rows_affected())
     }
 
-    async fn fetch_raw_strings(&self, query: &str) -> Result<Vec<(u64, String)>> {
-        let rows = sqlx::query(query)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)?;
+    async fn fetch_raw_strings(&self, query: &str) -> DbResult<Vec<(u64, String)>> {
+        let rows = sqlx::query(query).fetch_all(&self.db).await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let id: u64 = row.try_get(0).map_err(Error::new)?;
-            let value: String = row.try_get(1).map_err(Error::new)?;
+            let id: u64 = row.try_get(0)?;
+            let value: String = row.try_get(1)?;
             results.push((id, value));
         }
         Ok(results)
     }
 
-    async fn get_active_customers_with_contact_prefs(&self) -> Result<Vec<crate::User>> {
+    async fn get_active_customers_with_contact_prefs(&self) -> DbResult<Vec<User>> {
         let query = r#"
             SELECT DISTINCT 
                 u.id,
@@ -994,9 +964,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             ORDER BY u.id
         "#;
 
-        let users = sqlx::query_as::<_, crate::User>(query)
-            .fetch_all(&self.db)
-            .await?;
+        let users = sqlx::query_as(query).fetch_all(&self.db).await?;
 
         Ok(users)
     }
@@ -1005,47 +973,63 @@ impl LNVpsDbBase for LNVpsDbMysql {
     // Subscription Billing System Implementations
     // ========================================================================
 
+    async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>> {
+        let query = r#"
+            SELECT DISTINCT user_id
+            FROM admin_role_assignments
+            WHERE expires_at IS NULL OR expires_at > NOW()
+            ORDER BY user_id
+        "#;
+
+        let user_ids = sqlx::query_scalar::<_, u64>(query)
+            .fetch_all(&self.db)
+            .await?;
+
+        Ok(user_ids)
+    }
+
     // Subscriptions
-    async fn list_subscriptions(&self) -> Result<Vec<Subscription>> {
-        sqlx::query_as("SELECT * FROM subscription")
+    async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as("SELECT * FROM subscription")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_subscriptions_by_user(&self, user_id: u64) -> Result<Vec<Subscription>> {
-        sqlx::query_as("SELECT * FROM subscription WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn list_subscriptions_active(&self, user_id: u64) -> Result<Vec<Subscription>> {
-        sqlx::query_as("SELECT * FROM subscription WHERE user_id = ? AND is_active = 1")
-            .bind(user_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription WHERE user_id = ? AND is_active = 1")
+                .bind(user_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_subscription(&self, id: u64) -> Result<Subscription> {
-        sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
+    async fn get_subscription(&self, id: u64) -> DbResult<Subscription> {
+        Ok(sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_subscription_by_ext_id(&self, external_id: &str) -> Result<Subscription> {
-        sqlx::query_as("SELECT * FROM subscription WHERE external_id = ?")
-            .bind(external_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_subscription_by_ext_id(&self, external_id: &str) -> DbResult<Subscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription WHERE external_id = ?")
+                .bind(external_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_subscription(&self, subscription: &Subscription) -> Result<u64> {
+    async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
@@ -1062,13 +1046,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(res.last_insert_id())
     }
 
-    async fn update_subscription(&self, subscription: &Subscription) -> Result<()> {
+    async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
         sqlx::query(
             "UPDATE subscription SET user_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
         )
@@ -1085,23 +1068,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&subscription.external_id)
         .bind(subscription.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn delete_subscription(&self, id: u64) -> Result<()> {
+    async fn delete_subscription(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM subscription WHERE id = ?")
             .bind(id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn get_subscription_base_currency(&self, subscription_id: u64) -> Result<String> {
+    async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String> {
         let result: (String,) = sqlx::query_as(
             "SELECT c.base_currency 
              FROM subscription s
@@ -1111,8 +1092,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .bind(subscription_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.0)
     }
@@ -1121,23 +1101,28 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_subscription_line_items(
         &self,
         subscription_id: u64,
-    ) -> Result<Vec<SubscriptionLineItem>> {
-        sqlx::query_as("SELECT * FROM subscription_line_item WHERE subscription_id = ?")
-            .bind(subscription_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    ) -> DbResult<Vec<SubscriptionLineItem>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_line_item WHERE subscription_id = ?")
+                .bind(subscription_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_subscription_line_item(&self, id: u64) -> Result<SubscriptionLineItem> {
-        sqlx::query_as("SELECT * FROM subscription_line_item WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_subscription_line_item(&self, id: u64) -> DbResult<SubscriptionLineItem> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_line_item WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<u64> {
+    async fn insert_subscription_line_item(
+        &self,
+        line_item: &SubscriptionLineItem,
+    ) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO subscription_line_item (subscription_id, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?)"
         )
@@ -1148,13 +1133,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(res.last_insert_id())
     }
 
-    async fn update_subscription_line_item(&self, line_item: &SubscriptionLineItem) -> Result<()> {
+    async fn update_subscription_line_item(
+        &self,
+        line_item: &SubscriptionLineItem,
+    ) -> DbResult<()> {
         sqlx::query(
             "UPDATE subscription_line_item SET subscription_id = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ? WHERE id = ?"
         )
@@ -1166,18 +1153,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&line_item.configuration)
         .bind(line_item.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn delete_subscription_line_item(&self, id: u64) -> Result<()> {
+    async fn delete_subscription_line_item(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM subscription_line_item WHERE id = ?")
             .bind(id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
@@ -1186,49 +1171,53 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_subscription_payments(
         &self,
         subscription_id: u64,
-    ) -> Result<Vec<SubscriptionPayment>> {
-        sqlx::query_as("SELECT * FROM subscription_payment WHERE subscription_id = ?")
-            .bind(subscription_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_payment WHERE subscription_id = ?")
+                .bind(subscription_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
     async fn list_subscription_payments_by_user(
         &self,
         user_id: u64,
-    ) -> Result<Vec<SubscriptionPayment>> {
-        sqlx::query_as("SELECT * FROM subscription_payment WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_payment WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_subscription_payment(&self, id: &Vec<u8>) -> Result<SubscriptionPayment> {
-        sqlx::query_as("SELECT * FROM subscription_payment WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_subscription_payment(&self, id: &Vec<u8>) -> DbResult<SubscriptionPayment> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_payment WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
     async fn get_subscription_payment_by_ext_id(
         &self,
         external_id: &str,
-    ) -> Result<SubscriptionPayment> {
-        sqlx::query_as("SELECT * FROM subscription_payment WHERE external_id = ?")
-            .bind(external_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    ) -> DbResult<SubscriptionPayment> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_payment WHERE external_id = ?")
+                .bind(external_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,
-    ) -> Result<SubscriptionPaymentWithCompany> {
-        sqlx::query_as(
+    ) -> DbResult<SubscriptionPaymentWithCompany> {
+        Ok(sqlx::query_as(
             "SELECT sp.*, c.base_currency as company_base_currency
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
@@ -1238,11 +1227,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .bind(id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
-    async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+    async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
             "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, time_value, tax) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
@@ -1262,13 +1250,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(payment.time_value)
         .bind(payment.tax)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+    async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
             "UPDATE subscription_payment SET subscription_id = ?, user_id = ?, created = ?, expires = ?, amount = ?, currency = ?, payment_method = ?, payment_type = ?, external_data = ?, external_id = ?, is_paid = ?, rate = ?, time_value = ?, tax = ? WHERE id = ?"
         )
@@ -1288,19 +1275,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(payment.tax)
         .bind(&payment.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> Result<()> {
+    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+
         // Mark payment as paid
         sqlx::query("UPDATE subscription_payment SET is_paid = 1 WHERE id = ?")
             .bind(&payment.id)
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .execute(tx.as_mut())
+            .await?;
 
         // If payment has time_value, extend the subscription expiration
         if let Some(time_value) = payment.time_value {
@@ -1310,68 +1297,57 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 )
                 .bind(time_value)
                 .bind(payment.subscription_id)
-                .execute(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .execute(tx.as_mut())
+                .await?;
             }
         } else {
             // For one-time purchases without expiration, just activate the subscription
             sqlx::query("UPDATE subscription SET is_active = 1 WHERE id = ?")
                 .bind(payment.subscription_id)
-                .execute(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .execute(tx.as_mut())
+                .await?;
         }
 
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn last_paid_subscription_invoice(&self) -> Result<Option<SubscriptionPayment>> {
-        sqlx::query_as(
+    async fn last_paid_subscription_invoice(&self) -> DbResult<Option<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
             "SELECT * FROM subscription_payment WHERE is_paid = 1 ORDER BY created DESC LIMIT 1",
         )
         .fetch_optional(&self.db)
-        .await
-        .map_err(Error::new)
-    }
-
-    async fn list_admin_user_ids(&self) -> Result<Vec<u64>> {
-        let query = r#"
-            SELECT DISTINCT user_id
-            FROM admin_role_assignments
-            WHERE expires_at IS NULL OR expires_at > NOW()
-            ORDER BY user_id
-        "#;
-
-        let user_ids = sqlx::query_scalar::<_, u64>(query)
-            .fetch_all(&self.db)
-            .await?;
-
-        Ok(user_ids)
+        .await?)
     }
 }
 
 #[cfg(feature = "nostr-domain")]
 #[async_trait]
 impl LNVPSNostrDb for LNVpsDbMysql {
-    async fn get_handle(&self, handle_id: u64) -> Result<NostrDomainHandle> {
-        sqlx::query_as("select * from nostr_domain_handle where id=?")
-            .bind(handle_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_handle(&self, handle_id: u64) -> DbResult<NostrDomainHandle> {
+        Ok(
+            sqlx::query_as("select * from nostr_domain_handle where id=?")
+                .bind(handle_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_handle_by_name(&self, domain_id: u64, handle: &str) -> Result<NostrDomainHandle> {
-        sqlx::query_as("select * from nostr_domain_handle where domain_id=? and handle=?")
-            .bind(domain_id)
-            .bind(handle)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn get_handle_by_name(
+        &self,
+        domain_id: u64,
+        handle: &str,
+    ) -> DbResult<NostrDomainHandle> {
+        Ok(
+            sqlx::query_as("select * from nostr_domain_handle where domain_id=? and handle=?")
+                .bind(domain_id)
+                .bind(handle)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn insert_handle(&self, handle: &NostrDomainHandle) -> Result<u64> {
+    async fn insert_handle(&self, handle: &NostrDomainHandle) -> DbResult<u64> {
         Ok(
             sqlx::query(
                 "insert into nostr_domain_handle(domain_id,handle,pubkey,relays) values(?,?,?,?) returning id",
@@ -1381,13 +1357,12 @@ impl LNVPSNostrDb for LNVpsDbMysql {
                 .bind(&handle.pubkey)
                 .bind(&handle.relays)
                 .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?
+                .await?
                 .try_get(0)?,
         )
     }
 
-    async fn update_handle(&self, handle: &NostrDomainHandle) -> Result<()> {
+    async fn update_handle(&self, handle: &NostrDomainHandle) -> DbResult<()> {
         sqlx::query("update nostr_domain_handle set handle=?,pubkey=?,relays=? where id=?")
             .bind(&handle.handle)
             .bind(&handle.pubkey)
@@ -1398,7 +1373,7 @@ impl LNVPSNostrDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn delete_handle(&self, handle_id: u64) -> Result<()> {
+    async fn delete_handle(&self, handle_id: u64) -> DbResult<()> {
         sqlx::query("delete from nostr_domain_handle where id=?")
             .bind(handle_id)
             .execute(&self.db)
@@ -1406,39 +1381,37 @@ impl LNVPSNostrDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn list_handles(&self, domain_id: u64) -> Result<Vec<NostrDomainHandle>> {
-        sqlx::query_as("select * from nostr_domain_handle where domain_id=?")
-            .bind(domain_id)
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn list_handles(&self, domain_id: u64) -> DbResult<Vec<NostrDomainHandle>> {
+        Ok(
+            sqlx::query_as("select * from nostr_domain_handle where domain_id=?")
+                .bind(domain_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
-    async fn get_domain(&self, id: u64) -> Result<NostrDomain> {
-        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where id=?")
+    async fn get_domain(&self, id: u64) -> DbResult<NostrDomain> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where id=?")
             .bind(id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn get_domain_by_name(&self, name: &str) -> Result<NostrDomain> {
-        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where name=?")
+    async fn get_domain_by_name(&self, name: &str) -> DbResult<NostrDomain> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where name=?")
             .bind(name)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_domains(&self, owner_id: u64) -> Result<Vec<NostrDomain>> {
-        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where owner_id=?")
+    async fn list_domains(&self, owner_id: u64) -> DbResult<Vec<NostrDomain>> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where owner_id=?")
             .bind(owner_id)
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn insert_domain(&self, domain: &NostrDomain) -> Result<u64> {
+    async fn insert_domain(&self, domain: &NostrDomain) -> DbResult<u64> {
         Ok(
             sqlx::query(
                 "insert into nostr_domain(owner_id,name,relays) values(?,?,?) returning id",
@@ -1447,43 +1420,38 @@ impl LNVPSNostrDb for LNVpsDbMysql {
             .bind(&domain.name)
             .bind(&domain.relays)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?
+            .await?
             .try_get(0)?,
         )
     }
 
-    async fn delete_domain(&self, domain_id: u64) -> Result<()> {
+    async fn delete_domain(&self, domain_id: u64) -> DbResult<()> {
         sqlx::query("delete from nostr_domain where id = ?")
             .bind(domain_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn list_all_domains(&self) -> Result<Vec<NostrDomain>> {
-        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain")
+    async fn list_all_domains(&self) -> DbResult<Vec<NostrDomain>> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_active_domains(&self) -> Result<Vec<NostrDomain>> {
-        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=1")
+    async fn list_active_domains(&self) -> DbResult<Vec<NostrDomain>> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=1")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn list_disabled_domains(&self) -> Result<Vec<NostrDomain>> {
-        sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=0")
+    async fn list_disabled_domains(&self) -> DbResult<Vec<NostrDomain>> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=0")
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn enable_domain(&self, domain_id: u64) -> Result<()> {
+    async fn enable_domain(&self, domain_id: u64) -> DbResult<()> {
         sqlx::query(
             "update nostr_domain set enabled=1, last_status_change=CURRENT_TIMESTAMP where id=?",
         )
@@ -1493,7 +1461,7 @@ impl LNVPSNostrDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn disable_domain(&self, domain_id: u64) -> Result<()> {
+    async fn disable_domain(&self, domain_id: u64) -> DbResult<()> {
         sqlx::query(
             "update nostr_domain set enabled=0, last_status_change=CURRENT_TIMESTAMP where id=?",
         )
@@ -1510,7 +1478,7 @@ impl AdminDb for LNVpsDbMysql {
     async fn get_user_permissions(
         &self,
         user_id: u64,
-    ) -> Result<std::collections::HashSet<(u16, u16)>> {
+    ) -> DbResult<std::collections::HashSet<(u16, u16)>> {
         let query = r#"
             SELECT DISTINCT rp.resource, rp.action
             FROM admin_role_assignments ara
@@ -1527,7 +1495,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(rows.into_iter().collect())
     }
 
-    async fn get_user_roles(&self, user_id: u64) -> Result<Vec<u64>> {
+    async fn get_user_roles(&self, user_id: u64) -> DbResult<Vec<u64>> {
         let query = r#"
             SELECT role_id
             FROM admin_role_assignments
@@ -1543,7 +1511,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(rows)
     }
 
-    async fn is_admin_user(&self, user_id: u64) -> Result<bool> {
+    async fn is_admin_user(&self, user_id: u64) -> DbResult<bool> {
         let query = r#"
             SELECT COUNT(*) > 0
             FROM admin_role_assignments
@@ -1559,7 +1527,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(has_role)
     }
 
-    async fn assign_user_role(&self, user_id: u64, role_id: u64, assigned_by: u64) -> Result<()> {
+    async fn assign_user_role(&self, user_id: u64, role_id: u64, assigned_by: u64) -> DbResult<()> {
         let query = r#"
             INSERT INTO admin_role_assignments (user_id, role_id, assigned_by)
             VALUES (?, ?, ?)
@@ -1579,7 +1547,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn revoke_user_role(&self, user_id: u64, role_id: u64) -> Result<()> {
+    async fn revoke_user_role(&self, user_id: u64, role_id: u64) -> DbResult<()> {
         let query = r#"
             DELETE FROM admin_role_assignments
             WHERE user_id = ? AND role_id = ?
@@ -1594,7 +1562,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn create_role(&self, name: &str, description: Option<&str>) -> Result<u64> {
+    async fn create_role(&self, name: &str, description: Option<&str>) -> DbResult<u64> {
         let query = r#"
             INSERT INTO admin_roles (name, description, is_system_role)
             VALUES (?, ?, false)
@@ -1609,7 +1577,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(result.last_insert_id())
     }
 
-    async fn get_role(&self, role_id: u64) -> Result<AdminRole> {
+    async fn get_role(&self, role_id: u64) -> DbResult<AdminRole> {
         let query = r#"
             SELECT *
             FROM admin_roles
@@ -1624,7 +1592,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(role)
     }
 
-    async fn get_role_by_name(&self, name: &str) -> Result<AdminRole> {
+    async fn get_role_by_name(&self, name: &str) -> DbResult<AdminRole> {
         let query = r#"
             SELECT *
             FROM admin_roles
@@ -1639,7 +1607,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(role)
     }
 
-    async fn list_roles(&self) -> Result<Vec<AdminRole>> {
+    async fn list_roles(&self) -> DbResult<Vec<AdminRole>> {
         let query = r#"
             SELECT *
             FROM admin_roles
@@ -1653,7 +1621,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(roles)
     }
 
-    async fn update_role(&self, role: &AdminRole) -> Result<()> {
+    async fn update_role(&self, role: &AdminRole) -> DbResult<()> {
         let query = r#"
             UPDATE admin_roles
             SET name = ?, description = ?
@@ -1668,13 +1636,16 @@ impl AdminDb for LNVpsDbMysql {
             .await?;
 
         if result.rows_affected() == 0 {
-            bail!("Role not found or is a system role (cannot be updated)");
+            return Err(DbError::Source(
+                anyhow!("Role not found or is a system role (cannot be updated)")
+                    .into_boxed_dyn_error(),
+            ));
         }
 
         Ok(())
     }
 
-    async fn delete_role(&self, role_id: u64) -> Result<()> {
+    async fn delete_role(&self, role_id: u64) -> DbResult<()> {
         // First check if role has any assignments
         let assignments_count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM admin_role_assignments WHERE role_id = ?",
@@ -1684,10 +1655,13 @@ impl AdminDb for LNVpsDbMysql {
         .await?;
 
         if assignments_count > 0 {
-            bail!(
-                "Cannot delete role: {} active user assignments exist",
-                assignments_count
-            );
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete role: {} active user assignments exist",
+                    assignments_count
+                )
+                .into_boxed_dyn_error(),
+            ));
         }
 
         let query = r#"
@@ -1698,13 +1672,16 @@ impl AdminDb for LNVpsDbMysql {
         let result = sqlx::query(query).bind(role_id).execute(&self.db).await?;
 
         if result.rows_affected() == 0 {
-            bail!("Role not found or is a system role (cannot be deleted)");
+            return Err(DbError::Source(
+                anyhow!("Role not found or is a system role (cannot be deleted)")
+                    .into_boxed_dyn_error(),
+            ));
         }
 
         Ok(())
     }
 
-    async fn add_role_permission(&self, role_id: u64, resource: u16, action: u16) -> Result<()> {
+    async fn add_role_permission(&self, role_id: u64, resource: u16, action: u16) -> DbResult<()> {
         let query = r#"
             INSERT IGNORE INTO admin_role_permissions (role_id, resource, action)
             VALUES (?, ?, ?)
@@ -1720,7 +1697,12 @@ impl AdminDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn remove_role_permission(&self, role_id: u64, resource: u16, action: u16) -> Result<()> {
+    async fn remove_role_permission(
+        &self,
+        role_id: u64,
+        resource: u16,
+        action: u16,
+    ) -> DbResult<()> {
         let query = r#"
             DELETE FROM admin_role_permissions
             WHERE role_id = ? AND resource = ? AND action = ?
@@ -1736,7 +1718,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn get_role_permissions(&self, role_id: u64) -> Result<Vec<(u16, u16)>> {
+    async fn get_role_permissions(&self, role_id: u64) -> DbResult<Vec<(u16, u16)>> {
         let query = r#"
             SELECT resource, action
             FROM admin_role_permissions
@@ -1752,7 +1734,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(permissions)
     }
 
-    async fn get_user_role_assignments(&self, user_id: u64) -> Result<Vec<AdminRoleAssignment>> {
+    async fn get_user_role_assignments(&self, user_id: u64) -> DbResult<Vec<AdminRoleAssignment>> {
         let query = r#"
             SELECT *
             FROM admin_role_assignments
@@ -1768,7 +1750,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok(assignments)
     }
 
-    async fn count_role_users(&self, role_id: u64) -> Result<u64> {
+    async fn count_role_users(&self, role_id: u64) -> DbResult<u64> {
         let query = r#"
             SELECT COUNT(*)
             FROM admin_role_assignments
@@ -1789,13 +1771,14 @@ impl AdminDb for LNVpsDbMysql {
         limit: u64,
         offset: u64,
         search_pubkey: Option<&str>,
-    ) -> Result<(Vec<crate::AdminUserInfo>, u64)> {
+    ) -> DbResult<(Vec<crate::AdminUserInfo>, u64)> {
         let (where_clause, search_param) = if let Some(pubkey) = search_pubkey {
             if pubkey.len() == 64 {
                 (" WHERE HEX(u.pubkey) = ? ", Some(pubkey.to_uppercase()))
             } else {
-                return Err(anyhow::anyhow!(
-                    "Search only supports 64-character hex pubkeys"
+                return Err(DbError::Source(
+                    anyhow::anyhow!("Search only supports 64-character hex pubkeys")
+                        .into_boxed_dyn_error(),
                 ));
             }
         } else {
@@ -1873,12 +1856,11 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<VmHostRegion>, u64)> {
+    ) -> DbResult<(Vec<VmHostRegion>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host_region")
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         // Get paginated results
         let regions = sqlx::query_as::<_, VmHostRegion>(
@@ -1887,8 +1869,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok((regions, total as u64))
     }
@@ -1898,7 +1879,7 @@ impl AdminDb for LNVpsDbMysql {
         name: &str,
         enabled: bool,
         company_id: Option<u64>,
-    ) -> Result<u64> {
+    ) -> DbResult<u64> {
         let id = sqlx::query_scalar::<_, u64>(
             "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
         )
@@ -1906,38 +1887,35 @@ impl AdminDb for LNVpsDbMysql {
         .bind(enabled)
         .bind(company_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(id)
     }
 
-    async fn admin_update_region(&self, region: &VmHostRegion) -> Result<()> {
+    async fn admin_update_region(&self, region: &VmHostRegion) -> DbResult<()> {
         sqlx::query("UPDATE vm_host_region SET name = ?, enabled = ?, company_id = ? WHERE id = ?")
             .bind(&region.name)
             .bind(region.enabled)
             .bind(region.company_id)
             .bind(region.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_region(&self, region_id: u64) -> Result<()> {
+    async fn admin_delete_region(&self, region_id: u64) -> DbResult<()> {
         // First check if any hosts are assigned to this region
         let host_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
                 .bind(region_id)
                 .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .await?;
 
         if host_count > 0 {
-            return Err(anyhow::anyhow!(
-                "Cannot delete region with {} assigned hosts",
-                host_count
+            return Err(DbError::Source(
+                anyhow!("Cannot delete region with {} assigned hosts", host_count)
+                    .into_boxed_dyn_error(),
             ));
         }
 
@@ -1946,23 +1924,21 @@ impl AdminDb for LNVpsDbMysql {
             .bind(false)
             .bind(region_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn admin_count_region_hosts(&self, region_id: u64) -> Result<u64> {
+    async fn admin_count_region_hosts(&self, region_id: u64) -> DbResult<u64> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
             .bind(region_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(count as u64)
     }
 
-    async fn admin_get_region_stats(&self, region_id: u64) -> Result<RegionStats> {
+    async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
         // Get comprehensive region statistics with a single efficient query
         // Use CAST to ensure we get the right SQL types for Rust compatibility
         let row: (i64, i64, Option<u64>, Option<u64>, i64) = sqlx::query_as(
@@ -1981,8 +1957,7 @@ impl AdminDb for LNVpsDbMysql {
         )
         .bind(region_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(RegionStats {
             host_count: row.0 as u64,
@@ -1997,7 +1972,7 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<VmOsImage>, u64)> {
+    ) -> DbResult<(Vec<VmOsImage>, u64)> {
         // Get paginated list of VM OS images
         let images = sqlx::query_as::<_, VmOsImage>(
             "SELECT * FROM vm_os_image ORDER BY id LIMIT ? OFFSET ?",
@@ -2005,27 +1980,24 @@ impl AdminDb for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         // Get total count
         let total_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vm_os_image")
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok((images, total_count.0 as u64))
     }
 
-    async fn admin_get_vm_os_image(&self, image_id: u64) -> Result<VmOsImage> {
-        sqlx::query_as("SELECT * FROM vm_os_image WHERE id = ?")
+    async fn admin_get_vm_os_image(&self, image_id: u64) -> DbResult<VmOsImage> {
+        Ok(sqlx::query_as("SELECT * FROM vm_os_image WHERE id = ?")
             .bind(image_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
-    async fn admin_create_vm_os_image(&self, image: &VmOsImage) -> Result<u64> {
+    async fn admin_create_vm_os_image(&self, image: &VmOsImage) -> DbResult<u64> {
         let result = sqlx::query(
             r#"
             INSERT INTO vm_os_image (distribution, flavour, version, enabled, release_date, url, default_username)
@@ -2040,13 +2012,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&image.url)
         .bind(&image.default_username)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn admin_update_vm_os_image(&self, image: &VmOsImage) -> Result<()> {
+    async fn admin_update_vm_os_image(&self, image: &VmOsImage) -> DbResult<()> {
         sqlx::query(
             r#"
             UPDATE vm_os_image 
@@ -2063,32 +2034,32 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&image.default_username)
         .bind(image.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_vm_os_image(&self, image_id: u64) -> Result<()> {
+    async fn admin_delete_vm_os_image(&self, image_id: u64) -> DbResult<()> {
         // Check if the image is referenced by any VMs
         let vm_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vm WHERE image_id = ?")
             .bind(image_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         if vm_count.0 > 0 {
-            bail!(
-                "Cannot delete VM OS image: {} VMs are using this image",
-                vm_count.0
-            );
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete VM OS image: {} VMs are using this image",
+                    vm_count.0
+                )
+                .into_boxed_dyn_error(),
+            ));
         }
 
         sqlx::query("DELETE FROM vm_os_image WHERE id = ?")
             .bind(image_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
@@ -2097,7 +2068,7 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         limit: i64,
         offset: i64,
-    ) -> Result<(Vec<VmTemplate>, i64)> {
+    ) -> DbResult<(Vec<VmTemplate>, i64)> {
         // Get paginated list of VM templates
         let templates = sqlx::query_as::<_, VmTemplate>(
             "SELECT * FROM vm_template ORDER BY id LIMIT ? OFFSET ?",
@@ -2105,19 +2076,17 @@ impl AdminDb for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         // Get total count
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vm_template")
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok((templates, total.0))
     }
 
-    async fn update_vm_template(&self, template: &VmTemplate) -> Result<()> {
+    async fn update_vm_template(&self, template: &VmTemplate) -> DbResult<()> {
         sqlx::query(
             r#"UPDATE vm_template SET 
                name = ?, enabled = ?, expires = ?, cpu = ?, memory = ?, 
@@ -2137,26 +2106,23 @@ impl AdminDb for LNVpsDbMysql {
         .bind(template.region_id)
         .bind(template.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
         Ok(())
     }
 
-    async fn delete_vm_template(&self, template_id: u64) -> Result<()> {
+    async fn delete_vm_template(&self, template_id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM vm_template WHERE id = ?")
             .bind(template_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn check_vm_template_usage(&self, template_id: u64) -> Result<i64> {
+    async fn check_vm_template_usage(&self, template_id: u64) -> DbResult<i64> {
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vm WHERE template_id = ?")
             .bind(template_id)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(count.0)
     }
 
@@ -2164,14 +2130,13 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<AdminVmHost>, u64)> {
+    ) -> DbResult<(Vec<AdminVmHost>, u64)> {
         // Get total count (including disabled hosts)
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm_host h JOIN vm_host_region hr ON h.region_id = hr.id",
         )
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         // Get paginated results with region info and active VM count (including disabled hosts)
         let mut hosts: Vec<AdminVmHost> = sqlx::query_as(
@@ -2195,8 +2160,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         // Fetch disk information for each host
         for host in &mut hosts {
@@ -2204,8 +2168,7 @@ impl AdminDb for LNVpsDbMysql {
                 sqlx::query_as("SELECT * FROM vm_host_disk WHERE host_id = ? ORDER BY name")
                     .bind(host.host.id)
                     .fetch_all(&self.db)
-                    .await
-                    .map_err(Error::new)?;
+                    .await?;
 
             host.disks = disks;
         }
@@ -2213,7 +2176,7 @@ impl AdminDb for LNVpsDbMysql {
         Ok((hosts, total as u64))
     }
 
-    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> Result<u64> {
+    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
         let query = r#"
             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2235,13 +2198,12 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.min_memory)
             .bind(pricing.max_memory)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> Result<()> {
+    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<()> {
         let query = r#"
             UPDATE vm_custom_pricing 
             SET name = ?, enabled = ?, expires = ?, region_id = ?, currency = ?, 
@@ -2266,32 +2228,31 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.max_memory)
             .bind(pricing.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         if result.rows_affected() == 0 {
-            bail!("Custom pricing model not found");
+            return Err(DbError::Source(
+                anyhow!("Custom pricing model not found").into_boxed_dyn_error(),
+            ));
         }
 
         Ok(())
     }
 
-    async fn delete_custom_pricing(&self, id: u64) -> Result<()> {
+    async fn delete_custom_pricing(&self, id: u64) -> DbResult<()> {
         let query = "DELETE FROM vm_custom_pricing WHERE id = ?";
-        let result = sqlx::query(query)
-            .bind(id)
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let result = sqlx::query(query).bind(id).execute(&self.db).await?;
 
         if result.rows_affected() == 0 {
-            bail!("Custom pricing model not found");
+            return Err(DbError::Source(
+                anyhow!("Custom pricing model not found").into_boxed_dyn_error(),
+            ));
         }
 
         Ok(())
     }
 
-    async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> Result<u64> {
+    async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> DbResult<u64> {
         let query = r#"
             INSERT INTO vm_custom_pricing_disk (pricing_id, kind, interface, cost, min_disk_size, max_disk_size)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -2305,30 +2266,27 @@ impl AdminDb for LNVpsDbMysql {
             .bind(disk.min_disk_size)
             .bind(disk.max_disk_size)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> Result<()> {
+    async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> DbResult<()> {
         let query = "DELETE FROM vm_custom_pricing_disk WHERE pricing_id = ?";
         sqlx::query(query)
             .bind(pricing_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
         Ok(())
     }
 
-    async fn count_custom_templates_by_pricing(&self, pricing_id: u64) -> Result<u64> {
+    async fn count_custom_templates_by_pricing(&self, pricing_id: u64) -> DbResult<u64> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vm_custom_template WHERE pricing_id = ?",
         )
         .bind(pricing_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(count as u64)
     }
@@ -2338,14 +2296,13 @@ impl AdminDb for LNVpsDbMysql {
         pricing_id: u64,
         limit: i64,
         offset: i64,
-    ) -> Result<(Vec<VmCustomTemplate>, u64)> {
+    ) -> DbResult<(Vec<VmCustomTemplate>, u64)> {
         let total = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vm_custom_template WHERE pricing_id = ?",
         )
         .bind(pricing_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         let templates = sqlx::query_as::<_, VmCustomTemplate>(
             "SELECT * FROM vm_custom_template WHERE pricing_id = ? ORDER BY id LIMIT ? OFFSET ?",
@@ -2354,13 +2311,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok((templates, total as u64))
     }
 
-    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> Result<u64> {
+    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
         let query = r#"
             INSERT INTO vm_custom_template (cpu, memory, disk_size, disk_type, disk_interface, pricing_id)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -2374,13 +2330,12 @@ impl AdminDb for LNVpsDbMysql {
             .bind(template.disk_interface as u16)
             .bind(template.pricing_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn update_custom_template(&self, template: &VmCustomTemplate) -> Result<()> {
+    async fn update_custom_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
         let query = r#"
             UPDATE vm_custom_template 
             SET cpu = ?, memory = ?, disk_size = ?, disk_type = ?, disk_interface = ?, pricing_id = ?
@@ -2396,70 +2351,67 @@ impl AdminDb for LNVpsDbMysql {
             .bind(template.pricing_id)
             .bind(template.id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         if result.rows_affected() == 0 {
-            bail!("Custom template not found");
+            return Err(DbError::Source(
+                anyhow!("Custom template not found").into_boxed_dyn_error(),
+            ));
         }
 
         Ok(())
     }
 
-    async fn delete_custom_template(&self, id: u64) -> Result<()> {
+    async fn delete_custom_template(&self, id: u64) -> DbResult<()> {
         let query = "DELETE FROM vm_custom_template WHERE id = ?";
-        let result = sqlx::query(query)
-            .bind(id)
-            .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let result = sqlx::query(query).bind(id).execute(&self.db).await?;
 
         if result.rows_affected() == 0 {
-            bail!("Custom template not found");
+            return Err(DbError::Source(
+                anyhow!("Custom template not found").into_boxed_dyn_error(),
+            ));
         }
 
         Ok(())
     }
 
-    async fn count_vms_by_custom_template(&self, template_id: u64) -> Result<u64> {
+    async fn count_vms_by_custom_template(&self, template_id: u64) -> DbResult<u64> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vm WHERE custom_template_id = ? AND deleted = false",
         )
         .bind(template_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(count as u64)
     }
 
-    async fn admin_list_companies(&self, limit: u64, offset: u64) -> Result<(Vec<Company>, u64)> {
+    async fn admin_list_companies(&self, limit: u64, offset: u64) -> DbResult<(Vec<Company>, u64)> {
         let companies = sqlx::query_as::<_, Company>(
             "SELECT * FROM company ORDER BY created DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM company")
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok((companies, total as u64))
     }
 
-    async fn admin_get_company(&self, company_id: u64) -> Result<Company> {
-        sqlx::query_as::<_, Company>("SELECT * FROM company WHERE id = ?")
-            .bind(company_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_get_company(&self, company_id: u64) -> DbResult<Company> {
+        Ok(
+            sqlx::query_as::<_, Company>("SELECT * FROM company WHERE id = ?")
+                .bind(company_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn admin_create_company(&self, company: &Company) -> Result<u64> {
+    async fn admin_create_company(&self, company: &Company) -> DbResult<u64> {
         let result = sqlx::query(
             r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)"#,
@@ -2476,13 +2428,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.email)
             .bind(&company.base_currency)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn admin_update_company(&self, company: &Company) -> Result<()> {
+    async fn admin_update_company(&self, company: &Company) -> DbResult<()> {
         sqlx::query(
             r#"UPDATE company SET 
                name = ?, address_1 = ?, address_2 = ?, city = ?, state = ?, 
@@ -2501,39 +2452,39 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.email)
         .bind(company.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_company(&self, company_id: u64) -> Result<()> {
+    async fn admin_delete_company(&self, company_id: u64) -> DbResult<()> {
         // Check if company has any regions assigned
         let region_count = self.admin_count_company_regions(company_id).await?;
         if region_count > 0 {
-            return Err(anyhow::anyhow!(
-                "Cannot delete company with {} assigned regions",
-                region_count
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete company with {} assigned regions",
+                    region_count
+                )
+                .into_boxed_dyn_error(),
             ));
         }
 
         sqlx::query("DELETE FROM company WHERE id = ?")
             .bind(company_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn admin_count_company_regions(&self, company_id: u64) -> Result<u64> {
+    async fn admin_count_company_regions(&self, company_id: u64) -> DbResult<u64> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vm_host_region WHERE company_id = ?",
         )
         .bind(company_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(count as u64)
     }
@@ -2542,15 +2493,14 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<VmPayment>> {
-        sqlx::query_as(
+    ) -> DbResult<Vec<VmPayment>> {
+        Ok(sqlx::query_as(
             "SELECT * FROM vm_payment WHERE created >= ? AND created < ? AND is_paid = true ORDER BY created",
         )
         .bind(start_date)
         .bind(end_date)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
     async fn admin_get_payments_by_date_range_and_company(
@@ -2558,8 +2508,8 @@ impl AdminDb for LNVpsDbMysql {
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
-    ) -> Result<Vec<VmPayment>> {
-        sqlx::query_as(
+    ) -> DbResult<Vec<VmPayment>> {
+        Ok(sqlx::query_as(
             "SELECT vp.* FROM vm_payment vp
              JOIN vm v ON vp.vm_id = v.id
              JOIN vm_host vh ON v.host_id = vh.id
@@ -2571,8 +2521,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(end_date)
         .bind(company_id)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)
+        .await?)
     }
 
     async fn admin_get_payments_with_company_info(
@@ -2581,10 +2530,10 @@ impl AdminDb for LNVpsDbMysql {
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> Result<Vec<VmPaymentWithCompany>> {
+    ) -> DbResult<Vec<VmPaymentWithCompany>> {
         match currency {
             Some(currency) => {
-                sqlx::query_as(
+                Ok(sqlx::query_as(
                     "SELECT vp.*, c.id as company_id, c.name as company_name, c.base_currency as company_base_currency
                      FROM vm_payment vp
                      JOIN vm v ON vp.vm_id = v.id
@@ -2598,10 +2547,10 @@ impl AdminDb for LNVpsDbMysql {
                 .bind(end_date)
                 .bind(company_id)
                 .bind(currency)
-                .fetch_all(&self.db).await.map_err(Error::new)
+                .fetch_all(&self.db).await?)
             },
             None => {
-                sqlx::query_as(
+                Ok(sqlx::query_as(
                     "SELECT vp.*, c.id as company_id, c.name as company_name, c.base_currency as company_base_currency
                      FROM vm_payment vp
                      JOIN vm v ON vp.vm_id = v.id
@@ -2614,7 +2563,7 @@ impl AdminDb for LNVpsDbMysql {
                 .bind(start_date)
                 .bind(end_date)
                 .bind(company_id)
-                .fetch_all(&self.db).await.map_err(Error::new)
+                .fetch_all(&self.db).await?)
             }
         }
     }
@@ -2625,7 +2574,7 @@ impl AdminDb for LNVpsDbMysql {
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         ref_code: Option<&str>,
-    ) -> Result<Vec<ReferralCostUsage>> {
+    ) -> DbResult<Vec<ReferralCostUsage>> {
         let mut query = "SELECT v.id as vm_id,
                                 v.ref_code,
                                 vp.created,
@@ -2663,7 +2612,7 @@ impl AdminDb for LNVpsDbMysql {
             db_query = db_query.bind(code);
         }
 
-        db_query.fetch_all(&self.db).await.map_err(Error::new)
+        Ok(db_query.fetch_all(&self.db).await?)
     }
 
     async fn admin_list_ip_ranges(
@@ -2671,7 +2620,7 @@ impl AdminDb for LNVpsDbMysql {
         limit: u64,
         offset: u64,
         region_id: Option<u64>,
-    ) -> Result<(Vec<IpRange>, u64)> {
+    ) -> DbResult<(Vec<IpRange>, u64)> {
         let (ip_ranges, total) = if let Some(region_id) = region_id {
             // Filter by region
             let ip_ranges = sqlx::query_as::<_, IpRange>(
@@ -2681,15 +2630,13 @@ impl AdminDb for LNVpsDbMysql {
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
             let total =
                 sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ip_range WHERE region_id = ?")
                     .bind(region_id)
                     .fetch_one(&self.db)
-                    .await
-                    .map_err(Error::new)?;
+                    .await?;
 
             (ip_ranges, total)
         } else {
@@ -2700,13 +2647,11 @@ impl AdminDb for LNVpsDbMysql {
             .bind(limit)
             .bind(offset)
             .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
             let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ip_range")
                 .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .await?;
 
             (ip_ranges, total)
         };
@@ -2714,15 +2659,16 @@ impl AdminDb for LNVpsDbMysql {
         Ok((ip_ranges, total as u64))
     }
 
-    async fn admin_get_ip_range(&self, ip_range_id: u64) -> Result<IpRange> {
-        sqlx::query_as::<_, IpRange>("SELECT * FROM ip_range WHERE id = ?")
-            .bind(ip_range_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_get_ip_range(&self, ip_range_id: u64) -> DbResult<IpRange> {
+        Ok(
+            sqlx::query_as::<_, IpRange>("SELECT * FROM ip_range WHERE id = ?")
+                .bind(ip_range_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn admin_create_ip_range(&self, ip_range: &IpRange) -> Result<u64> {
+    async fn admin_create_ip_range(&self, ip_range: &IpRange) -> DbResult<u64> {
         let result = sqlx::query(
             r#"INSERT INTO ip_range (cidr, gateway, enabled, region_id, reverse_zone_id, access_policy_id, allocation_mode, use_full_range)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
@@ -2736,13 +2682,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(ip_range.allocation_mode as u16)
         .bind(ip_range.use_full_range)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn admin_update_ip_range(&self, ip_range: &IpRange) -> Result<()> {
+    async fn admin_update_ip_range(&self, ip_range: &IpRange) -> DbResult<()> {
         sqlx::query(
             r#"UPDATE ip_range SET 
                cidr = ?, gateway = ?, enabled = ?, region_id = ?, 
@@ -2759,81 +2704,81 @@ impl AdminDb for LNVpsDbMysql {
         .bind(ip_range.use_full_range)
         .bind(ip_range.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_ip_range(&self, ip_range_id: u64) -> Result<()> {
+    async fn admin_delete_ip_range(&self, ip_range_id: u64) -> DbResult<()> {
         // Check if IP range has any assignments
         let assignment_count = self.admin_count_ip_range_assignments(ip_range_id).await?;
         if assignment_count > 0 {
-            return Err(anyhow::anyhow!(
-                "Cannot delete IP range with {} active IP assignments",
-                assignment_count
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete IP range with {} active IP assignments",
+                    assignment_count
+                )
+                .into_boxed_dyn_error(),
             ));
         }
 
         sqlx::query("DELETE FROM ip_range WHERE id = ?")
             .bind(ip_range_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn admin_count_ip_range_assignments(&self, ip_range_id: u64) -> Result<u64> {
+    async fn admin_count_ip_range_assignments(&self, ip_range_id: u64) -> DbResult<u64> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vm_ip_assignment WHERE ip_range_id = ? AND deleted = false",
         )
         .bind(ip_range_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(count as u64)
     }
 
-    async fn admin_list_access_policies(&self) -> Result<Vec<AccessPolicy>> {
-        sqlx::query_as::<_, AccessPolicy>("SELECT * FROM access_policy ORDER BY name")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_list_access_policies(&self) -> DbResult<Vec<AccessPolicy>> {
+        Ok(
+            sqlx::query_as::<_, AccessPolicy>("SELECT * FROM access_policy ORDER BY name")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
     async fn admin_list_access_policies_paginated(
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<AccessPolicy>, u64)> {
+    ) -> DbResult<(Vec<AccessPolicy>, u64)> {
         let access_policies = sqlx::query_as::<_, AccessPolicy>(
             "SELECT * FROM access_policy ORDER BY name LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM access_policy")
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok((access_policies, total as u64))
     }
 
-    async fn admin_get_access_policy(&self, access_policy_id: u64) -> Result<AccessPolicy> {
-        sqlx::query_as::<_, AccessPolicy>("SELECT * FROM access_policy WHERE id = ?")
-            .bind(access_policy_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_get_access_policy(&self, access_policy_id: u64) -> DbResult<AccessPolicy> {
+        Ok(
+            sqlx::query_as::<_, AccessPolicy>("SELECT * FROM access_policy WHERE id = ?")
+                .bind(access_policy_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn admin_create_access_policy(&self, access_policy: &AccessPolicy) -> Result<u64> {
+    async fn admin_create_access_policy(&self, access_policy: &AccessPolicy) -> DbResult<u64> {
         let result = sqlx::query(
             r#"INSERT INTO access_policy (name, kind, router_id, interface)
                VALUES (?, ?, ?, ?)"#,
@@ -2843,13 +2788,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(access_policy.router_id)
         .bind(&access_policy.interface)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn admin_update_access_policy(&self, access_policy: &AccessPolicy) -> Result<()> {
+    async fn admin_update_access_policy(&self, access_policy: &AccessPolicy) -> DbResult<()> {
         sqlx::query(
             r#"UPDATE access_policy SET 
                name = ?, kind = ?, router_id = ?, interface = ?
@@ -2861,82 +2805,82 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&access_policy.interface)
         .bind(access_policy.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_access_policy(&self, access_policy_id: u64) -> Result<()> {
+    async fn admin_delete_access_policy(&self, access_policy_id: u64) -> DbResult<()> {
         // Check if access policy is used by any IP ranges
         let usage_count = self
             .admin_count_access_policy_ip_ranges(access_policy_id)
             .await?;
         if usage_count > 0 {
-            return Err(anyhow::anyhow!(
-                "Cannot delete access policy used by {} IP ranges",
-                usage_count
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete access policy used by {} IP ranges",
+                    usage_count
+                )
+                .into_boxed_dyn_error(),
             ));
         }
 
         sqlx::query("DELETE FROM access_policy WHERE id = ?")
             .bind(access_policy_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn admin_count_access_policy_ip_ranges(&self, access_policy_id: u64) -> Result<u64> {
+    async fn admin_count_access_policy_ip_ranges(&self, access_policy_id: u64) -> DbResult<u64> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM ip_range WHERE access_policy_id = ?",
         )
         .bind(access_policy_id)
         .fetch_one(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(count as u64)
     }
 
-    async fn admin_list_routers(&self) -> Result<Vec<Router>> {
-        sqlx::query_as::<_, Router>("SELECT * FROM router ORDER BY name")
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_list_routers(&self) -> DbResult<Vec<Router>> {
+        Ok(
+            sqlx::query_as::<_, Router>("SELECT * FROM router ORDER BY name")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
     async fn admin_list_routers_paginated(
         &self,
         limit: u64,
         offset: u64,
-    ) -> Result<(Vec<Router>, u64)> {
+    ) -> DbResult<(Vec<Router>, u64)> {
         let routers =
             sqlx::query_as::<_, Router>("SELECT * FROM router ORDER BY name LIMIT ? OFFSET ?")
                 .bind(limit)
                 .bind(offset)
                 .fetch_all(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .await?;
 
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM router")
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok((routers, total.0 as u64))
     }
 
-    async fn admin_get_router(&self, router_id: u64) -> Result<Router> {
-        sqlx::query_as::<_, Router>("SELECT * FROM router WHERE id = ?")
-            .bind(router_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_get_router(&self, router_id: u64) -> DbResult<Router> {
+        Ok(
+            sqlx::query_as::<_, Router>("SELECT * FROM router WHERE id = ?")
+                .bind(router_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn admin_create_router(&self, router: &Router) -> Result<u64> {
+    async fn admin_create_router(&self, router: &Router) -> DbResult<u64> {
         let result = sqlx::query(
             "INSERT INTO router (name, enabled, kind, url, token) VALUES (?, ?, ?, ?, ?)",
         )
@@ -2946,13 +2890,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&router.url)
         .bind(&router.token)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn admin_update_router(&self, router: &Router) -> Result<()> {
+    async fn admin_update_router(&self, router: &Router) -> DbResult<()> {
         sqlx::query(
             "UPDATE router SET name = ?, enabled = ?, kind = ?, url = ?, token = ? WHERE id = ?",
         )
@@ -2963,44 +2906,43 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&router.token)
         .bind(router.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_router(&self, router_id: u64) -> Result<()> {
+    async fn admin_delete_router(&self, router_id: u64) -> DbResult<()> {
         // Check if router is used by any access policies
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM access_policy WHERE router_id = ?")
                 .bind(router_id)
                 .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .await?;
 
         if count.0 > 0 {
-            return Err(anyhow::anyhow!(
-                "Cannot delete router: {} access policies are using this router",
-                count.0
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete router: {} access policies are using this router",
+                    count.0
+                )
+                .into_boxed_dyn_error(),
             ));
         }
 
         sqlx::query("DELETE FROM router WHERE id = ?")
             .bind(router_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }
 
-    async fn admin_count_router_access_policies(&self, router_id: u64) -> Result<u64> {
+    async fn admin_count_router_access_policies(&self, router_id: u64) -> DbResult<u64> {
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM access_policy WHERE router_id = ?")
                 .bind(router_id)
                 .fetch_one(&self.db)
-                .await
-                .map_err(Error::new)?;
+                .await?;
 
         Ok(count.0 as u64)
     }
@@ -3014,7 +2956,7 @@ impl AdminDb for LNVpsDbMysql {
         pubkey: Option<&str>,
         region_id: Option<u64>,
         include_deleted: Option<bool>,
-    ) -> Result<(Vec<crate::Vm>, u64)> {
+    ) -> DbResult<(Vec<crate::Vm>, u64)> {
         // Resolve user_id from pubkey if provided
         let resolved_user_id = if let Some(pk) = pubkey {
             // Use SQL UNHEX to decode the pubkey and find the user
@@ -3104,11 +3046,7 @@ impl AdminDb for LNVpsDbMysql {
         }
 
         // Execute count query
-        let total: i64 = count_query
-            .build_query_scalar()
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let total: i64 = count_query.build_query_scalar().fetch_one(&self.db).await?;
 
         // Add ordering and pagination to data query
         data_query
@@ -3118,21 +3056,16 @@ impl AdminDb for LNVpsDbMysql {
             .push_bind(offset);
 
         // Execute data query
-        let vms: Vec<Vm> = data_query
-            .build_query_as()
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let vms: Vec<Vm> = data_query.build_query_as().fetch_all(&self.db).await?;
 
         Ok((vms, total as u64))
     }
 
-    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> Result<crate::User> {
-        sqlx::query_as("SELECT * FROM users WHERE pubkey = ?")
+    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> DbResult<crate::User> {
+        Ok(sqlx::query_as("SELECT * FROM users WHERE pubkey = ?")
             .bind(pubkey)
             .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+            .await?)
     }
 
     async fn admin_list_vm_ip_assignments(
@@ -3143,7 +3076,7 @@ impl AdminDb for LNVpsDbMysql {
         ip_range_id: Option<u64>,
         ip: Option<&str>,
         include_deleted: Option<bool>,
-    ) -> Result<(Vec<VmIpAssignment>, u64)> {
+    ) -> DbResult<(Vec<VmIpAssignment>, u64)> {
         let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM vm_ip_assignment");
         let mut data_query = QueryBuilder::new("SELECT * FROM vm_ip_assignment");
 
@@ -3209,11 +3142,7 @@ impl AdminDb for LNVpsDbMysql {
         }
 
         // Execute count query
-        let total: i64 = count_query
-            .build_query_scalar()
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let total: i64 = count_query.build_query_scalar().fetch_one(&self.db).await?;
 
         // Add ordering and pagination to data query
         data_query
@@ -3223,24 +3152,22 @@ impl AdminDb for LNVpsDbMysql {
             .push_bind(offset);
 
         // Execute data query
-        let assignments: Vec<VmIpAssignment> = data_query
-            .build_query_as()
-            .fetch_all(&self.db)
-            .await
-            .map_err(Error::new)?;
+        let assignments: Vec<VmIpAssignment> =
+            data_query.build_query_as().fetch_all(&self.db).await?;
 
         Ok((assignments, total as u64))
     }
 
-    async fn admin_get_vm_ip_assignment(&self, assignment_id: u64) -> Result<VmIpAssignment> {
-        sqlx::query_as::<_, VmIpAssignment>("SELECT * FROM vm_ip_assignment WHERE id = ?")
-            .bind(assignment_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(Error::new)
+    async fn admin_get_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<VmIpAssignment> {
+        Ok(
+            sqlx::query_as::<_, VmIpAssignment>("SELECT * FROM vm_ip_assignment WHERE id = ?")
+                .bind(assignment_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
-    async fn admin_create_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> Result<u64> {
+    async fn admin_create_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> DbResult<u64> {
         // Check if IP already exists and is not deleted
         if let Ok(_existing) = sqlx::query_as::<_, VmIpAssignment>(
             "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE",
@@ -3249,7 +3176,9 @@ impl AdminDb for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await
         {
-            bail!("IP address {} is already assigned", assignment.ip);
+            return Err(DbError::Source(
+                anyhow!("IP address {} is already assigned", assignment.ip).into_boxed_dyn_error(),
+            ));
         }
 
         let result = sqlx::query(
@@ -3265,13 +3194,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&assignment.dns_reverse)
         .bind(&assignment.dns_reverse_ref)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(result.last_insert_id())
     }
 
-    async fn admin_update_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> Result<()> {
+    async fn admin_update_vm_ip_assignment(&self, assignment: &VmIpAssignment) -> DbResult<()> {
         // Check if IP already exists for a different assignment
         if let Ok(existing) = sqlx::query_as::<_, VmIpAssignment>(
             "SELECT * FROM vm_ip_assignment WHERE ip = ? AND deleted = FALSE AND id != ?",
@@ -3281,11 +3209,14 @@ impl AdminDb for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await
         {
-            bail!(
-                "IP address {} is already assigned to assignment {}",
-                assignment.ip,
-                existing.id
-            );
+            return Err(DbError::Source(
+                anyhow!(
+                    "IP address {} is already assigned to assignment {}",
+                    assignment.ip,
+                    existing.id
+                )
+                .into_boxed_dyn_error(),
+            ));
         }
 
         sqlx::query(
@@ -3301,18 +3232,16 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&assignment.dns_reverse_ref)
         .bind(assignment.id)
         .execute(&self.db)
-        .await
-        .map_err(Error::new)?;
+        .await?;
 
         Ok(())
     }
 
-    async fn admin_delete_vm_ip_assignment(&self, assignment_id: u64) -> Result<()> {
+    async fn admin_delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
         sqlx::query("UPDATE vm_ip_assignment SET deleted = TRUE WHERE id = ?")
             .bind(assignment_id)
             .execute(&self.db)
-            .await
-            .map_err(Error::new)?;
+            .await?;
 
         Ok(())
     }

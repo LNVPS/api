@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
-    DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
+    DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
     VmIpAssignment, VmTemplate,
 };
 use std::collections::{HashMap, HashSet};
@@ -179,7 +179,7 @@ impl HostCapacityService {
 
         // load templates
         let templates = self.db.list_vm_templates().await?;
-        let custom_templates: Vec<Result<VmCustomTemplate>> = join_all(
+        let custom_templates: Vec<DbResult<VmCustomTemplate>> = join_all(
             vms.iter()
                 .filter(|v| v.custom_template_id.is_some() && v.expires > Utc::now())
                 .map(|v| {

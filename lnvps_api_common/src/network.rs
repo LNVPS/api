@@ -58,14 +58,14 @@ impl NetworkProvisioner {
 
         // filter by kind
         ip_ranges.retain(|r| {
-                let net = r.cidr.parse();
-                match (net, &kind) {
-                    (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
-                    (Ok(IpNetwork::V6(_)), Some(IpAddrKind::IPv6)) => true,
-                    (Err(_), _) => false,
-                    _ => true,
-                }
-            });
+            let net = r.cidr.parse();
+            match (net, &kind) {
+                (Ok(IpNetwork::V4(_)), Some(IpAddrKind::IPv4)) => true,
+                (Ok(IpNetwork::V6(_)), Some(IpAddrKind::IPv6)) => true,
+                (Err(_), _) => false,
+                _ => true,
+            }
+        });
 
         // Randomize the order of IP ranges for even distribution
         ip_ranges.shuffle(&mut rand::rng());
@@ -258,6 +258,11 @@ mod tests {
         let ip = mgr.pick_ip_for_region(1).await.expect("No ip found in db");
         let v4 = ip.ip4.unwrap();
         assert_eq!(second, v4.ip.ip());
+
+        // when picking IP's when there are free ips, it must always succeed
+        for _ in 0..1_000 {
+            assert!(mgr.pick_ip_for_region(1).await.is_ok())
+        }
     }
 
     #[tokio::test]
@@ -270,5 +275,10 @@ mod tests {
         let v4 = ip.ip4.unwrap();
         let v6 = ip.ip6.unwrap();
         assert_eq!(1, v4.region_id);
+
+        // when picking IP's when there are free ips, it must always succeed
+        for _ in 0..1_000 {
+            assert!(mgr.pick_ip_for_region(1).await.is_ok())
+        }
     }
 }

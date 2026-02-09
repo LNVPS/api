@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
+use lnvps_api_common::retry::{OpError, OpResult};
+use lnvps_api_common::{op_fatal, op_transient};
 use log::debug;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
 use reqwest::{Client, Method, Request, RequestBuilder, Url};
@@ -90,15 +92,19 @@ impl JsonApi {
         &self.base
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> OpResult<T> {
         self.req::<T, ()>(Method::GET, path, None).await
     }
 
-    pub async fn post<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
+    pub async fn post<T: DeserializeOwned, R: Serialize>(
+        &self,
+        path: &str,
+        body: R,
+    ) -> OpResult<T> {
         self.req(Method::POST, path, Some(body)).await
     }
 
-    pub async fn put<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> Result<T> {
+    pub async fn put<T: DeserializeOwned, R: Serialize>(&self, path: &str, body: R) -> OpResult<T> {
         self.req(Method::PUT, path, Some(body)).await
     }
 
@@ -134,34 +140,39 @@ impl JsonApi {
         method: Method,
         path: &str,
         body: Option<R>,
-    ) -> Result<T> {
-        let req = self.build_req(method.clone(), path, body)?;
+    ) -> OpResult<T> {
+        let req = self
+            .build_req(method.clone(), path, body)
+            .map_err(|e| OpError::Fatal(anyhow!(e)))?;
         let rsp = match self.client.execute(req).await {
             Ok(rsp) => rsp,
             Err(e) => {
-                bail!(
+                op_transient!(
                     "Failed to send request: {} source={}",
                     e,
                     e.source()
                         .map(|x| x.to_string())
                         .unwrap_or_else(|| "None".to_owned())
-                )
+                );
             }
         };
 
         let status = rsp.status();
-        let text = rsp.text().await?;
+        let text = rsp
+            .text()
+            .await
+            .map_err(|e| OpError::Transient(anyhow!(e)))?;
         #[cfg(debug_assertions)]
         debug!("<< {}", text);
         if status.is_success() {
             match serde_json::from_str(&text) {
                 Ok(t) => Ok(t),
                 Err(e) => {
-                    bail!("Failed to parse JSON from {}: {} {}", path, text, e);
+                    op_fatal!("Failed to parse JSON from {}: {} {}", path, text, e);
                 }
             }
         } else {
-            bail!("{} {}: {}: {}", method, path, status, &text);
+            op_transient!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 
@@ -171,18 +182,27 @@ impl JsonApi {
         method: Method,
         path: &str,
         body: Option<R>,
-    ) -> Result<u16> {
-        let req = self.build_req(method.clone(), path, body)?;
-        let rsp = self.client.execute(req).await?;
+    ) -> OpResult<u16> {
+        let req = self
+            .build_req(method.clone(), path, body)
+            .map_err(|e| OpError::Fatal(anyhow!(e)))?;
+        let rsp = self
+            .client
+            .execute(req)
+            .await
+            .map_err(|e| OpError::Transient(anyhow!(e)))?;
 
         let status = rsp.status();
-        let text = rsp.text().await?;
+        let text = rsp
+            .text()
+            .await
+            .map_err(|e| OpError::Transient(anyhow!(e)))?;
         #[cfg(debug_assertions)]
         debug!("<< {}", text);
         if status.is_success() {
             Ok(status.as_u16())
         } else {
-            bail!("{} {}: {}: {}", method, path, status, &text);
+            op_transient!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 }

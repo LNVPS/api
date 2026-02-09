@@ -2,20 +2,17 @@ use crate::dns::{BasicRecord, DnsServer};
 use crate::host::{FullVmInfo, get_host_client};
 use crate::router::{ArpEntry, MikrotikRouter, OvhDedicatedServerVMacRouter, Router};
 use crate::settings::{ProvisionerConfig, Settings};
-use anyhow::{Context, Result, bail, ensure};
-use lnvps_api_common::retry::{RetryPolicy, retry_async};
+use anyhow::{Context, Result, bail, ensure, anyhow};
+use lnvps_api_common::retry::{RetryPolicy, retry_async, OpResult, OpError};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
-use lnvps_api_common::ExchangeRateService;
+use lnvps_api_common::{op_fatal, ExchangeRateService};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote,
 };
-use lnvps_db::{
-    AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod,
-    PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate,
-};
+use lnvps_db::{AccessPolicy, IpRange, IpRangeAllocationMode, LNVpsDb, NetworkAccessPolicy, PaymentMethod, PaymentType, RouterKind, Vm, VmCustomTemplate, VmHost, VmIpAssignment, VmPayment, VmTemplate};
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
@@ -76,10 +73,7 @@ impl LNVpsProvisioner {
         &self.provisioner_config
     }
 
-    pub async fn get_router(&self, router_id: u64) -> Result<Arc<dyn Router>> {
-        #[cfg(test)]
-        return Ok(Arc::new(crate::mocks::MockRouter::new()));
-
+    pub async fn get_router(&self, router_id: u64) -> OpResult<Arc<dyn Router>> {
         let cfg = self.db.get_router(router_id).await?;
         match cfg.kind {
             RouterKind::Mikrotik => {
@@ -101,8 +95,8 @@ impl LNVpsProvisioner {
         &self,
         assignment: &mut VmIpAssignment,
         policy: &AccessPolicy,
-    ) -> Result<()> {
-        let ip = IpNetwork::from_str(&assignment.ip)?;
+    ) -> OpResult<()> {
+        let ip = IpNetwork::from_str(&assignment.ip).map_err(|e| OpError::Fatal(anyhow!(e)))?;
         if matches!(policy.kind, NetworkAccessPolicy::StaticArp) && ip.is_ipv4() {
             let router = self
                 .get_router(
@@ -116,16 +110,15 @@ impl LNVpsProvisioner {
 
             let has_arp_ref = assignment.arp_ref.is_some();
 
-            let arp = retry_async(Self::retry_policy(), || async {
-                if has_arp_ref {
-                    router.update_arp_entry(&entry).await
-                } else {
-                    router.add_arp_entry(&entry).await
-                }
-            })
-                .await?;
+            let arp = if has_arp_ref {
+                router.update_arp_entry(&entry).await?
+            } else {
+                router.add_arp_entry(&entry).await?
+            };
 
-            ensure!(arp.id.is_some(), "ARP id was empty");
+            if arp.id.is_none() {
+                op_fatal!("ARP id was empty")
+            }
             assignment.arp_ref = arp.id;
         }
         Ok(())
@@ -136,8 +129,8 @@ impl LNVpsProvisioner {
         &self,
         assignment: &mut VmIpAssignment,
         policy: &AccessPolicy,
-    ) -> Result<()> {
-        let ip = IpNetwork::from_str(&assignment.ip)?;
+    ) -> OpResult<()> {
+        let ip = IpNetwork::from_str(&assignment.ip).map_err(|e| OpError::Fatal(anyhow!(e)))?;
         if matches!(policy.kind, NetworkAccessPolicy::StaticArp) && ip.is_ipv4() {
             let router = self
                 .get_router(
@@ -151,11 +144,7 @@ impl LNVpsProvisioner {
             } else {
                 warn!("ARP REF not found, using arp list");
 
-                let ent = retry_async(Self::retry_policy(), || async {
-                    router.list_arp_entry().await
-                })
-                    .await?;
-
+                let ent = router.list_arp_entry().await?;
                 if let Some(ent) = ent.iter().find(|e| e.address == assignment.ip) {
                     ent.id.clone()
                 } else {
@@ -179,7 +168,7 @@ impl LNVpsProvisioner {
     }
 
     /// Delete DNS on the dns server, does not save to database!
-    pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+    pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
         // Delete forward/reverse dns
         if let Some(dns) = &self.dns {
             let range = self.db.get_ip_range(assignment.ip_range_id).await?;
@@ -215,19 +204,14 @@ impl LNVpsProvisioner {
     }
 
     /// Update DNS on the dns server, does not save to database!
-    pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+    pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
         if let (Some(z), Some(dns)) = (&self.forward_zone_id, &self.dns) {
             let fwd = BasicRecord::forward(assignment)?;
-            let has_id = fwd.id.is_some();
-
-            let ret_fwd = retry_async(Self::retry_policy(), || async {
-                if has_id {
-                    dns.update_record(z, &fwd).await
-                } else {
-                    dns.add_record(z, &fwd).await
-                }
-            })
-                .await?;
+            let ret_fwd = if fwd.id.is_some() {
+                dns.update_record(z, &fwd).await?
+            } else {
+                dns.add_record(z, &fwd).await?
+            };
 
             assignment.dns_forward = Some(ret_fwd.name);
             assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
@@ -236,7 +220,7 @@ impl LNVpsProvisioner {
     }
 
     /// Update DNS on the dns server, does not save to database!
-    pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> Result<()> {
+    pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
         if let Some(dns) = &self.dns {
             let range = self.db.get_ip_range(assignment.ip_range_id).await?;
             if let Some(z) = &range.reverse_zone_id {
@@ -247,14 +231,11 @@ impl LNVpsProvisioner {
                     BasicRecord::reverse_to_fwd(assignment)?
                 };
 
-                let ret_rev = retry_async(Self::retry_policy(), || async {
-                    if has_ref {
-                        dns.update_record(z, &rev_record).await
-                    } else {
-                        dns.add_record(z, &rev_record).await
-                    }
-                })
-                    .await?;
+                let ret_rev = if has_ref {
+                    dns.update_record(z, &rev_record).await?
+                } else {
+                    dns.add_record(z, &rev_record).await?
+                };
 
                 assignment.dns_reverse = Some(ret_rev.value);
                 assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);

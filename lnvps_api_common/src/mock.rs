@@ -3,11 +3,12 @@ use anyhow::{Context, anyhow, bail};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDbBase,
-    NostrDomain, NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    AccessPolicy, Company, DbResult, DiskInterface, DiskType, IpRange, IpRangeAllocationMode,
+    LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, Router, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
+    Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -239,11 +240,11 @@ impl Default for MockDb {
 
 #[async_trait]
 impl LNVpsDbBase for MockDb {
-    async fn migrate(&self) -> anyhow::Result<()> {
+    async fn migrate(&self) -> DbResult<()> {
         Ok(())
     }
 
-    async fn upsert_user(&self, pubkey: &[u8; 32]) -> anyhow::Result<u64> {
+    async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
         let mut users = self.users.lock().await;
         if let Some(e) = users.iter().find(|(_k, u)| u.pubkey == *pubkey) {
             Ok(*e.0)
@@ -263,12 +264,12 @@ impl LNVpsDbBase for MockDb {
         }
     }
 
-    async fn get_user(&self, id: u64) -> anyhow::Result<User> {
+    async fn get_user(&self, id: u64) -> DbResult<User> {
         let users = self.users.lock().await;
         Ok(users.get(&id).ok_or(anyhow!("no user"))?.clone())
     }
 
-    async fn update_user(&self, user: &User) -> anyhow::Result<()> {
+    async fn update_user(&self, user: &User) -> DbResult<()> {
         let mut users = self.users.lock().await;
         if let Some(u) = users.get_mut(&user.id) {
             u.email = user.email.clone();
@@ -278,18 +279,18 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn delete_user(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_user(&self, id: u64) -> DbResult<()> {
         let mut users = self.users.lock().await;
         users.remove(&id);
         Ok(())
     }
 
-    async fn list_users(&self) -> anyhow::Result<Vec<User>> {
+    async fn list_users(&self) -> DbResult<Vec<User>> {
         let users = self.users.lock().await;
         Ok(users.values().cloned().collect())
     }
 
-    async fn list_users_paginated(&self, limit: u64, offset: u64) -> anyhow::Result<Vec<User>> {
+    async fn list_users_paginated(&self, limit: u64, offset: u64) -> DbResult<Vec<User>> {
         let users = self.users.lock().await;
         Ok(users
             .values()
@@ -299,12 +300,12 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn count_users(&self) -> anyhow::Result<u64> {
+    async fn count_users(&self) -> DbResult<u64> {
         let users = self.users.lock().await;
         Ok(users.len() as u64)
     }
 
-    async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> anyhow::Result<u64> {
+    async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> DbResult<u64> {
         let mut ssh_keys = self.user_ssh_keys.lock().await;
         let max_keys = *ssh_keys.keys().max().unwrap_or(&0);
         ssh_keys.insert(
@@ -317,18 +318,18 @@ impl LNVpsDbBase for MockDb {
         Ok(max_keys + 1)
     }
 
-    async fn get_user_ssh_key(&self, id: u64) -> anyhow::Result<UserSshKey> {
+    async fn get_user_ssh_key(&self, id: u64) -> DbResult<UserSshKey> {
         let keys = self.user_ssh_keys.lock().await;
         Ok(keys.get(&id).ok_or(anyhow!("no key"))?.clone())
     }
 
-    async fn delete_user_ssh_key(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_user_ssh_key(&self, id: u64) -> DbResult<()> {
         let mut keys = self.user_ssh_keys.lock().await;
         keys.remove(&id);
         Ok(())
     }
 
-    async fn list_user_ssh_key(&self, user_id: u64) -> anyhow::Result<Vec<UserSshKey>> {
+    async fn list_user_ssh_key(&self, user_id: u64) -> DbResult<Vec<UserSshKey>> {
         let keys = self.user_ssh_keys.lock().await;
         Ok(keys
             .values()
@@ -337,17 +338,17 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn list_host_region(&self) -> anyhow::Result<Vec<VmHostRegion>> {
+    async fn list_host_region(&self) -> DbResult<Vec<VmHostRegion>> {
         let regions = self.regions.lock().await;
         Ok(regions.values().filter(|r| r.enabled).cloned().collect())
     }
 
-    async fn get_host_region(&self, id: u64) -> anyhow::Result<VmHostRegion> {
+    async fn get_host_region(&self, id: u64) -> DbResult<VmHostRegion> {
         let regions = self.regions.lock().await;
         Ok(regions.get(&id).ok_or(anyhow!("no region"))?.clone())
     }
 
-    async fn get_host_region_by_name(&self, name: &str) -> anyhow::Result<VmHostRegion> {
+    async fn get_host_region_by_name(&self, name: &str) -> DbResult<VmHostRegion> {
         let regions = self.regions.lock().await;
         Ok(regions
             .iter()
@@ -357,16 +358,12 @@ impl LNVpsDbBase for MockDb {
             .clone())
     }
 
-    async fn list_hosts(&self) -> anyhow::Result<Vec<VmHost>> {
+    async fn list_hosts(&self) -> DbResult<Vec<VmHost>> {
         let hosts = self.hosts.lock().await;
         Ok(hosts.values().filter(|h| h.enabled).cloned().collect())
     }
 
-    async fn list_hosts_paginated(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> anyhow::Result<(Vec<VmHost>, u64)> {
+    async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         let hosts = self.hosts.lock().await;
         let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
         let total = filtered_hosts.len() as u64;
@@ -382,7 +379,7 @@ impl LNVpsDbBase for MockDb {
         &self,
         limit: u64,
         offset: u64,
-    ) -> anyhow::Result<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    ) -> DbResult<(Vec<(VmHost, VmHostRegion)>, u64)> {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
@@ -401,12 +398,12 @@ impl LNVpsDbBase for MockDb {
         Ok((hosts_with_regions, total))
     }
 
-    async fn get_host(&self, id: u64) -> anyhow::Result<VmHost> {
+    async fn get_host(&self, id: u64) -> DbResult<VmHost> {
         let hosts = self.hosts.lock().await;
         Ok(hosts.get(&id).ok_or(anyhow!("no host"))?.clone())
     }
 
-    async fn update_host(&self, host: &VmHost) -> anyhow::Result<()> {
+    async fn update_host(&self, host: &VmHost) -> DbResult<()> {
         let mut hosts = self.hosts.lock().await;
         if let Some(h) = hosts.get_mut(&host.id) {
             h.enabled = host.enabled;
@@ -416,7 +413,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn create_host(&self, host: &VmHost) -> anyhow::Result<u64> {
+    async fn create_host(&self, host: &VmHost) -> DbResult<u64> {
         let mut hosts = self.hosts.lock().await;
         let id = (hosts.len() as u64) + 1;
         let mut new_host = host.clone();
@@ -425,17 +422,17 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_host_disks(&self, _TB: u64) -> anyhow::Result<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, _TB: u64) -> DbResult<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
         Ok(disks.values().filter(|d| d.enabled).cloned().collect())
     }
 
-    async fn get_host_disk(&self, disk_id: u64) -> anyhow::Result<VmHostDisk> {
+    async fn get_host_disk(&self, disk_id: u64) -> DbResult<VmHostDisk> {
         let disks = self.host_disks.lock().await;
         Ok(disks.get(&disk_id).ok_or(anyhow!("no disk"))?.clone())
     }
 
-    async fn update_host_disk(&self, disk: &VmHostDisk) -> anyhow::Result<()> {
+    async fn update_host_disk(&self, disk: &VmHostDisk) -> DbResult<()> {
         let mut disks = self.host_disks.lock().await;
         if let Some(d) = disks.get_mut(&disk.id) {
             d.name = disk.name.clone();
@@ -447,7 +444,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn create_host_disk(&self, disk: &VmHostDisk) -> anyhow::Result<u64> {
+    async fn create_host_disk(&self, disk: &VmHostDisk) -> DbResult<u64> {
         let mut disks = self.host_disks.lock().await;
         let max_id = disks.keys().max().unwrap_or(&0);
         let new_id = max_id + 1;
@@ -457,27 +454,27 @@ impl LNVpsDbBase for MockDb {
         Ok(new_id)
     }
 
-    async fn get_os_image(&self, id: u64) -> anyhow::Result<VmOsImage> {
+    async fn get_os_image(&self, id: u64) -> DbResult<VmOsImage> {
         let os_images = self.os_images.lock().await;
         Ok(os_images.get(&id).ok_or(anyhow!("no image"))?.clone())
     }
 
-    async fn list_os_image(&self) -> anyhow::Result<Vec<VmOsImage>> {
+    async fn list_os_image(&self) -> DbResult<Vec<VmOsImage>> {
         let os_images = self.os_images.lock().await;
         Ok(os_images.values().filter(|i| i.enabled).cloned().collect())
     }
 
-    async fn get_ip_range(&self, id: u64) -> anyhow::Result<IpRange> {
+    async fn get_ip_range(&self, id: u64) -> DbResult<IpRange> {
         let ip_range = self.ip_range.lock().await;
         Ok(ip_range.get(&id).ok_or(anyhow!("no ip range"))?.clone())
     }
 
-    async fn list_ip_range(&self) -> anyhow::Result<Vec<IpRange>> {
+    async fn list_ip_range(&self) -> DbResult<Vec<IpRange>> {
         let ip_range = self.ip_range.lock().await;
         Ok(ip_range.values().filter(|r| r.enabled).cloned().collect())
     }
 
-    async fn list_ip_range_in_region(&self, region_id: u64) -> anyhow::Result<Vec<IpRange>> {
+    async fn list_ip_range_in_region(&self, region_id: u64) -> DbResult<Vec<IpRange>> {
         let ip_range = self.ip_range.lock().await;
         Ok(ip_range
             .values()
@@ -486,17 +483,17 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_cost_plan(&self, id: u64) -> anyhow::Result<VmCostPlan> {
+    async fn get_cost_plan(&self, id: u64) -> DbResult<VmCostPlan> {
         let cost_plans = self.cost_plans.lock().await;
         Ok(cost_plans.get(&id).ok_or(anyhow!("no cost plan"))?.clone())
     }
 
-    async fn list_cost_plans(&self) -> anyhow::Result<Vec<VmCostPlan>> {
+    async fn list_cost_plans(&self) -> DbResult<Vec<VmCostPlan>> {
         let cost_plans = self.cost_plans.lock().await;
         Ok(cost_plans.values().cloned().collect())
     }
 
-    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> anyhow::Result<u64> {
+    async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64> {
         let mut cost_plans = self.cost_plans.lock().await;
         let max = *cost_plans.keys().max().unwrap_or(&0);
         let id = max + 1;
@@ -506,7 +503,7 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> anyhow::Result<()> {
+    async fn update_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<()> {
         let mut cost_plans = self.cost_plans.lock().await;
         if cost_plans.contains_key(&cost_plan.id) {
             cost_plans.insert(cost_plan.id, cost_plan.clone());
@@ -514,18 +511,18 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn delete_cost_plan(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_cost_plan(&self, id: u64) -> DbResult<()> {
         let mut cost_plans = self.cost_plans.lock().await;
         cost_plans.remove(&id);
         Ok(())
     }
 
-    async fn get_vm_template(&self, id: u64) -> anyhow::Result<VmTemplate> {
+    async fn get_vm_template(&self, id: u64) -> DbResult<VmTemplate> {
         let templates = self.templates.lock().await;
         Ok(templates.get(&id).ok_or(anyhow!("no template"))?.clone())
     }
 
-    async fn list_vm_templates(&self) -> anyhow::Result<Vec<VmTemplate>> {
+    async fn list_vm_templates(&self) -> DbResult<Vec<VmTemplate>> {
         let templates = self.templates.lock().await;
         Ok(templates
             .values()
@@ -534,7 +531,7 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn insert_vm_template(&self, template: &VmTemplate) -> anyhow::Result<u64> {
+    async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
         let mut templates = self.templates.lock().await;
         let max_id = *templates.keys().max().unwrap_or(&0);
         templates.insert(
@@ -547,12 +544,12 @@ impl LNVpsDbBase for MockDb {
         Ok(max_id + 1)
     }
 
-    async fn list_vms(&self) -> anyhow::Result<Vec<Vm>> {
+    async fn list_vms(&self) -> DbResult<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms.values().filter(|v| !v.deleted).cloned().collect())
     }
 
-    async fn list_vms_on_host(&self, host_id: u64) -> anyhow::Result<Vec<Vm>> {
+    async fn list_vms_on_host(&self, host_id: u64) -> DbResult<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms
             .values()
@@ -561,7 +558,7 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn count_active_vms_on_host(&self, host_id: u64) -> anyhow::Result<u64> {
+    async fn count_active_vms_on_host(&self, host_id: u64) -> DbResult<u64> {
         let vms = self.vms.lock().await;
         Ok(vms
             .values()
@@ -569,7 +566,7 @@ impl LNVpsDbBase for MockDb {
             .count() as u64)
     }
 
-    async fn list_expired_vms(&self) -> anyhow::Result<Vec<Vm>> {
+    async fn list_expired_vms(&self) -> DbResult<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms
             .values()
@@ -578,7 +575,7 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn list_user_vms(&self, id: u64) -> anyhow::Result<Vec<Vm>> {
+    async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms
             .values()
@@ -587,12 +584,12 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_vm(&self, vm_id: u64) -> anyhow::Result<Vm> {
+    async fn get_vm(&self, vm_id: u64) -> DbResult<Vm> {
         let vms = self.vms.lock().await;
         Ok(vms.get(&vm_id).ok_or(anyhow!("no vm"))?.clone())
     }
 
-    async fn insert_vm(&self, vm: &Vm) -> anyhow::Result<u64> {
+    async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
         let mut vms = self.vms.lock().await;
         let max_id = *vms.keys().max().unwrap_or(&0);
 
@@ -619,13 +616,13 @@ impl LNVpsDbBase for MockDb {
         Ok(max_id + 1)
     }
 
-    async fn delete_vm(&self, vm_id: u64) -> anyhow::Result<()> {
+    async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
         vms.remove(&vm_id);
         Ok(())
     }
 
-    async fn update_vm(&self, vm: &Vm) -> anyhow::Result<()> {
+    async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(v) = vms.get_mut(&vm.id) {
             v.image_id = vm.image_id;
@@ -639,7 +636,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> anyhow::Result<u64> {
+    async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         let max = *ip_assignments.keys().max().unwrap_or(&0);
         ip_assignments.insert(
@@ -652,7 +649,7 @@ impl LNVpsDbBase for MockDb {
         Ok(max + 1)
     }
 
-    async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> anyhow::Result<()> {
+    async fn update_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<()> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         if let Some(i) = ip_assignments.get_mut(&ip_assignment.id) {
             i.arp_ref = ip_assignment.arp_ref.clone();
@@ -664,7 +661,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn list_vm_ip_assignments(&self, vm_id: u64) -> anyhow::Result<Vec<VmIpAssignment>> {
+    async fn list_vm_ip_assignments(&self, vm_id: u64) -> DbResult<Vec<VmIpAssignment>> {
         let ip_assignments = self.ip_assignments.lock().await;
         Ok(ip_assignments
             .values()
@@ -676,7 +673,7 @@ impl LNVpsDbBase for MockDb {
     async fn list_vm_ip_assignments_in_range(
         &self,
         range_id: u64,
-    ) -> anyhow::Result<Vec<VmIpAssignment>> {
+    ) -> DbResult<Vec<VmIpAssignment>> {
         let ip_assignments = self.ip_assignments.lock().await;
         Ok(ip_assignments
             .values()
@@ -685,7 +682,7 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> anyhow::Result<()> {
+    async fn delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> DbResult<()> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         for ip_assignment in ip_assignments.values_mut() {
             if ip_assignment.vm_id == vm_id {
@@ -695,7 +692,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> anyhow::Result<()> {
+    async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         for ip_assignment in ip_assignments.values_mut() {
             if ip_assignment.id == assignment_id {
@@ -705,7 +702,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn list_vm_payment(&self, vm_id: u64) -> anyhow::Result<Vec<VmPayment>> {
+    async fn list_vm_payment(&self, vm_id: u64) -> DbResult<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         Ok(p.iter().filter(|p| p.vm_id == vm_id).cloned().collect())
     }
@@ -715,7 +712,7 @@ impl LNVpsDbBase for MockDb {
         vm_id: u64,
         limit: u64,
         offset: u64,
-    ) -> anyhow::Result<Vec<VmPayment>> {
+    ) -> DbResult<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         let mut filtered: Vec<_> = p.iter().filter(|p| p.vm_id == vm_id).cloned().collect();
         filtered.sort_by(|a, b| b.created.cmp(&a.created));
@@ -731,7 +728,7 @@ impl LNVpsDbBase for MockDb {
         vm_id: u64,
         method: lnvps_db::PaymentMethod,
         payment_type: lnvps_db::PaymentType,
-    ) -> anyhow::Result<Vec<VmPayment>> {
+    ) -> DbResult<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         let mut filtered: Vec<_> = p
             .iter()
@@ -748,13 +745,13 @@ impl LNVpsDbBase for MockDb {
         Ok(filtered)
     }
 
-    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
+    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
         let mut p = self.payments.lock().await;
         p.push(vm_payment.clone());
         Ok(())
     }
 
-    async fn get_vm_payment(&self, id: &Vec<u8>) -> anyhow::Result<VmPayment> {
+    async fn get_vm_payment(&self, id: &Vec<u8>) -> DbResult<VmPayment> {
         let p = self.payments.lock().await;
         Ok(p.iter()
             .find(|p| p.id == *id)
@@ -762,7 +759,7 @@ impl LNVpsDbBase for MockDb {
             .clone())
     }
 
-    async fn get_vm_payment_by_ext_id(&self, id: &str) -> anyhow::Result<VmPayment> {
+    async fn get_vm_payment_by_ext_id(&self, id: &str) -> DbResult<VmPayment> {
         let p = self.payments.lock().await;
         Ok(p.iter()
             .find(|p| p.external_id == Some(id.to_string()))
@@ -770,7 +767,7 @@ impl LNVpsDbBase for MockDb {
             .clone())
     }
 
-    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> anyhow::Result<()> {
+    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
         let mut p = self.payments.lock().await;
         if let Some(p) = p.iter_mut().find(|p| p.id == *vm_payment.id) {
             p.is_paid = vm_payment.is_paid;
@@ -778,7 +775,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn vm_payment_paid(&self, p: &VmPayment) -> anyhow::Result<()> {
+    async fn vm_payment_paid(&self, p: &VmPayment) -> DbResult<()> {
         let mut v = self.vms.lock().await;
         self.update_vm_payment(p).await?;
         if let Some(v) = v.get_mut(&p.vm_id) {
@@ -787,7 +784,7 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn last_paid_invoice(&self) -> anyhow::Result<Option<VmPayment>> {
+    async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>> {
         let p = self.payments.lock().await;
         Ok(p.iter()
             .filter(|p| p.is_paid)
@@ -795,22 +792,22 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
-    async fn list_custom_pricing(&self, _TB: u64) -> anyhow::Result<Vec<VmCustomPricing>> {
+    async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().filter(|p| p.enabled).cloned().collect())
     }
 
-    async fn get_custom_pricing(&self, id: u64) -> anyhow::Result<VmCustomPricing> {
+    async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
         let p = self.custom_pricing.lock().await;
         Ok(p.get(&id).cloned().context("no custom pricing")?)
     }
 
-    async fn get_custom_vm_template(&self, id: u64) -> anyhow::Result<VmCustomTemplate> {
+    async fn get_custom_vm_template(&self, id: u64) -> DbResult<VmCustomTemplate> {
         let t = self.custom_template.lock().await;
         Ok(t.get(&id).cloned().context("no custom template")?)
     }
 
-    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> anyhow::Result<u64> {
+    async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
         let mut t = self.custom_template.lock().await;
         let max_id = *t.keys().max().unwrap_or(&0);
         t.insert(
@@ -823,7 +820,7 @@ impl LNVpsDbBase for MockDb {
         Ok(max_id + 1)
     }
 
-    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
+    async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
         let mut t = self.custom_template.lock().await;
         t.insert(template.id, template.clone());
         Ok(())
@@ -832,7 +829,7 @@ impl LNVpsDbBase for MockDb {
     async fn list_custom_pricing_disk(
         &self,
         pricing_id: u64,
-    ) -> anyhow::Result<Vec<VmCustomPricingDisk>> {
+    ) -> DbResult<Vec<VmCustomPricingDisk>> {
         let d = self.custom_pricing_disk.lock().await;
         Ok(d.values()
             .filter(|d| d.pricing_id == pricing_id)
@@ -840,50 +837,50 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_router(&self, router_id: u64) -> anyhow::Result<Router> {
+    async fn get_router(&self, router_id: u64) -> DbResult<Router> {
         let r = self.router.lock().await;
         Ok(r.get(&router_id).cloned().context("no router")?)
     }
 
-    async fn list_routers(&self) -> anyhow::Result<Vec<Router>> {
+    async fn list_routers(&self) -> DbResult<Vec<Router>> {
         let routers = self.router.lock().await;
         Ok(routers.values().cloned().collect())
     }
 
-    async fn get_vm_ip_assignment(&self, id: u64) -> anyhow::Result<VmIpAssignment> {
+    async fn get_vm_ip_assignment(&self, id: u64) -> DbResult<VmIpAssignment> {
         let assignments = self.ip_assignments.lock().await;
-        assignments
+        Ok(assignments
             .values()
             .find(|a| a.id == id)
             .cloned()
-            .ok_or_else(|| anyhow!("IP assignment not found for {}", id))
+            .ok_or_else(|| anyhow!("IP assignment not found for {}", id))?)
     }
 
-    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> anyhow::Result<VmIpAssignment> {
+    async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> DbResult<VmIpAssignment> {
         let assignments = self.ip_assignments.lock().await;
-        assignments
+        Ok(assignments
             .values()
             .find(|a| a.ip == ip)
             .cloned()
-            .ok_or_else(|| anyhow!("IP assignment not found for {}", ip))
+            .ok_or_else(|| anyhow!("IP assignment not found for {}", ip))?)
     }
 
-    async fn get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> {
+    async fn get_access_policy(&self, access_policy_id: u64) -> DbResult<AccessPolicy> {
         let p = self.access_policy.lock().await;
         Ok(p.get(&access_policy_id)
             .cloned()
             .context("no access policy")?)
     }
 
-    async fn get_company(&self, company_id: u64) -> anyhow::Result<Company> {
+    async fn get_company(&self, company_id: u64) -> DbResult<Company> {
         let companies = self.companies.lock().await;
-        companies
+        Ok(companies
             .get(&company_id)
             .cloned()
-            .ok_or_else(|| anyhow!("Company with id {} not found", company_id))
+            .ok_or_else(|| anyhow!("Company with id {} not found", company_id))?)
     }
 
-    async fn get_vm_base_currency(&self, vm_id: u64) -> anyhow::Result<String> {
+    async fn get_vm_base_currency(&self, vm_id: u64) -> DbResult<String> {
         // Follow VM -> Host -> Region -> Company chain
         let vms = self.vms.lock().await;
         let vm = vms.get(&vm_id).ok_or_else(|| anyhow!("VM not found"))?;
@@ -909,7 +906,7 @@ impl LNVpsDbBase for MockDb {
         }
     }
 
-    async fn insert_vm_history(&self, history: &VmHistory) -> anyhow::Result<u64> {
+    async fn insert_vm_history(&self, history: &VmHistory) -> DbResult<u64> {
         let mut vm_history_map = self.vm_history.lock().await;
         let id = (vm_history_map.len() + 1) as u64;
         let mut new_history = history.clone();
@@ -918,7 +915,7 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_vm_history(&self, vm_id: u64) -> anyhow::Result<Vec<VmHistory>> {
+    async fn list_vm_history(&self, vm_id: u64) -> DbResult<Vec<VmHistory>> {
         let vm_history_map = self.vm_history.lock().await;
         let mut history: Vec<VmHistory> = vm_history_map
             .values()
@@ -935,7 +932,7 @@ impl LNVpsDbBase for MockDb {
         vm_id: u64,
         limit: u64,
         offset: u64,
-    ) -> anyhow::Result<Vec<VmHistory>> {
+    ) -> DbResult<Vec<VmHistory>> {
         let all_history = self.list_vm_history(vm_id).await?;
         let start = offset as usize;
         let end = (start + limit as usize).min(all_history.len());
@@ -946,15 +943,15 @@ impl LNVpsDbBase for MockDb {
         }
     }
 
-    async fn get_vm_history(&self, id: u64) -> anyhow::Result<VmHistory> {
+    async fn get_vm_history(&self, id: u64) -> DbResult<VmHistory> {
         let vm_history_map = self.vm_history.lock().await;
-        vm_history_map
+        Ok(vm_history_map
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow!("VM history not found: {}", id))
+            .ok_or_else(|| anyhow!("VM history not found: {}", id))?)
     }
 
-    async fn execute_query(&self, _query: &str) -> anyhow::Result<u64> {
+    async fn execute_query(&self, _query: &str) -> DbResult<u64> {
         // Mock implementation - always returns success
         Ok(0)
     }
@@ -963,17 +960,17 @@ impl LNVpsDbBase for MockDb {
         &self,
         _query: &str,
         _params: Vec<String>,
-    ) -> anyhow::Result<u64> {
+    ) -> DbResult<u64> {
         // Mock implementation - always returns success
         Ok(0)
     }
 
-    async fn fetch_raw_strings(&self, _query: &str) -> anyhow::Result<Vec<(u64, String)>> {
+    async fn fetch_raw_strings(&self, _query: &str) -> DbResult<Vec<(u64, String)>> {
         // Mock implementation - returns empty result
         Ok(vec![])
     }
 
-    async fn get_active_customers_with_contact_prefs(&self) -> anyhow::Result<Vec<User>> {
+    async fn get_active_customers_with_contact_prefs(&self) -> DbResult<Vec<User>> {
         let users = self.users.lock().await;
         let vms = self.vms.lock().await;
 
@@ -996,13 +993,17 @@ impl LNVpsDbBase for MockDb {
         Ok(active_customers)
     }
 
+    async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>> {
+        Ok(vec![])
+    }
+
     // Subscription methods
-    async fn list_subscriptions(&self) -> anyhow::Result<Vec<Subscription>> {
+    async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions.values().cloned().collect())
     }
 
-    async fn list_subscriptions_by_user(&self, user_id: u64) -> anyhow::Result<Vec<Subscription>> {
+    async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions
             .values()
@@ -1011,7 +1012,7 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn list_subscriptions_active(&self, user_id: u64) -> anyhow::Result<Vec<Subscription>> {
+    async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions
             .values()
@@ -1020,24 +1021,24 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_subscription(&self, id: u64) -> anyhow::Result<Subscription> {
+    async fn get_subscription(&self, id: u64) -> DbResult<Subscription> {
         let subscriptions = self.subscriptions.lock().await;
-        subscriptions
+        Ok(subscriptions
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow!("Subscription not found: {}", id))
+            .ok_or_else(|| anyhow!("Subscription not found: {}", id))?)
     }
 
-    async fn get_subscription_by_ext_id(&self, ext_id: &str) -> anyhow::Result<Subscription> {
+    async fn get_subscription_by_ext_id(&self, ext_id: &str) -> DbResult<Subscription> {
         let subscriptions = self.subscriptions.lock().await;
-        subscriptions
+        Ok(subscriptions
             .values()
             .find(|s| s.external_id.as_deref() == Some(ext_id))
             .cloned()
-            .ok_or_else(|| anyhow!("Subscription not found with external_id: {}", ext_id))
+            .ok_or_else(|| anyhow!("Subscription not found with external_id: {}", ext_id))?)
     }
 
-    async fn insert_subscription(&self, subscription: &Subscription) -> anyhow::Result<u64> {
+    async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         let mut subscriptions = self.subscriptions.lock().await;
         let max_id = subscriptions.keys().max().unwrap_or(&0);
         let new_id = max_id + 1;
@@ -1047,23 +1048,25 @@ impl LNVpsDbBase for MockDb {
         Ok(new_id)
     }
 
-    async fn update_subscription(&self, subscription: &Subscription) -> anyhow::Result<()> {
+    async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
         let mut subscriptions = self.subscriptions.lock().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = subscriptions.entry(subscription.id) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            subscriptions.entry(subscription.id)
+        {
             e.insert(subscription.clone());
             Ok(())
         } else {
-            bail!("Subscription not found: {}", subscription.id)
+            Err(anyhow!("Subscription not found: {}", subscription.id).into())
         }
     }
 
-    async fn delete_subscription(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_subscription(&self, id: u64) -> DbResult<()> {
         let mut subscriptions = self.subscriptions.lock().await;
         subscriptions.remove(&id);
         Ok(())
     }
 
-    async fn get_subscription_base_currency(&self, subscription_id: u64) -> anyhow::Result<String> {
+    async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String> {
         // Get currency from the subscription itself
         let subscriptions = self.subscriptions.lock().await;
         if let Some(subscription) = subscriptions.get(&subscription_id) {
@@ -1077,7 +1080,7 @@ impl LNVpsDbBase for MockDb {
     async fn list_subscription_line_items(
         &self,
         subscription_id: u64,
-    ) -> anyhow::Result<Vec<SubscriptionLineItem>> {
+    ) -> DbResult<Vec<SubscriptionLineItem>> {
         let line_items = self.subscription_line_items.lock().await;
         Ok(line_items
             .values()
@@ -1086,18 +1089,18 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_subscription_line_item(&self, id: u64) -> anyhow::Result<SubscriptionLineItem> {
+    async fn get_subscription_line_item(&self, id: u64) -> DbResult<SubscriptionLineItem> {
         let line_items = self.subscription_line_items.lock().await;
-        line_items
+        Ok(line_items
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow!("Subscription line item not found: {}", id))
+            .ok_or_else(|| anyhow!("Subscription line item not found: {}", id))?)
     }
 
     async fn insert_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,
-    ) -> anyhow::Result<u64> {
+    ) -> DbResult<u64> {
         let mut line_items = self.subscription_line_items.lock().await;
         let max_id = line_items.keys().max().unwrap_or(&0);
         let new_id = max_id + 1;
@@ -1110,17 +1113,17 @@ impl LNVpsDbBase for MockDb {
     async fn update_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,
-    ) -> anyhow::Result<()> {
+    ) -> DbResult<()> {
         let mut line_items = self.subscription_line_items.lock().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = line_items.entry(line_item.id) {
             e.insert(line_item.clone());
             Ok(())
         } else {
-            bail!("Subscription line item not found: {}", line_item.id)
+            Err(anyhow!("Subscription line item not found: {}", line_item.id).into())
         }
     }
 
-    async fn delete_subscription_line_item(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_subscription_line_item(&self, id: u64) -> DbResult<()> {
         let mut line_items = self.subscription_line_items.lock().await;
         line_items.remove(&id);
         Ok(())
@@ -1130,7 +1133,7 @@ impl LNVpsDbBase for MockDb {
     async fn list_subscription_payments(
         &self,
         subscription_id: u64,
-    ) -> anyhow::Result<Vec<SubscriptionPayment>> {
+    ) -> DbResult<Vec<SubscriptionPayment>> {
         let payments = self.subscription_payments.lock().await;
         Ok(payments
             .iter()
@@ -1142,7 +1145,7 @@ impl LNVpsDbBase for MockDb {
     async fn list_subscription_payments_by_user(
         &self,
         user_id: u64,
-    ) -> anyhow::Result<Vec<SubscriptionPayment>> {
+    ) -> DbResult<Vec<SubscriptionPayment>> {
         let payments = self.subscription_payments.lock().await;
         Ok(payments
             .iter()
@@ -1151,31 +1154,31 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_subscription_payment(&self, id: &Vec<u8>) -> anyhow::Result<SubscriptionPayment> {
+    async fn get_subscription_payment(&self, id: &Vec<u8>) -> DbResult<SubscriptionPayment> {
         let payments = self.subscription_payments.lock().await;
-        payments
+        Ok(payments
             .iter()
             .find(|p| &p.id == id)
             .cloned()
-            .context("Subscription payment not found")
+            .context("Subscription payment not found")?)
     }
 
     async fn get_subscription_payment_by_ext_id(
         &self,
         ext_id: &str,
-    ) -> anyhow::Result<SubscriptionPayment> {
+    ) -> DbResult<SubscriptionPayment> {
         let payments = self.subscription_payments.lock().await;
-        payments
+        Ok(payments
             .iter()
             .find(|p| p.external_id.as_deref() == Some(ext_id))
             .cloned()
-            .context("Subscription payment not found")
+            .context("Subscription payment not found")?)
     }
 
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,
-    ) -> anyhow::Result<SubscriptionPaymentWithCompany> {
+    ) -> DbResult<SubscriptionPaymentWithCompany> {
         let payments = self.subscription_payments.lock().await;
         let payment = payments
             .iter()
@@ -1204,29 +1207,23 @@ impl LNVpsDbBase for MockDb {
         })
     }
 
-    async fn insert_subscription_payment(
-        &self,
-        payment: &SubscriptionPayment,
-    ) -> anyhow::Result<()> {
+    async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         let mut payments = self.subscription_payments.lock().await;
         payments.push(payment.clone());
         Ok(())
     }
 
-    async fn update_subscription_payment(
-        &self,
-        payment: &SubscriptionPayment,
-    ) -> anyhow::Result<()> {
+    async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         let mut payments = self.subscription_payments.lock().await;
         if let Some(p) = payments.iter_mut().find(|p| p.id == payment.id) {
             p.is_paid = payment.is_paid;
             Ok(())
         } else {
-            bail!("Subscription payment not found")
+            Err(anyhow!("Subscription payment not found").into())
         }
     }
 
-    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> anyhow::Result<()> {
+    async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         // Mark payment as paid
         self.update_subscription_payment(payment).await?;
 
@@ -1247,17 +1244,13 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn last_paid_subscription_invoice(&self) -> anyhow::Result<Option<SubscriptionPayment>> {
+    async fn last_paid_subscription_invoice(&self) -> DbResult<Option<SubscriptionPayment>> {
         let payments = self.subscription_payments.lock().await;
         Ok(payments
             .iter()
             .filter(|p| p.is_paid)
             .max_by(|a, b| a.created.cmp(&b.created))
             .cloned())
-    }
-
-    async fn list_admin_user_ids(&self) -> anyhow::Result<Vec<u64>> {
-        Ok(vec![])
     }
 }
 
@@ -1317,15 +1310,15 @@ impl lnvps_db::AdminDb for MockDb {
     async fn get_user_permissions(
         &self,
         _user_id: u64,
-    ) -> anyhow::Result<std::collections::HashSet<(u16, u16)>> {
+    ) -> DbResult<std::collections::HashSet<(u16, u16)>> {
         Ok(std::collections::HashSet::new())
     }
 
-    async fn get_user_roles(&self, _user_id: u64) -> anyhow::Result<Vec<u64>> {
+    async fn get_user_roles(&self, _user_id: u64) -> DbResult<Vec<u64>> {
         Ok(vec![])
     }
 
-    async fn is_admin_user(&self, _user_id: u64) -> anyhow::Result<bool> {
+    async fn is_admin_user(&self, _user_id: u64) -> DbResult<bool> {
         Ok(false)
     }
 
@@ -1334,35 +1327,35 @@ impl lnvps_db::AdminDb for MockDb {
         _user_id: u64,
         _role_id: u64,
         _assigned_by: u64,
-    ) -> anyhow::Result<()> {
+    ) -> DbResult<()> {
         Ok(())
     }
 
-    async fn revoke_user_role(&self, _user_id: u64, _role_id: u64) -> anyhow::Result<()> {
+    async fn revoke_user_role(&self, _user_id: u64, _role_id: u64) -> DbResult<()> {
         Ok(())
     }
 
-    async fn create_role(&self, _name: &str, _description: Option<&str>) -> anyhow::Result<u64> {
+    async fn create_role(&self, _name: &str, _description: Option<&str>) -> DbResult<u64> {
         Ok(1)
     }
 
-    async fn get_role(&self, _role_id: u64) -> anyhow::Result<AdminRole> {
-        bail!("Mock implementation: get_role not implemented")
+    async fn get_role(&self, _role_id: u64) -> DbResult<AdminRole> {
+        todo!()
     }
 
-    async fn get_role_by_name(&self, _name: &str) -> anyhow::Result<AdminRole> {
-        bail!("Mock implementation: get_role_by_name not implemented")
+    async fn get_role_by_name(&self, _name: &str) -> DbResult<AdminRole> {
+        todo!()
     }
 
-    async fn list_roles(&self) -> anyhow::Result<Vec<AdminRole>> {
+    async fn list_roles(&self) -> DbResult<Vec<AdminRole>> {
         Ok(vec![])
     }
 
-    async fn update_role(&self, _role: &AdminRole) -> anyhow::Result<()> {
+    async fn update_role(&self, _role: &AdminRole) -> DbResult<()> {
         Ok(())
     }
 
-    async fn delete_role(&self, _role_id: u64) -> anyhow::Result<()> {
+    async fn delete_role(&self, _role_id: u64) -> DbResult<()> {
         Ok(())
     }
 
@@ -1371,7 +1364,7 @@ impl lnvps_db::AdminDb for MockDb {
         _role_id: u64,
         _resource: u16,
         _action: u16,
-    ) -> anyhow::Result<()> {
+    ) -> DbResult<()> {
         Ok(())
     }
 
@@ -1380,22 +1373,19 @@ impl lnvps_db::AdminDb for MockDb {
         _role_id: u64,
         _resource: u16,
         _action: u16,
-    ) -> anyhow::Result<()> {
+    ) -> DbResult<()> {
         Ok(())
     }
 
-    async fn get_role_permissions(&self, _role_id: u64) -> anyhow::Result<Vec<(u16, u16)>> {
+    async fn get_role_permissions(&self, _role_id: u64) -> DbResult<Vec<(u16, u16)>> {
         Ok(vec![])
     }
 
-    async fn get_user_role_assignments(
-        &self,
-        _user_id: u64,
-    ) -> anyhow::Result<Vec<AdminRoleAssignment>> {
+    async fn get_user_role_assignments(&self, _user_id: u64) -> DbResult<Vec<AdminRoleAssignment>> {
         Ok(vec![])
     }
 
-    async fn count_role_users(&self, _role_id: u64) -> anyhow::Result<u64> {
+    async fn count_role_users(&self, _role_id: u64) -> DbResult<u64> {
         Ok(0)
     }
 
@@ -1404,7 +1394,7 @@ impl lnvps_db::AdminDb for MockDb {
         limit: u64,
         offset: u64,
         _search_pubkey: Option<&str>,
-    ) -> anyhow::Result<(Vec<AdminUserInfo>, u64)> {
+    ) -> DbResult<(Vec<AdminUserInfo>, u64)> {
         let users = self.users.lock().await;
         let total = users.len() as u64;
         let paginated_users: Vec<AdminUserInfo> = users
@@ -1424,7 +1414,7 @@ impl lnvps_db::AdminDb for MockDb {
         &self,
         limit: u64,
         offset: u64,
-    ) -> anyhow::Result<(Vec<VmHostRegion>, u64)> {
+    ) -> DbResult<(Vec<VmHostRegion>, u64)> {
         let regions = self.regions.lock().await;
         let total = regions.len() as u64;
         let paginated_regions: Vec<VmHostRegion> = regions
@@ -1442,45 +1432,45 @@ impl lnvps_db::AdminDb for MockDb {
         _name: &str,
         _enabled: bool,
         _company_id: Option<u64>,
-    ) -> anyhow::Result<u64> {
+    ) -> DbResult<u64> {
         Ok(1)
     }
-    async fn admin_update_region(&self, _region: &VmHostRegion) -> anyhow::Result<()> {
+    async fn admin_update_region(&self, _region: &VmHostRegion) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_delete_region(&self, _region_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_region(&self, _region_id: u64) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_count_region_hosts(&self, _region_id: u64) -> anyhow::Result<u64> {
+    async fn admin_count_region_hosts(&self, _region_id: u64) -> DbResult<u64> {
         Ok(0)
     }
-    async fn admin_get_region_stats(&self, _region_id: u64) -> anyhow::Result<RegionStats> {
-        bail!("Mock implementation: admin_get_region_stats not implemented")
+    async fn admin_get_region_stats(&self, _region_id: u64) -> DbResult<RegionStats> {
+        todo!()
     }
     async fn admin_list_vm_os_images(
         &self,
         _limit: u64,
         _offset: u64,
-    ) -> anyhow::Result<(Vec<VmOsImage>, u64)> {
+    ) -> DbResult<(Vec<VmOsImage>, u64)> {
         Ok((vec![], 0))
     }
-    async fn admin_get_vm_os_image(&self, _image_id: u64) -> anyhow::Result<VmOsImage> {
-        bail!("Mock implementation: admin_get_vm_os_image not implemented")
+    async fn admin_get_vm_os_image(&self, _image_id: u64) -> DbResult<VmOsImage> {
+        todo!()
     }
-    async fn admin_create_vm_os_image(&self, _image: &VmOsImage) -> anyhow::Result<u64> {
+    async fn admin_create_vm_os_image(&self, _image: &VmOsImage) -> DbResult<u64> {
         Ok(1)
     }
-    async fn admin_update_vm_os_image(&self, _image: &VmOsImage) -> anyhow::Result<()> {
+    async fn admin_update_vm_os_image(&self, _image: &VmOsImage) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_delete_vm_os_image(&self, _image_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_vm_os_image(&self, _image_id: u64) -> DbResult<()> {
         Ok(())
     }
     async fn list_vm_templates_paginated(
         &self,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<(Vec<VmTemplate>, i64)> {
+    ) -> DbResult<(Vec<VmTemplate>, i64)> {
         let templates = self.templates.lock().await;
         let total = templates.len() as i64;
         let paginated: Vec<VmTemplate> = templates
@@ -1491,20 +1481,20 @@ impl lnvps_db::AdminDb for MockDb {
             .collect();
         Ok((paginated, total))
     }
-    async fn update_vm_template(&self, _template: &VmTemplate) -> anyhow::Result<()> {
+    async fn update_vm_template(&self, _template: &VmTemplate) -> DbResult<()> {
         Ok(())
     }
-    async fn delete_vm_template(&self, _template_id: u64) -> anyhow::Result<()> {
+    async fn delete_vm_template(&self, _template_id: u64) -> DbResult<()> {
         Ok(())
     }
-    async fn check_vm_template_usage(&self, _template_id: u64) -> anyhow::Result<i64> {
+    async fn check_vm_template_usage(&self, _template_id: u64) -> DbResult<i64> {
         Ok(0)
     }
     async fn admin_list_hosts_with_regions_paginated(
         &self,
         limit: u64,
         offset: u64,
-    ) -> anyhow::Result<(Vec<AdminVmHost>, u64)> {
+    ) -> DbResult<(Vec<AdminVmHost>, u64)> {
         let (host_region_pairs, total) = self
             .list_hosts_with_regions_paginated(limit, offset)
             .await?;
@@ -1528,7 +1518,7 @@ impl lnvps_db::AdminDb for MockDb {
 
         Ok((admin_hosts, total))
     }
-    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<u64> {
+    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
         let mut pricing_map = self.custom_pricing.lock().await;
         let max_id = pricing_map.keys().max().unwrap_or(&0) + 1;
         let mut new_pricing = pricing.clone();
@@ -1536,24 +1526,24 @@ impl lnvps_db::AdminDb for MockDb {
         pricing_map.insert(max_id, new_pricing);
         Ok(max_id)
     }
-    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> anyhow::Result<()> {
+    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<()> {
         let mut pricing_map = self.custom_pricing.lock().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = pricing_map.entry(pricing.id) {
             e.insert(pricing.clone());
             Ok(())
         } else {
-            bail!("Custom pricing not found: {}", pricing.id)
+            Err(anyhow!("Custom pricing not found: {}", pricing.id).into())
         }
     }
-    async fn delete_custom_pricing(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_custom_pricing(&self, id: u64) -> DbResult<()> {
         let mut pricing_map = self.custom_pricing.lock().await;
         if pricing_map.remove(&id).is_some() {
             Ok(())
         } else {
-            bail!("Custom pricing not found: {}", id)
+            Err(anyhow!("Custom pricing not found: {}", id).into())
         }
     }
-    async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> anyhow::Result<u64> {
+    async fn insert_custom_pricing_disk(&self, disk: &VmCustomPricingDisk) -> DbResult<u64> {
         let mut disk_map = self.custom_pricing_disk.lock().await;
         let max_id = disk_map.keys().max().unwrap_or(&0) + 1;
         let mut new_disk = disk.clone();
@@ -1561,12 +1551,12 @@ impl lnvps_db::AdminDb for MockDb {
         disk_map.insert(max_id, new_disk);
         Ok(max_id)
     }
-    async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> anyhow::Result<()> {
+    async fn delete_custom_pricing_disks(&self, pricing_id: u64) -> DbResult<()> {
         let mut disk_map = self.custom_pricing_disk.lock().await;
         disk_map.retain(|_, disk| disk.pricing_id != pricing_id);
         Ok(())
     }
-    async fn count_custom_templates_by_pricing(&self, pricing_id: u64) -> anyhow::Result<u64> {
+    async fn count_custom_templates_by_pricing(&self, pricing_id: u64) -> DbResult<u64> {
         let template_map = self.custom_template.lock().await;
         let count = template_map
             .values()
@@ -1580,7 +1570,7 @@ impl lnvps_db::AdminDb for MockDb {
         pricing_id: u64,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<(Vec<VmCustomTemplate>, u64)> {
+    ) -> DbResult<(Vec<VmCustomTemplate>, u64)> {
         let template_map = self.custom_template.lock().await;
         let filtered_templates: Vec<VmCustomTemplate> = template_map
             .values()
@@ -1596,7 +1586,7 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((paginated, total))
     }
 
-    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<u64> {
+    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
         let mut template_map = self.custom_template.lock().await;
         let max_id = template_map.keys().max().unwrap_or(&0) + 1;
         let mut new_template = template.clone();
@@ -1605,26 +1595,26 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(max_id)
     }
 
-    async fn update_custom_template(&self, template: &VmCustomTemplate) -> anyhow::Result<()> {
+    async fn update_custom_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
         let mut template_map = self.custom_template.lock().await;
         if let std::collections::hash_map::Entry::Occupied(mut e) = template_map.entry(template.id)
         {
             e.insert(template.clone());
             Ok(())
         } else {
-            bail!("Custom template not found: {}", template.id)
+            Err(anyhow!("Custom template not found: {}", template.id).into())
         }
     }
 
-    async fn delete_custom_template(&self, id: u64) -> anyhow::Result<()> {
+    async fn delete_custom_template(&self, id: u64) -> DbResult<()> {
         let mut template_map = self.custom_template.lock().await;
         if template_map.remove(&id).is_some() {
             Ok(())
         } else {
-            bail!("Custom template not found: {}", id)
+            Err(anyhow!("Custom template not found: {}", id).into())
         }
     }
-    async fn count_vms_by_custom_template(&self, template_id: u64) -> anyhow::Result<u64> {
+    async fn count_vms_by_custom_template(&self, template_id: u64) -> DbResult<u64> {
         let vm_map = self.vms.lock().await;
         let count = vm_map
             .values()
@@ -1636,29 +1626,29 @@ impl lnvps_db::AdminDb for MockDb {
         &self,
         _limit: u64,
         _offset: u64,
-    ) -> anyhow::Result<(Vec<Company>, u64)> {
+    ) -> DbResult<(Vec<Company>, u64)> {
         Ok((vec![], 0))
     }
-    async fn admin_get_company(&self, company_id: u64) -> anyhow::Result<Company> {
+    async fn admin_get_company(&self, company_id: u64) -> DbResult<Company> {
         self.get_company(company_id).await
     }
-    async fn admin_create_company(&self, _company: &Company) -> anyhow::Result<u64> {
+    async fn admin_create_company(&self, _company: &Company) -> DbResult<u64> {
         Ok(1)
     }
-    async fn admin_update_company(&self, _company: &Company) -> anyhow::Result<()> {
+    async fn admin_update_company(&self, _company: &Company) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_delete_company(&self, _company_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_company(&self, _company_id: u64) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_count_company_regions(&self, _company_id: u64) -> anyhow::Result<u64> {
+    async fn admin_count_company_regions(&self, _company_id: u64) -> DbResult<u64> {
         Ok(0)
     }
     async fn admin_get_payments_by_date_range(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<Vec<VmPayment>> {
+    ) -> DbResult<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         Ok(p.iter()
             .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
@@ -1670,7 +1660,7 @@ impl lnvps_db::AdminDb for MockDb {
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
-    ) -> anyhow::Result<Vec<VmPayment>> {
+    ) -> DbResult<Vec<VmPayment>> {
         let p = self.payments.lock().await;
         let vms = self.vms.lock().await;
         let hosts = self.hosts.lock().await;
@@ -1701,7 +1691,7 @@ impl lnvps_db::AdminDb for MockDb {
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> anyhow::Result<Vec<VmPaymentWithCompany>> {
+    ) -> DbResult<Vec<VmPaymentWithCompany>> {
         let p = self.payments.lock().await;
         let vms = self.vms.lock().await;
         let hosts = self.hosts.lock().await;
@@ -1771,7 +1761,7 @@ impl lnvps_db::AdminDb for MockDb {
         _end_date: chrono::DateTime<chrono::Utc>,
         _company_id: u64,
         _ref_code: Option<&str>,
-    ) -> anyhow::Result<Vec<lnvps_db::ReferralCostUsage>> {
+    ) -> DbResult<Vec<lnvps_db::ReferralCostUsage>> {
         // Mock implementation - return empty for now
         Ok(vec![])
     }
@@ -1780,65 +1770,56 @@ impl lnvps_db::AdminDb for MockDb {
         _limit: u64,
         _offset: u64,
         _region_id: Option<u64>,
-    ) -> anyhow::Result<(Vec<IpRange>, u64)> {
+    ) -> DbResult<(Vec<IpRange>, u64)> {
         Ok((vec![], 0))
     }
-    async fn admin_get_ip_range(&self, ip_range_id: u64) -> anyhow::Result<IpRange> {
+    async fn admin_get_ip_range(&self, ip_range_id: u64) -> DbResult<IpRange> {
         self.get_ip_range(ip_range_id).await
     }
-    async fn admin_create_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<u64> {
+    async fn admin_create_ip_range(&self, _ip_range: &IpRange) -> DbResult<u64> {
         Ok(1)
     }
-    async fn admin_update_ip_range(&self, _ip_range: &IpRange) -> anyhow::Result<()> {
+    async fn admin_update_ip_range(&self, _ip_range: &IpRange) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_delete_ip_range(&self, _ip_range_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_ip_range(&self, _ip_range_id: u64) -> DbResult<()> {
         Ok(())
     }
-    async fn admin_count_ip_range_assignments(&self, _ip_range_id: u64) -> anyhow::Result<u64> {
+    async fn admin_count_ip_range_assignments(&self, _ip_range_id: u64) -> DbResult<u64> {
         Ok(0)
     }
-    async fn admin_list_access_policies(&self) -> anyhow::Result<Vec<AccessPolicy>> {
+    async fn admin_list_access_policies(&self) -> DbResult<Vec<AccessPolicy>> {
         Ok(vec![])
     }
     async fn admin_list_access_policies_paginated(
         &self,
         _limit: u64,
         _offset: u64,
-    ) -> anyhow::Result<(Vec<AccessPolicy>, u64)> {
+    ) -> DbResult<(Vec<AccessPolicy>, u64)> {
         Ok((vec![], 0))
     }
 
-    async fn admin_get_access_policy(&self, access_policy_id: u64) -> anyhow::Result<AccessPolicy> {
+    async fn admin_get_access_policy(&self, access_policy_id: u64) -> DbResult<AccessPolicy> {
         self.get_access_policy(access_policy_id).await
     }
 
-    async fn admin_create_access_policy(
-        &self,
-        _access_policy: &AccessPolicy,
-    ) -> anyhow::Result<u64> {
+    async fn admin_create_access_policy(&self, _access_policy: &AccessPolicy) -> DbResult<u64> {
         Ok(1)
     }
 
-    async fn admin_update_access_policy(
-        &self,
-        _access_policy: &AccessPolicy,
-    ) -> anyhow::Result<()> {
+    async fn admin_update_access_policy(&self, _access_policy: &AccessPolicy) -> DbResult<()> {
         Ok(())
     }
 
-    async fn admin_delete_access_policy(&self, _access_policy_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_access_policy(&self, _access_policy_id: u64) -> DbResult<()> {
         Ok(())
     }
 
-    async fn admin_count_access_policy_ip_ranges(
-        &self,
-        _access_policy_id: u64,
-    ) -> anyhow::Result<u64> {
+    async fn admin_count_access_policy_ip_ranges(&self, _access_policy_id: u64) -> DbResult<u64> {
         Ok(0)
     }
 
-    async fn admin_list_routers(&self) -> anyhow::Result<Vec<Router>> {
+    async fn admin_list_routers(&self) -> DbResult<Vec<Router>> {
         self.list_routers().await
     }
 
@@ -1846,27 +1827,27 @@ impl lnvps_db::AdminDb for MockDb {
         &self,
         _limit: u64,
         _offset: u64,
-    ) -> anyhow::Result<(Vec<Router>, u64)> {
+    ) -> DbResult<(Vec<Router>, u64)> {
         Ok((vec![], 0))
     }
 
-    async fn admin_get_router(&self, router_id: u64) -> anyhow::Result<Router> {
+    async fn admin_get_router(&self, router_id: u64) -> DbResult<Router> {
         self.get_router(router_id).await
     }
 
-    async fn admin_create_router(&self, _router: &Router) -> anyhow::Result<u64> {
+    async fn admin_create_router(&self, _router: &Router) -> DbResult<u64> {
         Ok(1)
     }
 
-    async fn admin_update_router(&self, _router: &Router) -> anyhow::Result<()> {
+    async fn admin_update_router(&self, _router: &Router) -> DbResult<()> {
         Ok(())
     }
 
-    async fn admin_delete_router(&self, _router_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_router(&self, _router_id: u64) -> DbResult<()> {
         Ok(())
     }
 
-    async fn admin_count_router_access_policies(&self, _router_id: u64) -> anyhow::Result<u64> {
+    async fn admin_count_router_access_policies(&self, _router_id: u64) -> DbResult<u64> {
         Ok(0)
     }
 
@@ -1879,7 +1860,7 @@ impl lnvps_db::AdminDb for MockDb {
         pubkey: Option<&str>,
         region_id: Option<u64>,
         include_deleted: Option<bool>,
-    ) -> anyhow::Result<(Vec<Vm>, u64)> {
+    ) -> DbResult<(Vec<Vm>, u64)> {
         let vms = self.vms.lock().await;
         let hosts = self.hosts.lock().await;
 
@@ -1954,13 +1935,13 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((paginated, total))
     }
 
-    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> anyhow::Result<User> {
+    async fn get_user_by_pubkey(&self, pubkey: &[u8]) -> DbResult<User> {
         let users = self.users.lock().await;
-        users
+        Ok(users
             .values()
             .find(|user| user.pubkey == pubkey)
             .cloned()
-            .ok_or_else(|| anyhow!("User not found with provided pubkey"))
+            .ok_or_else(|| anyhow!("User not found with provided pubkey"))?)
     }
 
     async fn admin_list_vm_ip_assignments(
@@ -1971,7 +1952,7 @@ impl lnvps_db::AdminDb for MockDb {
         _ip_range_id: Option<u64>,
         _ip: Option<&str>,
         _include_deleted: Option<bool>,
-    ) -> anyhow::Result<(Vec<lnvps_db::VmIpAssignment>, u64)> {
+    ) -> DbResult<(Vec<lnvps_db::VmIpAssignment>, u64)> {
         // Mock implementation
         Ok((vec![], 0))
     }
@@ -1979,7 +1960,7 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_get_vm_ip_assignment(
         &self,
         _assignment_id: u64,
-    ) -> anyhow::Result<lnvps_db::VmIpAssignment> {
+    ) -> DbResult<lnvps_db::VmIpAssignment> {
         // Mock implementation
         Ok(lnvps_db::VmIpAssignment::default())
     }
@@ -1987,7 +1968,7 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_create_vm_ip_assignment(
         &self,
         _assignment: &lnvps_db::VmIpAssignment,
-    ) -> anyhow::Result<u64> {
+    ) -> DbResult<u64> {
         // Mock implementation
         Ok(1)
     }
@@ -1995,12 +1976,12 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_update_vm_ip_assignment(
         &self,
         _assignment: &lnvps_db::VmIpAssignment,
-    ) -> anyhow::Result<()> {
+    ) -> DbResult<()> {
         // Mock implementation
         Ok(())
     }
 
-    async fn admin_delete_vm_ip_assignment(&self, _assignment_id: u64) -> anyhow::Result<()> {
+    async fn admin_delete_vm_ip_assignment(&self, _assignment_id: u64) -> DbResult<()> {
         // Mock implementation
         Ok(())
     }
@@ -2009,71 +1990,71 @@ impl lnvps_db::AdminDb for MockDb {
 // Nostr trait implementation with stub methods
 #[async_trait]
 impl LNVPSNostrDb for MockDb {
-    async fn get_handle(&self, _handle_id: u64) -> anyhow::Result<NostrDomainHandle> {
-        bail!("Mock implementation: get_handle not implemented")
+    async fn get_handle(&self, _handle_id: u64) -> DbResult<NostrDomainHandle> {
+        todo!()
     }
 
     async fn get_handle_by_name(
         &self,
         _domain_id: u64,
         _handle: &str,
-    ) -> anyhow::Result<NostrDomainHandle> {
-        bail!("Mock implementation: get_handle_by_name not implemented")
-    }
-
-    async fn insert_handle(&self, _handle: &NostrDomainHandle) -> anyhow::Result<u64> {
-        Ok(1)
-    }
-
-    async fn update_handle(&self, _handle: &NostrDomainHandle) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn delete_handle(&self, _handle_id: u64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn list_handles(&self, _domain_id: u64) -> anyhow::Result<Vec<NostrDomainHandle>> {
-        Ok(vec![])
-    }
-
-    async fn get_domain(&self, _id: u64) -> anyhow::Result<NostrDomain> {
-        bail!("Mock implementation: get_domain not implemented")
-    }
-
-    async fn get_domain_by_name(&self, _name: &str) -> anyhow::Result<NostrDomain> {
-        bail!("Mock implementation: get_domain_by_name not implemented")
-    }
-
-    async fn list_domains(&self, _owner_id: u64) -> anyhow::Result<Vec<NostrDomain>> {
-        Ok(vec![])
-    }
-
-    async fn insert_domain(&self, _domain: &NostrDomain) -> anyhow::Result<u64> {
-        Ok(1)
-    }
-
-    async fn delete_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn list_all_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
+    ) -> DbResult<NostrDomainHandle> {
         todo!()
     }
 
-    async fn list_active_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
-        Ok(vec![])
+    async fn insert_handle(&self, _handle: &NostrDomainHandle) -> DbResult<u64> {
+        Ok(1)
     }
 
-    async fn list_disabled_domains(&self) -> anyhow::Result<Vec<NostrDomain>> {
-        Ok(vec![])
-    }
-
-    async fn enable_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
+    async fn update_handle(&self, _handle: &NostrDomainHandle) -> DbResult<()> {
         Ok(())
     }
 
-    async fn disable_domain(&self, _domain_id: u64) -> anyhow::Result<()> {
+    async fn delete_handle(&self, _handle_id: u64) -> DbResult<()> {
+        Ok(())
+    }
+
+    async fn list_handles(&self, _domain_id: u64) -> DbResult<Vec<NostrDomainHandle>> {
+        Ok(vec![])
+    }
+
+    async fn get_domain(&self, _id: u64) -> DbResult<NostrDomain> {
+        todo!()
+    }
+
+    async fn get_domain_by_name(&self, _name: &str) -> DbResult<NostrDomain> {
+        todo!()
+    }
+
+    async fn list_domains(&self, _owner_id: u64) -> DbResult<Vec<NostrDomain>> {
+        Ok(vec![])
+    }
+
+    async fn insert_domain(&self, _domain: &NostrDomain) -> DbResult<u64> {
+        Ok(1)
+    }
+
+    async fn delete_domain(&self, _domain_id: u64) -> DbResult<()> {
+        Ok(())
+    }
+
+    async fn list_all_domains(&self) -> DbResult<Vec<NostrDomain>> {
+        todo!()
+    }
+
+    async fn list_active_domains(&self) -> DbResult<Vec<NostrDomain>> {
+        Ok(vec![])
+    }
+
+    async fn list_disabled_domains(&self) -> DbResult<Vec<NostrDomain>> {
+        Ok(vec![])
+    }
+
+    async fn enable_domain(&self, _domain_id: u64) -> DbResult<()> {
+        Ok(())
+    }
+
+    async fn disable_domain(&self, _domain_id: u64) -> DbResult<()> {
         Ok(())
     }
 }
