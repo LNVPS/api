@@ -240,8 +240,18 @@ impl LNVpsProvisioner {
         Ok(vm_payment)
     }
 
-    /// Create a renewal payment
+    /// Create a renewal payment for a single interval
     pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
+        self.renew_intervals(vm_id, method, 1).await
+    }
+
+    /// Create a renewal payment for multiple intervals
+    pub async fn renew_intervals(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+    ) -> Result<VmPayment> {
         let pe = PricingEngine::new_for_vm(
             self.db.clone(),
             self.rates.clone(),
@@ -249,7 +259,7 @@ impl LNVpsProvisioner {
             vm_id,
         )
         .await?;
-        let price = pe.get_vm_cost(vm_id, method).await?;
+        let price = pe.get_vm_cost_for_intervals(vm_id, method, intervals).await?;
         self.price_to_payment(vm_id, method, price).await
     }
 
@@ -266,9 +276,168 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
+    }
+
+    /// Create a renewal/purchase payment for a subscription
+    pub async fn renew_subscription(
+        &self,
+        subscription_id: u64,
+        method: PaymentMethod,
+    ) -> Result<lnvps_db::SubscriptionPayment> {
+        use lnvps_db::{SubscriptionPayment, SubscriptionPaymentType};
+
+        // Get subscription and line items
+        let subscription = self.db.get_subscription(subscription_id).await?;
+        let line_items = self.db.list_subscription_line_items(subscription_id).await?;
+        ensure!(!line_items.is_empty(), "Subscription has no line items");
+
+        // Get user for tax calculation
+        let user = self.db.get_user(subscription.user_id).await?;
+
+        // Calculate total cost in subscription currency
+        let mut monthly_cost: u64 = 0;
+        let mut setup_fee: u64 = 0;
+
+        for item in &line_items {
+            monthly_cost += item.amount;
+            setup_fee += item.setup_amount;
+        }
+
+        // Check if this is first payment (purchase) or renewal
+        let existing_payments = self.db.list_subscription_payments(subscription_id).await?;
+        let has_paid = existing_payments.iter().any(|p| p.is_paid);
+
+        let (list_price_amount, payment_type) = if has_paid {
+            // Renewal - monthly cost only
+            (monthly_cost, SubscriptionPaymentType::Renewal)
+        } else {
+            // Purchase - monthly cost + setup fees
+            (monthly_cost + setup_fee, SubscriptionPaymentType::Purchase)
+        };
+
+        // Parse subscription currency
+        let subscription_currency = Currency::from_str(&subscription.currency).map_err(|e| anyhow::anyhow!("Invalid currency"))?;
+        let list_price = CurrencyAmount::from_u64(subscription_currency, list_price_amount);
+
+        // Create pricing engine for currency conversion
+        let pe = PricingEngine::new(
+            self.db.clone(),
+            self.rates.clone(),
+            self.tax_rates.clone(),
+            subscription_currency,
+        );
+
+        // Convert list price to payment method currency and get rate
+        let converted = pe.get_amount_and_rate(list_price, method).await?;
+
+        // Calculate tax on the converted amount
+        let tax = pe.get_tax_for_user(user.id, converted.amount.value()).await?;
+
+        // Generate payment based on method
+        let subscription_payment = match method {
+            PaymentMethod::Lightning => {
+                ensure!(
+                    converted.amount.currency() == Currency::BTC,
+                    "Lightning payment must be in BTC"
+                );
+                const INVOICE_EXPIRE: u64 = 600;
+                let invoice_amount = converted.amount.value() + tax;
+                let desc = match payment_type {
+                    SubscriptionPaymentType::Purchase => {
+                        format!("Subscription purchase: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Renewal => {
+                        format!("Subscription renewal: {}", subscription.name)
+                    }
+                };
+
+                info!(
+                    "Creating invoice for subscription {} for {} sats",
+                    subscription_id,
+                    invoice_amount / 1000
+                );
+
+                let invoice = self
+                    .node
+                    .add_invoice(AddInvoiceRequest {
+                        memo: Some(desc),
+                        amount: invoice_amount,
+                        expire: Some(INVOICE_EXPIRE as u32),
+                    })
+                    .await?;
+
+                SubscriptionPayment {
+                    id: hex::decode(invoice.payment_hash())?,
+                    subscription_id,
+                    user_id: subscription.user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
+                    amount: converted.amount.value(),
+                    currency: converted.amount.currency().to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: invoice.pr().into(),
+                    external_id: invoice.external_id,
+                    is_paid: false,
+                    rate: converted.rate.rate,
+                    tax,
+                }
+            }
+            PaymentMethod::Revolut => {
+                let rev = if let Some(r) = &self.revolut {
+                    r
+                } else {
+                    bail!("Revolut not configured")
+                };
+                ensure!(
+                    converted.amount.currency() != Currency::BTC,
+                    "Cannot create Revolut orders for BTC currency"
+                );
+
+                let desc = match payment_type {
+                    SubscriptionPaymentType::Purchase => {
+                        format!("Subscription purchase: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Renewal => {
+                        format!("Subscription renewal: {}", subscription.name)
+                    }
+                };
+
+                let order_amount = CurrencyAmount::from_u64(
+                    converted.amount.currency(),
+                    converted.amount.value() + tax,
+                );
+                let order = rev.create_order(&desc, order_amount, None).await?;
+
+                let new_id: [u8; 32] = rand::random();
+                SubscriptionPayment {
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id: subscription.user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(3600)),
+                    amount: converted.amount.value(),
+                    currency: converted.amount.currency().to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.raw_data.into(),
+                    external_id: Some(order.external_id),
+                    is_paid: false,
+                    rate: converted.rate.rate,
+                    tax,
+                }
+            }
+            PaymentMethod::Paypal => bail!("PayPal not implemented"),
+            PaymentMethod::Stripe => bail!("Stripe not implemented"),
+        };
+
+        // Save payment to database
+        self.db.insert_subscription_payment(&subscription_payment).await?;
+
+        Ok(subscription_payment)
     }
 
     async fn price_to_payment(
@@ -348,6 +517,7 @@ impl LNVpsProvisioner {
                             .create_order(
                                 &desc,
                                 CurrencyAmount::from_u64(p.currency, p.amount + p.tax),
+                                None
                             )
                             .await?;
                         let new_id: [u8; 32] = rand::random();
@@ -505,7 +675,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-        .await?;
+            .await?;
         pe.calculate_upgrade_cost(vm_id, cfg, method).await
     }
 
@@ -555,7 +725,7 @@ impl LNVpsProvisioner {
             PaymentType::Upgrade,
             Some(upgrade_params_json),
         )
-        .await
+            .await
     }
 
     /// Create a new custom template using a vm's existing standard template

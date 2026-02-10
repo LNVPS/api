@@ -1,9 +1,10 @@
 use crate::{
-    AccessPolicy, Company, DbError, DbResult, IpRange, LNVpsDbBase, PaymentMethod, PaymentType,
-    ReferralCostUsage, RegionStats, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
+    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage, RegionStats,
+    Router, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -977,10 +978,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(users)
     }
 
-    // ========================================================================
-    // Subscription Billing System Implementations
-    // ========================================================================
-
     async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>> {
         let query = r#"
             SELECT DISTINCT user_id
@@ -995,6 +992,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         Ok(user_ids)
     }
+
+    // ========================================================================
+    // Subscription Billing System Implementations
+    // ========================================================================
 
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
@@ -1039,7 +1040,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
         .bind(&subscription.name)
@@ -1048,8 +1049,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.expires)
         .bind(subscription.is_active)
         .bind(&subscription.currency)
-        .bind(subscription.interval_amount)
-        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1059,9 +1058,57 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(res.last_insert_id())
     }
 
+    async fn insert_subscription_with_line_items(
+        &self,
+        subscription: &Subscription,
+        mut line_items: Vec<SubscriptionLineItem>,
+    ) -> DbResult<u64> {
+        let mut tx = self.db.begin().await?;
+
+        // Insert subscription
+        let res = sqlx::query(
+            "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(subscription.user_id)
+        .bind(&subscription.name)
+        .bind(&subscription.description)
+        .bind(subscription.created)
+        .bind(subscription.expires)
+        .bind(subscription.is_active)
+        .bind(&subscription.currency)
+        .bind(subscription.setup_fee)
+        .bind(subscription.auto_renewal_enabled)
+        .bind(&subscription.external_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let subscription_id = res.last_insert_id();
+
+        // Insert all line items with the subscription_id
+        for line_item in &mut line_items {
+            line_item.subscription_id = subscription_id;
+
+            sqlx::query(
+                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(line_item.subscription_id)
+            .bind(line_item.subscription_type)
+            .bind(&line_item.name)
+            .bind(&line_item.description)
+            .bind(line_item.amount)
+            .bind(line_item.setup_amount)
+            .bind(&line_item.configuration)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(subscription_id)
+    }
+
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription SET user_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
+            "UPDATE subscription SET user_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
         )
         .bind(subscription.user_id)
         .bind(&subscription.name)
@@ -1069,8 +1116,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.expires)
         .bind(subscription.is_active)
         .bind(&subscription.currency)
-        .bind(subscription.interval_amount)
-        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1132,9 +1177,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription_line_item (subscription_id, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(line_item.subscription_id)
+        .bind(line_item.subscription_type)
         .bind(&line_item.name)
         .bind(&line_item.description)
         .bind(line_item.amount)
@@ -1151,9 +1197,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription_line_item SET subscription_id = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ? WHERE id = ?"
+            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ? WHERE id = ?"
         )
         .bind(line_item.subscription_id)
+        .bind(line_item.subscription_type)
         .bind(&line_item.name)
         .bind(&line_item.description)
         .bind(line_item.amount)
@@ -1240,7 +1287,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, time_value, tax) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&payment.id)
         .bind(payment.subscription_id)
@@ -1255,7 +1302,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&payment.external_id)
         .bind(payment.is_paid)
         .bind(payment.rate)
-        .bind(payment.time_value)
         .bind(payment.tax)
         .execute(&self.db)
         .await?;
@@ -1265,7 +1311,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription_payment SET subscription_id = ?, user_id = ?, created = ?, expires = ?, amount = ?, currency = ?, payment_method = ?, payment_type = ?, external_data = ?, external_id = ?, is_paid = ?, rate = ?, time_value = ?, tax = ? WHERE id = ?"
+            "UPDATE subscription_payment SET subscription_id = ?, user_id = ?, created = ?, expires = ?, amount = ?, currency = ?, payment_method = ?, payment_type = ?, external_data = ?, external_id = ?, is_paid = ?, rate = ?, tax = ? WHERE id = ?"
         )
         .bind(payment.subscription_id)
         .bind(payment.user_id)
@@ -1279,7 +1325,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&payment.external_id)
         .bind(payment.is_paid)
         .bind(payment.rate)
-        .bind(payment.time_value)
         .bind(payment.tax)
         .bind(&payment.id)
         .execute(&self.db)
@@ -1297,26 +1342,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(tx.as_mut())
             .await?;
 
-        // If payment has time_value, extend the subscription expiration
-        if let Some(time_value) = payment.time_value {
-            if time_value > 0 {
-                sqlx::query(
-                    "UPDATE subscription SET expires = DATE_ADD(COALESCE(expires, NOW()), INTERVAL ? SECOND), is_active = 1 WHERE id = ?"
-                )
-                .bind(time_value)
-                .bind(payment.subscription_id)
-                .execute(tx.as_mut())
-                .await?;
-            }
-        } else {
-            // For one-time purchases without expiration, just activate the subscription
-            sqlx::query("UPDATE subscription SET is_active = 1 WHERE id = ?")
-                .bind(payment.subscription_id)
-                .execute(tx.as_mut())
-                .await?;
-        }
+        // Subscriptions are always monthly - extend by 30 days and activate
+        sqlx::query(
+            "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL 30 DAY), is_active = 1 WHERE id = ?"
+        )
+        .bind(payment.subscription_id)
+        .execute(&self.db)
+        .await?;
 
-        tx.commit().await?;
         Ok(())
     }
 
@@ -1326,6 +1359,264 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .fetch_optional(&self.db)
         .await?)
+    }
+
+    // Available IP Space
+    async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM available_ip_space ORDER BY created DESC")
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
+        Ok(
+            sqlx::query_as("SELECT * FROM available_ip_space WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace> {
+        Ok(
+            sqlx::query_as("SELECT * FROM available_ip_space WHERE cidr = ?")
+                .bind(cidr)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64> {
+        let result = sqlx::query(
+            "INSERT INTO available_ip_space (cidr, min_prefix_size, max_prefix_size, registry, external_id, is_available, is_reserved, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&space.cidr)
+        .bind(space.min_prefix_size)
+        .bind(space.max_prefix_size)
+        .bind(space.registry)
+        .bind(&space.external_id)
+        .bind(space.is_available)
+        .bind(space.is_reserved)
+        .bind(&space.metadata)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE available_ip_space SET cidr = ?, min_prefix_size = ?, max_prefix_size = ?, registry = ?, external_id = ?, is_available = ?, is_reserved = ?, metadata = ? WHERE id = ?"
+        )
+        .bind(&space.cidr)
+        .bind(space.min_prefix_size)
+        .bind(space.max_prefix_size)
+        .bind(space.registry)
+        .bind(&space.external_id)
+        .bind(space.is_available)
+        .bind(space.is_reserved)
+        .bind(&space.metadata)
+        .bind(space.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_available_ip_space(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM available_ip_space WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
+    // IP Space Pricing
+    async fn list_ip_space_pricing_by_space(
+        &self,
+        available_ip_space_id: u64,
+    ) -> DbResult<Vec<IpSpacePricing>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ?")
+                .bind(available_ip_space_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_space_pricing WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_ip_space_pricing_by_prefix(
+        &self,
+        available_ip_space_id: u64,
+        prefix_size: u16,
+    ) -> DbResult<IpSpacePricing> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ? AND prefix_size = ?",
+        )
+        .bind(available_ip_space_id)
+        .bind(prefix_size)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<u64> {
+        let result = sqlx::query(
+            "INSERT INTO ip_space_pricing (available_ip_space_id, prefix_size, price_per_month, currency, setup_fee) VALUES (?, ?, ?, ?, ?)"
+        )
+        .bind(pricing.available_ip_space_id)
+        .bind(pricing.prefix_size)
+        .bind(pricing.price_per_month)
+        .bind(&pricing.currency)
+        .bind(pricing.setup_fee)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_space_pricing SET available_ip_space_id = ?, prefix_size = ?, price_per_month = ?, currency = ?, setup_fee = ? WHERE id = ?"
+        )
+        .bind(pricing.available_ip_space_id)
+        .bind(pricing.prefix_size)
+        .bind(pricing.price_per_month)
+        .bind(&pricing.currency)
+        .bind(pricing.setup_fee)
+        .bind(pricing.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_ip_space_pricing(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM ip_space_pricing WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // IP Range Subscriptions
+    async fn list_ip_range_subscriptions_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM ip_range_subscription WHERE subscription_line_item_id = ?",
+        )
+        .bind(subscription_line_item_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_ip_range_subscriptions_by_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT ips.* FROM ip_range_subscription ips
+             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id
+             WHERE sli.subscription_id = ?",
+        )
+        .bind(subscription_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_ip_range_subscriptions_by_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT ips.* FROM ip_range_subscription ips
+             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id
+             INNER JOIN subscription s ON sli.subscription_id = s.id
+             WHERE s.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_range_subscription WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM ip_range_subscription WHERE cidr = ?")
+                .bind(cidr)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<u64> {
+        let result = sqlx::query(
+            "INSERT INTO ip_range_subscription (subscription_line_item_id, available_ip_space_id, cidr, is_active, started_at, ended_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(subscription.subscription_line_item_id)
+        .bind(subscription.available_ip_space_id)
+        .bind(&subscription.cidr)
+        .bind(subscription.is_active)
+        .bind(subscription.started_at)
+        .bind(subscription.ended_at)
+        .bind(&subscription.metadata)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn update_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_range_subscription SET subscription_line_item_id = ?, available_ip_space_id = ?, cidr = ?, is_active = ?, started_at = ?, ended_at = ?, metadata = ? WHERE id = ?"
+        )
+        .bind(subscription.subscription_line_item_id)
+        .bind(subscription.available_ip_space_id)
+        .bind(&subscription.cidr)
+        .bind(subscription.is_active)
+        .bind(subscription.started_at)
+        .bind(subscription.ended_at)
+        .bind(&subscription.metadata)
+        .bind(subscription.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM ip_range_subscription WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
     }
 }
 

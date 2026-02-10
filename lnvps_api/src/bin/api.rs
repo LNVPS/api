@@ -184,7 +184,8 @@ async fn main() -> Result<(), Error> {
             .merge(main_router())
             .merge(contacts_router())
             .merge(webhook_router())
-            .merge(subscriptions_router());
+            .merge(subscriptions_router())
+        .merge(ip_space_router());
 
         #[cfg(feature = "openapi")]
         {

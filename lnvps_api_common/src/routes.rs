@@ -1,6 +1,6 @@
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 
 pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
@@ -46,13 +46,13 @@ impl<T: Serialize> ApiPaginatedData<T> {
 
 #[derive(Serialize)]
 pub struct ApiError {
-    pub message: String,
+    pub error: String,
 }
 
 impl ApiError {
     pub fn new(message: impl ToString) -> Self {
         Self {
-            message: message.to_string(),
+            error: message.to_string(),
         }
     }
 }
@@ -65,6 +65,24 @@ impl<T: ToString> From<T> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(self.message)).into_response()
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_error_json_format() {
+        let error = ApiError::new("Something went wrong");
+        let json = serde_json::to_string(&error).unwrap();
+        assert_eq!(json, r#"{"error":"Something went wrong"}"#);
+    }
+
+    #[test]
+    fn test_api_error_from_str() {
+        let error: ApiError = "Test error".into();
+        assert_eq!(error.error, "Test error");
     }
 }

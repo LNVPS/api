@@ -196,15 +196,6 @@ async fn admin_update_subscription(
         }
         subscription.currency = currency.trim().to_uppercase();
     }
-    if let Some(interval_amount) = request.interval_amount {
-        if interval_amount == 0 {
-            return Err(anyhow::anyhow!("Interval amount cannot be zero").into());
-        }
-        subscription.interval_amount = interval_amount;
-    }
-    if let Some(interval_type) = request.interval_type {
-        subscription.interval_type = interval_type.into();
-    }
     if let Some(setup_fee) = request.setup_fee {
         subscription.setup_fee = setup_fee;
     }

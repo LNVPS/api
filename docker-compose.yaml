@@ -1,5 +1,6 @@
 volumes:
   db:
+  krill:
 services:
   db:
     image: docker.io/mariadb
@@ -16,3 +17,15 @@ services:
     restart: unless-stopped
     ports:
       - "6398:6379"
+  krill:
+    image: nlnetlabs/krill
+    restart: unless-stopped
+    environment:
+      - "KRILL_FQDN=rpki.localhost"
+      - "TZ=Europe/Dublin"
+      - "KRILL_LOG_LEVEL=debug"
+      - "KRILL_AUTH_TOKEN=krill"
+    ports:
+      - "3000:3000"
+    volumes:
+      - "krill:/var/krill/data"

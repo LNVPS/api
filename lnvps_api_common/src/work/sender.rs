@@ -58,14 +58,15 @@ impl RedisWorkCommander {
     pub async fn listen_for_jobs(&self) -> Result<Vec<WorkJobMessage>> {
         let mut conn = self.conn.clone();
 
+        // Ensure the consumer group exists
+        self.ensure_group_exists(&mut conn).await?;
+
         let pending = self.claim_pending_jobs().await?;
         if !pending.is_empty() {
             info!("Got {} pending jobs", pending.len());
             return Ok(pending);
         }
 
-        // Ensure the consumer group exists
-        self.ensure_group_exists(&mut conn).await?;
         let opts = StreamReadOptions::default()
             .count(10)
             .block(100)

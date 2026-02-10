@@ -443,10 +443,6 @@ pub struct ApiSubscription {
     pub created: DateTime<Utc>,
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
-    pub currency: ApiCurrency,
-    pub interval_amount: u64,
-    pub interval_type: ApiVmCostPlanIntervalType,
-    pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub line_items: Vec<ApiSubscriptionLineItem>,
 }
@@ -460,20 +456,8 @@ impl ApiSubscription {
             .list_subscription_line_items(subscription.id)
             .await?
             .into_iter()
-            .map(ApiSubscriptionLineItem::from)
+            .map(|item| ApiSubscriptionLineItem::from_with_currency(item, &subscription.currency))
             .collect();
-
-        let currency = match subscription.currency.to_uppercase().as_str() {
-            "EUR" => ApiCurrency::EUR,
-            "BTC" => ApiCurrency::BTC,
-            "USD" => ApiCurrency::USD,
-            "GBP" => ApiCurrency::GBP,
-            "CAD" => ApiCurrency::CAD,
-            "CHF" => ApiCurrency::CHF,
-            "AUD" => ApiCurrency::AUD,
-            "JPY" => ApiCurrency::JPY,
-            _ => ApiCurrency::USD,
-        };
 
         Ok(Self {
             id: subscription.id,
@@ -482,10 +466,6 @@ impl ApiSubscription {
             created: subscription.created,
             expires: subscription.expires,
             is_active: subscription.is_active,
-            currency,
-            interval_amount: subscription.interval_amount,
-            interval_type: ApiVmCostPlanIntervalType::from(subscription.interval_type),
-            setup_fee: subscription.setup_fee,
             auto_renewal_enabled: subscription.auto_renewal_enabled,
             line_items,
         })
@@ -498,20 +478,28 @@ pub struct ApiSubscriptionLineItem {
     pub subscription_id: u64,
     pub name: String,
     pub description: Option<String>,
-    pub amount: u64,
-    pub setup_amount: u64,
+    pub price: ApiPrice,
+    pub setup_fee: ApiPrice,
     pub configuration: Option<serde_json::Value>,
 }
 
-impl From<lnvps_db::SubscriptionLineItem> for ApiSubscriptionLineItem {
-    fn from(line_item: lnvps_db::SubscriptionLineItem) -> Self {
+impl ApiSubscriptionLineItem {
+    pub fn from_with_currency(line_item: lnvps_db::SubscriptionLineItem, currency: &str) -> Self {
+        let api_currency: ApiCurrency = currency
+            .parse::<Currency>()
+            .unwrap_or(Currency::USD)
+            .into();
+
+        let price = CurrencyAmount::from_u64(api_currency.into(), line_item.amount);
+        let setup_fee = CurrencyAmount::from_u64(api_currency.into(), line_item.setup_amount);
+
         Self {
             id: line_item.id,
             subscription_id: line_item.subscription_id,
             name: line_item.name,
             description: line_item.description,
-            amount: line_item.amount,
-            setup_amount: line_item.setup_amount,
+            price: price.into(),
+            setup_fee: setup_fee.into(),
             configuration: line_item.configuration,
         }
     }
@@ -523,13 +511,11 @@ pub struct ApiSubscriptionPayment {
     pub subscription_id: u64,
     pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
-    pub amount: u64,
-    pub currency: ApiCurrency,
+    pub amount: ApiPrice,
     pub payment_method: ApiPaymentMethod,
     pub payment_type: ApiSubscriptionPaymentType,
     pub is_paid: bool,
-    pub time_value: Option<u64>,
-    pub tax: u64,
+    pub tax: ApiPrice,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -549,30 +535,214 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
 
 impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
     fn from(payment: lnvps_db::SubscriptionPayment) -> Self {
-        let currency = match payment.currency.to_uppercase().as_str() {
-            "EUR" => ApiCurrency::EUR,
-            "BTC" => ApiCurrency::BTC,
-            "USD" => ApiCurrency::USD,
-            "GBP" => ApiCurrency::GBP,
-            "CAD" => ApiCurrency::CAD,
-            "CHF" => ApiCurrency::CHF,
-            "AUD" => ApiCurrency::AUD,
-            "JPY" => ApiCurrency::JPY,
-            _ => ApiCurrency::USD,
-        };
+        let currency: ApiCurrency = payment.currency
+            .parse::<Currency>()
+            .unwrap_or(Currency::USD)
+            .into();
+
+        let amount = CurrencyAmount::from_u64(currency.into(), payment.amount);
+        let tax = CurrencyAmount::from_u64(currency.into(), payment.tax);
 
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
             created: payment.created,
             expires: payment.expires,
-            amount: payment.amount,
-            currency,
+            amount: amount.into(),
             payment_method: ApiPaymentMethod::from(payment.payment_method),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             is_paid: payment.is_paid,
-            time_value: payment.time_value,
-            tax: payment.tax,
+            tax: tax.into(),
         }
     }
+}
+
+// IP Space Models
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiIpVersion {
+    #[serde(rename = "ipv4")]
+    IPv4,
+    #[serde(rename = "ipv6")]
+    IPv6,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiInternetRegistry {
+    ARIN,
+    RIPE,
+    APNIC,
+    LACNIC,
+    AFRINIC,
+}
+
+impl From<lnvps_db::InternetRegistry> for ApiInternetRegistry {
+    fn from(registry: lnvps_db::InternetRegistry) -> Self {
+        match registry {
+            lnvps_db::InternetRegistry::ARIN => ApiInternetRegistry::ARIN,
+            lnvps_db::InternetRegistry::RIPE => ApiInternetRegistry::RIPE,
+            lnvps_db::InternetRegistry::APNIC => ApiInternetRegistry::APNIC,
+            lnvps_db::InternetRegistry::LACNIC => ApiInternetRegistry::LACNIC,
+            lnvps_db::InternetRegistry::AFRINIC => ApiInternetRegistry::AFRINIC,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ApiAvailableIpSpace {
+    pub id: u64,
+    pub min_prefix_size: u16,
+    pub max_prefix_size: u16,
+    pub registry: ApiInternetRegistry,
+    pub ip_version: ApiIpVersion,
+    pub pricing: Vec<ApiIpSpacePricing>,
+}
+
+impl ApiAvailableIpSpace {
+    pub async fn from_ip_space_with_pricing(
+        db: &dyn lnvps_db::LNVpsDbBase,
+        space: lnvps_db::AvailableIpSpace,
+    ) -> Result<Self> {
+        let pricing_list = db.list_ip_space_pricing_by_space(space.id).await?;
+        let pricing = pricing_list
+            .into_iter()
+            .map(ApiIpSpacePricing::from)
+            .collect();
+
+        // Determine IP version from CIDR
+        let network: ipnetwork::IpNetwork = space
+            .cidr
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Failed to parse CIDR"))?;
+        let ip_version = if network.is_ipv6() {
+            ApiIpVersion::IPv6
+        } else {
+            ApiIpVersion::IPv4
+        };
+
+        Ok(Self {
+            id: space.id,
+            min_prefix_size: space.min_prefix_size,
+            max_prefix_size: space.max_prefix_size,
+            registry: ApiInternetRegistry::from(space.registry),
+            ip_version,
+            pricing,
+        })
+    }
+
+    /// Expand pricing to include alternative currencies
+    pub async fn expand_pricing(&mut self, rates: &Arc<dyn ExchangeRateService>) -> Result<()> {
+        let rates = rates.list_rates().await?;
+
+        for pricing in &mut self.pricing {
+            let price_amount = CurrencyAmount::from_f32(
+                pricing.price.currency.into(),
+                pricing.price.amount,
+            );
+            let setup_fee_amount = CurrencyAmount::from_f32(
+                pricing.setup_fee.currency.into(),
+                pricing.setup_fee.amount,
+            );
+
+            for alt_price in alt_prices(&rates, price_amount) {
+                pricing.other_price.push(ApiPrice {
+                    currency: alt_price.currency().into(),
+                    amount: alt_price.value_f32(),
+                });
+            }
+
+            for alt_setup_fee in alt_prices(&rates, setup_fee_amount) {
+                pricing.other_setup_fee.push(ApiPrice {
+                    currency: alt_setup_fee.currency().into(),
+                    amount: alt_setup_fee.value_f32(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+pub struct ApiIpSpacePricing {
+    pub id: u64,
+    pub prefix_size: u16,
+    pub price: ApiPrice,
+    pub setup_fee: ApiPrice,
+    pub other_price: Vec<ApiPrice>,
+    pub other_setup_fee: Vec<ApiPrice>,
+}
+
+impl From<lnvps_db::IpSpacePricing> for ApiIpSpacePricing {
+    fn from(pricing: lnvps_db::IpSpacePricing) -> Self {
+        let currency = pricing.currency.parse().unwrap();
+        Self {
+            id: pricing.id,
+            prefix_size: pricing.prefix_size,
+            price: CurrencyAmount::from_u64(currency, pricing.price_per_month).into(),
+            setup_fee: CurrencyAmount::from_u64(currency, pricing.setup_fee).into(),
+            other_price: vec![], // Filled externally
+            other_setup_fee: vec![], // Filled externally
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ApiIpRangeSubscription {
+    pub id: u64,
+    pub cidr: String,
+    pub is_active: bool,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub parent_cidr: String, // The IP space this was allocated from
+}
+
+impl ApiIpRangeSubscription {
+    pub async fn from_subscription_with_space(
+        db: &dyn lnvps_db::LNVpsDbBase,
+        sub: lnvps_db::IpRangeSubscription,
+    ) -> anyhow::Result<Self> {
+        let space = db.get_available_ip_space(sub.available_ip_space_id).await?;
+
+        Ok(Self {
+            id: sub.id,
+            cidr: sub.cidr,
+            is_active: sub.is_active,
+            started_at: sub.started_at,
+            ended_at: sub.ended_at,
+            parent_cidr: space.cidr,
+        })
+    }
+}
+
+// ============================================================================
+// Subscription Creation Models
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ApiCreateSubscriptionRequest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub currency: Option<String>, // USD, BTC, EUR, etc.
+    pub auto_renewal_enabled: Option<bool>,
+    pub line_items: Vec<ApiCreateSubscriptionLineItemRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+pub enum ApiCreateSubscriptionLineItemRequest {
+    #[serde(rename = "ip_range")]
+    IpRange { ip_space_pricing_id: u64 },
+
+    #[serde(rename = "asn_sponsoring")]
+    AsnSponsoring {
+        asn: u32,
+        // Add pricing/plan details here
+    },
+
+    #[serde(rename = "dns_hosting")]
+    DnsHosting {
+        domain: String,
+        // Add pricing/plan details here
+    },
 }

@@ -60,3 +60,68 @@ values(5,"X-Large",1,12,1024*1024*1024*16,1024*1024*1024*800,1,2,5,1);
 insert
 ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
 values(6,"XX-Large",1,20,1024*1024*1024*24,1024*1024*1024*1000,1,2,6,1);
+
+-- Available IP Space for sale
+insert
+ignore into available_ip_space(id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+values(1,"192.0.2.0/24",32,24,0,"ARIN-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
+
+insert
+ignore into available_ip_space(id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+values(2,"198.51.100.0/22",26,22,0,"ARIN-2024-002",1,0,'{"upstream":"ExampleISP","asn":65000}');
+
+insert
+ignore into available_ip_space(id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+values(3,"2001:db8::/29",48,32,1,"RIPE-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
+
+-- IP Space Pricing
+-- Pricing for 192.0.2.0/24
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(1,1,32,500,"USD",1000); -- /32 single IP: $5/mo, $10 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(2,1,24,15000,"USD",5000); -- /24 (256 IPs): $150/mo, $50 setup
+
+-- Pricing for 198.51.100.0/22
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(3,2,26,4000,"USD",2000); -- /26 (64 IPs): $40/mo, $20 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(4,2,25,7500,"USD",3000); -- /25 (128 IPs): $75/mo, $30 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(5,2,24,14000,"USD",5000); -- /24 (256 IPs): $140/mo, $50 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(6,2,23,26000,"USD",8000); -- /23 (512 IPs): $260/mo, $80 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(7,2,22,50000,"USD",15000); -- /22 (1024 IPs): $500/mo, $150 setup
+
+-- Pricing for IPv6 2001:db8::/29
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(8,3,48,2000,"USD",5000); -- /48 (for end sites): $20/mo, $50 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(9,3,44,5000,"USD",10000); -- /44: $50/mo, $100 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(10,3,40,12000,"USD",20000); -- /40: $120/mo, $200 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(11,3,36,25000,"USD",35000); -- /36: $250/mo, $350 setup
+
+insert
+ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(12,3,32,50000,"USD",50000); -- /32 (large ISP): $500/mo, $500 setup

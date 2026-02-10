@@ -26,7 +26,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 config = { version = "0.15", features = ["yaml"] }
 hex = "0.4"
 ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "f01575cbf2fc596c0a1761c122aa92525cbb7974" }
-payments-rs = { git = "https://github.com/v0l/payments-rs.git", rev = "ac367cd6ad3b37a11a0e4df4a46a89bfd3e186ed", default-features = false }
+payments-rs = { git = "https://github.com/v0l/payments-rs.git", rev = "60b0fbf3838385439fbd08d43565fb1d9ab810fb", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
 

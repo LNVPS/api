@@ -35,6 +35,7 @@ lnd = ["payments-rs/method-lnd"]
 bitvora = ["payments-rs/method-bitvora"]
 cloudflare = ["dep:reqwest"]
 revolut = ["payments-rs/method-revolut"]
+stripe = ["payments-rs/method-stripe"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }

@@ -5,8 +5,8 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
-    OsDistribution, PaymentMethod, RouterKind, VmHistory, VmHistoryActionType, VmHostKind,
-    VmPayment,
+    OsDistribution, PaymentMethod, RouterKind, SubscriptionType, VmHistory, VmHistoryActionType,
+    VmHostKind, VmPayment,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1767,8 +1767,6 @@ pub struct AdminSubscriptionInfo {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub currency: String,
-    pub interval_amount: u64,
-    pub interval_type: ApiVmCostPlanIntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
@@ -1784,8 +1782,6 @@ pub struct AdminCreateSubscriptionRequest {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub currency: String,
-    pub interval_amount: u64,
-    pub interval_type: ApiVmCostPlanIntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
@@ -1798,8 +1794,6 @@ pub struct AdminUpdateSubscriptionRequest {
     pub expires: Option<Option<DateTime<Utc>>>,
     pub is_active: Option<bool>,
     pub currency: Option<String>,
-    pub interval_amount: Option<u64>,
-    pub interval_type: Option<ApiVmCostPlanIntervalType>,
     pub setup_fee: Option<u64>,
     pub auto_renewal_enabled: Option<bool>,
     pub external_id: Option<Option<String>>,
@@ -1816,12 +1810,10 @@ impl From<lnvps_db::Subscription> for AdminSubscriptionInfo {
             expires: subscription.expires,
             is_active: subscription.is_active,
             currency: subscription.currency,
-            interval_amount: subscription.interval_amount,
-            interval_type: ApiVmCostPlanIntervalType::from(subscription.interval_type),
             setup_fee: subscription.setup_fee,
             auto_renewal_enabled: subscription.auto_renewal_enabled,
             external_id: subscription.external_id,
-            line_items: vec![],
+            line_items: Vec::new(),
             payment_count: 0,
         }
     }
@@ -1837,10 +1829,6 @@ impl AdminCreateSubscriptionRequest {
             return Err(anyhow::anyhow!("Currency cannot be empty"));
         }
 
-        if self.interval_amount == 0 {
-            return Err(anyhow::anyhow!("Interval amount cannot be zero"));
-        }
-
         Ok(lnvps_db::Subscription {
             id: 0,
             user_id: self.user_id,
@@ -1850,8 +1838,6 @@ impl AdminCreateSubscriptionRequest {
             expires: self.expires,
             is_active: self.is_active,
             currency: self.currency.trim().to_uppercase(),
-            interval_amount: self.interval_amount,
-            interval_type: self.interval_type.into(),
             setup_fee: self.setup_fee,
             auto_renewal_enabled: self.auto_renewal_enabled,
             external_id: self.external_id.clone(),
@@ -1874,6 +1860,7 @@ pub struct AdminSubscriptionLineItemInfo {
 #[derive(Deserialize)]
 pub struct AdminCreateSubscriptionLineItemRequest {
     pub subscription_id: u64,
+    pub subscription_type: SubscriptionType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,
@@ -1883,6 +1870,7 @@ pub struct AdminCreateSubscriptionLineItemRequest {
 
 #[derive(Deserialize)]
 pub struct AdminUpdateSubscriptionLineItemRequest {
+    pub subscription_type: Option<SubscriptionType>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub amount: Option<u64>,
@@ -1913,6 +1901,7 @@ impl AdminCreateSubscriptionLineItemRequest {
         Ok(lnvps_db::SubscriptionLineItem {
             id: 0,
             subscription_id: self.subscription_id,
+            subscription_type: self.subscription_type,
             name: self.name.trim().to_string(),
             description: self.description.clone(),
             amount: self.amount,
@@ -1937,7 +1926,6 @@ pub struct AdminSubscriptionPaymentInfo {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
-    pub time_value: Option<u64>,
     pub tax: u64,
 }
 
@@ -1980,8 +1968,293 @@ impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
             external_id: payment.external_id,
             is_paid: payment.is_paid,
             rate: payment.rate,
-            time_value: payment.time_value,
             tax: payment.tax,
         }
+    }
+}
+
+// IP Space Management Models
+#[derive(Serialize)]
+pub struct AdminInternetRegistry {
+    pub value: u8,
+    pub name: String,
+}
+
+impl From<lnvps_db::InternetRegistry> for AdminInternetRegistry {
+    fn from(registry: lnvps_db::InternetRegistry) -> Self {
+        Self {
+            value: registry as u8,
+            name: registry.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct AdminAvailableIpSpaceInfo {
+    pub id: u64,
+    pub cidr: String,
+    pub min_prefix_size: u16,
+    pub max_prefix_size: u16,
+    pub registry: AdminInternetRegistry,
+    pub external_id: Option<String>,
+    pub is_available: bool,
+    pub is_reserved: bool,
+    pub metadata: Option<serde_json::Value>,
+    pub pricing_count: u64, // Number of pricing tiers for this block
+}
+
+#[derive(Deserialize)]
+pub struct CreateAvailableIpSpaceRequest {
+    pub cidr: String,
+    pub min_prefix_size: u16,
+    pub max_prefix_size: u16,
+    pub registry: u8, // 0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC
+    pub external_id: Option<String>,
+    pub is_available: Option<bool>, // Default: true
+    pub is_reserved: Option<bool>,  // Default: false
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAvailableIpSpaceRequest {
+    pub cidr: Option<String>,
+    pub min_prefix_size: Option<u16>,
+    pub max_prefix_size: Option<u16>,
+    pub registry: Option<u8>,
+    pub external_id: Option<Option<String>>,
+    pub is_available: Option<bool>,
+    pub is_reserved: Option<bool>,
+    pub metadata: Option<Option<serde_json::Value>>,
+}
+
+impl From<lnvps_db::AvailableIpSpace> for AdminAvailableIpSpaceInfo {
+    fn from(space: lnvps_db::AvailableIpSpace) -> Self {
+        Self {
+            id: space.id,
+            cidr: space.cidr,
+            min_prefix_size: space.min_prefix_size,
+            max_prefix_size: space.max_prefix_size,
+            registry: AdminInternetRegistry::from(space.registry),
+            external_id: space.external_id,
+            is_available: space.is_available,
+            is_reserved: space.is_reserved,
+            metadata: space.metadata,
+            pricing_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+impl CreateAvailableIpSpaceRequest {
+    pub fn to_available_ip_space(&self) -> anyhow::Result<lnvps_db::AvailableIpSpace> {
+        use chrono::Utc;
+        use lnvps_db::InternetRegistry;
+
+        let registry = match self.registry {
+            0 => InternetRegistry::ARIN,
+            1 => InternetRegistry::RIPE,
+            2 => InternetRegistry::APNIC,
+            3 => InternetRegistry::LACNIC,
+            4 => InternetRegistry::AFRINIC,
+            _ => return Err(anyhow::anyhow!("Invalid registry value")),
+        };
+
+        if self.min_prefix_size < self.max_prefix_size {
+            return Err(anyhow::anyhow!(
+                "min_prefix_size must be greater than or equal to max_prefix_size (smaller prefix number = larger block)"
+            ));
+        }
+
+        // Parse CIDR to determine if IPv4 or IPv6
+        let network: ipnetwork::IpNetwork = self
+            .cidr
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid CIDR format"))?;
+        let is_ipv6 = network.is_ipv6();
+        let parent_prefix = network.prefix() as u16;
+
+        // Validate max_prefix_size
+        // 1. Must not be smaller than RIR BGP minimum
+        // 2. Must not be larger than the parent CIDR block
+        let rir_min = if is_ipv6 {
+            registry.min_ipv6_prefix_size()
+        } else {
+            registry.min_ipv4_prefix_size()
+        };
+
+        if self.max_prefix_size > rir_min {
+            return Err(anyhow::anyhow!(
+                "max_prefix_size /{} is too small for BGP announcement (RIR minimum: /{})",
+                self.max_prefix_size,
+                rir_min
+            ));
+        }
+
+        if self.max_prefix_size < parent_prefix {
+            return Err(anyhow::anyhow!(
+                "max_prefix_size /{} cannot be larger than parent CIDR /{}",
+                self.max_prefix_size,
+                parent_prefix
+            ));
+        }
+
+        // Validate min_prefix_size is within valid bounds
+        let max_prefix_num = if is_ipv6 { 128 } else { 32 };
+        if self.min_prefix_size > max_prefix_num {
+            return Err(anyhow::anyhow!(
+                "min_prefix_size /{} exceeds maximum /{}",
+                self.min_prefix_size,
+                max_prefix_num
+            ));
+        }
+
+        Ok(lnvps_db::AvailableIpSpace {
+            id: 0, // Will be set by database
+            cidr: self.cidr.trim().to_string(),
+            min_prefix_size: self.min_prefix_size,
+            max_prefix_size: self.max_prefix_size,
+            created: Utc::now(),
+            updated: Utc::now(),
+            registry,
+            external_id: self
+                .external_id
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            is_available: self.is_available.unwrap_or(true),
+            is_reserved: self.is_reserved.unwrap_or(false),
+            metadata: self.metadata.clone(),
+        })
+    }
+}
+
+// IP Space Pricing Management Models
+#[derive(Serialize)]
+pub struct AdminIpSpacePricingInfo {
+    pub id: u64,
+    pub available_ip_space_id: u64,
+    pub prefix_size: u16,
+    pub price_per_month: u64, // In cents/millisats
+    pub currency: String,
+    pub setup_fee: u64,       // In cents/millisats
+    pub cidr: Option<String>, // Populated with parent CIDR for context
+}
+
+#[derive(Deserialize)]
+pub struct CreateIpSpacePricingRequest {
+    pub prefix_size: u16,
+    pub price_per_month: u64,     // In cents/millisats
+    pub currency: Option<String>, // Default: "USD"
+    pub setup_fee: Option<u64>,   // Default: 0
+}
+
+#[derive(Deserialize)]
+pub struct UpdateIpSpacePricingRequest {
+    pub prefix_size: Option<u16>,
+    pub price_per_month: Option<u64>,
+    pub currency: Option<String>,
+    pub setup_fee: Option<u64>,
+}
+
+impl From<lnvps_db::IpSpacePricing> for AdminIpSpacePricingInfo {
+    fn from(pricing: lnvps_db::IpSpacePricing) -> Self {
+        Self {
+            id: pricing.id,
+            available_ip_space_id: pricing.available_ip_space_id,
+            prefix_size: pricing.prefix_size,
+            price_per_month: pricing.price_per_month,
+            currency: pricing.currency,
+            setup_fee: pricing.setup_fee,
+            cidr: None, // Will be filled by handler
+        }
+    }
+}
+
+impl CreateIpSpacePricingRequest {
+    pub fn to_ip_space_pricing(
+        &self,
+        available_ip_space_id: u64,
+    ) -> anyhow::Result<lnvps_db::IpSpacePricing> {
+        use chrono::Utc;
+
+        // Validate price is not zero
+        if self.price_per_month == 0 {
+            return Err(anyhow::anyhow!("price_per_month cannot be 0"));
+        }
+
+        Ok(lnvps_db::IpSpacePricing {
+            id: 0, // Will be set by database
+            available_ip_space_id,
+            prefix_size: self.prefix_size,
+            price_per_month: self.price_per_month,
+            currency: self.currency.clone().unwrap_or_else(|| "USD".to_string()),
+            setup_fee: self.setup_fee.unwrap_or(0),
+            created: Utc::now(),
+            updated: Utc::now(),
+        })
+    }
+}
+
+// IP Range Subscription Management Models
+#[derive(Serialize)]
+pub struct AdminIpRangeSubscriptionInfo {
+    pub id: u64,
+    pub subscription_line_item_id: u64,
+    pub available_ip_space_id: u64,
+    pub cidr: String,
+    pub is_active: bool,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub metadata: Option<serde_json::Value>,
+    // Enriched data
+    pub subscription_id: Option<u64>,
+    pub user_id: Option<u64>,
+    pub parent_cidr: Option<String>, // The available_ip_space CIDR this was allocated from
+}
+
+impl From<lnvps_db::IpRangeSubscription> for AdminIpRangeSubscriptionInfo {
+    fn from(sub: lnvps_db::IpRangeSubscription) -> Self {
+        Self {
+            id: sub.id,
+            subscription_line_item_id: sub.subscription_line_item_id,
+            available_ip_space_id: sub.available_ip_space_id,
+            cidr: sub.cidr,
+            is_active: sub.is_active,
+            started_at: sub.started_at,
+            ended_at: sub.ended_at,
+            metadata: sub.metadata,
+            subscription_id: None,
+            user_id: None,
+            parent_cidr: None,
+        }
+    }
+}
+
+impl AdminIpRangeSubscriptionInfo {
+    pub async fn from_subscription_with_admin_data(
+        db: &Arc<dyn lnvps_db::LNVpsDb>,
+        sub: lnvps_db::IpRangeSubscription,
+    ) -> anyhow::Result<Self> {
+        let mut info = Self::from(sub.clone());
+
+        // Get line item details
+        if let Ok(line_item) = db
+            .get_subscription_line_item(sub.subscription_line_item_id)
+            .await
+        {
+            info.subscription_id = Some(line_item.subscription_id);
+
+            // Get subscription details for user_id
+            if let Ok(subscription) = db.get_subscription(line_item.subscription_id).await {
+                info.user_id = Some(subscription.user_id);
+            }
+        }
+
+        // Get parent IP space CIDR
+        if let Ok(ip_space) = db.get_available_ip_space(sub.available_ip_space_id).await {
+            info.parent_cidr = Some(ip_space.cidr);
+        }
+
+        Ok(info)
     }
 }
