@@ -240,16 +240,26 @@ impl LNVpsProvisioner {
         Ok(vm_payment)
     }
 
-    /// Create a renewal payment
+    /// Create a renewal payment for a single interval
     pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
+        self.renew_intervals(vm_id, method, 1).await
+    }
+
+    /// Create a renewal payment for multiple intervals
+    pub async fn renew_intervals(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+    ) -> Result<VmPayment> {
         let pe = PricingEngine::new_for_vm(
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
-        let price = pe.get_vm_cost(vm_id, method).await?;
+        .await?;
+        let price = pe.get_vm_cost_for_intervals(vm_id, method, intervals).await?;
         self.price_to_payment(vm_id, method, price).await
     }
 

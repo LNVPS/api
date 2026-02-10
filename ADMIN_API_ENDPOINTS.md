@@ -2764,8 +2764,8 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 ```json
 {
   "cidr": "string",                      // CIDR notation (validated)
-  "min_prefix_size": number,             // Must be <= max_prefix_size
-  "max_prefix_size": number,             // Must be >= min_prefix_size
+  "min_prefix_size": number,             // Must be >= max_prefix_size (larger number = smaller block)
+  "max_prefix_size": number,             // Must be <= min_prefix_size (smaller number = larger block)
   "registry": number,                    // 0=ARIN, 1=RIPE, 2=APNIC, 3=LACNIC, 4=AFRINIC
   "external_id": "string | null",        // Optional RIR allocation ID
   "is_available": boolean,               // Optional, default: true
@@ -2778,8 +2778,8 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 ```json
 {
   "cidr": "string | null",               // Optional CIDR update (validated)
-  "min_prefix_size": number | null,      // Optional, must be <= max_prefix_size
-  "max_prefix_size": number | null,      // Optional, must be >= min_prefix_size
+  "min_prefix_size": number | null,      // Optional, must be >= max_prefix_size
+  "max_prefix_size": number | null,      // Optional, must be <= min_prefix_size
   "registry": number | null,             // Optional registry update
   "external_id": "string | null",        // Optional, null to clear
   "is_available": boolean | null,        // Optional availability update
@@ -2847,6 +2847,13 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 - `max_prefix_size` should be the smallest number (largest allocation)
 - Example: min=24, max=22 allows selling /24, /23, and /22 subnets
 
+**RIR Validation:**
+- All RIRs enforce minimum BGP announcement sizes for validation
+- IPv4: Minimum prefix size is /24 (256 addresses)
+- IPv6: Minimum prefix size is /48
+- Prefix sizes are validated against RIR limits when creating/updating IP spaces
+- Validation ensures compliance with industry-standard BGP routing requirements
+
 **Pricing Structure:**
 - Multiple pricing tiers can exist for the same IP space
 - Each tier targets a specific prefix size (e.g., /24, /28, /32)
@@ -2858,6 +2865,10 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 - `is_available=false` → Hidden from customer browsing
 - `is_reserved=true` → Admin reserved, not for sale
 - Cannot delete IP space with active subscriptions
+
+**Public API vs Admin API:**
+- Public API: CIDR blocks are hidden for security until purchase; uses `ip_version` field instead
+- Admin API: Full CIDR information visible for management purposes
 
 **Metadata Examples:**
 ```json

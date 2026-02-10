@@ -45,7 +45,13 @@ async fn v1_list_ip_space(
     let mut ip_spaces = Vec::new();
     for space in paginated_spaces {
         match ApiAvailableIpSpace::from_ip_space_with_pricing(this.db.as_ref(), space).await {
-            Ok(api_space) => ip_spaces.push(api_space),
+            Ok(mut api_space) => {
+                // Expand pricing with alternative currencies
+                if let Err(_) = api_space.expand_pricing(&this.rates).await {
+                    // If expansion fails, continue with base pricing
+                }
+                ip_spaces.push(api_space);
+            }
             Err(_) => continue, // Skip if we can't load pricing
         }
     }
@@ -65,8 +71,13 @@ async fn v1_get_ip_space(
         return ApiData::err("IP space not available");
     }
 
-    let api_space =
+    let mut api_space =
         ApiAvailableIpSpace::from_ip_space_with_pricing(this.db.as_ref(), space).await?;
+
+    // Expand pricing with alternative currencies
+    if let Err(_) = api_space.expand_pricing(&this.rates).await {
+        // If expansion fails, continue with base pricing
+    }
 
     ApiData::ok(api_space)
 }

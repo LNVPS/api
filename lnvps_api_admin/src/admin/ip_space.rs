@@ -197,9 +197,9 @@ async fn admin_update_ip_space(
         space.max_prefix_size = max_prefix_size;
     }
 
-    // Validate min <= max
-    if space.min_prefix_size > space.max_prefix_size {
-        return ApiData::err("min_prefix_size must be less than or equal to max_prefix_size");
+    // Validate min >= max (remember: larger prefix number = smaller block)
+    if space.min_prefix_size < space.max_prefix_size {
+        return ApiData::err("min_prefix_size must be greater than or equal to max_prefix_size (smaller prefix number = larger block)");
     }
 
     if let Some(registry) = req.registry {
@@ -211,6 +211,36 @@ async fn admin_update_ip_space(
             4 => InternetRegistry::AFRINIC,
             _ => return ApiData::err("Invalid registry value"),
         };
+    }
+
+    // Validate max prefix size against RIR limits and parent CIDR
+    let network: ipnetwork::IpNetwork = space
+        .cidr
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid CIDR format"))?;
+    let is_ipv6 = network.is_ipv6();
+    let parent_prefix = network.prefix() as u16;
+
+    let rir_min = if is_ipv6 {
+        space.registry.min_ipv6_prefix_size()
+    } else {
+        space.registry.min_ipv4_prefix_size()
+    };
+
+    if space.max_prefix_size > rir_min {
+        return ApiData::err(&format!(
+            "max_prefix_size /{} is too small for BGP announcement (RIR minimum: /{})",
+            space.max_prefix_size,
+            rir_min
+        ));
+    }
+
+    if space.max_prefix_size < parent_prefix {
+        return ApiData::err(&format!(
+            "max_prefix_size /{} cannot be larger than parent CIDR /{}",
+            space.max_prefix_size,
+            parent_prefix
+        ));
     }
 
     if let Some(external_id) = &req.external_id {
@@ -361,10 +391,13 @@ async fn admin_create_ip_space_pricing(
     let space = this.db.get_available_ip_space(id).await?;
 
     // Validate prefix size is within space's min/max bounds
-    if req.prefix_size < space.min_prefix_size || req.prefix_size > space.max_prefix_size {
+    // Remember: min_prefix_size = largest number (smallest block)
+    //           max_prefix_size = smallest number (largest block)
+    // Valid range: max_prefix_size <= prefix_size <= min_prefix_size
+    if req.prefix_size < space.max_prefix_size || req.prefix_size > space.min_prefix_size {
         return ApiData::err(&format!(
-            "Prefix size must be between {} and {}",
-            space.min_prefix_size, space.max_prefix_size
+            "Prefix size must be between /{} and /{}",
+            space.max_prefix_size, space.min_prefix_size
         ));
     }
 
@@ -415,10 +448,13 @@ async fn admin_update_ip_space_pricing(
     // Update fields if provided
     if let Some(prefix_size) = req.prefix_size {
         // Validate prefix size is within space's min/max bounds
-        if prefix_size < space.min_prefix_size || prefix_size > space.max_prefix_size {
+        // Remember: min_prefix_size = largest number (smallest block)
+        //           max_prefix_size = smallest number (largest block)
+        // Valid range: max_prefix_size <= prefix_size <= min_prefix_size
+        if prefix_size < space.max_prefix_size || prefix_size > space.min_prefix_size {
             return ApiData::err(&format!(
-                "Prefix size must be between {} and {}",
-                space.min_prefix_size, space.max_prefix_size
+                "Prefix size must be between /{} and /{}",
+                space.max_prefix_size, space.min_prefix_size
             ));
         }
 
@@ -438,8 +474,8 @@ async fn admin_update_ip_space_pricing(
     }
 
     if let Some(price_per_month) = req.price_per_month {
-        if price_per_month < 0 {
-            return ApiData::err("price_per_month cannot be negative");
+        if price_per_month == 0 {
+            return ApiData::err("price_per_month cannot be 0");
         }
         pricing.price_per_month = price_per_month;
     }
@@ -452,9 +488,6 @@ async fn admin_update_ip_space_pricing(
     }
 
     if let Some(setup_fee) = req.setup_fee {
-        if setup_fee < 0 {
-            return ApiData::err("setup_fee cannot be negative");
-        }
         pricing.setup_fee = setup_fee;
     }
 

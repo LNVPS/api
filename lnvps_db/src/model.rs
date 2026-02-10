@@ -1138,6 +1138,53 @@ impl Display for InternetRegistry {
     }
 }
 
+impl InternetRegistry {
+    /// Get the minimum IPv4 prefix size that can be announced in BGP for this RIR
+    /// Based on industry-standard minimum announcement sizes
+    pub fn min_ipv4_prefix_size(&self) -> u16 {
+        match self {
+            InternetRegistry::ARIN => 24,    // /24 minimum
+            InternetRegistry::RIPE => 24,    // /24 minimum
+            InternetRegistry::APNIC => 24,   // /24 minimum
+            InternetRegistry::LACNIC => 24,  // /24 minimum
+            InternetRegistry::AFRINIC => 24, // /24 minimum
+        }
+    }
+
+    /// Get the minimum IPv6 prefix size that can be announced in BGP for this RIR
+    /// Based on industry-standard minimum announcement sizes
+    pub fn min_ipv6_prefix_size(&self) -> u16 {
+        match self {
+            InternetRegistry::ARIN => 48, // /48 minimum (though /32 is more common for allocations)
+            InternetRegistry::RIPE => 48, // /48 minimum
+            InternetRegistry::APNIC => 48, // /48 minimum
+            InternetRegistry::LACNIC => 48, // /48 minimum
+            InternetRegistry::AFRINIC => 48, // /48 minimum
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_internet_registry_min_prefix_sizes() {
+        // Test that all RIRs return correct minimum prefix sizes
+        assert_eq!(InternetRegistry::ARIN.min_ipv4_prefix_size(), 24);
+        assert_eq!(InternetRegistry::RIPE.min_ipv4_prefix_size(), 24);
+        assert_eq!(InternetRegistry::APNIC.min_ipv4_prefix_size(), 24);
+        assert_eq!(InternetRegistry::LACNIC.min_ipv4_prefix_size(), 24);
+        assert_eq!(InternetRegistry::AFRINIC.min_ipv4_prefix_size(), 24);
+
+        assert_eq!(InternetRegistry::ARIN.min_ipv6_prefix_size(), 48);
+        assert_eq!(InternetRegistry::RIPE.min_ipv6_prefix_size(), 48);
+        assert_eq!(InternetRegistry::APNIC.min_ipv6_prefix_size(), 48);
+        assert_eq!(InternetRegistry::LACNIC.min_ipv6_prefix_size(), 48);
+        assert_eq!(InternetRegistry::AFRINIC.min_ipv6_prefix_size(), 48);
+    }
+}
+
 /// Available IP Space - Inventory of IP ranges available for sale
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct AvailableIpSpace {

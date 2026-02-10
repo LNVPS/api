@@ -2058,9 +2058,53 @@ impl CreateAvailableIpSpaceRequest {
             _ => return Err(anyhow::anyhow!("Invalid registry value")),
         };
 
-        if self.min_prefix_size > self.max_prefix_size {
+        if self.min_prefix_size < self.max_prefix_size {
             return Err(anyhow::anyhow!(
-                "min_prefix_size must be less than or equal to max_prefix_size"
+                "min_prefix_size must be greater than or equal to max_prefix_size (smaller prefix number = larger block)"
+            ));
+        }
+
+        // Parse CIDR to determine if IPv4 or IPv6
+        let network: ipnetwork::IpNetwork = self
+            .cidr
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid CIDR format"))?;
+        let is_ipv6 = network.is_ipv6();
+        let parent_prefix = network.prefix() as u16;
+
+        // Validate max_prefix_size
+        // 1. Must not be smaller than RIR BGP minimum
+        // 2. Must not be larger than the parent CIDR block
+        let rir_min = if is_ipv6 {
+            registry.min_ipv6_prefix_size()
+        } else {
+            registry.min_ipv4_prefix_size()
+        };
+
+        if self.max_prefix_size > rir_min {
+            return Err(anyhow::anyhow!(
+                "max_prefix_size /{} is too small for BGP announcement (RIR minimum: /{})",
+                self.max_prefix_size,
+                rir_min
+            ));
+        }
+
+        if self.max_prefix_size < parent_prefix {
+            return Err(anyhow::anyhow!(
+                "max_prefix_size /{} cannot be larger than parent CIDR /{}",
+                self.max_prefix_size,
+                parent_prefix
+            ));
+        }
+
+        // Validate min_prefix_size is within valid bounds
+        let max_prefix_num = if is_ipv6 { 128 } else { 32 };
+        if self.min_prefix_size > max_prefix_num {
+            return Err(anyhow::anyhow!(
+                "min_prefix_size /{} exceeds maximum /{}",
+                self.min_prefix_size,
+                max_prefix_num
             ));
         }
 
@@ -2092,16 +2136,16 @@ pub struct AdminIpSpacePricingInfo {
     pub prefix_size: u16,
     pub price_per_month: u64, // In cents/millisats
     pub currency: String,
-    pub setup_fee: u64, // In cents/millisats
+    pub setup_fee: u64,       // In cents/millisats
     pub cidr: Option<String>, // Populated with parent CIDR for context
 }
 
 #[derive(Deserialize)]
 pub struct CreateIpSpacePricingRequest {
     pub prefix_size: u16,
-    pub price_per_month: u64, // In cents/millisats
+    pub price_per_month: u64,     // In cents/millisats
     pub currency: Option<String>, // Default: "USD"
-    pub setup_fee: Option<u64>,    // Default: 0
+    pub setup_fee: Option<u64>,   // Default: 0
 }
 
 #[derive(Deserialize)]
@@ -2132,6 +2176,11 @@ impl CreateIpSpacePricingRequest {
         available_ip_space_id: u64,
     ) -> anyhow::Result<lnvps_db::IpSpacePricing> {
         use chrono::Utc;
+
+        // Validate price is not zero
+        if self.price_per_month == 0 {
+            return Err(anyhow::anyhow!("price_per_month cannot be 0"));
+        }
 
         Ok(lnvps_db::IpSpacePricing {
             id: 0, // Will be set by database

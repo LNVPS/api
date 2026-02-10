@@ -10,6 +10,8 @@ mod webhook;
 #[derive(Deserialize)]
 pub(crate) struct PaymentMethodQuery {
     pub method: Option<String>,
+    /// Number of intervals to renew for (e.g., 2 means renew for 2x the normal period)
+    pub intervals: Option<u32>,
 }
 
 #[derive(Deserialize)]

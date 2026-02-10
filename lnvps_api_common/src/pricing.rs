@@ -123,25 +123,59 @@ impl PricingEngine {
         }))
     }
 
-    /// Get VM cost (for renewal)
+    /// Get VM cost (for renewal) for a single interval
     pub async fn get_vm_cost(&self, vm_id: u64, method: PaymentMethod) -> Result<CostResult> {
+        self.get_vm_cost_for_intervals(vm_id, method, 1).await
+    }
+
+    /// Get VM cost (for renewal) for multiple intervals
+    pub async fn get_vm_cost_for_intervals(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+    ) -> Result<CostResult> {
+        let intervals = intervals.max(1); // Ensure at least 1 interval
         let vm = self.db.get_vm(vm_id).await?;
 
-        // Reuse existing renewal payment until expired
+        // Calculate the base cost to determine expected time value
+        let base_cost = if vm.template_id.is_some() {
+            self.get_template_vm_cost(&vm, method).await?
+        } else {
+            self.get_custom_vm_cost(&vm, method).await?
+        };
+
+        let expected_time_value = base_cost.time_value * intervals as u64;
+
+        // Check for existing payment with matching time value
         let payments = self
             .db
             .list_vm_payment_by_method_and_type(vm.id, method, PaymentType::Renewal)
             .await?;
-        if let Some(px) = payments.into_iter().next() {
+        if let Some(px) = payments
+            .into_iter()
+            .find(|p| p.time_value == expected_time_value)
+        {
             return Ok(CostResult::Existing(px));
         }
 
-        if vm.template_id.is_some() {
-            Ok(CostResult::New(
-                self.get_template_vm_cost(&vm, method).await?,
-            ))
+        // Scale the cost by number of intervals
+        if intervals == 1 {
+            Ok(CostResult::New(base_cost))
         } else {
-            Ok(CostResult::New(self.get_custom_vm_cost(&vm, method).await?))
+            let scaled_amount = base_cost.amount * intervals as u64;
+            let scaled_time = expected_time_value;
+            let scaled_tax = self
+                .get_tax_for_user(vm.user_id, scaled_amount)
+                .await?;
+            Ok(CostResult::New(NewPaymentInfo {
+                amount: scaled_amount,
+                tax: scaled_tax,
+                currency: base_cost.currency,
+                rate: base_cost.rate,
+                time_value: scaled_time,
+                new_expiry: vm.expires.add(TimeDelta::seconds(scaled_time as i64)),
+            }))
         }
     }
 

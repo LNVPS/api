@@ -813,6 +813,9 @@ if (result.error) {
 
 ## IP Space Management
 
+IP Space management allows users to browse and purchase IP address blocks. For security reasons, 
+the actual CIDR blocks are not exposed in the public API until after purchase.
+
 ### Data Types
 
 ```typescript
@@ -820,19 +823,25 @@ type InternetRegistry = 'arin' | 'ripe' | 'apnic' | 'lacnic' | 'afrinic';
 
 interface AvailableIpSpace {
   id: number;
-  cidr: string; // e.g., "192.168.0.0/22"
   min_prefix_size: number; // e.g., 24 (smallest allocation)
   max_prefix_size: number; // e.g., 22 (largest allocation)
   registry: InternetRegistry;
+  ip_version: 'ipv4' | 'ipv6'; // IP version of this block
   pricing: IpSpacePricing[];
 }
 
 interface IpSpacePricing {
   id: number;
   prefix_size: number; // e.g., 24 for /24
-  price_per_month: number; // In cents for fiat, millisats for BTC
-  currency: 'BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY';
-  setup_fee: number; // In cents for fiat, millisats for BTC
+  price: Price; // Base price in original currency
+  setup_fee: Price; // Setup fee in original currency
+  other_price: Price[]; // Prices converted to alternative currencies
+  other_setup_fee: Price[]; // Setup fees converted to alternative currencies
+}
+
+interface Price {
+  currency: 'usd' | 'eur' | 'btc' | 'gbp' | 'cad' | 'chf' | 'aud' | 'jpy';
+  amount: number; // In decimal format (e.g., 10.00 for $10, 0.00011 for BTC)
 }
 
 interface IpRangeSubscription {
@@ -871,9 +880,12 @@ const result: ApiPaginatedResponse<AvailableIpSpace> = await response.json();
 
 if (!result.error) {
   result.data.forEach(space => {
-    console.log(`${space.cidr} from ${space.registry.toUpperCase()}`);
+    console.log(`${space.ip_version.toUpperCase()} block from ${space.registry.toUpperCase()}`);
     space.pricing.forEach(price => {
-      console.log(`  /${price.prefix_size}: $${price.price_per_month / 100}/month`);
+      console.log(`  /${price.prefix_size}: ${price.price.currency} ${price.price.amount}/month`);
+      if (price.other_price.length > 0) {
+        console.log(`    Also available in: ${price.other_price.map(p => p.currency).join(', ')}`);
+      }
     });
   });
 }
@@ -881,9 +893,11 @@ if (!result.error) {
 
 **Notes**:
 1. Only shows IP spaces that are available and not reserved
-2. Each IP space includes all available pricing tiers
-3. Pricing is returned in the smallest currency unit (cents/millisats)
-4. Different prefix sizes within the same block can have different prices
+2. The actual CIDR blocks are not exposed in the public API - use `ip_version` to determine IPv4 or IPv6
+3. Each IP space includes all available pricing tiers with alternative currency conversions
+4. Base pricing uses the `price` and `setup_fee` fields
+5. Alternative currencies are available in `other_price` and `other_setup_fee` arrays
+6. Different prefix sizes within the same block can have different prices
 
 ### Get IP Space Details
 
@@ -909,7 +923,7 @@ const response = await fetch('/api/v1/ip_space/1');
 const result: ApiResponse<AvailableIpSpace> = await response.json();
 
 if (!result.error) {
-  console.log(`Available: ${result.data.cidr}`);
+  console.log(`${result.data.ip_version} block from ${result.data.registry}`);
   console.log(`Prefix sizes: /${result.data.min_prefix_size} to /${result.data.max_prefix_size}`);
 }
 ```

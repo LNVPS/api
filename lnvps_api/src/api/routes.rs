@@ -451,6 +451,7 @@ async fn v1_renew_vm(
 ) -> ApiResult<ApiVmPayment> {
     let (uid, _) = get_user_vm(&auth, &this, id).await?;
     let user = this.db.get_user(uid).await?;
+    let intervals = q.intervals.unwrap_or(1);
 
     // handle "nwc" payments automatically
     let rsp = if q.method.as_deref() == Some("nwc") && user.nwc_connection_string.is_some() {
@@ -459,11 +460,12 @@ async fn v1_renew_vm(
             .await?
     } else {
         this.provisioner
-            .renew(
+            .renew_intervals(
                 id,
                 q.method
                     .and_then(|m| PaymentMethod::from_str(&m).ok())
                     .unwrap_or(PaymentMethod::Lightning),
+                intervals,
             )
             .await?
     };

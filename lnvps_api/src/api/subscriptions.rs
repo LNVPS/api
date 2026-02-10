@@ -53,8 +53,7 @@ async fn v1_list_subscriptions(
         .skip(offset as usize)
         .take(limit as usize)
     {
-        subscriptions
-            .push(ApiSubscription::from_subscription(this.db.as_ref(), subscription).await?);
+        subscriptions.push(ApiSubscription::from_subscription(this.db.as_ref(), subscription).await?);
     }
 
     ApiPaginatedData::ok(subscriptions, total, limit, offset)

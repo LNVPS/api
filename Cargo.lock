@@ -3166,7 +3166,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 [[package]]
 name = "payments-rs"
 version = "0.2.0"
-source = "git+https://github.com/v0l/payments-rs.git?rev=c749877cdcf1fa989c6797690a0d9ac8815aaf33#c749877cdcf1fa989c6797690a0d9ac8815aaf33"
+source = "git+https://github.com/v0l/payments-rs.git?rev=60b0fbf3838385439fbd08d43565fb1d9ab810fb#60b0fbf3838385439fbd08d43565fb1d9ab810fb"
 dependencies = [
  "anyhow",
  "async-trait",
