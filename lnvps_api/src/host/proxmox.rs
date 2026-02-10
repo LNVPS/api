@@ -915,7 +915,8 @@ impl VmHostClient for ProxmoxClient {
                 .await
                 .map_err(OpError::Transient)?;
             info!("{}", rsp);
-            if code != 0 {
+            // exit code 2 = doesnt exist, ignore
+            if code != 0 && code != 2 {
                 op_fatal!("Failed to destroy vm, exit-code {}, {}", code, rsp)
             }
         }
