@@ -6,7 +6,9 @@ use lnvps_api_common::WorkJob;
 use lnvps_api_common::{VmHistoryLogger, WorkCommander};
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType};
 use log::{error, info, warn};
-use payments_rs::fiat::{RevolutApi, RevolutConfig, RevolutWebhookBody, RevolutWebhookEvent};
+use payments_rs::fiat::{
+    RevolutApi, RevolutConfig, RevolutOrderState, RevolutWebhookBody, RevolutWebhookEvent,
+};
 use payments_rs::webhook::WEBHOOK_BRIDGE;
 use reqwest::Url;
 use std::sync::Arc;
@@ -51,6 +53,7 @@ impl RevolutPaymentHandler {
                 vec![
                     RevolutWebhookEvent::OrderCompleted,
                     RevolutWebhookEvent::OrderAuthorised,
+                    RevolutWebhookEvent::OrderCancelled,
                 ],
             )
             .await?;
@@ -70,10 +73,19 @@ impl RevolutPaymentHandler {
                 Ok(m) => m,
             };
 
-            if let RevolutWebhookEvent::OrderCompleted = msg.event
-                && let Err(e) = self.try_complete_payment(&msg.order_id).await
-            {
-                error!("Failed to complete order: {}", e);
+            match msg.event {
+                RevolutWebhookEvent::OrderCompleted => {
+                    let order_ref = &msg.merchant_order_ext_ref.as_ref().unwrap_or(&msg.order_id);
+                    if let Err(e) = self.try_complete_payment(order_ref).await {
+                        error!("Failed to complete order {}: {}", order_ref, e);
+                    }
+                }
+                RevolutWebhookEvent::OrderAuthorised => {
+                    info!("Order {} authorised, awaiting completion", msg.order_id);
+                }
+                RevolutWebhookEvent::OrderCancelled => {
+                    warn!("Order {} was cancelled", msg.order_id);
+                }
             }
         }
         Ok(())
@@ -87,6 +99,10 @@ impl RevolutPaymentHandler {
 
         // save payment state json into external_data
         let order = self.api.get_order(ext_id).await?;
+        if !matches!(order.state, RevolutOrderState::Completed) {
+            error!("Invalid order state {:?}", order);
+            return Ok(());
+        }
         payment.external_data = serde_json::to_string(&order)?.into();
 
         // check user country matches card country
