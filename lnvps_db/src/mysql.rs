@@ -1344,7 +1344,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         // Subscriptions are always monthly - extend by 30 days and activate
         sqlx::query(
-            "UPDATE subscription SET expires = DATE_ADD(COALESCE(expires, NOW()), INTERVAL 30 DAY), is_active = 1 WHERE id = ?"
+            "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL 30 DAY), is_active = 1 WHERE id = ?"
         )
         .bind(payment.subscription_id)
         .execute(&self.db)
