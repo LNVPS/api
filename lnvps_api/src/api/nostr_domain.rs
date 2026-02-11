@@ -4,7 +4,7 @@ use axum::extract::{Path, State};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use lnvps_api_common::{ApiData, ApiResult};
+use lnvps_api_common::{ApiData, ApiError, ApiResult};
 use lnvps_db::{NostrDomain, NostrDomainHandle};
 use serde::{Deserialize, Serialize};
 
@@ -88,7 +88,8 @@ async fn v1_create_nostr_domain_handle(
         return ApiData::err("Access denied");
     }
 
-    let h_pubkey = hex::decode(&data.pubkey)?;
+    let h_pubkey = hex::decode(&data.pubkey)
+        .map_err(|_| ApiError::new("Invalid public key hex encoding"))?;
     if h_pubkey.len() != 32 {
         return ApiData::err("Invalid public key");
     }

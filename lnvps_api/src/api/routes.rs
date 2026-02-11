@@ -106,7 +106,8 @@ async fn v1_patch_account(
             Ok(s) => {
                 // test connection
                 let client = nwc::NWC::new(s);
-                let info = client.get_info().await?;
+                let info = client.get_info().await
+                    .map_err(|e| ApiError::new(format!("Failed to connect to NWC: {}", e)))?;
                 if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
                     return ApiData::err("NWC connection must allow pay_invoice");
                 }
@@ -410,7 +411,8 @@ async fn v1_add_ssh_key(
 ) -> ApiResult<ApiUserSshKey> {
     let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
 
-    let pk: PublicKey = req.key_data.parse()?;
+    let pk: PublicKey = req.key_data.parse()
+        .map_err(|_| ApiError::new("Invalid SSH public key format"))?;
     let key_name = if !req.name.is_empty() {
         &req.name
     } else {
@@ -419,7 +421,9 @@ async fn v1_add_ssh_key(
     let mut new_key = lnvps_db::UserSshKey {
         name: key_name.to_string(),
         user_id: uid,
-        key_data: pk.to_openssh()?.into(),
+        key_data: pk.to_openssh()
+            .map_err(|_| ApiError::new("Failed to encode SSH key"))?
+            .into(),
         ..Default::default()
     };
     let key_id = this.db.insert_user_ssh_key(&new_key).await?;

@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use log::error;
 use serde::{Deserialize, Serialize};
 
 pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
@@ -17,7 +18,7 @@ impl<T: Serialize> ApiData<T> {
     }
 
     pub fn err(msg: &str) -> ApiResult<T> {
-        Err(msg.into())
+        Err(ApiError::new(msg))
     }
 }
 
@@ -40,7 +41,7 @@ impl<T: Serialize> ApiPaginatedData<T> {
     }
 
     pub fn err(msg: &str) -> ApiPaginatedResult<T> {
-        Err(msg.into())
+        Err(ApiError::new(msg))
     }
 }
 
@@ -50,16 +51,38 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// Create an API error with a user-safe message
     pub fn new(message: impl ToString) -> Self {
         Self {
             error: message.to_string(),
         }
     }
+
+    /// Create an API error from an internal error, logging the full details
+    /// but only returning a generic message to the client
+    pub fn internal(err: impl std::fmt::Display) -> Self {
+        error!("Internal error: {}", err);
+        Self {
+            error: "An internal error occurred".to_string(),
+        }
+    }
 }
 
-impl<T: ToString> From<T> for ApiError {
-    fn from(value: T) -> Self {
-        Self::new(value.to_string())
+impl From<anyhow::Error> for ApiError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::internal(value)
+    }
+}
+
+impl From<lnvps_db::DbError> for ApiError {
+    fn from(value: lnvps_db::DbError) -> Self {
+        Self::internal(value)
+    }
+}
+
+impl From<crate::retry::OpError<anyhow::Error>> for ApiError {
+    fn from(value: crate::retry::OpError<anyhow::Error>) -> Self {
+        Self::internal(value)
     }
 }
 
@@ -81,8 +104,8 @@ mod tests {
     }
 
     #[test]
-    fn test_api_error_from_str() {
-        let error: ApiError = "Test error".into();
-        assert_eq!(error.error, "Test error");
+    fn test_api_error_internal_sanitizes() {
+        let error = ApiError::internal("secret internal details at 192.168.1.1");
+        assert_eq!(error.error, "An internal error occurred");
     }
 }

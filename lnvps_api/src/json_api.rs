@@ -145,13 +145,29 @@ impl JsonApi {
         let rsp = match self.client.execute(req).await {
             Ok(rsp) => rsp,
             Err(e) => {
-                op_transient!(
-                    "Failed to send request: {} source={}",
-                    e,
-                    e.source()
-                        .map(|x| x.to_string())
-                        .unwrap_or_else(|| "None".to_owned())
-                );
+                // Build a detailed error message from the reqwest error chain
+                let mut details = Vec::new();
+                if e.is_connect() {
+                    details.push("connection failed".to_string());
+                }
+                if e.is_timeout() {
+                    details.push("timeout".to_string());
+                }
+                if let Some(url) = e.url() {
+                    details.push(format!("url={}", url));
+                }
+                // Walk the error chain for more context
+                let mut source = e.source();
+                while let Some(err) = source {
+                    details.push(err.to_string());
+                    source = err.source();
+                }
+                let detail_str = if details.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", details.join(", "))
+                };
+                op_transient!("Request failed: {}{}", e, detail_str);
             }
         };
 
