@@ -6,7 +6,7 @@ use crate::host::{
 use crate::settings::QemuConfig;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
-use lnvps_api_common::VmRunningState;
+use lnvps_api_common::{op_fatal, VmRunningState};
 use lnvps_api_common::VmRunningStates;
 use lnvps_api_common::retry::{OpError, OpResult};
 use lnvps_db::{LNVpsDb, Vm, VmOsImage};
@@ -50,7 +50,7 @@ impl LibVirtHost {
         // check the storage disk exists, we don't need anything else from it for now
         let _storage_disk = if let Some(d) = storage
             .iter()
-            .find(|s| s.get_name().map(|n| n == cfg.disk.name).unwrap_or(false))
+            .find(|s| s.name().map(|n| n == cfg.disk.name).unwrap_or(false))
         {
             d
         } else {
@@ -59,7 +59,7 @@ impl LibVirtHost {
                 cfg.disk.name,
                 storage
                     .iter()
-                    .filter_map(|s| s.get_name().ok())
+                    .filter_map(|s| s.name().ok())
                     .collect::<Vec<_>>()
                     .join(",")
             );
@@ -130,7 +130,7 @@ impl VmHostClient for LibVirtHost {
     async fn get_info(&self) -> OpResult<VmHostInfo> {
         let info = self
             .connection
-            .get_node_info()
+            .node_info()
             .map_err(|e| OpError::Fatal(anyhow::anyhow!(e)))?;
         let storage = self
             .connection
@@ -142,9 +142,9 @@ impl VmHostClient for LibVirtHost {
             disks: storage
                 .iter()
                 .filter_map(|p| {
-                    let info = p.get_info().ok()?;
+                    let info = p.info().ok()?;
                     Some(VmHostDiskInfo {
-                        name: p.get_name().context("storage pool name is missing").ok()?,
+                        name: p.name().context("storage pool name is missing").ok()?,
                         size: info.capacity,
                         used: info.allocation,
                     })
@@ -182,8 +182,7 @@ impl VmHostClient for LibVirtHost {
     async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         let domain = self.create_domain_xml(cfg).map_err(OpError::Transient)?;
         let xml = quick_xml::se::to_string(&domain).map_err(|e| OpError::Fatal(e.into()))?;
-        let domain = Domain::create_xml(&self.connection, &xml, VIR_DOMAIN_START_VALIDATE)
-            .map_err(|e| OpError::Transient(e.into()))?;
+        op_fatal!("Not implemented");
 
         Ok(())
     }

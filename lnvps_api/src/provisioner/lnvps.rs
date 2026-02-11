@@ -578,6 +578,7 @@ impl LNVpsProvisioner {
             info,
         };
         Ok(Pipeline::new(ctx)
+            .with_retry_policy(Self::retry_policy())
             .step_with_rollback(
                 "ip_allocation",
                 |ctx| Box::pin(async move { ctx.assign_ips().await }),
