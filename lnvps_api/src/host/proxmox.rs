@@ -5,7 +5,7 @@ use crate::host::{
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipnetwork::IpNetwork;
@@ -235,13 +235,13 @@ impl ProxmoxClient {
     }
 
     /// Helper function to wait for a task to complete
-    pub async fn wait_for_task(&self, task: &TaskId) -> Result<TaskStatus> {
+    pub async fn wait_for_task(&self, task: &TaskId) -> OpResult<TaskStatus> {
         let max_wait_time = Duration::from_secs(300); // 5 minutes max
         let start_time = std::time::Instant::now();
 
         loop {
             if start_time.elapsed() > max_wait_time {
-                bail!("Task {} timed out after 5 minutes", task.id);
+                op_fatal!("Task {} timed out after 5 minutes", task.id);
             }
 
             let s = self.get_task_status(task).await?;
@@ -249,7 +249,7 @@ impl ProxmoxClient {
                 if s.is_success() {
                     return Ok(s);
                 } else {
-                    bail!(
+                    op_fatal!(
                         "Task finished with error: {}",
                         s.exit_status.unwrap_or("no error message".to_string())
                     );
@@ -259,7 +259,7 @@ impl ProxmoxClient {
         }
     }
 
-    async fn get_iso_storage(&self, node: &str) -> Result<String> {
+    async fn get_iso_storage(&self, node: &str) -> OpResult<String> {
         let storages = self.list_storage(node).await?;
         if let Some(s) = storages
             .iter()
@@ -267,12 +267,12 @@ impl ProxmoxClient {
         {
             Ok(s.storage.clone())
         } else {
-            bail!("No image storage found");
+            op_fatal!("No image storage found");
         }
     }
 
     /// Download an image to the host disk
-    pub async fn download_image(&self, req: DownloadUrlRequest) -> Result<TaskId> {
+    pub async fn download_image(&self, req: DownloadUrlRequest) -> OpResult<TaskId> {
         let api = &self.api;
         let node_clone = req.node.clone();
 
@@ -292,7 +292,7 @@ impl ProxmoxClient {
         })
     }
 
-    pub async fn import_disk_image(&self, req: ImportDiskImageRequest) -> Result<()> {
+    pub async fn import_disk_image(&self, req: ImportDiskImageRequest) -> OpResult<()> {
         // import the disk
         // TODO: find a way to avoid using SSH
         if let Some(ssh_config) = &self.ssh {
@@ -326,22 +326,24 @@ impl ProxmoxClient {
             );
 
             // SSH connection and execution with retry
-            let mut s = SshClient::new()?;
-            s.connect((host.clone(), 22), &ssh_user, &ssh_key).await?;
-            let (code, rsp) = s.execute(&cmd).await?;
+            let mut s = SshClient::new().map_err(OpError::Transient)?;
+            s.connect((host.clone(), 22), &ssh_user, &ssh_key)
+                .await
+                .map_err(OpError::Transient)?;
+            let (code, rsp) = s.execute(&cmd).await.map_err(OpError::Transient)?;
             info!("{}", rsp);
 
             if code != 0 {
-                bail!("Failed to import disk, exit-code {}, {}", code, rsp);
+                op_fatal!("Failed to import disk, exit-code {}, {}", code, rsp);
             }
             Ok(())
         } else {
-            bail!("Cannot complete, no method available to import disk, consider configuring ssh")
+            op_fatal!("Cannot complete, no method available to import disk, consider configuring ssh")
         }
     }
 
     /// Resize a disk on a VM
-    pub async fn resize_disk(&self, req: ResizeDiskRequest) -> Result<TaskId> {
+    pub async fn resize_disk(&self, req: ResizeDiskRequest) -> OpResult<TaskId> {
         let api = &self.api;
         let node_clone = req.node.clone();
 
@@ -360,7 +362,7 @@ impl ProxmoxClient {
     }
 
     /// Start a VM
-    pub async fn start_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
+    pub async fn start_vm(&self, node: &str, vm: ProxmoxVmId) -> OpResult<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
 
@@ -378,7 +380,7 @@ impl ProxmoxClient {
     }
 
     /// Stop a VM
-    pub async fn stop_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
+    pub async fn stop_vm(&self, node: &str, vm: ProxmoxVmId) -> OpResult<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
 
@@ -396,7 +398,7 @@ impl ProxmoxClient {
     }
 
     /// Stop a VM
-    pub async fn shutdown_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
+    pub async fn shutdown_vm(&self, node: &str, vm: ProxmoxVmId) -> OpResult<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
 
@@ -414,7 +416,7 @@ impl ProxmoxClient {
     }
 
     /// Stop a VM
-    pub async fn reset_vm(&self, node: &str, vm: ProxmoxVmId) -> Result<TaskId> {
+    pub async fn reset_vm(&self, node: &str, vm: ProxmoxVmId) -> OpResult<TaskId> {
         let api = &self.api;
         let node_str = node.to_string();
 
@@ -438,7 +440,7 @@ impl ProxmoxClient {
         vm: ProxmoxVmId,
         disks: Vec<String>,
         force: bool,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status::<()>(
                 Method::PUT,
@@ -462,7 +464,7 @@ impl ProxmoxClient {
         &self,
         node: &str,
         vm_id: ProxmoxVmId,
-    ) -> Result<VmFirewallConfig> {
+    ) -> OpResult<VmFirewallConfig> {
         let rsp: ResponseBase<VmFirewallConfig> = self
             .api
             .get(&format!(
@@ -481,7 +483,7 @@ impl ProxmoxClient {
         node: &str,
         vm_id: ProxmoxVmId,
         req: VmFirewallConfig,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status(
                 Method::PUT,
@@ -495,7 +497,7 @@ impl ProxmoxClient {
     /// List VM firewall IPsets
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset
-    pub async fn list_vm_ipsets(&self, node: &str, vm_id: ProxmoxVmId) -> Result<Vec<VmIpsetInfo>> {
+    pub async fn list_vm_ipsets(&self, node: &str, vm_id: ProxmoxVmId) -> OpResult<Vec<VmIpsetInfo>> {
         let rsp: ResponseBase<Vec<VmIpsetInfo>> = self
             .api
             .get(&format!(
@@ -514,7 +516,7 @@ impl ProxmoxClient {
         node: &str,
         vm_id: ProxmoxVmId,
         req: CreateVmIpsetRequest,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status(
                 Method::POST,
@@ -533,7 +535,7 @@ impl ProxmoxClient {
         node: &str,
         vm_id: ProxmoxVmId,
         ipset_name: &str,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status::<()>(
                 Method::DELETE,
@@ -555,7 +557,7 @@ impl ProxmoxClient {
         node: &str,
         vm_id: ProxmoxVmId,
         ipset_name: &str,
-    ) -> Result<Vec<VmIpsetEntry>> {
+    ) -> OpResult<Vec<VmIpsetEntry>> {
         let rsp: ResponseBase<Vec<VmIpsetEntry>> = self
             .api
             .get(&format!(
@@ -575,7 +577,7 @@ impl ProxmoxClient {
         vm_id: ProxmoxVmId,
         ipset_name: &str,
         req: CreateVmIpsetEntryRequest,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status(
                 Method::POST,
@@ -598,7 +600,7 @@ impl ProxmoxClient {
         vm_id: ProxmoxVmId,
         ipset_name: &str,
         cidr: &str,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status::<()>(
                 Method::DELETE,
@@ -622,7 +624,7 @@ impl ProxmoxClient {
         &self,
         node: &str,
         vm_id: ProxmoxVmId,
-    ) -> Result<Vec<VmFirewallRule>> {
+    ) -> OpResult<Vec<VmFirewallRule>> {
         let rsp: ResponseBase<Vec<VmFirewallRule>> = self
             .api
             .get(&format!(
@@ -641,7 +643,7 @@ impl ProxmoxClient {
         node: &str,
         vm_id: ProxmoxVmId,
         req: VmFirewallRule,
-    ) -> Result<()> {
+    ) -> OpResult<()> {
         self.api
             .req_status(
                 Method::POST,
@@ -737,8 +739,8 @@ impl ProxmoxClient {
         })
     }
 
-    /// Import main disk image from the template
-    async fn import_template_disk(&self, req: &FullVmInfo) -> OpResult<()> {
+    /// Import main disk image from the template (without resizing)
+    async fn import_disk(&self, req: &FullVmInfo) -> OpResult<()> {
         let vm_id = req.vm.id.into();
 
         // import primary disk from image (scsi0)
@@ -752,7 +754,13 @@ impl ProxmoxClient {
         })
         .await?;
 
-        // resize disk to match template
+        Ok(())
+    }
+
+    /// Resize the main disk to match template size
+    async fn resize_main_disk(&self, req: &FullVmInfo) -> OpResult<()> {
+        let vm_id = req.vm.id.into();
+
         let j_resize = self
             .resize_disk(ResizeDiskRequest {
                 node: self.node.clone(),
@@ -763,6 +771,14 @@ impl ProxmoxClient {
             .await?;
         self.wait_for_task(&j_resize).await?;
 
+        Ok(())
+    }
+
+    /// Import main disk image from the template (import + resize)
+    /// Used by reinstall_vm which doesn't use the pipeline
+    async fn import_template_disk(&self, req: &FullVmInfo) -> OpResult<()> {
+        self.import_disk(req).await?;
+        self.resize_main_disk(req).await?;
         Ok(())
     }
 
@@ -945,8 +961,11 @@ impl VmHostClient for ProxmoxClient {
                     })
                 },
             )
-            .step("import_template_disk", |ctx| {
-                Box::pin(async move { ctx.client.import_template_disk(ctx.req).await })
+            .step("import_disk", |ctx| {
+                Box::pin(async move { ctx.client.import_disk(ctx.req).await })
+            })
+            .step("resize_disk", |ctx| {
+                Box::pin(async move { ctx.client.resize_main_disk(ctx.req).await })
             })
             .step("patch_firewall", |ctx| {
                 Box::pin(async move { ctx.client.patch_firewall(ctx.req).await })
