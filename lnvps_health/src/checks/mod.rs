@@ -1,0 +1,53 @@
+use anyhow::Result;
+use async_trait::async_trait;
+
+pub mod dns;
+pub mod mss;
+
+/// Result of a health check
+#[derive(Debug, Clone)]
+pub struct CheckResult {
+    /// Name/identifier for this check
+    pub name: String,
+    /// Whether the check passed
+    pub passed: bool,
+    /// Human-readable message describing the result
+    pub message: String,
+    /// Optional details for debugging
+    pub details: Option<String>,
+}
+
+impl CheckResult {
+    pub fn ok(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            passed: true,
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn fail(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            passed: false,
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+}
+
+/// Trait for health checks
+#[async_trait]
+pub trait HealthCheck: Send + Sync {
+    /// Run the health check and return the result
+    async fn check(&self) -> Result<CheckResult>;
+
+    /// Get a unique identifier for this check (used for alert cooldown tracking)
+    fn id(&self) -> String;
+}

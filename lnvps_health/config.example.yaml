@@ -1,0 +1,83 @@
+# LNVPS Health Checker Configuration
+# Copy this file to config.yaml and modify as needed
+
+# Redis configuration for sending notifications via the work commander
+redis:
+  url: "redis://localhost:6379"
+
+# Check interval in seconds (default: 600 = 10 minutes)
+interval-secs: 600
+
+# Alert cooldown in seconds - don't re-alert for same check within this period
+# Default: 3600 (1 hour)
+alert-cooldown-secs: 3600
+
+# =============================================================================
+# MSS Checks - Verify TCP Maximum Segment Size is at expected levels
+# =============================================================================
+# Each check connects to the target and reads the negotiated MSS.
+# Low MSS values indicate MTU/fragmentation issues on the network path.
+# Each MSS check automatically creates both IPv4 and IPv6 probes.
+# If no address of a given family exists, that check is skipped.
+
+mss-checks:
+  # Example: IPv4-only target
+  - name: "Google DNS"
+    host: "8.8.8.8"
+    port: 443
+    expected-mss: 1460  # Standard ethernet MSS (IPv6 will be skipped)
+
+  # Example: Dual-stack target with separate IPv6 threshold
+  - name: "Google (dual-stack)"
+    host: "google.com"
+    port: 443
+    expected-mss: 1460      # IPv4 MSS threshold
+    expected-mss-v6: 1440   # IPv6 MSS threshold (20 bytes less due to larger header)
+
+  # Example: VPN tunnel path (lower MSS expected due to encapsulation overhead)
+  - name: "Customer API via VPN"
+    host: "api.example.com"
+    port: 443
+    expected-mss: 1400  # ~60 bytes overhead for VPN
+
+  # Example: Test a specific VM host
+  - name: "VM Host 1"
+    host: "10.0.0.10"
+    port: 22
+    expected-mss: 1460
+
+# =============================================================================
+# DNS Checks - Verify DNS resolution is working correctly
+# =============================================================================
+# Each check queries a specific DNS server and optionally verifies the response.
+# Each check can specify both IPv4 (server) and IPv6 (server-v6) DNS servers.
+# Separate checks are created for each address family configured.
+
+dns-checks:
+  # Example: Dual-stack check using Google DNS
+  - name: "Google DNS"
+    server: "8.8.8.8"
+    server-v6: "2001:4860:4860::8888"
+    query: "google.com"
+    timeout-secs: 5
+
+  # Example: Dual-stack check using Cloudflare DNS
+  - name: "Cloudflare DNS"
+    server: "1.1.1.1"
+    server-v6: "2606:4700:4700::1111"
+    query: "cloudflare.com"
+    timeout-secs: 5
+
+  # Example: IPv4-only check
+  - name: "Internal DNS - API"
+    server: "10.0.0.1"
+    query: "api.internal.example.com"
+    expected-ips:
+      - "10.0.1.100"
+    timeout-secs: 5
+
+  # Example: IPv6-only check
+  - name: "IPv6 DNS Server"
+    server-v6: "2001:db8::1"
+    query: "www.example.com"
+    timeout-secs: 10

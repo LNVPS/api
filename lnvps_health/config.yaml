@@ -1,0 +1,37 @@
+# LNVPS Health Checker Configuration
+
+# Redis configuration for sending notifications via the work commander
+redis:
+  url: "redis://localhost:6398"
+
+# Check interval in seconds (default: 600 = 10 minutes)
+interval-secs: 600
+
+# Alert cooldown in seconds - don't re-alert for same check within this period
+# Default: 3600 (1 hour)
+alert-cooldown-secs: 3600
+
+# =============================================================================
+# MSS Checks - Verify TCP Maximum Segment Size is at expected levels
+# =============================================================================
+mss-checks:
+  - name: "Google DNS"
+    host: "8.8.8.8"
+    port: 443
+    expected-mss: 1390  # Adjusted for VPN/tunnel overhead
+
+  - name: "Google (dual-stack)"
+    host: "google.com"
+    port: 443
+    expected-mss: 1390
+    expected-mss-v6: 1370  # IPv6 has 20 byte larger header
+
+# =============================================================================
+# DNS Checks - Verify DNS resolution is working correctly
+# =============================================================================
+dns-checks:
+  - name: "Google DNS"
+    server: "8.8.8.8"
+    server-v6: "2001:4860:4860::8888"
+    query: "google.com"
+    timeout-secs: 5

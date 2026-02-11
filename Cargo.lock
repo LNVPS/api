@@ -2560,6 +2560,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_health"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "config",
+ "env_logger",
+ "hickory-resolver",
+ "libc",
+ "lnvps_api_common",
+ "log 0.4.29",
+ "serde",
+ "socket2 0.5.10",
+ "tokio",
+]
+
+[[package]]
 name = "lnvps_nostr"
 version = "0.1.0"
 dependencies = [

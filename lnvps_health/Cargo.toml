@@ -1,0 +1,28 @@
+[package]
+name = "lnvps_health"
+version = "0.1.0"
+edition.workspace = true
+description = "Network health monitoring service for LNVPS (MSS, DNS, connectivity checks)"
+
+[[bin]]
+name = "lnvps_health"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+lnvps_api_common = { path = "../lnvps_api_common" }
+
+# Workspace shared
+tokio = { workspace = true, features = ["signal", "time", "net", "io-util"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+config.workspace = true
+
+# Local dependencies
+clap = { version = "4.5", features = ["derive"] }
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+hickory-resolver = "0.25"
+async-trait.workspace = true
