@@ -17,6 +17,8 @@ pub struct CheckResult {
     pub details: Option<String>,
     /// Optional numeric metric value (e.g., MSS bytes, latency ms)
     pub metric_value: Option<f64>,
+    /// Optional PMTU value (for MSS checks)
+    pub pmtu_value: Option<f64>,
 }
 
 impl CheckResult {
@@ -27,6 +29,7 @@ impl CheckResult {
             message: message.into(),
             details: None,
             metric_value: None,
+            pmtu_value: None,
         }
     }
 
@@ -37,6 +40,7 @@ impl CheckResult {
             message: message.into(),
             details: None,
             metric_value: None,
+            pmtu_value: None,
         }
     }
 
@@ -47,6 +51,11 @@ impl CheckResult {
 
     pub fn with_metric(mut self, value: f64) -> Self {
         self.metric_value = Some(value);
+        self
+    }
+
+    pub fn with_pmtu(mut self, value: f64) -> Self {
+        self.pmtu_value = Some(value);
         self
     }
 }

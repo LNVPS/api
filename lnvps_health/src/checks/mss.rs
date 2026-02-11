@@ -152,7 +152,7 @@ impl HealthCheck for MssCheck {
         match result.mss {
             Some(mss) if mss_exceeds_pmtu => {
                 let max_mss = max_mss_from_pmtu.unwrap();
-                Ok(CheckResult::fail(
+                let mut check_result = CheckResult::fail(
                     &name,
                     format!(
                         "MSS {} exceeds PMTU limit {} (PMTU: {}) [{}]",
@@ -165,30 +165,46 @@ impl HealthCheck for MssCheck {
                      This will cause packet fragmentation or drops.",
                     host, port, result.target, mss, result.pmtu.unwrap(), max_mss
                 ))
-                .with_metric(mss as f64))
+                .with_metric(mss as f64);
+                if let Some(pmtu) = result.pmtu {
+                    check_result = check_result.with_pmtu(pmtu as f64);
+                }
+                Ok(check_result)
             }
-            Some(mss) if mss >= expected_mss => Ok(CheckResult::ok(
-                &name,
-                format!(
-                    "MSS OK: {} bytes (expected >= {}){} [{}]",
-                    mss, expected_mss, pmtu_info, result.target
-                ),
-            )
-            .with_metric(mss as f64)),
-            Some(mss) => Ok(CheckResult::fail(
-                &name,
-                format!(
-                    "MSS too low: {} bytes (expected >= {}){} [{}]",
-                    mss, expected_mss, pmtu_info, result.target
-                ),
-            )
-            .with_details(format!(
-                "Target: {}:{} ({})\nMSS: {} bytes{}\n\
-                 This may cause connectivity issues for customers.\n\
-                 Consider checking MTU settings on the network path.",
-                host, port, result.target, mss, pmtu_info
-            ))
-            .with_metric(mss as f64)),
+            Some(mss) if mss >= expected_mss => {
+                let mut check_result = CheckResult::ok(
+                    &name,
+                    format!(
+                        "MSS OK: {} bytes (expected >= {}){} [{}]",
+                        mss, expected_mss, pmtu_info, result.target
+                    ),
+                )
+                .with_metric(mss as f64);
+                if let Some(pmtu) = result.pmtu {
+                    check_result = check_result.with_pmtu(pmtu as f64);
+                }
+                Ok(check_result)
+            }
+            Some(mss) => {
+                let mut check_result = CheckResult::fail(
+                    &name,
+                    format!(
+                        "MSS too low: {} bytes (expected >= {}){} [{}]",
+                        mss, expected_mss, pmtu_info, result.target
+                    ),
+                )
+                .with_details(format!(
+                    "Target: {}:{} ({})\nMSS: {} bytes{}\n\
+                     This may cause connectivity issues for customers.\n\
+                     Consider checking MTU settings on the network path.",
+                    host, port, result.target, mss, pmtu_info
+                ))
+                .with_metric(mss as f64);
+                if let Some(pmtu) = result.pmtu {
+                    check_result = check_result.with_pmtu(pmtu as f64);
+                }
+                Ok(check_result)
+            }
             None => Ok(CheckResult::fail(
                 &name,
                 "Could not determine MSS (connection succeeded but no MSS info)".to_string(),

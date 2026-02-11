@@ -7,6 +7,8 @@ pub struct HealthMetrics {
     registry: Registry,
     /// MSS value by target (host, port, address_family)
     pub mss_gauge: GaugeVec,
+    /// PMTU value by target (host, port, address_family)
+    pub pmtu_gauge: GaugeVec,
     /// DNS check latency (server, query, address_family)
     pub dns_latency_gauge: GaugeVec,
     /// Check status (1 = pass, 0 = fail) by check_id
@@ -22,6 +24,12 @@ impl HealthMetrics {
             &["host", "port", "family"],
         )
         .expect("Failed to create mss_gauge");
+
+        let pmtu_gauge = GaugeVec::new(
+            Opts::new("health_pmtu_bytes", "Path MTU in bytes"),
+            &["host", "port", "family"],
+        )
+        .expect("Failed to create pmtu_gauge");
 
         let dns_latency_gauge = GaugeVec::new(
             Opts::new(
@@ -45,6 +53,9 @@ impl HealthMetrics {
             .register(Box::new(mss_gauge.clone()))
             .expect("Failed to register mss_gauge");
         registry
+            .register(Box::new(pmtu_gauge.clone()))
+            .expect("Failed to register pmtu_gauge");
+        registry
             .register(Box::new(dns_latency_gauge.clone()))
             .expect("Failed to register dns_latency_gauge");
         registry
@@ -54,6 +65,7 @@ impl HealthMetrics {
         Self {
             registry,
             mss_gauge,
+            pmtu_gauge,
             dns_latency_gauge,
             check_status,
         }

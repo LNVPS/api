@@ -322,10 +322,6 @@ async fn run_checks(
 
 /// Record type-specific metrics based on check ID pattern
 fn record_check_metric(metrics: &HealthMetrics, check_id: &str, result: &checks::CheckResult) {
-    let Some(value) = result.metric_value else {
-        return;
-    };
-
     let parts: Vec<&str> = check_id.split(':').collect();
     if parts.is_empty() {
         return;
@@ -337,20 +333,30 @@ fn record_check_metric(metrics: &HealthMetrics, check_id: &str, result: &checks:
             let host = parts[1];
             let port = parts[2];
             let family = parts[3];
-            metrics
-                .mss_gauge
-                .with_label_values(&[host, port, family])
-                .set(value);
+            if let Some(value) = result.metric_value {
+                metrics
+                    .mss_gauge
+                    .with_label_values(&[host, port, family])
+                    .set(value);
+            }
+            if let Some(pmtu) = result.pmtu_value {
+                metrics
+                    .pmtu_gauge
+                    .with_label_values(&[host, port, family])
+                    .set(pmtu);
+            }
         }
         "dns" if parts.len() >= 4 => {
             // dns:server:query:family
             let server = parts[1];
             let query = parts[2];
             let family = parts[3];
-            metrics
-                .dns_latency_gauge
-                .with_label_values(&[server, query, family])
-                .set(value);
+            if let Some(value) = result.metric_value {
+                metrics
+                    .dns_latency_gauge
+                    .with_label_values(&[server, query, family])
+                    .set(value);
+            }
         }
         _ => {}
     }
