@@ -5,11 +5,11 @@ use crate::host::{
 use crate::json_api::JsonApi;
 use crate::settings::{QemuConfig, SshConfig};
 use crate::ssh_client::SshClient;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use ipnetwork::IpNetwork;
-use lnvps_api_common::retry::{OpError, OpResult};
+use lnvps_api_common::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{VmRunningState, VmRunningStates, op_fatal};
 use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
@@ -24,6 +24,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 
+#[derive(Clone)]
 pub struct ProxmoxClient {
     api: JsonApi,
     config: QemuConfig,
@@ -764,6 +765,49 @@ impl ProxmoxClient {
 
         Ok(())
     }
+
+    /// Destroy a VM by ID (stop first, then delete via SSH)
+    async fn destroy_vm(&self, vm_id: ProxmoxVmId) -> OpResult<()> {
+        // Check if VM exists first
+        if self.get_vm_status(&self.node, vm_id).await.is_err() {
+            info!("VM {} doesn't exist, skipping destroy", vm_id);
+            return Ok(());
+        }
+
+        // Stop first, ignoring errors
+        self.stop_vm(&self.node, vm_id).await.ok();
+
+        if let Some(ssh) = &self.ssh {
+            let mut ses = SshClient::new().map_err(OpError::Transient)?;
+            ses.connect(
+                (self.api.base().host().unwrap().to_string(), 22),
+                &ssh.user,
+                &ssh.key,
+            )
+            .await
+            .map_err(OpError::Transient)?;
+
+            let cmd = format!("/usr/sbin/qm destroy {}", vm_id);
+            let (code, rsp) = ses
+                .execute(cmd.as_str())
+                .await
+                .map_err(OpError::Transient)?;
+            info!("{}", rsp);
+            // exit code 2 = doesn't exist, ignore
+            if code != 0 && code != 2 {
+                op_fatal!("Failed to destroy vm, exit-code {}, {}", code, rsp)
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Context for the create_vm pipeline - tracks what we need for rollback
+struct CreateVmContext<'a> {
+    client: ProxmoxClient,
+    req: &'a FullVmInfo,
+    vm_id: ProxmoxVmId,
+    config: VmConfig,
 }
 
 #[async_trait]
@@ -863,64 +907,71 @@ impl VmHostClient for ProxmoxClient {
 
     async fn create_vm(&self, req: &FullVmInfo) -> OpResult<()> {
         let config = self.make_config(req)?;
-        let vm_id = req.vm.id.into();
-        let t_create = self
-            .create_vm(CreateVm {
-                node: self.node.clone(),
-                vm_id,
-                config,
-            })
+        let vm_id: ProxmoxVmId = req.vm.id.into();
+
+        let ctx = CreateVmContext {
+            client: self.clone(),
+            req,
+            vm_id,
+            config,
+        };
+
+        Pipeline::new(ctx)
+            .with_retry_policy(RetryPolicy::default())
+            .step_with_rollback(
+                "create_vm_shell",
+                |ctx| {
+                    Box::pin(async move {
+                        let t_create = ctx
+                            .client
+                            .create_vm(CreateVm {
+                                node: ctx.client.node.clone(),
+                                vm_id: ctx.vm_id,
+                                config: ctx.config.clone(),
+                            })
+                            .await?;
+                        ctx.client.wait_for_task(&t_create).await?;
+                        Ok(())
+                    })
+                },
+                |ctx| {
+                    Box::pin(async move {
+                        info!("Rolling back: deleting VM {}", ctx.vm_id);
+                        ctx.client.destroy_vm(ctx.vm_id).await
+                    })
+                },
+            )
+            .step(
+                "import_template_disk",
+                |ctx| Box::pin(async move { ctx.client.import_template_disk(ctx.req).await }),
+            )
+            .step(
+                "patch_firewall",
+                |ctx| Box::pin(async move { ctx.client.patch_firewall(ctx.req).await }),
+            )
+            .step(
+                "start_vm",
+                |ctx| {
+                    Box::pin(async move {
+                        // try start, otherwise ignore error (maybe its already running)
+                        if let Ok(j_start) =
+                            ctx.client.start_vm(&ctx.client.node, ctx.vm_id).await
+                            && let Err(e) = ctx.client.wait_for_task(&j_start).await
+                        {
+                            warn!("Failed to start vm: {}", e);
+                        }
+                        Ok(())
+                    })
+                },
+            )
+            .execute()
             .await?;
-        self.wait_for_task(&t_create).await?;
-
-        // import template image
-        self.import_template_disk(req).await?;
-
-        // apply firewall config and manage IPsets using patch_firewall
-        self.patch_firewall(req).await?;
-
-        // try start, otherwise ignore error (maybe its already running)
-        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
-            && let Err(e) = self.wait_for_task(&j_start).await
-        {
-            warn!("Failed to start vm: {}", e);
-        }
 
         Ok(())
     }
 
     async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
-        let vm_id: ProxmoxVmId = vm.id.into();
-
-        // NOT IMPLEMENTED
-        //let t = self.delete_vm(&self.node, vm_id).await?;
-        //self.wait_for_task(&t).await?;
-
-        //always stop first before deleting, ignoring if already stopped
-        self.stop_vm(&self.node, vm_id).await.ok();
-
-        if let Some(ssh) = &self.ssh {
-            let mut ses = SshClient::new()?;
-            ses.connect(
-                (self.api.base().host().unwrap().to_string(), 22),
-                &ssh.user,
-                &ssh.key,
-            )
-            .await
-            .map_err(OpError::Transient)?;
-
-            let cmd = format!("/usr/sbin/qm destroy {}", vm_id,);
-            let (code, rsp) = ses
-                .execute(cmd.as_str())
-                .await
-                .map_err(OpError::Transient)?;
-            info!("{}", rsp);
-            // exit code 2 = doesnt exist, ignore
-            if code != 0 && code != 2 {
-                op_fatal!("Failed to destroy vm, exit-code {}, {}", code, rsp)
-            }
-        }
-        Ok(())
+        self.destroy_vm(vm.id.into()).await
     }
 
     async fn reinstall_vm(&self, req: &FullVmInfo) -> OpResult<()> {
@@ -1507,7 +1558,7 @@ pub struct ImportDiskImageRequest {
     pub is_ssd: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VmBios {
     SeaBios,
@@ -1545,7 +1596,7 @@ pub struct HashedVmConfig {
     pub config: VmConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct VmConfig {
     #[serde(rename = "onboot")]
     #[serde(skip_serializing_if = "Option::is_none")]

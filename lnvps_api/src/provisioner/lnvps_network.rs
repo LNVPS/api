@@ -202,7 +202,7 @@ impl LNVpsNetworkProvisioner {
     pub async fn delete_all_ip_assignments(&self, vm_id: u64) -> OpResult<()> {
         let mut ips = self.db.list_vm_ip_assignments(vm_id).await?;
         for ip in &mut ips {
-            let range = self.db.get_ip_range(ip.id).await?;
+            let range = self.db.get_ip_range(ip.ip_range_id).await?;
             self.delete_ip_assignment(ip, &range).await?;
         }
         Ok(())
