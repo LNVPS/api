@@ -917,7 +917,11 @@ impl VmHostClient for ProxmoxClient {
         };
 
         Pipeline::new(ctx)
-            .with_retry_policy(RetryPolicy::default())
+            .with_retry_policy(
+                RetryPolicy::default()
+                    .with_min_delay(Duration::from_secs(3))
+                    .with_max_delay(Duration::from_secs(60)),
+            )
             .step_with_rollback(
                 "create_vm_shell",
                 |ctx| {
@@ -941,29 +945,23 @@ impl VmHostClient for ProxmoxClient {
                     })
                 },
             )
-            .step(
-                "import_template_disk",
-                |ctx| Box::pin(async move { ctx.client.import_template_disk(ctx.req).await }),
-            )
-            .step(
-                "patch_firewall",
-                |ctx| Box::pin(async move { ctx.client.patch_firewall(ctx.req).await }),
-            )
-            .step(
-                "start_vm",
-                |ctx| {
-                    Box::pin(async move {
-                        // try start, otherwise ignore error (maybe its already running)
-                        if let Ok(j_start) =
-                            ctx.client.start_vm(&ctx.client.node, ctx.vm_id).await
-                            && let Err(e) = ctx.client.wait_for_task(&j_start).await
-                        {
-                            warn!("Failed to start vm: {}", e);
-                        }
-                        Ok(())
-                    })
-                },
-            )
+            .step("import_template_disk", |ctx| {
+                Box::pin(async move { ctx.client.import_template_disk(ctx.req).await })
+            })
+            .step("patch_firewall", |ctx| {
+                Box::pin(async move { ctx.client.patch_firewall(ctx.req).await })
+            })
+            .step("start_vm", |ctx| {
+                Box::pin(async move {
+                    // try start, otherwise ignore error (maybe its already running)
+                    if let Ok(j_start) = ctx.client.start_vm(&ctx.client.node, ctx.vm_id).await
+                        && let Err(e) = ctx.client.wait_for_task(&j_start).await
+                    {
+                        warn!("Failed to start vm: {}", e);
+                    }
+                    Ok(())
+                })
+            })
             .execute()
             .await?;
 
