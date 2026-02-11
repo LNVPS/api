@@ -71,10 +71,10 @@ hickory-resolver = "0.25"
 humantime = "2.2"
 
 #nostr-dm
-nostr-sdk = { version = "0.44", optional = true, default-features = false }
+nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", optional = true, default-features = false }
 
 #nostr-nwc
-nwc = { version = "0.44", optional = true }
+nwc = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", optional = true }
 
 #proxmox
 tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
