@@ -15,6 +15,8 @@ pub struct CheckResult {
     pub message: String,
     /// Optional details for debugging
     pub details: Option<String>,
+    /// Optional numeric metric value (e.g., MSS bytes, latency ms)
+    pub metric_value: Option<f64>,
 }
 
 impl CheckResult {
@@ -24,6 +26,7 @@ impl CheckResult {
             passed: true,
             message: message.into(),
             details: None,
+            metric_value: None,
         }
     }
 
@@ -33,11 +36,17 @@ impl CheckResult {
             passed: false,
             message: message.into(),
             details: None,
+            metric_value: None,
         }
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
         self.details = Some(details.into());
+        self
+    }
+
+    pub fn with_metric(mut self, value: f64) -> Self {
+        self.metric_value = Some(value);
         self
     }
 }

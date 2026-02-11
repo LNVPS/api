@@ -1,9 +1,36 @@
 # LNVPS Health Checker Configuration
 # Copy this file to config.yaml and modify as needed
 
-# Redis configuration for sending notifications via the work commander
-redis:
-  url: "redis://localhost:6379"
+# =============================================================================
+# SMTP Configuration for Email Notifications
+# =============================================================================
+# Configure SMTP to receive email alerts when health checks fail.
+# If not configured, alerts will only be logged.
+
+smtp:
+  host: "smtp.example.com"
+  port: 587                    # 587 for STARTTLS, 465 for SSL
+  username: "alerts@example.com"
+  password: "your-smtp-password"
+  from: "LNVPS Health <alerts@example.com>"
+  to:
+    - "admin@example.com"
+    - "oncall@example.com"
+  starttls: true               # Use STARTTLS (recommended for port 587)
+
+# =============================================================================
+# Prometheus Metrics
+# =============================================================================
+# Expose metrics at /metrics endpoint for scraping by Prometheus.
+# Useful for graphing MSS/PMTU values over time.
+
+metrics:
+  enabled: true
+  bind: "127.0.0.1:9090"       # Bind address for metrics HTTP server
+
+# =============================================================================
+# Check Timing
+# =============================================================================
 
 # Check interval in seconds (default: 600 = 10 minutes)
 interval-secs: 600
@@ -19,26 +46,28 @@ alert-cooldown-secs: 3600
 # Low MSS values indicate MTU/fragmentation issues on the network path.
 # Each MSS check automatically creates both IPv4 and IPv6 probes.
 # If no address of a given family exists, that check is skipped.
+#
+# Prometheus metric: health_tcp_mss_bytes{host, port, family}
 
 mss-checks:
   # Example: IPv4-only target
   - name: "Google DNS"
     host: "8.8.8.8"
     port: 443
-    expected-mss: 1460  # Standard ethernet MSS (IPv6 will be skipped)
+    expected-mss: 1460         # Standard ethernet MSS (IPv6 will be skipped)
 
   # Example: Dual-stack target with separate IPv6 threshold
   - name: "Google (dual-stack)"
     host: "google.com"
     port: 443
-    expected-mss: 1460      # IPv4 MSS threshold
-    expected-mss-v6: 1440   # IPv6 MSS threshold (20 bytes less due to larger header)
+    expected-mss: 1460         # IPv4 MSS threshold
+    expected-mss-v6: 1440      # IPv6 MSS threshold (20 bytes less due to larger header)
 
   # Example: VPN tunnel path (lower MSS expected due to encapsulation overhead)
   - name: "Customer API via VPN"
     host: "api.example.com"
     port: 443
-    expected-mss: 1400  # ~60 bytes overhead for VPN
+    expected-mss: 1400         # ~60 bytes overhead for VPN
 
   # Example: Test a specific VM host
   - name: "VM Host 1"
@@ -52,6 +81,8 @@ mss-checks:
 # Each check queries a specific DNS server and optionally verifies the response.
 # Each check can specify both IPv4 (server) and IPv6 (server-v6) DNS servers.
 # Separate checks are created for each address family configured.
+#
+# Prometheus metric: health_dns_latency_seconds{server, query, family}
 
 dns-checks:
   # Example: Dual-stack check using Google DNS
@@ -68,7 +99,7 @@ dns-checks:
     query: "cloudflare.com"
     timeout-secs: 5
 
-  # Example: IPv4-only check
+  # Example: IPv4-only check with expected result verification
   - name: "Internal DNS - API"
     server: "10.0.0.1"
     query: "api.internal.example.com"
@@ -80,4 +111,36 @@ dns-checks:
   - name: "IPv6 DNS Server"
     server-v6: "2001:db8::1"
     query: "www.example.com"
+    timeout-secs: 10
+
+# =============================================================================
+# Path MTU Checks - Discover MTU along network paths using ICMP
+# =============================================================================
+# Each check uses ICMP echo with don't-fragment flag to discover the path MTU.
+# This helps identify MTU issues on specific network paths (tunnels, VPNs, etc).
+# Each PMTU check automatically creates both IPv4 and IPv6 probes.
+#
+# NOTE: Requires ping with CAP_NET_RAW capability or root privileges.
+#       Run: sudo setcap cap_net_raw+ep /usr/bin/ping
+#
+# Prometheus metric: health_path_mtu_bytes{host, family}
+
+pmtu-checks:
+  # Example: Check path to external service
+  - name: "Google"
+    host: "google.com"
+    expected-pmtu: 1500        # Standard ethernet MTU
+    expected-pmtu-v6: 1500
+    timeout-secs: 10
+
+  # Example: Check path through VPN tunnel
+  - name: "Datacenter via VPN"
+    host: "dc1.internal.example.com"
+    expected-pmtu: 1420        # Lower due to VPN encapsulation
+    timeout-secs: 15
+
+  # Example: Check path to customer network
+  - name: "Customer Network"
+    host: "192.168.100.1"
+    expected-pmtu: 1500
     timeout-secs: 10

@@ -130,28 +130,65 @@ impl HealthCheck for MssCheck {
             .await
             .context("Probe task panicked")??;
 
+        // Calculate max MSS allowed by PMTU (PMTU - IP header - TCP header)
+        // IPv4: 20 + 20 = 40 bytes, IPv6: 40 + 20 = 60 bytes
+        let header_overhead: u16 = match self.addr_family {
+            AddrFamily::V4 => 40,
+            AddrFamily::V6 => 60,
+        };
+        let max_mss_from_pmtu = result.pmtu.map(|p| p.saturating_sub(header_overhead));
+
+        // Check if MSS exceeds what PMTU allows
+        let mss_exceeds_pmtu = match (result.mss, max_mss_from_pmtu) {
+            (Some(mss), Some(max_mss)) => mss > max_mss,
+            _ => false,
+        };
+
+        let pmtu_info = result
+            .pmtu
+            .map(|p| format!(", PMTU: {}", p))
+            .unwrap_or_default();
+
         match result.mss {
+            Some(mss) if mss_exceeds_pmtu => {
+                let max_mss = max_mss_from_pmtu.unwrap();
+                Ok(CheckResult::fail(
+                    &name,
+                    format!(
+                        "MSS {} exceeds PMTU limit {} (PMTU: {}) [{}]",
+                        mss, max_mss, result.pmtu.unwrap(), result.target
+                    ),
+                )
+                .with_details(format!(
+                    "Target: {}:{} ({})\nMSS: {} bytes\nPMTU: {} bytes\nMax MSS for PMTU: {} bytes\n\n\
+                     The negotiated MSS is larger than what the path MTU allows.\n\
+                     This will cause packet fragmentation or drops.",
+                    host, port, result.target, mss, result.pmtu.unwrap(), max_mss
+                ))
+                .with_metric(mss as f64))
+            }
             Some(mss) if mss >= expected_mss => Ok(CheckResult::ok(
                 &name,
                 format!(
-                    "MSS OK: {} bytes (expected >= {}) [{}]",
-                    mss,
-                    expected_mss,
-                    result.target
+                    "MSS OK: {} bytes (expected >= {}){} [{}]",
+                    mss, expected_mss, pmtu_info, result.target
                 ),
-            )),
+            )
+            .with_metric(mss as f64)),
             Some(mss) => Ok(CheckResult::fail(
                 &name,
                 format!(
-                    "MSS too low: {} bytes (expected >= {}) [{}]",
-                    mss, expected_mss, result.target
+                    "MSS too low: {} bytes (expected >= {}){} [{}]",
+                    mss, expected_mss, pmtu_info, result.target
                 ),
             )
             .with_details(format!(
-                "Target: {}:{} ({})\nThis may cause connectivity issues for customers.\n\
+                "Target: {}:{} ({})\nMSS: {} bytes{}\n\
+                 This may cause connectivity issues for customers.\n\
                  Consider checking MTU settings on the network path.",
-                host, port, result.target
-            ))),
+                host, port, result.target, mss, pmtu_info
+            ))
+            .with_metric(mss as f64)),
             None => Ok(CheckResult::fail(
                 &name,
                 "Could not determine MSS (connection succeeded but no MSS info)".to_string(),
@@ -173,6 +210,7 @@ impl HealthCheck for MssCheck {
 #[derive(Debug, Clone)]
 struct MssProbeResult {
     mss: Option<u16>,
+    pmtu: Option<u16>,
     target: SocketAddr,
 }
 
@@ -193,15 +231,42 @@ fn probe_mss(target: SocketAddr, timeout: Duration) -> Result<MssProbeResult> {
         .set_write_timeout(Some(timeout))
         .context("Failed to set write timeout")?;
 
+    // Enable PMTU discovery
+    let is_v6 = target.is_ipv6();
+    if is_v6 {
+        let val: i32 = libc::IPV6_PMTUDISC_DO;
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                &val as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+    } else {
+        let val: i32 = libc::IP_PMTUDISC_DO;
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &val as *const i32 as *const libc::c_void,
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            );
+        }
+    }
+
     socket
         .connect_timeout(&target.into(), timeout)
         .context("Connection failed")?;
 
     let mss = get_tcp_mss(socket.as_raw_fd())?;
+    let pmtu = get_ip_mtu(socket.as_raw_fd(), is_v6)?;
 
     let _ = socket.shutdown(std::net::Shutdown::Both);
 
-    Ok(MssProbeResult { mss, target })
+    Ok(MssProbeResult { mss, pmtu, target })
 }
 
 /// Get the TCP MSS value from a connected socket
@@ -230,6 +295,43 @@ fn get_tcp_mss(fd: i32) -> Result<Option<u16>> {
     } else {
         let err = std::io::Error::last_os_error();
         debug!("getsockopt(TCP_MAXSEG) failed: {}", err);
+        Ok(None)
+    }
+}
+
+/// Get the path MTU from a connected socket
+fn get_ip_mtu(fd: i32, is_v6: bool) -> Result<Option<u16>> {
+    const IP_MTU: i32 = 14;
+    const IPV6_MTU: i32 = 24;
+
+    let mut mtu: i32 = 0;
+    let mut len: libc::socklen_t = std::mem::size_of::<i32>() as libc::socklen_t;
+
+    let (level, optname) = if is_v6 {
+        (libc::IPPROTO_IPV6, IPV6_MTU)
+    } else {
+        (libc::IPPROTO_IP, IP_MTU)
+    };
+
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            optname,
+            &mut mtu as *mut i32 as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if result == 0 && mtu > 0 {
+        debug!("IP_MTU returned: {}", mtu);
+        Ok(Some(mtu as u16))
+    } else if result == 0 {
+        debug!("IP_MTU returned 0");
+        Ok(None)
+    } else {
+        let err = std::io::Error::last_os_error();
+        debug!("getsockopt(IP_MTU) failed: {}", err);
         Ok(None)
     }
 }

@@ -6,7 +6,7 @@ use hickory_resolver::Resolver;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{CheckResult, HealthCheck};
 
@@ -123,6 +123,7 @@ impl HealthCheck for DnsCheck {
 
         debug!("Querying {} via {} ({})", query, server_str, self.family_suffix());
 
+        let start = Instant::now();
         let lookup = match resolver.lookup_ip(query.as_str()).await {
             Ok(lookup) => lookup,
             Err(e) => {
@@ -139,6 +140,7 @@ impl HealthCheck for DnsCheck {
                 )));
             }
         };
+        let latency = start.elapsed();
 
         let resolved_ips: Vec<IpAddr> = lookup.iter().collect();
 
@@ -187,12 +189,14 @@ impl HealthCheck for DnsCheck {
         Ok(CheckResult::ok(
             &name,
             format!(
-                "DNS OK: {} -> [{}] via {}",
+                "DNS OK: {} -> [{}] via {} ({:.1}ms)",
                 query,
                 resolved_str.join(", "),
-                server_str
+                server_str,
+                latency.as_secs_f64() * 1000.0
             ),
-        ))
+        )
+        .with_metric(latency.as_secs_f64()))
     }
 
     fn id(&self) -> String {
