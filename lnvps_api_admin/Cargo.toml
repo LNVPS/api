@@ -17,7 +17,7 @@ demo = ["dep:rand"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
-lnvps_api_common = { path = "../lnvps_api_common" }
+lnvps_api_common = { path = "../lnvps_api_common", features = ["admin"] }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true

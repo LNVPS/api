@@ -59,11 +59,21 @@ impl ApiError {
     }
 
     /// Create an API error from an internal error, logging the full details
-    /// but only returning a generic message to the client
+    /// but only returning a generic message to the client (in non-admin mode)
+    #[cfg(not(feature = "admin"))]
     pub fn internal(err: impl std::fmt::Display) -> Self {
         error!("Internal error: {}", err);
         Self {
             error: "An internal error occurred".to_string(),
+        }
+    }
+
+    /// In admin mode, show the full error message for debugging
+    #[cfg(feature = "admin")]
+    pub fn internal(err: impl std::fmt::Display) -> Self {
+        error!("Internal error: {}", err);
+        Self {
+            error: err.to_string(),
         }
     }
 }
@@ -86,6 +96,24 @@ impl From<crate::retry::OpError<anyhow::Error>> for ApiError {
     }
 }
 
+impl From<Box<dyn std::error::Error + Send + Sync>> for ApiError {
+    fn from(value: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::internal(value)
+    }
+}
+
+impl From<&str> for ApiError {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ApiError {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response()
@@ -104,8 +132,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "admin"))]
     fn test_api_error_internal_sanitizes() {
         let error = ApiError::internal("secret internal details at 192.168.1.1");
         assert_eq!(error.error, "An internal error occurred");
+    }
+
+    #[test]
+    #[cfg(feature = "admin")]
+    fn test_api_error_internal_shows_details() {
+        let error = ApiError::internal("secret internal details at 192.168.1.1");
+        assert_eq!(error.error, "secret internal details at 192.168.1.1");
     }
 }
