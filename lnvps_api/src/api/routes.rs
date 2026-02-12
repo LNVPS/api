@@ -19,7 +19,7 @@ use futures::future::join_all;
 use isocountry::CountryCode;
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
-use lnvps_api_common::{ApiCurrency, ApiError, PageQuery};
+use lnvps_api_common::{ApiCurrency, ApiError, EuVatClient, PageQuery};
 use lnvps_api_common::{ApiData, ApiResult, Nip98Auth, UpgradeConfig, WorkJob};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{
@@ -113,6 +113,18 @@ async fn v1_patch_account(
                 }
             }
             Err(e) => return ApiData::err(&format!("Failed to parse NWC url: {}", e)),
+        }
+    }
+
+    // validate tax_id if provided
+    if let Some(Some(tax_id)) = &req.tax_id {
+        let vat_client = EuVatClient::new();
+        let result = vat_client
+            .validate_vat_number(tax_id, None)
+            .await
+            .map_err(|e| ApiError::new(format!("Failed to validate tax ID: {}", e)))?;
+        if !result.valid {
+            return ApiData::err("Invalid tax ID");
         }
     }
 
