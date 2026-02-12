@@ -9,6 +9,7 @@ mod pricing;
 pub mod retry;
 mod routes;
 mod status;
+mod vat;
 mod vm_history;
 mod work;
 
@@ -23,6 +24,7 @@ pub use pricing::*;
 pub use routes::*;
 use serde::{Deserialize, Deserializer};
 pub use status::*;
+pub use vat::*;
 pub use vm_history::*;
 pub use work::*;
 

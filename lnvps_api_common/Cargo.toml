@@ -26,7 +26,7 @@ payments-rs = { workspace = true, features = ["fiat"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = { version = "0.22", features = ["alloc"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
-reqwest = "0.13"
+reqwest = { version = "0.13", features = ["json"] }
 rand = "0.9"
 isocountry = "0.3"
 redis = { version = "1", features = ["tokio-comp", "cluster"] }
