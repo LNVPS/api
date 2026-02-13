@@ -1,7 +1,7 @@
 use crate::host::{FullVmInfo, get_host_client};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Days, Utc};
 use hickory_resolver::TokioResolver;
 use lettre::AsyncTransport;
@@ -12,7 +12,8 @@ use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
     UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
-    WorkFeedback, WorkJob, WorkJobMessage,
+    WorkFeedback, WorkJob, WorkJobMessage, op_fatal,
+    retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{LNVpsDb, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
@@ -169,7 +170,7 @@ impl Worker {
                             Ok(_) => {
                                 renewal_successful = true;
                                 info!("Successfully auto-renewed VM {} via NWC", vm.id);
-                                self.queue_notification(vm.user_id,format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id), Some(format!("[VM{}] Auto-Renewed", vm.id))).await;
+                                self.queue_notification(vm.user_id, format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id), Some(format!("[VM{}] Auto-Renewed", vm.id))).await;
                             }
                             Err(e) => {
                                 warn!("Auto-renewal error for VM {}: {}", vm.id, e);
@@ -210,7 +211,7 @@ impl Worker {
                     message,
                     Some(format!("[VM{}] Expiring Soon", vm.id)),
                 )
-                .await;
+                    .await;
             }
         }
 
@@ -225,7 +226,7 @@ impl Worker {
             self.queue_notification(
                 vm.user_id,
                 format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", vm.id, self.settings.delete_after),
-                Some(format!("[VM{}] Expired", vm.id))
+                Some(format!("[VM{}] Expired", vm.id)),
             ).await;
         }
 
@@ -250,7 +251,7 @@ impl Worker {
                 format!("Your VM #{} has been deleted!", vm.id),
                 title.clone(),
             )
-            .await;
+                .await;
             self.queue_admin_notification(format!("VM{} is ready for deletion", vm.id), title)
                 .await;
         }
@@ -347,7 +348,7 @@ impl Worker {
             format!("Your {}", &msg),
             Some(format!("[VM{}] Created", vm.id)),
         )
-        .await;
+            .await;
         self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))
             .await;
         Ok(())
@@ -426,7 +427,7 @@ impl Worker {
                     format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
                     Some(format!("VM {} Deletion Failed", vm.id)),
                 )
-                .await
+                    .await
             }
         }
 
@@ -442,7 +443,7 @@ impl Worker {
                             format!("Failed to check VM {}:\n{}", vm.id, e),
                             Some(format!("VM {} Check Failed", vm.id)),
                         )
-                        .await
+                            .await
                     }
                 }
             }
@@ -501,7 +502,7 @@ impl Worker {
                 message,
                 None,
             )
-            .await?;
+                .await?;
             c.send_event(&ev).await?;
         }
         Ok(())
@@ -587,7 +588,7 @@ impl Worker {
             ),
             Some("Bulk Message Complete".to_string()),
         )
-        .await;
+            .await;
 
         Ok(())
     }
@@ -775,7 +776,7 @@ impl Worker {
                                     notification_message,
                                     Some(format!("Nostr Domain '{}' Activated", domain.name)),
                                 )
-                                .await;
+                                    .await;
                             }
                             Err(e) => {
                                 error!(
@@ -821,7 +822,7 @@ impl Worker {
                                     notification_message,
                                     Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
                                 )
-                                .await;
+                                    .await;
                             }
                             Err(e) => {
                                 error!(
@@ -880,7 +881,7 @@ impl Worker {
                                         notification_message,
                                         Some(format!("Nostr Domain '{}' Deleted", domain.name)),
                                     )
-                                    .await;
+                                        .await;
                                 }
                                 Err(e) => {
                                     error!(
@@ -1069,7 +1070,7 @@ impl Worker {
                     ),
                     title.clone(),
                 )
-                .await;
+                    .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1079,7 +1080,7 @@ impl Worker {
                     ),
                     title,
                 )
-                .await;
+                    .await;
 
                 return Ok(Some(format!("VM {} deleted successfully", vm_id)));
             }
@@ -1128,7 +1129,7 @@ impl Worker {
                     format!("Your VM #{} has been started by an administrator.", vm_id),
                     title.clone(),
                 )
-                .await;
+                    .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1138,7 +1139,7 @@ impl Worker {
                     ),
                     title,
                 )
-                .await;
+                    .await;
 
                 return Ok(Some(format!("VM {} started successfully", vm_id)));
             }
@@ -1178,7 +1179,7 @@ impl Worker {
                     format!("Your VM #{} has been stopped by an administrator.", vm_id),
                     title.clone(),
                 )
-                .await;
+                    .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1188,7 +1189,7 @@ impl Worker {
                     ),
                     title,
                 )
-                .await;
+                    .await;
 
                 return Ok(Some(format!("VM {} stopped successfully", vm_id)));
             }
@@ -1299,160 +1300,215 @@ impl Worker {
     async fn process_vm_upgrade(&self, vm_id: u64, cfg: &UpgradeConfig) -> Result<()> {
         info!("Processing VM {} upgrade with new specs", vm_id);
 
-        let vm_before = self.db.get_vm(vm_id).await?;
-        if vm_before.custom_template_id.is_some() {
-            // VM already uses custom template - update the existing template
-            info!(
-                "VM {} already uses custom template, updating existing template",
-                vm_id
-            );
-
-            let custom_template_id = vm_before.custom_template_id.unwrap();
-            let old_template = self.db.get_custom_vm_template(custom_template_id).await?;
-            let mut new_template = old_template.clone();
-
-            // Update the template with new specifications
-            if let Some(new_cpu) = cfg.new_cpu {
-                new_template.cpu = new_cpu;
-            }
-            if let Some(new_memory) = cfg.new_memory {
-                new_template.memory = new_memory;
-            }
-            if let Some(new_disk) = cfg.new_disk {
-                new_template.disk_size = new_disk;
-            }
-
-            ensure!(old_template.cpu <= new_template.cpu, "Cannot downgrade CPU");
-            ensure!(
-                old_template.memory <= new_template.memory,
-                "Cannot downgrade memory"
-            );
-            ensure!(
-                old_template.disk_size <= new_template.disk_size,
-                "Cannot downgrade disk size"
-            );
-
-            // Update the custom template in the database
-            self.db.update_custom_vm_template(&new_template).await?;
-
-            // Log the upgrade in VM history
-            let upgrade_metadata = serde_json::json!({
-                "upgrade_type": "custom_template_update",
-                "old_specs": {
-                    "cpu": old_template.cpu,
-                    "memory": old_template.memory,
-                    "disk_size": old_template.disk_size
-                },
-                "new_specs": {
-                    "cpu": new_template.cpu,
-                    "memory": new_template.memory,
-                    "disk_size": new_template.disk_size
-                }
-            });
-
-            if let Err(e) = self
-                .vm_history_logger
-                .log_vm_configuration_changed(
-                    vm_id,
-                    None, // System-initiated upgrade
-                    &vm_before,
-                    &vm_before, // VM record doesn't change, only the template
-                    Some(upgrade_metadata),
-                )
-                .await
-            {
-                warn!("Failed to log VM upgrade history for VM {}: {}", vm_id, e);
-            }
-
-            info!(
-                "Successfully updated custom template {} for VM {}",
-                custom_template_id, vm_id
-            );
-        } else {
-            // VM uses standard template - convert to custom template
-            info!(
-                "VM {} uses standard template, converting to custom template",
-                vm_id
-            );
-            self.provisioner
-                .convert_to_custom_template(vm_id, cfg)
-                .await?;
-
-            // Get the VM after conversion to see the changes
-            let vm_after = self.db.get_vm(vm_id).await?;
-
-            // Log the conversion in VM history
-            let upgrade_metadata = serde_json::json!({
-                "upgrade_type": "standard_to_custom_conversion",
-                "changes": {
-                    "cpu": cfg.new_cpu,
-                    "memory": cfg.new_memory,
-                    "disk": cfg.new_disk
-                },
-                "converted_from_template_id": vm_before.template_id,
-                "new_custom_template_id": vm_after.custom_template_id
-            });
-
-            if let Err(e) = self
-                .vm_history_logger
-                .log_vm_configuration_changed(
-                    vm_id,
-                    None, // System-initiated upgrade
-                    &vm_before,
-                    &vm_after,
-                    Some(upgrade_metadata),
-                )
-                .await
-            {
-                warn!("Failed to log VM upgrade history for VM {}: {}", vm_id, e);
-            }
-
-            info!("Successfully converted VM {} to custom template", vm_id);
+        // Context struct for the pipeline
+        struct UpgradeContext {
+            vm_id: u64,
+            cfg: UpgradeConfig,
+            db: Arc<dyn LNVpsDb>,
+            provisioner: Arc<LNVpsProvisioner>,
+            settings: WorkerSettings,
+            vm_history_logger: VmHistoryLogger,
         }
 
-        // apply changes on host - requires VM restart
-        let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let host = self.db.get_host(full_info.host.id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
-
-        // Get current VM state to determine if we need to restart
-        let vm_state = client.get_vm_state(&full_info.vm).await?;
-        let was_running = vm_state.state == VmRunningStates::Running;
-
-        if was_running {
-            info!("Stopping VM {} for upgrade configuration changes", vm_id);
-            client.stop_vm(&full_info.vm).await?;
-        }
-
-        // Apply the hardware changes while VM is stopped
-        if cfg.new_disk.is_some() {
-            info!("Resizing disk for VM {}", vm_id);
-            client.resize_disk(&full_info).await?;
-        }
-        if cfg.new_cpu.is_some() || cfg.new_memory.is_some() {
-            info!("Updating CPU/memory configuration for VM {}", vm_id);
-            client.configure_vm(&full_info).await?;
-        }
-
-        // Restart the VM if it was running before
-        if was_running {
-            info!("Starting VM {} after upgrade configuration changes", vm_id);
-            client.start_vm(&full_info.vm).await?;
-        }
-
-        // Notify the user about the successful upgrade
-        let restart_message = if was_running {
-            "Your VM was restarted to apply the new hardware configuration."
-        } else {
-            "Your VM was not running during the upgrade."
+        let ctx = UpgradeContext {
+            vm_id,
+            cfg: cfg.clone(),
+            db: self.db.clone(),
+            provisioner: self.provisioner.clone(),
+            settings: self.settings.clone(),
+            vm_history_logger: self.vm_history_logger.clone(),
         };
 
+        Pipeline::new(ctx)
+            .with_retry_policy(RetryPolicy::default())
+            .step("update_template", |ctx| {
+                Box::pin(async move {
+                    let vm_before = ctx.db.get_vm(ctx.vm_id).await?;
+
+                    if vm_before.custom_template_id.is_some() {
+                        // VM already uses custom template - update the existing template
+                        info!(
+                            "VM {} already uses custom template, updating existing template",
+                            ctx.vm_id
+                        );
+
+                        let custom_template_id = vm_before.custom_template_id.unwrap();
+                        let old_template = ctx.db.get_custom_vm_template(custom_template_id).await?;
+                        let mut new_template = old_template.clone();
+
+                        // Update the template with new specifications
+                        if let Some(new_cpu) = ctx.cfg.new_cpu {
+                            new_template.cpu = new_cpu;
+                        }
+                        if let Some(new_memory) = ctx.cfg.new_memory {
+                            new_template.memory = new_memory;
+                        }
+                        if let Some(new_disk) = ctx.cfg.new_disk {
+                            new_template.disk_size = new_disk;
+                        }
+
+                        if old_template.cpu > new_template.cpu {
+                            op_fatal!("Cannot downgrade CPU");
+                        }
+                        if old_template.memory > new_template.memory {
+                            op_fatal!("Cannot downgrade memory");
+                        }
+                        if old_template.disk_size > new_template.disk_size {
+                            op_fatal!("Cannot downgrade disk size");
+                        }
+
+                        // Skip if no changes needed
+                        if old_template.cpu == new_template.cpu
+                            && old_template.memory == new_template.memory
+                            && old_template.disk_size == new_template.disk_size
+                        {
+                            info!(
+                                "Custom template {} for VM {} already has the requested specs, skipping template update",
+                                custom_template_id, ctx.vm_id
+                            );
+                            return Ok(());
+                        }
+
+                        // Update the custom template in the database
+                        ctx.db.update_custom_vm_template(&new_template).await?;
+
+                        // Log the upgrade in VM history
+                        let upgrade_metadata = serde_json::json!({
+                            "upgrade_type": "custom_template_update",
+                            "old_specs": {
+                                "cpu": old_template.cpu,
+                                "memory": old_template.memory,
+                                "disk_size": old_template.disk_size
+                            },
+                            "new_specs": {
+                                "cpu": new_template.cpu,
+                                "memory": new_template.memory,
+                                "disk_size": new_template.disk_size
+                            }
+                        });
+
+                        if let Err(e) = ctx
+                            .vm_history_logger
+                            .log_vm_configuration_changed(
+                                ctx.vm_id,
+                                None, // System-initiated upgrade
+                                &vm_before,
+                                &vm_before, // VM record doesn't change, only the template
+                                Some(upgrade_metadata),
+                            )
+                            .await
+                        {
+                            warn!("Failed to log VM upgrade history for VM {}: {}", ctx.vm_id, e);
+                        }
+
+                        info!(
+                            "Successfully updated custom template {} for VM {}",
+                            custom_template_id, ctx.vm_id
+                        );
+                    } else {
+                        // VM uses standard template - convert to custom template
+                        info!(
+                            "VM {} uses standard template, converting to custom template",
+                            ctx.vm_id
+                        );
+                        ctx.provisioner
+                            .convert_to_custom_template(ctx.vm_id, &ctx.cfg)
+                            .await?;
+
+                        // Get the VM after conversion to see the changes
+                        let vm_after = ctx.db.get_vm(ctx.vm_id).await?;
+
+                        // Log the conversion in VM history
+                        let upgrade_metadata = serde_json::json!({
+                            "upgrade_type": "standard_to_custom_conversion",
+                            "changes": {
+                                "cpu": ctx.cfg.new_cpu,
+                                "memory": ctx.cfg.new_memory,
+                                "disk": ctx.cfg.new_disk
+                            },
+                            "converted_from_template_id": vm_before.template_id,
+                            "new_custom_template_id": vm_after.custom_template_id
+                        });
+
+                        if let Err(e) = ctx
+                            .vm_history_logger
+                            .log_vm_configuration_changed(
+                                ctx.vm_id,
+                                None, // System-initiated upgrade
+                                &vm_before,
+                                &vm_after,
+                                Some(upgrade_metadata),
+                            )
+                            .await
+                        {
+                            warn!("Failed to log VM upgrade history for VM {}: {}", ctx.vm_id, e);
+                        }
+
+                        info!("Successfully converted VM {} to custom template", ctx.vm_id);
+                    }
+                    Ok(())
+                })
+            })
+            .step("stop_vm", |ctx| {
+                Box::pin(async move {
+                    let vm = ctx.db.get_vm(ctx.vm_id).await?;
+                    let host = ctx.db.get_host(vm.host_id).await?;
+                    let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+
+                    info!("Stopping VM {} for upgrade", ctx.vm_id);
+                    if let Err(e) = client.stop_vm(&vm).await {
+                        // Ignore errors - VM might already be stopped
+                        warn!("Failed to stop VM {} (may already be stopped): {}", ctx.vm_id, e);
+                    }
+                    Ok::<_, OpError<anyhow::Error>>(())
+                })
+            })
+            .step("resize_disk", |ctx| {
+                Box::pin(async move {
+                    if ctx.cfg.new_disk.is_some() {
+                        let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
+                        let host = ctx.db.get_host(full_info.host.id).await?;
+                        let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+
+                        info!("Resizing disk for VM {}", ctx.vm_id);
+                        client.resize_disk(&full_info).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .step("configure_cpu_memory", |ctx| {
+                Box::pin(async move {
+                    if ctx.cfg.new_cpu.is_some() || ctx.cfg.new_memory.is_some() {
+                        let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
+                        let host = ctx.db.get_host(full_info.host.id).await?;
+                        let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+
+                        info!("Updating CPU/memory configuration for VM {}", ctx.vm_id);
+                        client.configure_vm(&full_info).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .step("start_vm", |ctx| {
+                Box::pin(async move {
+                    let vm = ctx.db.get_vm(ctx.vm_id).await?;
+                    let host = ctx.db.get_host(vm.host_id).await?;
+                    let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+
+                    info!("Starting VM {} after upgrade", ctx.vm_id);
+                    client.start_vm(&vm).await?;
+                    Ok::<_, OpError<anyhow::Error>>(())
+                })
+            })
+            .execute()
+            .await?;
+
         self.queue_notification(
-            full_info.vm.user_id,
-                                format!(
-            "Your VM #{} has been successfully upgraded. The new specifications are now active. {}",
-            vm_id, restart_message
-        ),
+            self.db.get_vm(vm_id).await?.user_id,
+            format!(
+                "Your VM #{} has been successfully upgraded. The new specifications are now active.",
+                vm_id
+            ),
             Some(format!("[VM{}] Upgrade Complete", vm_id)),
         ).await;
 
