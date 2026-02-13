@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use ipnetwork::IpNetwork;
+use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{IpRange, IpRangeAllocationMode, LNVpsDb};
 use log::warn;
 use rand::Rng;
@@ -216,6 +216,25 @@ impl NetworkProvisioner {
             nibbles.push(format!("{:x}", high_nibble));
         }
         Ok(format!("{}.ip6.arpa", nibbles.join(".")))
+    }
+
+    /// Count the number of available IPs in an IPv4 range.
+    /// Returns None for IPv6 ranges.
+    pub fn count_available_ips(range: &IpRange, assignment_count: u64) -> Option<u64> {
+        let network: IpNetwork = range.cidr.parse().ok()?;
+
+        // Only calculate for IPv4
+        let total_ips = match network.size() {
+            NetworkSize::V4(s) => s as u64,
+            NetworkSize::V6(_) => return None,
+        };
+
+        // Reserved IPs: gateway is always reserved
+        // If use_full_range is false, first and last IPs are also reserved (network + broadcast)
+        let reserved = if range.use_full_range { 1 } else { 3 };
+
+        let available = total_ips.saturating_sub(reserved).saturating_sub(assignment_count);
+        Some(available)
     }
 }
 

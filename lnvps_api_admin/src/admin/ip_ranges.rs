@@ -6,7 +6,7 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner};
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode};
 use serde::Deserialize;
 use std::net::IpAddr;
@@ -78,10 +78,13 @@ async fn admin_list_ip_ranges(
             None
         };
 
+        let available_ips = NetworkProvisioner::count_available_ips(&ip_range, assignment_count);
+
         let mut admin_ip_range = AdminIpRangeInfo::from(ip_range);
         admin_ip_range.assignment_count = assignment_count;
         admin_ip_range.region_name = region_name;
         admin_ip_range.access_policy_name = access_policy_name;
+        admin_ip_range.available_ips = available_ips;
         ip_ranges.push(admin_ip_range);
     }
 
@@ -120,10 +123,13 @@ async fn admin_get_ip_range(
         None
     };
 
+    let available_ips = NetworkProvisioner::count_available_ips(&ip_range, assignment_count);
+
     let mut admin_ip_range = AdminIpRangeInfo::from(ip_range);
     admin_ip_range.assignment_count = assignment_count;
     admin_ip_range.region_name = region_name;
     admin_ip_range.access_policy_name = access_policy_name;
+    admin_ip_range.available_ips = available_ips;
 
     ApiData::ok(admin_ip_range)
 }
@@ -191,10 +197,13 @@ async fn admin_create_ip_range(
         None
     };
 
+    let available_ips = NetworkProvisioner::count_available_ips(&created_ip_range, 0);
+
     let mut admin_ip_range = AdminIpRangeInfo::from(created_ip_range);
     admin_ip_range.region_name = region_name;
     admin_ip_range.access_policy_name = access_policy_name;
     admin_ip_range.assignment_count = 0; // New range has no assignments
+    admin_ip_range.available_ips = available_ips;
 
     ApiData::ok(admin_ip_range)
 }
@@ -302,10 +311,13 @@ async fn admin_update_ip_range(
         None
     };
 
+    let available_ips = NetworkProvisioner::count_available_ips(&ip_range, assignment_count);
+
     let mut admin_ip_range = AdminIpRangeInfo::from(ip_range);
     admin_ip_range.assignment_count = assignment_count;
     admin_ip_range.region_name = region_name;
     admin_ip_range.access_policy_name = access_policy_name;
+    admin_ip_range.available_ips = available_ips;
 
     ApiData::ok(admin_ip_range)
 }

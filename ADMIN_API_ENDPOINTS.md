@@ -2397,7 +2397,8 @@ The RBAC system uses the following permission format: `resource::action`
   "access_policy_name": "string | null", // Populated with access policy name
   "allocation_mode": "sequential",     // IpRangeAllocationMode enum: "random", "sequential", or "slaac_eui64"
   "use_full_range": boolean,           // Whether to use first and last IPs in range
-  "assignment_count": number           // Number of active IP assignments in this range
+  "assignment_count": number,          // Number of active IP assignments in this range
+  "available_ips": "number | null"    // Number of available IPs (IPv4 only, null for IPv6)
 }
 ```
 

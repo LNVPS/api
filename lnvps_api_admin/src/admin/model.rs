@@ -1192,6 +1192,8 @@ pub struct AdminIpRangeInfo {
     pub allocation_mode: AdminIpRangeAllocationMode,
     pub use_full_range: bool,
     pub assignment_count: u64, // Number of active IP assignments in this range
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_ips: Option<u64>, // Number of available IPs (only for IPv4 ranges)
 }
 
 #[derive(Deserialize)]
@@ -1243,6 +1245,7 @@ impl From<lnvps_db::IpRange> for AdminIpRangeInfo {
             allocation_mode: AdminIpRangeAllocationMode::from(ip_range.allocation_mode),
             use_full_range: ip_range.use_full_range,
             assignment_count: 0, // Will be filled by handler
+            available_ips: None, // Will be filled by handler for IPv4 ranges
         }
     }
 }
