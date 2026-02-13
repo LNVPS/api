@@ -213,10 +213,6 @@ interface Subscription {
   created: string; // ISO 8601 datetime
   expires?: string; // ISO 8601 datetime
   is_active: boolean;
-  currency: 'BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY';
-  interval_amount: number; // Billing cycle multiplier (e.g., 1 for monthly, 3 for quarterly)
-  interval_type: 'day' | 'month' | 'year';
-  setup_fee: number; // One-time setup fee in smallest currency unit (cents/millisats)
   auto_renewal_enabled: boolean;
   line_items: SubscriptionLineItem[]; // Services included in this subscription
 }
@@ -226,8 +222,8 @@ interface SubscriptionLineItem {
   subscription_id: number;
   name: string;
   description?: string;
-  amount: number; // Recurring cost per billing cycle in smallest currency unit (cents/millisats)
-  setup_amount: number; // One-time setup fee in smallest currency unit (cents/millisats)
+  price: Price; // Recurring cost per billing cycle
+  setup_fee: Price; // One-time setup fee
   configuration?: any; // Service-specific configuration (JSON)
 }
 
@@ -235,22 +231,12 @@ interface SubscriptionPayment {
   id: string; // Hex-encoded payment ID
   subscription_id: number;
   created: string; // ISO 8601 datetime
-  expires?: string; // ISO 8601 datetime
-  amount: number; // Total amount in smallest currency unit (cents/millisats)
-  currency: 'BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY';
+  expires: string; // ISO 8601 datetime
+  amount: Price; // Total payment amount
   payment_method: 'lightning' | 'revolut' | 'paypal' | 'stripe';
-  payment_type: 'purchase' | 'renewal'; // 0=Purchase, 1=Renewal
+  payment_type: 'Purchase' | 'Renewal';
   is_paid: boolean;
-  rate?: number; // Exchange rate if applicable
-  time_value: number; // Duration purchased in seconds
-  tax: number; // Tax amount in smallest currency unit (cents/millisats)
-  external_id?: string; // External payment processor ID (e.g., Stripe, PayPal)
-}
-
-interface SubscriptionSummary {
-  active_subscriptions: number; // Count of active subscriptions
-  total_monthly_cost: number; // Total monthly cost across all active subscriptions
-  currency: string; // Currency code
+  tax: Price; // Tax amount
 }
 ```
 
@@ -488,11 +474,13 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **Response**: `PaymentMethod[]`
 
 #### Renew/Extend VM
-- **GET** `/api/v1/vm/{id}/renew?method={payment_method}`
+- **GET** `/api/v1/vm/{id}/renew?method={payment_method}&intervals={count}`
 - **Auth**: Required
 - **Query Params**: 
-  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal')
+  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal' | 'nwc')
+  - `intervals`: Optional number of billing intervals to renew (default: 1). For example, if the VM has a monthly billing cycle, `intervals=3` would generate a payment for 3 months.
 - **Response**: `VmPayment`
+- **Description**: Generates a payment invoice to extend the VM's expiration. The payment amount is calculated based on the VM's cost plan and the number of intervals requested. If `method=nwc` is specified and the user has a valid NWC connection string configured, the payment will be automatically processed via Nostr Wallet Connect.
 
 #### Get Payment Status
 - **GET** `/api/v1/payment/{payment_id}`
@@ -528,27 +516,73 @@ interface PaginatedResponse<T> {
 // Returns: PaginatedResponse<Subscription>
 ```
 
+#### Create Subscription
+- **POST** `/api/v1/subscriptions`
+- **Auth**: Required
+- **Body**: `CreateSubscriptionRequest`
+- **Response**: `Subscription`
+- **Description**: Creates a new subscription with one or more line items. The subscription is created in an **inactive** state. Resources (IP ranges, ASNs, etc.) are **not allocated** until the first payment is made via the renewal endpoint. After payment confirmation, resources are allocated and the subscription becomes active.
+
+```typescript
+interface CreateSubscriptionRequest {
+  name?: string; // Display name for the subscription
+  description?: string; // Optional description
+  currency?: string; // Currency code (default: 'USD'): 'USD', 'EUR', 'BTC', etc.
+  auto_renewal_enabled?: boolean; // Enable auto-renewal (default: true)
+  line_items: CreateSubscriptionLineItemRequest[]; // At least one required
+}
+
+// Line item request - tagged union based on service type
+type CreateSubscriptionLineItemRequest = 
+  | { type: 'ip_range'; ip_space_pricing_id: number }
+  | { type: 'asn_sponsoring'; asn: number } // Not yet implemented
+  | { type: 'dns_hosting'; domain: string }; // Not yet implemented
+```
+
+**Workflow:**
+1. User creates subscription with line items (this endpoint)
+2. User generates payment via `GET /api/v1/subscriptions/{id}/renew`
+3. User completes payment (Lightning, Revolut, etc.)
+4. Payment handler allocates resources and activates subscription
+5. Resources remain active while subscription is paid
+
+**Example Request:**
+```typescript
+const request: CreateSubscriptionRequest = {
+  name: "My IP Block Subscription",
+  description: "IPv4 /24 block from RIPE",
+  currency: "USD",
+  auto_renewal_enabled: true,
+  line_items: [
+    { type: "ip_range", ip_space_pricing_id: 5 }
+  ]
+};
+
+const response = await fetch('/api/v1/subscriptions', {
+  method: 'POST',
+  headers: {
+    'Authorization': nip98AuthHeader,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify(request)
+});
+
+const result: ApiResponse<Subscription> = await response.json();
+// result.data.is_active will be false until payment is made
+```
+
 #### Get Subscription Details
 - **GET** `/api/v1/subscriptions/{id}`
 - **Auth**: Required
 - **Response**: `Subscription` (includes all line items)
 
-#### Get Subscription Summary
-- **GET** `/api/v1/subscriptions/summary`
+#### Renew Subscription
+- **GET** `/api/v1/subscriptions/{id}/renew?method={payment_method}`
 - **Auth**: Required
-- **Response**: `SubscriptionSummary`
-- **Description**: Returns aggregated statistics including active subscription count and total monthly cost across all active subscriptions
-
-#### List Subscription Line Items
-- **GET** `/api/v1/subscriptions/{subscription_id}/line_items`
-- **Auth**: Required
-- **Response**: `SubscriptionLineItem[]`
-- **Note**: Line items are also included in subscription responses, so this endpoint is primarily for backward compatibility
-
-#### Get Subscription Line Item
-- **GET** `/api/v1/subscription_line_items/{id}`
-- **Auth**: Required
-- **Response**: `SubscriptionLineItem`
+- **Query Params**:
+  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal' | 'stripe'). Defaults to 'lightning'
+- **Response**: `SubscriptionPayment`
+- **Description**: Generates a payment invoice to renew/extend the subscription. For the first payment, the amount includes setup fees plus the monthly recurring cost. For subsequent renewals, only the monthly recurring cost is charged. After payment is confirmed, resources (IP ranges, etc.) are allocated and the subscription is activated.
 
 #### List Subscription Payments
 - **GET** `/api/v1/subscriptions/{subscription_id}/payments?limit={limit}&offset={offset}`
@@ -557,22 +591,6 @@ interface PaginatedResponse<T> {
   - `limit`: Optional (default: 50, max: 100)
   - `offset`: Optional (default: 0)
 - **Response**: Paginated list of payments for a specific subscription
-```typescript
-// Returns: PaginatedResponse<SubscriptionPayment>
-```
-
-#### Get Subscription Payment
-- **GET** `/api/v1/subscription_payments/{hex_id}`
-- **Auth**: Required
-- **Response**: `SubscriptionPayment`
-
-#### List All User Subscription Payments
-- **GET** `/api/v1/subscription_payments?limit={limit}&offset={offset}`
-- **Auth**: Required
-- **Query Params**:
-  - `limit`: Optional (default: 50, max: 100)
-  - `offset`: Optional (default: 0)
-- **Response**: Paginated list of all subscription payments for the authenticated user
 ```typescript
 // Returns: PaginatedResponse<SubscriptionPayment>
 ```
@@ -657,14 +675,14 @@ function isApiSuccess<T>(response: ApiResult<T>): response is ApiResponse<T> {
 
 1. **Authentication**: All authenticated endpoints require NIP-98 Nostr event authentication
 2. **Date Formats**: All dates are in ISO 8601 format
-3. **Currency Units**: Amounts are in the smallest unit (satoshis for BTC, cents for fiat)
+3. **Currency Units**: Amounts are returned as `Price` objects with `currency` and `amount` fields. The `amount` is a float representing the value in the currency's standard unit (e.g., 12.34 EUR, 0.00012345 BTC)
 4. **Memory/Disk Units**: All memory and disk sizes are in bytes
 5. **VM States**: VM states are string enums representing current operational status
 6. **Error Handling**: Always check for error responses before accessing data
 7. **Pagination**: Some endpoints support optional pagination with `limit` and `offset` parameters
-8. **Subscriptions**: Subscription responses now include all line items embedded. The standalone line item endpoints are still available for backward compatibility.
-9. **Billing Cycles**: Subscriptions have a single billing cycle (interval_amount + interval_type) that applies to all line items. Total recurring cost is the sum of all line item amounts.
-10. **Setup Fees**: Both subscriptions and individual line items can have one-time setup fees that are charged only on initial purchase.
+8. **Subscriptions**: Subscription responses include all line items embedded. Subscriptions are created inactive and only become active after the first payment is completed.
+9. **Subscription Billing**: Subscriptions use monthly billing cycles. The first payment includes setup fees plus the monthly recurring cost. Subsequent renewals only charge the monthly recurring cost.
+10. **Setup Fees**: Individual line items can have one-time setup fees that are charged only on initial purchase.
 
 ### VM Upgrade Process
 
