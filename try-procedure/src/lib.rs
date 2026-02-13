@@ -166,8 +166,8 @@ pub struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            min_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(10),
+            min_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
             max_retries: 3,
             factor: 2.0,
         }

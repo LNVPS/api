@@ -54,6 +54,12 @@ impl MockRouter {
             arp: LAZY_ARP.clone(),
         }
     }
+
+    /// Clear all ARP entries - useful for test isolation
+    pub async fn clear(&self) {
+        let mut arp = self.arp.lock().await;
+        arp.clear();
+    }
 }
 
 #[async_trait]

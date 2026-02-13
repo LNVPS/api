@@ -214,13 +214,8 @@ impl LNVpsNetworkProvisioner {
         ip: &mut VmIpAssignment,
         range: &IpRange,
     ) -> OpResult<()> {
-        if let Some(ap) = range.access_policy_id {
-            let ap = self.db.get_access_policy(ap).await?;
-            // remove access policy
-            self.remove_access_policy(ip, &ap).await?;
-        }
-        // remove dns
-        self.remove_ip_dns(ip).await?;
+        // remove access policy and dns
+        self.rollback_ip_assignment_policy(ip, range).await?;
         // save arp/dns changes
         self.db.update_vm_ip_assignment(ip).await?;
         // mark as deleted
@@ -229,11 +224,29 @@ impl LNVpsNetworkProvisioner {
         Ok(())
     }
 
-    pub async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
-        // load range info to check access policy
-        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+    /// Rollback access policy and DNS for an IP assignment.
+    /// This can be used to clean up resources that were created but not persisted to DB.
+    pub async fn rollback_ip_assignment_policy(
+        &self,
+        ip: &mut VmIpAssignment,
+        range: &IpRange,
+    ) -> OpResult<()> {
+        if let Some(ap) = range.access_policy_id {
+            let ap = self.db.get_access_policy(ap).await?;
+            // remove access policy
+            self.remove_access_policy(ip, &ap).await?;
+        }
+        // remove dns
+        self.remove_ip_dns(ip).await?;
+        Ok(())
+    }
 
-        // Validate provided IP format and range
+    /// Validate IP assignment format and range
+    pub fn validate_ip_assignment(
+        &self,
+        assignment: &VmIpAssignment,
+        range: &IpRange,
+    ) -> OpResult<()> {
         let provided_ip = assignment
             .ip
             .trim()
@@ -249,31 +262,70 @@ impl LNVpsNetworkProvisioner {
             op_fatal!("IP address is not within the specified IP range");
         }
 
-        // Update access policy / dns
-        self.update_ip_assignment_policy(assignment, &range).await?;
-
-        // save to db
-        let id = self.db.insert_vm_ip_assignment(assignment).await?;
-        assignment.id = id;
-
         Ok(())
     }
 
-    /// Update access policy and dns
-    pub async fn update_ip_assignment_policy(
+    /// Save IP assignment to database (insert if id == 0, otherwise update)
+    pub async fn persist_ip_assignment(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
+        if assignment.id == 0 {
+            let id = self.db.insert_vm_ip_assignment(assignment).await?;
+            assignment.id = id;
+        } else {
+            self.db.update_vm_ip_assignment(assignment).await?;
+        }
+        Ok(())
+    }
+
+    /// Update access policy (ARP) for an IP assignment, does not save to database!
+    pub async fn update_ip_assignment_access_policy(
         &self,
         assignment: &mut VmIpAssignment,
         range: &IpRange,
     ) -> OpResult<()> {
         if let Some(ap) = range.access_policy_id {
             let ap = self.db.get_access_policy(ap).await?;
-            // apply access policy
             self.update_access_policy(assignment, &ap).await?;
         }
+        Ok(())
+    }
 
-        // Add DNS records
+    /// Remove access policy (ARP) for an IP assignment, does not save to database!
+    pub async fn remove_ip_assignment_access_policy(
+        &self,
+        assignment: &mut VmIpAssignment,
+        range: &IpRange,
+    ) -> OpResult<()> {
+        if let Some(ap) = range.access_policy_id {
+            let ap = self.db.get_access_policy(ap).await?;
+            self.remove_access_policy(assignment, &ap).await?;
+        }
+        Ok(())
+    }
+
+    /// Convenience method: Update all external resources (ARP + DNS) for an IP assignment.
+    /// Does NOT persist to database - use persist_ip_assignment() after this if needed.
+    pub async fn update_ip_assignment_policy(
+        &self,
+        assignment: &mut VmIpAssignment,
+        range: &IpRange,
+    ) -> OpResult<()> {
+        self.update_ip_assignment_access_policy(assignment, range)
+            .await?;
         self.update_forward_ip_dns(assignment).await?;
         self.update_reverse_ip_dns(assignment).await?;
+        Ok(())
+    }
+
+    /// Convenience method: Create IP assignment with all external resources and persist to DB.
+    /// Combines validation, ARP setup, DNS setup, and DB persistence.
+    pub async fn save_ip_assignment(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+
+        self.validate_ip_assignment(assignment, &range)?;
+        self.update_ip_assignment_policy(assignment, &range)
+            .await?;
+        self.persist_ip_assignment(assignment).await?;
+
         Ok(())
     }
 }

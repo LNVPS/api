@@ -259,7 +259,9 @@ impl LNVpsProvisioner {
             vm_id,
         )
         .await?;
-        let price = pe.get_vm_cost_for_intervals(vm_id, method, intervals).await?;
+        let price = pe
+            .get_vm_cost_for_intervals(vm_id, method, intervals)
+            .await?;
         self.price_to_payment(vm_id, method, price).await
     }
 
@@ -276,7 +278,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
         self.price_to_payment(vm_id, method, price).await
     }
@@ -291,7 +293,10 @@ impl LNVpsProvisioner {
 
         // Get subscription and line items
         let subscription = self.db.get_subscription(subscription_id).await?;
-        let line_items = self.db.list_subscription_line_items(subscription_id).await?;
+        let line_items = self
+            .db
+            .list_subscription_line_items(subscription_id)
+            .await?;
         ensure!(!line_items.is_empty(), "Subscription has no line items");
 
         // Get user for tax calculation
@@ -319,7 +324,8 @@ impl LNVpsProvisioner {
         };
 
         // Parse subscription currency
-        let subscription_currency = Currency::from_str(&subscription.currency).map_err(|e| anyhow::anyhow!("Invalid currency"))?;
+        let subscription_currency = Currency::from_str(&subscription.currency)
+            .map_err(|e| anyhow::anyhow!("Invalid currency"))?;
         let list_price = CurrencyAmount::from_u64(subscription_currency, list_price_amount);
 
         // Create pricing engine for currency conversion
@@ -334,7 +340,9 @@ impl LNVpsProvisioner {
         let converted = pe.get_amount_and_rate(list_price, method).await?;
 
         // Calculate tax on the converted amount
-        let tax = pe.get_tax_for_user(user.id, converted.amount.value()).await?;
+        let tax = pe
+            .get_tax_for_user(user.id, converted.amount.value())
+            .await?;
 
         // Generate payment based on method
         let subscription_payment = match method {
@@ -435,7 +443,9 @@ impl LNVpsProvisioner {
         };
 
         // Save payment to database
-        self.db.insert_subscription_payment(&subscription_payment).await?;
+        self.db
+            .insert_subscription_payment(&subscription_payment)
+            .await?;
 
         Ok(subscription_payment)
     }
@@ -517,7 +527,7 @@ impl LNVpsProvisioner {
                             .create_order(
                                 &desc,
                                 CurrencyAmount::from_u64(p.currency, p.amount + p.tax),
-                                None
+                                None,
                             )
                             .await?;
                         let new_id: [u8; 32] = rand::random();
@@ -581,7 +591,14 @@ impl LNVpsProvisioner {
             .with_retry_policy(Self::retry_policy())
             .step_with_rollback(
                 "ip_allocation",
-                |ctx| Box::pin(async move { ctx.assign_ips().await }),
+                |ctx| {
+                    Box::pin(async move {
+                        ctx.assign_ips().await?;
+                        // Save VM immediately so MAC is available in DB for ARP setup
+                        ctx.db.update_vm(&ctx.info.vm).await?;
+                        Ok(())
+                    })
+                },
                 |ctx| {
                     Box::pin(async move {
                         // rollback any remote resources as we didn't save the assignments to the database yet
@@ -595,22 +612,92 @@ impl LNVpsProvisioner {
                 |ctx| Box::pin(async move { ctx.host_client.delete_vm(&ctx.info.vm).await }),
             )
             .step_with_rollback(
-                "save_vm",
+                "arp_setup",
                 |ctx| {
                     Box::pin(async move {
-                        ctx.db.update_vm(&ctx.info.vm).await?;
                         for ip in &mut ctx.info.ips {
-                            if ip.id != 0 {
-                                // IP already inserted, skip
-                                continue;
-                            }
-                            ctx.network.save_ip_assignment(ip).await?;
+                            let range = ctx.db.get_ip_range(ip.ip_range_id).await?;
+                            ctx.network.validate_ip_assignment(ip, &range)?;
+                            ctx.network
+                                .update_ip_assignment_access_policy(ip, &range)
+                                .await?;
                         }
                         Ok(())
                     })
                 },
                 |ctx| {
                     Box::pin(async move {
+                        for ip in &mut ctx.info.ips {
+                            if ip.arp_ref.is_some() {
+                                let range = ctx.db.get_ip_range(ip.ip_range_id).await?;
+                                ctx.network
+                                    .remove_ip_assignment_access_policy(ip, &range)
+                                    .await?;
+                            }
+                        }
+                        Ok(())
+                    })
+                },
+            )
+            .step_with_rollback(
+                "dns_forward",
+                |ctx| {
+                    Box::pin(async move {
+                        for ip in &mut ctx.info.ips {
+                            ctx.network.update_forward_ip_dns(ip).await?;
+                        }
+                        Ok(())
+                    })
+                },
+                |ctx| {
+                    Box::pin(async move {
+                        for ip in &mut ctx.info.ips {
+                            if ip.dns_forward_ref.is_some() {
+                                ctx.network.remove_ip_dns(ip).await?;
+                            }
+                        }
+                        Ok(())
+                    })
+                },
+            )
+            .step_with_rollback(
+                "dns_reverse",
+                |ctx| {
+                    Box::pin(async move {
+                        for ip in &mut ctx.info.ips {
+                            ctx.network.update_reverse_ip_dns(ip).await?;
+                        }
+                        Ok(())
+                    })
+                },
+                |ctx| {
+                    Box::pin(async move {
+                        for ip in &mut ctx.info.ips {
+                            if ip.dns_reverse_ref.is_some() {
+                                ctx.network.remove_ip_dns(ip).await?;
+                            }
+                        }
+                        Ok(())
+                    })
+                },
+            )
+            .step_with_rollback(
+                "save_ips",
+                |ctx| {
+                    Box::pin(async move {
+                        for ip in &mut ctx.info.ips {
+                            if ip.id != 0 {
+                                // IP already inserted, skip
+                                continue;
+                            }
+                            ctx.network.persist_ip_assignment(ip).await?;
+                        }
+                        Ok(())
+                    })
+                },
+                |ctx| {
+                    Box::pin(async move {
+                        // Clean up any IPs that were persisted to DB
                         ctx.network
                             .delete_all_ip_assignments(ctx.info.vm.id)
                             .await?;
@@ -676,7 +763,7 @@ impl LNVpsProvisioner {
             self.tax_rates.clone(),
             vm_id,
         )
-            .await?;
+        .await?;
         pe.calculate_upgrade_cost(vm_id, cfg, method).await
     }
 
@@ -726,7 +813,7 @@ impl LNVpsProvisioner {
             PaymentType::Upgrade,
             Some(upgrade_params_json),
         )
-            .await
+        .await
     }
 
     /// Create a new custom template using a vm's existing standard template

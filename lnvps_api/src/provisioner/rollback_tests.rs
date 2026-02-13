@@ -21,6 +21,11 @@ mod tests {
 
     const ROUTER_BRIDGE: &str = "bridge1";
 
+    /// Clear shared mock state for test isolation
+    async fn clear_mock_state() {
+        MockRouter::new().clear().await;
+    }
+
     async fn setup_db_with_static_arp(db: &Arc<MockDb>) -> Result<()> {
         let mut r = db.router.lock().await;
         r.insert(
@@ -81,6 +86,7 @@ mod tests {
     /// This should remove any ARP entries that were created
     #[tokio::test]
     async fn test_rollback_ip_allocation_on_host_spawn_failure() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -139,6 +145,7 @@ mod tests {
     /// Test that when save_vm step fails, both host_spawn and ip_allocation are rolled back
     #[tokio::test]
     async fn test_rollback_chain_on_save_vm_failure() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -211,6 +218,7 @@ mod tests {
     /// Test that DNS records are properly rolled back (deleted) when VM is deleted
     #[tokio::test]
     async fn test_rollback_dns_records_on_delete() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -297,6 +305,7 @@ mod tests {
     /// Test that IP assignments are properly managed during spawn and delete
     #[tokio::test]
     async fn test_ip_assignments_hard_deleted_on_rollback() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -356,6 +365,7 @@ mod tests {
     /// Test that skipping already assigned IPs works correctly during re-spawn attempts
     #[tokio::test]
     async fn test_skip_already_assigned_ips() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -396,6 +406,7 @@ mod tests {
     /// Test that MAC address rollback works when router generates the MAC
     #[tokio::test]
     async fn test_mac_address_rollback_with_router_generated_mac() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -444,6 +455,7 @@ mod tests {
     /// Test the delete_vm pipeline executes all cleanup steps
     #[tokio::test]
     async fn test_delete_vm_pipeline_complete_cleanup() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -516,9 +528,113 @@ mod tests {
         Ok(())
     }
 
+    /// Test that ARP/DNS resources created during save_vm step are properly rolled back
+    /// when the step fails (simulating the scenario where ARP is created but DB insert fails)
+    #[tokio::test]
+    async fn test_rollback_unpersisted_arp_dns_on_save_vm_failure() -> Result<()> {
+        clear_mock_state().await;
+        use crate::provisioner::LNVpsNetworkProvisioner;
+        use try_procedure::RetryPolicy;
+
+        let db = Arc::new(MockDb::default());
+        let dns = Arc::new(MockDnsServer::new());
+
+        setup_db_with_static_arp(&db).await?;
+
+        let network = LNVpsNetworkProvisioner::new(
+            db.clone(),
+            Some(dns.clone()),
+            Some("mock-forward-zone-id".to_string()),
+            RetryPolicy::default().with_max_retries(0),
+        );
+
+        // Create a VM
+        let (user, ssh_key) = add_user(&db).await?;
+
+        // Create the VM first
+        let mut vm = lnvps_db::Vm {
+            id: 0,
+            host_id: 1,
+            user_id: user.id,
+            image_id: 1,
+            ssh_key_id: ssh_key.id,
+            template_id: Some(1),
+            custom_template_id: None,
+            disk_id: 1,
+            mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
+            expires: chrono::Utc::now() + chrono::Duration::days(30),
+            created: chrono::Utc::now(),
+            ref_code: None,
+            deleted: false,
+            auto_renewal_enabled: false,
+        };
+        let vm_id = db.insert_vm(&vm).await?;
+        vm.id = vm_id;
+
+        // Create an IP assignment that has not been persisted yet (id == 0)
+        let mut assignment = lnvps_db::VmIpAssignment {
+            id: 0, // Not persisted
+            vm_id,
+            ip_range_id: 1,
+            ip: "10.0.0.5".to_string(),
+            arp_ref: None,
+            dns_forward: None,
+            dns_reverse: None,
+            dns_forward_ref: None,
+            dns_reverse_ref: None,
+            deleted: false,
+        };
+
+        let range = db.get_ip_range(1).await?;
+
+        // Simulate what save_ip_assignment does: create ARP and DNS entries
+        network
+            .update_ip_assignment_policy(&mut assignment, &range)
+            .await?;
+
+        // At this point, ARP and DNS refs should be set, but IP is not in DB
+        assert!(
+            assignment.arp_ref.is_some(),
+            "ARP ref should be set after policy update"
+        );
+        // DNS refs may or may not be set depending on zone config
+        let arp_ref = assignment.arp_ref.clone().unwrap();
+
+        // Verify ARP entry exists on router
+        let router = MockRouter::new();
+        let arp_entries = router.list_arp_entry().await?;
+        assert!(
+            arp_entries.iter().any(|e| e.id.as_ref() == Some(&arp_ref)),
+            "ARP entry should exist after policy update"
+        );
+
+        // Now simulate rollback (what happens if DB insert fails)
+        network
+            .rollback_ip_assignment_policy(&mut assignment, &range)
+            .await?;
+
+        // Verify ARP entry was removed
+        let arp_entries_after = router.list_arp_entry().await?;
+        assert!(
+            !arp_entries_after
+                .iter()
+                .any(|e| e.id.as_ref() == Some(&arp_ref)),
+            "ARP entry should be removed after rollback"
+        );
+
+        // Verify refs are cleared
+        assert!(
+            assignment.arp_ref.is_none(),
+            "ARP ref should be cleared after rollback"
+        );
+
+        Ok(())
+    }
+
     /// Test that the pipeline handles cleanup correctly for all resources
     #[tokio::test]
     async fn test_pipeline_handles_complete_cleanup() -> Result<()> {
+        clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
