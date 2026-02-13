@@ -276,8 +276,12 @@ impl VmHostClient for MockVmHost {
         Ok(())
     }
 
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
-        todo!()
+    async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
+        Ok(())
+    }
+
+    async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
+        Ok(())
     }
 
     async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {

@@ -19,13 +19,14 @@ use futures::future::join_all;
 use isocountry::CountryCode;
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
+use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
 use lnvps_api_common::{ApiCurrency, ApiError, EuVatClient, PageQuery};
 use lnvps_api_common::{ApiData, ApiResult, Nip98Auth, UpgradeConfig, WorkJob};
 use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
 use lnvps_db::{
     PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
 };
-use log::error;
+use log::{error, info, warn};
 use nostr_sdk::{ToBech32, Url};
 use payments_rs::currency::CurrencyAmount;
 use serde::Serialize;
@@ -106,7 +107,9 @@ async fn v1_patch_account(
             Ok(s) => {
                 // test connection
                 let client = nwc::NWC::new(s);
-                let info = client.get_info().await
+                let info = client
+                    .get_info()
+                    .await
                     .map_err(|e| ApiError::new(format!("Failed to connect to NWC: {}", e)))?;
                 if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
                     return ApiData::err("NWC connection must allow pay_invoice");
@@ -423,7 +426,9 @@ async fn v1_add_ssh_key(
 ) -> ApiResult<ApiUserSshKey> {
     let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
 
-    let pk: PublicKey = req.key_data.parse()
+    let pk: PublicKey = req
+        .key_data
+        .parse()
         .map_err(|_| ApiError::new("Invalid SSH public key format"))?;
     let key_name = if !req.name.is_empty() {
         &req.name
@@ -433,7 +438,8 @@ async fn v1_add_ssh_key(
     let mut new_key = lnvps_db::UserSshKey {
         name: key_name.to_string(),
         user_id: uid,
-        key_data: pk.to_openssh()
+        key_data: pk
+            .to_openssh()
             .map_err(|_| ApiError::new("Failed to encode SSH key"))?
             .into(),
         ..Default::default()
@@ -639,7 +645,53 @@ async fn v1_reinstall_vm(
     let host = this.db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &this.settings.provisioner)?;
     let info = FullVmInfo::load(vm.id, this.db.clone()).await?;
-    client.reinstall_vm(&info).await?;
+
+    struct ReinstallContext {
+        vm_id: u64,
+        client: std::sync::Arc<dyn crate::host::VmHostClient>,
+        info: FullVmInfo,
+    }
+
+    let ctx = ReinstallContext {
+        vm_id: vm.id,
+        client,
+        info,
+    };
+
+    Pipeline::new(ctx)
+        .with_retry_policy(RetryPolicy::default())
+        .step("stop_vm", |ctx| {
+            Box::pin(async move {
+                info!("Stopping VM {} for reinstall", ctx.vm_id);
+                ctx.client.stop_vm(&ctx.info.vm).await
+            })
+        })
+        .step("unlink_disk", |ctx| {
+            Box::pin(async move {
+                info!("Unlinking disk for VM {}", ctx.vm_id);
+                ctx.client.unlink_primary_disk(&ctx.info.vm).await
+            })
+        })
+        .step("import_template_disk", |ctx| {
+            Box::pin(async move {
+                info!("Importing template disk for VM {}", ctx.vm_id);
+                ctx.client.import_template_disk(&ctx.info).await
+            })
+        })
+        .step("resize_disk", |ctx| {
+            Box::pin(async move {
+                info!("Resizing disk for VM {}", ctx.vm_id);
+                ctx.client.resize_disk(&ctx.info).await
+            })
+        })
+        .step("start_vm", |ctx| {
+            Box::pin(async move {
+                info!("Starting VM {} after reinstall", ctx.vm_id);
+                ctx.client.start_vm(&ctx.info.vm).await
+            })
+        })
+        .execute()
+        .await?;
 
     // Log VM reinstall (assuming same image ID for now)
     this.history

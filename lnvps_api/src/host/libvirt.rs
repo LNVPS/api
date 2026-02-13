@@ -191,7 +191,11 @@ impl VmHostClient for LibVirtHost {
         todo!()
     }
 
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
+    async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
+        todo!()
+    }
+
+    async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
         todo!()
     }
 

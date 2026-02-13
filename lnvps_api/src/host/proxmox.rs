@@ -338,7 +338,9 @@ impl ProxmoxClient {
             }
             Ok(())
         } else {
-            op_fatal!("Cannot complete, no method available to import disk, consider configuring ssh")
+            op_fatal!(
+                "Cannot complete, no method available to import disk, consider configuring ssh"
+            )
         }
     }
 
@@ -497,7 +499,11 @@ impl ProxmoxClient {
     /// List VM firewall IPsets
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/ipset
-    pub async fn list_vm_ipsets(&self, node: &str, vm_id: ProxmoxVmId) -> OpResult<Vec<VmIpsetInfo>> {
+    pub async fn list_vm_ipsets(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+    ) -> OpResult<Vec<VmIpsetInfo>> {
         let rsp: ResponseBase<Vec<VmIpsetInfo>> = self
             .api
             .get(&format!(
@@ -991,31 +997,13 @@ impl VmHostClient for ProxmoxClient {
         self.destroy_vm(vm.id.into()).await
     }
 
-    async fn reinstall_vm(&self, req: &FullVmInfo) -> OpResult<()> {
-        let vm_id = req.vm.id.into();
+    async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
+        self.unlink_disk(&self.node, vm.id.into(), vec!["scsi0".to_string()], true)
+            .await
+    }
 
-        // try stop, otherwise ignore error (maybe its already running)
-        if let Ok(j_stop) = self.stop_vm(&self.node, vm_id).await
-            && let Err(e) = self.wait_for_task(&j_stop).await
-        {
-            warn!("Failed to stop vm: {}", e);
-        }
-
-        // unlink the existing main disk
-        self.unlink_disk(&self.node, vm_id, vec!["scsi0".to_string()], true)
-            .await?;
-
-        // import disk from template again
-        self.import_template_disk(req).await?;
-
-        // try start, otherwise ignore error (maybe its already running)
-        if let Ok(j_start) = self.start_vm(&self.node, vm_id).await
-            && let Err(e) = self.wait_for_task(&j_start).await
-        {
-            warn!("Failed to start vm: {}", e);
-        }
-
-        Ok(())
+    async fn import_template_disk(&self, req: &FullVmInfo) -> OpResult<()> {
+        self.import_template_disk(req).await
     }
 
     async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {

@@ -49,8 +49,11 @@ pub trait VmHostClient: Send + Sync {
     /// Delete a VM
     async fn delete_vm(&self, vm: &Vm) -> OpResult<()>;
 
-    /// Re-install a vm OS
-    async fn reinstall_vm(&self, cfg: &FullVmInfo) -> OpResult<()>;
+    /// Unlink/delete the primary disk of a VM
+    async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()>;
+
+    /// Import a fresh disk from the OS template
+    async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
     /// Resize the primary disk of a VM
     async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()>;

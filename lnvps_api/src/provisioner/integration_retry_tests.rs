@@ -123,8 +123,12 @@ mod tests {
             self.inner.delete_vm(vm).await
         }
 
-        async fn reinstall_vm(&self, req: &crate::host::FullVmInfo) -> OpResult<()> {
-            self.inner.reinstall_vm(req).await
+        async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
+            self.inner.unlink_primary_disk(vm).await
+        }
+
+        async fn import_template_disk(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
+            self.inner.import_template_disk(cfg).await
         }
 
         async fn resize_disk(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
