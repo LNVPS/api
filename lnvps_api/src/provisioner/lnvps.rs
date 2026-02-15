@@ -56,43 +56,6 @@ impl LNVpsProvisioner {
         rates: Arc<dyn ExchangeRateService>,
         dns: Option<Arc<dyn DnsServer>>,
     ) -> Self {
-        // Convert settings processing fees to common type
-        let processing_fees = lnvps_api_common::ProcessingFeesConfig {
-            revolut: settings.processing_fees.revolut.as_ref().map(|fee| {
-                let currency = fee.base_fee_currency.parse().unwrap_or_else(|_| {
-                    warn!("Invalid Revolut fee currency '{}', defaulting to EUR", fee.base_fee_currency);
-                    Currency::EUR
-                });
-                lnvps_api_common::ProcessingFeeRate {
-                    percentage_rate: fee.percentage_rate,
-                    base_fee: fee.base_fee,
-                    base_fee_currency: currency,
-                }
-            }),
-            stripe: settings.processing_fees.stripe.as_ref().map(|fee| {
-                let currency = fee.base_fee_currency.parse().unwrap_or_else(|_| {
-                    warn!("Invalid Stripe fee currency '{}', defaulting to USD", fee.base_fee_currency);
-                    Currency::USD
-                });
-                lnvps_api_common::ProcessingFeeRate {
-                    percentage_rate: fee.percentage_rate,
-                    base_fee: fee.base_fee,
-                    base_fee_currency: currency,
-                }
-            }),
-            paypal: settings.processing_fees.paypal.as_ref().map(|fee| {
-                let currency = fee.base_fee_currency.parse().unwrap_or_else(|_| {
-                    warn!("Invalid PayPal fee currency '{}', defaulting to USD", fee.base_fee_currency);
-                    Currency::USD
-                });
-                lnvps_api_common::ProcessingFeeRate {
-                    percentage_rate: fee.percentage_rate,
-                    base_fee: fee.base_fee,
-                    base_fee_currency: currency,
-                }
-            }),
-        };
-
         Self {
             network: LNVpsNetworkProvisioner::new(
                 db.clone(),
@@ -102,7 +65,7 @@ impl LNVpsProvisioner {
             ),
             revolut: settings.get_revolut().expect("revolut config"),
             tax_rates: settings.tax_rate,
-            processing_fees,
+            processing_fees: settings.processing_fees,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
             db,

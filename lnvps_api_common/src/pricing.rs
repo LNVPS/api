@@ -14,18 +14,20 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Processing fee rate structure: percentage + fixed base fee
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ProcessingFeeRate {
     /// Percentage rate (e.g., 1.0 for 1%)
     pub percentage_rate: f32,
     /// Base fee in smallest currency unit (e.g., cents for fiat)
     pub base_fee: u64,
     /// Currency for the base fee (e.g., "EUR", "USD")
-    pub base_fee_currency: Currency,
+    pub base_fee_currency: String,
 }
 
 /// Configuration for processing fees per payment method
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ProcessingFeesConfig {
     /// Revolut processing fee configuration
     pub revolut: Option<ProcessingFeeRate>,
@@ -33,6 +35,21 @@ pub struct ProcessingFeesConfig {
     pub stripe: Option<ProcessingFeeRate>,
     /// PayPal processing fee configuration
     pub paypal: Option<ProcessingFeeRate>,
+}
+
+impl Default for ProcessingFeesConfig {
+    fn default() -> Self {
+        Self {
+            // Default to Revolut's standard pricing: 1% + 0.20 EUR
+            revolut: Some(ProcessingFeeRate {
+                percentage_rate: 1.0,
+                base_fee: 20, // 0.20 EUR in cents
+                base_fee_currency: "EUR".to_string(),
+            }),
+            stripe: None,
+            paypal: None,
+        }
+    }
 }
 
 
@@ -112,7 +129,8 @@ impl PricingEngine {
         let percentage_fee = ((amount as f64) * (config.percentage_rate as f64 / 100.0)).round() as u64;
 
         // Get base fee, converting currency if needed
-        let base_fee = if config.base_fee_currency == currency {
+        let base_fee_currency = Currency::from_str(&config.base_fee_currency).unwrap_or(currency);
+        let base_fee = if base_fee_currency == currency {
             // Same currency, use directly
             config.base_fee
         } else {
@@ -724,7 +742,7 @@ mod tests {
             revolut: Some(ProcessingFeeRate {
                 percentage_rate: 1.0,
                 base_fee: 20,
-                base_fee_currency: Currency::EUR,
+                base_fee_currency: "EUR".to_string(),
             }),
             stripe: None,
             paypal: None,

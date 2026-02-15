@@ -3,7 +3,7 @@ use crate::exchange::ExchangeRateService;
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Result;
 use isocountry::CountryCode;
-use lnvps_api_common::RedisConfig;
+use lnvps_api_common::{ProcessingFeesConfig, RedisConfig};
 use lnvps_db::LNVpsDb;
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::LightningNode;
@@ -212,45 +212,6 @@ pub struct EncryptionConfig {
     pub key_file: PathBuf,
     /// Automatically generate key if file doesn't exist
     pub auto_generate: bool,
-}
-
-/// Processing fee configuration for payment methods
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ProcessingFeesConfig {
-    /// Revolut processing fee configuration
-    pub revolut: Option<ProcessingFeeRate>,
-    /// Stripe processing fee configuration
-    pub stripe: Option<ProcessingFeeRate>,
-    /// PayPal processing fee configuration
-    pub paypal: Option<ProcessingFeeRate>,
-}
-
-impl Default for ProcessingFeesConfig {
-    fn default() -> Self {
-        Self {
-            // Default to Revolut's standard pricing: 1% + 0.20 EUR
-            revolut: Some(ProcessingFeeRate {
-                percentage_rate: 1.0,
-                base_fee: 20, // 0.20 EUR in cents
-                base_fee_currency: "EUR".to_string(),
-            }),
-            stripe: None,
-            paypal: None,
-        }
-    }
-}
-
-/// Processing fee rate structure: percentage + fixed base fee
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ProcessingFeeRate {
-    /// Percentage rate (e.g., 1.0 for 1%)
-    pub percentage_rate: f32,
-    /// Base fee in smallest currency unit (e.g., cents for fiat)
-    pub base_fee: u64,
-    /// Currency for the base fee (e.g., "EUR", "USD")
-    pub base_fee_currency: String,
 }
 
 impl Settings {
