@@ -343,6 +343,9 @@ impl LNVpsProvisioner {
         let tax = pe
             .get_tax_for_user(user.id, converted.amount.value())
             .await?;
+        
+        // Calculate processing fee
+        let processing_fee = pe.calculate_processing_fee(method, converted.amount.currency(), converted.amount.value());
 
         // Generate payment based on method
         let subscription_payment = match method {
@@ -392,6 +395,7 @@ impl LNVpsProvisioner {
                     is_paid: false,
                     rate: converted.rate.rate,
                     tax,
+                    processing_fee,
                 }
             }
             PaymentMethod::Revolut => {
@@ -416,7 +420,7 @@ impl LNVpsProvisioner {
 
                 let order_amount = CurrencyAmount::from_u64(
                     converted.amount.currency(),
-                    converted.amount.value() + tax,
+                    converted.amount.value() + tax + processing_fee,
                 );
                 let order = rev.create_order(&desc, order_amount, None).await?;
 
@@ -436,6 +440,7 @@ impl LNVpsProvisioner {
                     is_paid: false,
                     rate: converted.rate.rate,
                     tax,
+                    processing_fee,
                 }
             }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
@@ -502,6 +507,7 @@ impl LNVpsProvisioner {
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
                             amount: p.amount,
                             tax: p.tax,
+                            processing_fee: p.processing_fee,
                             currency: p.currency.to_string(),
                             payment_method: method,
                             payment_type,
@@ -526,7 +532,7 @@ impl LNVpsProvisioner {
                         let order = rev
                             .create_order(
                                 &desc,
-                                CurrencyAmount::from_u64(p.currency, p.amount + p.tax),
+                                CurrencyAmount::from_u64(p.currency, p.amount + p.tax + p.processing_fee),
                                 None,
                             )
                             .await?;
@@ -538,6 +544,7 @@ impl LNVpsProvisioner {
                             expires: Utc::now().add(Duration::from_secs(3600)),
                             amount: p.amount,
                             tax: p.tax,
+                            processing_fee: p.processing_fee,
                             currency: p.currency.to_string(),
                             payment_method: method,
                             payment_type,
@@ -803,6 +810,7 @@ impl LNVpsProvisioner {
             time_value: 0, //upgrades dont add time
             new_expiry: Default::default(),
             tax: 0, // No tax on upgrades for now
+            processing_fee: 0, // No processing fee on upgrades for now
         };
         let upgrade_params_json = serde_json::to_string(cfg)?;
 

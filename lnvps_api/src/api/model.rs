@@ -132,6 +132,7 @@ pub struct ApiVmPayment {
     pub expires: DateTime<Utc>,
     pub amount: u64,
     pub tax: u64,
+    pub processing_fee: u64,
     pub currency: String,
     pub is_paid: bool,
     pub data: ApiPaymentData,
@@ -147,6 +148,8 @@ pub struct ApiInvoiceItem {
     pub amount: u64,
     /// Raw tax amount in smallest currency unit (cents for fiat, millisats for BTC)
     pub tax: u64,
+    /// Raw processing fee amount in smallest currency unit (cents for fiat, millisats for BTC)
+    pub processing_fee: u64,
     /// Raw currency string
     pub currency: String,
     /// Raw duration in seconds
@@ -155,6 +158,8 @@ pub struct ApiInvoiceItem {
     pub formatted_amount: String,
     /// Formatted tax amount (e.g., "EUR 2.88", "BTC 0.00002879")
     pub formatted_tax: String,
+    /// Formatted processing fee (e.g., "EUR 0.30", "BTC 0.00000700")
+    pub formatted_processing_fee: String,
     /// Formatted duration (e.g., "30 days", "1 month", "6 hours")
     pub formatted_duration: String,
 }
@@ -164,6 +169,7 @@ impl ApiInvoiceItem {
     pub fn from_payment_data(
         amount: u64,
         tax: u64,
+        processing_fee: u64,
         currency: &str,
         time_seconds: u64,
     ) -> Result<Self, anyhow::Error> {
@@ -172,14 +178,17 @@ impl ApiInvoiceItem {
 
         let amount_currency = CurrencyAmount::from_u64(parsed_currency, amount);
         let tax_currency = CurrencyAmount::from_u64(parsed_currency, tax);
+        let processing_fee_currency = CurrencyAmount::from_u64(parsed_currency, processing_fee);
 
         Ok(Self {
             amount,
             tax,
+            processing_fee,
             currency: currency.to_string(),
             time: time_seconds,
             formatted_amount: amount_currency.to_string(),
             formatted_tax: tax_currency.to_string(),
+            formatted_processing_fee: processing_fee_currency.to_string(),
             formatted_duration: format_duration(Duration::from_secs(time_seconds)).to_string(),
         })
     }
@@ -189,6 +198,7 @@ impl ApiInvoiceItem {
         Self::from_payment_data(
             payment.amount,
             payment.tax,
+            payment.processing_fee,
             &payment.currency,
             payment.time_value,
         )
@@ -204,6 +214,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             expires: value.expires,
             amount: value.amount,
             tax: value.tax,
+            processing_fee: value.processing_fee,
             currency: value.currency,
             is_paid: value.is_paid,
             time: value.time_value,
@@ -516,6 +527,7 @@ pub struct ApiSubscriptionPayment {
     pub payment_type: ApiSubscriptionPaymentType,
     pub is_paid: bool,
     pub tax: ApiPrice,
+    pub processing_fee: ApiPrice,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -542,6 +554,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
 
         let amount = CurrencyAmount::from_u64(currency.into(), payment.amount);
         let tax = CurrencyAmount::from_u64(currency.into(), payment.tax);
+        let processing_fee = CurrencyAmount::from_u64(currency.into(), payment.processing_fee);
 
         Self {
             id: hex::encode(&payment.id),
@@ -553,6 +566,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             is_paid: payment.is_paid,
             tax: tax.into(),
+            processing_fee: processing_fee.into(),
         }
     }
 }

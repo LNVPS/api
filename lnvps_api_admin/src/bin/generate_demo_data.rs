@@ -1265,6 +1265,7 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             external_id: Some(external_id),
             payment_type,
             tax: 0,
+            processing_fee: 0,
             upgrade_params: None,
         };
 

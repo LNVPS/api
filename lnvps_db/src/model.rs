@@ -538,6 +538,8 @@ pub struct VmPayment {
     pub time_value: u64,
     /// Taxes to charge on payment
     pub tax: u64,
+    /// Processing fee charged by the payment provider
+    pub processing_fee: u64,
     /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
     pub upgrade_params: Option<String>,
 }
@@ -575,6 +577,8 @@ pub struct VmPaymentWithCompany {
     pub time_value: u64,
     /// Taxes to charge on payment
     pub tax: u64,
+    /// Processing fee charged by the payment provider
+    pub processing_fee: u64,
     /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
     pub upgrade_params: Option<String>,
     // Company information
@@ -1093,6 +1097,7 @@ pub struct SubscriptionPayment {
     pub is_paid: bool,
     pub rate: f32,
     pub tax: u64,
+    pub processing_fee: u64,
 }
 
 /// Subscription payment with company info (for admin views)
@@ -1112,6 +1117,7 @@ pub struct SubscriptionPaymentWithCompany {
     pub is_paid: bool,
     pub rate: f32,
     pub tax: u64,
+    pub processing_fee: u64,
     pub company_base_currency: String,
 }
 

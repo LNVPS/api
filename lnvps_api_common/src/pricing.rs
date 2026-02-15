@@ -62,6 +62,36 @@ impl PricingEngine {
         };
         base_seconds * interval_amount as i64
     }
+    
+    /// Calculate processing fee for a payment based on payment method and amount
+    /// Returns the processing fee in the same currency as the amount
+    pub fn calculate_processing_fee(
+        &self,
+        method: PaymentMethod,
+        currency: Currency,
+        amount: u64,
+    ) -> u64 {
+        match method {
+            PaymentMethod::Revolut => {
+                // Revolut charges 1% + 0.20 EUR
+                // Convert 0.20 EUR to the smallest unit (cents)
+                let fixed_fee_cents = 20u64; // 0.20 EUR = 20 cents
+                let fixed_fee = match currency {
+                    Currency::EUR => fixed_fee_cents,
+                    // For other currencies, we should ideally convert, but for now use EUR value
+                    // This is a simplification - in production you'd convert via exchange rates
+                    _ => fixed_fee_cents,
+                };
+                
+                // 1% of amount + fixed fee
+                let percentage_fee = amount / 100; // 1% = amount / 100
+                percentage_fee + fixed_fee
+            }
+            // Other payment methods don't have processing fees (Lightning is free, Stripe TBD)
+            PaymentMethod::Lightning | PaymentMethod::Paypal | PaymentMethod::Stripe => 0,
+        }
+    }
+    
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         rates: Arc<dyn ExchangeRateService>,
@@ -120,6 +150,7 @@ impl PricingEngine {
             new_expiry: vm.expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
             tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
+            processing_fee: self.calculate_processing_fee(method, cost.currency, input.value()),
         }))
     }
 
@@ -168,9 +199,11 @@ impl PricingEngine {
             let scaled_tax = self
                 .get_tax_for_user(vm.user_id, scaled_amount)
                 .await?;
+            let processing_fee = self.calculate_processing_fee(method, base_cost.currency, scaled_amount);
             Ok(CostResult::New(NewPaymentInfo {
                 amount: scaled_amount,
                 tax: scaled_tax,
+                processing_fee,
                 currency: base_cost.currency,
                 rate: base_cost.rate,
                 time_value: scaled_time,
@@ -257,6 +290,7 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
+            processing_fee: self.calculate_processing_fee(method, converted_amount.amount.currency(), converted_amount.amount.value()),
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -330,6 +364,7 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
+            processing_fee: self.calculate_processing_fee(method, converted_amount.amount.currency(), converted_amount.amount.value()),
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -610,6 +645,8 @@ pub struct NewPaymentInfo {
     pub new_expiry: DateTime<Utc>,
     /// Taxes to charge
     pub tax: u64,
+    /// Processing fee charged by the payment provider
+    pub processing_fee: u64,
 }
 
 impl NewPaymentInfo {
