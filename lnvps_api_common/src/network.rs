@@ -12,7 +12,9 @@ use std::sync::Arc;
 /// If the string is a plain IP address without CIDR notation, it will be converted to:
 /// - /32 for IPv4 addresses
 /// - /128 for IPv6 addresses
-fn parse_gateway(gateway: &str) -> Result<IpNetwork> {
+/// 
+/// This is a public function that can be used across the codebase for consistent gateway parsing.
+pub fn parse_gateway(gateway: &str) -> Result<IpNetwork> {
     // Try parsing as IpNetwork first (CIDR notation)
     if let Ok(network) = gateway.parse::<IpNetwork>() {
         return Ok(network);

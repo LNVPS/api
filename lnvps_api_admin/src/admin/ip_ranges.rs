@@ -6,11 +6,9 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use ipnetwork::IpNetwork;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, parse_gateway};
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode};
 use serde::Deserialize;
-use std::net::IpAddr;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -26,30 +24,13 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-/// Validate and normalize gateway format.
+/// Validate and normalize gateway format for API responses.
 /// Accepts both IP addresses (e.g., "10.0.0.1") and CIDR notation (e.g., "10.0.0.1/24").
 /// Returns the gateway in CIDR notation for storage.
 fn validate_gateway(gateway: &str) -> Result<String, &'static str> {
-    let trimmed = gateway.trim();
-    
-    // Try parsing as IpNetwork first (CIDR notation)
-    if let Ok(network) = trimmed.parse::<IpNetwork>() {
-        return Ok(network.to_string());
-    }
-    
-    // Try parsing as plain IpAddr for backward compatibility
-    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        // Convert to CIDR notation with /32 for IPv4 or /128 for IPv6
-        let prefix = match ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        if let Ok(network) = IpNetwork::new(ip, prefix) {
-            return Ok(network.to_string());
-        }
-    }
-    
-    Err("Invalid gateway format. Must be an IP address or CIDR notation (e.g., '10.0.0.1' or '10.0.0.1/24')")
+    parse_gateway(gateway.trim())
+        .map(|net| net.to_string())
+        .map_err(|_| "Invalid gateway format. Must be an IP address or CIDR notation (e.g., '10.0.0.1' or '10.0.0.1/24')")
 }
 
 #[derive(Deserialize, Default)]
