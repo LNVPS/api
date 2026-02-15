@@ -408,4 +408,37 @@ mod tests {
         assert!(last_octet >= 64 && last_octet <= 127, 
             "IP {} should be in range 185.18.221.64-127", ip_str);
     }
+
+    #[tokio::test]
+    async fn test_gateway_cidr_ipv6() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        
+        // Create an IPv6 range with a smaller subnet but wider gateway
+        let range = IpRange {
+            id: 100,
+            cidr: "2001:db8::/80".to_string(), // /80 allocation range
+            gateway: "2001:db8::1/64".to_string(), // Gateway is in the broader /64 network
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: false,
+            ..Default::default()
+        };
+        
+        db.ip_range.lock().await.insert(100, range.clone());
+        
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+        
+        // Pick an IP from this range
+        let available = mgr.pick_ip_from_range_id(100).await.expect("Failed to pick IPv6");
+        
+        // Verify the gateway is parsed correctly with /64 prefix
+        assert_eq!(available.gateway.prefix(), 64);
+        assert_eq!(available.gateway.ip().to_string(), "2001:db8::1");
+        
+        // Verify the allocated IP has /80 prefix (from the allocation range)
+        assert_eq!(available.ip.prefix(), 80);
+    }
 }

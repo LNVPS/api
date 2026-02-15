@@ -721,9 +721,11 @@ impl ProxmoxClient {
                             } else {
                                 let range: IpNetwork = ip_range.cidr.parse().ok()?;
                                 let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
+                                // take the largest (smallest prefix number) of the network prefixes
+                                let max_net = range.prefix().min(range_gw.prefix());
                                 format!(
                                     "ip6={},gw6={}",
-                                    IpNetwork::new(addr.into(), range.prefix()).ok()?,
+                                    IpNetwork::new(addr.into(), max_net).ok()?,
                                     range_gw.ip(),
                                 )
                             }
