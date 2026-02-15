@@ -108,8 +108,8 @@ impl PricingEngine {
             return 0;
         };
 
-        // Calculate percentage fee
-        let percentage_fee = ((amount as f64) * (config.percentage_rate as f64 / 100.0)) as u64;
+        // Calculate percentage fee (round instead of truncate to avoid systematic undercharging)
+        let percentage_fee = ((amount as f64) * (config.percentage_rate as f64 / 100.0)).round() as u64;
 
         // Get base fee, converting currency if needed
         let base_fee = if config.base_fee_currency == currency {
