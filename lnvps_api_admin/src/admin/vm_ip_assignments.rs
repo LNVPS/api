@@ -150,7 +150,7 @@ async fn admin_create_vm_ip_assignment(
         // Auto-assign IP from the range using NetworkProvisioner
         let network_provisioner = NetworkProvisioner::new(this.db.clone());
         match network_provisioner.pick_ip_from_range(&ip_range).await {
-            Ok(available_ip) => available_ip.ip.ip().to_string(),
+            Ok(available_ip) => available_ip.ip.to_string(),
             Err(e) => {
                 return ApiData::err(&format!("Failed to auto-assign IP from range: {}", e));
             }

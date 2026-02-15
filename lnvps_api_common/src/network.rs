@@ -139,6 +139,11 @@ impl NetworkProvisioner {
 
         let gateway: IpNetwork = parse_gateway(&range.gateway)?;
 
+        // Calculate the prefix to use: take the smallest prefix value (largest network)
+        // between the allocation range and the gateway CIDR.
+        // This allows VMs to reach gateways outside their allocation range.
+        let max_net = range_cidr.prefix().min(gateway.prefix());
+
         // mark some IPS as always used
         // Namely:
         //  .0 & .255 of /24 (first and last)
@@ -155,7 +160,7 @@ impl NetworkProvisioner {
                 IpRangeAllocationMode::Sequential => range_cidr
                     .iter()
                     .find(|i| !ips.contains(i))
-                    .and_then(|i| IpNetwork::new(i, range_cidr.prefix()).ok()),
+                    .and_then(|i| IpNetwork::new(i, max_net).ok()),
                 IpRangeAllocationMode::Random => {
                     let mut rng = rand::rng();
                     match range_cidr {
@@ -163,7 +168,7 @@ impl NetworkProvisioner {
                             let n = rng.random_range(0..v4.size());
                             let addr = IpAddr::V4(v4.nth(n).unwrap());
                             if !ips.contains(&addr) {
-                                break IpNetwork::new(addr, range_cidr.prefix()).ok();
+                                break IpNetwork::new(addr, max_net).ok();
                             } else {
                                 continue;
                             }
@@ -172,7 +177,7 @@ impl NetworkProvisioner {
                             let n = rng.random_range(0..v6.size());
                             let addr = IpAddr::V6(v6.nth(n).unwrap());
                             if !ips.contains(&addr) {
-                                break IpNetwork::new(addr, range_cidr.prefix()).ok();
+                                break IpNetwork::new(addr, max_net).ok();
                             } else {
                                 continue;
                             }
@@ -298,7 +303,7 @@ mod tests {
             id: 0,
             vm_id: 0,
             ip_range_id: v4.range_id,
-            ip: v4.ip.ip().to_string(),
+            ip: v4.ip.to_string(),
             ..Default::default()
         })
         .await
@@ -400,7 +405,10 @@ mod tests {
         assert_eq!(available.gateway.prefix(), 24);
         assert_eq!(available.gateway.ip().to_string(), "185.18.221.1");
         
-        // Verify the allocated IP is from the /26 range
+        // Verify the allocated IP has the correct prefix (/24 from gateway, not /26 from range)
+        assert_eq!(available.ip.prefix(), 24, "IP should have /24 prefix from gateway");
+        
+        // Verify the allocated IP address itself is from the /26 range
         let ip = available.ip.ip();
         let ip_str = ip.to_string();
         assert!(ip_str.starts_with("185.18.221."));
@@ -440,7 +448,7 @@ mod tests {
         assert_eq!(available.gateway.prefix(), 64);
         assert_eq!(available.gateway.ip().to_string(), "2001:db8::1");
         
-        // Verify the allocated IP has /80 prefix (from the allocation range)
-        assert_eq!(available.ip.prefix(), 80);
+        // Verify the allocated IP has /64 prefix (from gateway, not /80 from range)
+        assert_eq!(available.ip.prefix(), 64, "IP should have /64 prefix from gateway");
     }
 }
