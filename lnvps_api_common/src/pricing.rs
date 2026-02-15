@@ -76,10 +76,16 @@ impl PricingEngine {
                 // Revolut charges 1% + 0.20 EUR
                 // Convert 0.20 EUR to the smallest unit (cents)
                 let fixed_fee_cents = 20u64; // 0.20 EUR = 20 cents
+                
+                // TODO: Implement proper currency conversion for the fixed fee component
+                // Currently, we use EUR cents for all currencies as a simplification.
+                // This means non-EUR transactions will be charged 0.20 in their currency
+                // instead of the EUR-equivalent. For production, this should use the
+                // exchange rate service to convert 0.20 EUR to the target currency.
                 let fixed_fee = match currency {
                     Currency::EUR => fixed_fee_cents,
-                    // For other currencies, we should ideally convert, but for now use EUR value
-                    // This is a simplification - in production you'd convert via exchange rates
+                    // For now, use the same value for all currencies
+                    // In production, convert via: self.rates.get_rate(Ticker(EUR, currency))
                     _ => fixed_fee_cents,
                 };
                 
@@ -87,8 +93,12 @@ impl PricingEngine {
                 let percentage_fee = amount / 100; // 1% = amount / 100
                 percentage_fee + fixed_fee
             }
-            // Other payment methods don't have processing fees (Lightning is free, Stripe TBD)
-            PaymentMethod::Lightning | PaymentMethod::Paypal | PaymentMethod::Stripe => 0,
+            // Lightning has no processing fees (peer-to-peer network)
+            PaymentMethod::Lightning => 0,
+            // TODO: Stripe processing fees not yet defined - needs product decision
+            PaymentMethod::Stripe => 0,
+            // TODO: PayPal processing fees not yet defined - needs product decision
+            PaymentMethod::Paypal => 0,
         }
     }
     
