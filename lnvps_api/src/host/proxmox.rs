@@ -24,6 +24,28 @@ use std::time::Duration;
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 
+/// Parse gateway string as IpNetwork, with backward compatibility for plain IP addresses.
+/// If the string is a plain IP address without CIDR notation, it will be converted to:
+/// - /32 for IPv4 addresses
+/// - /128 for IPv6 addresses
+fn parse_gateway(gateway: &str) -> Option<IpNetwork> {
+    // Try parsing as IpNetwork first (CIDR notation)
+    if let Ok(network) = gateway.parse::<IpNetwork>() {
+        return Some(network);
+    }
+    
+    // Try parsing as plain IpAddr for backward compatibility
+    if let Ok(ip) = gateway.parse::<IpAddr>() {
+        let prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        return IpNetwork::new(ip, prefix).ok();
+    }
+    
+    None
+}
+
 #[derive(Clone)]
 pub struct ProxmoxClient {
     api: JsonApi,
@@ -680,7 +702,7 @@ impl ProxmoxClient {
                         IpAddr::V4(addr) => {
                             let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
                             let range: IpNetwork = ip_range.cidr.parse().ok()?;
-                            let range_gw: IpNetwork = ip_range.gateway.parse().ok()?;
+                            let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
                             // take the largest (smallest prefix number) of the network prefixes
                             let max_net = range.prefix().min(range_gw.prefix());
                             format!(
@@ -698,7 +720,7 @@ impl ProxmoxClient {
                                 "ip6=auto".to_string()
                             } else {
                                 let range: IpNetwork = ip_range.cidr.parse().ok()?;
-                                let range_gw: IpNetwork = ip_range.gateway.parse().ok()?;
+                                let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
                                 format!(
                                     "ip6={},gw6={}",
                                     IpNetwork::new(addr.into(), range.prefix()).ok()?,

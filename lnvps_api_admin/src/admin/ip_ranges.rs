@@ -6,6 +6,7 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use ipnetwork::IpNetwork;
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner};
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode};
 use serde::Deserialize;
@@ -23,6 +24,32 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_update_ip_range)
                 .delete(admin_delete_ip_range),
         )
+}
+
+/// Validate and normalize gateway format.
+/// Accepts both IP addresses (e.g., "10.0.0.1") and CIDR notation (e.g., "10.0.0.1/24").
+/// Returns the gateway in CIDR notation for storage.
+fn validate_gateway(gateway: &str) -> Result<String, &'static str> {
+    let trimmed = gateway.trim();
+    
+    // Try parsing as IpNetwork first (CIDR notation)
+    if let Ok(network) = trimmed.parse::<IpNetwork>() {
+        return Ok(network.to_string());
+    }
+    
+    // Try parsing as plain IpAddr for backward compatibility
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        // Convert to CIDR notation with /32 for IPv4 or /128 for IPv6
+        let prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if let Ok(network) = IpNetwork::new(ip, prefix) {
+            return Ok(network.to_string());
+        }
+    }
+    
+    Err("Invalid gateway format. Must be an IP address or CIDR notation (e.g., '10.0.0.1' or '10.0.0.1/24')")
 }
 
 #[derive(Deserialize, Default)]
@@ -156,10 +183,11 @@ async fn admin_create_ip_range(
         return ApiData::err("Invalid CIDR format");
     }
 
-    // Validate gateway IP format
-    if req.gateway.trim().parse::<IpAddr>().is_err() {
-        return ApiData::err("Invalid gateway IP address format");
-    }
+    // Validate and normalize gateway format
+    let normalized_gateway = match validate_gateway(&req.gateway) {
+        Ok(gw) => gw,
+        Err(err) => return ApiData::err(err),
+    };
 
     // Validate region exists
     if let Err(_) = this.db.get_host_region(req.region_id).await {
@@ -173,8 +201,9 @@ async fn admin_create_ip_range(
         return ApiData::err("Specified access policy does not exist");
     }
 
-    // Create IP range object
-    let ip_range = req.to_ip_range()?;
+    // Create IP range object with normalized gateway
+    let mut ip_range = req.to_ip_range()?;
+    ip_range.gateway = normalized_gateway;
 
     let ip_range_id = this.db.admin_create_ip_range(&ip_range).await?;
 
@@ -236,11 +265,12 @@ async fn admin_update_ip_range(
         if gateway.trim().is_empty() {
             return ApiData::err("Gateway cannot be empty");
         }
-        // Validate gateway IP format
-        if gateway.trim().parse::<IpAddr>().is_err() {
-            return ApiData::err("Invalid gateway IP address format");
-        }
-        ip_range.gateway = gateway.trim().to_string();
+        // Validate and normalize gateway format
+        let normalized_gateway = match validate_gateway(gateway) {
+            Ok(gw) => gw,
+            Err(err) => return ApiData::err(err),
+        };
+        ip_range.gateway = normalized_gateway;
     }
 
     if let Some(enabled) = req.enabled {
