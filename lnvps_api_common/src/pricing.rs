@@ -40,7 +40,8 @@ pub struct ProcessingFeesConfig {
 impl Default for ProcessingFeesConfig {
     fn default() -> Self {
         Self {
-            // Default to Revolut's standard pricing: 1% + 0.20 EUR
+            // Default example configuration (not guaranteed to match actual provider rates)
+            // Revolut example: 1% + 0.20 EUR
             revolut: Some(ProcessingFeeRate {
                 percentage_rate: 1.0,
                 base_fee: 20, // 0.20 EUR in cents
@@ -129,7 +130,14 @@ impl PricingEngine {
         let percentage_fee = ((amount as f64) * (config.percentage_rate as f64 / 100.0)).round() as u64;
 
         // Get base fee, converting currency if needed
-        let base_fee_currency = Currency::from_str(&config.base_fee_currency).unwrap_or(currency);
+        let base_fee_currency = Currency::from_str(&config.base_fee_currency).unwrap_or_else(|_| {
+            log::warn!(
+                "Invalid processing fee currency '{}' for {:?}, using transaction currency instead",
+                config.base_fee_currency,
+                method
+            );
+            currency
+        });
         let base_fee = if base_fee_currency == currency {
             // Same currency, use directly
             config.base_fee
