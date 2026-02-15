@@ -675,42 +675,13 @@ impl ProxmoxClient {
             .ips
             .iter()
             .map_while(|ip| {
-                // Try parsing as IpNetwork first (includes CIDR), fall back to plain IpAddr
-                if let Ok(ip_net) = ip.ip.parse::<IpNetwork>() {
-                    Some(match ip_net.ip() {
-                        IpAddr::V4(_) => {
-                            let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
-                            let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
-                            format!(
-                                "ip={},gw={}",
-                                ip_net,
-                                range_gw.ip()
-                            )
-                        }
-                        IpAddr::V6(_) => {
-                            let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
-                            if matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64)
-                            {
-                                // just ignore what's in the db and use whatever the host wants
-                                // what's in the db is purely informational
-                                "ip6=auto".to_string()
-                            } else {
-                                let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
-                                format!(
-                                    "ip6={},gw6={}",
-                                    ip_net,
-                                    range_gw.ip(),
-                                )
-                            }
-                        }
-                    })
-                } else if let Ok(addr) = ip.ip.parse::<IpAddr>() {
-                    // Backward compatibility: if stored as plain IP, recalculate prefix
+                if let Ok(addr) = ip.ip.parse::<IpAddr>() {
                     Some(match addr {
                         IpAddr::V4(_) => {
                             let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
                             let range: IpNetwork = ip_range.cidr.parse().ok()?;
                             let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
+                            // take the largest (smallest prefix number) of the network prefixes
                             let max_net = range.prefix().min(range_gw.prefix());
                             format!(
                                 "ip={},gw={}",
@@ -722,10 +693,13 @@ impl ProxmoxClient {
                             let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
                             if matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64)
                             {
+                                // just ignore what's in the db and use whatever the host wants
+                                // what's in the db is purely informational
                                 "ip6=auto".to_string()
                             } else {
                                 let range: IpNetwork = ip_range.cidr.parse().ok()?;
                                 let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
+                                // take the largest (smallest prefix number) of the network prefixes
                                 let max_net = range.prefix().min(range_gw.prefix());
                                 format!(
                                     "ip6={},gw6={}",

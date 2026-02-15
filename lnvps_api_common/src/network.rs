@@ -135,6 +135,7 @@ impl NetworkProvisioner {
     pub async fn pick_ip_from_range(&self, range: &IpRange) -> Result<AvailableIp> {
         let range_cidr: IpNetwork = range.cidr.parse()?;
         let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
+        // Parse stored IPs (stored as plain IP addresses)
         let mut ips: HashSet<IpAddr> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
 
         let gateway: IpNetwork = parse_gateway(&range.gateway)?;
@@ -303,7 +304,7 @@ mod tests {
             id: 0,
             vm_id: 0,
             ip_range_id: v4.range_id,
-            ip: v4.ip.to_string(),
+            ip: v4.ip.ip().to_string(),
             ..Default::default()
         })
         .await
