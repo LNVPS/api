@@ -13,6 +13,29 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Processing fee rate structure: percentage + fixed base fee
+#[derive(Debug, Clone)]
+pub struct ProcessingFeeRate {
+    /// Percentage rate (e.g., 1.0 for 1%)
+    pub percentage_rate: f32,
+    /// Base fee in smallest currency unit (e.g., cents for fiat)
+    pub base_fee: u64,
+    /// Currency for the base fee (e.g., "EUR", "USD")
+    pub base_fee_currency: Currency,
+}
+
+/// Configuration for processing fees per payment method
+#[derive(Debug, Clone, Default)]
+pub struct ProcessingFeesConfig {
+    /// Revolut processing fee configuration
+    pub revolut: Option<ProcessingFeeRate>,
+    /// Stripe processing fee configuration
+    pub stripe: Option<ProcessingFeeRate>,
+    /// PayPal processing fee configuration
+    pub paypal: Option<ProcessingFeeRate>,
+}
+
+
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
 pub struct UpgradeCostQuote {
@@ -47,6 +70,7 @@ pub struct PricingEngine {
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
     base_currency: Currency,
+    processing_fees: ProcessingFeesConfig,
 }
 
 impl PricingEngine {
@@ -71,35 +95,35 @@ impl PricingEngine {
         currency: Currency,
         amount: u64,
     ) -> u64 {
-        match method {
-            PaymentMethod::Revolut => {
-                // Revolut charges 1% + 0.20 EUR
-                // Convert 0.20 EUR to the smallest unit (cents)
-                let fixed_fee_cents = 20u64; // 0.20 EUR = 20 cents
-                
-                // TODO: Implement proper currency conversion for the fixed fee component
-                // Currently, we use EUR cents for all currencies as a simplification.
-                // This means non-EUR transactions will be charged 0.20 in their currency
-                // instead of the EUR-equivalent. For production, this should use the
-                // exchange rate service to convert 0.20 EUR to the target currency.
-                let fixed_fee = match currency {
-                    Currency::EUR => fixed_fee_cents,
-                    // For now, use the same value for all currencies
-                    // In production, convert via: self.rates.get_rate(Ticker(EUR, currency))
-                    _ => fixed_fee_cents,
-                };
-                
-                // 1% of amount + fixed fee
-                let percentage_fee = amount / 100; // 1% = amount / 100
-                percentage_fee + fixed_fee
-            }
+        let fee_config = match method {
+            PaymentMethod::Revolut => &self.processing_fees.revolut,
+            PaymentMethod::Stripe => &self.processing_fees.stripe,
+            PaymentMethod::Paypal => &self.processing_fees.paypal,
             // Lightning has no processing fees (peer-to-peer network)
-            PaymentMethod::Lightning => 0,
-            // TODO: Stripe processing fees not yet defined - needs product decision
-            PaymentMethod::Stripe => 0,
-            // TODO: PayPal processing fees not yet defined - needs product decision
-            PaymentMethod::Paypal => 0,
-        }
+            PaymentMethod::Lightning => return 0,
+        };
+
+        // If no config is set for this payment method, return 0
+        let Some(config) = fee_config else {
+            return 0;
+        };
+
+        // Calculate percentage fee
+        let percentage_fee = ((amount as f64) * (config.percentage_rate as f64 / 100.0)) as u64;
+
+        // Get base fee, converting currency if needed
+        let base_fee = if config.base_fee_currency == currency {
+            // Same currency, use directly
+            config.base_fee
+        } else {
+            // TODO: Implement proper currency conversion for the base fee
+            // For now, use the base fee value as-is in the transaction currency
+            // This is a simplification - in production, this should use the
+            // exchange rate service to convert the fee to the target currency
+            config.base_fee
+        };
+
+        percentage_fee + base_fee
     }
     
     pub fn new(
@@ -107,12 +131,14 @@ impl PricingEngine {
         rates: Arc<dyn ExchangeRateService>,
         tax_rates: HashMap<CountryCode, f32>,
         base_currency: Currency,
+        processing_fees: ProcessingFeesConfig,
     ) -> Self {
         Self {
             db,
             rates,
             tax_rates,
             base_currency,
+            processing_fees,
         }
     }
 
@@ -121,6 +147,7 @@ impl PricingEngine {
         db: Arc<dyn LNVpsDb>,
         rates: Arc<dyn ExchangeRateService>,
         tax_rates: HashMap<CountryCode, f32>,
+        processing_fees: ProcessingFeesConfig,
         vm_id: u64,
     ) -> Result<Self> {
         let base_currency_str = db.get_vm_base_currency(vm_id).await?;
@@ -128,7 +155,7 @@ impl PricingEngine {
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid base currency: {}", base_currency_str))?;
 
-        Ok(Self::new(db, rates, tax_rates, base_currency))
+        Ok(Self::new(db, rates, tax_rates, base_currency, processing_fees))
     }
 
     /// Get amount of time a certain currency amount will extend a vm in seconds
@@ -692,6 +719,18 @@ mod tests {
     const MOCK_RATE: f32 = 100_000.0;
     const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0; // 30 days * 24 hours * 3600 seconds
 
+    fn default_processing_fees() -> ProcessingFeesConfig {
+        ProcessingFeesConfig {
+            revolut: Some(ProcessingFeeRate {
+                percentage_rate: 1.0,
+                base_fee: 20,
+                base_fee_currency: Currency::EUR,
+            }),
+            stripe: None,
+            paypal: None,
+        }
+    }
+
     async fn add_custom_pricing(db: &MockDb) {
         let mut p = db.custom_pricing.lock().await;
         p.insert(
@@ -802,7 +841,7 @@ mod tests {
 
         let taxes = HashMap::from([(CountryCode::IRL, 23.0)]);
 
-        let pe = PricingEngine::new(db.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db.clone(), rates, taxes, Currency::EUR, default_processing_fees());
         let plan = MockDb::mock_cost_plan();
 
         let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
@@ -868,10 +907,10 @@ mod tests {
 
         // Test EUR pricing engine
         let pe_eur =
-            PricingEngine::new(db_arc.clone(), rates.clone(), taxes.clone(), Currency::EUR);
+            PricingEngine::new(db_arc.clone(), rates.clone(), taxes.clone(), Currency::EUR, default_processing_fees());
 
         // Test USD pricing engine
-        let pe_usd = PricingEngine::new(db_arc.clone(), rates.clone(), taxes, Currency::USD);
+        let pe_usd = PricingEngine::new(db_arc.clone(), rates.clone(), taxes, Currency::USD, default_processing_fees());
 
         // Both should work with their respective base currencies
         // The base currency is now stored in the pricing engine itself
@@ -900,7 +939,7 @@ mod tests {
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
 
         // Test creating pricing engine for VM (should use EUR from default company)
-        let pe = PricingEngine::new_for_vm(db_arc.clone(), rates.clone(), taxes.clone(), 1).await?;
+        let pe = PricingEngine::new_for_vm(db_arc.clone(), rates.clone(), taxes.clone(), default_processing_fees(), 1).await?;
         assert_eq!(pe.base_currency, Currency::EUR);
 
         Ok(())
@@ -983,7 +1022,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
 
         // Test upgrade configuration - increase CPU from 1 to 2
         let upgrade_config = UpgradeConfig {
@@ -1034,7 +1073,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(2),
@@ -1078,7 +1117,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(2),
@@ -1123,7 +1162,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(4), // Upgrade from 2 to 4 CPUs
@@ -1178,7 +1217,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
 
         // Test upgrade - increase CPU from 2 to 4 (double the CPU)
         let upgrade_config = UpgradeConfig {
@@ -1342,7 +1381,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
 
         // Test large upgrade - significantly increase all resources
         let upgrade_config = UpgradeConfig {
@@ -1486,7 +1525,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR);
+        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR, default_processing_fees());
 
         // Test Lightning payment (no processing fee)
         let price_lightning = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;

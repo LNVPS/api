@@ -38,6 +38,7 @@ pub struct LNVpsProvisioner {
     revolut: Option<Arc<dyn FiatPaymentService>>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
+    processing_fees: lnvps_api_common::ProcessingFeesConfig,
     pub network: LNVpsNetworkProvisioner,
     provisioner_config: ProvisionerConfig,
 }
@@ -55,6 +56,31 @@ impl LNVpsProvisioner {
         rates: Arc<dyn ExchangeRateService>,
         dns: Option<Arc<dyn DnsServer>>,
     ) -> Self {
+        // Convert settings processing fees to common type
+        let processing_fees = lnvps_api_common::ProcessingFeesConfig {
+            revolut: settings.processing_fees.revolut.as_ref().map(|fee| {
+                lnvps_api_common::ProcessingFeeRate {
+                    percentage_rate: fee.percentage_rate,
+                    base_fee: fee.base_fee,
+                    base_fee_currency: fee.base_fee_currency.parse().unwrap_or(Currency::EUR),
+                }
+            }),
+            stripe: settings.processing_fees.stripe.as_ref().map(|fee| {
+                lnvps_api_common::ProcessingFeeRate {
+                    percentage_rate: fee.percentage_rate,
+                    base_fee: fee.base_fee,
+                    base_fee_currency: fee.base_fee_currency.parse().unwrap_or(Currency::USD),
+                }
+            }),
+            paypal: settings.processing_fees.paypal.as_ref().map(|fee| {
+                lnvps_api_common::ProcessingFeeRate {
+                    percentage_rate: fee.percentage_rate,
+                    base_fee: fee.base_fee,
+                    base_fee_currency: fee.base_fee_currency.parse().unwrap_or(Currency::USD),
+                }
+            }),
+        };
+
         Self {
             network: LNVpsNetworkProvisioner::new(
                 db.clone(),
@@ -64,6 +90,7 @@ impl LNVpsProvisioner {
             ),
             revolut: settings.get_revolut().expect("revolut config"),
             tax_rates: settings.tax_rate,
+            processing_fees,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
             db,
@@ -256,6 +283,7 @@ impl LNVpsProvisioner {
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
+            self.processing_fees.clone(),
             vm_id,
         )
         .await?;
@@ -276,6 +304,7 @@ impl LNVpsProvisioner {
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
+            self.processing_fees.clone(),
             vm_id,
         )
         .await?;
@@ -334,6 +363,7 @@ impl LNVpsProvisioner {
             self.rates.clone(),
             self.tax_rates.clone(),
             subscription_currency,
+            self.processing_fees.clone(),
         );
 
         // Convert list price to payment method currency and get rate
@@ -768,6 +798,7 @@ impl LNVpsProvisioner {
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
+            self.processing_fees.clone(),
             vm_id,
         )
         .await?;
