@@ -801,6 +801,7 @@ mod tests {
                 let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
                 assert_eq!(expect_price, payment_info.amount);
                 assert_eq!(0, payment_info.tax);
+                assert_eq!(0, payment_info.processing_fee);
             }
             _ => bail!("??"),
         }
@@ -815,6 +816,7 @@ mod tests {
                     (expect_price as f64 * 0.23).floor() as u64,
                     payment_info.tax
                 );
+                assert_eq!(0, payment_info.processing_fee);
             }
             _ => bail!("??"),
         }
@@ -834,6 +836,7 @@ mod tests {
                 assert_eq!(expect_time, payment_info.time_value);
                 assert_eq!(0, payment_info.tax);
                 assert_eq!(payment_info.amount, 1000);
+                assert_eq!(0, payment_info.processing_fee);
             }
             _ => bail!("??"),
         }
@@ -1453,6 +1456,60 @@ mod tests {
             quote.renewal.amount.value(),
             renewal_cost_diff
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_processing_fees() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        
+        // Set up EUR rate
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        // Add a basic VM
+        {
+            let mut v = db.vms.lock().await;
+            v.insert(1, MockDb::mock_vm());
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let taxes = HashMap::new();
+        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR);
+
+        // Test Lightning payment (no processing fee)
+        let price_lightning = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
+        match price_lightning {
+            CostResult::New(payment_info) => {
+                assert_eq!(0, payment_info.processing_fee, "Lightning should have no processing fee");
+            }
+            _ => bail!("Expected new payment"),
+        }
+
+        // Test Revolut payment (1% + 0.20 EUR processing fee)
+        let price_revolut = pe.get_vm_cost(1, PaymentMethod::Revolut).await?;
+        match price_revolut {
+            CostResult::New(payment_info) => {
+                let plan = MockDb::mock_cost_plan();
+                // Amount is in EUR cents (plan.amount is 5.0 EUR = 500 cents)
+                let expected_amount_cents = (plan.amount * 100.0) as u64;
+                
+                // Processing fee: 1% + 0.20 EUR
+                // 1% of 500 cents = 5 cents
+                // 0.20 EUR = 20 cents
+                // Total = 25 cents
+                let expected_fee = (expected_amount_cents / 100) + 20;
+                
+                assert_eq!(
+                    expected_fee, 
+                    payment_info.processing_fee,
+                    "Revolut processing fee should be 1% + 0.20 EUR"
+                );
+                assert_eq!(Currency::EUR, payment_info.currency, "Should be EUR");
+            }
+            _ => bail!("Expected new payment"),
+        }
 
         Ok(())
     }
