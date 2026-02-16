@@ -107,11 +107,28 @@ async fn admin_update_payment_method(
     if let Some(rate) = request.processing_fee_rate {
         config.processing_fee_rate = rate;
     }
-    if let Some(base) = request.processing_fee_base {
-        config.processing_fee_base = base;
-    }
+    // Handle currency first so we can use it for base conversion
     if let Some(currency) = &request.processing_fee_currency {
         config.processing_fee_currency = currency.as_ref().map(|s| s.trim().to_uppercase());
+    }
+    // Convert processing_fee_base from f32 (human-readable) to u64 (smallest units)
+    if let Some(base) = request.processing_fee_base {
+        use payments_rs::currency::{Currency, CurrencyAmount};
+        use std::str::FromStr;
+        
+        config.processing_fee_base = match (base, &config.processing_fee_currency) {
+            (Some(amount), Some(currency)) => {
+                let cur = Currency::from_str(currency)
+                    .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency))?;
+                Some(CurrencyAmount::from_f32(cur, amount).value())
+            }
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(anyhow::anyhow!(
+                    "Processing fee currency is required when processing fee base is set"
+                ).into());
+            }
+        };
     }
 
     // Validate that if processing fee base is set, currency must also be set

@@ -212,6 +212,40 @@ mod tests {
 - **Never add JavaScript code examples to API documentation**
 - **Prefer `map()` and `and_then()` over deeply nested if structures**
 
+## Currency Handling
+
+The project uses `payments_rs::currency::CurrencyAmount` for currency conversions.
+
+### Database Storage
+- Money amounts are stored as `u64` in smallest currency units (cents for fiat, millisats for BTC)
+- The `processing_fee_base` field in `PaymentMethodConfig` stores cents/millisats
+
+### Admin API
+- The admin API accepts and returns human-readable amounts (`f32`)
+- Conversion is automatic using `payments_rs`:
+  - `CurrencyAmount::from_f32(Currency, f32)` - human-readable to smallest units
+  - `CurrencyAmount::from_u64(Currency, u64)` - smallest units directly
+  - `.value()` - returns `u64` smallest units
+  - `.value_f32()` - returns `f32` human-readable
+
+### Currency Decimal Places
+- Most fiat currencies (EUR, USD, GBP, CAD, CHF, AUD): 2 decimal places (100 cents = 1 unit)
+- JPY: 0 decimal places
+- BTC: uses millisats (1000 millisats = 1 satoshi)
+
+### Example
+```rust
+use payments_rs::currency::{Currency, CurrencyAmount};
+
+// Human-readable to smallest units
+let amount = CurrencyAmount::from_f32(Currency::EUR, 0.20); // €0.20
+assert_eq!(amount.value(), 20); // 20 cents
+
+// Smallest units to human-readable
+let amount = CurrencyAmount::from_u64(Currency::EUR, 20); // 20 cents
+assert_eq!(amount.value_f32(), 0.20); // €0.20
+```
+
 ## Module Structure Pattern
 
 ```rust

@@ -2316,8 +2316,8 @@ pub struct AdminPaymentMethodConfigInfo {
     pub config: Option<lnvps_db::ProviderConfig>,
     /// Processing fee percentage rate (e.g., 1.0 for 1%)
     pub processing_fee_rate: Option<f32>,
-    /// Processing fee base amount in smallest currency unit
-    pub processing_fee_base: Option<u64>,
+    /// Processing fee base amount in human-readable currency units (e.g., 0.20 for €0.20)
+    pub processing_fee_base: Option<f32>,
     /// Currency for the processing fee base
     pub processing_fee_currency: Option<String>,
     pub created: DateTime<Utc>,
@@ -2326,7 +2326,18 @@ pub struct AdminPaymentMethodConfigInfo {
 
 impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
     fn from(config: lnvps_db::PaymentMethodConfig) -> Self {
+        use payments_rs::currency::{Currency, CurrencyAmount};
+        
         let provider_config = config.get_provider_config();
+        // Convert processing_fee_base from u64 (smallest units) to f32 (human-readable)
+        let processing_fee_base = match (&config.processing_fee_base, &config.processing_fee_currency) {
+            (Some(base), Some(currency)) => {
+                Currency::from_str(currency)
+                    .ok()
+                    .map(|cur| CurrencyAmount::from_u64(cur, *base).value_f32())
+            }
+            _ => None,
+        };
         Self {
             id: config.id,
             company_id: config.company_id,
@@ -2336,7 +2347,7 @@ impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
             provider_type: config.provider_type,
             config: provider_config,
             processing_fee_rate: config.processing_fee_rate,
-            processing_fee_base: config.processing_fee_base,
+            processing_fee_base,
             processing_fee_currency: config.processing_fee_currency,
             created: config.created,
             modified: config.modified,
@@ -2354,12 +2365,15 @@ pub struct CreatePaymentMethodConfigRequest {
     /// Typed provider configuration
     pub config: lnvps_db::ProviderConfig,
     pub processing_fee_rate: Option<f32>,
-    pub processing_fee_base: Option<u64>,
+    /// Processing fee base in human-readable units (e.g., 0.20 for €0.20)
+    pub processing_fee_base: Option<f32>,
     pub processing_fee_currency: Option<String>,
 }
 
 impl CreatePaymentMethodConfigRequest {
     pub fn to_payment_method_config(&self) -> anyhow::Result<lnvps_db::PaymentMethodConfig> {
+        use payments_rs::currency::{Currency, CurrencyAmount};
+        
         if self.name.trim().is_empty() {
             return Err(anyhow!("Payment method config name cannot be empty"));
         }
@@ -2371,6 +2385,16 @@ impl CreatePaymentMethodConfigRequest {
             ));
         }
 
+        // Convert processing_fee_base from f32 (human-readable) to u64 (smallest units)
+        let processing_fee_base = match (&self.processing_fee_base, &self.processing_fee_currency) {
+            (Some(base), Some(currency)) => {
+                let cur = Currency::from_str(currency)
+                    .map_err(|_| anyhow!("Invalid currency: {}", currency))?;
+                Some(CurrencyAmount::from_f32(cur, *base).value())
+            }
+            _ => None,
+        };
+
         let mut payment_config = lnvps_db::PaymentMethodConfig::new_with_config(
             self.company_id,
             self.config.payment_method(),
@@ -2379,7 +2403,7 @@ impl CreatePaymentMethodConfigRequest {
             self.config.clone(),
         );
         payment_config.processing_fee_rate = self.processing_fee_rate;
-        payment_config.processing_fee_base = self.processing_fee_base;
+        payment_config.processing_fee_base = processing_fee_base;
         payment_config.processing_fee_currency = self
             .processing_fee_currency
             .as_ref()
@@ -2397,7 +2421,6 @@ pub struct UpdatePaymentMethodConfigRequest {
     /// Typed provider configuration
     pub config: Option<lnvps_db::ProviderConfig>,
     pub processing_fee_rate: Option<Option<f32>>,
-    pub processing_fee_base: Option<Option<u64>>,
+    pub processing_fee_base: Option<Option<f32>>,
     pub processing_fee_currency: Option<Option<String>>,
 }
-

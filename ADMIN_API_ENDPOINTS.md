@@ -2885,7 +2885,7 @@ Body:
   "enabled": boolean,                         // Optional - Default: true
   "config": ProviderConfig,                   // Required - Typed provider configuration (see examples below)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": integer | null,      // Optional - Base fee in smallest currency unit (e.g., 20 for €0.20)
+  "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (e.g., 0.20 for €0.20)
   "processing_fee_currency": "string | null"  // Required if processing_fee_base is set - Currency code (e.g., "EUR")
 }
 ```
@@ -2960,7 +2960,7 @@ Body (all optional):
   "enabled": boolean,                         // Enable/disable the payment method
   "config": ProviderConfig,                   // Typed provider configuration (see examples above)
   "processing_fee_rate": number | null,       // Fee percentage (null to clear)
-  "processing_fee_base": integer | null,      // Base fee in smallest currency unit (e.g., 20 for €0.20, null to clear)
+  "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20, null to clear)
   "processing_fee_currency": "string | null"  // Currency code (required if base fee is set)
 }
 ```
@@ -2999,7 +2999,7 @@ Response:
   "provider_type": "string",                  // Provider implementation type ("lnd", "bitvora", "revolut", "stripe", "paypal")
   "config": ProviderConfig | null,            // Typed provider config (may be null if deserialization fails)
   "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": integer | null,      // Base fee in smallest currency unit (e.g., 20 for €0.20)
+  "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20)
   "processing_fee_currency": "string | null", // Currency code for base fee
   "created": "string (ISO 8601)",
   "modified": "string (ISO 8601)"
@@ -3014,7 +3014,7 @@ Response:
   "enabled": boolean,                         // Optional - Default: true
   "config": ProviderConfig,                   // Required - Typed provider config (with "type" discriminator)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": integer | null,      // Optional - Base fee in smallest currency unit (e.g., 20 for €0.20)
+  "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (e.g., 0.20 for €0.20)
   "processing_fee_currency": "string | null"  // Required if base fee is set
 }
 ```
@@ -3026,7 +3026,7 @@ Response:
   "enabled": boolean | null,                  // Optional - Enable/disable
   "config": ProviderConfig | null,            // Optional - Typed provider config (with "type" discriminator)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (null to clear)
-  "processing_fee_base": integer | null,      // Optional - Base fee in smallest currency unit (null to clear)
+  "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (null to clear)
   "processing_fee_currency": "string | null"  // Optional - Currency (null to clear)
 }
 ```
@@ -3057,8 +3057,10 @@ A company can have multiple payment method configurations for the same payment m
 
 **Processing Fees:**
 - `processing_fee_rate` is a percentage (1.0 = 1%, 2.5 = 2.5%)
-- `processing_fee_base` is an integer in the smallest currency unit (e.g., 20 for €0.20, 100 for $1.00, millisats for BTC)
+- `processing_fee_base` is in human-readable currency units (e.g., 0.20 for €0.20, 1.0 for $1.00)
+- For BTC, the value is in millisats (e.g., 1000 for 1 satoshi)
 - When `processing_fee_base` is set, `processing_fee_currency` is required
+- The API automatically converts to/from internal storage format
 
 **Security:**
 - Configuration JSON may contain sensitive credentials (API keys, secrets)
