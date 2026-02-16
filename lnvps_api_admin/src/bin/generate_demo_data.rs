@@ -216,7 +216,7 @@ async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<
             id: 0, // Will be auto-generated
             name: name.to_string(),
             enabled: true,
-            company_id: Some(company_id),
+            company_id,
         };
 
         let id = db
@@ -492,103 +492,106 @@ async fn create_os_images(db: &LNVpsDbMysql) -> Result<Vec<VmOsImage>> {
 }
 
 async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
-    let plans_data = vec![
+    // Amounts are in smallest currency units: cents for fiat, millisats for BTC
+    // BTC: 1 BTC = 100,000,000 sats = 100,000,000,000 millisats
+    // 0.0005 BTC = 50,000 sats = 50,000,000 millisats
+    let plans_data: Vec<(&str, u64, &str, i32, VmCostPlanIntervalType, DateTime<Utc>)> = vec![
         (
             "Nano BTC Plan",
-            0.0005,
+            50_000_000, // 0.0005 BTC in millisats (~$50)
             "BTC",
             1,
             VmCostPlanIntervalType::Month,
             years_ago(2),
-        ), // 2 years ago - 0.0005 BTC (~$50)
+        ),
         (
             "Micro BTC Plan",
-            0.001,
+            100_000_000, // 0.001 BTC in millisats (~$100)
             "BTC",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(21),
-        ), // 21 months ago - 0.001 BTC (~$100)
+        ),
         (
             "Small BTC Plan",
-            0.002,
+            200_000_000, // 0.002 BTC in millisats (~$200)
             "BTC",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(15),
-        ), // 15 months ago - 0.002 BTC (~$200)
+        ),
         (
             "Medium BTC Plan",
-            0.005,
+            500_000_000, // 0.005 BTC in millisats (~$500)
             "BTC",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(12),
-        ), // 1 year ago - 0.005 BTC (~$500)
+        ),
         (
             "Large BTC Plan",
-            0.008,
+            800_000_000, // 0.008 BTC in millisats (~$800)
             "BTC",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(8),
-        ), // 8 months ago - 0.008 BTC (~$800)
+        ),
         (
             "XL BTC Plan",
-            0.012,
+            1_200_000_000, // 0.012 BTC in millisats (~$1200)
             "BTC",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(3),
-        ), // 3 months ago - 0.012 BTC (~$1200)
+        ),
         (
             "Basic USD Plan",
-            5.00,
+            500, // $5.00 in cents
             "USD",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(20),
-        ), // 20 months ago - $5.00
+        ),
         (
             "Standard USD Plan",
-            10.00,
+            1000, // $10.00 in cents
             "USD",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(16),
-        ), // 16 months ago - $10.00
+        ),
         (
             "Premium USD Plan",
-            15.00,
+            1500, // $15.00 in cents
             "USD",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(10),
-        ), // 10 months ago - $15.00
+        ),
         (
             "Enterprise USD Plan",
-            25.00,
+            2500, // $25.00 in cents
             "USD",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(4),
-        ), // 4 months ago - $25.00
+        ),
         (
             "Basic EUR Plan",
-            4.50,
+            450, // €4.50 in cents
             "EUR",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(9),
-        ), // 9 months ago - €4.50
+        ),
         (
             "Premium EUR Plan",
-            12.00,
+            1200, // €12.00 in cents
             "EUR",
             1,
             VmCostPlanIntervalType::Month,
             months_ago(1),
-        ), // 1 month ago - €12.00
+        ),
     ];
 
     let mut cost_plans = Vec::new();
@@ -796,15 +799,21 @@ async fn create_custom_pricing(
     db: &LNVpsDbMysql,
     regions: &[VmHostRegion],
 ) -> Result<Vec<VmCustomPricing>> {
-    let pricing_data = vec![
+    // Costs are in smallest currency units per resource unit:
+    // - cpu_cost: per CPU core per month
+    // - memory_cost: per GB RAM per month
+    // - ip4_cost: per IPv4 address per month
+    // - ip6_cost: per IPv6 address per month
+    // BTC: amounts in millisats, Fiat: amounts in cents
+    let pricing_data: Vec<(&str, u64, &str, u64, u64, u64, u64, i32, i32, u64, u64, DateTime<Utc>)> = vec![
         (
             "US-East Flex Pricing",
             regions[0].id,
             "BTC",
-            0.000050,
-            0.0000025,
-            0.0001,
-            0.00005,
+            5_000_000,    // cpu_cost: 0.00005 BTC = 5000 sats = 5,000,000 millisats per CPU
+            250_000,      // memory_cost: 0.0000025 BTC = 250 sats = 250,000 millisats per GB
+            10_000_000,   // ip4_cost: 0.0001 BTC = 10000 sats = 10,000,000 millisats per IPv4
+            5_000_000,    // ip6_cost: 0.00005 BTC = 5000 sats = 5,000,000 millisats per IPv6
             1,
             32,
             1073741824u64,
@@ -815,10 +824,10 @@ async fn create_custom_pricing(
             "EU-Central GDPR Compliant",
             regions[2].id,
             "EUR",
-            0.135,
-            0.0007,
-            0.045,
-            0.0225,
+            14,   // cpu_cost: €0.135 ≈ 14 cents per CPU
+            1,    // memory_cost: €0.0007 ≈ 1 cent per GB (rounded up)
+            5,    // ip4_cost: €0.045 ≈ 5 cents per IPv4
+            2,    // ip6_cost: €0.0225 ≈ 2 cents per IPv6
             1,
             40,
             1073741824u64,
@@ -829,10 +838,10 @@ async fn create_custom_pricing(
             "Asia-Pacific Budget",
             regions[4].id,
             "USD",
-            0.08,
-            0.00005,
-            0.03,
-            0.015,
+            8,    // cpu_cost: $0.08 = 8 cents per CPU
+            1,    // memory_cost: $0.00005 ≈ 0 cents (min 1)
+            3,    // ip4_cost: $0.03 = 3 cents per IPv4
+            2,    // ip6_cost: $0.015 ≈ 2 cents per IPv6
             1,
             24,
             1073741824u64,
@@ -843,10 +852,10 @@ async fn create_custom_pricing(
             "Canada Premium",
             regions[5].id,
             "USD",
-            0.15,
-            0.00008,
-            0.05,
-            0.025,
+            15,   // cpu_cost: $0.15 = 15 cents per CPU
+            1,    // memory_cost: $0.00008 ≈ 0 cents (min 1)
+            5,    // ip4_cost: $0.05 = 5 cents per IPv4
+            3,    // ip6_cost: $0.025 ≈ 3 cents per IPv6
             2,
             48,
             2147483648u64,
@@ -857,10 +866,10 @@ async fn create_custom_pricing(
             "EU-North Lightning",
             regions[7].id,
             "BTC",
-            0.000080,
-            0.000004,
-            0.00015,
-            0.00008,
+            8_000_000,    // cpu_cost: 0.00008 BTC = 8000 sats = 8,000,000 millisats per CPU
+            400_000,      // memory_cost: 0.000004 BTC = 400 sats = 400,000 millisats per GB
+            15_000_000,   // ip4_cost: 0.00015 BTC = 15000 sats = 15,000,000 millisats per IPv4
+            8_000_000,    // ip6_cost: 0.00008 BTC = 8000 sats = 8,000,000 millisats per IPv6
             1,
             64,
             1073741824u64,
@@ -871,10 +880,10 @@ async fn create_custom_pricing(
             "US-Central Enterprise",
             regions[6].id,
             "USD",
-            0.25,
-            0.00012,
-            0.08,
-            0.04,
+            25,   // cpu_cost: $0.25 = 25 cents per CPU
+            1,    // memory_cost: $0.00012 ≈ 0 cents (min 1)
+            8,    // ip4_cost: $0.08 = 8 cents per IPv4
+            4,    // ip6_cost: $0.04 = 4 cents per IPv6
             4,
             128,
             8589934592u64,
@@ -1265,6 +1274,7 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             external_id: Some(external_id),
             payment_type,
             tax: 0,
+            processing_fee: 0,
             upgrade_params: None,
         };
 

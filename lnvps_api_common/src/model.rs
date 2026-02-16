@@ -406,7 +406,8 @@ pub struct ApiVmCostPlan {
     pub id: u64,
     pub name: String,
     pub currency: ApiCurrency,
-    pub amount: f32,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: u64,
     pub other_price: Vec<ApiPrice>,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,

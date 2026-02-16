@@ -365,9 +365,11 @@ async fn v1_custom_template_calc(
     let template: VmCustomTemplate = req.into();
 
     let price = PricingEngine::get_custom_vm_cost_amount(&this.db, 0, &template).await?;
+    // Convert from smallest units (u64) to human-readable (f32) for display
+    let amount = CurrencyAmount::from_u64(price.currency, price.total());
     ApiData::ok(ApiPrice {
         currency: price.currency.into(),
-        amount: price.total(),
+        amount: amount.value_f32(),
     })
 }
 
@@ -884,16 +886,11 @@ async fn v1_get_payment_invoice(
         .get_host_region(host.region_id)
         .await
         .map_err(|_| "Region not found")?;
-    let company = if let Some(c) = region.company_id {
-        Some(
-            this.db
-                .get_company(c)
-                .await
-                .map_err(|_| "Company not found")?,
-        )
-    } else {
-        None
-    };
+    let company = this
+        .db
+        .get_company(region.company_id)
+        .await
+        .ok();
     let user = this.db.get_user(uid).await.map_err(|_| "User not found")?;
     #[cfg(debug_assertions)]
     let template =

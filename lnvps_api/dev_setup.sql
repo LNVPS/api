@@ -1,5 +1,10 @@
+-- Default company
 insert
-ignore into vm_host_region(id,name,enabled) values(1,"uat",1);
+ignore into company(id,name,email,base_currency)
+values(1,"Dev Company","dev@example.com","EUR");
+
+insert
+ignore into vm_host_region(id,name,enabled,company_id) values(1,"uat",1,1);
 insert
 ignore into vm_host(id,kind,region_id,name,ip,cpu,memory,enabled,api_token)
 values(1, 0, 1, "lab", "https://10.100.1.5:8006", 4, 4096*1024, 1, "root@pam!tester=c82f8a57-f876-4ca4-8610-c086d8d9d51c");
@@ -63,16 +68,16 @@ values(6,"XX-Large",1,20,1024*1024*1024*24,1024*1024*1024*1000,1,2,6,1);
 
 -- Available IP Space for sale
 insert
-ignore into available_ip_space(id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
-values(1,"192.0.2.0/24",32,24,0,"ARIN-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
+ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+values(1,1,"192.0.2.0/24",32,24,0,"ARIN-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
 
 insert
-ignore into available_ip_space(id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
-values(2,"198.51.100.0/22",26,22,0,"ARIN-2024-002",1,0,'{"upstream":"ExampleISP","asn":65000}');
+ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+values(2,1,"198.51.100.0/22",26,22,0,"ARIN-2024-002",1,0,'{"upstream":"ExampleISP","asn":65000}');
 
 insert
-ignore into available_ip_space(id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
-values(3,"2001:db8::/29",48,32,1,"RIPE-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
+ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+values(3,1,"2001:db8::/29",48,32,1,"RIPE-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
 
 -- IP Space Pricing
 -- Pricing for 192.0.2.0/24

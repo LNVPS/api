@@ -1,0 +1,45 @@
+# API Changelog
+
+All notable changes to the LNVPS APIs are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## [Unreleased]
+
+### Changed
+- **2026-02-16** - **BREAKING CHANGE**: All money amounts now use `u64` in smallest currency units (cents for fiat, millisats for BTC)
+  - **Requires database migration**: Run `20260217100000_amount_to_cents.sql` which converts existing data
+  - Cost plan `amount` field changed from `f32` (human-readable) to `u64` (smallest units)
+  - Custom pricing costs (`cpu_cost`, `memory_cost`, `ip4_cost`, `ip6_cost`) changed from `f32` to `u64`
+  - Custom pricing disk `cost` field changed from `f32` to `u64`
+  - VM template `cost_plan_amount` field changed from `f32` to `u64`
+  - Payment method config `processing_fee_base` field changed from `f32` to `u64`
+  - Affected endpoints:
+    - `POST /api/admin/v1/cost_plans`, `PATCH /api/admin/v1/cost_plans/{id}`
+    - `POST /api/admin/v1/custom_pricing`, `PATCH /api/admin/v1/custom_pricing/{id}`
+    - `POST /api/admin/v1/vm_templates`, `PATCH /api/admin/v1/vm_templates/{id}`
+    - `POST /api/admin/v1/custom_pricing/{id}/calculate`
+    - `POST /api/admin/v1/payment_methods`, `PATCH /api/admin/v1/payment_methods/{id}`
+  - Example: `"amount": 10.99` (EUR) becomes `"amount": 1099` (cents)
+  - Example: `"cpu_cost": 0.05` (BTC) becomes `"cpu_cost": 5000000` (millisats = 5000 sats)
+  - Example: `"processing_fee_base": 0.20` (EUR) becomes `"processing_fee_base": 20` (cents)
+
+- **2026-02-16** - Payment method config updates now support partial config updates
+  - `PATCH /api/admin/v1/payment_methods/{id}` now accepts `PartialProviderConfig` instead of full `ProviderConfig`
+  - Only fields included in the request are updated; missing fields retain their existing values
+  - The `type` field is still required to identify the provider type
+  - Cannot change provider type during update (e.g., from `lnd` to `revolut`)
+
+### Deprecated
+- **2026-02-16** - Bitvora payment provider has been disabled
+  - Bitvora service has been shut down and is no longer available
+  - The `bitvora` provider type is no longer supported for new configurations
+  - Existing Bitvora configurations in the database are preserved for historical reference
+  - Affected endpoints: `POST /api/admin/v1/payment_methods`, `PATCH /api/admin/v1/payment_methods/{id}`
+
+### Security
+- **2026-02-16** - Sanitized sensitive fields in `AdminPaymentMethodConfigInfo` responses
+  - Provider config secrets (tokens, API keys, webhook secrets) are no longer returned in GET/list responses
+  - Affected endpoints: `GET /api/v1/admin/payment-config`, `GET /api/v1/admin/payment-config/{id}`
+  - Secrets are replaced with boolean indicators (e.g., `has_token: true`, `has_webhook_secret: true`)
+  - Public/non-sensitive fields (URLs, client IDs, publishable keys) are still returned

@@ -18,7 +18,6 @@ default = [
     "lnd",
     "cloudflare",
     "revolut",
-    "bitvora",
     "tokio/sync",
     "tokio/io-util",
     "payments-rs/tls-ring"
@@ -32,6 +31,7 @@ nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
 proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
+# bitvora is disabled - service has been shut down
 bitvora = ["payments-rs/method-bitvora"]
 cloudflare = ["dep:reqwest"]
 revolut = ["payments-rs/method-revolut"]

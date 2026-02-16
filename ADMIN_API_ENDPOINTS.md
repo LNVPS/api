@@ -874,7 +874,7 @@ Body:
   "region_id": number,
   // Cost plan auto-creation fields (used when cost_plan_id not provided)
   "cost_plan_name": "string",            // optional, defaults to "{template_name} Cost Plan"
-  "cost_plan_amount": number,            // required if cost_plan_id not provided
+  "cost_plan_amount": number,            // required if cost_plan_id not provided, in smallest currency units (cents/millisats)
   "cost_plan_currency": "string",        // optional, defaults to "USD"
   "cost_plan_interval_amount": number,   // optional, defaults to 1
   "cost_plan_interval_type": "day" | "month" | "year"  // optional, defaults to "month"
@@ -901,7 +901,7 @@ Body (all optional):
   "cost_plan_id": number,
   "region_id": number,
   "cost_plan_name": "string",                    // Update associated cost plan name
-  "cost_plan_amount": number,                    // Update associated cost plan amount
+  "cost_plan_amount": number,                    // Update associated cost plan amount in smallest currency units (cents/millisats)
   "cost_plan_currency": "string",               // Update associated cost plan currency
   "cost_plan_interval_amount": number,          // Update associated cost plan interval amount
   "cost_plan_interval_type": "day" | "month" | "year"  // Update associated cost plan interval type
@@ -950,8 +950,8 @@ Body:
 ```json
 {
   "name": "string",
-  "amount": number,                        // Cost amount (must be >= 0)
-  "currency": "string",                    // Currency code (e.g., "USD", "EUR")
+  "amount": number,                        // Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+  "currency": "string",                    // Currency code (e.g., "USD", "EUR", "BTC")
   "interval_amount": number,               // Billing interval count (must be > 0)
   "interval_type": "day" | "month" | "year"  // Billing interval type
 }
@@ -967,7 +967,7 @@ Body (all optional):
 ```json
 {
   "name": "string",
-  "amount": number,
+  "amount": number,                        // Cost amount in smallest currency units (cents for fiat, millisats for BTC)
   "currency": "string",
   "interval_amount": number,
   "interval_type": "day" | "month" | "year"
@@ -1020,10 +1020,10 @@ Body:
   "expires": "string (ISO 8601) | null", // optional, null for no expiration
   "region_id": number,
   "currency": "string",                  // e.g., "USD", "EUR", "BTC"
-  "cpu_cost": number,                   // Cost per CPU core per month
-  "memory_cost": number,                // Cost per GB RAM per month
-  "ip4_cost": number,                   // Cost per IPv4 address per month
-  "ip6_cost": number,                   // Cost per IPv6 address per month
+  "cpu_cost": number,                   // Cost per CPU core per month in smallest currency units (cents/millisats)
+  "memory_cost": number,                // Cost per GB RAM per month in smallest currency units (cents/millisats)
+  "ip4_cost": number,                   // Cost per IPv4 address per month in smallest currency units (cents/millisats)
+  "ip6_cost": number,                   // Cost per IPv6 address per month in smallest currency units (cents/millisats)
   "min_cpu": number,                    // Minimum CPU cores allowed
   "max_cpu": number,                    // Maximum CPU cores allowed
   "min_memory": number,                 // Minimum memory in bytes
@@ -1032,7 +1032,7 @@ Body:
     {
       "kind": "ssd",                    // DiskType enum: "hdd" or "ssd"
       "interface": "pcie",              // DiskInterface enum: "sata", "scsi", or "pcie"
-      "cost": number,                   // Cost per GB per month
+      "cost": number,                   // Cost per GB per month in smallest currency units (cents/millisats)
       "min_disk_size": number,          // Minimum disk size in bytes for this type/interface
       "max_disk_size": number           // Maximum disk size in bytes for this type/interface
     }
@@ -1054,10 +1054,10 @@ Body (all optional):
   "expires": "string (ISO 8601) | null",
   "region_id": number,
   "currency": "string",
-  "cpu_cost": number,
-  "memory_cost": number,
-  "ip4_cost": number,
-  "ip6_cost": number,
+  "cpu_cost": number,                       // Cost per CPU core in smallest currency units (cents/millisats)
+  "memory_cost": number,                    // Cost per GB RAM in smallest currency units (cents/millisats)
+  "ip4_cost": number,                       // Cost per IPv4 address in smallest currency units (cents/millisats)
+  "ip6_cost": number,                       // Cost per IPv6 address in smallest currency units (cents/millisats)
   "min_cpu": number,                        // Minimum CPU cores allowed
   "max_cpu": number,                        // Maximum CPU cores allowed
   "min_memory": number,                     // Minimum memory in bytes
@@ -1066,7 +1066,7 @@ Body (all optional):
     {
       "kind": "ssd",                        // DiskType enum: "hdd", "ssd"
       "interface": "pcie",                  // DiskInterface enum: "sata", "scsi", "pcie"
-      "cost": number,
+      "cost": number,                       // Cost per GB in smallest currency units (cents/millisats)
       "min_disk_size": number,              // Minimum disk size in bytes for this type/interface
       "max_disk_size": number               // Maximum disk size in bytes for this type/interface
     }
@@ -1164,16 +1164,16 @@ Body:
 }
 ```
 
-Returns calculated pricing breakdown for the specified configuration without creating a template:
+Returns calculated pricing breakdown for the specified configuration without creating a template (all costs in smallest currency units - cents/millisats):
 ```json
 {
   "currency": "string",
-  "cpu_cost": number,
-  "memory_cost": number,
-  "disk_cost": number,
-  "ip4_cost": number,
-  "ip6_cost": number,
-  "total_monthly_cost": number
+  "cpu_cost": number,           // Cost for CPU cores in smallest currency units
+  "memory_cost": number,        // Cost for RAM in smallest currency units
+  "disk_cost": number,          // Cost for disk in smallest currency units
+  "ip4_cost": number,           // Cost for IPv4 addresses in smallest currency units
+  "ip6_cost": number,           // Cost for IPv6 addresses in smallest currency units
+  "total_monthly_cost": number  // Total monthly cost in smallest currency units
 }
 ```
 
@@ -1949,6 +1949,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `subscriptions` - Subscription management
 - `subscription_line_items` - Subscription line item management
 - `subscription_payments` - Subscription payment management
+- `payment_method_config` - Payment method configuration management
 
 ### Actions:
 - `create` - Create new resources
@@ -1971,6 +1972,8 @@ The RBAC system uses the following permission format: `resource::action`
 - `subscriptions::create` - Create new subscriptions
 - `subscription_line_items::update` - Modify subscription line items
 - `subscription_payments::view` - View subscription payments
+- `payment_method_config::view` - View payment method configurations
+- `payment_method_config::create` - Create payment method configurations
 
 ## Response Models
 
@@ -2838,6 +2841,288 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
   "parent_cidr": "string | null"         // Parent IP space CIDR (enriched)
 }
 ```
+
+---
+
+## Payment Method Configuration Management
+
+Payment method configurations store provider settings for payment processing (Lightning/LND, Revolut, Stripe, PayPal). This allows payment provider settings to be managed in the database instead of static configuration files.
+
+> **Note:** Bitvora support has been removed as the service has been shut down.
+
+Each configuration belongs to a specific company, and multiple configurations can exist per company/payment method combination. This allows keeping disabled legacy configurations that are still referenced by historical payments while having newer active configurations.
+
+### List Payment Method Configurations
+```
+GET /api/admin/v1/payment_methods
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `company_id`: number (optional) - filter by company ID
+
+Required Permission: `payment_method_config::view`
+
+Returns paginated list of payment method configurations.
+
+### Get Payment Method Configuration
+```
+GET /api/admin/v1/payment_methods/{id}
+```
+Required Permission: `payment_method_config::view`
+
+Returns detailed information about a specific payment method configuration.
+
+### Create Payment Method Configuration
+```
+POST /api/admin/v1/payment_methods
+```
+Required Permission: `payment_method_config::create`
+
+Body:
+```json
+{
+  "company_id": number,                       // Required - Company this configuration belongs to
+  "name": "string",                           // Required - Display name for the configuration
+  "enabled": boolean,                         // Optional - Default: true
+  "config": ProviderConfig,                   // Required - Typed provider configuration (see examples below)
+  "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency units (e.g., 20 for €0.20)
+  "processing_fee_currency": "string | null"  // Required if processing_fee_base is set - Currency code (e.g., "EUR")
+}
+```
+
+**Provider Configuration Examples:**
+
+The `config` field is a tagged union using `"type"` as the discriminator field.
+
+LND (Lightning):
+```json
+{
+  "type": "lnd",
+  "url": "https://lnd.example.com:8080",
+  "cert_path": "/path/to/tls.cert",
+  "macaroon_path": "/path/to/admin.macaroon"
+}
+```
+
+Bitvora (Lightning) - **DEPRECATED: Service shut down**:
+```json
+{
+  "type": "bitvora",
+  "token": "bv_api_token_here",
+  "webhook_secret": "webhook_secret_here"
+}
+```
+
+Revolut:
+```json
+{
+  "type": "revolut",
+  "url": "https://api.revolut.com",
+  "token": "rev_api_token_here",
+  "api_version": "2024-09-01",
+  "public_key": "pk_xxx",
+  "webhook_secret": "whs_xxx"
+}
+```
+
+Note: The `webhook_secret` field is automatically populated when the API registers a webhook with Revolut. If you need to manually set this (e.g., when restoring from backup or migrating), you can provide it during creation or update. If omitted or set to `null`, the system will automatically register a new webhook and store the secret on startup.
+
+Stripe:
+```json
+{
+  "type": "stripe",
+  "secret_key": "sk_live_xxx",
+  "publishable_key": "pk_live_xxx",
+  "webhook_secret": "whsec_xxx"
+}
+```
+
+PayPal:
+```json
+{
+  "type": "paypal",
+  "client_id": "client_id_here",
+  "client_secret": "client_secret_here",
+  "mode": "live"
+}
+```
+
+### Update Payment Method Configuration
+```
+PATCH /api/admin/v1/payment_methods/{id}
+```
+Required Permission: `payment_method_config::update`
+
+Body (all fields optional):
+```json
+{
+  "name": "string",                           // Display name (cannot be empty)
+  "enabled": boolean,                         // Enable/disable the payment method
+  "config": PartialProviderConfig,            // Partial provider configuration (only include fields to update)
+  "processing_fee_rate": number | null,       // Fee percentage (null to clear)
+  "processing_fee_base": number | null,       // Base fee in smallest currency units (e.g., 20 for €0.20, null to clear)
+  "processing_fee_currency": "string | null"  // Currency code (required if base fee is set)
+}
+```
+
+**Partial Config Update Examples:**
+
+When updating config, only provide the fields you want to change. Missing fields will retain their existing values.
+
+Update only the `url` for a Revolut config (keeps token, api_version, etc.):
+```json
+{
+  "config": {
+    "type": "revolut",
+    "url": "https://merchant.revolut.com/api/"
+  }
+}
+```
+
+Update only the `public_key` for a Revolut config:
+```json
+{
+  "config": {
+    "type": "revolut",
+    "public_key": "pk_new_key_here"
+  }
+}
+```
+
+Update LND macaroon path only:
+```json
+{
+  "config": {
+    "type": "lnd",
+    "macaroon_path": "/new/path/to/admin.macaroon"
+  }
+}
+```
+
+**Notes:**
+- The `type` field is always required in the config to identify the provider type
+- You cannot change the provider type during an update (e.g., from `lnd` to `revolut`)
+- If `processing_fee_base` is set, `processing_fee_currency` must also be provided
+- Sensitive fields (tokens, secrets) that are not provided will remain unchanged
+
+### Delete Payment Method Configuration
+```
+DELETE /api/admin/v1/payment_methods/{id}
+```
+Required Permission: `payment_method_config::delete`
+
+Response:
+```json
+{
+  "data": {
+    "success": true,
+    "message": "Payment method configuration deleted successfully"
+  }
+}
+```
+
+---
+
+## Payment Method Configuration Data Types
+
+### AdminPaymentMethodConfigInfo
+
+**Note:** For security reasons, sensitive values (tokens, API keys, secrets) are NEVER returned in API responses. Instead, the config contains boolean indicators showing whether these values are configured.
+
+```json
+{
+  "id": number,
+  "company_id": number,                       // Company this config belongs to
+  "payment_method": "lightning",              // AdminPaymentMethodType: "lightning", "revolut", "paypal", "stripe"
+  "name": "string",
+  "enabled": boolean,
+  "provider_type": "string",                  // Provider implementation type ("lnd", "revolut", "stripe", "paypal")
+  "config": SanitizedProviderConfig | null,   // Sanitized provider config - secrets replaced with boolean indicators
+  "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
+  "processing_fee_base": number | null,       // Base fee in smallest currency units (e.g., 20 for €0.20)
+  "processing_fee_currency": "string | null", // Currency code for base fee
+  "created": "string (ISO 8601)",
+  "modified": "string (ISO 8601)"
+}
+```
+
+### CreatePaymentMethodConfigRequest
+```json
+{
+  "company_id": number,                       // Required - Company to create config for
+  "name": "string",                           // Required - Display name
+  "enabled": boolean,                         // Optional - Default: true
+  "config": ProviderConfig,                   // Required - Typed provider config (with "type" discriminator)
+  "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency units (e.g., 20 for €0.20)
+  "processing_fee_currency": "string | null"  // Required if base fee is set
+}
+```
+
+### UpdatePaymentMethodConfigRequest
+```json
+{
+  "name": "string | null",                    // Optional - Display name
+  "enabled": boolean | null,                  // Optional - Enable/disable
+  "config": PartialProviderConfig | null,     // Optional - Partial provider config (only include fields to update)
+  "processing_fee_rate": number | null,       // Optional - Fee percentage (null to clear)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency units (null to clear)
+  "processing_fee_currency": "string | null"  // Optional - Currency (null to clear)
+}
+```
+
+### ProviderConfig (Tagged Union) - For Creation
+
+The `config` field for **creating** a new payment method uses a tagged union format with `"type"` as the discriminator.
+All fields except `webhook_secret` are required when creating:
+
+| Type      | Payment Method | Required Fields                                           |
+|-----------|----------------|-----------------------------------------------------------|
+| `lnd`     | lightning      | `url`, `cert_path`, `macaroon_path`                       |
+| ~~`bitvora`~~ | ~~lightning~~ | ~~`token`, `webhook_secret`~~ (service shut down)        |
+| `revolut` | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
+| `stripe`  | stripe         | `secret_key`, `publishable_key`, `webhook_secret`         |
+| `paypal`  | paypal         | `client_id`, `client_secret`, `mode`                      |
+
+### PartialProviderConfig (Tagged Union) - For Updates
+
+The `config` field for **updating** a payment method also uses a tagged union format with `"type"` as the discriminator.
+Only the `type` field is required; all other fields are optional and will keep their existing values if not provided:
+
+| Type      | Optional Fields                                                    |
+|-----------|-------------------------------------------------------------------|
+| `lnd`     | `url`, `cert_path`, `macaroon_path`                               |
+| ~~`bitvora`~~ | ~~`token`, `webhook_secret`~~ (service shut down)             |
+| `revolut` | `url`, `token`, `api_version`, `public_key`, `webhook_secret`     |
+| `stripe`  | `secret_key`, `publishable_key`, `webhook_secret`                 |
+| `paypal`  | `client_id`, `client_secret`, `mode`                              |
+
+### Notes
+
+**Provider Types:**
+- `lnd` - Lightning Network Daemon for Lightning payments
+- ~~`bitvora`~~ - ~~Bitvora API for Lightning payments~~ (service shut down)
+- `revolut` - Revolut Business API
+- `stripe` - Stripe Payments API
+- `paypal` - PayPal REST API
+
+**Multiple Configurations:**
+A company can have multiple payment method configurations for the same payment method type. This allows keeping disabled legacy configurations that are still referenced by historical payments (e.g., VM payments, subscription payments) while having newer active configurations.
+
+**Processing Fees:**
+- `processing_fee_rate` is a percentage (1.0 = 1%, 2.5 = 2.5%)
+- `processing_fee_base` is in smallest currency units (e.g., 20 for €0.20, 100 for $1.00)
+- For BTC, the value is in millisats (e.g., 1000000 for 1000 sats)
+- When `processing_fee_base` is set, `processing_fee_currency` is required
+
+**Security:**
+- Configuration JSON may contain sensitive credentials (API keys, secrets)
+- Ensure proper access controls are in place for payment method management
+- Consider masking sensitive fields in API responses for audit logging
+
+---
 
 ### Notes
 

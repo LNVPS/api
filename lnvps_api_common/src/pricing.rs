@@ -13,6 +13,7 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
 
+
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
 pub struct UpgradeCostQuote {
@@ -62,6 +63,68 @@ impl PricingEngine {
         };
         base_seconds * interval_amount as i64
     }
+    
+    /// Calculate processing fee for a payment based on payment method and amount
+    /// Returns the processing fee in the same currency as the amount
+    /// Queries the database for fee configuration
+    pub async fn calculate_processing_fee(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        currency: Currency,
+        amount: u64,
+    ) -> u64 {
+        // Lightning has no processing fees (peer-to-peer network)
+        if method == PaymentMethod::Lightning {
+            return 0;
+        }
+
+        // Try to get fee config from database
+        let config = match self.db.get_payment_method_config_for_company(company_id, method).await {
+            Ok(config) => config,
+            Err(e) => {
+                log::warn!("Failed to load payment method config for company {} method {:?}: {}", company_id, method, e);
+                return 0;
+            }
+        };
+
+        // Check if config is enabled and has fee settings
+        if !config.enabled || config.processing_fee_rate.is_none() || config.processing_fee_base.is_none() {
+            return 0;
+        }
+
+        let rate = config.processing_fee_rate.unwrap_or(0.0);
+        let base = config.processing_fee_base.unwrap_or(0);
+        let base_currency_str = config.processing_fee_currency.as_deref().unwrap_or("");
+
+        // Calculate percentage fee (round instead of truncate to avoid systematic undercharging)
+        let percentage_fee = ((amount as f64) * (rate as f64 / 100.0)).round() as u64;
+
+        // Get base fee, converting currency if needed
+        let base_fee_currency = Currency::from_str(base_currency_str).unwrap_or_else(|_| {
+            if !base_currency_str.is_empty() {
+                log::warn!(
+                    "Invalid processing fee currency '{}' for {:?}, using transaction currency instead",
+                    base_currency_str,
+                    method
+                );
+            }
+            currency
+        });
+        let base_fee = if base_fee_currency == currency {
+            // Same currency, use directly
+            base
+        } else {
+            // TODO: Implement proper currency conversion for the base fee
+            // For now, use the base fee value as-is in the transaction currency
+            // This is a simplification - in production, this should use the
+            // exchange rate service to convert the fee to the target currency
+            base
+        };
+
+        percentage_fee + base_fee
+    }
+    
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         rates: Arc<dyn ExchangeRateService>,
@@ -99,11 +162,12 @@ impl PricingEngine {
         method: PaymentMethod,
     ) -> Result<CostResult> {
         let vm = self.db.get_vm(vm_id).await?;
+        let company_id = self.db.get_vm_company_id(vm_id).await?;
 
         let cost = if vm.template_id.is_some() {
-            self.get_template_vm_cost(&vm, method).await?
+            self.get_template_vm_cost(&vm, method, company_id).await?
         } else {
-            self.get_custom_vm_cost(&vm, method).await?
+            self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
         ensure!(cost.currency == input.currency(), "Invalid currency");
@@ -120,6 +184,7 @@ impl PricingEngine {
             new_expiry: vm.expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
             tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
+            processing_fee: self.calculate_processing_fee(company_id, method, cost.currency, input.value()).await,
         }))
     }
 
@@ -137,12 +202,13 @@ impl PricingEngine {
     ) -> Result<CostResult> {
         let intervals = intervals.max(1); // Ensure at least 1 interval
         let vm = self.db.get_vm(vm_id).await?;
+        let company_id = self.db.get_vm_company_id(vm_id).await?;
 
         // Calculate the base cost to determine expected time value
         let base_cost = if vm.template_id.is_some() {
-            self.get_template_vm_cost(&vm, method).await?
+            self.get_template_vm_cost(&vm, method, company_id).await?
         } else {
-            self.get_custom_vm_cost(&vm, method).await?
+            self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
         let expected_time_value = base_cost.time_value * intervals as u64;
@@ -168,9 +234,11 @@ impl PricingEngine {
             let scaled_tax = self
                 .get_tax_for_user(vm.user_id, scaled_amount)
                 .await?;
+            let processing_fee = self.calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount).await;
             Ok(CostResult::New(NewPaymentInfo {
                 amount: scaled_amount,
                 tax: scaled_tax,
+                processing_fee,
                 currency: base_cost.currency,
                 rate: base_cost.rate,
                 time_value: scaled_time,
@@ -212,11 +280,15 @@ impl PricingEngine {
             } else {
                 bail!("No disk price found")
             };
-        let disk_cost = (template.disk_size / crate::GB) as f32 * disk_pricing.cost;
-        let cpu_cost = pricing.cpu_cost * template.cpu as f32;
-        let memory_cost = pricing.memory_cost * (template.memory / crate::GB) as f32;
-        let ip4_cost = pricing.ip4_cost * v4s as f32;
-        let ip6_cost = pricing.ip6_cost * v6s as f32;
+        // All costs are in smallest currency units (cents/millisats)
+        let disk_size_gb = template.disk_size / crate::GB;
+        let memory_gb = template.memory / crate::GB;
+        
+        let disk_cost = disk_size_gb * disk_pricing.cost;
+        let cpu_cost = pricing.cpu_cost * template.cpu as u64;
+        let memory_cost = pricing.memory_cost * memory_gb;
+        let ip4_cost = pricing.ip4_cost * v4s as u64;
+        let ip6_cost = pricing.ip6_cost * v6s as u64;
 
         let currency: Currency = if let Ok(p) = pricing.currency.parse() {
             p
@@ -234,7 +306,7 @@ impl PricingEngine {
     }
 
     /// Get the renewal cost of a custom VM
-    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<NewPaymentInfo> {
+    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: u64) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.custom_template_id {
             i
         } else {
@@ -248,7 +320,7 @@ impl PricingEngine {
         let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
-                CurrencyAmount::from_f32(price.currency, price.total()),
+                CurrencyAmount::from_u64(price.currency, price.total()),
                 method,
             )
             .await?;
@@ -257,6 +329,7 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
+            processing_fee: self.calculate_processing_fee(company_id, method, converted_amount.amount.currency(), converted_amount.amount.value()).await,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -311,7 +384,7 @@ impl PricingEngine {
     }
 
     /// Gets the renewal cost of a standard VM
-    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<NewPaymentInfo> {
+    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: u64) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.template_id {
             i
         } else {
@@ -322,7 +395,7 @@ impl PricingEngine {
 
         let currency = cost_plan.currency.parse().expect("Invalid currency");
         let converted_amount = self
-            .get_amount_and_rate(CurrencyAmount::from_f32(currency, cost_plan.amount), method)
+            .get_amount_and_rate(CurrencyAmount::from_u64(currency, cost_plan.amount), method)
             .await?;
         let time_value = Self::next_template_expire(vm, &cost_plan);
         Ok(NewPaymentInfo {
@@ -330,6 +403,7 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
+            processing_fee: self.calculate_processing_fee(company_id, method, converted_amount.amount.currency(), converted_amount.amount.value()).await,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -456,7 +530,7 @@ impl PricingEngine {
                 cost_plan.interval_amount,
             );
             (
-                CurrencyAmount::from_f32(
+                CurrencyAmount::from_u64(
                     cost_plan
                         .currency
                         .parse()
@@ -470,7 +544,7 @@ impl PricingEngine {
             let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
             let time_value = Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
             (
-                CurrencyAmount::from_f32(price.currency, price.total()),
+                CurrencyAmount::from_u64(price.currency, price.total()),
                 time_value,
             )
         } else {
@@ -529,7 +603,7 @@ impl PricingEngine {
         // Get the cost of renewal
         let new_price =
             Self::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
-        let new_price = CurrencyAmount::from_f32(new_price.currency, new_price.total());
+        let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
         let custom_plan_seconds =
@@ -610,6 +684,8 @@ pub struct NewPaymentInfo {
     pub new_expiry: DateTime<Utc>,
     /// Taxes to charge
     pub tax: u64,
+    /// Processing fee charged by the payment provider
+    pub processing_fee: u64,
 }
 
 impl NewPaymentInfo {
@@ -621,15 +697,20 @@ impl NewPaymentInfo {
 #[derive(Clone, Debug)]
 pub struct PricingData {
     pub currency: Currency,
-    pub cpu_cost: f32,
-    pub memory_cost: f32,
-    pub ip4_cost: f32,
-    pub ip6_cost: f32,
-    pub disk_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
+    /// Cost per GB disk in smallest currency units (cents for fiat, millisats for BTC)
+    pub disk_cost: u64,
 }
 
 impl PricingData {
-    pub fn total(&self) -> f32 {
+    pub fn total(&self) -> u64 {
         self.cpu_cost + self.memory_cost + self.ip4_cost + self.ip6_cost + self.disk_cost
     }
 }
@@ -639,11 +720,34 @@ mod tests {
     use super::*;
     use crate::{MockDb, MockExchangeRate};
     use lnvps_db::{
-        DiskType, LNVpsDbBase, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+        DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     };
 
     const MOCK_RATE: f32 = 100_000.0;
     const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0; // 30 days * 24 hours * 3600 seconds
+
+    async fn add_revolut_processing_fee_config(db: &MockDb) {
+        use lnvps_db::{ProviderConfig, RevolutProviderConfig};
+        let mut configs = db.payment_method_configs.lock().await;
+        let mut config = PaymentMethodConfig::new_with_config(
+            1, // Default company from MockDb
+            PaymentMethod::Revolut,
+            "Revolut".to_string(),
+            true,
+            ProviderConfig::Revolut(RevolutProviderConfig {
+                url: "https://api.revolut.com".to_string(),
+                token: "test-token".to_string(),
+                api_version: "2024-09-01".to_string(),
+                public_key: "pk_test".to_string(),
+                webhook_secret: None,
+            }),
+        );
+        config.id = 1;
+        config.processing_fee_rate = Some(1.0);
+        config.processing_fee_base = Some(20);
+        config.processing_fee_currency = Some("EUR".to_string());
+        configs.insert(1, config);
+    }
 
     async fn add_custom_pricing(db: &MockDb) {
         let mut p = db.custom_pricing.lock().await;
@@ -657,10 +761,10 @@ mod tests {
                 expires: None,
                 region_id: 1,
                 currency: "EUR".to_string(),
-                cpu_cost: 1.5,
-                memory_cost: 0.5,
-                ip4_cost: 0.5,
-                ip6_cost: 0.05,
+                cpu_cost: 150,    // €1.50 in cents per CPU core
+                memory_cost: 50,  // €0.50 in cents per GB RAM
+                ip4_cost: 50,     // €0.50 in cents per IPv4
+                ip6_cost: 5,      // €0.05 in cents per IPv6
                 min_cpu: 1,
                 max_cpu: 16,
                 min_memory: 1 * crate::GB,
@@ -688,7 +792,7 @@ mod tests {
                 pricing_id: 1,
                 kind: DiskType::SSD,
                 interface: Default::default(),
-                cost: 0.05,
+                cost: 5,  // €0.05 in cents per GB disk
                 min_disk_size: 5 * crate::GB,
                 max_disk_size: 1 * crate::TB,
             },
@@ -702,12 +806,19 @@ mod tests {
 
         let template = db.get_custom_vm_template(1).await?;
         let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
-        assert_eq!(3.0, price.cpu_cost);
-        assert_eq!(1.0, price.memory_cost);
-        assert_eq!(0.5, price.ip4_cost);
-        assert_eq!(0.05, price.ip6_cost);
-        assert_eq!(4.0, price.disk_cost);
-        assert_eq!(8.55, price.total());
+        // All costs now in cents:
+        // cpu_cost = 150 cents/CPU * 2 CPUs = 300 cents
+        // memory_cost = 50 cents/GB * 2 GB = 100 cents
+        // ip4_cost = 50 cents * 1 = 50 cents
+        // ip6_cost = 5 cents * 1 = 5 cents
+        // disk_cost = 5 cents/GB * 80 GB = 400 cents
+        // total = 300 + 100 + 50 + 5 + 400 = 855 cents = €8.55
+        assert_eq!(300, price.cpu_cost);
+        assert_eq!(100, price.memory_cost);
+        assert_eq!(50, price.ip4_cost);
+        assert_eq!(5, price.ip6_cost);
+        assert_eq!(400, price.disk_cost);
+        assert_eq!(855, price.total());
 
         Ok(())
     }
@@ -761,9 +872,13 @@ mod tests {
         let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
         match price {
             CostResult::New(payment_info) => {
-                let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+                // plan.amount is 132 cents (€1.32), convert to EUR then to millisats
+                // €1.32 / 100000 (EUR/BTC rate) * 1e11 millisats/BTC = 1320000 millisats
+                let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
+                let expect_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
                 assert_eq!(expect_price, payment_info.amount);
                 assert_eq!(0, payment_info.tax);
+                assert_eq!(0, payment_info.processing_fee);
             }
             _ => bail!("??"),
         }
@@ -772,12 +887,14 @@ mod tests {
         let price = pe.get_vm_cost(2, PaymentMethod::Lightning).await?;
         match price {
             CostResult::New(payment_info) => {
-                let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+                let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
+                let expect_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
                 assert_eq!(expect_price, payment_info.amount);
                 assert_eq!(
                     (expect_price as f64 * 0.23).floor() as u64,
                     payment_info.tax
                 );
+                assert_eq!(0, payment_info.processing_fee);
             }
             _ => bail!("??"),
         }
@@ -787,7 +904,8 @@ mod tests {
             .get_cost_by_amount(1, CurrencyAmount::millisats(1000), PaymentMethod::Lightning)
             .await?;
         // full month price in msats
-        let mo_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+        let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
+        let mo_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
         let time_scale = 1000f64 / mo_price as f64;
         let vm = db.get_vm(1).await?;
         let next_expire = PricingEngine::next_template_expire(&vm, &plan);
@@ -797,6 +915,7 @@ mod tests {
                 assert_eq!(expect_time, payment_info.time_value);
                 assert_eq!(0, payment_info.tax);
                 assert_eq!(payment_info.amount, 1000);
+                assert_eq!(0, payment_info.processing_fee);
             }
             _ => bail!("??"),
         }
@@ -871,10 +990,10 @@ mod tests {
                     expires: None,
                     region_id: 1,
                     currency: "EUR".to_string(),
-                    cpu_cost: 2.0,    // 2 EUR per CPU per month
-                    memory_cost: 1.0, // 1 EUR per GB per month
-                    ip4_cost: 0.0,
-                    ip6_cost: 0.0,
+                    cpu_cost: 200,    // €2.00 in cents per CPU per month
+                    memory_cost: 100, // €1.00 in cents per GB per month
+                    ip4_cost: 0,
+                    ip6_cost: 0,
                     min_cpu: 1,
                     max_cpu: 16,
                     min_memory: 1 * crate::GB,
@@ -893,7 +1012,7 @@ mod tests {
                     pricing_id: 1,
                     kind: DiskType::SSD,
                     interface: DiskInterface::PCIe,
-                    cost: 0.5, // 0.5 EUR per GB per month
+                    cost: 50, // €0.50 in cents per GB per month
                     min_disk_size: 5 * crate::GB,
                     max_disk_size: 1 * crate::TB,
                 },
@@ -1139,8 +1258,9 @@ mod tests {
 
         // Get the old VM cost per second
         let vm = db_arc.get_vm(1).await?;
+        let company_id = db_arc.get_vm_company_id(1).await?;
         let old_cost_info = pe
-            .get_template_vm_cost(&vm, PaymentMethod::Lightning)
+            .get_template_vm_cost(&vm, PaymentMethod::Lightning, company_id)
             .await?;
         let old_cost_per_second = old_cost_info.cost_per_second();
 
@@ -1153,12 +1273,12 @@ mod tests {
         let month_in_seconds = 30 * 24 * 60 * 60; // 2,592,000 seconds
 
         // Mock template specs: 2 CPU, 2GB memory, 64GB disk
-        // Mock template cost: 1.32 EUR/month (from MockDb::mock_cost_plan)
-        // Custom pricing: 2.0 EUR/CPU, 1.0 EUR/GB memory, 0.5 EUR/GB disk
-        // Old cost (from template): 1.32 EUR/month
-        // New cost (custom): 4*2.0 + 2*1.0 + 64*0.5 = 8 + 2 + 32 = 42 EUR/month
-        let old_monthly_cost_eur = 1.32f64; // From MockDb::mock_cost_plan
-        let new_monthly_cost_eur = 42.0f64;
+        // Mock template cost: 132 cents = €1.32/month (from MockDb::mock_cost_plan)
+        // Custom pricing (in cents): 200 cents/CPU, 100 cents/GB memory, 50 cents/GB disk
+        // Old cost (from template): €1.32/month = 132 cents
+        // New cost (custom): 4*200 + 2*100 + 64*50 = 800 + 200 + 3200 = 4200 cents = €42.00/month
+        let old_monthly_cost_eur = 1.32f64; // From MockDb::mock_cost_plan (132 cents)
+        let new_monthly_cost_eur = 42.0f64; // 4200 cents
         let new_cost_per_second = new_monthly_cost_eur / month_in_seconds as f64;
 
         // Pro-rated costs for the remaining time (86400 seconds)
@@ -1416,6 +1536,73 @@ mod tests {
             quote.renewal.amount.value(),
             renewal_cost_diff
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_processing_fees() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        
+        // Set up EUR rate
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        // Add a basic VM and user
+        {
+            let mut v = db.vms.lock().await;
+            v.insert(1, MockDb::mock_vm());
+            
+            let mut u = db.users.lock().await;
+            u.insert(
+                1,
+                User {
+                    id: 1,
+                    pubkey: vec![],
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Add Revolut processing fee config to the database
+        add_revolut_processing_fee_config(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let taxes = HashMap::new();
+        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR);
+
+        // Test Lightning payment (no processing fee)
+        let price_lightning = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
+        match price_lightning {
+            CostResult::New(payment_info) => {
+                assert_eq!(0, payment_info.processing_fee, "Lightning should have no processing fee");
+            }
+            _ => bail!("Expected new payment"),
+        }
+
+        // Test Revolut payment (1% + 0.20 EUR processing fee)
+        let price_revolut = pe.get_vm_cost(1, PaymentMethod::Revolut).await?;
+        match price_revolut {
+            CostResult::New(payment_info) => {
+                let plan = MockDb::mock_cost_plan();
+                // plan.amount is already in cents (132 cents = €1.32)
+                let expected_amount_cents = plan.amount;
+                
+                // Processing fee: 1% + 0.20 EUR
+                // 1% of 132 cents = 1 cent (rounded)
+                // 0.20 EUR = 20 cents
+                // Total = 21 cents
+                let expected_fee = (expected_amount_cents / 100) + 20;
+                
+                assert_eq!(
+                    expected_fee, 
+                    payment_info.processing_fee,
+                    "Revolut processing fee should be 1% + 0.20 EUR"
+                );
+                assert_eq!(Currency::EUR, payment_info.currency, "Should be EUR");
+            }
+            _ => bail!("Expected new payment"),
+        }
 
         Ok(())
     }

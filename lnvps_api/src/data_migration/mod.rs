@@ -2,6 +2,7 @@ use crate::data_migration::arp_ref_fixer::ArpRefFixerDataMigration;
 use crate::data_migration::dns::DnsDataMigration;
 use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
+use crate::data_migration::payment_method_config::PaymentMethodConfigMigration;
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::Settings;
 use anyhow::Result;
@@ -15,6 +16,7 @@ mod arp_ref_fixer;
 mod dns;
 mod encryption_migration;
 mod ip6_init;
+mod payment_method_config;
 
 /// Basic data migration to run at startup
 pub trait DataMigration: Send + Sync {
@@ -41,6 +43,12 @@ pub async fn run_data_migrations(
     }
 
     migrations.push(Box::new(ArpRefFixerDataMigration::new(db.clone())));
+
+    // Migrate payment method config from YAML to database
+    migrations.push(Box::new(PaymentMethodConfigMigration::new(
+        db.clone(),
+        settings.clone(),
+    )));
 
     info!("Running {} data migrations", migrations.len());
     for migration in migrations {

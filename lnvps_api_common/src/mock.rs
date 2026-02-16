@@ -5,10 +5,11 @@ use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, DbResult, DiskInterface, DiskType, IpRange,
     IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Router, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
+    Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -45,6 +46,7 @@ pub struct MockDb {
     pub subscriptions: Arc<Mutex<HashMap<u64, Subscription>>>,
     pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
+    pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
 }
 
 impl MockDb {
@@ -59,7 +61,7 @@ impl MockDb {
             id: 1,
             name: "mock".to_string(),
             created: Utc::now(),
-            amount: 1.32,
+            amount: 132, // 132 cents = €1.32 (in smallest currency units)
             currency: "EUR".to_string(), // This can be overridden based on company config
             interval_amount: 1,
             interval_type: VmCostPlanIntervalType::Month,
@@ -113,7 +115,7 @@ impl Default for MockDb {
                 id: 1,
                 name: "Mock".to_string(),
                 enabled: true,
-                company_id: Some(1), // Link to default company
+                company_id: 1, // Link to default company
             },
         );
         let mut ip_ranges = HashMap::new();
@@ -235,6 +237,7 @@ impl Default for MockDb {
             subscriptions: Arc::new(Default::default()),
             subscription_line_items: Arc::new(Default::default()),
             subscription_payments: Arc::new(Default::default()),
+            payment_method_configs: Arc::new(Default::default()),
         }
     }
 }
@@ -887,6 +890,13 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("Company with id {} not found", company_id))?)
     }
 
+    async fn list_companies(&self) -> DbResult<Vec<Company>> {
+        let companies = self.companies.lock().await;
+        let mut result: Vec<Company> = companies.values().cloned().collect();
+        result.sort_by_key(|c| c.id);
+        Ok(result)
+    }
+
     async fn get_vm_base_currency(&self, vm_id: u64) -> DbResult<String> {
         // Follow VM -> Host -> Region -> Company chain
         let vms = self.vms.lock().await;
@@ -902,15 +912,29 @@ impl LNVpsDbBase for MockDb {
             .get(&host.region_id)
             .ok_or_else(|| anyhow!("Region not found"))?;
 
-        if let Some(company_id) = region.company_id {
-            let companies = self.companies.lock().await;
-            let company = companies
-                .get(&company_id)
-                .ok_or_else(|| anyhow!("Company not found"))?;
-            Ok(company.base_currency.clone())
-        } else {
-            Ok("EUR".to_string()) // Default fallback
-        }
+        let companies = self.companies.lock().await;
+        let company = companies
+            .get(&region.company_id)
+            .ok_or_else(|| anyhow!("Company not found"))?;
+        Ok(company.base_currency.clone())
+    }
+
+    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<u64> {
+        // Follow VM -> Host -> Region -> Company chain
+        let vms = self.vms.lock().await;
+        let vm = vms.get(&vm_id).ok_or_else(|| anyhow!("VM not found"))?;
+
+        let hosts = self.hosts.lock().await;
+        let host = hosts
+            .get(&vm.host_id)
+            .ok_or_else(|| anyhow!("Host not found"))?;
+
+        let regions = self.regions.lock().await;
+        let region = regions
+            .get(&host.region_id)
+            .ok_or_else(|| anyhow!("Region not found"))?;
+
+        Ok(region.company_id)
     }
 
     async fn insert_vm_history(&self, history: &VmHistory) -> DbResult<u64> {
@@ -1211,6 +1235,7 @@ impl LNVpsDbBase for MockDb {
             is_paid: payment.is_paid,
             rate: payment.rate,
             tax: payment.tax,
+            processing_fee: payment.processing_fee,
             company_base_currency: "EUR".to_string(),
         })
     }
@@ -1359,6 +1384,89 @@ impl LNVpsDbBase for MockDb {
 
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         todo!()
+    }
+
+    // Payment Method Config
+    async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>> {
+        let configs = self.payment_method_configs.lock().await;
+        Ok(configs.values().cloned().collect())
+    }
+
+    async fn list_payment_method_configs_for_company(
+        &self,
+        company_id: u64,
+    ) -> DbResult<Vec<PaymentMethodConfig>> {
+        let configs = self.payment_method_configs.lock().await;
+        Ok(configs
+            .values()
+            .filter(|c| c.company_id == company_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_enabled_payment_method_configs_for_company(
+        &self,
+        company_id: u64,
+    ) -> DbResult<Vec<PaymentMethodConfig>> {
+        let configs = self.payment_method_configs.lock().await;
+        Ok(configs
+            .values()
+            .filter(|c| c.company_id == company_id && c.enabled)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_payment_method_config(&self, id: u64) -> DbResult<PaymentMethodConfig> {
+        let configs = self.payment_method_configs.lock().await;
+        Ok(configs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Payment method config not found: {}", id))?)
+    }
+
+    async fn get_payment_method_config_for_company(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+    ) -> DbResult<PaymentMethodConfig> {
+        let configs = self.payment_method_configs.lock().await;
+        Ok(configs
+            .values()
+            .find(|c| c.company_id == company_id && c.payment_method == method)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Payment method config not found for company {} / {:?}",
+                    company_id,
+                    method
+                )
+            })?)
+    }
+
+    async fn insert_payment_method_config(&self, config: &PaymentMethodConfig) -> DbResult<u64> {
+        let mut configs = self.payment_method_configs.lock().await;
+        let max_id = configs.keys().max().unwrap_or(&0);
+        let new_id = max_id + 1;
+        let mut new_config = config.clone();
+        new_config.id = new_id;
+        configs.insert(new_id, new_config);
+        Ok(new_id)
+    }
+
+    async fn update_payment_method_config(&self, config: &PaymentMethodConfig) -> DbResult<()> {
+        let mut configs = self.payment_method_configs.lock().await;
+        if configs.contains_key(&config.id) {
+            configs.insert(config.id, config.clone());
+            Ok(())
+        } else {
+            Err(anyhow!("Payment method config not found: {}", config.id).into())
+        }
+    }
+
+    async fn delete_payment_method_config(&self, id: u64) -> DbResult<()> {
+        let mut configs = self.payment_method_configs.lock().await;
+        configs.remove(&id);
+        Ok(())
     }
 }
 
@@ -1539,7 +1647,7 @@ impl lnvps_db::AdminDb for MockDb {
         &self,
         _name: &str,
         _enabled: bool,
-        _company_id: Option<u64>,
+        _company_id: u64,
     ) -> DbResult<u64> {
         Ok(1)
     }
@@ -1784,7 +1892,7 @@ impl lnvps_db::AdminDb for MockDb {
                 if let Some(vm) = vms.get(&payment.vm_id) {
                     if let Some(host) = hosts.get(&vm.host_id) {
                         if let Some(region) = regions.get(&host.region_id) {
-                            return region.company_id == Some(company_id);
+                            return region.company_id == company_id;
                         }
                     }
                 }
@@ -1824,34 +1932,34 @@ impl lnvps_db::AdminDb for MockDb {
             if let Some(vm) = vms.get(&payment.vm_id) {
                 if let Some(host) = hosts.get(&vm.host_id) {
                     if let Some(region) = regions.get(&host.region_id) {
-                        if let Some(region_company_id) = region.company_id {
-                            // Filter by company (always required)
-                            if region_company_id != company_id {
-                                continue;
-                            }
+                        let region_company_id = region.company_id;
+                        // Filter by company (always required)
+                        if region_company_id != company_id {
+                            continue;
+                        }
 
-                            if let Some(company) = companies.get(&region_company_id) {
-                                result.push(VmPaymentWithCompany {
-                                    id: payment.id.clone(),
-                                    vm_id: payment.vm_id,
-                                    created: payment.created,
-                                    expires: payment.expires,
-                                    amount: payment.amount,
-                                    currency: payment.currency.clone(),
-                                    payment_method: payment.payment_method,
-                                    payment_type: payment.payment_type,
-                                    external_data: payment.external_data.clone(),
-                                    external_id: payment.external_id.clone(),
-                                    is_paid: payment.is_paid,
-                                    rate: payment.rate,
-                                    time_value: payment.time_value,
-                                    tax: payment.tax,
-                                    upgrade_params: payment.upgrade_params.clone(),
-                                    company_id: region_company_id,
-                                    company_name: company.name.clone(),
-                                    company_base_currency: company.base_currency.clone(),
-                                });
-                            }
+                        if let Some(company) = companies.get(&region_company_id) {
+                            result.push(VmPaymentWithCompany {
+                                id: payment.id.clone(),
+                                vm_id: payment.vm_id,
+                                created: payment.created,
+                                expires: payment.expires,
+                                amount: payment.amount,
+                                currency: payment.currency.clone(),
+                                payment_method: payment.payment_method,
+                                payment_type: payment.payment_type,
+                                external_data: payment.external_data.clone(),
+                                external_id: payment.external_id.clone(),
+                                is_paid: payment.is_paid,
+                                rate: payment.rate,
+                                time_value: payment.time_value,
+                                tax: payment.tax,
+                                processing_fee: payment.processing_fee,
+                                upgrade_params: payment.upgrade_params.clone(),
+                                company_id: region_company_id,
+                                company_name: company.name.clone(),
+                                company_base_currency: company.base_currency.clone(),
+                            });
                         }
                     }
                 }

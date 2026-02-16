@@ -2,7 +2,7 @@ use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
 use anyhow::Result;
 use lnvps_api_common::{UpgradeConfig, WorkCommander, WorkJob};
-use lnvps_db::{LNVpsDb, VmPayment};
+use lnvps_db::{LNVpsDb, PaymentMethod, VmPayment};
 use log::{error, info, warn};
 use payments_rs::lightning::LightningNode;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ mod revolut;
 #[cfg(feature = "stripe")]
 mod stripe;
 
-pub fn listen_all_payments(
+pub async fn listen_all_payments(
     settings: &Settings,
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
@@ -36,21 +36,36 @@ pub fn listen_all_payments(
     #[cfg(feature = "revolut")]
     {
         use crate::payments::revolut::RevolutPaymentHandler;
-        if let Some(r) = &settings.revolut {
-            let mut handler = RevolutPaymentHandler::new(
-                r.clone(),
-                &settings.public_url,
-                db.clone(),
-                sender.clone(),
-            )?;
-            ret.push(tokio::spawn(async move {
-                loop {
-                    if let Err(e) = handler.listen().await {
-                        error!("revolut-error: {}", e);
-                    }
-                    sleep(Duration::from_secs(30)).await;
+
+        // Load all Revolut payment configs from database
+        let revolut_configs = db
+            .list_payment_method_configs()
+            .await?
+            .into_iter()
+            .filter(|c| c.payment_method == PaymentMethod::Revolut && c.enabled)
+            .collect::<Vec<_>>();
+
+        for config in revolut_configs {
+            info!("Starting Revolut payment handler for config: {}", config.name);
+            match RevolutPaymentHandler::new(&config, &settings.public_url, db.clone(), sender.clone())
+            {
+                Ok(mut handler) => {
+                    ret.push(tokio::spawn(async move {
+                        loop {
+                            if let Err(e) = handler.listen().await {
+                                error!("revolut-error: {}", e);
+                            }
+                            sleep(Duration::from_secs(30)).await;
+                        }
+                    }));
                 }
-            }));
+                Err(e) => {
+                    error!(
+                        "Failed to create Revolut payment handler for '{}': {}",
+                        config.name, e
+                    );
+                }
+            }
         }
     }
 

@@ -15,8 +15,9 @@ cargo build
 # Build with all features
 cargo build --all-features
 
-# Run all tests
-cargo test
+# Run all tests (IMPORTANT: use --test-threads=1 to avoid flaky tests)
+# Tests use shared static state (LazyLock) in mocks, so they must run sequentially
+cargo test -- --test-threads=1
 
 # Run a single test by name (substring match)
 cargo test test_name_substring
@@ -210,6 +211,53 @@ mod tests {
 - **Always return amounts in API responses as cents / milli-sats**
 - **Never add JavaScript code examples to API documentation**
 - **Prefer `map()` and `and_then()` over deeply nested if structures**
+- **Never expose secrets in admin API responses** - tokens, API keys, webhook secrets, and other sensitive values must never be returned in GET/list responses. Use sanitized structs with boolean indicators (e.g., `has_token: true`) instead of actual values.
+
+## API Documentation Requirements
+
+When modifying any API (user-facing or admin), you **MUST**:
+
+1. **Update the API documentation** - Keep `ADMIN_API_ENDPOINTS.md` and any other API docs in sync with code changes
+2. **Update the API changelog** - Add an entry to `API_CHANGELOG.md` describing the change with:
+   - Date of change
+   - Type of change (Added, Changed, Deprecated, Removed, Fixed, Security)
+   - Brief description of what changed
+   - Which endpoints are affected
+
+## Currency Handling
+
+The project uses `payments_rs::currency::CurrencyAmount` for currency conversions.
+
+### Database Storage
+- All money amounts are stored as `u64` in smallest currency units (cents for fiat, millisats for BTC)
+- This includes: cost plan amounts, custom pricing costs (cpu_cost, memory_cost, ip4_cost, ip6_cost, disk cost), fees, payment amounts
+
+### Admin API
+- The admin API accepts and returns amounts as `u64` in smallest currency units (cents for fiat, millisats for BTC)
+- Use `payments_rs` for conversions:
+  - `CurrencyAmount::from_u64(Currency, u64)` - smallest units directly
+  - `CurrencyAmount::from_f32(Currency, f32)` - human-readable to smallest units
+  - `.value()` - returns `u64` smallest units
+  - `.value_f32()` - returns `f32` human-readable
+
+### Currency Decimal Places
+- Most fiat currencies (EUR, USD, GBP, CAD, CHF, AUD): 2 decimal places (100 cents = 1 unit)
+- JPY: 0 decimal places
+- BTC: uses millisats (1000 millisats = 1 satoshi)
+
+### Example
+```rust
+use payments_rs::currency::{Currency, CurrencyAmount};
+
+// Working with smallest units (preferred for API)
+let amount = CurrencyAmount::from_u64(Currency::EUR, 1099); // €10.99 = 1099 cents
+assert_eq!(amount.value(), 1099); // 1099 cents
+assert_eq!(amount.value_f32(), 10.99); // €10.99
+
+// Converting human-readable to smallest units
+let amount = CurrencyAmount::from_f32(Currency::EUR, 10.99); // €10.99
+assert_eq!(amount.value(), 1099); // 1099 cents
+```
 
 ## Module Structure Pattern
 

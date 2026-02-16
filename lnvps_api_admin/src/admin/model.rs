@@ -618,7 +618,7 @@ pub struct AdminRegionInfo {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
-    pub company_id: Option<u64>,
+    pub company_id: u64,
     pub host_count: u64,
     pub total_vms: u64,
     pub total_cpu_cores: u64,
@@ -630,7 +630,7 @@ pub struct AdminRegionInfo {
 pub struct CreateRegionRequest {
     pub name: String,
     pub enabled: bool,
-    pub company_id: Option<u64>,
+    pub company_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -982,7 +982,8 @@ pub struct AdminCreateVmTemplateRequest {
     pub region_id: u64,
     // Cost plan creation fields - used when cost_plan_id is not provided
     pub cost_plan_name: Option<String>, // Defaults to "{template_name} Cost Plan"
-    pub cost_plan_amount: Option<f32>,  // Required if cost_plan_id not provided
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC) - required if cost_plan_id not provided
+    pub cost_plan_amount: Option<u64>,
     pub cost_plan_currency: Option<String>, // Defaults to "USD"
     pub cost_plan_interval_amount: Option<u64>, // Defaults to 1
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
@@ -1002,7 +1003,8 @@ pub struct AdminUpdateVmTemplateRequest {
     pub region_id: Option<u64>,
     // Cost plan update fields - will update the associated cost plan for this template
     pub cost_plan_name: Option<String>,
-    pub cost_plan_amount: Option<f32>,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost_plan_amount: Option<u64>,
     pub cost_plan_currency: Option<String>,
     pub cost_plan_interval_amount: Option<u64>,
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>,
@@ -1033,10 +1035,14 @@ pub struct AdminCustomPricingInfo {
     pub region_id: u64,
     pub region_name: Option<String>,
     pub currency: String,
-    pub cpu_cost: f32,
-    pub memory_cost: f32,
-    pub ip4_cost: f32,
-    pub ip6_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
     pub min_cpu: u16,
     pub max_cpu: u16,
     pub min_memory: u64,
@@ -1050,7 +1056,8 @@ pub struct AdminCustomPricingDisk {
     pub id: u64,
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
-    pub cost: f32,
+    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost: u64,
     pub max_disk_size: u64,
     pub min_disk_size: u64,
 }
@@ -1062,10 +1069,14 @@ pub struct UpdateCustomPricingRequest {
     pub expires: Option<Option<DateTime<Utc>>>,
     pub region_id: Option<u64>,
     pub currency: Option<String>,
-    pub cpu_cost: Option<f32>,
-    pub memory_cost: Option<f32>,
-    pub ip4_cost: Option<f32>,
-    pub ip6_cost: Option<f32>,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: Option<u64>,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: Option<u64>,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: Option<u64>,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: Option<u64>,
     pub min_cpu: Option<u16>,
     pub max_cpu: Option<u16>,
     pub min_memory: Option<u64>,
@@ -1080,10 +1091,14 @@ pub struct CreateCustomPricingRequest {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
-    pub cpu_cost: f32,
-    pub memory_cost: f32,
-    pub ip4_cost: f32,
-    pub ip6_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
     pub min_cpu: u16,
     pub max_cpu: u16,
     pub min_memory: u64,
@@ -1095,7 +1110,8 @@ pub struct CreateCustomPricingRequest {
 pub struct CreateCustomPricingDisk {
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
-    pub cost: f32,
+    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost: u64,
     pub min_disk_size: u64,
     pub max_disk_size: u64,
 }
@@ -1433,7 +1449,8 @@ pub struct AdminCostPlanInfo {
     pub id: u64,
     pub name: String,
     pub created: DateTime<Utc>,
-    pub amount: f32,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,
@@ -1443,7 +1460,8 @@ pub struct AdminCostPlanInfo {
 #[derive(Deserialize)]
 pub struct AdminCreateCostPlanRequest {
     pub name: String,
-    pub amount: f32,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,
@@ -1452,7 +1470,8 @@ pub struct AdminCreateCostPlanRequest {
 #[derive(Deserialize)]
 pub struct AdminUpdateCostPlanRequest {
     pub name: Option<String>,
-    pub amount: Option<f32>,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: Option<u64>,
     pub currency: Option<String>,
     pub interval_amount: Option<u64>,
     pub interval_type: Option<ApiVmCostPlanIntervalType>,
@@ -1479,10 +1498,6 @@ impl AdminCreateCostPlanRequest {
 
         if self.name.trim().is_empty() {
             return Err(anyhow::anyhow!("Cost plan name cannot be empty"));
-        }
-
-        if self.amount < 0.0 {
-            return Err(anyhow::anyhow!("Cost plan amount cannot be negative"));
         }
 
         if self.currency.trim().is_empty() {
@@ -1780,6 +1795,7 @@ pub struct AdminSubscriptionInfo {
 #[derive(Deserialize)]
 pub struct AdminCreateSubscriptionRequest {
     pub user_id: u64,
+    pub company_id: u64,
     pub name: String,
     pub description: Option<String>,
     pub expires: Option<DateTime<Utc>>,
@@ -1835,6 +1851,7 @@ impl AdminCreateSubscriptionRequest {
         Ok(lnvps_db::Subscription {
             id: 0,
             user_id: self.user_id,
+            company_id: self.company_id,
             name: self.name.trim().to_string(),
             description: self.description.clone(),
             created: chrono::Utc::now(),
@@ -1995,6 +2012,7 @@ impl From<lnvps_db::InternetRegistry> for AdminInternetRegistry {
 #[derive(Serialize)]
 pub struct AdminAvailableIpSpaceInfo {
     pub id: u64,
+    pub company_id: u64,
     pub cidr: String,
     pub min_prefix_size: u16,
     pub max_prefix_size: u16,
@@ -2008,6 +2026,7 @@ pub struct AdminAvailableIpSpaceInfo {
 
 #[derive(Deserialize)]
 pub struct CreateAvailableIpSpaceRequest {
+    pub company_id: u64,
     pub cidr: String,
     pub min_prefix_size: u16,
     pub max_prefix_size: u16,
@@ -2034,6 +2053,7 @@ impl From<lnvps_db::AvailableIpSpace> for AdminAvailableIpSpaceInfo {
     fn from(space: lnvps_db::AvailableIpSpace) -> Self {
         Self {
             id: space.id,
+            company_id: space.company_id,
             cidr: space.cidr,
             min_prefix_size: space.min_prefix_size,
             max_prefix_size: space.max_prefix_size,
@@ -2113,6 +2133,7 @@ impl CreateAvailableIpSpaceRequest {
 
         Ok(lnvps_db::AvailableIpSpace {
             id: 0, // Will be set by database
+            company_id: self.company_id,
             cidr: self.cidr.trim().to_string(),
             min_prefix_size: self.min_prefix_size,
             max_prefix_size: self.max_prefix_size,
@@ -2259,5 +2280,385 @@ impl AdminIpRangeSubscriptionInfo {
         }
 
         Ok(info)
+    }
+}
+
+// Payment Method Configuration Models
+
+/// Admin payment method enum matching PaymentMethod from lnvps_db
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminPaymentMethodType {
+    Lightning,
+    Revolut,
+    Paypal,
+    Stripe,
+}
+
+impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
+    fn from(method: lnvps_db::PaymentMethod) -> Self {
+        match method {
+            lnvps_db::PaymentMethod::Lightning => AdminPaymentMethodType::Lightning,
+            lnvps_db::PaymentMethod::Revolut => AdminPaymentMethodType::Revolut,
+            lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
+            lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
+        }
+    }
+}
+
+impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
+    fn from(method: AdminPaymentMethodType) -> Self {
+        match method {
+            AdminPaymentMethodType::Lightning => lnvps_db::PaymentMethod::Lightning,
+            AdminPaymentMethodType::Revolut => lnvps_db::PaymentMethod::Revolut,
+            AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
+            AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
+        }
+    }
+}
+
+// Sanitized provider configs - hide secret values for view-only/display purposes
+
+/// Sanitized LND config (shows paths but not file contents)
+#[derive(Serialize)]
+pub struct SanitizedLndConfig {
+    pub url: String,
+    pub cert_path: String,
+    pub macaroon_path: String,
+}
+
+/// Sanitized Bitvora config (hides token and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedBitvoraConfig {
+    /// Whether token is configured
+    pub has_token: bool,
+    /// Whether webhook secret is configured
+    pub has_webhook_secret: bool,
+}
+
+/// Sanitized Revolut config (hides token and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedRevolutConfig {
+    pub url: String,
+    pub api_version: String,
+    pub public_key: String,
+    /// Whether token is configured
+    pub has_token: bool,
+    /// Whether webhook secret is configured
+    pub has_webhook_secret: bool,
+}
+
+/// Sanitized Stripe config (hides secret_key and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedStripeConfig {
+    pub publishable_key: String,
+    /// Whether secret key is configured
+    pub has_secret_key: bool,
+    /// Whether webhook secret is configured
+    pub has_webhook_secret: bool,
+}
+
+/// Sanitized PayPal config (hides client_secret)
+#[derive(Serialize)]
+pub struct SanitizedPaypalConfig {
+    pub client_id: String,
+    pub mode: String,
+    /// Whether client secret is configured
+    pub has_client_secret: bool,
+}
+
+/// Sanitized provider configuration - hides all secret/token values
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SanitizedProviderConfig {
+    Lnd(SanitizedLndConfig),
+    Bitvora(SanitizedBitvoraConfig),
+    Revolut(SanitizedRevolutConfig),
+    Stripe(SanitizedStripeConfig),
+    Paypal(SanitizedPaypalConfig),
+}
+
+impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
+    fn from(config: &lnvps_db::ProviderConfig) -> Self {
+        match config {
+            lnvps_db::ProviderConfig::Lnd(cfg) => {
+                SanitizedProviderConfig::Lnd(SanitizedLndConfig {
+                    url: cfg.url.clone(),
+                    cert_path: cfg.cert_path.display().to_string(),
+                    macaroon_path: cfg.macaroon_path.display().to_string(),
+                })
+            }
+            lnvps_db::ProviderConfig::Bitvora(cfg) => {
+                SanitizedProviderConfig::Bitvora(SanitizedBitvoraConfig {
+                    has_token: !cfg.token.is_empty(),
+                    has_webhook_secret: !cfg.webhook_secret.is_empty(),
+                })
+            }
+            lnvps_db::ProviderConfig::Revolut(cfg) => {
+                SanitizedProviderConfig::Revolut(SanitizedRevolutConfig {
+                    url: cfg.url.clone(),
+                    api_version: cfg.api_version.clone(),
+                    public_key: cfg.public_key.clone(),
+                    has_token: !cfg.token.is_empty(),
+                    has_webhook_secret: cfg.webhook_secret.as_ref().map_or(false, |s| !s.is_empty()),
+                })
+            }
+            lnvps_db::ProviderConfig::Stripe(cfg) => {
+                SanitizedProviderConfig::Stripe(SanitizedStripeConfig {
+                    publishable_key: cfg.publishable_key.clone(),
+                    has_secret_key: !cfg.secret_key.is_empty(),
+                    has_webhook_secret: !cfg.webhook_secret.is_empty(),
+                })
+            }
+            lnvps_db::ProviderConfig::Paypal(cfg) => {
+                SanitizedProviderConfig::Paypal(SanitizedPaypalConfig {
+                    client_id: cfg.client_id.clone(),
+                    mode: cfg.mode.clone(),
+                    has_client_secret: !cfg.client_secret.is_empty(),
+                })
+            }
+        }
+    }
+}
+
+/// Admin view of payment method configuration
+/// Note: Secret values (tokens, API keys, etc.) are never returned - use sanitized config
+#[derive(Serialize)]
+pub struct AdminPaymentMethodConfigInfo {
+    pub id: u64,
+    /// Company this config belongs to - enforces one config per payment method per company
+    pub company_id: u64,
+    pub payment_method: AdminPaymentMethodType,
+    pub name: String,
+    pub enabled: bool,
+    pub provider_type: String,
+    /// Sanitized provider configuration - secrets are hidden (may be None if deserialization fails)
+    pub config: Option<SanitizedProviderConfig>,
+    /// Processing fee percentage rate (e.g., 1.0 for 1%)
+    pub processing_fee_rate: Option<f32>,
+    /// Processing fee base amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub processing_fee_base: Option<u64>,
+    /// Currency for the processing fee base
+    pub processing_fee_currency: Option<String>,
+    pub created: DateTime<Utc>,
+    pub modified: DateTime<Utc>,
+}
+
+impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
+    fn from(config: lnvps_db::PaymentMethodConfig) -> Self {
+        let provider_config = config.get_provider_config();
+        // Convert to sanitized config - hide all secret values
+        let sanitized_config = provider_config.as_ref().map(SanitizedProviderConfig::from);
+        Self {
+            id: config.id,
+            company_id: config.company_id,
+            payment_method: AdminPaymentMethodType::from(config.payment_method),
+            name: config.name,
+            enabled: config.enabled,
+            provider_type: config.provider_type,
+            config: sanitized_config,
+            processing_fee_rate: config.processing_fee_rate,
+            processing_fee_base: config.processing_fee_base,
+            processing_fee_currency: config.processing_fee_currency,
+            created: config.created,
+            modified: config.modified,
+        }
+    }
+}
+
+/// Request to create a new payment method configuration
+#[derive(Deserialize)]
+pub struct CreatePaymentMethodConfigRequest {
+    /// Company this config belongs to - each company can have one config per payment method type
+    pub company_id: u64,
+    pub name: String,
+    pub enabled: Option<bool>,
+    /// Typed provider configuration
+    pub config: lnvps_db::ProviderConfig,
+    pub processing_fee_rate: Option<f32>,
+    /// Processing fee base in smallest currency units (cents for fiat, millisats for BTC)
+    pub processing_fee_base: Option<u64>,
+    pub processing_fee_currency: Option<String>,
+}
+
+impl CreatePaymentMethodConfigRequest {
+    pub fn to_payment_method_config(&self) -> anyhow::Result<lnvps_db::PaymentMethodConfig> {
+        if self.name.trim().is_empty() {
+            return Err(anyhow!("Payment method config name cannot be empty"));
+        }
+
+        // Validate that if processing fee base is set, currency must also be set
+        if self.processing_fee_base.is_some() && self.processing_fee_currency.is_none() {
+            return Err(anyhow!(
+                "Processing fee currency is required when processing fee base is set"
+            ));
+        }
+
+        let mut payment_config = lnvps_db::PaymentMethodConfig::new_with_config(
+            self.company_id,
+            self.config.payment_method(),
+            self.name.trim().to_string(),
+            self.enabled.unwrap_or(true),
+            self.config.clone(),
+        );
+        payment_config.processing_fee_rate = self.processing_fee_rate;
+        payment_config.processing_fee_base = self.processing_fee_base;
+        payment_config.processing_fee_currency = self
+            .processing_fee_currency
+            .as_ref()
+            .map(|s| s.trim().to_uppercase());
+
+        Ok(payment_config)
+    }
+}
+
+/// Request to update an existing payment method configuration
+#[derive(Deserialize)]
+pub struct UpdatePaymentMethodConfigRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    /// Partial provider configuration - only provided fields will be updated
+    pub config: Option<PartialProviderConfig>,
+    pub processing_fee_rate: Option<Option<f32>>,
+    /// Processing fee base in smallest currency units (cents for fiat, millisats for BTC)
+    pub processing_fee_base: Option<Option<u64>>,
+    pub processing_fee_currency: Option<Option<String>>,
+}
+
+// Partial provider config types for updates - all fields are optional
+
+/// Partial LND config for updates
+#[derive(Deserialize)]
+pub struct PartialLndConfig {
+    pub url: Option<String>,
+    pub cert_path: Option<std::path::PathBuf>,
+    pub macaroon_path: Option<std::path::PathBuf>,
+}
+
+/// Partial Bitvora config for updates
+#[derive(Deserialize)]
+pub struct PartialBitvoraConfig {
+    pub token: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+/// Partial Revolut config for updates
+#[derive(Deserialize)]
+pub struct PartialRevolutConfig {
+    pub url: Option<String>,
+    pub token: Option<String>,
+    pub api_version: Option<String>,
+    pub public_key: Option<String>,
+    pub webhook_secret: Option<Option<String>>,
+}
+
+/// Partial Stripe config for updates
+#[derive(Deserialize)]
+pub struct PartialStripeConfig {
+    pub secret_key: Option<String>,
+    pub publishable_key: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+/// Partial PayPal config for updates
+#[derive(Deserialize)]
+pub struct PartialPaypalConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub mode: Option<String>,
+}
+
+/// Partial provider configuration for updates - only provided fields will be updated
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartialProviderConfig {
+    Lnd(PartialLndConfig),
+    Bitvora(PartialBitvoraConfig),
+    Revolut(PartialRevolutConfig),
+    Stripe(PartialStripeConfig),
+    Paypal(PartialPaypalConfig),
+}
+
+impl PartialProviderConfig {
+    /// Merge this partial config with an existing full config
+    /// Returns an error if the types don't match
+    pub fn merge_with(
+        self,
+        existing: &lnvps_db::ProviderConfig,
+    ) -> anyhow::Result<lnvps_db::ProviderConfig> {
+        use lnvps_db::ProviderConfig;
+
+        match (self, existing) {
+            (PartialProviderConfig::Lnd(partial), ProviderConfig::Lnd(existing)) => {
+                Ok(ProviderConfig::Lnd(lnvps_db::LndConfig {
+                    url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                    cert_path: partial.cert_path.unwrap_or_else(|| existing.cert_path.clone()),
+                    macaroon_path: partial
+                        .macaroon_path
+                        .unwrap_or_else(|| existing.macaroon_path.clone()),
+                }))
+            }
+            (PartialProviderConfig::Bitvora(partial), ProviderConfig::Bitvora(existing)) => {
+                Ok(ProviderConfig::Bitvora(lnvps_db::BitvoraConfig {
+                    token: partial.token.unwrap_or_else(|| existing.token.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                }))
+            }
+            (PartialProviderConfig::Revolut(partial), ProviderConfig::Revolut(existing)) => {
+                Ok(ProviderConfig::Revolut(lnvps_db::RevolutProviderConfig {
+                    url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                    token: partial.token.unwrap_or_else(|| existing.token.clone()),
+                    api_version: partial
+                        .api_version
+                        .unwrap_or_else(|| existing.api_version.clone()),
+                    public_key: partial
+                        .public_key
+                        .unwrap_or_else(|| existing.public_key.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                }))
+            }
+            (PartialProviderConfig::Stripe(partial), ProviderConfig::Stripe(existing)) => {
+                Ok(ProviderConfig::Stripe(lnvps_db::StripeProviderConfig {
+                    secret_key: partial
+                        .secret_key
+                        .unwrap_or_else(|| existing.secret_key.clone()),
+                    publishable_key: partial
+                        .publishable_key
+                        .unwrap_or_else(|| existing.publishable_key.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                }))
+            }
+            (PartialProviderConfig::Paypal(partial), ProviderConfig::Paypal(existing)) => {
+                Ok(ProviderConfig::Paypal(lnvps_db::PaypalProviderConfig {
+                    client_id: partial
+                        .client_id
+                        .unwrap_or_else(|| existing.client_id.clone()),
+                    client_secret: partial
+                        .client_secret
+                        .unwrap_or_else(|| existing.client_secret.clone()),
+                    mode: partial.mode.unwrap_or_else(|| existing.mode.clone()),
+                }))
+            }
+            _ => Err(anyhow!(
+                "Cannot change provider type during update. Create a new config instead."
+            )),
+        }
+    }
+
+    /// Get the provider type for validation
+    pub fn provider_type(&self) -> &'static str {
+        match self {
+            PartialProviderConfig::Lnd(_) => "lnd",
+            PartialProviderConfig::Bitvora(_) => "bitvora",
+            PartialProviderConfig::Revolut(_) => "revolut",
+            PartialProviderConfig::Stripe(_) => "stripe",
+            PartialProviderConfig::Paypal(_) => "paypal",
+        }
     }
 }

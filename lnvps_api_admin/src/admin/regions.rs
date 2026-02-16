@@ -135,8 +135,8 @@ async fn admin_update_region(
     if let Some(enabled) = req.enabled {
         region.enabled = enabled;
     }
-    if req.company_id.is_some() {
-        region.company_id = req.company_id;
+    if let Some(company_id) = req.company_id {
+        region.company_id = company_id;
     }
 
     // Save changes

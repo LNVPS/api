@@ -14,6 +14,7 @@ mod hosts;
 mod ip_ranges;
 mod ip_space;
 mod model;
+mod payment_methods;
 mod regions;
 mod reports;
 mod roles;
@@ -62,6 +63,7 @@ pub fn admin_router(
         .merge(subscriptions::router())
         .merge(reports::router())
         .merge(websocket::router())
+        .merge(payment_methods::router())
         .with_state(RouterState {
             db,
             work_commander,
