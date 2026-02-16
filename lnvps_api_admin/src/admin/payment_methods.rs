@@ -99,10 +99,18 @@ async fn admin_update_payment_method(
     if let Some(enabled) = request.enabled {
         config.enabled = enabled;
     }
-    if let Some(new_config) = request.config {
-        // When updating config, also update the payment_method field
-        config.payment_method = new_config.payment_method();
-        config.set_provider_config(new_config);
+    if let Some(partial_config) = request.config {
+        // Get existing config to merge with
+        let existing_config = config
+            .get_provider_config()
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse existing provider config"))?;
+
+        // Merge partial config with existing
+        let merged_config = partial_config.merge_with(&existing_config)?;
+
+        // Update the config
+        config.payment_method = merged_config.payment_method();
+        config.set_provider_config(merged_config);
     }
     if let Some(rate) = request.processing_fee_rate {
         config.processing_fee_rate = rate;

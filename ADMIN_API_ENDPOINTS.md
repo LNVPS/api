@@ -2955,20 +2955,57 @@ PATCH /api/admin/v1/payment_methods/{id}
 ```
 Required Permission: `payment_method_config::update`
 
-Body (all optional):
+Body (all fields optional):
 ```json
 {
   "name": "string",                           // Display name (cannot be empty)
   "enabled": boolean,                         // Enable/disable the payment method
-  "config": ProviderConfig,                   // Typed provider configuration (see examples above)
+  "config": PartialProviderConfig,            // Partial provider configuration (only include fields to update)
   "processing_fee_rate": number | null,       // Fee percentage (null to clear)
   "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20, null to clear)
   "processing_fee_currency": "string | null"  // Currency code (required if base fee is set)
 }
 ```
 
-Note: If `processing_fee_base` is set, `processing_fee_currency` must also be provided.
-Note: When updating `config`, the entire ProviderConfig object must be provided (including `type` discriminator).
+**Partial Config Update Examples:**
+
+When updating config, only provide the fields you want to change. Missing fields will retain their existing values.
+
+Update only the `url` for a Revolut config (keeps token, api_version, etc.):
+```json
+{
+  "config": {
+    "type": "revolut",
+    "url": "https://merchant.revolut.com/api/"
+  }
+}
+```
+
+Update only the `public_key` for a Revolut config:
+```json
+{
+  "config": {
+    "type": "revolut",
+    "public_key": "pk_new_key_here"
+  }
+}
+```
+
+Update LND macaroon path only:
+```json
+{
+  "config": {
+    "type": "lnd",
+    "macaroon_path": "/new/path/to/admin.macaroon"
+  }
+}
+```
+
+**Notes:**
+- The `type` field is always required in the config to identify the provider type
+- You cannot change the provider type during an update (e.g., from `lnd` to `revolut`)
+- If `processing_fee_base` is set, `processing_fee_currency` must also be provided
+- Sensitive fields (tokens, secrets) that are not provided will remain unchanged
 
 ### Delete Payment Method Configuration
 ```
@@ -3029,24 +3066,38 @@ Response:
 {
   "name": "string | null",                    // Optional - Display name
   "enabled": boolean | null,                  // Optional - Enable/disable
-  "config": ProviderConfig | null,            // Optional - Typed provider config (with "type" discriminator)
+  "config": PartialProviderConfig | null,     // Optional - Partial provider config (only include fields to update)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (null to clear)
   "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (null to clear)
   "processing_fee_currency": "string | null"  // Optional - Currency (null to clear)
 }
 ```
 
-### ProviderConfig (Tagged Union)
+### ProviderConfig (Tagged Union) - For Creation
 
-The `config` field uses a tagged union format with `"type"` as the discriminator:
+The `config` field for **creating** a new payment method uses a tagged union format with `"type"` as the discriminator.
+All fields except `webhook_secret` are required when creating:
 
-| Type      | Payment Method | Fields                                                    |
+| Type      | Payment Method | Required Fields                                           |
 |-----------|----------------|-----------------------------------------------------------|
 | `lnd`     | lightning      | `url`, `cert_path`, `macaroon_path`                       |
 | ~~`bitvora`~~ | ~~lightning~~ | ~~`token`, `webhook_secret`~~ (service shut down)        |
-| `revolut` | revolut        | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
+| `revolut` | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
 | `stripe`  | stripe         | `secret_key`, `publishable_key`, `webhook_secret`         |
 | `paypal`  | paypal         | `client_id`, `client_secret`, `mode`                      |
+
+### PartialProviderConfig (Tagged Union) - For Updates
+
+The `config` field for **updating** a payment method also uses a tagged union format with `"type"` as the discriminator.
+Only the `type` field is required; all other fields are optional and will keep their existing values if not provided:
+
+| Type      | Optional Fields                                                    |
+|-----------|-------------------------------------------------------------------|
+| `lnd`     | `url`, `cert_path`, `macaroon_path`                               |
+| ~~`bitvora`~~ | ~~`token`, `webhook_secret`~~ (service shut down)             |
+| `revolut` | `url`, `token`, `api_version`, `public_key`, `webhook_secret`     |
+| `stripe`  | `secret_key`, `publishable_key`, `webhook_secret`                 |
+| `paypal`  | `client_id`, `client_secret`, `mode`                              |
 
 ### Notes
 

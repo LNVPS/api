@@ -982,7 +982,8 @@ pub struct AdminCreateVmTemplateRequest {
     pub region_id: u64,
     // Cost plan creation fields - used when cost_plan_id is not provided
     pub cost_plan_name: Option<String>, // Defaults to "{template_name} Cost Plan"
-    pub cost_plan_amount: Option<f32>,  // Required if cost_plan_id not provided
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC) - required if cost_plan_id not provided
+    pub cost_plan_amount: Option<u64>,
     pub cost_plan_currency: Option<String>, // Defaults to "USD"
     pub cost_plan_interval_amount: Option<u64>, // Defaults to 1
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
@@ -1002,7 +1003,8 @@ pub struct AdminUpdateVmTemplateRequest {
     pub region_id: Option<u64>,
     // Cost plan update fields - will update the associated cost plan for this template
     pub cost_plan_name: Option<String>,
-    pub cost_plan_amount: Option<f32>,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost_plan_amount: Option<u64>,
     pub cost_plan_currency: Option<String>,
     pub cost_plan_interval_amount: Option<u64>,
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>,
@@ -1033,10 +1035,14 @@ pub struct AdminCustomPricingInfo {
     pub region_id: u64,
     pub region_name: Option<String>,
     pub currency: String,
-    pub cpu_cost: f32,
-    pub memory_cost: f32,
-    pub ip4_cost: f32,
-    pub ip6_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
     pub min_cpu: u16,
     pub max_cpu: u16,
     pub min_memory: u64,
@@ -1050,7 +1056,8 @@ pub struct AdminCustomPricingDisk {
     pub id: u64,
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
-    pub cost: f32,
+    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost: u64,
     pub max_disk_size: u64,
     pub min_disk_size: u64,
 }
@@ -1062,10 +1069,14 @@ pub struct UpdateCustomPricingRequest {
     pub expires: Option<Option<DateTime<Utc>>>,
     pub region_id: Option<u64>,
     pub currency: Option<String>,
-    pub cpu_cost: Option<f32>,
-    pub memory_cost: Option<f32>,
-    pub ip4_cost: Option<f32>,
-    pub ip6_cost: Option<f32>,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: Option<u64>,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: Option<u64>,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: Option<u64>,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: Option<u64>,
     pub min_cpu: Option<u16>,
     pub max_cpu: Option<u16>,
     pub min_memory: Option<u64>,
@@ -1080,10 +1091,14 @@ pub struct CreateCustomPricingRequest {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
-    pub cpu_cost: f32,
-    pub memory_cost: f32,
-    pub ip4_cost: f32,
-    pub ip6_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
     pub min_cpu: u16,
     pub max_cpu: u16,
     pub min_memory: u64,
@@ -1095,7 +1110,8 @@ pub struct CreateCustomPricingRequest {
 pub struct CreateCustomPricingDisk {
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
-    pub cost: f32,
+    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost: u64,
     pub min_disk_size: u64,
     pub max_disk_size: u64,
 }
@@ -1433,7 +1449,8 @@ pub struct AdminCostPlanInfo {
     pub id: u64,
     pub name: String,
     pub created: DateTime<Utc>,
-    pub amount: f32,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,
@@ -1443,7 +1460,8 @@ pub struct AdminCostPlanInfo {
 #[derive(Deserialize)]
 pub struct AdminCreateCostPlanRequest {
     pub name: String,
-    pub amount: f32,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: ApiVmCostPlanIntervalType,
@@ -1452,7 +1470,8 @@ pub struct AdminCreateCostPlanRequest {
 #[derive(Deserialize)]
 pub struct AdminUpdateCostPlanRequest {
     pub name: Option<String>,
-    pub amount: Option<f32>,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: Option<u64>,
     pub currency: Option<String>,
     pub interval_amount: Option<u64>,
     pub interval_type: Option<ApiVmCostPlanIntervalType>,
@@ -1479,10 +1498,6 @@ impl AdminCreateCostPlanRequest {
 
         if self.name.trim().is_empty() {
             return Err(anyhow::anyhow!("Cost plan name cannot be empty"));
-        }
-
-        if self.amount < 0.0 {
-            return Err(anyhow::anyhow!("Cost plan amount cannot be negative"));
         }
 
         if self.currency.trim().is_empty() {
@@ -2525,9 +2540,147 @@ impl CreatePaymentMethodConfigRequest {
 pub struct UpdatePaymentMethodConfigRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
-    /// Typed provider configuration
-    pub config: Option<lnvps_db::ProviderConfig>,
+    /// Partial provider configuration - only provided fields will be updated
+    pub config: Option<PartialProviderConfig>,
     pub processing_fee_rate: Option<Option<f32>>,
     pub processing_fee_base: Option<Option<f32>>,
     pub processing_fee_currency: Option<Option<String>>,
+}
+
+// Partial provider config types for updates - all fields are optional
+
+/// Partial LND config for updates
+#[derive(Deserialize)]
+pub struct PartialLndConfig {
+    pub url: Option<String>,
+    pub cert_path: Option<std::path::PathBuf>,
+    pub macaroon_path: Option<std::path::PathBuf>,
+}
+
+/// Partial Bitvora config for updates
+#[derive(Deserialize)]
+pub struct PartialBitvoraConfig {
+    pub token: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+/// Partial Revolut config for updates
+#[derive(Deserialize)]
+pub struct PartialRevolutConfig {
+    pub url: Option<String>,
+    pub token: Option<String>,
+    pub api_version: Option<String>,
+    pub public_key: Option<String>,
+    pub webhook_secret: Option<Option<String>>,
+}
+
+/// Partial Stripe config for updates
+#[derive(Deserialize)]
+pub struct PartialStripeConfig {
+    pub secret_key: Option<String>,
+    pub publishable_key: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+/// Partial PayPal config for updates
+#[derive(Deserialize)]
+pub struct PartialPaypalConfig {
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub mode: Option<String>,
+}
+
+/// Partial provider configuration for updates - only provided fields will be updated
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartialProviderConfig {
+    Lnd(PartialLndConfig),
+    Bitvora(PartialBitvoraConfig),
+    Revolut(PartialRevolutConfig),
+    Stripe(PartialStripeConfig),
+    Paypal(PartialPaypalConfig),
+}
+
+impl PartialProviderConfig {
+    /// Merge this partial config with an existing full config
+    /// Returns an error if the types don't match
+    pub fn merge_with(
+        self,
+        existing: &lnvps_db::ProviderConfig,
+    ) -> anyhow::Result<lnvps_db::ProviderConfig> {
+        use lnvps_db::ProviderConfig;
+
+        match (self, existing) {
+            (PartialProviderConfig::Lnd(partial), ProviderConfig::Lnd(existing)) => {
+                Ok(ProviderConfig::Lnd(lnvps_db::LndConfig {
+                    url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                    cert_path: partial.cert_path.unwrap_or_else(|| existing.cert_path.clone()),
+                    macaroon_path: partial
+                        .macaroon_path
+                        .unwrap_or_else(|| existing.macaroon_path.clone()),
+                }))
+            }
+            (PartialProviderConfig::Bitvora(partial), ProviderConfig::Bitvora(existing)) => {
+                Ok(ProviderConfig::Bitvora(lnvps_db::BitvoraConfig {
+                    token: partial.token.unwrap_or_else(|| existing.token.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                }))
+            }
+            (PartialProviderConfig::Revolut(partial), ProviderConfig::Revolut(existing)) => {
+                Ok(ProviderConfig::Revolut(lnvps_db::RevolutProviderConfig {
+                    url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                    token: partial.token.unwrap_or_else(|| existing.token.clone()),
+                    api_version: partial
+                        .api_version
+                        .unwrap_or_else(|| existing.api_version.clone()),
+                    public_key: partial
+                        .public_key
+                        .unwrap_or_else(|| existing.public_key.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                }))
+            }
+            (PartialProviderConfig::Stripe(partial), ProviderConfig::Stripe(existing)) => {
+                Ok(ProviderConfig::Stripe(lnvps_db::StripeProviderConfig {
+                    secret_key: partial
+                        .secret_key
+                        .unwrap_or_else(|| existing.secret_key.clone()),
+                    publishable_key: partial
+                        .publishable_key
+                        .unwrap_or_else(|| existing.publishable_key.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                }))
+            }
+            (PartialProviderConfig::Paypal(partial), ProviderConfig::Paypal(existing)) => {
+                Ok(ProviderConfig::Paypal(lnvps_db::PaypalProviderConfig {
+                    client_id: partial
+                        .client_id
+                        .unwrap_or_else(|| existing.client_id.clone()),
+                    client_secret: partial
+                        .client_secret
+                        .unwrap_or_else(|| existing.client_secret.clone()),
+                    mode: partial.mode.unwrap_or_else(|| existing.mode.clone()),
+                }))
+            }
+            _ => Err(anyhow!(
+                "Cannot change provider type during update. Create a new config instead."
+            )),
+        }
+    }
+
+    /// Get the provider type for validation
+    pub fn provider_type(&self) -> &'static str {
+        match self {
+            PartialProviderConfig::Lnd(_) => "lnd",
+            PartialProviderConfig::Bitvora(_) => "bitvora",
+            PartialProviderConfig::Revolut(_) => "revolut",
+            PartialProviderConfig::Stripe(_) => "stripe",
+            PartialProviderConfig::Paypal(_) => "paypal",
+        }
+    }
 }
