@@ -49,6 +49,7 @@ async fn v1_create_nostr_domain(
     let mut dom = NostrDomain {
         owner_id: uid,
         name: data.name.clone(),
+        activation_hash: Some(uuid::Uuid::new_v4().to_string()),
         ..Default::default()
     };
     let dom_id = this.db.insert_domain(&dom).await?;

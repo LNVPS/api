@@ -24,7 +24,7 @@ url = "2.5"
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
-sha2 = "0.10"
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.13"

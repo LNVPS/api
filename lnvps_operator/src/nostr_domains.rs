@@ -219,13 +219,13 @@ pub async fn reconcile_nostr_domains(context: &Context) -> Result<()> {
         context.settings.namespace.as_deref().unwrap_or("default"),
     );
 
-    info!("Fetching enabled nostr domains from database...");
-    let domains = context.db.list_active_domains().await?;
-    info!("Found {} enabled nostr domains", domains.len());
+    info!("Fetching all nostr domains from database...");
+    let domains = context.db.list_all_domains().await?;
+    info!("Found {} total nostr domains", domains.len());
 
-    // Split domains into HTTP-only and HTTPS-enabled
+    // Split domains into HTTP-only (including not-yet-activated) and HTTPS-enabled (activated with DNS)
     let http_only_domains: Vec<&NostrDomain> = domains.iter().filter(|d| d.http_only).collect();
-    let https_domains: Vec<&NostrDomain> = domains.iter().filter(|d| !d.http_only).collect();
+    let https_domains: Vec<&NostrDomain> = domains.iter().filter(|d| !d.http_only && d.enabled).collect();
 
     info!(
         "Split: {} HTTP-only domains, {} HTTPS domains",

@@ -44,21 +44,10 @@ async fn nostr_address(
         .unwrap_or("lnvps.net");
     info!("Got request for {} on host {}", name, host);
     
-    // First, try to get domain by hostname
-    let domain = match this.db.get_domain_by_name(host).await {
-        Ok(d) => d,
-        Err(_) => {
-            // If domain not found by hostname, check if name parameter is an activation hash
-            // This supports the activation check: /.well-known/nostr.json?name=<hash>
-            info!("Domain not found by hostname, checking if name is activation hash");
-            this.db
-                .get_domain_by_activation_hash(&name)
-                .await
-                .map_err(|_| "Domain not found")?
-        }
-    };
+    let domain = this.db.get_domain_by_name(host).await
+        .map_err(|_| "Domain not found")?;
     
-    // If we found domain by activation hash, return a simple success response
+    // If the name parameter matches the activation hash, return a simple success response
     // This allows the activation check to verify the path is reachable
     if q.name.is_some() && domain.activation_hash.as_ref() == Some(&name) {
         info!("Activation hash matched for domain {}", domain.name);

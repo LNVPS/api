@@ -1855,12 +1855,6 @@ impl LNVPSNostrDb for LNVpsDbMysql {
     }
 
     async fn insert_domain(&self, domain: &NostrDomain) -> DbResult<u64> {
-        // Generate activation hash from domain name using SHA256
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(domain.name.as_bytes());
-        let activation_hash = format!("{:x}", hasher.finalize());
-
         Ok(
             sqlx::query(
                 "insert into nostr_domain(owner_id,name,relays,activation_hash,http_only) values(?,?,?,?,1) returning id",
@@ -1868,7 +1862,7 @@ impl LNVPSNostrDb for LNVpsDbMysql {
             .bind(domain.owner_id)
             .bind(&domain.name)
             .bind(&domain.relays)
-            .bind(&activation_hash)
+            .bind(&domain.activation_hash)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?,

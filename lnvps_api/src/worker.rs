@@ -741,40 +741,31 @@ impl Worker {
         debug!("Checking path activation for domain {} at {}", domain.name, activation_url);
 
         // Try to fetch the activation URL
-        #[cfg(any(feature = "mikrotik", feature = "proxmox", feature = "cloudflare"))]
-        {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
 
-            match client.get(&activation_url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        debug!("Path activation check succeeded for domain {}", domain.name);
-                        Ok(true)
-                    } else {
-                        debug!(
-                            "Path activation check failed for domain {} - got status {}",
-                            domain.name,
-                            response.status()
-                        );
-                        Ok(false)
-                    }
-                }
-                Err(e) => {
+        match client.get(&activation_url).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    debug!("Path activation check succeeded for domain {}", domain.name);
+                    Ok(true)
+                } else {
                     debug!(
-                        "Path activation check failed for domain {} - error: {}",
-                        domain.name, e
+                        "Path activation check failed for domain {} - got status {}",
+                        domain.name,
+                        response.status()
                     );
                     Ok(false)
                 }
             }
-        }
-        
-        #[cfg(not(any(feature = "mikrotik", feature = "proxmox", feature = "cloudflare")))]
-        {
-            warn!("Path activation check skipped - reqwest feature not enabled");
-            Ok(false)
+            Err(e) => {
+                debug!(
+                    "Path activation check failed for domain {} - error: {}",
+                    domain.name, e
+                );
+                Ok(false)
+            }
         }
     }
 
