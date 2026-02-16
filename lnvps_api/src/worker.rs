@@ -904,6 +904,8 @@ impl Worker {
                                 Some(format!("Domain Activation Failed: {}", domain.name)),
                             ).await;
                         }
+                    }
+                }
             }
             // If domain is active but has no DNS record and no path activation, deactivate it
             else if domain.enabled && !has_dns_record && !has_path_activation {
