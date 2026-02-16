@@ -8,6 +8,31 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
+/// Parse gateway string as IpNetwork, with backward compatibility for plain IP addresses.
+/// If the string is a plain IP address without CIDR notation, it will be converted to:
+/// - /32 for IPv4 addresses
+/// - /128 for IPv6 addresses
+/// 
+/// This is a public function that can be used across the codebase for consistent gateway parsing.
+pub fn parse_gateway(gateway: &str) -> Result<IpNetwork> {
+    // Try parsing as IpNetwork first (CIDR notation)
+    if let Ok(network) = gateway.parse::<IpNetwork>() {
+        return Ok(network);
+    }
+    
+    // Try parsing as plain IpAddr for backward compatibility
+    if let Ok(ip) = gateway.parse::<IpAddr>() {
+        let prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        return IpNetwork::new(ip, prefix)
+            .with_context(|| format!("Failed to create network from IP {}", gateway));
+    }
+    
+    bail!("Invalid gateway format: {}", gateway)
+}
+
 #[derive(Debug, Clone)]
 pub struct AvailableIps {
     pub ip4: Option<AvailableIp>,
@@ -110,9 +135,15 @@ impl NetworkProvisioner {
     pub async fn pick_ip_from_range(&self, range: &IpRange) -> Result<AvailableIp> {
         let range_cidr: IpNetwork = range.cidr.parse()?;
         let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
+        // Parse stored IPs (stored as plain IP addresses)
         let mut ips: HashSet<IpAddr> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
 
-        let gateway: IpNetwork = range.gateway.parse()?;
+        let gateway: IpNetwork = parse_gateway(&range.gateway)?;
+
+        // Calculate the prefix to use: take the smallest prefix value (largest network)
+        // between the allocation range and the gateway CIDR.
+        // This allows VMs to reach gateways outside their allocation range.
+        let max_net = range_cidr.prefix().min(gateway.prefix());
 
         // mark some IPS as always used
         // Namely:
@@ -130,7 +161,7 @@ impl NetworkProvisioner {
                 IpRangeAllocationMode::Sequential => range_cidr
                     .iter()
                     .find(|i| !ips.contains(i))
-                    .and_then(|i| IpNetwork::new(i, range_cidr.prefix()).ok()),
+                    .and_then(|i| IpNetwork::new(i, max_net).ok()),
                 IpRangeAllocationMode::Random => {
                     let mut rng = rand::rng();
                     match range_cidr {
@@ -138,7 +169,7 @@ impl NetworkProvisioner {
                             let n = rng.random_range(0..v4.size());
                             let addr = IpAddr::V4(v4.nth(n).unwrap());
                             if !ips.contains(&addr) {
-                                break IpNetwork::new(addr, range_cidr.prefix()).ok();
+                                break IpNetwork::new(addr, max_net).ok();
                             } else {
                                 continue;
                             }
@@ -147,7 +178,7 @@ impl NetworkProvisioner {
                             let n = rng.random_range(0..v6.size());
                             let addr = IpAddr::V6(v6.nth(n).unwrap());
                             if !ips.contains(&addr) {
-                                break IpNetwork::new(addr, range_cidr.prefix()).ok();
+                                break IpNetwork::new(addr, max_net).ok();
                             } else {
                                 continue;
                             }
@@ -306,5 +337,119 @@ mod tests {
             assert!(ips.ip4.is_some());
             assert!(ips.ip6.is_some());
         }
+    }
+
+    #[test]
+    fn test_parse_gateway_cidr() {
+        // Test parsing gateway with CIDR notation
+        let gw = parse_gateway("10.0.0.1/24").unwrap();
+        assert_eq!(gw.to_string(), "10.0.0.1/24");
+        
+        let gw = parse_gateway("185.18.221.1/24").unwrap();
+        assert_eq!(gw.to_string(), "185.18.221.1/24");
+        
+        // Test IPv6 CIDR
+        let gw = parse_gateway("2001:db8::1/64").unwrap();
+        assert_eq!(gw.to_string(), "2001:db8::1/64");
+    }
+
+    #[test]
+    fn test_parse_gateway_plain_ip() {
+        // Test parsing plain IP addresses (backward compatibility)
+        let gw = parse_gateway("10.0.0.1").unwrap();
+        assert_eq!(gw.to_string(), "10.0.0.1/32");
+        
+        let gw = parse_gateway("185.18.221.1").unwrap();
+        assert_eq!(gw.to_string(), "185.18.221.1/32");
+        
+        // Test IPv6 plain address
+        let gw = parse_gateway("2001:db8::1").unwrap();
+        assert_eq!(gw.to_string(), "2001:db8::1/128");
+    }
+
+    #[test]
+    fn test_parse_gateway_invalid() {
+        // Test invalid gateway formats
+        assert!(parse_gateway("invalid").is_err());
+        assert!(parse_gateway("").is_err());
+        assert!(parse_gateway("10.0.0.256").is_err());
+        assert!(parse_gateway("10.0.0.1/33").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_cidr_wider_than_range() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        
+        // Create an IP range with a smaller subnet but wider gateway
+        // Example: allocation range is 185.18.221.64/26 but gateway is 185.18.221.1/24
+        let range = IpRange {
+            id: 99,
+            cidr: "185.18.221.64/26".to_string(), // /26 = 64 IPs (185.18.221.64-127)
+            gateway: "185.18.221.1/24".to_string(), // Gateway is in the broader /24 network
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: false,
+            ..Default::default()
+        };
+        
+        db.ip_range.lock().await.insert(99, range.clone());
+        
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+        
+        // Pick an IP from this range
+        let available = mgr.pick_ip_from_range_id(99).await.expect("Failed to pick IP");
+        
+        // Verify the gateway is parsed correctly with /24 prefix
+        assert_eq!(available.gateway.prefix(), 24);
+        assert_eq!(available.gateway.ip().to_string(), "185.18.221.1");
+        
+        // Verify the allocated IP has the correct prefix (/24 from gateway, not /26 from range)
+        assert_eq!(available.ip.prefix(), 24, "IP should have /24 prefix from gateway");
+        
+        // Verify the allocated IP address itself is from the /26 range
+        let ip = available.ip.ip();
+        let ip_str = ip.to_string();
+        assert!(ip_str.starts_with("185.18.221."));
+        
+        // Parse the last octet to ensure it's in the /26 range (64-127)
+        let last_octet: u8 = ip_str.split('.').last().unwrap().parse().unwrap();
+        assert!(last_octet >= 64 && last_octet <= 127, 
+            "IP {} should be in range 185.18.221.64-127", ip_str);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_cidr_ipv6() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        
+        // Create an IPv6 range with a smaller subnet but wider gateway
+        let range = IpRange {
+            id: 100,
+            cidr: "2001:db8::/80".to_string(), // /80 allocation range
+            gateway: "2001:db8::1/64".to_string(), // Gateway is in the broader /64 network
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: false,
+            ..Default::default()
+        };
+        
+        db.ip_range.lock().await.insert(100, range.clone());
+        
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+        
+        // Pick an IP from this range
+        let available = mgr.pick_ip_from_range_id(100).await.expect("Failed to pick IPv6");
+        
+        // Verify the gateway is parsed correctly with /64 prefix
+        assert_eq!(available.gateway.prefix(), 64);
+        assert_eq!(available.gateway.ip().to_string(), "2001:db8::1");
+        
+        // Verify the allocated IP has /64 prefix (from gateway, not /80 from range)
+        assert_eq!(available.ip.prefix(), 64, "IP should have /64 prefix from gateway");
     }
 }
