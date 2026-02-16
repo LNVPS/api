@@ -2989,6 +2989,9 @@ Response:
 ## Payment Method Configuration Data Types
 
 ### AdminPaymentMethodConfigInfo
+
+**Note:** For security reasons, sensitive values (tokens, API keys, secrets) are NEVER returned in API responses. Instead, the config contains boolean indicators showing whether these values are configured.
+
 ```json
 {
   "id": number,
@@ -2997,7 +3000,7 @@ Response:
   "name": "string",
   "enabled": boolean,
   "provider_type": "string",                  // Provider implementation type ("lnd", "bitvora", "revolut", "stripe", "paypal")
-  "config": ProviderConfig | null,            // Typed provider config (may be null if deserialization fails)
+  "config": SanitizedProviderConfig | null,   // Sanitized provider config - secrets replaced with boolean indicators
   "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
   "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20)
   "processing_fee_currency": "string | null", // Currency code for base fee

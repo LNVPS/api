@@ -2302,7 +2302,112 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
     }
 }
 
+// Sanitized provider configs - hide secret values for view-only/display purposes
+
+/// Sanitized LND config (shows paths but not file contents)
+#[derive(Serialize)]
+pub struct SanitizedLndConfig {
+    pub url: String,
+    pub cert_path: String,
+    pub macaroon_path: String,
+}
+
+/// Sanitized Bitvora config (hides token and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedBitvoraConfig {
+    /// Whether token is configured
+    pub has_token: bool,
+    /// Whether webhook secret is configured
+    pub has_webhook_secret: bool,
+}
+
+/// Sanitized Revolut config (hides token and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedRevolutConfig {
+    pub url: String,
+    pub api_version: String,
+    pub public_key: String,
+    /// Whether token is configured
+    pub has_token: bool,
+    /// Whether webhook secret is configured
+    pub has_webhook_secret: bool,
+}
+
+/// Sanitized Stripe config (hides secret_key and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedStripeConfig {
+    pub publishable_key: String,
+    /// Whether secret key is configured
+    pub has_secret_key: bool,
+    /// Whether webhook secret is configured
+    pub has_webhook_secret: bool,
+}
+
+/// Sanitized PayPal config (hides client_secret)
+#[derive(Serialize)]
+pub struct SanitizedPaypalConfig {
+    pub client_id: String,
+    pub mode: String,
+    /// Whether client secret is configured
+    pub has_client_secret: bool,
+}
+
+/// Sanitized provider configuration - hides all secret/token values
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SanitizedProviderConfig {
+    Lnd(SanitizedLndConfig),
+    Bitvora(SanitizedBitvoraConfig),
+    Revolut(SanitizedRevolutConfig),
+    Stripe(SanitizedStripeConfig),
+    Paypal(SanitizedPaypalConfig),
+}
+
+impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
+    fn from(config: &lnvps_db::ProviderConfig) -> Self {
+        match config {
+            lnvps_db::ProviderConfig::Lnd(cfg) => {
+                SanitizedProviderConfig::Lnd(SanitizedLndConfig {
+                    url: cfg.url.clone(),
+                    cert_path: cfg.cert_path.display().to_string(),
+                    macaroon_path: cfg.macaroon_path.display().to_string(),
+                })
+            }
+            lnvps_db::ProviderConfig::Bitvora(cfg) => {
+                SanitizedProviderConfig::Bitvora(SanitizedBitvoraConfig {
+                    has_token: !cfg.token.is_empty(),
+                    has_webhook_secret: !cfg.webhook_secret.is_empty(),
+                })
+            }
+            lnvps_db::ProviderConfig::Revolut(cfg) => {
+                SanitizedProviderConfig::Revolut(SanitizedRevolutConfig {
+                    url: cfg.url.clone(),
+                    api_version: cfg.api_version.clone(),
+                    public_key: cfg.public_key.clone(),
+                    has_token: !cfg.token.is_empty(),
+                    has_webhook_secret: cfg.webhook_secret.as_ref().map_or(false, |s| !s.is_empty()),
+                })
+            }
+            lnvps_db::ProviderConfig::Stripe(cfg) => {
+                SanitizedProviderConfig::Stripe(SanitizedStripeConfig {
+                    publishable_key: cfg.publishable_key.clone(),
+                    has_secret_key: !cfg.secret_key.is_empty(),
+                    has_webhook_secret: !cfg.webhook_secret.is_empty(),
+                })
+            }
+            lnvps_db::ProviderConfig::Paypal(cfg) => {
+                SanitizedProviderConfig::Paypal(SanitizedPaypalConfig {
+                    client_id: cfg.client_id.clone(),
+                    mode: cfg.mode.clone(),
+                    has_client_secret: !cfg.client_secret.is_empty(),
+                })
+            }
+        }
+    }
+}
+
 /// Admin view of payment method configuration
+/// Note: Secret values (tokens, API keys, etc.) are never returned - use sanitized config
 #[derive(Serialize)]
 pub struct AdminPaymentMethodConfigInfo {
     pub id: u64,
@@ -2312,8 +2417,8 @@ pub struct AdminPaymentMethodConfigInfo {
     pub name: String,
     pub enabled: bool,
     pub provider_type: String,
-    /// Typed provider configuration (may be None if deserialization fails)
-    pub config: Option<lnvps_db::ProviderConfig>,
+    /// Sanitized provider configuration - secrets are hidden (may be None if deserialization fails)
+    pub config: Option<SanitizedProviderConfig>,
     /// Processing fee percentage rate (e.g., 1.0 for 1%)
     pub processing_fee_rate: Option<f32>,
     /// Processing fee base amount in human-readable currency units (e.g., 0.20 for €0.20)
@@ -2329,6 +2434,8 @@ impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
         use payments_rs::currency::{Currency, CurrencyAmount};
         
         let provider_config = config.get_provider_config();
+        // Convert to sanitized config - hide all secret values
+        let sanitized_config = provider_config.as_ref().map(SanitizedProviderConfig::from);
         // Convert processing_fee_base from u64 (smallest units) to f32 (human-readable)
         let processing_fee_base = match (&config.processing_fee_base, &config.processing_fee_currency) {
             (Some(base), Some(currency)) => {
@@ -2345,7 +2452,7 @@ impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
             name: config.name,
             enabled: config.enabled,
             provider_type: config.provider_type,
-            config: provider_config,
+            config: sanitized_config,
             processing_fee_rate: config.processing_fee_rate,
             processing_fee_base,
             processing_fee_currency: config.processing_fee_currency,
