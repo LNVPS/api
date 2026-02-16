@@ -681,11 +681,9 @@ impl ProxmoxClient {
                             let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
                             let range: IpNetwork = ip_range.cidr.parse().ok()?;
                             let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
-                            // take the largest (smallest prefix number) of the network prefixes
-                            let max_net = range.prefix().min(range_gw.prefix());
                             format!(
                                 "ip={},gw={}",
-                                IpNetwork::new(addr, max_net).ok()?,
+                                IpNetwork::new(addr, range.prefix()).ok()?,
                                 range_gw.ip()
                             )
                         }
@@ -699,11 +697,9 @@ impl ProxmoxClient {
                             } else {
                                 let range: IpNetwork = ip_range.cidr.parse().ok()?;
                                 let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
-                                // take the largest (smallest prefix number) of the network prefixes
-                                let max_net = range.prefix().min(range_gw.prefix());
                                 format!(
                                     "ip6={},gw6={}",
-                                    IpNetwork::new(addr, max_net).ok()?,
+                                    IpNetwork::new(addr, range.prefix()).ok()?,
                                     range_gw.ip(),
                                 )
                             }
@@ -1861,7 +1857,7 @@ mod tests {
         assert_eq!(
             vm.ip_config,
             Some(
-                "ip=192.168.1.2/16,gw=192.168.1.1,ip=192.168.2.2/24,gw=10.10.10.10,ip6=auto"
+                "ip=192.168.1.2/24,gw=192.168.1.1,ip=192.168.2.2/24,gw=10.10.10.10,ip6=auto"
                     .to_string()
             )
         );
