@@ -216,7 +216,7 @@ async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<
             id: 0, // Will be auto-generated
             name: name.to_string(),
             enabled: true,
-            company_id: Some(company_id),
+            company_id,
         };
 
         let id = db

@@ -344,10 +344,8 @@ impl LNVpsProvisioner {
             .get_tax_for_user(user.id, converted.amount.value())
             .await?;
         
-        // Calculate processing fee
-        // Note: Subscriptions don't have a company_id, so we pass None (no processing fee)
-        // This could be enhanced to derive company from subscription line items if needed
-        let processing_fee = pe.calculate_processing_fee(None, method, converted.amount.currency(), converted.amount.value()).await;
+        // Calculate processing fee using subscription's company_id
+        let processing_fee = pe.calculate_processing_fee(subscription.company_id, method, converted.amount.currency(), converted.amount.value()).await;
 
         // Generate payment based on method
         let subscription_payment = match method {

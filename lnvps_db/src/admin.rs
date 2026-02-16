@@ -81,7 +81,7 @@ pub trait AdminDb: Send + Sync {
         &self,
         name: &str,
         enabled: bool,
-        company_id: Option<u64>,
+        company_id: u64,
     ) -> DbResult<u64>;
 
     /// Update region information

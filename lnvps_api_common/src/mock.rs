@@ -115,7 +115,7 @@ impl Default for MockDb {
                 id: 1,
                 name: "Mock".to_string(),
                 enabled: true,
-                company_id: Some(1), // Link to default company
+                company_id: 1, // Link to default company
             },
         );
         let mut ip_ranges = HashMap::new();
@@ -912,18 +912,14 @@ impl LNVpsDbBase for MockDb {
             .get(&host.region_id)
             .ok_or_else(|| anyhow!("Region not found"))?;
 
-        if let Some(company_id) = region.company_id {
-            let companies = self.companies.lock().await;
-            let company = companies
-                .get(&company_id)
-                .ok_or_else(|| anyhow!("Company not found"))?;
-            Ok(company.base_currency.clone())
-        } else {
-            Ok("EUR".to_string()) // Default fallback
-        }
+        let companies = self.companies.lock().await;
+        let company = companies
+            .get(&region.company_id)
+            .ok_or_else(|| anyhow!("Company not found"))?;
+        Ok(company.base_currency.clone())
     }
 
-    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<Option<u64>> {
+    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<u64> {
         // Follow VM -> Host -> Region -> Company chain
         let vms = self.vms.lock().await;
         let vm = vms.get(&vm_id).ok_or_else(|| anyhow!("VM not found"))?;
@@ -1651,7 +1647,7 @@ impl lnvps_db::AdminDb for MockDb {
         &self,
         _name: &str,
         _enabled: bool,
-        _company_id: Option<u64>,
+        _company_id: u64,
     ) -> DbResult<u64> {
         Ok(1)
     }
@@ -1896,7 +1892,7 @@ impl lnvps_db::AdminDb for MockDb {
                 if let Some(vm) = vms.get(&payment.vm_id) {
                     if let Some(host) = hosts.get(&vm.host_id) {
                         if let Some(region) = regions.get(&host.region_id) {
-                            return region.company_id == Some(company_id);
+                            return region.company_id == company_id;
                         }
                     }
                 }
@@ -1936,35 +1932,34 @@ impl lnvps_db::AdminDb for MockDb {
             if let Some(vm) = vms.get(&payment.vm_id) {
                 if let Some(host) = hosts.get(&vm.host_id) {
                     if let Some(region) = regions.get(&host.region_id) {
-                        if let Some(region_company_id) = region.company_id {
-                            // Filter by company (always required)
-                            if region_company_id != company_id {
-                                continue;
-                            }
+                        let region_company_id = region.company_id;
+                        // Filter by company (always required)
+                        if region_company_id != company_id {
+                            continue;
+                        }
 
-                            if let Some(company) = companies.get(&region_company_id) {
-                                result.push(VmPaymentWithCompany {
-                                    id: payment.id.clone(),
-                                    vm_id: payment.vm_id,
-                                    created: payment.created,
-                                    expires: payment.expires,
-                                    amount: payment.amount,
-                                    currency: payment.currency.clone(),
-                                    payment_method: payment.payment_method,
-                                    payment_type: payment.payment_type,
-                                    external_data: payment.external_data.clone(),
-                                    external_id: payment.external_id.clone(),
-                                    is_paid: payment.is_paid,
-                                    rate: payment.rate,
-                                    time_value: payment.time_value,
-                                    tax: payment.tax,
-                                    processing_fee: payment.processing_fee,
-                                    upgrade_params: payment.upgrade_params.clone(),
-                                    company_id: region_company_id,
-                                    company_name: company.name.clone(),
-                                    company_base_currency: company.base_currency.clone(),
-                                });
-                            }
+                        if let Some(company) = companies.get(&region_company_id) {
+                            result.push(VmPaymentWithCompany {
+                                id: payment.id.clone(),
+                                vm_id: payment.vm_id,
+                                created: payment.created,
+                                expires: payment.expires,
+                                amount: payment.amount,
+                                currency: payment.currency.clone(),
+                                payment_method: payment.payment_method,
+                                payment_type: payment.payment_type,
+                                external_data: payment.external_data.clone(),
+                                external_id: payment.external_id.clone(),
+                                is_paid: payment.is_paid,
+                                rate: payment.rate,
+                                time_value: payment.time_value,
+                                tax: payment.tax,
+                                processing_fee: payment.processing_fee,
+                                upgrade_params: payment.upgrade_params.clone(),
+                                company_id: region_company_id,
+                                company_name: company.name.clone(),
+                                company_base_currency: company.base_currency.clone(),
+                            });
                         }
                     }
                 }

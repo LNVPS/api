@@ -69,7 +69,7 @@ impl PricingEngine {
     /// Queries the database for fee configuration
     pub async fn calculate_processing_fee(
         &self,
-        company_id: Option<u64>,
+        company_id: u64,
         method: PaymentMethod,
         currency: Currency,
         amount: u64,
@@ -78,12 +78,6 @@ impl PricingEngine {
         if method == PaymentMethod::Lightning {
             return 0;
         }
-
-        // Need a company_id to look up fee config
-        let Some(company_id) = company_id else {
-            log::warn!("No company_id provided for processing fee calculation");
-            return 0;
-        };
 
         // Try to get fee config from database
         let config = match self.db.get_payment_method_config_for_company(company_id, method).await {
@@ -308,7 +302,7 @@ impl PricingEngine {
     }
 
     /// Get the renewal cost of a custom VM
-    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: Option<u64>) -> Result<NewPaymentInfo> {
+    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: u64) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.custom_template_id {
             i
         } else {
@@ -386,7 +380,7 @@ impl PricingEngine {
     }
 
     /// Gets the renewal cost of a standard VM
-    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: Option<u64>) -> Result<NewPaymentInfo> {
+    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: u64) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.template_id {
             i
         } else {

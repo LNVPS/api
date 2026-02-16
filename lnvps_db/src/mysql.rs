@@ -874,8 +874,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(currency)
     }
 
-    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<Option<u64>> {
-        let company_id = sqlx::query_scalar::<_, Option<u64>>(
+    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<u64> {
+        let company_id = sqlx::query_scalar::<_, u64>(
             "SELECT vhr.company_id 
              FROM vm v
              JOIN vm_host vh ON v.host_id = vh.id  
@@ -1060,9 +1060,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
+        .bind(subscription.company_id)
         .bind(&subscription.name)
         .bind(&subscription.description)
         .bind(subscription.created)
@@ -1087,9 +1088,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         // Insert subscription
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
+        .bind(subscription.company_id)
         .bind(&subscription.name)
         .bind(&subscription.description)
         .bind(subscription.created)
@@ -1128,9 +1130,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription SET user_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
+            "UPDATE subscription SET user_id = ?, company_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
         )
         .bind(subscription.user_id)
+        .bind(subscription.company_id)
         .bind(&subscription.name)
         .bind(&subscription.description)
         .bind(subscription.expires)
@@ -2310,7 +2313,7 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         name: &str,
         enabled: bool,
-        company_id: Option<u64>,
+        company_id: u64,
     ) -> DbResult<u64> {
         let id = sqlx::query_scalar::<_, u64>(
             "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",

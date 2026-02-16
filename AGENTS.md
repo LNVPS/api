@@ -15,8 +15,9 @@ cargo build
 # Build with all features
 cargo build --all-features
 
-# Run all tests
-cargo test
+# Run all tests (IMPORTANT: use --test-threads=1 to avoid flaky tests)
+# Tests use shared static state (LazyLock) in mocks, so they must run sequentially
+cargo test -- --test-threads=1
 
 # Run a single test by name (substring match)
 cargo test test_name_substring

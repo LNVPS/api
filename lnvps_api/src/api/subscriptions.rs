@@ -145,6 +145,7 @@ async fn v1_create_subscription(
     let mut total_setup_fee = 0u64;
     let mut total_recurring_amount = 0u64;
     let mut line_items_to_create = Vec::new();
+    let mut derived_company_id: Option<u64> = None;
 
     // Process each line item to validate and calculate pricing
     for item in &req.line_items {
@@ -159,6 +160,17 @@ async fn v1_create_subscription(
                     .db
                     .get_available_ip_space(pricing.available_ip_space_id)
                     .await?;
+
+                // Derive company_id from the IP space
+                match derived_company_id {
+                    None => derived_company_id = Some(ip_space.company_id),
+                    Some(cid) if cid != ip_space.company_id => {
+                        return ApiData::err(
+                            "All line items must belong to the same company",
+                        );
+                    }
+                    _ => {}
+                }
 
                 // Verify IP space is available
                 if !ip_space.is_available || ip_space.is_reserved {
@@ -184,12 +196,12 @@ async fn v1_create_subscription(
                     })),
                 ));
             }
-            ApiCreateSubscriptionLineItemRequest::AsnSponsoring { asn } => {
+            ApiCreateSubscriptionLineItemRequest::AsnSponsoring { asn: _ } => {
                 // TODO: Implement ASN sponsoring pricing lookup
                 // For now, return error
                 return ApiData::err("ASN sponsoring not yet implemented");
             }
-            ApiCreateSubscriptionLineItemRequest::DnsHosting { domain } => {
+            ApiCreateSubscriptionLineItemRequest::DnsHosting { domain: _ } => {
                 // TODO: Implement DNS hosting pricing lookup
                 // For now, return error
                 return ApiData::err("DNS hosting not yet implemented");
@@ -197,10 +209,15 @@ async fn v1_create_subscription(
         }
     }
 
+    // company_id must be derived from line items
+    let company_id = derived_company_id
+        .ok_or_else(|| anyhow::anyhow!("Could not determine company from line items"))?;
+
     // Create the subscription (always monthly interval)
     let subscription = Subscription {
         id: 0, // Will be set by database
         user_id: uid,
+        company_id,
         name: req.name.unwrap_or_else(|| "Subscription".to_string()),
         description: req.description,
         created: Utc::now(),

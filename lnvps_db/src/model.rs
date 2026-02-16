@@ -84,7 +84,7 @@ pub struct VmHostRegion {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
-    pub company_id: Option<u64>,
+    pub company_id: u64,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -150,7 +150,7 @@ pub struct AdminVmHost {
     #[sqlx(rename = "region_enabled")]
     pub region_enabled: bool,
     #[sqlx(rename = "region_company_id")]
-    pub region_company_id: Option<u64>,
+    pub region_company_id: u64,
 
     // Disk information (populated separately, not from SQL)
     #[sqlx(skip)]
@@ -1042,6 +1042,7 @@ impl Display for SubscriptionPaymentType {
 pub struct Subscription {
     pub id: u64,
     pub user_id: u64,
+    pub company_id: u64,
     pub name: String,
     pub description: Option<String>,
     pub created: DateTime<Utc>,
@@ -1200,6 +1201,8 @@ mod tests {
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct AvailableIpSpace {
     pub id: u64,
+    /// Company that owns this IP space inventory
+    pub company_id: u64,
     pub cidr: String,
     pub min_prefix_size: u16,
     pub max_prefix_size: u16,

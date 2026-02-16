@@ -618,7 +618,7 @@ pub struct AdminRegionInfo {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
-    pub company_id: Option<u64>,
+    pub company_id: u64,
     pub host_count: u64,
     pub total_vms: u64,
     pub total_cpu_cores: u64,
@@ -630,7 +630,7 @@ pub struct AdminRegionInfo {
 pub struct CreateRegionRequest {
     pub name: String,
     pub enabled: bool,
-    pub company_id: Option<u64>,
+    pub company_id: u64,
 }
 
 #[derive(Deserialize)]
@@ -1780,6 +1780,7 @@ pub struct AdminSubscriptionInfo {
 #[derive(Deserialize)]
 pub struct AdminCreateSubscriptionRequest {
     pub user_id: u64,
+    pub company_id: u64,
     pub name: String,
     pub description: Option<String>,
     pub expires: Option<DateTime<Utc>>,
@@ -1835,6 +1836,7 @@ impl AdminCreateSubscriptionRequest {
         Ok(lnvps_db::Subscription {
             id: 0,
             user_id: self.user_id,
+            company_id: self.company_id,
             name: self.name.trim().to_string(),
             description: self.description.clone(),
             created: chrono::Utc::now(),
@@ -1995,6 +1997,7 @@ impl From<lnvps_db::InternetRegistry> for AdminInternetRegistry {
 #[derive(Serialize)]
 pub struct AdminAvailableIpSpaceInfo {
     pub id: u64,
+    pub company_id: u64,
     pub cidr: String,
     pub min_prefix_size: u16,
     pub max_prefix_size: u16,
@@ -2008,6 +2011,7 @@ pub struct AdminAvailableIpSpaceInfo {
 
 #[derive(Deserialize)]
 pub struct CreateAvailableIpSpaceRequest {
+    pub company_id: u64,
     pub cidr: String,
     pub min_prefix_size: u16,
     pub max_prefix_size: u16,
@@ -2034,6 +2038,7 @@ impl From<lnvps_db::AvailableIpSpace> for AdminAvailableIpSpaceInfo {
     fn from(space: lnvps_db::AvailableIpSpace) -> Self {
         Self {
             id: space.id,
+            company_id: space.company_id,
             cidr: space.cidr,
             min_prefix_size: space.min_prefix_size,
             max_prefix_size: space.max_prefix_size,
@@ -2113,6 +2118,7 @@ impl CreateAvailableIpSpaceRequest {
 
         Ok(lnvps_db::AvailableIpSpace {
             id: 0, // Will be set by database
+            company_id: self.company_id,
             cidr: self.cidr.trim().to_string(),
             min_prefix_size: self.min_prefix_size,
             max_prefix_size: self.max_prefix_size,
