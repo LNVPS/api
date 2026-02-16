@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - **2026-02-16** - **BREAKING CHANGE**: All money amounts now use `u64` in smallest currency units (cents for fiat, millisats for BTC)
+  - **Requires database migration**: Run `20260217100000_amount_to_cents.sql` which converts existing data
   - Cost plan `amount` field changed from `f32` (human-readable) to `u64` (smallest units)
   - Custom pricing costs (`cpu_cost`, `memory_cost`, `ip4_cost`, `ip6_cost`) changed from `f32` to `u64`
   - Custom pricing disk `cost` field changed from `f32` to `u64`
