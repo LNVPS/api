@@ -4,6 +4,9 @@
 //! This module bridges the gap between `PaymentMethodConfig` records in the database
 //! and the concrete payment handler implementations (LightningNode, FiatPaymentService).
 
+#[cfg(feature = "bitvora")]
+compile_error!("Bitvora service has been shut down and is no longer available. Remove the 'bitvora' feature from your build.");
+
 use anyhow::{Context, Result, bail};
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentMethodConfig, ProviderConfig};
 use payments_rs::fiat::FiatPaymentService;

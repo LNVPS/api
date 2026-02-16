@@ -2846,7 +2846,9 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 
 ## Payment Method Configuration Management
 
-Payment method configurations store provider settings for payment processing (Lightning/LND/Bitvora, Revolut, Stripe, PayPal). This allows payment provider settings to be managed in the database instead of static configuration files.
+Payment method configurations store provider settings for payment processing (Lightning/LND, Revolut, Stripe, PayPal). This allows payment provider settings to be managed in the database instead of static configuration files.
+
+> **Note:** Bitvora support has been removed as the service has been shut down.
 
 Each configuration belongs to a specific company, and multiple configurations can exist per company/payment method combination. This allows keeping disabled legacy configurations that are still referenced by historical payments while having newer active configurations.
 
@@ -2904,7 +2906,7 @@ LND (Lightning):
 }
 ```
 
-Bitvora (Lightning):
+Bitvora (Lightning) - **DEPRECATED: Service shut down**:
 ```json
 {
   "type": "bitvora",
@@ -2999,7 +3001,7 @@ Response:
   "payment_method": "lightning",              // AdminPaymentMethodType: "lightning", "revolut", "paypal", "stripe"
   "name": "string",
   "enabled": boolean,
-  "provider_type": "string",                  // Provider implementation type ("lnd", "bitvora", "revolut", "stripe", "paypal")
+  "provider_type": "string",                  // Provider implementation type ("lnd", "revolut", "stripe", "paypal")
   "config": SanitizedProviderConfig | null,   // Sanitized provider config - secrets replaced with boolean indicators
   "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
   "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20)
@@ -3041,7 +3043,7 @@ The `config` field uses a tagged union format with `"type"` as the discriminator
 | Type      | Payment Method | Fields                                                    |
 |-----------|----------------|-----------------------------------------------------------|
 | `lnd`     | lightning      | `url`, `cert_path`, `macaroon_path`                       |
-| `bitvora` | lightning      | `token`, `webhook_secret`                                 |
+| ~~`bitvora`~~ | ~~lightning~~ | ~~`token`, `webhook_secret`~~ (service shut down)        |
 | `revolut` | revolut        | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`  | stripe         | `secret_key`, `publishable_key`, `webhook_secret`         |
 | `paypal`  | paypal         | `client_id`, `client_secret`, `mode`                      |
@@ -3050,7 +3052,7 @@ The `config` field uses a tagged union format with `"type"` as the discriminator
 
 **Provider Types:**
 - `lnd` - Lightning Network Daemon for Lightning payments
-- `bitvora` - Bitvora API for Lightning payments
+- ~~`bitvora`~~ - ~~Bitvora API for Lightning payments~~ (service shut down)
 - `revolut` - Revolut Business API
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API

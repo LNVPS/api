@@ -8,7 +8,7 @@ A bitcoin powered VPS system.
 - Payments:
   - Bitcoin:
       - LND
-      - [Bitvora](https://bitvora.com?r=lnvps)
+      - ~~[Bitvora](https://bitvora.com)~~ (service shut down)
   - Fiat:
     - [RevolutPay](https://www.revolut.com/business/revolut-pay/)
 - VM Backend:
