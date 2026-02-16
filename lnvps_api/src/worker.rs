@@ -1002,7 +1002,7 @@ impl Worker {
                     "Domain {} is correctly active (DNS: {}, Path: {}, HTTP-only: {})",
                     domain.name, has_dns_record, has_path_activation, domain.http_only
                 );
-            } 
+            }
             else if !domain.enabled && !has_dns_record && !has_path_activation {
                 debug!(
                     "Domain {} is correctly inactive without DNS or path activation",

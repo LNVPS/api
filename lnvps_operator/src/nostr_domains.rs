@@ -281,7 +281,7 @@ async fn reconcile_http_only_ingress(
 
     // Convert &[&NostrDomain] to Vec<NostrDomain> for create function
     let domain_vec: Vec<NostrDomain> = domains.iter().map(|d| (*d).clone()).collect();
-    
+
     // Create the HTTP-only ingress
     let new_ingress = create_http_only_ingress(&domain_vec, settings);
 
@@ -393,7 +393,7 @@ async fn reconcile_https_ingress(
 
     // Convert &[&NostrDomain] to Vec<NostrDomain> for create function
     let domain_vec: Vec<NostrDomain> = domains.iter().map(|d| (*d).clone()).collect();
-    
+
     // Create the HTTPS ingress for all domains
     let new_ingress = create_unified_nostr_ingress(&domain_vec, settings);
 
