@@ -1273,6 +1273,9 @@ pub struct RevolutProviderConfig {
     pub api_version: String,
     /// Public key for client-side integration
     pub public_key: String,
+    /// Webhook signing secret (populated after webhook registration)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
 }
 
 /// Stripe provider configuration

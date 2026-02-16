@@ -107,6 +107,7 @@ impl DataMigration for PaymentMethodConfigMigration {
                     token: revolut.token.clone(),
                     api_version: revolut.api_version.clone(),
                     public_key: revolut.public_key.clone(),
+                    webhook_secret: None, // Will be populated when webhook is registered
                 });
 
                 let payment_config = PaymentMethodConfig::new_with_config(

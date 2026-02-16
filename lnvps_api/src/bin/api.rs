@@ -146,7 +146,7 @@ async fn main() -> Result<(), Error> {
         node.clone(),
         db.clone(),
         worker.commander(),
-    )?);
+    ).await?);
 
     // refresh rates every 1min
     let rates = exchange.clone();

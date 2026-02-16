@@ -266,6 +266,7 @@ mod tests {
                 token: "test-token".to_string(),
                 api_version: "2024-09-01".to_string(),
                 public_key: "pk_test_123".to_string(),
+                webhook_secret: None,
             }),
         );
         config.processing_fee_rate = Some(1.0);

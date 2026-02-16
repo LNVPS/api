@@ -2885,8 +2885,8 @@ Body:
   "enabled": boolean,                         // Optional - Default: true
   "config": ProviderConfig,                   // Required - Typed provider configuration (see examples below)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency unit
-  "processing_fee_currency": "string | null"  // Required if processing_fee_base is set - Currency code (e.g., "USD")
+  "processing_fee_base": integer | null,      // Optional - Base fee in smallest currency unit (e.g., 20 for €0.20)
+  "processing_fee_currency": "string | null"  // Required if processing_fee_base is set - Currency code (e.g., "EUR")
 }
 ```
 
@@ -2920,9 +2920,12 @@ Revolut:
   "url": "https://api.revolut.com",
   "token": "rev_api_token_here",
   "api_version": "2024-09-01",
-  "public_key": "pk_xxx"
+  "public_key": "pk_xxx",
+  "webhook_secret": "whs_xxx"
 }
 ```
+
+Note: The `webhook_secret` field is automatically populated when the API registers a webhook with Revolut. If you need to manually set this (e.g., when restoring from backup or migrating), you can provide it during creation or update. If omitted or set to `null`, the system will automatically register a new webhook and store the secret on startup.
 
 Stripe:
 ```json
@@ -2957,7 +2960,7 @@ Body (all optional):
   "enabled": boolean,                         // Enable/disable the payment method
   "config": ProviderConfig,                   // Typed provider configuration (see examples above)
   "processing_fee_rate": number | null,       // Fee percentage (null to clear)
-  "processing_fee_base": number | null,       // Base fee (null to clear)
+  "processing_fee_base": integer | null,      // Base fee in smallest currency unit (e.g., 20 for €0.20, null to clear)
   "processing_fee_currency": "string | null"  // Currency code (required if base fee is set)
 }
 ```
@@ -2996,7 +2999,7 @@ Response:
   "provider_type": "string",                  // Provider implementation type ("lnd", "bitvora", "revolut", "stripe", "paypal")
   "config": ProviderConfig | null,            // Typed provider config (may be null if deserialization fails)
   "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": number | null,       // Base fee in smallest currency unit (cents/millisats)
+  "processing_fee_base": integer | null,      // Base fee in smallest currency unit (e.g., 20 for €0.20)
   "processing_fee_currency": "string | null", // Currency code for base fee
   "created": "string (ISO 8601)",
   "modified": "string (ISO 8601)"
@@ -3010,8 +3013,8 @@ Response:
   "name": "string",                           // Required - Display name
   "enabled": boolean,                         // Optional - Default: true
   "config": ProviderConfig,                   // Required - Typed provider config (with "type" discriminator)
-  "processing_fee_rate": number | null,       // Optional - Fee percentage
-  "processing_fee_base": number | null,       // Optional - Base fee amount
+  "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
+  "processing_fee_base": integer | null,      // Optional - Base fee in smallest currency unit (e.g., 20 for €0.20)
   "processing_fee_currency": "string | null"  // Required if base fee is set
 }
 ```
@@ -3023,7 +3026,7 @@ Response:
   "enabled": boolean | null,                  // Optional - Enable/disable
   "config": ProviderConfig | null,            // Optional - Typed provider config (with "type" discriminator)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (null to clear)
-  "processing_fee_base": number | null,       // Optional - Base fee (null to clear)
+  "processing_fee_base": integer | null,      // Optional - Base fee in smallest currency unit (null to clear)
   "processing_fee_currency": "string | null"  // Optional - Currency (null to clear)
 }
 ```
@@ -3036,7 +3039,7 @@ The `config` field uses a tagged union format with `"type"` as the discriminator
 |-----------|----------------|-----------------------------------------------------------|
 | `lnd`     | lightning      | `url`, `cert_path`, `macaroon_path`                       |
 | `bitvora` | lightning      | `token`, `webhook_secret`                                 |
-| `revolut` | revolut        | `url`, `token`, `api_version`, `public_key`               |
+| `revolut` | revolut        | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`  | stripe         | `secret_key`, `publishable_key`, `webhook_secret`         |
 | `paypal`  | paypal         | `client_id`, `client_secret`, `mode`                      |
 
@@ -3054,7 +3057,7 @@ A company can have multiple payment method configurations for the same payment m
 
 **Processing Fees:**
 - `processing_fee_rate` is a percentage (1.0 = 1%, 2.5 = 2.5%)
-- `processing_fee_base` is in smallest currency unit (cents for USD, millisats for BTC)
+- `processing_fee_base` is an integer in the smallest currency unit (e.g., 20 for €0.20, 100 for $1.00, millisats for BTC)
 - When `processing_fee_base` is set, `processing_fee_currency` is required
 
 **Security:**

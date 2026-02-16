@@ -730,6 +730,7 @@ mod tests {
                 token: "test-token".to_string(),
                 api_version: "2024-09-01".to_string(),
                 public_key: "pk_test".to_string(),
+                webhook_secret: None,
             }),
         );
         config.id = 1;
