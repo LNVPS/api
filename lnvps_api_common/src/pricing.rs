@@ -13,46 +13,6 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// Processing fee rate structure: percentage + fixed base fee
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ProcessingFeeRate {
-    /// Percentage rate (e.g., 1.0 for 1%)
-    pub percentage_rate: f32,
-    /// Base fee in smallest currency unit (e.g., cents for fiat)
-    pub base_fee: u64,
-    /// Currency for the base fee (e.g., "EUR", "USD")
-    pub base_fee_currency: String,
-}
-
-/// Configuration for processing fees per payment method
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct ProcessingFeesConfig {
-    /// Revolut processing fee configuration
-    pub revolut: Option<ProcessingFeeRate>,
-    /// Stripe processing fee configuration
-    pub stripe: Option<ProcessingFeeRate>,
-    /// PayPal processing fee configuration
-    pub paypal: Option<ProcessingFeeRate>,
-}
-
-impl Default for ProcessingFeesConfig {
-    fn default() -> Self {
-        Self {
-            // Default example configuration (not guaranteed to match actual provider rates)
-            // Revolut example: 1% + 0.20 EUR
-            revolut: Some(ProcessingFeeRate {
-                percentage_rate: 1.0,
-                base_fee: 20, // 0.20 EUR in cents
-                base_fee_currency: "EUR".to_string(),
-            }),
-            stripe: None,
-            paypal: None,
-        }
-    }
-}
-
 
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
@@ -88,7 +48,6 @@ pub struct PricingEngine {
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
     base_currency: Currency,
-    processing_fees: ProcessingFeesConfig,
 }
 
 impl PricingEngine {
@@ -107,46 +66,66 @@ impl PricingEngine {
     
     /// Calculate processing fee for a payment based on payment method and amount
     /// Returns the processing fee in the same currency as the amount
-    pub fn calculate_processing_fee(
+    /// Queries the database for fee configuration
+    pub async fn calculate_processing_fee(
         &self,
+        company_id: Option<u64>,
         method: PaymentMethod,
         currency: Currency,
         amount: u64,
     ) -> u64 {
-        let fee_config = match method {
-            PaymentMethod::Revolut => &self.processing_fees.revolut,
-            PaymentMethod::Stripe => &self.processing_fees.stripe,
-            PaymentMethod::Paypal => &self.processing_fees.paypal,
-            // Lightning has no processing fees (peer-to-peer network)
-            PaymentMethod::Lightning => return 0,
-        };
+        // Lightning has no processing fees (peer-to-peer network)
+        if method == PaymentMethod::Lightning {
+            return 0;
+        }
 
-        // If no config is set for this payment method, return 0
-        let Some(config) = fee_config else {
+        // Need a company_id to look up fee config
+        let Some(company_id) = company_id else {
+            log::warn!("No company_id provided for processing fee calculation");
             return 0;
         };
 
+        // Try to get fee config from database
+        let config = match self.db.get_payment_method_config_for_company(company_id, method).await {
+            Ok(config) => config,
+            Err(e) => {
+                log::warn!("Failed to load payment method config for company {} method {:?}: {}", company_id, method, e);
+                return 0;
+            }
+        };
+
+        // Check if config is enabled and has fee settings
+        if !config.enabled || config.processing_fee_rate.is_none() || config.processing_fee_base.is_none() {
+            return 0;
+        }
+
+        let rate = config.processing_fee_rate.unwrap_or(0.0);
+        let base = config.processing_fee_base.unwrap_or(0);
+        let base_currency_str = config.processing_fee_currency.as_deref().unwrap_or("");
+
         // Calculate percentage fee (round instead of truncate to avoid systematic undercharging)
-        let percentage_fee = ((amount as f64) * (config.percentage_rate as f64 / 100.0)).round() as u64;
+        let percentage_fee = ((amount as f64) * (rate as f64 / 100.0)).round() as u64;
 
         // Get base fee, converting currency if needed
-        let base_fee_currency = Currency::from_str(&config.base_fee_currency).unwrap_or_else(|_| {
-            log::warn!(
-                "Invalid processing fee currency '{}' for {:?}, using transaction currency instead",
-                config.base_fee_currency,
-                method
-            );
+        let base_fee_currency = Currency::from_str(base_currency_str).unwrap_or_else(|_| {
+            if !base_currency_str.is_empty() {
+                log::warn!(
+                    "Invalid processing fee currency '{}' for {:?}, using transaction currency instead",
+                    base_currency_str,
+                    method
+                );
+            }
             currency
         });
         let base_fee = if base_fee_currency == currency {
             // Same currency, use directly
-            config.base_fee
+            base
         } else {
             // TODO: Implement proper currency conversion for the base fee
             // For now, use the base fee value as-is in the transaction currency
             // This is a simplification - in production, this should use the
             // exchange rate service to convert the fee to the target currency
-            config.base_fee
+            base
         };
 
         percentage_fee + base_fee
@@ -157,14 +136,12 @@ impl PricingEngine {
         rates: Arc<dyn ExchangeRateService>,
         tax_rates: HashMap<CountryCode, f32>,
         base_currency: Currency,
-        processing_fees: ProcessingFeesConfig,
     ) -> Self {
         Self {
             db,
             rates,
             tax_rates,
             base_currency,
-            processing_fees,
         }
     }
 
@@ -173,7 +150,6 @@ impl PricingEngine {
         db: Arc<dyn LNVpsDb>,
         rates: Arc<dyn ExchangeRateService>,
         tax_rates: HashMap<CountryCode, f32>,
-        processing_fees: ProcessingFeesConfig,
         vm_id: u64,
     ) -> Result<Self> {
         let base_currency_str = db.get_vm_base_currency(vm_id).await?;
@@ -181,7 +157,7 @@ impl PricingEngine {
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid base currency: {}", base_currency_str))?;
 
-        Ok(Self::new(db, rates, tax_rates, base_currency, processing_fees))
+        Ok(Self::new(db, rates, tax_rates, base_currency))
     }
 
     /// Get amount of time a certain currency amount will extend a vm in seconds
@@ -192,11 +168,12 @@ impl PricingEngine {
         method: PaymentMethod,
     ) -> Result<CostResult> {
         let vm = self.db.get_vm(vm_id).await?;
+        let company_id = self.db.get_vm_company_id(vm_id).await?;
 
         let cost = if vm.template_id.is_some() {
-            self.get_template_vm_cost(&vm, method).await?
+            self.get_template_vm_cost(&vm, method, company_id).await?
         } else {
-            self.get_custom_vm_cost(&vm, method).await?
+            self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
         ensure!(cost.currency == input.currency(), "Invalid currency");
@@ -213,7 +190,7 @@ impl PricingEngine {
             new_expiry: vm.expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
             tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
-            processing_fee: self.calculate_processing_fee(method, cost.currency, input.value()),
+            processing_fee: self.calculate_processing_fee(company_id, method, cost.currency, input.value()).await,
         }))
     }
 
@@ -231,12 +208,13 @@ impl PricingEngine {
     ) -> Result<CostResult> {
         let intervals = intervals.max(1); // Ensure at least 1 interval
         let vm = self.db.get_vm(vm_id).await?;
+        let company_id = self.db.get_vm_company_id(vm_id).await?;
 
         // Calculate the base cost to determine expected time value
         let base_cost = if vm.template_id.is_some() {
-            self.get_template_vm_cost(&vm, method).await?
+            self.get_template_vm_cost(&vm, method, company_id).await?
         } else {
-            self.get_custom_vm_cost(&vm, method).await?
+            self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
         let expected_time_value = base_cost.time_value * intervals as u64;
@@ -262,7 +240,7 @@ impl PricingEngine {
             let scaled_tax = self
                 .get_tax_for_user(vm.user_id, scaled_amount)
                 .await?;
-            let processing_fee = self.calculate_processing_fee(method, base_cost.currency, scaled_amount);
+            let processing_fee = self.calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount).await;
             Ok(CostResult::New(NewPaymentInfo {
                 amount: scaled_amount,
                 tax: scaled_tax,
@@ -330,7 +308,7 @@ impl PricingEngine {
     }
 
     /// Get the renewal cost of a custom VM
-    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<NewPaymentInfo> {
+    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: Option<u64>) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.custom_template_id {
             i
         } else {
@@ -353,7 +331,7 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
-            processing_fee: self.calculate_processing_fee(method, converted_amount.amount.currency(), converted_amount.amount.value()),
+            processing_fee: self.calculate_processing_fee(company_id, method, converted_amount.amount.currency(), converted_amount.amount.value()).await,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -408,7 +386,7 @@ impl PricingEngine {
     }
 
     /// Gets the renewal cost of a standard VM
-    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<NewPaymentInfo> {
+    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: Option<u64>) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.template_id {
             i
         } else {
@@ -427,7 +405,7 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
-            processing_fee: self.calculate_processing_fee(method, converted_amount.amount.currency(), converted_amount.amount.value()),
+            processing_fee: self.calculate_processing_fee(company_id, method, converted_amount.amount.currency(), converted_amount.amount.value()).await,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -739,22 +717,32 @@ mod tests {
     use super::*;
     use crate::{MockDb, MockExchangeRate};
     use lnvps_db::{
-        DiskType, LNVpsDbBase, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+        DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     };
 
     const MOCK_RATE: f32 = 100_000.0;
     const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0; // 30 days * 24 hours * 3600 seconds
 
-    fn default_processing_fees() -> ProcessingFeesConfig {
-        ProcessingFeesConfig {
-            revolut: Some(ProcessingFeeRate {
-                percentage_rate: 1.0,
-                base_fee: 20,
-                base_fee_currency: "EUR".to_string(),
+    async fn add_revolut_processing_fee_config(db: &MockDb) {
+        use lnvps_db::{ProviderConfig, RevolutProviderConfig};
+        let mut configs = db.payment_method_configs.lock().await;
+        let mut config = PaymentMethodConfig::new_with_config(
+            1, // Default company from MockDb
+            PaymentMethod::Revolut,
+            "Revolut".to_string(),
+            true,
+            ProviderConfig::Revolut(RevolutProviderConfig {
+                url: "https://api.revolut.com".to_string(),
+                token: "test-token".to_string(),
+                api_version: "2024-09-01".to_string(),
+                public_key: "pk_test".to_string(),
             }),
-            stripe: None,
-            paypal: None,
-        }
+        );
+        config.id = 1;
+        config.processing_fee_rate = Some(1.0);
+        config.processing_fee_base = Some(20);
+        config.processing_fee_currency = Some("EUR".to_string());
+        configs.insert(1, config);
     }
 
     async fn add_custom_pricing(db: &MockDb) {
@@ -867,7 +855,7 @@ mod tests {
 
         let taxes = HashMap::from([(CountryCode::IRL, 23.0)]);
 
-        let pe = PricingEngine::new(db.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db.clone(), rates, taxes, Currency::EUR);
         let plan = MockDb::mock_cost_plan();
 
         let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
@@ -933,10 +921,10 @@ mod tests {
 
         // Test EUR pricing engine
         let pe_eur =
-            PricingEngine::new(db_arc.clone(), rates.clone(), taxes.clone(), Currency::EUR, default_processing_fees());
+            PricingEngine::new(db_arc.clone(), rates.clone(), taxes.clone(), Currency::EUR);
 
         // Test USD pricing engine
-        let pe_usd = PricingEngine::new(db_arc.clone(), rates.clone(), taxes, Currency::USD, default_processing_fees());
+        let pe_usd = PricingEngine::new(db_arc.clone(), rates.clone(), taxes, Currency::USD);
 
         // Both should work with their respective base currencies
         // The base currency is now stored in the pricing engine itself
@@ -965,7 +953,7 @@ mod tests {
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
 
         // Test creating pricing engine for VM (should use EUR from default company)
-        let pe = PricingEngine::new_for_vm(db_arc.clone(), rates.clone(), taxes.clone(), default_processing_fees(), 1).await?;
+        let pe = PricingEngine::new_for_vm(db_arc.clone(), rates.clone(), taxes.clone(), 1).await?;
         assert_eq!(pe.base_currency, Currency::EUR);
 
         Ok(())
@@ -1048,7 +1036,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
 
         // Test upgrade configuration - increase CPU from 1 to 2
         let upgrade_config = UpgradeConfig {
@@ -1099,7 +1087,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(2),
@@ -1143,7 +1131,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(2),
@@ -1188,7 +1176,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(4), // Upgrade from 2 to 4 CPUs
@@ -1243,7 +1231,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
 
         // Test upgrade - increase CPU from 2 to 4 (double the CPU)
         let upgrade_config = UpgradeConfig {
@@ -1254,8 +1242,9 @@ mod tests {
 
         // Get the old VM cost per second
         let vm = db_arc.get_vm(1).await?;
+        let company_id = db_arc.get_vm_company_id(1).await?;
         let old_cost_info = pe
-            .get_template_vm_cost(&vm, PaymentMethod::Lightning)
+            .get_template_vm_cost(&vm, PaymentMethod::Lightning, company_id)
             .await?;
         let old_cost_per_second = old_cost_info.cost_per_second();
 
@@ -1407,7 +1396,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
 
         // Test large upgrade - significantly increase all resources
         let upgrade_config = UpgradeConfig {
@@ -1543,15 +1532,28 @@ mod tests {
         // Set up EUR rate
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
-        // Add a basic VM
+        // Add a basic VM and user
         {
             let mut v = db.vms.lock().await;
             v.insert(1, MockDb::mock_vm());
+            
+            let mut u = db.users.lock().await;
+            u.insert(
+                1,
+                User {
+                    id: 1,
+                    pubkey: vec![],
+                    ..Default::default()
+                },
+            );
         }
+
+        // Add Revolut processing fee config to the database
+        add_revolut_processing_fee_config(&db).await;
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR, default_processing_fees());
+        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR);
 
         // Test Lightning payment (no processing fee)
         let price_lightning = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;

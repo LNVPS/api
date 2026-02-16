@@ -2261,3 +2261,137 @@ impl AdminIpRangeSubscriptionInfo {
         Ok(info)
     }
 }
+
+// Payment Method Configuration Models
+
+/// Admin payment method enum matching PaymentMethod from lnvps_db
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminPaymentMethodType {
+    Lightning,
+    Revolut,
+    Paypal,
+    Stripe,
+}
+
+impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
+    fn from(method: lnvps_db::PaymentMethod) -> Self {
+        match method {
+            lnvps_db::PaymentMethod::Lightning => AdminPaymentMethodType::Lightning,
+            lnvps_db::PaymentMethod::Revolut => AdminPaymentMethodType::Revolut,
+            lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
+            lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
+        }
+    }
+}
+
+impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
+    fn from(method: AdminPaymentMethodType) -> Self {
+        match method {
+            AdminPaymentMethodType::Lightning => lnvps_db::PaymentMethod::Lightning,
+            AdminPaymentMethodType::Revolut => lnvps_db::PaymentMethod::Revolut,
+            AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
+            AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
+        }
+    }
+}
+
+/// Admin view of payment method configuration
+#[derive(Serialize)]
+pub struct AdminPaymentMethodConfigInfo {
+    pub id: u64,
+    /// Company this config belongs to - enforces one config per payment method per company
+    pub company_id: u64,
+    pub payment_method: AdminPaymentMethodType,
+    pub name: String,
+    pub enabled: bool,
+    pub provider_type: String,
+    /// Typed provider configuration (may be None if deserialization fails)
+    pub config: Option<lnvps_db::ProviderConfig>,
+    /// Processing fee percentage rate (e.g., 1.0 for 1%)
+    pub processing_fee_rate: Option<f32>,
+    /// Processing fee base amount in smallest currency unit
+    pub processing_fee_base: Option<u64>,
+    /// Currency for the processing fee base
+    pub processing_fee_currency: Option<String>,
+    pub created: DateTime<Utc>,
+    pub modified: DateTime<Utc>,
+}
+
+impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
+    fn from(config: lnvps_db::PaymentMethodConfig) -> Self {
+        let provider_config = config.get_provider_config();
+        Self {
+            id: config.id,
+            company_id: config.company_id,
+            payment_method: AdminPaymentMethodType::from(config.payment_method),
+            name: config.name,
+            enabled: config.enabled,
+            provider_type: config.provider_type,
+            config: provider_config,
+            processing_fee_rate: config.processing_fee_rate,
+            processing_fee_base: config.processing_fee_base,
+            processing_fee_currency: config.processing_fee_currency,
+            created: config.created,
+            modified: config.modified,
+        }
+    }
+}
+
+/// Request to create a new payment method configuration
+#[derive(Deserialize)]
+pub struct CreatePaymentMethodConfigRequest {
+    /// Company this config belongs to - each company can have one config per payment method type
+    pub company_id: u64,
+    pub name: String,
+    pub enabled: Option<bool>,
+    /// Typed provider configuration
+    pub config: lnvps_db::ProviderConfig,
+    pub processing_fee_rate: Option<f32>,
+    pub processing_fee_base: Option<u64>,
+    pub processing_fee_currency: Option<String>,
+}
+
+impl CreatePaymentMethodConfigRequest {
+    pub fn to_payment_method_config(&self) -> anyhow::Result<lnvps_db::PaymentMethodConfig> {
+        if self.name.trim().is_empty() {
+            return Err(anyhow!("Payment method config name cannot be empty"));
+        }
+
+        // Validate that if processing fee base is set, currency must also be set
+        if self.processing_fee_base.is_some() && self.processing_fee_currency.is_none() {
+            return Err(anyhow!(
+                "Processing fee currency is required when processing fee base is set"
+            ));
+        }
+
+        let mut payment_config = lnvps_db::PaymentMethodConfig::new_with_config(
+            self.company_id,
+            self.config.payment_method(),
+            self.name.trim().to_string(),
+            self.enabled.unwrap_or(true),
+            self.config.clone(),
+        );
+        payment_config.processing_fee_rate = self.processing_fee_rate;
+        payment_config.processing_fee_base = self.processing_fee_base;
+        payment_config.processing_fee_currency = self
+            .processing_fee_currency
+            .as_ref()
+            .map(|s| s.trim().to_uppercase());
+
+        Ok(payment_config)
+    }
+}
+
+/// Request to update an existing payment method configuration
+#[derive(Deserialize)]
+pub struct UpdatePaymentMethodConfigRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    /// Typed provider configuration
+    pub config: Option<lnvps_db::ProviderConfig>,
+    pub processing_fee_rate: Option<Option<f32>>,
+    pub processing_fee_base: Option<Option<u64>>,
+    pub processing_fee_currency: Option<Option<String>>,
+}
+

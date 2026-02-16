@@ -38,7 +38,6 @@ pub struct LNVpsProvisioner {
     revolut: Option<Arc<dyn FiatPaymentService>>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
-    processing_fees: lnvps_api_common::ProcessingFeesConfig,
     pub network: LNVpsNetworkProvisioner,
     provisioner_config: ProvisionerConfig,
 }
@@ -65,7 +64,6 @@ impl LNVpsProvisioner {
             ),
             revolut: settings.get_revolut().expect("revolut config"),
             tax_rates: settings.tax_rate,
-            processing_fees: settings.processing_fees,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
             db,
@@ -258,7 +256,6 @@ impl LNVpsProvisioner {
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
-            self.processing_fees.clone(),
             vm_id,
         )
         .await?;
@@ -279,7 +276,6 @@ impl LNVpsProvisioner {
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
-            self.processing_fees.clone(),
             vm_id,
         )
         .await?;
@@ -338,7 +334,6 @@ impl LNVpsProvisioner {
             self.rates.clone(),
             self.tax_rates.clone(),
             subscription_currency,
-            self.processing_fees.clone(),
         );
 
         // Convert list price to payment method currency and get rate
@@ -350,7 +345,9 @@ impl LNVpsProvisioner {
             .await?;
         
         // Calculate processing fee
-        let processing_fee = pe.calculate_processing_fee(method, converted.amount.currency(), converted.amount.value());
+        // Note: Subscriptions don't have a company_id, so we pass None (no processing fee)
+        // This could be enhanced to derive company from subscription line items if needed
+        let processing_fee = pe.calculate_processing_fee(None, method, converted.amount.currency(), converted.amount.value()).await;
 
         // Generate payment based on method
         let subscription_payment = match method {
@@ -773,7 +770,6 @@ impl LNVpsProvisioner {
             self.db.clone(),
             self.rates.clone(),
             self.tax_rates.clone(),
-            self.processing_fees.clone(),
             vm_id,
         )
         .await?;

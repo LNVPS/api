@@ -1949,6 +1949,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `subscriptions` - Subscription management
 - `subscription_line_items` - Subscription line item management
 - `subscription_payments` - Subscription payment management
+- `payment_method_config` - Payment method configuration management
 
 ### Actions:
 - `create` - Create new resources
@@ -1971,6 +1972,8 @@ The RBAC system uses the following permission format: `resource::action`
 - `subscriptions::create` - Create new subscriptions
 - `subscription_line_items::update` - Modify subscription line items
 - `subscription_payments::view` - View subscription payments
+- `payment_method_config::view` - View payment method configurations
+- `payment_method_config::create` - Create payment method configurations
 
 ## Response Models
 
@@ -2838,6 +2841,228 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
   "parent_cidr": "string | null"         // Parent IP space CIDR (enriched)
 }
 ```
+
+---
+
+## Payment Method Configuration Management
+
+Payment method configurations store provider settings for payment processing (Lightning/LND/Bitvora, Revolut, Stripe, PayPal). This allows payment provider settings to be managed in the database instead of static configuration files.
+
+Each configuration belongs to a specific company, and multiple configurations can exist per company/payment method combination. This allows keeping disabled legacy configurations that are still referenced by historical payments while having newer active configurations.
+
+### List Payment Method Configurations
+```
+GET /api/admin/v1/payment_methods
+```
+Query Parameters:
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `company_id`: number (optional) - filter by company ID
+
+Required Permission: `payment_method_config::view`
+
+Returns paginated list of payment method configurations.
+
+### Get Payment Method Configuration
+```
+GET /api/admin/v1/payment_methods/{id}
+```
+Required Permission: `payment_method_config::view`
+
+Returns detailed information about a specific payment method configuration.
+
+### Create Payment Method Configuration
+```
+POST /api/admin/v1/payment_methods
+```
+Required Permission: `payment_method_config::create`
+
+Body:
+```json
+{
+  "company_id": number,                       // Required - Company this configuration belongs to
+  "name": "string",                           // Required - Display name for the configuration
+  "enabled": boolean,                         // Optional - Default: true
+  "config": ProviderConfig,                   // Required - Typed provider configuration (see examples below)
+  "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency unit
+  "processing_fee_currency": "string | null"  // Required if processing_fee_base is set - Currency code (e.g., "USD")
+}
+```
+
+**Provider Configuration Examples:**
+
+The `config` field is a tagged union using `"type"` as the discriminator field.
+
+LND (Lightning):
+```json
+{
+  "type": "lnd",
+  "url": "https://lnd.example.com:8080",
+  "cert_path": "/path/to/tls.cert",
+  "macaroon_path": "/path/to/admin.macaroon"
+}
+```
+
+Bitvora (Lightning):
+```json
+{
+  "type": "bitvora",
+  "token": "bv_api_token_here",
+  "webhook_secret": "webhook_secret_here"
+}
+```
+
+Revolut:
+```json
+{
+  "type": "revolut",
+  "url": "https://api.revolut.com",
+  "token": "rev_api_token_here",
+  "api_version": "2024-09-01",
+  "public_key": "pk_xxx"
+}
+```
+
+Stripe:
+```json
+{
+  "type": "stripe",
+  "secret_key": "sk_live_xxx",
+  "publishable_key": "pk_live_xxx",
+  "webhook_secret": "whsec_xxx"
+}
+```
+
+PayPal:
+```json
+{
+  "type": "paypal",
+  "client_id": "client_id_here",
+  "client_secret": "client_secret_here",
+  "mode": "live"
+}
+```
+
+### Update Payment Method Configuration
+```
+PATCH /api/admin/v1/payment_methods/{id}
+```
+Required Permission: `payment_method_config::update`
+
+Body (all optional):
+```json
+{
+  "name": "string",                           // Display name (cannot be empty)
+  "enabled": boolean,                         // Enable/disable the payment method
+  "config": ProviderConfig,                   // Typed provider configuration (see examples above)
+  "processing_fee_rate": number | null,       // Fee percentage (null to clear)
+  "processing_fee_base": number | null,       // Base fee (null to clear)
+  "processing_fee_currency": "string | null"  // Currency code (required if base fee is set)
+}
+```
+
+Note: If `processing_fee_base` is set, `processing_fee_currency` must also be provided.
+Note: When updating `config`, the entire ProviderConfig object must be provided (including `type` discriminator).
+
+### Delete Payment Method Configuration
+```
+DELETE /api/admin/v1/payment_methods/{id}
+```
+Required Permission: `payment_method_config::delete`
+
+Response:
+```json
+{
+  "data": {
+    "success": true,
+    "message": "Payment method configuration deleted successfully"
+  }
+}
+```
+
+---
+
+## Payment Method Configuration Data Types
+
+### AdminPaymentMethodConfigInfo
+```json
+{
+  "id": number,
+  "company_id": number,                       // Company this config belongs to
+  "payment_method": "lightning",              // AdminPaymentMethodType: "lightning", "revolut", "paypal", "stripe"
+  "name": "string",
+  "enabled": boolean,
+  "provider_type": "string",                  // Provider implementation type ("lnd", "bitvora", "revolut", "stripe", "paypal")
+  "config": ProviderConfig | null,            // Typed provider config (may be null if deserialization fails)
+  "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
+  "processing_fee_base": number | null,       // Base fee in smallest currency unit (cents/millisats)
+  "processing_fee_currency": "string | null", // Currency code for base fee
+  "created": "string (ISO 8601)",
+  "modified": "string (ISO 8601)"
+}
+```
+
+### CreatePaymentMethodConfigRequest
+```json
+{
+  "company_id": number,                       // Required - Company to create config for
+  "name": "string",                           // Required - Display name
+  "enabled": boolean,                         // Optional - Default: true
+  "config": ProviderConfig,                   // Required - Typed provider config (with "type" discriminator)
+  "processing_fee_rate": number | null,       // Optional - Fee percentage
+  "processing_fee_base": number | null,       // Optional - Base fee amount
+  "processing_fee_currency": "string | null"  // Required if base fee is set
+}
+```
+
+### UpdatePaymentMethodConfigRequest
+```json
+{
+  "name": "string | null",                    // Optional - Display name
+  "enabled": boolean | null,                  // Optional - Enable/disable
+  "config": ProviderConfig | null,            // Optional - Typed provider config (with "type" discriminator)
+  "processing_fee_rate": number | null,       // Optional - Fee percentage (null to clear)
+  "processing_fee_base": number | null,       // Optional - Base fee (null to clear)
+  "processing_fee_currency": "string | null"  // Optional - Currency (null to clear)
+}
+```
+
+### ProviderConfig (Tagged Union)
+
+The `config` field uses a tagged union format with `"type"` as the discriminator:
+
+| Type      | Payment Method | Fields                                                    |
+|-----------|----------------|-----------------------------------------------------------|
+| `lnd`     | lightning      | `url`, `cert_path`, `macaroon_path`                       |
+| `bitvora` | lightning      | `token`, `webhook_secret`                                 |
+| `revolut` | revolut        | `url`, `token`, `api_version`, `public_key`               |
+| `stripe`  | stripe         | `secret_key`, `publishable_key`, `webhook_secret`         |
+| `paypal`  | paypal         | `client_id`, `client_secret`, `mode`                      |
+
+### Notes
+
+**Provider Types:**
+- `lnd` - Lightning Network Daemon for Lightning payments
+- `bitvora` - Bitvora API for Lightning payments
+- `revolut` - Revolut Business API
+- `stripe` - Stripe Payments API
+- `paypal` - PayPal REST API
+
+**Multiple Configurations:**
+A company can have multiple payment method configurations for the same payment method type. This allows keeping disabled legacy configurations that are still referenced by historical payments (e.g., VM payments, subscription payments) while having newer active configurations.
+
+**Processing Fees:**
+- `processing_fee_rate` is a percentage (1.0 = 1%, 2.5 = 2.5%)
+- `processing_fee_base` is in smallest currency unit (cents for USD, millisats for BTC)
+- When `processing_fee_base` is set, `processing_fee_currency` is required
+
+**Security:**
+- Configuration JSON may contain sensitive credentials (API keys, secrets)
+- Ensure proper access controls are in place for payment method management
+- Consider masking sensitive fields in API responses for audit logging
+
+---
 
 ### Notes
 

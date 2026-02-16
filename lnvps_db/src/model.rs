@@ -826,6 +826,7 @@ pub enum AdminResource {
     SubscriptionLineItems = 18,
     SubscriptionPayments = 19,
     IpSpace = 20,
+    PaymentMethodConfig = 21,
 }
 
 /// Actions that can be performed on administrative resources
@@ -862,6 +863,7 @@ impl Display for AdminResource {
             AdminResource::SubscriptionLineItems => write!(f, "subscription_line_items"),
             AdminResource::SubscriptionPayments => write!(f, "subscription_payments"),
             AdminResource::IpSpace => write!(f, "ip_space"),
+            AdminResource::PaymentMethodConfig => write!(f, "payment_method_config"),
         }
     }
 }
@@ -892,6 +894,7 @@ impl FromStr for AdminResource {
             "subscription_line_items" => Ok(AdminResource::SubscriptionLineItems),
             "subscription_payments" => Ok(AdminResource::SubscriptionPayments),
             "ip_space" => Ok(AdminResource::IpSpace),
+            "payment_method_config" => Ok(AdminResource::PaymentMethodConfig),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -923,6 +926,7 @@ impl TryFrom<u16> for AdminResource {
             18 => Ok(AdminResource::SubscriptionLineItems),
             19 => Ok(AdminResource::SubscriptionPayments),
             20 => Ok(AdminResource::IpSpace),
+            21 => Ok(AdminResource::PaymentMethodConfig),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -953,6 +957,7 @@ impl AdminResource {
             AdminResource::SubscriptionLineItems,
             AdminResource::SubscriptionPayments,
             AdminResource::IpSpace,
+            AdminResource::PaymentMethodConfig,
         ]
     }
 }
@@ -1232,4 +1237,212 @@ pub struct IpRangeSubscription {
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Lightning provider configuration - LND
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LndConfig {
+    /// LND REST API URL
+    pub url: String,
+    /// Path to TLS certificate
+    pub cert_path: PathBuf,
+    /// Path to macaroon file
+    pub macaroon_path: PathBuf,
+}
+
+/// Lightning provider configuration - Bitvora
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BitvoraConfig {
+    /// API token
+    pub token: String,
+    /// Webhook secret for verifying callbacks
+    pub webhook_secret: String,
+}
+
+/// Revolut provider configuration
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevolutProviderConfig {
+    /// Revolut API URL
+    pub url: String,
+    /// API token
+    pub token: String,
+    /// API version string
+    pub api_version: String,
+    /// Public key for client-side integration
+    pub public_key: String,
+}
+
+/// Stripe provider configuration
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StripeProviderConfig {
+    /// Secret API key
+    pub secret_key: String,
+    /// Publishable key for client-side
+    pub publishable_key: String,
+    /// Webhook secret for verifying callbacks
+    pub webhook_secret: String,
+}
+
+/// PayPal provider configuration
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PaypalProviderConfig {
+    /// Client ID
+    pub client_id: String,
+    /// Client secret
+    pub client_secret: String,
+    /// Mode: "sandbox" or "live"
+    pub mode: String,
+}
+
+/// Typed provider configuration enum
+/// Wraps all supported payment provider configurations
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    /// LND Lightning Network Daemon configuration
+    Lnd(LndConfig),
+    /// Bitvora Lightning provider configuration
+    Bitvora(BitvoraConfig),
+    /// Revolut fiat payment configuration
+    Revolut(RevolutProviderConfig),
+    /// Stripe fiat payment configuration
+    Stripe(StripeProviderConfig),
+    /// PayPal fiat payment configuration
+    Paypal(PaypalProviderConfig),
+}
+
+impl ProviderConfig {
+    /// Get the provider type string for this config
+    pub fn provider_type(&self) -> &'static str {
+        match self {
+            ProviderConfig::Lnd(_) => "lnd",
+            ProviderConfig::Bitvora(_) => "bitvora",
+            ProviderConfig::Revolut(_) => "revolut",
+            ProviderConfig::Stripe(_) => "stripe",
+            ProviderConfig::Paypal(_) => "paypal",
+        }
+    }
+
+    /// Get the payment method for this provider config
+    pub fn payment_method(&self) -> PaymentMethod {
+        match self {
+            ProviderConfig::Lnd(_) | ProviderConfig::Bitvora(_) => PaymentMethod::Lightning,
+            ProviderConfig::Revolut(_) => PaymentMethod::Revolut,
+            ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
+            ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
+        }
+    }
+
+    /// Get LND config if this is an LND provider
+    pub fn as_lnd(&self) -> Option<&LndConfig> {
+        match self {
+            ProviderConfig::Lnd(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get Bitvora config if this is a Bitvora provider
+    pub fn as_bitvora(&self) -> Option<&BitvoraConfig> {
+        match self {
+            ProviderConfig::Bitvora(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get Revolut config if this is a Revolut provider
+    pub fn as_revolut(&self) -> Option<&RevolutProviderConfig> {
+        match self {
+            ProviderConfig::Revolut(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get Stripe config if this is a Stripe provider
+    pub fn as_stripe(&self) -> Option<&StripeProviderConfig> {
+        match self {
+            ProviderConfig::Stripe(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get PayPal config if this is a PayPal provider
+    pub fn as_paypal(&self) -> Option<&PaypalProviderConfig> {
+        match self {
+            ProviderConfig::Paypal(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+}
+
+/// Payment method configuration stored in database
+/// Replaces YAML config for payment providers
+#[derive(FromRow, Clone, Debug)]
+pub struct PaymentMethodConfig {
+    /// Unique id of this configuration
+    pub id: u64,
+    /// Company that owns this payment method configuration
+    pub company_id: u64,
+    /// Payment method type (Lightning, Revolut, etc.)
+    pub payment_method: PaymentMethod,
+    /// Display name for this configuration
+    pub name: String,
+    /// Whether this payment method is enabled
+    pub enabled: bool,
+    /// Provider type string (e.g., "lnd", "bitvora", "revolut")
+    pub provider_type: String,
+    /// JSON configuration for the provider
+    pub config: Option<serde_json::Value>,
+    /// Processing fee percentage rate (e.g., 1.0 for 1%)
+    pub processing_fee_rate: Option<f32>,
+    /// Processing fee base amount in smallest currency unit
+    pub processing_fee_base: Option<u64>,
+    /// Currency for the processing fee base
+    pub processing_fee_currency: Option<String>,
+    /// Created timestamp
+    pub created: DateTime<Utc>,
+    /// Last modified timestamp
+    pub modified: DateTime<Utc>,
+}
+
+impl PaymentMethodConfig {
+    /// Get the typed provider configuration
+    /// Returns None if config is None or deserialization fails
+    pub fn get_provider_config(&self) -> Option<ProviderConfig> {
+        self.config
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// Set the provider configuration from a typed config
+    /// Updates both the config JSON and provider_type field
+    pub fn set_provider_config(&mut self, provider_config: ProviderConfig) {
+        self.provider_type = provider_config.provider_type().to_string();
+        self.config = serde_json::to_value(&provider_config).ok();
+    }
+
+    /// Create a new PaymentMethodConfig with a typed provider configuration
+    pub fn new_with_config(
+        company_id: u64,
+        payment_method: PaymentMethod,
+        name: String,
+        enabled: bool,
+        provider_config: ProviderConfig,
+    ) -> Self {
+        let provider_type = provider_config.provider_type().to_string();
+        let config = serde_json::to_value(&provider_config).ok();
+        Self {
+            id: 0,
+            company_id,
+            payment_method,
+            name,
+            enabled,
+            provider_type,
+            config,
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+            created: Utc::now(),
+            modified: Utc::now(),
+        }
+    }
 }

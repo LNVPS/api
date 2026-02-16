@@ -3,7 +3,7 @@ use crate::exchange::ExchangeRateService;
 use crate::provisioner::LNVpsProvisioner;
 use anyhow::Result;
 use isocountry::CountryCode;
-use lnvps_api_common::{ProcessingFeesConfig, RedisConfig};
+use lnvps_api_common::RedisConfig;
 use lnvps_db::LNVpsDb;
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::LightningNode;
@@ -51,10 +51,6 @@ pub struct Settings {
     #[serde(default)]
     /// Tax rates to change per country as a percent of the amount
     pub tax_rate: HashMap<CountryCode, f32>,
-    
-    #[serde(default)]
-    /// Processing fee configuration for different payment methods
-    pub processing_fees: ProcessingFeesConfig,
 
     /// public host of lnvps_nostr service
     pub nostr_address_host: Option<String>,
@@ -315,7 +311,6 @@ pub fn mock_settings() -> Settings {
         nostr: None,
         revolut: None,
         tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
-        processing_fees: ProcessingFeesConfig::default(),
         nostr_address_host: None,
         redis: None,
         encryption: None,

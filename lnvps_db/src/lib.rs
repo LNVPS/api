@@ -32,6 +32,9 @@ pub enum DbError {
     #[error("{0}")]
     Source(#[source] Box<dyn std::error::Error + 'static + Send + Sync>),
 
+    #[error("{0}")]
+    Other(#[source] anyhow::Error),
+
     #[error("Unknown database error")]
     Unknown,
 }
@@ -312,8 +315,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get company
     async fn get_company(&self, company_id: u64) -> DbResult<Company>;
 
+    /// List all companies
+    async fn list_companies(&self) -> DbResult<Vec<Company>>;
+
     /// Get base currency for a VM based on its region's company
     async fn get_vm_base_currency(&self, vm_id: u64) -> DbResult<String>;
+
+    /// Get company ID for a VM based on its region's company
+    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<Option<u64>>;
 
     /// Insert a new VM history record
     async fn insert_vm_history(&self, history: &VmHistory) -> DbResult<u64>;
@@ -447,6 +456,45 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn insert_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> DbResult<u64>;
     async fn update_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> DbResult<()>;
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()>;
+
+    // ========================================================================
+    // Payment Method Configuration
+    // ========================================================================
+
+    /// List all payment method configurations
+    async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>>;
+
+    /// List payment method configurations for a company
+    async fn list_payment_method_configs_for_company(
+        &self,
+        company_id: u64,
+    ) -> DbResult<Vec<PaymentMethodConfig>>;
+
+    /// List enabled payment method configurations for a company
+    async fn list_enabled_payment_method_configs_for_company(
+        &self,
+        company_id: u64,
+    ) -> DbResult<Vec<PaymentMethodConfig>>;
+
+    /// Get a payment method configuration by id
+    async fn get_payment_method_config(&self, id: u64) -> DbResult<PaymentMethodConfig>;
+
+    /// Get a payment method configuration by company and payment method type
+    /// Returns a single result since each company can only have one config per payment method
+    async fn get_payment_method_config_for_company(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+    ) -> DbResult<PaymentMethodConfig>;
+
+    /// Insert a new payment method configuration
+    async fn insert_payment_method_config(&self, config: &PaymentMethodConfig) -> DbResult<u64>;
+
+    /// Update a payment method configuration
+    async fn update_payment_method_config(&self, config: &PaymentMethodConfig) -> DbResult<()>;
+
+    /// Delete a payment method configuration
+    async fn delete_payment_method_config(&self, id: u64) -> DbResult<()>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

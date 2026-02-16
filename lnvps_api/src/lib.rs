@@ -3,6 +3,7 @@ pub mod data_migration;
 pub mod dns;
 pub mod host;
 pub mod json_api;
+pub mod payment_factory;
 pub mod payments;
 pub mod provisioner;
 pub mod router;

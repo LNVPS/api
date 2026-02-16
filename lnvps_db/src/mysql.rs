@@ -1,16 +1,16 @@
 use crate::{
     AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentType, ReferralCostUsage, RegionStats,
-    Router, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
+    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType,
+    ReferralCostUsage, RegionStats, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 #[cfg(feature = "nostr-domain")]
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
@@ -853,6 +853,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn list_companies(&self) -> DbResult<Vec<Company>> {
+        Ok(sqlx::query_as("select * from company order by id")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
     async fn get_vm_base_currency(&self, vm_id: u64) -> DbResult<String> {
         let currency = sqlx::query_scalar::<_, String>(
             "SELECT COALESCE(c.base_currency, 'EUR') as base_currency 
@@ -866,6 +872,20 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await?;
         Ok(currency)
+    }
+
+    async fn get_vm_company_id(&self, vm_id: u64) -> DbResult<Option<u64>> {
+        let company_id = sqlx::query_scalar::<_, Option<u64>>(
+            "SELECT vhr.company_id 
+             FROM vm v
+             JOIN vm_host vh ON v.host_id = vh.id  
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             WHERE v.id = ?",
+        )
+        .bind(vm_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(company_id)
     }
 
     async fn insert_vm_history(&self, history: &VmHistory) -> DbResult<u64> {
@@ -1612,6 +1632,119 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM ip_range_subscription WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Payment Method Configuration
+    // ========================================================================
+
+    async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>> {
+        Ok(sqlx::query_as("SELECT * FROM payment_method_config ORDER BY company_id, payment_method, name")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn list_payment_method_configs_for_company(
+        &self,
+        company_id: u64,
+    ) -> DbResult<Vec<PaymentMethodConfig>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM payment_method_config WHERE company_id = ? ORDER BY payment_method, name",
+        )
+        .bind(company_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_enabled_payment_method_configs_for_company(
+        &self,
+        company_id: u64,
+    ) -> DbResult<Vec<PaymentMethodConfig>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM payment_method_config WHERE company_id = ? AND enabled = TRUE ORDER BY payment_method, name",
+        )
+        .bind(company_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn get_payment_method_config(&self, id: u64) -> DbResult<PaymentMethodConfig> {
+        Ok(sqlx::query_as("SELECT * FROM payment_method_config WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_payment_method_config_for_company(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+    ) -> DbResult<PaymentMethodConfig> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM payment_method_config WHERE company_id = ? AND payment_method = ?",
+        )
+        .bind(company_id)
+        .bind(method)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn insert_payment_method_config(&self, config: &PaymentMethodConfig) -> DbResult<u64> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO payment_method_config 
+            (company_id, payment_method, name, enabled, provider_type, config, 
+             processing_fee_rate, processing_fee_base, processing_fee_currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(config.company_id)
+        .bind(config.payment_method)
+        .bind(&config.name)
+        .bind(config.enabled)
+        .bind(&config.provider_type)
+        .bind(&config.config)
+        .bind(config.processing_fee_rate)
+        .bind(config.processing_fee_base)
+        .bind(&config.processing_fee_currency)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn update_payment_method_config(&self, config: &PaymentMethodConfig) -> DbResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE payment_method_config 
+            SET company_id = ?, payment_method = ?, name = ?, enabled = ?, provider_type = ?, config = ?,
+                processing_fee_rate = ?, processing_fee_base = ?, processing_fee_currency = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(config.company_id)
+        .bind(config.payment_method)
+        .bind(&config.name)
+        .bind(config.enabled)
+        .bind(&config.provider_type)
+        .bind(&config.config)
+        .bind(config.processing_fee_rate)
+        .bind(config.processing_fee_base)
+        .bind(&config.processing_fee_currency)
+        .bind(config.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_payment_method_config(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM payment_method_config WHERE id = ?")
             .bind(id)
             .execute(&self.db)
             .await?;
