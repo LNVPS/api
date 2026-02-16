@@ -126,9 +126,6 @@ async fn admin_update_cost_plan(
         cost_plan.name = name.trim().to_string();
     }
     if let Some(amount) = req.amount {
-        if amount < 0.0 {
-            return Err(anyhow::anyhow!("Cost plan amount cannot be negative").into());
-        }
         cost_plan.amount = amount;
     }
     if let Some(currency) = req.currency {

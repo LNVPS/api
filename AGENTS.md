@@ -229,14 +229,14 @@ When modifying any API (user-facing or admin), you **MUST**:
 The project uses `payments_rs::currency::CurrencyAmount` for currency conversions.
 
 ### Database Storage
-- Money amounts are stored as `u64` in smallest currency units (cents for fiat, millisats for BTC)
-- The `processing_fee_base` field in `PaymentMethodConfig` stores cents/millisats
+- All money amounts are stored as `u64` in smallest currency units (cents for fiat, millisats for BTC)
+- This includes: cost plan amounts, custom pricing costs (cpu_cost, memory_cost, ip4_cost, ip6_cost, disk cost), fees, payment amounts
 
 ### Admin API
-- The admin API accepts and returns human-readable amounts (`f32`)
-- Conversion is automatic using `payments_rs`:
-  - `CurrencyAmount::from_f32(Currency, f32)` - human-readable to smallest units
+- The admin API accepts and returns amounts as `u64` in smallest currency units (cents for fiat, millisats for BTC)
+- Use `payments_rs` for conversions:
   - `CurrencyAmount::from_u64(Currency, u64)` - smallest units directly
+  - `CurrencyAmount::from_f32(Currency, f32)` - human-readable to smallest units
   - `.value()` - returns `u64` smallest units
   - `.value_f32()` - returns `f32` human-readable
 
@@ -249,13 +249,14 @@ The project uses `payments_rs::currency::CurrencyAmount` for currency conversion
 ```rust
 use payments_rs::currency::{Currency, CurrencyAmount};
 
-// Human-readable to smallest units
-let amount = CurrencyAmount::from_f32(Currency::EUR, 0.20); // €0.20
-assert_eq!(amount.value(), 20); // 20 cents
+// Working with smallest units (preferred for API)
+let amount = CurrencyAmount::from_u64(Currency::EUR, 1099); // €10.99 = 1099 cents
+assert_eq!(amount.value(), 1099); // 1099 cents
+assert_eq!(amount.value_f32(), 10.99); // €10.99
 
-// Smallest units to human-readable
-let amount = CurrencyAmount::from_u64(Currency::EUR, 20); // 20 cents
-assert_eq!(amount.value_f32(), 0.20); // €0.20
+// Converting human-readable to smallest units
+let amount = CurrencyAmount::from_f32(Currency::EUR, 10.99); // €10.99
+assert_eq!(amount.value(), 1099); // 1099 cents
 ```
 
 ## Module Structure Pattern

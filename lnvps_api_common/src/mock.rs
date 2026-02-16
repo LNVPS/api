@@ -61,7 +61,7 @@ impl MockDb {
             id: 1,
             name: "mock".to_string(),
             created: Utc::now(),
-            amount: 1.32,
+            amount: 132, // 132 cents = €1.32 (in smallest currency units)
             currency: "EUR".to_string(), // This can be overridden based on company config
             interval_amount: 1,
             interval_type: VmCostPlanIntervalType::Month,

@@ -119,17 +119,10 @@ async fn admin_update_payment_method(
     if let Some(currency) = &request.processing_fee_currency {
         config.processing_fee_currency = currency.as_ref().map(|s| s.trim().to_uppercase());
     }
-    // Convert processing_fee_base from f32 (human-readable) to u64 (smallest units)
+    // processing_fee_base is already in smallest currency units (u64)
     if let Some(base) = request.processing_fee_base {
-        use payments_rs::currency::{Currency, CurrencyAmount};
-        use std::str::FromStr;
-        
         config.processing_fee_base = match (base, &config.processing_fee_currency) {
-            (Some(amount), Some(currency)) => {
-                let cur = Currency::from_str(currency)
-                    .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency))?;
-                Some(CurrencyAmount::from_f32(cur, amount).value())
-            }
+            (Some(amount), Some(_)) => Some(amount),
             (None, _) => None,
             (Some(_), None) => {
                 return Err(anyhow::anyhow!(

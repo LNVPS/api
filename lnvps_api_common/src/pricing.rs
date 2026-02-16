@@ -280,11 +280,15 @@ impl PricingEngine {
             } else {
                 bail!("No disk price found")
             };
-        let disk_cost = (template.disk_size / crate::GB) as f32 * disk_pricing.cost;
-        let cpu_cost = pricing.cpu_cost * template.cpu as f32;
-        let memory_cost = pricing.memory_cost * (template.memory / crate::GB) as f32;
-        let ip4_cost = pricing.ip4_cost * v4s as f32;
-        let ip6_cost = pricing.ip6_cost * v6s as f32;
+        // All costs are in smallest currency units (cents/millisats)
+        let disk_size_gb = template.disk_size / crate::GB;
+        let memory_gb = template.memory / crate::GB;
+        
+        let disk_cost = disk_size_gb * disk_pricing.cost;
+        let cpu_cost = pricing.cpu_cost * template.cpu as u64;
+        let memory_cost = pricing.memory_cost * memory_gb;
+        let ip4_cost = pricing.ip4_cost * v4s as u64;
+        let ip6_cost = pricing.ip6_cost * v6s as u64;
 
         let currency: Currency = if let Ok(p) = pricing.currency.parse() {
             p
@@ -316,7 +320,7 @@ impl PricingEngine {
         let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
-                CurrencyAmount::from_f32(price.currency, price.total()),
+                CurrencyAmount::from_u64(price.currency, price.total()),
                 method,
             )
             .await?;
@@ -391,7 +395,7 @@ impl PricingEngine {
 
         let currency = cost_plan.currency.parse().expect("Invalid currency");
         let converted_amount = self
-            .get_amount_and_rate(CurrencyAmount::from_f32(currency, cost_plan.amount), method)
+            .get_amount_and_rate(CurrencyAmount::from_u64(currency, cost_plan.amount), method)
             .await?;
         let time_value = Self::next_template_expire(vm, &cost_plan);
         Ok(NewPaymentInfo {
@@ -526,7 +530,7 @@ impl PricingEngine {
                 cost_plan.interval_amount,
             );
             (
-                CurrencyAmount::from_f32(
+                CurrencyAmount::from_u64(
                     cost_plan
                         .currency
                         .parse()
@@ -540,7 +544,7 @@ impl PricingEngine {
             let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
             let time_value = Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
             (
-                CurrencyAmount::from_f32(price.currency, price.total()),
+                CurrencyAmount::from_u64(price.currency, price.total()),
                 time_value,
             )
         } else {
@@ -599,7 +603,7 @@ impl PricingEngine {
         // Get the cost of renewal
         let new_price =
             Self::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
-        let new_price = CurrencyAmount::from_f32(new_price.currency, new_price.total());
+        let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
         let custom_plan_seconds =
@@ -693,15 +697,20 @@ impl NewPaymentInfo {
 #[derive(Clone, Debug)]
 pub struct PricingData {
     pub currency: Currency,
-    pub cpu_cost: f32,
-    pub memory_cost: f32,
-    pub ip4_cost: f32,
-    pub ip6_cost: f32,
-    pub disk_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
+    /// Cost per GB disk in smallest currency units (cents for fiat, millisats for BTC)
+    pub disk_cost: u64,
 }
 
 impl PricingData {
-    pub fn total(&self) -> f32 {
+    pub fn total(&self) -> u64 {
         self.cpu_cost + self.memory_cost + self.ip4_cost + self.ip6_cost + self.disk_cost
     }
 }
@@ -752,10 +761,10 @@ mod tests {
                 expires: None,
                 region_id: 1,
                 currency: "EUR".to_string(),
-                cpu_cost: 1.5,
-                memory_cost: 0.5,
-                ip4_cost: 0.5,
-                ip6_cost: 0.05,
+                cpu_cost: 150,    // €1.50 in cents per CPU core
+                memory_cost: 50,  // €0.50 in cents per GB RAM
+                ip4_cost: 50,     // €0.50 in cents per IPv4
+                ip6_cost: 5,      // €0.05 in cents per IPv6
                 min_cpu: 1,
                 max_cpu: 16,
                 min_memory: 1 * crate::GB,
@@ -783,7 +792,7 @@ mod tests {
                 pricing_id: 1,
                 kind: DiskType::SSD,
                 interface: Default::default(),
-                cost: 0.05,
+                cost: 5,  // €0.05 in cents per GB disk
                 min_disk_size: 5 * crate::GB,
                 max_disk_size: 1 * crate::TB,
             },
@@ -797,12 +806,19 @@ mod tests {
 
         let template = db.get_custom_vm_template(1).await?;
         let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
-        assert_eq!(3.0, price.cpu_cost);
-        assert_eq!(1.0, price.memory_cost);
-        assert_eq!(0.5, price.ip4_cost);
-        assert_eq!(0.05, price.ip6_cost);
-        assert_eq!(4.0, price.disk_cost);
-        assert_eq!(8.55, price.total());
+        // All costs now in cents:
+        // cpu_cost = 150 cents/CPU * 2 CPUs = 300 cents
+        // memory_cost = 50 cents/GB * 2 GB = 100 cents
+        // ip4_cost = 50 cents * 1 = 50 cents
+        // ip6_cost = 5 cents * 1 = 5 cents
+        // disk_cost = 5 cents/GB * 80 GB = 400 cents
+        // total = 300 + 100 + 50 + 5 + 400 = 855 cents = €8.55
+        assert_eq!(300, price.cpu_cost);
+        assert_eq!(100, price.memory_cost);
+        assert_eq!(50, price.ip4_cost);
+        assert_eq!(5, price.ip6_cost);
+        assert_eq!(400, price.disk_cost);
+        assert_eq!(855, price.total());
 
         Ok(())
     }
@@ -856,7 +872,10 @@ mod tests {
         let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
         match price {
             CostResult::New(payment_info) => {
-                let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+                // plan.amount is 132 cents (€1.32), convert to EUR then to millisats
+                // €1.32 / 100000 (EUR/BTC rate) * 1e11 millisats/BTC = 1320000 millisats
+                let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
+                let expect_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
                 assert_eq!(expect_price, payment_info.amount);
                 assert_eq!(0, payment_info.tax);
                 assert_eq!(0, payment_info.processing_fee);
@@ -868,7 +887,8 @@ mod tests {
         let price = pe.get_vm_cost(2, PaymentMethod::Lightning).await?;
         match price {
             CostResult::New(payment_info) => {
-                let expect_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+                let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
+                let expect_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
                 assert_eq!(expect_price, payment_info.amount);
                 assert_eq!(
                     (expect_price as f64 * 0.23).floor() as u64,
@@ -884,7 +904,8 @@ mod tests {
             .get_cost_by_amount(1, CurrencyAmount::millisats(1000), PaymentMethod::Lightning)
             .await?;
         // full month price in msats
-        let mo_price = (plan.amount / MOCK_RATE * 1.0e11) as u64;
+        let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
+        let mo_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
         let time_scale = 1000f64 / mo_price as f64;
         let vm = db.get_vm(1).await?;
         let next_expire = PricingEngine::next_template_expire(&vm, &plan);
@@ -969,10 +990,10 @@ mod tests {
                     expires: None,
                     region_id: 1,
                     currency: "EUR".to_string(),
-                    cpu_cost: 2.0,    // 2 EUR per CPU per month
-                    memory_cost: 1.0, // 1 EUR per GB per month
-                    ip4_cost: 0.0,
-                    ip6_cost: 0.0,
+                    cpu_cost: 200,    // €2.00 in cents per CPU per month
+                    memory_cost: 100, // €1.00 in cents per GB per month
+                    ip4_cost: 0,
+                    ip6_cost: 0,
                     min_cpu: 1,
                     max_cpu: 16,
                     min_memory: 1 * crate::GB,
@@ -991,7 +1012,7 @@ mod tests {
                     pricing_id: 1,
                     kind: DiskType::SSD,
                     interface: DiskInterface::PCIe,
-                    cost: 0.5, // 0.5 EUR per GB per month
+                    cost: 50, // €0.50 in cents per GB per month
                     min_disk_size: 5 * crate::GB,
                     max_disk_size: 1 * crate::TB,
                 },
@@ -1252,12 +1273,12 @@ mod tests {
         let month_in_seconds = 30 * 24 * 60 * 60; // 2,592,000 seconds
 
         // Mock template specs: 2 CPU, 2GB memory, 64GB disk
-        // Mock template cost: 1.32 EUR/month (from MockDb::mock_cost_plan)
-        // Custom pricing: 2.0 EUR/CPU, 1.0 EUR/GB memory, 0.5 EUR/GB disk
-        // Old cost (from template): 1.32 EUR/month
-        // New cost (custom): 4*2.0 + 2*1.0 + 64*0.5 = 8 + 2 + 32 = 42 EUR/month
-        let old_monthly_cost_eur = 1.32f64; // From MockDb::mock_cost_plan
-        let new_monthly_cost_eur = 42.0f64;
+        // Mock template cost: 132 cents = €1.32/month (from MockDb::mock_cost_plan)
+        // Custom pricing (in cents): 200 cents/CPU, 100 cents/GB memory, 50 cents/GB disk
+        // Old cost (from template): €1.32/month = 132 cents
+        // New cost (custom): 4*200 + 2*100 + 64*50 = 800 + 200 + 3200 = 4200 cents = €42.00/month
+        let old_monthly_cost_eur = 1.32f64; // From MockDb::mock_cost_plan (132 cents)
+        let new_monthly_cost_eur = 42.0f64; // 4200 cents
         let new_cost_per_second = new_monthly_cost_eur / month_in_seconds as f64;
 
         // Pro-rated costs for the remaining time (86400 seconds)
@@ -1564,13 +1585,13 @@ mod tests {
         match price_revolut {
             CostResult::New(payment_info) => {
                 let plan = MockDb::mock_cost_plan();
-                // Amount is in EUR cents (plan.amount is 5.0 EUR = 500 cents)
-                let expected_amount_cents = (plan.amount * 100.0) as u64;
+                // plan.amount is already in cents (132 cents = €1.32)
+                let expected_amount_cents = plan.amount;
                 
                 // Processing fee: 1% + 0.20 EUR
-                // 1% of 500 cents = 5 cents
+                // 1% of 132 cents = 1 cent (rounded)
                 // 0.20 EUR = 20 cents
-                // Total = 25 cents
+                // Total = 21 cents
                 let expected_fee = (expected_amount_cents / 100) + 20;
                 
                 assert_eq!(

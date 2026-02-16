@@ -375,7 +375,8 @@ pub struct VmCostPlan {
     pub id: u64,
     pub name: String,
     pub created: DateTime<Utc>,
-    pub amount: f32,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+    pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
     pub interval_type: VmCostPlanIntervalType,
@@ -422,14 +423,14 @@ pub struct VmCustomPricing {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
-    /// Cost per CPU core
-    pub cpu_cost: f32,
-    /// Cost per GB ram
-    pub memory_cost: f32,
-    /// Cost per IPv4 address
-    pub ip4_cost: f32,
-    /// Cost per IPv6 address
-    pub ip6_cost: f32,
+    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    pub cpu_cost: u64,
+    /// Cost per GB ram in smallest currency units (cents for fiat, millisats for BTC)
+    pub memory_cost: u64,
+    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip4_cost: u64,
+    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    pub ip6_cost: u64,
     /// Minimum CPU cores allowed
     pub min_cpu: u16,
     /// Maximum CPU cores allowed
@@ -447,8 +448,8 @@ pub struct VmCustomPricingDisk {
     pub pricing_id: u64,
     pub kind: DiskType,
     pub interface: DiskInterface,
-    /// Cost as per the currency of the [VmCustomPricing::currency]
-    pub cost: f32,
+    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    pub cost: u64,
     /// Minimum disk size in bytes for this disk type/interface
     pub min_disk_size: u64,
     /// Maximum disk size in bytes for this disk type/interface

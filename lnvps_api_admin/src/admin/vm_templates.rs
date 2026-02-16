@@ -124,10 +124,6 @@ async fn admin_create_vm_template(
             anyhow::anyhow!("cost_plan_amount is required when cost_plan_id is not provided")
         })?;
 
-        if cost_plan_amount < 0.0 {
-            return Err(anyhow::anyhow!("Cost plan amount cannot be negative").into());
-        }
-
         let cost_plan_name = req
             .cost_plan_name
             .unwrap_or_else(|| format!("{} Cost Plan", req.name));
@@ -238,9 +234,6 @@ async fn admin_update_vm_template(
             cost_plan.name = cost_plan_name.trim().to_string();
         }
         if let Some(cost_plan_amount) = req.cost_plan_amount {
-            if cost_plan_amount < 0.0 {
-                return Err(anyhow::anyhow!("Cost plan amount cannot be negative").into());
-            }
             cost_plan.amount = cost_plan_amount;
         }
         if let Some(cost_plan_currency) = req.cost_plan_currency {

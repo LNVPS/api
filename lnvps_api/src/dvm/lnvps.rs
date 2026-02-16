@@ -179,10 +179,10 @@ mod tests {
                     expires: None,
                     region_id: 1,
                     currency: "EUR".to_string(),
-                    cpu_cost: 1.5,
-                    memory_cost: 0.5,
-                    ip4_cost: 1.5,
-                    ip6_cost: 0.05,
+                    cpu_cost: 150,     // €1.50 in cents per CPU
+                    memory_cost: 50,   // €0.50 in cents per GB
+                    ip4_cost: 150,     // €1.50 in cents per IPv4
+                    ip6_cost: 5,       // €0.05 in cents per IPv6
                     min_cpu: 0,
                     max_cpu: 0,
                     min_memory: 0,
@@ -197,7 +197,7 @@ mod tests {
                     pricing_id: 1,
                     kind: DiskType::SSD,
                     interface: DiskInterface::PCIe,
-                    cost: 0.05,
+                    cost: 5,           // €0.05 in cents per GB
                     min_disk_size: 5 * crate::GB,
                     max_disk_size: 1 * crate::TB,
                 },

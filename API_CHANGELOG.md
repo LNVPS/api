@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- **2026-02-16** - **BREAKING CHANGE**: All money amounts now use `u64` in smallest currency units (cents for fiat, millisats for BTC)
+  - Cost plan `amount` field changed from `f32` (human-readable) to `u64` (smallest units)
+  - Custom pricing costs (`cpu_cost`, `memory_cost`, `ip4_cost`, `ip6_cost`) changed from `f32` to `u64`
+  - Custom pricing disk `cost` field changed from `f32` to `u64`
+  - VM template `cost_plan_amount` field changed from `f32` to `u64`
+  - Payment method config `processing_fee_base` field changed from `f32` to `u64`
+  - Affected endpoints:
+    - `POST /api/admin/v1/cost_plans`, `PATCH /api/admin/v1/cost_plans/{id}`
+    - `POST /api/admin/v1/custom_pricing`, `PATCH /api/admin/v1/custom_pricing/{id}`
+    - `POST /api/admin/v1/vm_templates`, `PATCH /api/admin/v1/vm_templates/{id}`
+    - `POST /api/admin/v1/custom_pricing/{id}/calculate`
+    - `POST /api/admin/v1/payment_methods`, `PATCH /api/admin/v1/payment_methods/{id}`
+  - Example: `"amount": 10.99` (EUR) becomes `"amount": 1099` (cents)
+  - Example: `"cpu_cost": 0.05` (BTC) becomes `"cpu_cost": 5000000` (millisats = 5000 sats)
+  - Example: `"processing_fee_base": 0.20` (EUR) becomes `"processing_fee_base": 20` (cents)
+
 - **2026-02-16** - Payment method config updates now support partial config updates
   - `PATCH /api/admin/v1/payment_methods/{id}` now accepts `PartialProviderConfig` instead of full `ProviderConfig`
   - Only fields included in the request are updated; missing fields retain their existing values

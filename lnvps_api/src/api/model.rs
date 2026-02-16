@@ -36,7 +36,7 @@ impl ApiTemplatesResponse {
         let rates = rates.list_rates().await?;
 
         for template in &mut self.templates {
-            let list_price = CurrencyAmount::from_f32(
+            let list_price = CurrencyAmount::from_u64(
                 template.cost_plan.currency.into(),
                 template.cost_plan.amount,
             );

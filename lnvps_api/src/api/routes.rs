@@ -365,9 +365,11 @@ async fn v1_custom_template_calc(
     let template: VmCustomTemplate = req.into();
 
     let price = PricingEngine::get_custom_vm_cost_amount(&this.db, 0, &template).await?;
+    // Convert from smallest units (u64) to human-readable (f32) for display
+    let amount = CurrencyAmount::from_u64(price.currency, price.total());
     ApiData::ok(ApiPrice {
         currency: price.currency.into(),
-        amount: price.total(),
+        amount: amount.value_f32(),
     })
 }
 

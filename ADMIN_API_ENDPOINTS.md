@@ -874,7 +874,7 @@ Body:
   "region_id": number,
   // Cost plan auto-creation fields (used when cost_plan_id not provided)
   "cost_plan_name": "string",            // optional, defaults to "{template_name} Cost Plan"
-  "cost_plan_amount": number,            // required if cost_plan_id not provided
+  "cost_plan_amount": number,            // required if cost_plan_id not provided, in smallest currency units (cents/millisats)
   "cost_plan_currency": "string",        // optional, defaults to "USD"
   "cost_plan_interval_amount": number,   // optional, defaults to 1
   "cost_plan_interval_type": "day" | "month" | "year"  // optional, defaults to "month"
@@ -901,7 +901,7 @@ Body (all optional):
   "cost_plan_id": number,
   "region_id": number,
   "cost_plan_name": "string",                    // Update associated cost plan name
-  "cost_plan_amount": number,                    // Update associated cost plan amount
+  "cost_plan_amount": number,                    // Update associated cost plan amount in smallest currency units (cents/millisats)
   "cost_plan_currency": "string",               // Update associated cost plan currency
   "cost_plan_interval_amount": number,          // Update associated cost plan interval amount
   "cost_plan_interval_type": "day" | "month" | "year"  // Update associated cost plan interval type
@@ -950,8 +950,8 @@ Body:
 ```json
 {
   "name": "string",
-  "amount": number,                        // Cost amount (must be >= 0)
-  "currency": "string",                    // Currency code (e.g., "USD", "EUR")
+  "amount": number,                        // Cost amount in smallest currency units (cents for fiat, millisats for BTC)
+  "currency": "string",                    // Currency code (e.g., "USD", "EUR", "BTC")
   "interval_amount": number,               // Billing interval count (must be > 0)
   "interval_type": "day" | "month" | "year"  // Billing interval type
 }
@@ -967,7 +967,7 @@ Body (all optional):
 ```json
 {
   "name": "string",
-  "amount": number,
+  "amount": number,                        // Cost amount in smallest currency units (cents for fiat, millisats for BTC)
   "currency": "string",
   "interval_amount": number,
   "interval_type": "day" | "month" | "year"
@@ -1020,10 +1020,10 @@ Body:
   "expires": "string (ISO 8601) | null", // optional, null for no expiration
   "region_id": number,
   "currency": "string",                  // e.g., "USD", "EUR", "BTC"
-  "cpu_cost": number,                   // Cost per CPU core per month
-  "memory_cost": number,                // Cost per GB RAM per month
-  "ip4_cost": number,                   // Cost per IPv4 address per month
-  "ip6_cost": number,                   // Cost per IPv6 address per month
+  "cpu_cost": number,                   // Cost per CPU core per month in smallest currency units (cents/millisats)
+  "memory_cost": number,                // Cost per GB RAM per month in smallest currency units (cents/millisats)
+  "ip4_cost": number,                   // Cost per IPv4 address per month in smallest currency units (cents/millisats)
+  "ip6_cost": number,                   // Cost per IPv6 address per month in smallest currency units (cents/millisats)
   "min_cpu": number,                    // Minimum CPU cores allowed
   "max_cpu": number,                    // Maximum CPU cores allowed
   "min_memory": number,                 // Minimum memory in bytes
@@ -1032,7 +1032,7 @@ Body:
     {
       "kind": "ssd",                    // DiskType enum: "hdd" or "ssd"
       "interface": "pcie",              // DiskInterface enum: "sata", "scsi", or "pcie"
-      "cost": number,                   // Cost per GB per month
+      "cost": number,                   // Cost per GB per month in smallest currency units (cents/millisats)
       "min_disk_size": number,          // Minimum disk size in bytes for this type/interface
       "max_disk_size": number           // Maximum disk size in bytes for this type/interface
     }
@@ -1054,10 +1054,10 @@ Body (all optional):
   "expires": "string (ISO 8601) | null",
   "region_id": number,
   "currency": "string",
-  "cpu_cost": number,
-  "memory_cost": number,
-  "ip4_cost": number,
-  "ip6_cost": number,
+  "cpu_cost": number,                       // Cost per CPU core in smallest currency units (cents/millisats)
+  "memory_cost": number,                    // Cost per GB RAM in smallest currency units (cents/millisats)
+  "ip4_cost": number,                       // Cost per IPv4 address in smallest currency units (cents/millisats)
+  "ip6_cost": number,                       // Cost per IPv6 address in smallest currency units (cents/millisats)
   "min_cpu": number,                        // Minimum CPU cores allowed
   "max_cpu": number,                        // Maximum CPU cores allowed
   "min_memory": number,                     // Minimum memory in bytes
@@ -1066,7 +1066,7 @@ Body (all optional):
     {
       "kind": "ssd",                        // DiskType enum: "hdd", "ssd"
       "interface": "pcie",                  // DiskInterface enum: "sata", "scsi", "pcie"
-      "cost": number,
+      "cost": number,                       // Cost per GB in smallest currency units (cents/millisats)
       "min_disk_size": number,              // Minimum disk size in bytes for this type/interface
       "max_disk_size": number               // Maximum disk size in bytes for this type/interface
     }
@@ -1164,16 +1164,16 @@ Body:
 }
 ```
 
-Returns calculated pricing breakdown for the specified configuration without creating a template:
+Returns calculated pricing breakdown for the specified configuration without creating a template (all costs in smallest currency units - cents/millisats):
 ```json
 {
   "currency": "string",
-  "cpu_cost": number,
-  "memory_cost": number,
-  "disk_cost": number,
-  "ip4_cost": number,
-  "ip6_cost": number,
-  "total_monthly_cost": number
+  "cpu_cost": number,           // Cost for CPU cores in smallest currency units
+  "memory_cost": number,        // Cost for RAM in smallest currency units
+  "disk_cost": number,          // Cost for disk in smallest currency units
+  "ip4_cost": number,           // Cost for IPv4 addresses in smallest currency units
+  "ip6_cost": number,           // Cost for IPv6 addresses in smallest currency units
+  "total_monthly_cost": number  // Total monthly cost in smallest currency units
 }
 ```
 
@@ -2887,7 +2887,7 @@ Body:
   "enabled": boolean,                         // Optional - Default: true
   "config": ProviderConfig,                   // Required - Typed provider configuration (see examples below)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (e.g., 0.20 for €0.20)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency units (e.g., 20 for €0.20)
   "processing_fee_currency": "string | null"  // Required if processing_fee_base is set - Currency code (e.g., "EUR")
 }
 ```
@@ -2962,7 +2962,7 @@ Body (all fields optional):
   "enabled": boolean,                         // Enable/disable the payment method
   "config": PartialProviderConfig,            // Partial provider configuration (only include fields to update)
   "processing_fee_rate": number | null,       // Fee percentage (null to clear)
-  "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20, null to clear)
+  "processing_fee_base": number | null,       // Base fee in smallest currency units (e.g., 20 for €0.20, null to clear)
   "processing_fee_currency": "string | null"  // Currency code (required if base fee is set)
 }
 ```
@@ -3041,7 +3041,7 @@ Response:
   "provider_type": "string",                  // Provider implementation type ("lnd", "revolut", "stripe", "paypal")
   "config": SanitizedProviderConfig | null,   // Sanitized provider config - secrets replaced with boolean indicators
   "processing_fee_rate": number | null,       // Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": number | null,       // Base fee in human-readable units (e.g., 0.20 for €0.20)
+  "processing_fee_base": number | null,       // Base fee in smallest currency units (e.g., 20 for €0.20)
   "processing_fee_currency": "string | null", // Currency code for base fee
   "created": "string (ISO 8601)",
   "modified": "string (ISO 8601)"
@@ -3056,7 +3056,7 @@ Response:
   "enabled": boolean,                         // Optional - Default: true
   "config": ProviderConfig,                   // Required - Typed provider config (with "type" discriminator)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (e.g., 1.0 for 1%)
-  "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (e.g., 0.20 for €0.20)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency units (e.g., 20 for €0.20)
   "processing_fee_currency": "string | null"  // Required if base fee is set
 }
 ```
@@ -3068,7 +3068,7 @@ Response:
   "enabled": boolean | null,                  // Optional - Enable/disable
   "config": PartialProviderConfig | null,     // Optional - Partial provider config (only include fields to update)
   "processing_fee_rate": number | null,       // Optional - Fee percentage (null to clear)
-  "processing_fee_base": number | null,       // Optional - Base fee in human-readable units (null to clear)
+  "processing_fee_base": number | null,       // Optional - Base fee in smallest currency units (null to clear)
   "processing_fee_currency": "string | null"  // Optional - Currency (null to clear)
 }
 ```
@@ -3113,10 +3113,9 @@ A company can have multiple payment method configurations for the same payment m
 
 **Processing Fees:**
 - `processing_fee_rate` is a percentage (1.0 = 1%, 2.5 = 2.5%)
-- `processing_fee_base` is in human-readable currency units (e.g., 0.20 for €0.20, 1.0 for $1.00)
-- For BTC, the value is in millisats (e.g., 1000 for 1 satoshi)
+- `processing_fee_base` is in smallest currency units (e.g., 20 for €0.20, 100 for $1.00)
+- For BTC, the value is in millisats (e.g., 1000000 for 1000 sats)
 - When `processing_fee_base` is set, `processing_fee_currency` is required
-- The API automatically converts to/from internal storage format
 
 **Security:**
 - Configuration JSON may contain sensitive credentials (API keys, secrets)
