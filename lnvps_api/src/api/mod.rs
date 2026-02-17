@@ -1,4 +1,5 @@
 mod contact;
+mod docs;
 mod ip_space;
 mod model;
 #[cfg(feature = "nostr-domain")]
@@ -39,6 +40,7 @@ pub struct RouterState {
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::Settings;
 pub use contact::router as contacts_router;
+pub use docs::router as docs_router;
 pub use ip_space::router as ip_space_router;
 use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander};
 use lnvps_db::LNVpsDb;

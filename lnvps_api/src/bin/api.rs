@@ -181,11 +181,12 @@ async fn main() -> Result<(), Error> {
         let listener = TcpListener::bind(ip).await?;
         info!("Listening on {}", ip);
         let mut router = Router::new()
+            .merge(docs_router())
             .merge(main_router())
             .merge(contacts_router())
             .merge(webhook_router())
             .merge(subscriptions_router())
-        .merge(ip_space_router());
+            .merge(ip_space_router());
 
         #[cfg(feature = "openapi")]
         {

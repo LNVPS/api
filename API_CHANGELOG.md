@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-17** - Added embedded API documentation served at root path (both User and Admin APIs)
+  - `GET /` or `GET /index.html` - Renders API documentation with markdown viewer
+  - `GET /docs/endpoints.md` - Raw markdown content of API endpoints documentation
+  - `GET /docs/changelog.md` - Raw markdown content of API changelog
+  - Documentation is embedded at compile time using `include_str!` and rendered client-side with marked.js
+  - User API serves `API_DOCUMENTATION.md`, Admin API serves `ADMIN_API_ENDPOINTS.md`
+
 - **2026-02-17** - Added `tax` and `processing_fee` fields to `AdminVmPaymentInfo` response
   - Affected endpoints: `GET /api/admin/v1/vms/{vm_id}/payments`, `GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}`
   - Both fields are `u64` in smallest currency unit (cents for fiat, millisats for BTC)

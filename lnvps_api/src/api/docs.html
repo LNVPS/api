@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LNVPS API Documentation</title>
+    <link rel="stylesheet" href="https://unpkg.com/github-markdown-css@5/github-markdown-light.css">
+    <style>
+        body {
+            box-sizing: border-box;
+            min-width: 200px;
+            max-width: 980px;
+            margin: 0 auto;
+            padding: 45px;
+            background-color: #f6f8fa;
+        }
+        .markdown-body {
+            background-color: #ffffff;
+            padding: 45px;
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+        }
+        .tab-container {
+            margin-bottom: 20px;
+        }
+        .tab-button {
+            padding: 10px 20px;
+            border: none;
+            background-color: #e1e4e8;
+            cursor: pointer;
+            font-size: 14px;
+            border-radius: 6px 6px 0 0;
+            margin-right: 4px;
+        }
+        .tab-button.active {
+            background-color: #ffffff;
+            border-bottom: 2px solid #0366d6;
+        }
+        .tab-button:hover {
+            background-color: #d1d5da;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .loading {
+            color: #586069;
+            font-style: italic;
+        }
+        @media (max-width: 767px) {
+            body {
+                padding: 15px;
+            }
+            .markdown-body {
+                padding: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="tab-container">
+        <button class="tab-button active" onclick="showTab('endpoints')">API Endpoints</button>
+        <button class="tab-button" onclick="showTab('changelog')">Changelog</button>
+    </div>
+    <article class="markdown-body">
+        <div id="endpoints" class="tab-content active"><p class="loading">Loading...</p></div>
+        <div id="changelog" class="tab-content"><p class="loading">Loading...</p></div>
+    </article>
+    <script src="https://unpkg.com/marked@12/marked.min.js"></script>
+    <script>
+        async function loadDocs() {
+            const [endpointsRes, changelogRes] = await Promise.all([
+                fetch('/docs/endpoints.md'),
+                fetch('/docs/changelog.md')
+            ]);
+            
+            const [endpoints, changelog] = await Promise.all([
+                endpointsRes.text(),
+                changelogRes.text()
+            ]);
+            
+            document.getElementById('endpoints').innerHTML = marked.parse(endpoints);
+            document.getElementById('changelog').innerHTML = marked.parse(changelog);
+        }
+        
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-button').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        loadDocs();
+    </script>
+</body>
+</html>

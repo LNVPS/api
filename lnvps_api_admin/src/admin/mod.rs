@@ -10,6 +10,7 @@ mod bulk_message;
 mod companies;
 mod cost_plans;
 mod custom_pricing;
+mod docs;
 mod hosts;
 mod ip_ranges;
 mod ip_space;
@@ -44,6 +45,7 @@ pub fn admin_router(
     feedback: Option<RedisWorkFeedback>,
 ) -> Router {
     Router::new()
+        .merge(docs::router())
         .merge(users::router())
         .merge(bulk_message::router())
         .merge(vms::router())
