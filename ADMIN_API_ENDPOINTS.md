@@ -2196,6 +2196,8 @@ The RBAC system uses the following permission format: `resource::action`
   "created": "string (ISO 8601)",         // When payment was created
   "expires": "string (ISO 8601)",         // When payment expires
   "amount": number,                       // Amount in smallest currency unit (satoshis, cents)
+  "tax": number,                          // Tax amount in smallest currency unit
+  "processing_fee": number,               // Processing fee in smallest currency unit
   "currency": "string",                   // Currency code (e.g., "EUR", "USD", "BTC")
   "payment_method": "lightning",          // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe"
   "external_id": "string | null",         // External payment provider ID
@@ -2260,14 +2262,11 @@ The RBAC system uses the following permission format: `resource::action`
   "currency": "string",                    // "USD", "EUR", "BTC", etc.
   "payment_method": "lightning" | "revolut" | "paypal" | "stripe",
   "payment_type": "purchase" | "renewal",  // SubscriptionPaymentType enum
+  "external_id": "string | null",         // External payment processor ID
   "is_paid": boolean,
   "rate": number | null,                   // Exchange rate if applicable
-  "time_value": number,                    // Duration purchased in seconds
   "tax": number,                           // Tax amount in cents/millisats
-  "external_id": "string | null",         // External payment processor ID
-  "company_id": number | null,            // Associated company ID
-  "company_name": "string | null",        // Associated company name
-  "company_base_currency": "string | null" // Company's base currency
+  "processing_fee": number                 // Processing fee in cents/millisats
 }
 ```
 

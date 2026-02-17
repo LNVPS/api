@@ -1644,6 +1644,8 @@ pub struct AdminVmPaymentInfo {
     pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
     pub amount: u64, // Amount in smallest currency unit (e.g., satoshis, cents)
+    pub tax: u64,    // Tax amount in smallest currency unit
+    pub processing_fee: u64, // Processing fee in smallest currency unit
     pub currency: String,
     pub payment_method: AdminPaymentMethod,
     pub external_id: Option<String>,
@@ -1660,6 +1662,8 @@ impl AdminVmPaymentInfo {
             created: payment.created,
             expires: payment.expires,
             amount: payment.amount,
+            tax: payment.tax,
+            processing_fee: payment.processing_fee,
             currency: payment.currency.clone(),
             payment_method: AdminPaymentMethod::from(payment.payment_method),
             external_id: payment.external_id.clone(),
@@ -1947,6 +1951,7 @@ pub struct AdminSubscriptionPaymentInfo {
     pub is_paid: bool,
     pub rate: f32,
     pub tax: u64,
+    pub processing_fee: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1989,6 +1994,7 @@ impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
             is_paid: payment.is_paid,
             rate: payment.rate,
             tax: payment.tax,
+            processing_fee: payment.processing_fee,
         }
     }
 }

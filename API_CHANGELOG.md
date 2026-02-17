@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **2026-02-17** - Added `tax` and `processing_fee` fields to `AdminVmPaymentInfo` response
+  - Affected endpoints: `GET /api/admin/v1/vms/{vm_id}/payments`, `GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}`
+  - Both fields are `u64` in smallest currency unit (cents for fiat, millisats for BTC)
+
+- **2026-02-17** - Added `processing_fee` field to `AdminSubscriptionPaymentInfo` response
+  - Affected endpoints: `GET /api/admin/v1/subscriptions/{id}/payments`, `GET /api/admin/v1/subscriptions/{id}/payments/{payment_id}`
+  - Field is `u64` in smallest currency unit (cents for fiat, millisats for BTC)
+
 ### Changed
 - **2026-02-16** - **BREAKING CHANGE**: All money amounts now use `u64` in smallest currency units (cents for fiat, millisats for BTC)
   - **Requires database migration**: Run `20260217100000_amount_to_cents.sql` which converts existing data
