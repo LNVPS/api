@@ -23,6 +23,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Field is `u64` in smallest currency unit (cents for fiat, millisats for BTC)
 
 ### Changed
+- **2026-02-18** - **BREAKING CHANGE**: `ApiPrice.amount` changed from `f32` to `u64` in smallest currency units
+  - The `Price` type returned by user-facing endpoints now uses `u64` integers instead of floats
+  - Amounts are in smallest currency units: cents for fiat (EUR, USD, etc.), millisats for BTC
+  - Affected endpoints: all endpoints returning `Price` objects, including:
+    - `GET /api/v1/templates` — `VmCostPlan.amount`
+    - `GET /api/v1/vm/{id}/upgrade/quote` — `cost_difference`, `new_renewal_cost`, `discount`
+    - `GET /api/v1/subscriptions` / `GET /api/v1/subscriptions/{id}` — `SubscriptionLineItem.price`, `SubscriptionLineItem.setup_fee`
+    - `GET /api/v1/subscriptions/{id}/payments` — `SubscriptionPayment.amount`, `SubscriptionPayment.tax`
+    - `POST /api/v1/vm/custom/price` — returned `Price`
+  - Example: `"amount": 10.99` (EUR float) becomes `"amount": 1099` (cents)
+  - Example: `"amount": 0.00012345` (BTC float) becomes `"amount": 12345` (millisats)
+
 - **2026-02-16** - **BREAKING CHANGE**: All money amounts now use `u64` in smallest currency units (cents for fiat, millisats for BTC)
   - **Requires database migration**: Run `20260217100000_amount_to_cents.sql` which converts existing data
   - Cost plan `amount` field changed from `f32` (human-readable) to `u64` (smallest units)

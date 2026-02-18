@@ -81,7 +81,7 @@ interface VmCostPlan {
   id: number;
   name: string;
   currency: 'BTC' | 'EUR' | 'USD';
-  amount: number; // Price amount as float
+  amount: number; // Price amount in smallest currency units (cents for fiat, millisats for BTC)
   other_price: Price[]; // Alternative currency prices
   interval_amount: number;
   interval_type: 'day' | 'month' | 'year';
@@ -89,7 +89,7 @@ interface VmCostPlan {
 
 interface Price {
   currency: 'BTC' | 'EUR' | 'USD';
-  amount: number;
+  amount: number; // Amount in smallest currency units (cents for fiat, millisats for BTC)
 }
 
 interface VmHostRegion {
@@ -675,7 +675,7 @@ function isApiSuccess<T>(response: ApiResult<T>): response is ApiResponse<T> {
 
 1. **Authentication**: All authenticated endpoints require NIP-98 Nostr event authentication
 2. **Date Formats**: All dates are in ISO 8601 format
-3. **Currency Units**: Amounts are returned as `Price` objects with `currency` and `amount` fields. The `amount` is a float representing the value in the currency's standard unit (e.g., 12.34 EUR, 0.00012345 BTC)
+3. **Currency Units**: Amounts are returned as `Price` objects with `currency` and `amount` fields. The `amount` is a `u64` integer in the **smallest currency unit** (e.g., cents for EUR/USD, millisats for BTC). To display human-readable values, divide by the currency's decimal factor (100 for most fiat, 1000 for BTC millisats to sats)
 4. **Memory/Disk Units**: All memory and disk sizes are in bytes
 5. **VM States**: VM states are string enums representing current operational status
 6. **Error Handling**: Always check for error responses before accessing data

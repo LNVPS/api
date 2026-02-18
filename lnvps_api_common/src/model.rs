@@ -506,14 +506,14 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
 #[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct ApiPrice {
     pub currency: ApiCurrency,
-    pub amount: f32,
+    pub amount: u64,
 }
 
 impl From<CurrencyAmount> for ApiPrice {
     fn from(amount: CurrencyAmount) -> Self {
         ApiPrice {
             currency: amount.currency().into(),
-            amount: amount.value_f32(),
+            amount: amount.value(),
         }
     }
 }

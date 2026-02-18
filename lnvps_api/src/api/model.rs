@@ -43,7 +43,7 @@ impl ApiTemplatesResponse {
             for alt_price in alt_prices(&rates, list_price) {
                 template.cost_plan.other_price.push(ApiPrice {
                     currency: alt_price.currency().into(),
-                    amount: alt_price.value_f32(),
+                    amount: alt_price.value(),
                 });
             }
         }
@@ -66,28 +66,68 @@ pub struct VMPatchRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct AccountPatchRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub email: Option<Option<String>>,
     pub contact_nip17: bool,
     pub contact_email: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub country_code: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub name: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub address_1: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub address_2: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub state: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub city: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub postcode: Option<Option<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub tax_id: Option<Option<String>>,
     /// Nostr Wallet Connect connection string for automatic VM renewals
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lnvps_api_common::deserialize_nullable_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub nwc_connection_string: Option<Option<String>>,
 }
 
@@ -496,10 +536,8 @@ pub struct ApiSubscriptionLineItem {
 
 impl ApiSubscriptionLineItem {
     pub fn from_with_currency(line_item: lnvps_db::SubscriptionLineItem, currency: &str) -> Self {
-        let api_currency: ApiCurrency = currency
-            .parse::<Currency>()
-            .unwrap_or(Currency::USD)
-            .into();
+        let api_currency: ApiCurrency =
+            currency.parse::<Currency>().unwrap_or(Currency::USD).into();
 
         let price = CurrencyAmount::from_u64(api_currency.into(), line_item.amount);
         let setup_fee = CurrencyAmount::from_u64(api_currency.into(), line_item.setup_amount);
@@ -547,7 +585,8 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
 
 impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
     fn from(payment: lnvps_db::SubscriptionPayment) -> Self {
-        let currency: ApiCurrency = payment.currency
+        let currency: ApiCurrency = payment
+            .currency
             .parse::<Currency>()
             .unwrap_or(Currency::USD)
             .into();
@@ -650,11 +689,9 @@ impl ApiAvailableIpSpace {
         let rates = rates.list_rates().await?;
 
         for pricing in &mut self.pricing {
-            let price_amount = CurrencyAmount::from_f32(
-                pricing.price.currency.into(),
-                pricing.price.amount,
-            );
-            let setup_fee_amount = CurrencyAmount::from_f32(
+            let price_amount =
+                CurrencyAmount::from_u64(pricing.price.currency.into(), pricing.price.amount);
+            let setup_fee_amount = CurrencyAmount::from_u64(
                 pricing.setup_fee.currency.into(),
                 pricing.setup_fee.amount,
             );
@@ -662,14 +699,14 @@ impl ApiAvailableIpSpace {
             for alt_price in alt_prices(&rates, price_amount) {
                 pricing.other_price.push(ApiPrice {
                     currency: alt_price.currency().into(),
-                    amount: alt_price.value_f32(),
+                    amount: alt_price.value(),
                 });
             }
 
             for alt_setup_fee in alt_prices(&rates, setup_fee_amount) {
                 pricing.other_setup_fee.push(ApiPrice {
                     currency: alt_setup_fee.currency().into(),
-                    amount: alt_setup_fee.value_f32(),
+                    amount: alt_setup_fee.value(),
                 });
             }
         }
@@ -695,7 +732,7 @@ impl From<lnvps_db::IpSpacePricing> for ApiIpSpacePricing {
             prefix_size: pricing.prefix_size,
             price: CurrencyAmount::from_u64(currency, pricing.price_per_month).into(),
             setup_fee: CurrencyAmount::from_u64(currency, pricing.setup_fee).into(),
-            other_price: vec![], // Filled externally
+            other_price: vec![],     // Filled externally
             other_setup_fee: vec![], // Filled externally
         }
     }
