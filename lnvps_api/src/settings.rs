@@ -12,9 +12,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "bitvora")]
-compile_error!("Bitvora service has been shut down and is no longer available. Remove the 'bitvora' feature from your build.");
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Settings {

@@ -5,9 +5,6 @@ use axum::routing::any;
 use futures::StreamExt;
 use payments_rs::webhook::{WEBHOOK_BRIDGE, WebhookMessage};
 
-#[cfg(feature = "bitvora")]
-compile_error!("Bitvora service has been shut down and is no longer available. Remove the 'bitvora' feature from your build.");
-
 pub fn router() -> Router<RouterState> {
     let mut router = Router::new();
 

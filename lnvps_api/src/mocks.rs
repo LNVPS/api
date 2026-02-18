@@ -65,7 +65,32 @@ impl MockRouter {
 #[async_trait]
 impl Router for MockRouter {
     async fn generate_mac(&self, ip: &str, comment: &str) -> anyhow::Result<Option<ArpEntry>> {
-        Ok(None)
+        // Generate a deterministic but distinct MAC from the IP so tests can verify
+        // that vm.mac_address is set from ArpEntry.mac_address, not ArpEntry.address
+        let bytes: Vec<u8> = ip
+            .split('.')
+            .filter_map(|o| o.parse::<u8>().ok())
+            .collect();
+        let mac = format!(
+            "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
+            bytes.first().copied().unwrap_or(0),
+            bytes.get(1).copied().unwrap_or(0),
+            bytes.get(2).copied().unwrap_or(0),
+            bytes.get(3).copied().unwrap_or(0),
+        );
+        let id = format!("{}={}", &mac, ip);
+        let entry = ArpEntry {
+            id: Some(id),
+            address: ip.to_string(),
+            mac_address: mac,
+            interface: None,
+            comment: Some(comment.to_string()),
+        };
+        // Store in the map so remove_arp_entry can find it later
+        let mut arp = self.arp.lock().await;
+        let max_id = *arp.keys().max().unwrap_or(&0);
+        arp.insert(max_id + 1, entry.clone());
+        Ok(Some(entry))
     }
 
     async fn list_arp_entry(&self) -> OpResult<Vec<ArpEntry>> {
@@ -92,7 +117,13 @@ impl Router for MockRouter {
 
     async fn remove_arp_entry(&self, id: &str) -> OpResult<()> {
         let mut arp = self.arp.lock().await;
-        arp.remove(&id.parse::<u64>().map_err(|e| OpError::Fatal(e.into()))?);
+        // Try numeric key first (entries added via add_arp_entry), then fall back
+        // to matching by the entry's own id field (entries added via generate_mac).
+        if let Ok(numeric_id) = id.parse::<u64>() {
+            arp.remove(&numeric_id);
+        } else {
+            arp.retain(|_, v| v.id.as_deref() != Some(id));
+        }
         Ok(())
     }
 
@@ -100,19 +131,28 @@ impl Router for MockRouter {
         if entry.id.is_none() {
             return Err(OpError::Fatal(anyhow::anyhow!("id is missing")));
         }
+        let id_str = entry.id.as_ref().unwrap();
         let mut arp = self.arp.lock().await;
-        if let Some(mut a) = arp.get_mut(
-            &entry
-                .id
-                .as_ref()
-                .unwrap()
-                .parse::<u64>()
-                .map_err(|e| OpError::Fatal(e.into()))?,
-        ) {
-            a.mac_address = entry.mac_address.clone();
-            a.address = entry.address.clone();
-            a.interface = entry.interface.clone();
-            a.comment = entry.comment.clone();
+
+        // Try numeric key first (entries stored by add_arp_entry), then fall back
+        // to matching by the entry's own id field (entries stored by generate_mac).
+        if let Ok(numeric_id) = id_str.parse::<u64>() {
+            if let Some(a) = arp.get_mut(&numeric_id) {
+                a.mac_address = entry.mac_address.clone();
+                a.address = entry.address.clone();
+                a.interface = entry.interface.clone();
+                a.comment = entry.comment.clone();
+            }
+        } else {
+            for a in arp.values_mut() {
+                if a.id.as_deref() == Some(id_str) {
+                    a.mac_address = entry.mac_address.clone();
+                    a.address = entry.address.clone();
+                    a.interface = entry.interface.clone();
+                    a.comment = entry.comment.clone();
+                    break;
+                }
+            }
         }
         Ok(entry.clone())
     }

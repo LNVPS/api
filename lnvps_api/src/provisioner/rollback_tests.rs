@@ -678,4 +678,58 @@ mod tests {
 
         Ok(())
     }
+
+    /// Test that when the router's generate_mac returns an ArpEntry, the vm.mac_address
+    /// is set from ArpEntry.mac_address (the actual MAC) and not ArpEntry.address (the IP).
+    /// This covers the regression where mac and IP were mixed up in the OVH router path.
+    #[tokio::test]
+    async fn test_router_generated_mac_stored_correctly() -> Result<()> {
+        clear_mock_state().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        let dns = Arc::new(MockDnsServer::new());
+        const MOCK_RATE: f32 = 69_420.0;
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner =
+            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
+        pipeline.execute().await?;
+
+        let vm_after = db.get_vm(vm.id).await?;
+        let stored_mac = &vm_after.mac_address;
+
+        // The router returns an ArpEntry where address=IP and mac_address=MAC.
+        // The stored value must look like a MAC address, not an IP address.
+        assert!(
+            !stored_mac.contains('.'),
+            "vm.mac_address must not be an IP address (got '{}')",
+            stored_mac
+        );
+        assert!(
+            stored_mac.contains(':'),
+            "vm.mac_address must be a MAC address in colon notation (got '{}')",
+            stored_mac
+        );
+
+        // Cross-check: the stored MAC must match what the router recorded for this VM
+        let router = MockRouter::new();
+        let arp_entries = router.list_arp_entry().await?;
+        assert!(
+            arp_entries.iter().any(|e| &e.mac_address == stored_mac),
+            "The ARP table should contain an entry whose mac_address matches the stored vm.mac_address"
+        );
+
+        Ok(())
+    }
 }
