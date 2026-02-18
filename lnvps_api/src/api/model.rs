@@ -194,14 +194,6 @@ pub struct ApiInvoiceItem {
     pub currency: String,
     /// Raw duration in seconds
     pub time: u64,
-    /// Formatted currency amount (e.g., "EUR 12.34", "BTC 0.00012345")
-    pub formatted_amount: String,
-    /// Formatted tax amount (e.g., "EUR 2.88", "BTC 0.00002879")
-    pub formatted_tax: String,
-    /// Formatted processing fee (e.g., "EUR 0.30", "BTC 0.00000700")
-    pub formatted_processing_fee: String,
-    /// Formatted duration (e.g., "30 days", "1 month", "6 hours")
-    pub formatted_duration: String,
 }
 
 impl ApiInvoiceItem {
@@ -213,23 +205,12 @@ impl ApiInvoiceItem {
         currency: &str,
         time_seconds: u64,
     ) -> Result<Self, anyhow::Error> {
-        let parsed_currency = Currency::from_str(currency)
-            .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency))?;
-
-        let amount_currency = CurrencyAmount::from_u64(parsed_currency, amount);
-        let tax_currency = CurrencyAmount::from_u64(parsed_currency, tax);
-        let processing_fee_currency = CurrencyAmount::from_u64(parsed_currency, processing_fee);
-
         Ok(Self {
             amount,
             tax,
             processing_fee,
             currency: currency.to_string(),
             time: time_seconds,
-            formatted_amount: amount_currency.to_string(),
-            formatted_tax: tax_currency.to_string(),
-            formatted_processing_fee: processing_fee_currency.to_string(),
-            formatted_duration: format_duration(Duration::from_secs(time_seconds)).to_string(),
         })
     }
 

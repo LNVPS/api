@@ -179,12 +179,15 @@ interface VmPayment {
   vm_id: number;
   created: string; // ISO 8601 datetime
   expires: string; // ISO 8601 datetime
-  amount: number; // Amount in smallest currency unit
-  tax: number; // Tax amount in smallest currency unit
+  amount: number; // Amount in smallest currency unit (cents for fiat, millisats for BTC)
+  tax: number; // Tax amount in smallest currency unit (cents for fiat, millisats for BTC)
+  processing_fee: number; // Processing fee in smallest currency unit (cents for fiat, millisats for BTC)
   currency: string;
   is_paid: boolean;
   data: PaymentData;
   time: number; // Seconds this payment adds to VM expiry
+  is_upgrade: boolean;
+  upgrade_params?: string; // JSON-encoded upgrade parameters (only present for upgrade payments)
 }
 
 type PaymentData = 
