@@ -1,1 +1,5 @@
-**/target
+**/target/
+**/.claude/
+agents/
+work/
+grafana.json
