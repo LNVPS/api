@@ -1,13 +1,3 @@
-use crate::api::model::ApiVmStatus;
-use crate::api::model::{
-    AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
-    ApiVmPayment, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmRequest,
-    VMPatchRequest, vm_to_status,
-};
-use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
-use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
-use crate::provisioner::{HostCapacityService, PricingEngine};
 use anyhow::Result;
 use axum::extract::ws::WebSocket;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
@@ -17,16 +7,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use isocountry::CountryCode;
+use log::{error, info, warn};
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
-use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
-use lnvps_api_common::{ApiCurrency, ApiError, EuVatClient, PageQuery};
-use lnvps_api_common::{ApiData, ApiResult, Nip98Auth, UpgradeConfig, WorkJob};
-use lnvps_api_common::{ApiPrice, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate};
-use lnvps_db::{
-    PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
-};
-use log::{error, info, warn};
 use nostr_sdk::{ToBech32, Url};
 use payments_rs::currency::CurrencyAmount;
 use serde::Serialize;
@@ -34,6 +17,23 @@ use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
+
+use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
+use lnvps_api_common::{ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey,
+    ApiVmOsImage, ApiVmTemplate, EuVatClient, Nip98Auth, PageQuery, UpgradeConfig, WorkJob};
+use lnvps_db::{
+    PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
+};
+
+use crate::api::model::{
+    AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
+    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
+    ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
+    CreateVmRequest, VMPatchRequest, vm_to_status,
+};
+use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
+use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
+use crate::provisioner::{HostCapacityService, PricingEngine};
 
 pub fn routes() -> Router<RouterState> {
     Router::new()

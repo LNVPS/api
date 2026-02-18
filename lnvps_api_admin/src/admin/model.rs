@@ -1,5 +1,10 @@
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+
 use lnvps_api_common::{
     ApiDiskInterface, ApiDiskType, ApiOsDistribution, ApiVmCostPlanIntervalType, VmRunningState,
 };
@@ -8,10 +13,6 @@ use lnvps_db::{
     OsDistribution, PaymentMethod, RouterKind, SubscriptionType, VmHistory, VmHistoryActionType,
     VmHostKind, VmPayment,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Arc;
 
 // Admin API Enums - Using enums from common crate where available, creating new ones only where needed
 
@@ -102,7 +103,9 @@ impl From<RouterKind> for AdminRouterKind {
         match router_kind {
             RouterKind::Mikrotik => AdminRouterKind::Mikrotik,
             RouterKind::OvhAdditionalIp => AdminRouterKind::OvhAdditionalIp,
-            _ => panic!("Invalid router kind"),
+            // MockRouter is a test-only variant and should never appear in production.
+            // Map it to Mikrotik as a safe fallback rather than panicking.
+            RouterKind::MockRouter => AdminRouterKind::Mikrotik,
         }
     }
 }
