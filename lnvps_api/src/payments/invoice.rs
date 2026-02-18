@@ -60,7 +60,7 @@ impl NodeInvoiceHandler {
             .vm_history_logger
             .log_vm_payment_received(
                 payment.vm_id,
-                payment.amount,
+                payment.amount + payment.tax + payment.processing_fee,
                 &payment.currency,
                 payment.time_value,
                 Some(payment_metadata),
@@ -79,7 +79,7 @@ impl NodeInvoiceHandler {
                     None,
                     vm_before.expires,
                     vm_after.expires,
-                    Some(payment.amount),
+                    Some(payment.amount + payment.tax + payment.processing_fee),
                     Some(&payment.currency),
                     Some(serde_json::json!({
                         "time_added_seconds": payment.time_value,

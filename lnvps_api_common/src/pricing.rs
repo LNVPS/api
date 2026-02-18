@@ -97,8 +97,11 @@ impl PricingEngine {
         let base = config.processing_fee_base.unwrap_or(0);
         let base_currency_str = config.processing_fee_currency.as_deref().unwrap_or("");
 
-        // Calculate percentage fee (round instead of truncate to avoid systematic undercharging)
-        let percentage_fee = ((amount as f64) * (rate as f64 / 100.0)).round() as u64;
+        // Gross-up: solve for fee such that (amount + fee) * (1 - rate) = amount
+        // => fee = amount * rate / (1 - rate)
+        // This ensures we net exactly `amount` after the provider deducts their cut.
+        let rate_fraction = rate as f64 / 100.0;
+        let percentage_fee = ((amount as f64) * rate_fraction / (1.0 - rate_fraction)).ceil() as u64;
 
         // Get base fee, converting currency if needed
         let base_fee_currency = Currency::from_str(base_currency_str).unwrap_or_else(|_| {
@@ -111,7 +114,7 @@ impl PricingEngine {
             }
             currency
         });
-        let base_fee = if base_fee_currency == currency {
+        let base_fee_raw = if base_fee_currency == currency {
             // Same currency, use directly
             base
         } else {
@@ -120,6 +123,14 @@ impl PricingEngine {
             // This is a simplification - in production, this should use the
             // exchange rate service to convert the fee to the target currency
             base
+        };
+
+        // Gross-up the flat base fee too — the provider takes their percentage cut on the
+        // entire order total, so a flat fee of X must be sent as X / (1 - rate) to net X.
+        let base_fee = if rate_fraction > 0.0 {
+            (base_fee_raw as f64 / (1.0 - rate_fraction)).ceil() as u64
+        } else {
+            base_fee_raw
         };
 
         percentage_fee + base_fee
@@ -798,6 +809,67 @@ mod tests {
             },
         );
     }
+    /// Verify that the processing fee gross-up ensures we net exactly the base amount
+    /// after the payment provider deducts their percentage cut.
+    #[tokio::test]
+    async fn test_processing_fee_grossup() -> Result<()> {
+        use lnvps_db::{ProviderConfig, RevolutProviderConfig};
+
+        let db = MockDb::default();
+
+        // Config with 1% rate and no flat base fee, to test pure percentage gross-up
+        {
+            let mut configs = db.payment_method_configs.lock().await;
+            let mut config = PaymentMethodConfig::new_with_config(
+                1,
+                PaymentMethod::Revolut,
+                "Revolut".to_string(),
+                true,
+                ProviderConfig::Revolut(RevolutProviderConfig {
+                    url: "https://api.revolut.com".to_string(),
+                    token: "test-token".to_string(),
+                    api_version: "2024-09-01".to_string(),
+                    public_key: "pk_test".to_string(),
+                    webhook_secret: None,
+                }),
+            );
+            config.id = 1;
+            config.processing_fee_rate = Some(1.0);
+            config.processing_fee_base = Some(0);
+            config.processing_fee_currency = Some("EUR".to_string());
+            configs.insert(1, config);
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        // Test a range of amounts to ensure gross-up always holds
+        for base in [100u64, 345, 1000, 9999, 50000] {
+            let fee = pe
+                .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, base)
+                .await;
+
+            let order_total = base + fee;
+
+            // Simulate provider taking their 1% cut (floor, as providers round down their fee)
+            let provider_cut = (order_total as f64 * 0.01).floor() as u64;
+            let net = order_total - provider_cut;
+
+            assert!(
+                net >= base,
+                "base={base}: expected net >= {base} but got {net} (order={order_total}, fee={fee})"
+            );
+            // Must not overcharge by more than 1 cent (from ceil rounding)
+            assert!(
+                net <= base + 1,
+                "base={base}: overcharged — net={net} is more than 1 cent above base={base}"
+            );
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn custom_pricing() -> Result<()> {
         let db = MockDb::default();
@@ -1588,11 +1660,11 @@ mod tests {
                 // plan.amount is already in cents (132 cents = €1.32)
                 let expected_amount_cents = plan.amount;
                 
-                // Processing fee: 1% + 0.20 EUR
-                // 1% of 132 cents = 1 cent (rounded)
-                // 0.20 EUR = 20 cents
-                // Total = 21 cents
-                let expected_fee = (expected_amount_cents / 100) + 20;
+                // Processing fee gross-up: ensure we net exactly `amount` after provider takes 1%
+                // percentage: ceil(132 * 0.01 / 0.99) = ceil(1.333) = 2 cents
+                // flat:       ceil(20  / 0.99)        = ceil(20.20)  = 21 cents
+                // total = 23 cents
+                let expected_fee = 23u64;
                 
                 assert_eq!(
                     expected_fee, 

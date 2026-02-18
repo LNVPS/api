@@ -667,13 +667,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,processing_fee,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
             .bind(vm_payment.vm_id)
             .bind(vm_payment.created)
             .bind(vm_payment.expires)
             .bind(vm_payment.amount)
             .bind(vm_payment.tax)
+            .bind(vm_payment.processing_fee)
             .bind(&vm_payment.currency)
             .bind(vm_payment.payment_method)
             .bind(vm_payment.payment_type)
