@@ -3,7 +3,7 @@ ARG IMAGE=rust:bookworm
 FROM $IMAGE AS build
 WORKDIR /app/src
 COPY . .
-RUN cargo install --root /app/build --path lnvps_operator lnvps_operator
+RUN cargo install --locked --root /app/build --path lnvps_operator lnvps_operator
 
 FROM $IMAGE AS runner
 WORKDIR /app
