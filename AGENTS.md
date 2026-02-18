@@ -12,3 +12,4 @@ This file is an index. Load only the specific doc(s) relevant to your task to mi
 | [agents/api-guidelines.md](agents/api-guidelines.md) | Modifying any user-facing or admin API endpoint |
 | [agents/currency.md](agents/currency.md) | Working with money amounts, pricing, or payments |
 | [agents/bug-fixes.md](agents/bug-fixes.md) | Resolving bugs (includes regression test requirement) |
+| [agents/coverage.md](agents/coverage.md) | Any edit that adds or modifies functions (100 % function coverage required) |
