@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use clap::Parser;
 use config::{Config, File};
 use log::{error, info, warn};
@@ -19,10 +19,10 @@ mod checks;
 mod metrics;
 mod notify;
 
+use checks::HealthCheck;
 use checks::dns::{DnsCheck, DnsCheckConfig};
 use checks::mss::{MssCheck, MssCheckConfig};
-use checks::HealthCheck;
-use metrics::{metrics_handler, HealthMetrics};
+use metrics::{HealthMetrics, metrics_handler};
 use notify::{EmailNotifier, NoopNotifier, Notifier, SmtpConfig};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -80,7 +80,11 @@ fn default_alert_cooldown() -> u64 {
 }
 
 #[derive(Parser)]
-#[clap(about = "Standalone network health monitoring service", version, author)]
+#[clap(
+    about = "Standalone network health monitoring service",
+    version,
+    author
+)]
 struct Args {
     /// Path to the config file
     #[clap(short, long)]
@@ -278,10 +282,8 @@ async fn run_checks(
                 } else {
                     let mut state = alert_state.lock().await;
                     if state.should_alert(&check_id, cooldown) {
-                        let mut message = format!(
-                            "Health check FAILED: {}\n\n{}",
-                            result.name, result.message
-                        );
+                        let mut message =
+                            format!("Health check FAILED: {}\n\n{}", result.name, result.message);
                         if let Some(details) = &result.details {
                             message.push_str("\n\nDetails:\n");
                             message.push_str(details);

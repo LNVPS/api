@@ -6,9 +6,9 @@ use crate::host::{
 use crate::settings::QemuConfig;
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
-use lnvps_api_common::{op_fatal, VmRunningState};
 use lnvps_api_common::VmRunningStates;
 use lnvps_api_common::retry::{OpError, OpResult};
+use lnvps_api_common::{VmRunningState, op_fatal};
 use lnvps_db::{LNVpsDb, Vm, VmOsImage};
 use log::info;
 use rand::random;

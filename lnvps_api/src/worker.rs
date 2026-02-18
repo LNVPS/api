@@ -211,7 +211,7 @@ impl Worker {
                     message,
                     Some(format!("[VM{}] Expiring Soon", vm.id)),
                 )
-                    .await;
+                .await;
             }
         }
 
@@ -251,7 +251,7 @@ impl Worker {
                 format!("Your VM #{} has been deleted!", vm.id),
                 title.clone(),
             )
-                .await;
+            .await;
             self.queue_admin_notification(format!("VM{} is ready for deletion", vm.id), title)
                 .await;
         }
@@ -348,7 +348,7 @@ impl Worker {
             format!("Your {}", &msg),
             Some(format!("[VM{}] Created", vm.id)),
         )
-            .await;
+        .await;
         self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))
             .await;
         Ok(())
@@ -427,7 +427,7 @@ impl Worker {
                     format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
                     Some(format!("VM {} Deletion Failed", vm.id)),
                 )
-                    .await
+                .await
             }
         }
 
@@ -443,7 +443,7 @@ impl Worker {
                             format!("Failed to check VM {}:\n{}", vm.id, e),
                             Some(format!("VM {} Check Failed", vm.id)),
                         )
-                            .await
+                        .await
                     }
                 }
             }
@@ -502,7 +502,7 @@ impl Worker {
                 message,
                 None,
             )
-                .await?;
+            .await?;
             c.send_event(&ev).await?;
         }
         Ok(())
@@ -588,7 +588,7 @@ impl Worker {
             ),
             Some("Bulk Message Complete".to_string()),
         )
-            .await;
+        .await;
 
         Ok(())
     }
@@ -738,7 +738,10 @@ impl Worker {
             domain.name, activation_hash
         );
 
-        debug!("Checking path activation for domain {} at {}", domain.name, activation_url);
+        debug!(
+            "Checking path activation for domain {} at {}",
+            domain.name, activation_url
+        );
 
         // Try to fetch the activation URL
         let client = reqwest::Client::builder()
@@ -798,7 +801,7 @@ impl Worker {
                     false
                 }
             };
-            
+
             let has_path_activation = match self.check_path_activation(domain).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -837,7 +840,7 @@ impl Worker {
                                 notification_message,
                                 Some(format!("Nostr Domain '{}' Activated (HTTPS)", domain.name)),
                             )
-                                .await;
+                            .await;
                         }
                         Err(e) => {
                             error!(
@@ -881,7 +884,7 @@ impl Worker {
                                 notification_message,
                                 Some(format!("Nostr Domain '{}' Activated (HTTP)", domain.name)),
                             )
-                                .await;
+                            .await;
                         }
                         Err(e) => {
                             error!(
@@ -927,7 +930,7 @@ impl Worker {
                             notification_message,
                             Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
                         )
-                            .await;
+                        .await;
                     }
                     Err(e) => {
                         error!(
@@ -971,7 +974,7 @@ impl Worker {
                             notification_message,
                             Some(format!("Nostr Domain '{}' Upgraded to HTTPS", domain.name)),
                         )
-                            .await;
+                        .await;
                     }
                     Err(e) => {
                         error!(
@@ -980,10 +983,13 @@ impl Worker {
                         );
 
                         self.queue_admin_notification(
-                            format!("Failed to upgrade domain '{}' (ID: {}) to HTTPS: {}",
-                                    domain.name, domain.id, e),
+                            format!(
+                                "Failed to upgrade domain '{}' (ID: {}) to HTTPS: {}",
+                                domain.name, domain.id, e
+                            ),
                             Some(format!("Domain HTTPS Upgrade Failed: {}", domain.name)),
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             }
@@ -993,8 +999,7 @@ impl Worker {
                     "Domain {} is correctly active (DNS: {}, Path: {}, HTTP-only: {})",
                     domain.name, has_dns_record, has_path_activation, domain.http_only
                 );
-            }
-            else if !domain.enabled && !has_dns_record && !has_path_activation {
+            } else if !domain.enabled && !has_dns_record && !has_path_activation {
                 debug!(
                     "Domain {} is correctly inactive without DNS or path activation",
                     domain.name
@@ -1030,7 +1035,7 @@ impl Worker {
                                 notification_message,
                                 Some(format!("Nostr Domain '{}' Deleted", domain.name)),
                             )
-                                .await;
+                            .await;
                         }
                         Err(e) => {
                             error!(
@@ -1211,7 +1216,7 @@ impl Worker {
                     ),
                     title.clone(),
                 )
-                    .await;
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1221,7 +1226,7 @@ impl Worker {
                     ),
                     title,
                 )
-                    .await;
+                .await;
 
                 return Ok(Some(format!("VM {} deleted successfully", vm_id)));
             }
@@ -1270,7 +1275,7 @@ impl Worker {
                     format!("Your VM #{} has been started by an administrator.", vm_id),
                     title.clone(),
                 )
-                    .await;
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1280,7 +1285,7 @@ impl Worker {
                     ),
                     title,
                 )
-                    .await;
+                .await;
 
                 return Ok(Some(format!("VM {} started successfully", vm_id)));
             }
@@ -1320,7 +1325,7 @@ impl Worker {
                     format!("Your VM #{} has been stopped by an administrator.", vm_id),
                     title.clone(),
                 )
-                    .await;
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1330,7 +1335,7 @@ impl Worker {
                     ),
                     title,
                 )
-                    .await;
+                .await;
 
                 return Ok(Some(format!("VM {} stopped successfully", vm_id)));
             }

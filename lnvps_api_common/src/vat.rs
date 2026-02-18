@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -171,16 +171,14 @@ impl EuVatClient {
             }
             let cc = &cleaned[..2];
             if !cc.chars().all(|c| c.is_ascii_alphabetic()) {
-                bail!("VAT number must start with 2-letter country code or country_code must be provided");
+                bail!(
+                    "VAT number must start with 2-letter country code or country_code must be provided"
+                );
             }
             (cc.to_uppercase(), cleaned[2..].to_string())
         };
 
-        trace!(
-            "Validating VAT number: {} for country: {}",
-            number,
-            country
-        );
+        trace!("Validating VAT number: {} for country: {}", number, country);
 
         let client = reqwest::Client::new();
         let response = client
@@ -205,9 +203,7 @@ impl EuVatClient {
             country_code: country,
             vat_number: number,
             name: vat_response.name.filter(|s| !s.is_empty() && s != "---"),
-            address: vat_response
-                .address
-                .filter(|s| !s.is_empty() && s != "---"),
+            address: vat_response.address.filter(|s| !s.is_empty() && s != "---"),
             request_identifier: vat_response.request_identifier,
         })
     }
@@ -299,7 +295,10 @@ mod tests {
         let client = EuVatClient::new();
 
         // Test with an invalid VAT number - should return valid=false
-        let result = client.validate_vat_number("DE123456789", None).await.unwrap();
+        let result = client
+            .validate_vat_number("DE123456789", None)
+            .await
+            .unwrap();
         assert!(!result.valid, "Random VAT number should be invalid");
         assert_eq!(result.country_code, "DE");
         assert_eq!(result.vat_number, "123456789");

@@ -1,13 +1,15 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::Html;
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_db::nostr::LNVPSNostrDb;
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use lnvps_db::nostr::LNVPSNostrDb;
 
 #[derive(Clone)]
 struct RouterState {
@@ -43,10 +45,13 @@ async fn nostr_address(
         .and_then(|s| s.to_str().ok())
         .unwrap_or("lnvps.net");
     info!("Got request for {} on host {}", name, host);
-    
-    let domain = this.db.get_domain_by_name(host).await
+
+    let domain = this
+        .db
+        .get_domain_by_name(host)
+        .await
         .map_err(|_| "Domain not found")?;
-    
+
     // If the name parameter matches the activation hash, return a simple success response
     // This allows the activation check to verify the path is reachable
     if q.name.is_some() && domain.activation_hash.as_ref() == Some(&name) {
@@ -56,7 +61,7 @@ async fn nostr_address(
             relays: HashMap::new(),
         }));
     }
-    
+
     let handle = this
         .db
         .get_handle_by_name(domain.id, &name)

@@ -23,17 +23,17 @@ default = [
     "payments-rs/tls-ring"
 ]
 openapi = ["dep:openapi-build-gen"]
-mikrotik = ["dep:reqwest"]
+mikrotik = []
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain"]
 nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
-proxmox = ["dep:reqwest", "dep:ssh2", "dep:tokio-tungstenite"]
+proxmox = ["dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
 # bitvora is disabled - service has been shut down
 bitvora = ["payments-rs/method-bitvora"]
-cloudflare = ["dep:reqwest"]
+cloudflare = []
 revolut = ["payments-rs/method-revolut"]
 stripe = ["payments-rs/method-stripe"]
 

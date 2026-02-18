@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use k8s_openapi::api::networking::v1::{
     Ingress, IngressBackend, IngressRule, IngressServiceBackend, IngressSpec, IngressTLS,
@@ -5,9 +7,9 @@ use k8s_openapi::api::networking::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
-use lnvps_db::NostrDomain;
 use log::{error, info};
-use std::collections::BTreeMap;
+
+use lnvps_db::NostrDomain;
 
 use crate::{Context, Settings};
 
@@ -225,7 +227,10 @@ pub async fn reconcile_nostr_domains(context: &Context) -> Result<()> {
 
     // Split domains into HTTP-only (including not-yet-activated) and HTTPS-enabled (activated with DNS)
     let http_only_domains: Vec<&NostrDomain> = domains.iter().filter(|d| d.http_only).collect();
-    let https_domains: Vec<&NostrDomain> = domains.iter().filter(|d| !d.http_only && d.enabled).collect();
+    let https_domains: Vec<&NostrDomain> = domains
+        .iter()
+        .filter(|d| !d.http_only && d.enabled)
+        .collect();
 
     info!(
         "Split: {} HTTP-only domains, {} HTTPS domains",

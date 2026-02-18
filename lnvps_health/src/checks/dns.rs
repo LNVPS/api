@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use hickory_resolver::Resolver;
 use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::Resolver;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -90,10 +90,8 @@ impl DnsCheck {
         opts.timeout = Duration::from_secs(self.config.timeout_secs);
         opts.attempts = 2;
 
-        let mut builder = Resolver::builder_with_config(
-            resolver_config,
-            TokioConnectionProvider::default(),
-        );
+        let mut builder =
+            Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default());
         *builder.options_mut() = opts;
         Ok(builder.build())
     }
@@ -115,29 +113,32 @@ impl HealthCheck for DnsCheck {
             }
         };
 
-        let server_ip: IpAddr = server_str
-            .parse()
-            .context("Invalid DNS server IP")?;
+        let server_ip: IpAddr = server_str.parse().context("Invalid DNS server IP")?;
 
         let resolver = self.create_resolver(server_ip)?;
 
-        debug!("Querying {} via {} ({})", query, server_str, self.family_suffix());
+        debug!(
+            "Querying {} via {} ({})",
+            query,
+            server_str,
+            self.family_suffix()
+        );
 
         let start = Instant::now();
         let lookup = match resolver.lookup_ip(query.as_str()).await {
             Ok(lookup) => lookup,
             Err(e) => {
-                return Ok(CheckResult::fail(
-                    &name,
-                    format!("DNS lookup failed: {}", e),
-                )
-                .with_details(format!(
-                    "Server: {} ({})\nQuery: {}\nError: {}",
-                    server_str,
-                    self.family_suffix(),
-                    query,
-                    e
-                )));
+                return Ok(
+                    CheckResult::fail(&name, format!("DNS lookup failed: {}", e)).with_details(
+                        format!(
+                            "Server: {} ({})\nQuery: {}\nError: {}",
+                            server_str,
+                            self.family_suffix(),
+                            query,
+                            e
+                        ),
+                    ),
+                );
             }
         };
         let latency = start.elapsed();
@@ -145,13 +146,14 @@ impl HealthCheck for DnsCheck {
         let resolved_ips: Vec<IpAddr> = lookup.iter().collect();
 
         if resolved_ips.is_empty() {
-            return Ok(CheckResult::fail(&name, "DNS lookup returned no results")
-                .with_details(format!(
+            return Ok(
+                CheckResult::fail(&name, "DNS lookup returned no results").with_details(format!(
                     "Server: {} ({})\nQuery: {}",
                     server_str,
                     self.family_suffix(),
                     query
-                )));
+                )),
+            );
         }
 
         // If expected IPs are configured, verify them
@@ -201,7 +203,12 @@ impl HealthCheck for DnsCheck {
 
     fn id(&self) -> String {
         let server = self.server_addr().unwrap_or("none");
-        format!("dns:{}:{}:{}", server, self.config.query, self.family_suffix())
+        format!(
+            "dns:{}:{}:{}",
+            server,
+            self.config.query,
+            self.family_suffix()
+        )
     }
 }
 
@@ -268,7 +275,11 @@ mod tests {
         };
 
         let checks = DnsCheck::from_config(config);
-        assert_eq!(checks.len(), 2, "Should create 2 checks for dual-stack config");
+        assert_eq!(
+            checks.len(),
+            2,
+            "Should create 2 checks for dual-stack config"
+        );
 
         for check in checks {
             match check.check().await {

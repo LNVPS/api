@@ -15,7 +15,7 @@ use lightning_invoice::{
     RawDataPart, RawHrp, SignedRawBolt11Invoice, TaggedField,
 };
 use lnvps_api_common::retry::{OpError, OpResult};
-use lnvps_api_common::{op_fatal, ExchangeRateService, VmRunningState, VmRunningStates};
+use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates, op_fatal};
 #[cfg(feature = "nostr-domain")]
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
@@ -25,7 +25,10 @@ use lnvps_db::{
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use nostr_sdk::Timestamp;
-use payments_rs::lightning::{AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode, PayInvoiceRequest, PayInvoiceResponse};
+use payments_rs::lightning::{
+    AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode, PayInvoiceRequest,
+    PayInvoiceResponse,
+};
 use ssh2::HashType::Sha256;
 use std::collections::HashMap;
 use std::ops::Add;

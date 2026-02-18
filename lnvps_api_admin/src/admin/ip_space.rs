@@ -1,7 +1,7 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminAvailableIpSpaceInfo, AdminIpSpacePricingInfo, AdminIpRangeSubscriptionInfo,
+    AdminAvailableIpSpaceInfo, AdminIpRangeSubscriptionInfo, AdminIpSpacePricingInfo,
     CreateAvailableIpSpaceRequest, CreateIpSpacePricingRequest, UpdateAvailableIpSpaceRequest,
     UpdateIpSpacePricingRequest,
 };
@@ -199,7 +199,9 @@ async fn admin_update_ip_space(
 
     // Validate min >= max (remember: larger prefix number = smaller block)
     if space.min_prefix_size < space.max_prefix_size {
-        return ApiData::err("min_prefix_size must be greater than or equal to max_prefix_size (smaller prefix number = larger block)");
+        return ApiData::err(
+            "min_prefix_size must be greater than or equal to max_prefix_size (smaller prefix number = larger block)",
+        );
     }
 
     if let Some(registry) = req.registry {
@@ -230,16 +232,14 @@ async fn admin_update_ip_space(
     if space.max_prefix_size > rir_min {
         return ApiData::err(&format!(
             "max_prefix_size /{} is too small for BGP announcement (RIR minimum: /{})",
-            space.max_prefix_size,
-            rir_min
+            space.max_prefix_size, rir_min
         ));
     }
 
     if space.max_prefix_size < parent_prefix {
         return ApiData::err(&format!(
             "max_prefix_size /{} cannot be larger than parent CIDR /{}",
-            space.max_prefix_size,
-            parent_prefix
+            space.max_prefix_size, parent_prefix
         ));
     }
 
@@ -580,8 +580,7 @@ async fn admin_list_ip_space_subscriptions(
     // Convert to API format with enriched data
     let mut sub_infos = Vec::new();
     for sub in paginated_subs {
-        match AdminIpRangeSubscriptionInfo::from_subscription_with_admin_data(&this.db, sub).await
-        {
+        match AdminIpRangeSubscriptionInfo::from_subscription_with_admin_data(&this.db, sub).await {
             Ok(info) => sub_infos.push(info),
             Err(_) => continue, // Skip if we can't enrich the data
         }
