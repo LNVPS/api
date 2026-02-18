@@ -923,10 +923,10 @@ async fn v1_get_payment_invoice(
                 vm: vm_to_status(&this.db, vm, None)
                     .await
                     .map_err(|_| "Failed to get VM state")?,
-                total: payment.amount + payment.tax,
+                total: payment.amount + payment.tax + payment.processing_fee,
                 total_formatted: CurrencyAmount::from_u64(
                     payment.currency.parse().map_err(|_| "Invalid currency")?,
-                    payment.amount + payment.tax,
+                    payment.amount + payment.tax + payment.processing_fee,
                 )
                 .to_string(),
                 payment: payment.into(),

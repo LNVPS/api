@@ -11,7 +11,6 @@ use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,6 +193,12 @@ pub struct ApiInvoiceItem {
     pub currency: String,
     /// Raw duration in seconds
     pub time: u64,
+    /// Human-readable amount string (e.g. "EUR 8.55" or "BTC 0.00001320")
+    pub formatted_amount: String,
+    /// Human-readable tax string (e.g. "EUR 1.97" or "BTC 0.00000304")
+    pub formatted_tax: String,
+    /// Human-readable duration string (e.g. "1month" or "30days")
+    pub formatted_duration: String,
 }
 
 impl ApiInvoiceItem {
@@ -205,12 +210,24 @@ impl ApiInvoiceItem {
         currency: &str,
         time_seconds: u64,
     ) -> Result<Self, anyhow::Error> {
+        let cur: payments_rs::currency::Currency = currency
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency))?;
+        let formatted_amount =
+            payments_rs::currency::CurrencyAmount::from_u64(cur, amount).to_string();
+        let formatted_tax =
+            payments_rs::currency::CurrencyAmount::from_u64(cur, tax).to_string();
+        let duration = Duration::from_secs(time_seconds);
+        let formatted_duration = format_duration(duration).to_string();
         Ok(Self {
             amount,
             tax,
             processing_fee,
             currency: currency.to_string(),
             time: time_seconds,
+            formatted_amount,
+            formatted_tax,
+            formatted_duration,
         })
     }
 
@@ -777,4 +794,85 @@ pub enum ApiCreateSubscriptionLineItemRequest {
         domain: String,
         // Add pricing/plan details here
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use lnvps_db::{EncryptedString, PaymentMethod, PaymentType, VmPayment};
+
+    fn make_payment(currency: &str, amount: u64, tax: u64, processing_fee: u64, time_value: u64) -> VmPayment {
+        VmPayment {
+            id: vec![0u8; 32],
+            vm_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount,
+            currency: currency.to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: PaymentType::Renewal,
+            external_data: EncryptedString::from("test"),
+            external_id: None,
+            is_paid: true,
+            rate: 1.0,
+            time_value,
+            tax,
+            processing_fee,
+            upgrade_params: None,
+        }
+    }
+
+    #[test]
+    fn test_from_payment_data_fiat() {
+        // EUR: amounts are in cents, time in seconds (30 days)
+        let item = ApiInvoiceItem::from_payment_data(855, 197, 10, "EUR", 30 * 24 * 3600)
+            .expect("should succeed");
+
+        assert_eq!(item.amount, 855);
+        assert_eq!(item.tax, 197);
+        assert_eq!(item.processing_fee, 10);
+        assert_eq!(item.currency, "EUR");
+        assert_eq!(item.time, 30 * 24 * 3600);
+        // CurrencyAmount::to_string for fiat: "{CURRENCY} {value/100:.2}"
+        assert_eq!(item.formatted_amount, "EUR 8.55");
+        assert_eq!(item.formatted_tax, "EUR 1.97");
+        // humantime produces something like "30days" or "720h" for 30*24*3600 seconds
+        assert!(!item.formatted_duration.is_empty());
+    }
+
+    #[test]
+    fn test_from_payment_data_btc() {
+        // BTC: amounts in millisats
+        let millisats = 1_320_000u64; // 1320 sats = 0.00001320 BTC
+        let item = ApiInvoiceItem::from_payment_data(millisats, 0, 0, "BTC", 2_592_000)
+            .expect("should succeed");
+
+        assert_eq!(item.amount, millisats);
+        assert_eq!(item.tax, 0);
+        assert_eq!(item.formatted_amount, "BTC 0.00001320");
+        assert_eq!(item.formatted_tax, "BTC 0.00000000");
+        assert!(!item.formatted_duration.is_empty());
+    }
+
+    #[test]
+    fn test_from_payment_data_invalid_currency() {
+        let result = ApiInvoiceItem::from_payment_data(100, 0, 0, "NOTACURRENCY", 3600);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_vm_payment() {
+        let payment = make_payment("EUR", 500, 115, 6, 86400);
+        let item = ApiInvoiceItem::from_vm_payment(&payment).expect("should succeed");
+
+        assert_eq!(item.amount, 500);
+        assert_eq!(item.tax, 115);
+        assert_eq!(item.processing_fee, 6);
+        assert_eq!(item.currency, "EUR");
+        assert_eq!(item.time, 86400);
+        assert_eq!(item.formatted_amount, "EUR 5.00");
+        assert_eq!(item.formatted_tax, "EUR 1.15");
+        assert!(!item.formatted_duration.is_empty());
+    }
 }
