@@ -1,0 +1,144 @@
+# Code Style Guidelines
+
+## Import Organization
+
+Organize imports in this order with blank lines between groups:
+1. External crate imports (non-std)
+2. Workspace crate imports (local crates from workspace)
+3. Local module imports (`crate::`, `super::`)
+
+```rust
+use anyhow::{Result, anyhow, bail, Context};
+use async_trait::async_trait;
+use axum::extract::{Path, Query, State};
+use serde::{Deserialize, Serialize};
+
+use lnvps_api_common::{ApiData, ApiResult, PageQuery};
+use lnvps_db::{LNVpsDb, Vm, VmHost};
+
+use crate::api::model::ApiVmStatus;
+use crate::settings::Settings;
+```
+
+Combine imports from the same crate using curly braces.
+
+## Error Handling
+
+- Use `anyhow` for all application errors
+- Return `Result<T>` (which resolves to `anyhow::Result<T>`)
+- Use `.context()` to add context to errors
+- Use `bail!()` for early returns with error messages
+- Use `anyhow!()` to create inline errors
+- **Prefer `map()`, `and_then()`, `ok_or()` over deeply nested if structures**
+
+```rust
+use anyhow::{Result, anyhow, bail, Context};
+
+async fn get_router(&self, id: u64) -> Result<Router> {
+    let cfg = self.db.get_router(id).await?;
+    let token = cfg.token.as_str()
+        .split(":")
+        .next()
+        .context("Invalid token format")?;
+
+    if token.is_empty() {
+        bail!("Token cannot be empty");
+    }
+    Ok(router)
+}
+```
+
+## Naming Conventions
+
+**Functions:** `snake_case`
+- CRUD: `get_*`, `list_*`, `insert_*`, `update_*`, `delete_*`
+- API handlers: `v1_get_vm`, `v1_patch_account`, `admin_list_hosts`
+
+**Types:** `PascalCase`
+- API models: prefix with `Api` (`ApiVmStatus`, `ApiUserSshKey`)
+- Admin models: prefix with `Admin` (`AdminHostInfo`, `AdminVmHost`)
+- Database models: no prefix (`User`, `Vm`, `VmHost`)
+- Request types: suffix with `Request` (`CreateVmRequest`)
+- Traits: describe capability (`LNVpsDb`, `VmHostClient`, `Router`)
+
+**Enums:**
+- `PascalCase` variants: `VmHostKind::Proxmox`, `PaymentMethod::Lightning`
+- Use `#[repr(u16)]` for database-stored enums
+
+## Async Patterns
+
+- Use `tokio` as the async runtime
+- Use `#[async_trait]` for async trait methods
+- Use `futures::future::join_all` for parallel async operations
+- Tests use `#[tokio::test]`
+
+```rust
+#[async_trait]
+pub trait LNVpsDbBase: Send + Sync {
+    async fn get_user(&self, id: u64) -> Result<User>;
+}
+```
+
+## State Management
+
+Use `Arc` for shared state across async boundaries:
+
+```rust
+pub struct RouterState {
+    pub db: Arc<dyn LNVpsDb>,
+    pub provisioner: Arc<LNVpsProvisioner>,
+}
+```
+
+## Derive Macros
+
+```rust
+#[derive(FromRow, Clone, Debug, Default)]      // Database structs
+#[derive(Serialize, Deserialize)]              // API models
+#[derive(Clone, FromRef)]                      // Axum state
+```
+
+## Serde Customization
+
+```rust
+#[serde(rename_all = "kebab-case")]                    // For config files
+#[serde(rename_all = "lowercase")]                     // For API enums
+#[serde(skip_serializing_if = "Option::is_none")]      // Optional fields
+```
+
+## Documentation
+
+- Use `///` doc comments on trait methods and public items
+- Document struct fields with `///`
+- Use `//!` for module-level documentation
+
+```rust
+/// Get a user by id
+async fn get_user(&self, id: u64) -> Result<User>;
+
+pub struct VmHost {
+    /// Unique id of this host
+    pub id: u64,
+    /// The host kind (Hypervisor)
+    pub kind: VmHostKind,
+}
+```
+
+## Test Organization
+
+- Place test modules in separate files: `#[cfg(test)] mod tests;`
+- Use mock implementations in dedicated files (`mocks.rs`)
+- Mocks use `Arc<Mutex<HashMap>>` for shared state
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_feature() -> Result<()> {
+        // Test implementation
+        Ok(())
+    }
+}
+```
