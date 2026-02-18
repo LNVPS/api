@@ -964,7 +964,7 @@ impl SpawnVmContext {
                 .generate_mac(&assignment.ip, &format!("VM{}", assignment.vm_id))
                 .await?
         {
-            self.info.vm.mac_address = mac.address.clone();
+            self.info.vm.mac_address = mac.mac_address.clone();
             assignment.arp_ref = mac.id.clone();
             self.generated_mac = Some(mac);
             return Ok(());
