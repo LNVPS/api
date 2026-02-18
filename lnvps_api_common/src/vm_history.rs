@@ -1,7 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
 use lnvps_db::{LNVpsDb, Vm, VmHistory, VmHistoryActionType};
+use payments_rs::currency::{Currency, CurrencyAmount};
 use serde_json::{Value, json};
+use std::str::FromStr;
 use std::sync::Arc;
 
 fn serialize_json_to_bytes(value: Option<Value>) -> Option<Vec<u8>> {
@@ -315,6 +317,9 @@ impl VmHistoryLogger {
         meta["payment_currency"] = json!(payment_currency);
         meta["time_added_seconds"] = json!(time_added_seconds);
 
+        let currency = Currency::from_str(payment_currency).unwrap_or(Currency::BTC);
+        let formatted_amount = CurrencyAmount::from_u64(currency, payment_amount);
+
         let history = VmHistory {
             id: 0,
             vm_id,
@@ -325,8 +330,8 @@ impl VmHistoryLogger {
             new_state: None,
             metadata: serialize_json_to_bytes(Some(meta)),
             description: Some(format!(
-                "VM {} received payment of {} {} ({} seconds added)",
-                vm_id, payment_amount, payment_currency, time_added_seconds
+                "VM {} received payment of {} ({} seconds added)",
+                vm_id, formatted_amount, time_added_seconds
             )),
         };
 
