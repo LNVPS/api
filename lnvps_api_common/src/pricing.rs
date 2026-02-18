@@ -754,7 +754,7 @@ mod tests {
             }),
         );
         config.id = 1;
-        config.processing_fee_rate = Some(1.0);
+        config.processing_fee_rate = Some(2.8);
         config.processing_fee_base = Some(20);
         config.processing_fee_currency = Some("EUR".to_string());
         configs.insert(1, config);
@@ -817,7 +817,7 @@ mod tests {
 
         let db = MockDb::default();
 
-        // Config with 1% rate and no flat base fee, to test pure percentage gross-up
+        // Config with 2.8% rate and no flat base fee, to test pure percentage gross-up
         {
             let mut configs = db.payment_method_configs.lock().await;
             let mut config = PaymentMethodConfig::new_with_config(
@@ -834,7 +834,7 @@ mod tests {
                 }),
             );
             config.id = 1;
-            config.processing_fee_rate = Some(1.0);
+            config.processing_fee_rate = Some(2.8);
             config.processing_fee_base = Some(0);
             config.processing_fee_currency = Some("EUR".to_string());
             configs.insert(1, config);
@@ -852,8 +852,8 @@ mod tests {
 
             let order_total = base + fee;
 
-            // Simulate provider taking their 1% cut (floor, as providers round down their fee)
-            let provider_cut = (order_total as f64 * 0.01).floor() as u64;
+            // Simulate provider taking their 2.8% cut (floor, as providers round down their fee)
+            let provider_cut = (order_total as f64 * 0.028).floor() as u64;
             let net = order_total - provider_cut;
 
             assert!(
@@ -866,6 +866,66 @@ mod tests {
                 "base={base}: overcharged — net={net} is more than 1 cent above base={base}"
             );
         }
+
+        Ok(())
+    }
+
+    /// Real-world regression: VM order €9.90, Revolut non-EU rate 2.8% + €0.20.
+    /// The system previously charged only €0.31 (1% rate); Revolut actually took €0.49,
+    /// leaving a shortfall. At 2.8% + €0.20 the correct gross-up fee is €0.50.
+    ///
+    /// Arithmetic:
+    ///   amount = 990 cents, rate = 2.8%, base = 20 cents
+    ///   percentage_fee = ceil(990 * 0.028 / 0.972) = ceil(28.518) = 29 cents
+    ///   base_fee       = ceil(20 / 0.972)           = ceil(20.576) = 21 cents
+    ///   total_fee      = 50 cents  →  customer pays 1040 cents
+    ///   Revolut cut    = floor(1040 * 0.028) + 20   = 29 + 20 = 49 cents
+    ///   net received   = 1040 - 49 = 991 cents  (≥ 990 ✓, ≤ 991 ✓)
+    #[tokio::test]
+    async fn test_revolut_non_eu_990() -> Result<()> {
+        use lnvps_db::{ProviderConfig, RevolutProviderConfig};
+
+        let db = MockDb::default();
+
+        {
+            let mut configs = db.payment_method_configs.lock().await;
+            let mut config = PaymentMethodConfig::new_with_config(
+                1,
+                PaymentMethod::Revolut,
+                "Revolut".to_string(),
+                true,
+                ProviderConfig::Revolut(RevolutProviderConfig {
+                    url: "https://api.revolut.com".to_string(),
+                    token: "test-token".to_string(),
+                    api_version: "2024-09-01".to_string(),
+                    public_key: "pk_test".to_string(),
+                    webhook_secret: None,
+                }),
+            );
+            config.id = 1;
+            config.processing_fee_rate = Some(2.8);
+            config.processing_fee_base = Some(20); // €0.20 flat fee in cents
+            config.processing_fee_currency = Some("EUR".to_string());
+            configs.insert(1, config);
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let amount = 990u64; // €9.90 in cents
+        let fee = pe
+            .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, amount)
+            .await;
+
+        assert_eq!(50, fee, "fee should be 50 cents (29 percentage + 21 flat)");
+
+        // Verify gross-up invariant: Revolut takes 2.8% of total + €0.20 flat
+        let order_total = amount + fee; // 1040 cents
+        let revolut_cut = (order_total as f64 * 0.028).floor() as u64 + 20;
+        let net = order_total - revolut_cut;
+        assert!(net >= amount, "net {net} must be >= amount {amount}");
+        assert!(net <= amount + 1, "net {net} must not exceed amount {amount} by more than 1 cent");
 
         Ok(())
     }
@@ -1652,7 +1712,7 @@ mod tests {
             _ => bail!("Expected new payment"),
         }
 
-        // Test Revolut payment (1% + 0.20 EUR processing fee)
+        // Test Revolut payment (2.8% + 0.20 EUR processing fee)
         let price_revolut = pe.get_vm_cost(1, PaymentMethod::Revolut).await?;
         match price_revolut {
             CostResult::New(payment_info) => {
@@ -1660,16 +1720,16 @@ mod tests {
                 // plan.amount is already in cents (132 cents = €1.32)
                 let expected_amount_cents = plan.amount;
                 
-                // Processing fee gross-up: ensure we net exactly `amount` after provider takes 1%
-                // percentage: ceil(132 * 0.01 / 0.99) = ceil(1.333) = 2 cents
-                // flat:       ceil(20  / 0.99)        = ceil(20.20)  = 21 cents
-                // total = 23 cents
-                let expected_fee = 23u64;
+                // Processing fee gross-up: ensure we net exactly `amount` after provider takes 2.8%
+                // percentage: ceil(132 * 0.028 / 0.972) = ceil(3.804) = 4 cents
+                // flat:       ceil(20  / 0.972)         = ceil(20.576) = 21 cents
+                // total = 25 cents
+                let expected_fee = 25u64;
                 
                 assert_eq!(
                     expected_fee, 
                     payment_info.processing_fee,
-                    "Revolut processing fee should be 1% + 0.20 EUR"
+                    "Revolut processing fee should be 2.8% + 0.20 EUR"
                 );
                 assert_eq!(Currency::EUR, payment_info.currency, "Should be EUR");
             }
