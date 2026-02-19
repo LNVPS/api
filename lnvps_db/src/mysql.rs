@@ -1835,19 +1835,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral_payout (referral_id, amount, currency) VALUES (?, ?, ?) returning id",
+            "INSERT INTO referral_payout (referral_id, amount, currency, invoice) VALUES (?, ?, ?, ?) returning id",
         )
         .bind(payout.referral_id)
         .bind(payout.amount)
         .bind(&payout.currency)
+        .bind(&payout.invoice)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
     }
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
-        sqlx::query("UPDATE referral_payout SET is_paid = ? WHERE id = ?")
+        sqlx::query("UPDATE referral_payout SET is_paid = ?, pre_image = ? WHERE id = ?")
             .bind(payout.is_paid)
+            .bind(&payout.pre_image)
             .bind(payout.id)
             .execute(&self.db)
             .await?;
@@ -1867,8 +1869,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as(
             "SELECT
                 r.code,
-                CAST(COALESCE(SUM(CASE WHEN rp.is_paid = 0 THEN rp.amount ELSE 0 END), 0) AS UNSIGNED) AS pending_amount,
-                CAST(COALESCE(SUM(CASE WHEN rp.is_paid = 1 THEN rp.amount ELSE 0 END), 0) AS UNSIGNED) AS paid_amount,
+                CAST(GREATEST(0, COALESCE(first_payments.total_amount, 0) - COALESCE(paid_payouts.paid_amount, 0)) AS UNSIGNED) AS pending_amount,
+                CAST(COALESCE(paid_payouts.paid_amount, 0) AS UNSIGNED) AS paid_amount,
                 CAST(COALESCE((
                     SELECT COUNT(DISTINCT v.id)
                     FROM vm v
@@ -1886,10 +1888,26 @@ impl LNVpsDbBase for LNVpsDbMysql {
                       )
                 ), 0) AS UNSIGNED) AS referrals_failed
              FROM referral r
-             LEFT JOIN referral_payout rp ON rp.referral_id = r.id
-             WHERE r.id = ?
-             GROUP BY r.id, r.code",
+             LEFT JOIN (
+                 SELECT SUM(vp.amount) AS total_amount
+                 FROM vm v
+                 JOIN (
+                     SELECT vm_id, amount,
+                            ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) AS rn
+                     FROM vm_payment
+                     WHERE is_paid = 1
+                 ) vp ON v.id = vp.vm_id AND vp.rn = 1
+                 WHERE v.ref_code = (SELECT code FROM referral WHERE id = ?)
+             ) first_payments ON TRUE
+             LEFT JOIN (
+                 SELECT SUM(amount) AS paid_amount
+                 FROM referral_payout
+                 WHERE referral_id = ? AND is_paid = 1
+             ) paid_payouts ON TRUE
+             WHERE r.id = ?",
         )
+        .bind(referral_id)
+        .bind(referral_id)
         .bind(referral_id)
         .fetch_one(&self.db)
         .await?)

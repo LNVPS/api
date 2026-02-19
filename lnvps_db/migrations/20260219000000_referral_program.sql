@@ -19,6 +19,8 @@ CREATE TABLE referral_payout (
     currency VARCHAR(10) NOT NULL,
     created DATETIME NOT NULL DEFAULT NOW(),
     is_paid BOOLEAN NOT NULL DEFAULT FALSE,
+    invoice VARCHAR(600),
+    pre_image VARCHAR(64),
     PRIMARY KEY (id),
     FOREIGN KEY (referral_id) REFERENCES referral(id)
 );

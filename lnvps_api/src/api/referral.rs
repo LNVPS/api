@@ -92,22 +92,14 @@ pub struct ApiReferralPatchRequest {
     pub use_nwc: Option<bool>,
 }
 
-/// Generate a random 8-character base32 referral code
+/// Generate a random 8-character base63 referral code (A-Za-z0-9_)
 fn generate_referral_code() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let bytes: [u8; 5] = rand::random();
-    // Encode 5 bytes (40 bits) as 8 base32 characters (5 bits each)
-    let bits = (bytes[0] as u64) << 32
-        | (bytes[1] as u64) << 24
-        | (bytes[2] as u64) << 16
-        | (bytes[3] as u64) << 8
-        | bytes[4] as u64;
-    let mut code = String::with_capacity(8);
-    for i in (0..8).rev() {
-        let idx = ((bits >> (i * 5)) & 0x1f) as usize;
-        code.push(ALPHABET[idx] as char);
-    }
-    code
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+    let bytes: [u8; 8] = rand::random();
+    bytes
+        .iter()
+        .map(|&b| ALPHABET[(b as usize) % ALPHABET.len()] as char)
+        .collect()
 }
 
 /// Get current referral state (code, stats, payout info)
@@ -217,11 +209,11 @@ mod tests {
 
     #[test]
     fn test_generate_referral_code_alphabet() {
-        const VALID: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        const VALID: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
         for _ in 0..100 {
             let code = generate_referral_code();
             for c in code.chars() {
-                assert!(VALID.contains(c), "Invalid base32 character: {}", c);
+                assert!(VALID.contains(c), "Invalid base63 character: {}", c);
             }
         }
     }

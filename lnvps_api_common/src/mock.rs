@@ -1520,7 +1520,10 @@ impl LNVpsDbBase for MockDb {
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let mut payouts = self.referral_payouts.lock().await;
         let new_id = payouts.len() as u64 + 1;
-        payouts.push(ReferralPayout { id: new_id, ..payout.clone() });
+        payouts.push(ReferralPayout {
+            id: new_id,
+            ..payout.clone()
+        });
         Ok(new_id)
     }
 
@@ -1528,6 +1531,7 @@ impl LNVpsDbBase for MockDb {
         let mut payouts = self.referral_payouts.lock().await;
         if let Some(p) = payouts.iter_mut().find(|p| p.id == payout.id) {
             p.is_paid = payout.is_paid;
+            p.pre_image = payout.pre_image.clone();
         }
         Ok(())
     }
@@ -1549,21 +1553,23 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("Referral not found: {}", referral_id))?;
         drop(referrals);
 
-        let payouts = self.referral_payouts.lock().await;
-        let pending_amount = payouts
-            .iter()
-            .filter(|p| p.referral_id == referral_id && !p.is_paid)
-            .map(|p| p.amount)
-            .sum();
-        let paid_amount = payouts
-            .iter()
-            .filter(|p| p.referral_id == referral_id && p.is_paid)
-            .map(|p| p.amount)
-            .sum();
-        drop(payouts);
-
+        // Compute total_amount as sum of first paid payment per VM with this ref code
         let vms = self.vms.lock().await;
         let payments = self.payments.lock().await;
+        let total_amount: u64 = vms
+            .values()
+            .filter(|v| v.ref_code.as_deref() == Some(&referral.code))
+            .filter_map(|v| {
+                // Get the first paid payment for this VM
+                let mut vm_payments: Vec<&VmPayment> = payments
+                    .iter()
+                    .filter(|p| p.vm_id == v.id && p.is_paid)
+                    .collect();
+                vm_payments.sort_by_key(|p| p.created);
+                vm_payments.first().map(|p| p.amount)
+            })
+            .sum();
+
         let referrals_success = vms
             .values()
             .filter(|v| v.ref_code.as_deref() == Some(&referral.code))
@@ -1574,6 +1580,18 @@ impl LNVpsDbBase for MockDb {
             .filter(|v| v.ref_code.as_deref() == Some(&referral.code))
             .filter(|v| !payments.iter().any(|p| p.vm_id == v.id && p.is_paid))
             .count() as u64;
+        drop(payments);
+        drop(vms);
+
+        let payouts = self.referral_payouts.lock().await;
+        let paid_amount: u64 = payouts
+            .iter()
+            .filter(|p| p.referral_id == referral_id && p.is_paid)
+            .map(|p| p.amount)
+            .sum();
+        drop(payouts);
+
+        let pending_amount = total_amount.saturating_sub(paid_amount);
 
         Ok(ReferralSummary {
             code: referral.code,

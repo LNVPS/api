@@ -929,6 +929,10 @@ pub struct ReferralPayout {
     pub created: DateTime<Utc>,
     /// Whether this payout has been completed
     pub is_paid: bool,
+    /// Lightning invoice for this payout
+    pub invoice: Option<String>,
+    /// Preimage revealed when the invoice was paid
+    pub pre_image: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
