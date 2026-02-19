@@ -73,7 +73,6 @@ pub async fn get_router(db: &Arc<dyn LNVpsDb>, router_id: u64) -> OpResult<Arc<d
             return Ok(Arc::new(crate::mocks::MockRouter::new()));
             #[cfg(not(test))]
             {
-                #[allow(unreachable_code)]
                 panic!("Cant use mock router outside tests!")
             }
         }

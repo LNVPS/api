@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
 
-use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
+use lnvps_api_common::retry::{Pipeline, RetryPolicy};
 use lnvps_api_common::{ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey,
     ApiVmOsImage, ApiVmTemplate, EuVatClient, Nip98Auth, PageQuery, UpgradeConfig, WorkJob};
 use lnvps_db::{
@@ -103,10 +103,10 @@ async fn v1_patch_account(
     // validate nwc string
     #[cfg(feature = "nostr-nwc")]
     if let Some(Some(nwc)) = &req.nwc_connection_string {
-        match nwc::prelude::NostrWalletConnectURI::parse(nwc) {
+        match nwc::prelude::NostrWalletConnectUri::parse(nwc) {
             Ok(s) => {
                 // test connection
-                let client = nwc::NWC::new(s);
+                let client = nwc::NostrWalletConnect::new(s);
                 let info = client
                     .get_info()
                     .await

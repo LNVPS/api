@@ -300,6 +300,7 @@ struct OvhVMacRequest {
 #[serde(rename_all = "lowercase")]
 enum OvhVMacType {
     Ovh,
+    #[allow(dead_code)]
     VMWare,
 }
 

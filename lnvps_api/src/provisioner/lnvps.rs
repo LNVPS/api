@@ -230,11 +230,11 @@ impl LNVpsProvisioner {
         );
 
         // Parse NWC connection string
-        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
+        let nwc_uri = nwc::prelude::NostrWalletConnectUri::from_str(nwc_connection_string)
             .context("Invalid NWC connection string")?;
 
         // Create nostr client for NWC
-        let client = nwc::NWC::new(nwc_uri);
+        let client = nwc::NostrWalletConnect::new(nwc_uri);
         client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
         info!("Successful NWC auto-renewal payment for VM {}", vm_id);
         Ok(vm_payment)
@@ -325,7 +325,7 @@ impl LNVpsProvisioner {
 
         // Parse subscription currency
         let subscription_currency = Currency::from_str(&subscription.currency)
-            .map_err(|e| anyhow::anyhow!("Invalid currency"))?;
+            .map_err(|_e| anyhow::anyhow!("Invalid currency"))?;
         let list_price = CurrencyAmount::from_u64(subscription_currency, list_price_amount);
 
         // Create pricing engine for currency conversion

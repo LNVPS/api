@@ -47,6 +47,7 @@ pub struct PricingEngine {
     db: Arc<dyn LNVpsDb>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
+    #[allow(dead_code)]
     base_currency: Currency,
 }
 

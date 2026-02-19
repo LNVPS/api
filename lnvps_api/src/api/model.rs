@@ -737,6 +737,7 @@ impl From<lnvps_db::IpSpacePricing> for ApiIpSpacePricing {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 pub struct ApiIpRangeSubscription {
     pub id: u64,
     pub cidr: String,
@@ -747,6 +748,7 @@ pub struct ApiIpRangeSubscription {
 }
 
 impl ApiIpRangeSubscription {
+    #[allow(dead_code)]
     pub async fn from_subscription_with_space(
         db: &dyn lnvps_db::LNVpsDbBase,
         sub: lnvps_db::IpRangeSubscription,
@@ -785,12 +787,14 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 
     #[serde(rename = "asn_sponsoring")]
     AsnSponsoring {
+        #[allow(dead_code)]
         asn: u32,
         // Add pricing/plan details here
     },
 
     #[serde(rename = "dns_hosting")]
     DnsHosting {
+        #[allow(dead_code)]
         domain: String,
         // Add pricing/plan details here
     },

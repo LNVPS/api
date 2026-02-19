@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
