@@ -1,5 +1,5 @@
 use crate::encrypted_string::EncryptedString;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -662,6 +662,8 @@ pub struct NostrDomain {
     pub relays: Option<String>,
     pub handles: i64,
     pub last_status_change: DateTime<Utc>,
+    pub activation_hash: Option<String>,
+    pub http_only: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

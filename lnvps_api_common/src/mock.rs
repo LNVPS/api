@@ -2242,6 +2242,10 @@ impl LNVPSNostrDb for MockDb {
         todo!()
     }
 
+    async fn get_domain_by_activation_hash(&self, _hash: &str) -> DbResult<NostrDomain> {
+        todo!()
+    }
+
     async fn list_domains(&self, _owner_id: u64) -> DbResult<Vec<NostrDomain>> {
         Ok(vec![])
     }
@@ -2255,7 +2259,7 @@ impl LNVPSNostrDb for MockDb {
     }
 
     async fn list_all_domains(&self) -> DbResult<Vec<NostrDomain>> {
-        todo!()
+        Ok(vec![])
     }
 
     async fn list_active_domains(&self) -> DbResult<Vec<NostrDomain>> {
@@ -2266,7 +2270,11 @@ impl LNVPSNostrDb for MockDb {
         Ok(vec![])
     }
 
-    async fn enable_domain(&self, _domain_id: u64) -> DbResult<()> {
+    async fn enable_domain_with_https(&self, _domain_id: u64) -> DbResult<()> {
+        Ok(())
+    }
+
+    async fn enable_domain_http_only(&self, _domain_id: u64) -> DbResult<()> {
         Ok(())
     }
 

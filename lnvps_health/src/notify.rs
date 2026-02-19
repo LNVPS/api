@@ -66,12 +66,7 @@ impl EmailNotifier {
     pub async fn send_alert(&self, subject: &str, body: &str) -> Result<()> {
         for recipient in &self.config.to {
             let email = Message::builder()
-                .from(
-                    self.config
-                        .from
-                        .parse()
-                        .context("Invalid from address")?,
-                )
+                .from(self.config.from.parse().context("Invalid from address")?)
                 .to(recipient.parse().context("Invalid recipient address")?)
                 .subject(subject)
                 .header(ContentType::TEXT_PLAIN)

@@ -28,6 +28,9 @@ pub trait LNVPSNostrDb: Sync + Send {
     /// Get domain object by name
     async fn get_domain_by_name(&self, name: &str) -> DbResult<NostrDomain>;
 
+    /// Get domain object by activation hash
+    async fn get_domain_by_activation_hash(&self, hash: &str) -> DbResult<NostrDomain>;
+
     /// List domains owned by a user
     async fn list_domains(&self, owner_id: u64) -> DbResult<Vec<NostrDomain>>;
 
@@ -46,8 +49,11 @@ pub trait LNVPSNostrDb: Sync + Send {
     /// List all disabled domains across all users
     async fn list_disabled_domains(&self) -> DbResult<Vec<NostrDomain>>;
 
-    /// Enable a domain by setting enabled=true
-    async fn enable_domain(&self, domain_id: u64) -> DbResult<()>;
+    /// Enable a domain by setting enabled=true and http_only=false (for DNS-based activation)
+    async fn enable_domain_with_https(&self, domain_id: u64) -> DbResult<()>;
+
+    /// Enable a domain by setting enabled=true but keeping http_only=true (for path-based activation)
+    async fn enable_domain_http_only(&self, domain_id: u64) -> DbResult<()>;
 
     /// Disable a domain by setting enabled=false
     async fn disable_domain(&self, domain_id: u64) -> DbResult<()>;

@@ -322,8 +322,7 @@ impl LNVpsNetworkProvisioner {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
         self.validate_ip_assignment(assignment, &range)?;
-        self.update_ip_assignment_policy(assignment, &range)
-            .await?;
+        self.update_ip_assignment_policy(assignment, &range).await?;
         self.persist_ip_assignment(assignment).await?;
 
         Ok(())

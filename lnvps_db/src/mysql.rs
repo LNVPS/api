@@ -1840,6 +1840,13 @@ impl LNVPSNostrDb for LNVpsDbMysql {
             .await?)
     }
 
+    async fn get_domain_by_activation_hash(&self, hash: &str) -> DbResult<NostrDomain> {
+        Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where activation_hash=?")
+            .bind(hash)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
     async fn list_domains(&self, owner_id: u64) -> DbResult<Vec<NostrDomain>> {
         Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where owner_id=?")
             .bind(owner_id)
@@ -1850,11 +1857,13 @@ impl LNVPSNostrDb for LNVpsDbMysql {
     async fn insert_domain(&self, domain: &NostrDomain) -> DbResult<u64> {
         Ok(
             sqlx::query(
-                "insert into nostr_domain(owner_id,name,relays) values(?,?,?) returning id",
+                "insert into nostr_domain(owner_id,name,relays,activation_hash,http_only) values(?,?,?,?,?) returning id",
             )
             .bind(domain.owner_id)
             .bind(&domain.name)
             .bind(&domain.relays)
+            .bind(&domain.activation_hash)
+            .bind(domain.http_only)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?,
@@ -1887,9 +1896,19 @@ impl LNVPSNostrDb for LNVpsDbMysql {
             .await?)
     }
 
-    async fn enable_domain(&self, domain_id: u64) -> DbResult<()> {
+    async fn enable_domain_with_https(&self, domain_id: u64) -> DbResult<()> {
         sqlx::query(
-            "update nostr_domain set enabled=1, last_status_change=CURRENT_TIMESTAMP where id=?",
+            "update nostr_domain set enabled=1, http_only=0, last_status_change=CURRENT_TIMESTAMP where id=?",
+        )
+        .bind(domain_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn enable_domain_http_only(&self, domain_id: u64) -> DbResult<()> {
+        sqlx::query(
+            "update nostr_domain set enabled=1, http_only=1, last_status_change=CURRENT_TIMESTAMP where id=?",
         )
         .bind(domain_id)
         .execute(&self.db)

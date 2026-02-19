@@ -450,11 +450,20 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         subscription_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>>;
-    async fn list_ip_range_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<IpRangeSubscription>>;
+    async fn list_ip_range_subscriptions_by_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Vec<IpRangeSubscription>>;
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription>;
     async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription>;
-    async fn insert_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> DbResult<u64>;
-    async fn update_ip_range_subscription(&self, subscription: &IpRangeSubscription) -> DbResult<()>;
+    async fn insert_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<u64>;
+    async fn update_ip_range_subscription(
+        &self,
+        subscription: &IpRangeSubscription,
+    ) -> DbResult<()>;
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()>;
 
     // ========================================================================

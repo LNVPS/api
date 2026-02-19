@@ -32,10 +32,7 @@ impl HealthMetrics {
         .expect("Failed to create pmtu_gauge");
 
         let dns_latency_gauge = GaugeVec::new(
-            Opts::new(
-                "health_dns_latency_seconds",
-                "DNS query latency in seconds",
-            ),
+            Opts::new("health_dns_latency_seconds", "DNS query latency in seconds"),
             &["server", "query", "family"],
         )
         .expect("Failed to create dns_latency_gauge");

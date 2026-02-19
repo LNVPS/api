@@ -37,6 +37,7 @@ pub struct Worker {
     work_commander: Arc<dyn WorkCommander>,
     feedback: Arc<dyn WorkFeedback>,
     kv: Arc<dyn KeyValueStore>,
+    http_client: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,9 @@ impl Worker {
         } else {
             Arc::new(BlackholeWorkFeedback)
         };
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
         Ok(Self {
             db,
             provisioner,
@@ -100,6 +104,7 @@ impl Worker {
             vm_history_logger,
             settings,
             work_commander,
+            http_client,
         })
     }
 
@@ -211,7 +216,7 @@ impl Worker {
                     message,
                     Some(format!("[VM{}] Expiring Soon", vm.id)),
                 )
-                    .await;
+                .await;
             }
         }
 
@@ -251,7 +256,7 @@ impl Worker {
                 format!("Your VM #{} has been deleted!", vm.id),
                 title.clone(),
             )
-                .await;
+            .await;
             self.queue_admin_notification(format!("VM{} is ready for deletion", vm.id), title)
                 .await;
         }
@@ -348,7 +353,7 @@ impl Worker {
             format!("Your {}", &msg),
             Some(format!("[VM{}] Created", vm.id)),
         )
-            .await;
+        .await;
         self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))
             .await;
         Ok(())
@@ -427,7 +432,7 @@ impl Worker {
                     format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
                     Some(format!("VM {} Deletion Failed", vm.id)),
                 )
-                    .await
+                .await
             }
         }
 
@@ -443,7 +448,7 @@ impl Worker {
                             format!("Failed to check VM {}:\n{}", vm.id, e),
                             Some(format!("VM {} Check Failed", vm.id)),
                         )
-                            .await
+                        .await
                     }
                 }
             }
@@ -502,7 +507,7 @@ impl Worker {
                 message,
                 None,
             )
-                .await?;
+            .await?;
             c.send_event(&ev).await?;
         }
         Ok(())
@@ -588,7 +593,7 @@ impl Worker {
             ),
             Some("Bulk Message Complete".to_string()),
         )
-            .await;
+        .await;
 
         Ok(())
     }
@@ -724,6 +729,79 @@ impl Worker {
         }
     }
 
+    /// Check if a domain can be activated via path-based activation
+    /// by fetching the activation URL and verifying the response is valid NIP-05 JSON
+    /// with an empty `names` map (indicating the hash was recognised by the server).
+    async fn check_path_activation(&self, domain: &lnvps_db::NostrDomain) -> Result<bool> {
+        let Some(activation_hash) = &domain.activation_hash else {
+            debug!("Domain {} has no activation hash", domain.name);
+            return Ok(false);
+        };
+
+        // Build the activation URL: http://<domain>/.well-known/nostr.json?name=<hash>
+        let activation_url = format!(
+            "http://{}/.well-known/nostr.json?name={}",
+            domain.name, activation_hash
+        );
+
+        debug!(
+            "Checking path activation for domain {} at {}",
+            domain.name, activation_url
+        );
+
+        match self.http_client.get(&activation_url).send().await {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    debug!(
+                        "Path activation check failed for domain {} - got status {}",
+                        domain.name,
+                        response.status()
+                    );
+                    return Ok(false);
+                }
+                // Verify the body is valid NIP-05 JSON with an empty `names` map.
+                // The lnvps_nostr server returns `{"names":{},"relays":{}}` when
+                // the activation hash matches, rather than a real handle lookup.
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let names_empty = body
+                            .get("names")
+                            .and_then(|n| n.as_object())
+                            .map(|m| m.is_empty())
+                            .unwrap_or(false);
+                        if names_empty {
+                            debug!(
+                                "Path activation check succeeded for domain {}",
+                                domain.name
+                            );
+                            Ok(true)
+                        } else {
+                            debug!(
+                                "Path activation check failed for domain {} - unexpected body",
+                                domain.name
+                            );
+                            Ok(false)
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Path activation check failed for domain {} - invalid JSON: {}",
+                            domain.name, e
+                        );
+                        Ok(false)
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Path activation check failed for domain {} - error: {}",
+                    domain.name, e
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// Check all nostr domains for DNS records - enable disabled domains with DNS records, disable active domains without DNS records
     async fn check_nostr_domains(&self) -> Result<()> {
         let Some(expected_hostname) = &self.settings.nostr_hostname else {
@@ -745,166 +823,264 @@ impl Worker {
         let mut domains_deleted = Vec::new();
 
         for domain in &all_domains {
-            match self.check_domain_dns(&domain.name).await {
-                Ok(has_dns_record) => {
-                    // If domain is disabled but has DNS record, activate it
-                    if !domain.enabled && has_dns_record {
-                        info!(
-                            "Domain {} has DNS record or matching A record pointing to {} - activating domain",
-                            domain.name, expected_hostname
-                        );
+            // Check both DNS and path-based activation
+            let has_dns_record = match self.check_domain_dns(&domain.name).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("DNS check error for {}: {}", domain.name, e);
+                    false
+                }
+            };
 
-                        // Enable the domain in the database
-                        match self.db.enable_domain(domain.id).await {
-                            Ok(()) => {
-                                info!(
-                                    "Successfully enabled domain {} (ID: {})",
-                                    domain.name, domain.id
-                                );
-                                domains_activated.push(&domain.name);
+            let has_path_activation = match self.check_path_activation(domain).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Path activation check error for {}: {}", domain.name, e);
+                    false
+                }
+            };
 
-                                // Send notification to the domain owner
-                                let notification_message = format!(
-                                    "Your nostr domain '{}' has been automatically activated! \n\n\
-                                    We detected that you've set up the required DNS record pointing to {}. \
-                                    Your domain is now active and ready to use for nostr addresses.",
-                                    domain.name, expected_hostname
-                                );
+            // If domain is disabled but has either DNS or path activation, enable it
+            if !domain.enabled && (has_dns_record || has_path_activation) {
+                if has_dns_record {
+                    info!(
+                        "Domain {} has DNS record pointing to {} - activating with HTTPS",
+                        domain.name, expected_hostname
+                    );
 
-                                self.queue_notification(
-                                    domain.owner_id,
-                                    notification_message,
-                                    Some(format!("Nostr Domain '{}' Activated", domain.name)),
-                                )
-                                    .await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to enable domain {} (ID: {}): {}",
-                                    domain.name, domain.id, e
-                                );
-
-                                // Send admin notification about the failure
-                                self.queue_admin_notification(
-                                    format!("Failed to enable domain '{}' (ID: {}) despite DNS record being detected: {}",
-                                            domain.name, domain.id, e),
-                                    Some(format!("Domain Activation Failed: {}", domain.name)),
-                                ).await;
-                            }
-                        }
-                    }
-                    // If domain is active but has no DNS record, deactivate it
-                    else if domain.enabled && !has_dns_record {
-                        info!(
-                            "Domain {} no longer has DNS record or matching A record pointing to {} - deactivating domain",
-                            domain.name, expected_hostname
-                        );
-
-                        // Disable the domain in the database
-                        match self.db.disable_domain(domain.id).await {
-                            Ok(()) => {
-                                info!(
-                                    "Successfully disabled domain {} (ID: {})",
-                                    domain.name, domain.id
-                                );
-                                domains_deactivated.push(&domain.name);
-
-                                // Send notification to the domain owner
-                                let notification_message = format!(
-                                    "Your nostr domain '{}' has been automatically deactivated. \n\n\
-                                    We detected that the required DNS record pointing to {} is no longer configured. \
-                                    To reactivate your domain, please ensure your DNS record is correctly set up.",
-                                    domain.name, expected_hostname
-                                );
-
-                                self.queue_notification(
-                                    domain.owner_id,
-                                    notification_message,
-                                    Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
-                                )
-                                    .await;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to disable domain {} (ID: {}): {}",
-                                    domain.name, domain.id, e
-                                );
-
-                                // Send admin notification about the failure
-                                self.queue_admin_notification(
-                                    format!("Failed to disable domain '{}' (ID: {}) despite missing DNS record: {}",
-                                            domain.name, domain.id, e),
-                                    Some(format!("Domain Deactivation Failed: {}", domain.name)),
-                                ).await;
-                            }
-                        }
-                    }
-                    // Domain status matches DNS record status - no change needed
-                    else if domain.enabled && has_dns_record {
-                        debug!(
-                            "Domain {} is correctly active with DNS record pointing to {}",
-                            domain.name, expected_hostname
-                        );
-                    } else if !domain.enabled && !has_dns_record {
-                        debug!(
-                            "Domain {} is correctly inactive without DNS record pointing to {}",
-                            domain.name, expected_hostname
-                        );
-
-                        // Check if domain has been disabled for more than 1 week - if so, delete it
-                        let one_week_ago = Utc::now().sub(Days::new(7));
-                        if domain.last_status_change < one_week_ago {
+                    // Enable the domain with HTTPS support (DNS-based activation)
+                    match self.db.enable_domain_with_https(domain.id).await {
+                        Ok(()) => {
                             info!(
-                                "Domain {} has been disabled for more than 1 week (since {}) - deleting domain",
-                                domain.name, domain.last_status_change
+                                "Successfully enabled domain {} (ID: {}) with HTTPS",
+                                domain.name, domain.id
+                            );
+                            domains_activated.push(&domain.name);
+
+                            // Send notification to the domain owner
+                            let notification_message = format!(
+                                "Your nostr domain '{}' has been automatically activated with HTTPS! \n\n\
+                                We detected that you've set up the required DNS record pointing to {}. \
+                                Your domain is now active with SSL/TLS encryption and ready to use for nostr addresses.",
+                                domain.name, expected_hostname
                             );
 
-                            // Delete the domain
-                            match self.db.delete_domain(domain.id).await {
-                                Ok(()) => {
-                                    info!(
-                                        "Successfully deleted domain {} (ID: {})",
-                                        domain.name, domain.id
-                                    );
-                                    domains_deleted.push(&domain.name);
+                            self.queue_notification(
+                                domain.owner_id,
+                                notification_message,
+                                Some(format!("Nostr Domain '{}' Activated (HTTPS)", domain.name)),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to enable domain {} (ID: {}) with HTTPS: {}",
+                                domain.name, domain.id, e
+                            );
 
-                                    // Send notification to the domain owner
-                                    let notification_message = format!(
-                                        "Your nostr domain '{}' has been permanently deleted. \n\n\
-                                        The domain was disabled for more than 1 week without the required DNS record. \
-                                        If you wish to use this domain again, you will need to register it again.",
-                                        domain.name
-                                    );
+                            self.queue_admin_notification(
+                                format!("Failed to enable domain '{}' (ID: {}) with HTTPS despite DNS record: {}",
+                                        domain.name, domain.id, e),
+                                Some(format!("Domain Activation Failed: {}", domain.name)),
+                            ).await;
+                        }
+                    }
+                } else {
+                    // Path activation only (HTTP-only)
+                    info!(
+                        "Domain {} has path activation - activating as HTTP-only",
+                        domain.name
+                    );
 
-                                    self.queue_notification(
-                                        domain.owner_id,
-                                        notification_message,
-                                        Some(format!("Nostr Domain '{}' Deleted", domain.name)),
-                                    )
-                                        .await;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to delete domain {} (ID: {}): {}",
-                                        domain.name, domain.id, e
-                                    );
+                    match self.db.enable_domain_http_only(domain.id).await {
+                        Ok(()) => {
+                            info!(
+                                "Successfully enabled domain {} (ID: {}) as HTTP-only",
+                                domain.name, domain.id
+                            );
+                            domains_activated.push(&domain.name);
 
-                                    // Send admin notification about the failure
-                                    self.queue_admin_notification(
-                                        format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}",
-                                                domain.name, domain.id, domain.last_status_change, e),
-                                        Some(format!("Domain Deletion Failed: {}", domain.name)),
-                                    ).await;
-                                }
-                            }
+                            // Send notification to the domain owner
+                            let notification_message = format!(
+                                "Your nostr domain '{}' has been activated (HTTP-only)! \n\n\
+                                We detected that the activation path is accessible. \
+                                Your domain is now active for nostr addresses. \
+                                To enable HTTPS, please set up a DNS record pointing to {}.",
+                                domain.name, expected_hostname
+                            );
+
+                            self.queue_notification(
+                                domain.owner_id,
+                                notification_message,
+                                Some(format!("Nostr Domain '{}' Activated (HTTP)", domain.name)),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to enable domain {} (ID: {}) as HTTP-only: {}",
+                                domain.name, domain.id, e
+                            );
+
+                            self.queue_admin_notification(
+                                format!("Failed to enable domain '{}' (ID: {}) as HTTP-only despite path activation: {}",
+                                        domain.name, domain.id, e),
+                                Some(format!("Domain Activation Failed: {}", domain.name)),
+                            ).await;
                         }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to check DNS record for domain {}: {}",
-                        domain.name, e
+            }
+            // If domain is active but has no DNS record and no path activation, deactivate it
+            else if domain.enabled && !has_dns_record && !has_path_activation {
+                info!(
+                    "Domain {} no longer has DNS record or path activation - deactivating domain",
+                    domain.name
+                );
+
+                // Disable the domain in the database
+                match self.db.disable_domain(domain.id).await {
+                    Ok(()) => {
+                        info!(
+                            "Successfully disabled domain {} (ID: {})",
+                            domain.name, domain.id
+                        );
+                        domains_deactivated.push(&domain.name);
+
+                        // Send notification to the domain owner
+                        let notification_message = format!(
+                            "Your nostr domain '{}' has been automatically deactivated. \n\n\
+                            We detected that the required DNS record or path activation is no longer available. \
+                            To reactivate your domain, please ensure your DNS record is correctly set up or path activation is available.",
+                            domain.name
+                        );
+
+                        self.queue_notification(
+                            domain.owner_id,
+                            notification_message,
+                            Some(format!("Nostr Domain '{}' Deactivated", domain.name)),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to disable domain {} (ID: {}): {}",
+                            domain.name, domain.id, e
+                        );
+
+                        // Send admin notification about the failure
+                        self.queue_admin_notification(
+                            format!("Failed to disable domain '{}' (ID: {}) despite missing DNS/path: {}",
+                                    domain.name, domain.id, e),
+                            Some(format!("Domain Deactivation Failed: {}", domain.name)),
+                        ).await;
+                    }
+                }
+            }
+            // If domain is HTTP-only but now has DNS, upgrade to HTTPS
+            else if domain.enabled && domain.http_only && has_dns_record {
+                info!(
+                    "Domain {} is HTTP-only but now has DNS - upgrading to HTTPS",
+                    domain.name
+                );
+
+                match self.db.enable_domain_with_https(domain.id).await {
+                    Ok(()) => {
+                        info!(
+                            "Successfully upgraded domain {} (ID: {}) to HTTPS",
+                            domain.name, domain.id
+                        );
+
+                        // Send notification to the domain owner
+                        let notification_message = format!(
+                            "Your nostr domain '{}' has been upgraded to HTTPS! \n\n\
+                            We detected that you've set up the required DNS record pointing to {}. \
+                            Your domain now has SSL/TLS encryption enabled.",
+                            domain.name, expected_hostname
+                        );
+
+                        self.queue_notification(
+                            domain.owner_id,
+                            notification_message,
+                            Some(format!("Nostr Domain '{}' Upgraded to HTTPS", domain.name)),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to upgrade domain {} (ID: {}) to HTTPS: {}",
+                            domain.name, domain.id, e
+                        );
+
+                        self.queue_admin_notification(
+                            format!(
+                                "Failed to upgrade domain '{}' (ID: {}) to HTTPS: {}",
+                                domain.name, domain.id, e
+                            ),
+                            Some(format!("Domain HTTPS Upgrade Failed: {}", domain.name)),
+                        )
+                        .await;
+                    }
+                }
+            }
+            // Domain status is correct - no change needed
+            else if domain.enabled && (has_dns_record || has_path_activation) {
+                debug!(
+                    "Domain {} is correctly active (DNS: {}, Path: {}, HTTP-only: {})",
+                    domain.name, has_dns_record, has_path_activation, domain.http_only
+                );
+            } else if !domain.enabled && !has_dns_record && !has_path_activation {
+                debug!(
+                    "Domain {} is correctly inactive without DNS or path activation",
+                    domain.name
+                );
+
+                // Check if domain has been disabled for more than 1 week - if so, delete it
+                let one_week_ago = Utc::now().sub(Days::new(7));
+                if domain.last_status_change < one_week_ago {
+                    info!(
+                        "Domain {} has been disabled for more than 1 week (since {}) - deleting domain",
+                        domain.name, domain.last_status_change
                     );
+
+                    // Delete the domain
+                    match self.db.delete_domain(domain.id).await {
+                        Ok(()) => {
+                            info!(
+                                "Successfully deleted domain {} (ID: {})",
+                                domain.name, domain.id
+                            );
+                            domains_deleted.push(&domain.name);
+
+                            // Send notification to the domain owner
+                            let notification_message = format!(
+                                "Your nostr domain '{}' has been permanently deleted. \n\n\
+                                The domain was disabled for more than 1 week without the required DNS record or path activation. \
+                                If you wish to use this domain again, you will need to register it again.",
+                                domain.name
+                            );
+
+                            self.queue_notification(
+                                domain.owner_id,
+                                notification_message,
+                                Some(format!("Nostr Domain '{}' Deleted", domain.name)),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to delete domain {} (ID: {}): {}",
+                                domain.name, domain.id, e
+                            );
+
+                            // Send admin notification about the failure
+                            self.queue_admin_notification(
+                                format!("Failed to delete old disabled domain '{}' (ID: {}) that was disabled since {}: {}",
+                                        domain.name, domain.id, domain.last_status_change, e),
+                                Some(format!("Domain Deletion Failed: {}", domain.name)),
+                            ).await;
+                        }
+                    }
                 }
             }
         }
@@ -1070,7 +1246,7 @@ impl Worker {
                     ),
                     title.clone(),
                 )
-                    .await;
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1080,7 +1256,7 @@ impl Worker {
                     ),
                     title,
                 )
-                    .await;
+                .await;
 
                 return Ok(Some(format!("VM {} deleted successfully", vm_id)));
             }
@@ -1129,7 +1305,7 @@ impl Worker {
                     format!("Your VM #{} has been started by an administrator.", vm_id),
                     title.clone(),
                 )
-                    .await;
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1139,7 +1315,7 @@ impl Worker {
                     ),
                     title,
                 )
-                    .await;
+                .await;
 
                 return Ok(Some(format!("VM {} started successfully", vm_id)));
             }
@@ -1179,7 +1355,7 @@ impl Worker {
                     format!("Your VM #{} has been stopped by an administrator.", vm_id),
                     title.clone(),
                 )
-                    .await;
+                .await;
 
                 // Notify admin
                 self.queue_admin_notification(
@@ -1189,7 +1365,7 @@ impl Worker {
                     ),
                     title,
                 )
-                    .await;
+                .await;
 
                 return Ok(Some(format!("VM {} stopped successfully", vm_id)));
             }

@@ -1,12 +1,14 @@
-use crate::Nip98Auth;
-use crate::api::RouterState;
 use axum::extract::{Path, State};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
 use lnvps_api_common::{ApiData, ApiError, ApiResult};
 use lnvps_db::{NostrDomain, NostrDomainHandle};
-use serde::{Deserialize, Serialize};
+
+use crate::Nip98Auth;
+use crate::api::RouterState;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -49,6 +51,7 @@ async fn v1_create_nostr_domain(
     let mut dom = NostrDomain {
         owner_id: uid,
         name: data.name.clone(),
+        activation_hash: Some(uuid::Uuid::new_v4().to_string()),
         ..Default::default()
     };
     let dom_id = this.db.insert_domain(&dom).await?;
@@ -88,8 +91,8 @@ async fn v1_create_nostr_domain_handle(
         return ApiData::err("Access denied");
     }
 
-    let h_pubkey = hex::decode(&data.pubkey)
-        .map_err(|_| ApiError::new("Invalid public key hex encoding"))?;
+    let h_pubkey =
+        hex::decode(&data.pubkey).map_err(|_| ApiError::new("Invalid public key hex encoding"))?;
     if h_pubkey.len() != 32 {
         return ApiData::err("Invalid public key");
     }

@@ -6,7 +6,9 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, parse_gateway};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, parse_gateway,
+};
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode};
 use serde::Deserialize;
 
