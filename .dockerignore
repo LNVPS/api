@@ -3,3 +3,7 @@
 docs/
 work/
 grafana.json
+**/*.log
+**/*.key
+**/local.*.yaml
+**/local.*.toml

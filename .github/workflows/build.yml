@@ -9,7 +9,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+    strategy:
+      matrix:
+        include:
+          - name: lnvps-api
+            file: lnvps_api/Dockerfile
+            image: registry.v0l.io/lnvps-api:latest
+          - name: lnvps-api-admin
+            file: lnvps_api_admin/Dockerfile
+            image: registry.v0l.io/lnvps-api-admin:latest
+          - name: lnvps-operator
+            file: lnvps_operator/Dockerfile
+            image: registry.v0l.io/lnvps-operator:latest
+          - name: lnvps-nostr
+            file: lnvps_nostr/Dockerfile
+            image: registry.v0l.io/lnvps-nostr:latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -24,26 +39,10 @@ jobs:
           username: registry
           password: ${{ secrets.REGISTRY_TOKEN }}
 
-      - name: Build and push lnvps-api
+      - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: lnvps_api/Dockerfile
+          file: ${{ matrix.file }}
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          tags: registry.v0l.io/lnvps-api:latest
-
-      - name: Build and push lnvps-api-admin
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: lnvps_api_admin/Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          tags: registry.v0l.io/lnvps-api-admin:latest
-
-      - name: Build and push lnvps-operator
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: lnvps_operator/Dockerfile
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          tags: registry.v0l.io/lnvps-operator:latest
+          tags: ${{ matrix.image }}
