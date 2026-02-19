@@ -506,6 +506,34 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Delete a payment method configuration
     async fn delete_payment_method_config(&self, id: u64) -> DbResult<()>;
+
+    // ========================================================================
+    // Referral Program
+    // ========================================================================
+
+    /// Get a user's referral entry by user id
+    async fn get_referral_by_user(&self, user_id: u64) -> DbResult<Referral>;
+
+    /// Get a referral entry by its code
+    async fn get_referral_by_code(&self, code: &str) -> DbResult<Referral>;
+
+    /// Insert a new referral entry
+    async fn insert_referral(&self, referral: &Referral) -> DbResult<u64>;
+
+    /// Update an existing referral entry
+    async fn update_referral(&self, referral: &Referral) -> DbResult<()>;
+
+    /// Insert a new referral payout record
+    async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64>;
+
+    /// Update a referral payout record
+    async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()>;
+
+    /// List all payout records for a referral
+    async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>>;
+
+    /// Get summary stats for a referral (single query)
+    async fn get_referral_summary(&self, referral_id: u64) -> DbResult<ReferralSummary>;
 }
 
 /// Super trait that combines all database functionality based on enabled features
