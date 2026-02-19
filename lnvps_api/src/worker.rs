@@ -527,13 +527,12 @@ impl Worker {
         subject: &str,
         message: &str,
     ) -> Result<()> {
-        let template = include_str!("../email.html");
-        let html = MultiPart::alternative_plain_html(
-            message.to_string(),
-            template
-                .replace("%%_MESSAGE_%%", message)
-                .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
-        );
+        let template = mustache::compile_str(include_str!("../email.html"))?;
+        let rendered = template.render_to_string(&mustache::MapBuilder::new()
+            .insert_str("message", message)
+            .insert_str("year", Utc::now().year().to_string())
+            .build())?;
+        let html = MultiPart::alternative_plain_html(message.to_string(), rendered);
         let mut b = MessageBuilder::new().to(to.parse()?).subject(subject);
         if let Some(f) = &smtp.from {
             b = b.from(f.parse()?);
@@ -559,9 +558,9 @@ impl Worker {
         let user = self.db.get_user(user_id).await?;
         if let Some(smtp) = self.settings.smtp.as_ref()
             && user.contact_email
-            && user.email.is_some()
+            && !user.email.is_empty()
         {
-            let to = user.email.as_ref().unwrap().as_str().to_string();
+            let to = user.email.as_str().to_string();
             let subject = title.as_deref().unwrap_or("Notification");
             Self::send_email(smtp, &to, subject, &message).await?;
         }
@@ -583,10 +582,9 @@ impl Worker {
 
     async fn send_email_verification(&self, user_id: u64, verify_url: &str) -> Result<()> {
         let user = self.db.get_user(user_id).await?;
-        let email = match &user.email {
-            Some(e) => e.as_str().to_string(),
-            None => return Ok(()), // No email, nothing to do
-        };
+        if user.email.is_empty() {
+            return Ok(()); // No email, nothing to do
+        }
         let Some(smtp) = self.settings.smtp.as_ref() else {
             return Ok(());
         };
@@ -594,7 +592,7 @@ impl Worker {
             "Please verify your email address by clicking the link below:\n\n{}",
             verify_url
         );
-        Self::send_email(smtp, &email, "Verify your email address", &message).await
+        Self::send_email(smtp, user.email.as_str(), "Verify your email address", &message).await
     }
 
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {

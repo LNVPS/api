@@ -19,7 +19,7 @@ pub struct User {
     /// When this user first started using the service (first login)
     pub created: DateTime<Utc>,
     /// Users email address for notifications (encrypted)
-    pub email: Option<EncryptedString>,
+    pub email: EncryptedString,
     /// Whether the email address has been verified
     pub email_verified: bool,
     /// Token used for email address verification (empty string means no pending verification)

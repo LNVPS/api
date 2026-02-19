@@ -147,9 +147,9 @@ async fn v1_patch_account(
                 return ApiData::err("Invalid email address");
             }
             // Check if email is changing
-            let old_email = user.email.as_ref().map(|e| e.as_str().to_string());
-            let email_changed = old_email.as_deref() != Some(new_email.as_str());
-            user.email = Some(new_email.clone().into());
+            let old_email = user.email.as_str().to_string();
+            let email_changed = old_email != new_email.as_str();
+            user.email = new_email.clone().into();
             if email_changed {
                 // Mark email as unverified and generate a verification token
                 let token = hex::encode(rand::random::<[u8; 32]>());
@@ -163,7 +163,7 @@ async fn v1_patch_account(
     }
 
     // If contact_email is enabled, email must be set
-    if req.contact_email && user.email.is_none() {
+    if req.contact_email && user.email.is_empty() {
         return ApiData::err("An email address is required to enable email notifications");
     }
 
@@ -228,22 +228,26 @@ async fn v1_verify_email(
     State(this): State<RouterState>,
     Query(params): Query<VerifyEmailQuery>,
 ) -> impl IntoResponse {
-    let make_page = |title: &str, message: &str, success: bool| {
-        let color = if success { "#2ecc71" } else { "#e74c3c" };
-        Html(format!(
-            r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{title}</title>
-<style>body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f5f5}}
-.card{{background:#fff;border-radius:8px;padding:2rem 3rem;box-shadow:0 2px 8px rgba(0,0,0,.1);text-align:center;max-width:400px}}
-h1{{color:{color}}}p{{color:#555}}</style></head>
-<body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>"#
-        ))
+    let make_page = |title: &str, message: &str, color: &str| {
+        let template = mustache::compile_str(include_str!("../../verify-email.html"))
+            .expect("valid verify-email template");
+        let rendered = template
+            .render_to_string(
+                &mustache::MapBuilder::new()
+                    .insert_str("title", title)
+                    .insert_str("message", message)
+                    .insert_str("color", color)
+                    .build(),
+            )
+            .unwrap_or_else(|_| format!("<h1>{title}</h1><p>{message}</p>"));
+        Html(rendered)
     };
 
     if params.token.trim().is_empty() {
         return make_page(
             "Invalid Link",
             "The verification link is missing a token.",
-            false,
+            "#e74c3c",
         );
     }
     let mut user = match this.db.get_user_by_email_verify_token(&params.token).await {
@@ -252,7 +256,7 @@ h1{{color:{color}}}p{{color:#555}}</style></head>
             return make_page(
                 "Invalid or Expired Link",
                 "This verification link is invalid or has already been used.",
-                false,
+                "#e74c3c",
             );
         }
     };
@@ -263,13 +267,13 @@ h1{{color:{color}}}p{{color:#555}}</style></head>
         return make_page(
             "Error",
             "An error occurred. Please try again later.",
-            false,
+            "#e74c3c",
         );
     }
     make_page(
         "Email Verified",
         "Your email address has been successfully verified.",
-        true,
+        "#2ecc71",
     )
 }
 

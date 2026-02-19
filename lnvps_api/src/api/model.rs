@@ -135,9 +135,10 @@ pub struct AccountPatchRequest {
 
 impl From<lnvps_db::User> for AccountPatchRequest {
     fn from(user: lnvps_db::User) -> Self {
-        let has_email = user.email.is_some();
+        let has_email = !user.email.is_empty();
+        let email_str: String = user.email.into();
         AccountPatchRequest {
-            email: Some(user.email.map(|e| e.into())),
+            email: if has_email { Some(Some(email_str)) } else { None },
             email_verified: has_email.then_some(user.email_verified),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,

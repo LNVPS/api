@@ -1038,7 +1038,7 @@ impl LNVpsDbBase for MockDb {
             if has_active_vm && (user.contact_email || user.contact_nip17) {
                 // For email: check if they have an email address
                 // For nip17: they should have a pubkey (which all users do)
-                if (user.contact_email && user.email.is_some()) || user.contact_nip17 {
+                if (user.contact_email && !user.email.is_empty()) || user.contact_nip17 {
                     active_customers.push(user.clone());
                 }
             }

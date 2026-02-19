@@ -1018,6 +1018,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 u.pubkey,
                 u.created,
                 u.email,
+                u.email_verified,
+                u.email_verify_token,
                 u.contact_nip17,
                 u.contact_email,
                 u.country_code,
@@ -1033,7 +1035,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             INNER JOIN vm ON u.id = vm.user_id
             WHERE vm.deleted = 0 
             AND (
-                (u.contact_email = 1 AND u.email IS NOT NULL) 
+                (u.contact_email = 1 AND u.email != '') 
                 OR 
                 u.contact_nip17 = 1
             )
@@ -2410,6 +2412,8 @@ impl AdminDb for LNVpsDbMysql {
                 u.pubkey,
                 u.created,
                 u.email,
+                u.email_verified,
+                u.email_verify_token,
                 u.contact_nip17,
                 u.contact_email,
                 u.country_code,
