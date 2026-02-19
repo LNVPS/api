@@ -78,7 +78,7 @@ pub trait VmHostClient: Send + Sync {
     ) -> OpResult<Vec<TimeSeriesData>>;
 
     /// Connect to terminal serial port
-    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream>;
+    async fn connect_terminal(&self, vm: &Vm, host: &VmHost) -> OpResult<TerminalStream>;
 }
 
 pub async fn get_vm_host_client(

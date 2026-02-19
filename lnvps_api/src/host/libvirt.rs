@@ -9,7 +9,7 @@ use chrono::Utc;
 use lnvps_api_common::VmRunningStates;
 use lnvps_api_common::retry::{OpError, OpResult};
 use lnvps_api_common::{VmRunningState, op_fatal};
-use lnvps_db::{LNVpsDb, Vm, VmOsImage};
+use lnvps_db::{LNVpsDb, Vm, VmHost, VmOsImage};
 use log::info;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,7 @@ impl VmHostClient for LibVirtHost {
         todo!()
     }
 
-    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
+    async fn connect_terminal(&self, vm: &Vm, _host: &VmHost) -> OpResult<TerminalStream> {
         todo!()
     }
 }

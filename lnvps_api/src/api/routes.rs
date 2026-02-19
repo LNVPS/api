@@ -750,7 +750,7 @@ async fn v1_terminal_proxy(
     let client = get_host_client(&host, &this.settings.provisioner)
         .map_err(|_| "Failed to get host client")?;
 
-    let mut terminal = client.connect_terminal(&vm).await.map_err(|e| {
+    let mut terminal = client.connect_terminal(&vm, &host).await.map_err(|e| {
         error!("Failed to start terminal proxy: {}", e);
         "Failed to open terminal proxy"
     })?;
