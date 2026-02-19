@@ -16,11 +16,11 @@ CREATE TABLE referral_payout (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     referral_id BIGINT UNSIGNED NOT NULL,
     amount BIGINT UNSIGNED NOT NULL,
-    currency VARCHAR(10) NOT NULL,
+    currency VARCHAR(5) NOT NULL,
     created DATETIME NOT NULL DEFAULT NOW(),
     is_paid BOOLEAN NOT NULL DEFAULT FALSE,
-    invoice VARCHAR(600),
-    pre_image VARCHAR(64),
+    invoice VARCHAR(2048),
+    pre_image BINARY(32),
     PRIMARY KEY (id),
     FOREIGN KEY (referral_id) REFERENCES referral(id)
 );

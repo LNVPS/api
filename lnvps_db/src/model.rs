@@ -931,8 +931,8 @@ pub struct ReferralPayout {
     pub is_paid: bool,
     /// Lightning invoice for this payout
     pub invoice: Option<String>,
-    /// Preimage revealed when the invoice was paid
-    pub pre_image: Option<String>,
+    /// Preimage revealed when the invoice was paid (32 bytes, SHA256)
+    pub pre_image: Option<Vec<u8>>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
