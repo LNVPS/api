@@ -1857,12 +1857,13 @@ impl LNVPSNostrDb for LNVpsDbMysql {
     async fn insert_domain(&self, domain: &NostrDomain) -> DbResult<u64> {
         Ok(
             sqlx::query(
-                "insert into nostr_domain(owner_id,name,relays,activation_hash,http_only) values(?,?,?,?,1) returning id",
+                "insert into nostr_domain(owner_id,name,relays,activation_hash,http_only) values(?,?,?,?,?) returning id",
             )
             .bind(domain.owner_id)
             .bind(&domain.name)
             .bind(&domain.relays)
             .bind(&domain.activation_hash)
+            .bind(domain.http_only)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?,
@@ -1893,16 +1894,6 @@ impl LNVPSNostrDb for LNVpsDbMysql {
         Ok(sqlx::query_as("select *,(select count(1) from nostr_domain_handle where domain_id=nostr_domain.id) handles from nostr_domain where enabled=0")
             .fetch_all(&self.db)
             .await?)
-    }
-
-    async fn enable_domain(&self, domain_id: u64) -> DbResult<()> {
-        sqlx::query(
-            "update nostr_domain set enabled=1, last_status_change=CURRENT_TIMESTAMP where id=?",
-        )
-        .bind(domain_id)
-        .execute(&self.db)
-        .await?;
-        Ok(())
     }
 
     async fn enable_domain_with_https(&self, domain_id: u64) -> DbResult<()> {

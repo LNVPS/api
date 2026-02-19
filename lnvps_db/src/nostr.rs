@@ -49,9 +49,6 @@ pub trait LNVPSNostrDb: Sync + Send {
     /// List all disabled domains across all users
     async fn list_disabled_domains(&self) -> DbResult<Vec<NostrDomain>>;
 
-    /// Enable a domain by setting enabled=true
-    async fn enable_domain(&self, domain_id: u64) -> DbResult<()>;
-
     /// Enable a domain by setting enabled=true and http_only=false (for DNS-based activation)
     async fn enable_domain_with_https(&self, domain_id: u64) -> DbResult<()>;
 

@@ -37,6 +37,7 @@ pub struct Worker {
     work_commander: Arc<dyn WorkCommander>,
     feedback: Arc<dyn WorkFeedback>,
     kv: Arc<dyn KeyValueStore>,
+    http_client: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -90,6 +91,9 @@ impl Worker {
         } else {
             Arc::new(BlackholeWorkFeedback)
         };
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
         Ok(Self {
             db,
             provisioner,
@@ -100,6 +104,7 @@ impl Worker {
             vm_history_logger,
             settings,
             work_commander,
+            http_client,
         })
     }
 
@@ -725,7 +730,8 @@ impl Worker {
     }
 
     /// Check if a domain can be activated via path-based activation
-    /// by checking if the activation URL is accessible
+    /// by fetching the activation URL and verifying the response is valid NIP-05 JSON
+    /// with an empty `names` map (indicating the hash was recognised by the server).
     async fn check_path_activation(&self, domain: &lnvps_db::NostrDomain) -> Result<bool> {
         let Some(activation_hash) = &domain.activation_hash else {
             debug!("Domain {} has no activation hash", domain.name);
@@ -743,23 +749,47 @@ impl Worker {
             domain.name, activation_url
         );
 
-        // Try to fetch the activation URL
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-
-        match client.get(&activation_url).send().await {
+        match self.http_client.get(&activation_url).send().await {
             Ok(response) => {
-                if response.status().is_success() {
-                    debug!("Path activation check succeeded for domain {}", domain.name);
-                    Ok(true)
-                } else {
+                if !response.status().is_success() {
                     debug!(
                         "Path activation check failed for domain {} - got status {}",
                         domain.name,
                         response.status()
                     );
-                    Ok(false)
+                    return Ok(false);
+                }
+                // Verify the body is valid NIP-05 JSON with an empty `names` map.
+                // The lnvps_nostr server returns `{"names":{},"relays":{}}` when
+                // the activation hash matches, rather than a real handle lookup.
+                match response.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let names_empty = body
+                            .get("names")
+                            .and_then(|n| n.as_object())
+                            .map(|m| m.is_empty())
+                            .unwrap_or(false);
+                        if names_empty {
+                            debug!(
+                                "Path activation check succeeded for domain {}",
+                                domain.name
+                            );
+                            Ok(true)
+                        } else {
+                            debug!(
+                                "Path activation check failed for domain {} - unexpected body",
+                                domain.name
+                            );
+                            Ok(false)
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Path activation check failed for domain {} - invalid JSON: {}",
+                            domain.name, e
+                        );
+                        Ok(false)
+                    }
                 }
             }
             Err(e) => {
