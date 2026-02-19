@@ -13,6 +13,9 @@ LNVPS is a Rust workspace for a VPS provisioning system with Lightning Network p
 | `lnvps_nostr` | Nostr protocol integration |
 | `lnvps_operator` | System operator/background tasks |
 | `try-procedure` | Retry utilities library |
+| `lnvps_health` | Standalone network health monitoring service (MSS, DNS, PMTU checks, Prometheus metrics, SMTP alerts) |
+| `lnvps_fw_service` | Firewall service that loads an eBPF/XDP program for per-VM rate limiting |
+| `lnvps_ebpf` | eBPF program (XDP) implementing a token-bucket rate limiter; compiled separately with aya-build |
 
 ## Feature Flags
 
