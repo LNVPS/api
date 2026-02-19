@@ -91,6 +91,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete user record
     async fn delete_user(&self, id: u64) -> DbResult<()>;
 
+    /// Get user by email verification token
+    async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 

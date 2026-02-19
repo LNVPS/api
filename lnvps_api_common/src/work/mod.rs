@@ -114,6 +114,8 @@ pub enum WorkJob {
         admin_user_id: u64,
         reason: Option<String>,
     },
+    /// Send an email verification link to the user
+    SendEmailVerification { user_id: u64, verify_url: String },
 }
 
 impl WorkJob {
@@ -150,6 +152,7 @@ impl fmt::Display for WorkJob {
             WorkJob::UpdateVmIp { .. } => write!(f, "UpdateVmIp"),
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
             WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
+            WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
         }
     }
 }

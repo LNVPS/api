@@ -71,6 +71,9 @@ pub struct AccountPatchRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub email: Option<Option<String>>,
+    /// Whether the email address has been verified (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
     pub contact_nip17: bool,
     pub contact_email: bool,
     #[serde(
@@ -132,8 +135,10 @@ pub struct AccountPatchRequest {
 
 impl From<lnvps_db::User> for AccountPatchRequest {
     fn from(user: lnvps_db::User) -> Self {
+        let has_email = user.email.is_some();
         AccountPatchRequest {
             email: Some(user.email.map(|e| e.into())),
+            email_verified: has_email.then_some(user.email_verified),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
             country_code: Some(user.country_code),

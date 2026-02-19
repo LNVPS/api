@@ -575,6 +575,44 @@ impl Worker {
         Ok(())
     }
 
+    async fn send_email_verification(&self, user_id: u64, verify_url: &str) -> Result<()> {
+        let user = self.db.get_user(user_id).await?;
+        let email = match &user.email {
+            Some(e) => e.as_str().to_string(),
+            None => return Ok(()), // No email, nothing to do
+        };
+        let Some(smtp) = self.settings.smtp.as_ref() else {
+            return Ok(());
+        };
+        let message = format!(
+            "Please verify your email address by clicking the link below:\n\n{}",
+            verify_url
+        );
+        let template = include_str!("../email.html");
+        let html = MultiPart::alternative_plain_html(
+            message.clone(),
+            template
+                .replace("%%_MESSAGE_%%", &message)
+                .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
+        );
+        let mut b = MessageBuilder::new()
+            .to(email.parse()?)
+            .subject("Verify your email address");
+        if let Some(f) = &smtp.from {
+            b = b.from(f.parse()?);
+        }
+        let msg = b.multipart(html)?;
+        let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+            .credentials(Credentials::new(
+                smtp.username.to_string(),
+                smtp.password.to_string(),
+            ))
+            .timeout(Some(Duration::from_secs(10)))
+            .build();
+        sender.send(msg).await?;
+        Ok(())
+    }
+
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
         if let Err(e) = self
             .work_commander
@@ -1669,6 +1707,9 @@ impl Worker {
                     "VM {} created successfully for user {}",
                     vm.id, user_id
                 )));
+            }
+            WorkJob::SendEmailVerification { user_id, verify_url } => {
+                self.send_email_verification(*user_id, verify_url).await?;
             }
         }
         Ok(None)

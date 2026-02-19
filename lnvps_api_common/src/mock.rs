@@ -3,14 +3,13 @@ use anyhow::{Context, anyhow};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbResult, DiskInterface, DiskType,
-    IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
+    AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
+    DiskType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
+    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
     ReferralCostUsage, ReferralPayout, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmTemplate,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -290,6 +289,8 @@ impl LNVpsDbBase for MockDb {
         let mut users = self.users.lock().await;
         if let Some(u) = users.get_mut(&user.id) {
             u.email = user.email.clone();
+            u.email_verified = user.email_verified;
+            u.email_verify_token = user.email_verify_token.clone();
             u.contact_email = user.contact_email;
             u.contact_nip17 = user.contact_nip17;
         }
@@ -300,6 +301,15 @@ impl LNVpsDbBase for MockDb {
         let mut users = self.users.lock().await;
         users.remove(&id);
         Ok(())
+    }
+
+    async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User> {
+        let users = self.users.lock().await;
+        users
+            .values()
+            .find(|u| u.email_verify_token.as_deref() == Some(token))
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no user with that token")))
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {

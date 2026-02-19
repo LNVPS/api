@@ -169,6 +169,7 @@ pub struct AdminUserInfo {
     pub pubkey: String, // hex encoded
     pub created: DateTime<Utc>,
     pub email: Option<String>,
+    pub email_verified: bool,
     pub contact_nip17: bool,
     pub contact_email: bool,
     pub country_code: Option<String>,
@@ -262,6 +263,7 @@ impl From<lnvps_db::User> for AdminUserInfo {
             pubkey: hex::encode(&user.pubkey),
             created: user.created,
             email: user.email.map(|e| e.into()),
+            email_verified: user.email_verified,
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
             country_code: user.country_code,
@@ -288,6 +290,7 @@ impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
             pubkey: hex::encode(&user.user_info.pubkey),
             created: user.user_info.created,
             email: user.user_info.email.map(|e| e.into()),
+            email_verified: user.user_info.email_verified,
             contact_nip17: user.user_info.contact_nip17,
             contact_email: user.user_info.contact_email,
             country_code: user.user_info.country_code,
