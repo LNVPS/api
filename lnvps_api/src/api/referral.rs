@@ -5,8 +5,9 @@ use axum::extract::State;
 use axum::routing::{get, patch, post};
 use chrono::Utc;
 use lnvps_api_common::{ApiData, ApiError, ApiResult, Nip98Auth};
-use lnvps_db::{Referral, ReferralSummary};
+use lnvps_db::{Referral, ReferralCostUsage, ReferralPayout};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub fn router() -> Router<RouterState> {
     Router::new().route(
@@ -41,29 +42,78 @@ impl From<Referral> for ApiReferral {
     }
 }
 
-/// Response type combining referral info and summary stats
+/// Per-currency earned amount from referrals
+#[derive(Serialize)]
+pub struct ApiReferralEarning {
+    /// Currency code
+    pub currency: String,
+    /// Total earned amount in this currency (sum of first payments per referred VM)
+    pub amount: u64,
+}
+
+/// A single payout record
+#[derive(Serialize)]
+pub struct ApiReferralPayout {
+    pub id: u64,
+    pub amount: u64,
+    pub currency: String,
+    pub created: chrono::DateTime<Utc>,
+    pub is_paid: bool,
+    pub invoice: Option<String>,
+}
+
+impl From<ReferralPayout> for ApiReferralPayout {
+    fn from(p: ReferralPayout) -> Self {
+        Self {
+            id: p.id,
+            amount: p.amount,
+            currency: p.currency,
+            created: p.created,
+            is_paid: p.is_paid,
+            invoice: p.invoice,
+        }
+    }
+}
+
+/// Full referral state returned by GET /api/v1/referral
 #[derive(Serialize)]
 pub struct ApiReferralState {
     #[serde(flatten)]
     pub referral: ApiReferral,
-    /// Total amount pending payout (earned but not yet paid)
-    pub pending_amount: u64,
-    /// Total lifetime paid amount
-    pub paid_amount: u64,
-    /// Number of referrals that resulted in a paid subscription
+    /// Per-currency breakdown of amounts earned from referrals
+    pub earned: Vec<ApiReferralEarning>,
+    /// Complete payout history (most recent first)
+    pub payouts: Vec<ApiReferralPayout>,
+    /// Number of referred VMs that made at least one payment
     pub referrals_success: u64,
-    /// Number of referrals that never paid
+    /// Number of referred VMs that never made a payment
     pub referrals_failed: u64,
 }
 
 impl ApiReferralState {
-    pub fn from_referral_and_summary(referral: Referral, summary: ReferralSummary) -> Self {
+    fn build(
+        referral: Referral,
+        usage: Vec<ReferralCostUsage>,
+        payouts: Vec<ReferralPayout>,
+        referrals_failed: u64,
+    ) -> Self {
+        // Aggregate earned amounts per currency
+        let mut by_currency: HashMap<String, u64> = HashMap::new();
+        for u in &usage {
+            *by_currency.entry(u.currency.clone()).or_insert(0) += u.amount;
+        }
+        let mut earned: Vec<ApiReferralEarning> = by_currency
+            .into_iter()
+            .map(|(currency, amount)| ApiReferralEarning { currency, amount })
+            .collect();
+        earned.sort_by(|a, b| a.currency.cmp(&b.currency));
+
         Self {
+            referrals_success: usage.len() as u64,
+            referrals_failed,
             referral: referral.into(),
-            pending_amount: summary.pending_amount,
-            paid_amount: summary.paid_amount,
-            referrals_success: summary.referrals_success,
-            referrals_failed: summary.referrals_failed,
+            earned,
+            payouts: payouts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -102,7 +152,7 @@ fn generate_referral_code() -> String {
         .collect()
 }
 
-/// Get current referral state (code, stats, payout info)
+/// Get current referral state (code, per-currency earnings, payout history, counts)
 async fn v1_get_referral(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -116,9 +166,13 @@ async fn v1_get_referral(
         .await
         .map_err(|_| ApiError::new("Not enrolled in referral program"))?;
 
-    let summary = this.db.get_referral_summary(referral.id).await?;
+    let (usage, payouts, referrals_failed) = tokio::try_join!(
+        this.db.list_referral_usage(&referral.code),
+        this.db.list_referral_payouts(referral.id),
+        this.db.count_failed_referrals(&referral.code),
+    )?;
 
-    ApiData::ok(ApiReferralState::from_referral_and_summary(referral, summary))
+    ApiData::ok(ApiReferralState::build(referral, usage, payouts, referrals_failed))
 }
 
 /// Sign up for the referral program

@@ -6,7 +6,7 @@ use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbResult, DiskInterface, DiskType,
     IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
     NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
-    ReferralPayout, ReferralSummary, Router, Subscription, SubscriptionLineItem,
+    ReferralCostUsage, ReferralPayout, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
@@ -1545,61 +1545,40 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn get_referral_summary(&self, referral_id: u64) -> DbResult<ReferralSummary> {
-        let referrals = self.referrals.lock().await;
-        let referral = referrals
-            .get(&referral_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("Referral not found: {}", referral_id))?;
-        drop(referrals);
-
-        // Compute total_amount as sum of first paid payment per VM with this ref code
+    async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
         let vms = self.vms.lock().await;
         let payments = self.payments.lock().await;
-        let total_amount: u64 = vms
-            .values()
-            .filter(|v| v.ref_code.as_deref() == Some(&referral.code))
-            .filter_map(|v| {
-                // Get the first paid payment for this VM
-                let mut vm_payments: Vec<&VmPayment> = payments
-                    .iter()
-                    .filter(|p| p.vm_id == v.id && p.is_paid)
-                    .collect();
-                vm_payments.sort_by_key(|p| p.created);
-                vm_payments.first().map(|p| p.amount)
-            })
-            .sum();
+        let mut result = Vec::new();
+        for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
+            let mut vm_payments: Vec<&VmPayment> = payments
+                .iter()
+                .filter(|p| p.vm_id == vm.id && p.is_paid)
+                .collect();
+            vm_payments.sort_by_key(|p| p.created);
+            if let Some(first) = vm_payments.first() {
+                result.push(ReferralCostUsage {
+                    vm_id: vm.id,
+                    ref_code: code.to_string(),
+                    created: first.created,
+                    amount: first.amount,
+                    currency: first.currency.clone(),
+                    rate: first.rate,
+                    base_currency: "EUR".to_string(),
+                });
+            }
+        }
+        result.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(result)
+    }
 
-        let referrals_success = vms
+    async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
+        let vms = self.vms.lock().await;
+        let payments = self.payments.lock().await;
+        Ok(vms
             .values()
-            .filter(|v| v.ref_code.as_deref() == Some(&referral.code))
-            .filter(|v| payments.iter().any(|p| p.vm_id == v.id && p.is_paid))
-            .count() as u64;
-        let referrals_failed = vms
-            .values()
-            .filter(|v| v.ref_code.as_deref() == Some(&referral.code))
+            .filter(|v| v.ref_code.as_deref() == Some(code))
             .filter(|v| !payments.iter().any(|p| p.vm_id == v.id && p.is_paid))
-            .count() as u64;
-        drop(payments);
-        drop(vms);
-
-        let payouts = self.referral_payouts.lock().await;
-        let paid_amount: u64 = payouts
-            .iter()
-            .filter(|p| p.referral_id == referral_id && p.is_paid)
-            .map(|p| p.amount)
-            .sum();
-        drop(payouts);
-
-        let pending_amount = total_amount.saturating_sub(paid_amount);
-
-        Ok(ReferralSummary {
-            code: referral.code,
-            pending_amount,
-            paid_amount,
-            referrals_success,
-            referrals_failed,
-        })
+            .count() as u64)
     }
 }
 

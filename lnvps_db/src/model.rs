@@ -935,20 +935,6 @@ pub struct ReferralPayout {
     pub pre_image: Option<Vec<u8>>,
 }
 
-#[derive(FromRow, Clone, Debug, Default)]
-pub struct ReferralSummary {
-    /// The referral code
-    pub code: String,
-    /// Total pending payout amount (created but not yet paid)
-    pub pending_amount: u64,
-    /// Total lifetime paid amount
-    pub paid_amount: u64,
-    /// Number of VMs that used this referral code and made at least one payment
-    pub referrals_success: u64,
-    /// Number of VMs that used this referral code but never made a payment
-    pub referrals_failed: u64,
-}
-
 #[derive(FromRow, Clone, Debug)]
 pub struct ReferralCostUsage {
     pub vm_id: u64,

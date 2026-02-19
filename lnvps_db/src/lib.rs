@@ -532,8 +532,12 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all payout records for a referral
     async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>>;
 
-    /// Get summary stats for a referral (single query)
-    async fn get_referral_summary(&self, referral_id: u64) -> DbResult<ReferralSummary>;
+    /// List the first paid VM payment per VM that used this referral code.
+    /// This is the basis for computing earned amounts (per currency).
+    async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>>;
+
+    /// Count VMs that used this referral code but have never made a paid payment.
+    async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

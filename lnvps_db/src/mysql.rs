@@ -1,11 +1,10 @@
 use crate::{
     AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
     IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
-    ReferralCostUsage, ReferralPayout, ReferralSummary, RegionStats, Router, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
-    Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost,
-    VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany,
-    VmTemplate,
+    ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -1865,52 +1864,45 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
-    async fn get_referral_summary(&self, referral_id: u64) -> DbResult<ReferralSummary> {
+    async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
         Ok(sqlx::query_as(
-            "SELECT
-                r.code,
-                CAST(GREATEST(0, COALESCE(first_payments.total_amount, 0) - COALESCE(paid_payouts.paid_amount, 0)) AS UNSIGNED) AS pending_amount,
-                CAST(COALESCE(paid_payouts.paid_amount, 0) AS UNSIGNED) AS paid_amount,
-                CAST(COALESCE((
-                    SELECT COUNT(DISTINCT v.id)
-                    FROM vm v
-                    WHERE v.ref_code = r.code
-                      AND EXISTS (
-                          SELECT 1 FROM vm_payment vp WHERE vp.vm_id = v.id AND vp.is_paid = 1
-                      )
-                ), 0) AS UNSIGNED) AS referrals_success,
-                CAST(COALESCE((
-                    SELECT COUNT(DISTINCT v.id)
-                    FROM vm v
-                    WHERE v.ref_code = r.code
-                      AND NOT EXISTS (
-                          SELECT 1 FROM vm_payment vp WHERE vp.vm_id = v.id AND vp.is_paid = 1
-                      )
-                ), 0) AS UNSIGNED) AS referrals_failed
-             FROM referral r
-             LEFT JOIN (
-                 SELECT SUM(vp.amount) AS total_amount
-                 FROM vm v
-                 JOIN (
-                     SELECT vm_id, amount,
-                            ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) AS rn
-                     FROM vm_payment
-                     WHERE is_paid = 1
-                 ) vp ON v.id = vp.vm_id AND vp.rn = 1
-                 WHERE v.ref_code = (SELECT code FROM referral WHERE id = ?)
-             ) first_payments ON TRUE
-             LEFT JOIN (
-                 SELECT SUM(amount) AS paid_amount
-                 FROM referral_payout
-                 WHERE referral_id = ? AND is_paid = 1
-             ) paid_payouts ON TRUE
-             WHERE r.id = ?",
+            "SELECT v.id as vm_id,
+                    v.ref_code,
+                    vp.created,
+                    vp.amount,
+                    vp.currency,
+                    vp.rate,
+                    c.base_currency
+             FROM vm v
+             JOIN (
+                 SELECT vm_id, currency, amount, created, rate,
+                        ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) AS rn
+                 FROM vm_payment
+                 WHERE is_paid = 1
+             ) vp ON v.id = vp.vm_id AND vp.rn = 1
+             JOIN vm_host vh ON v.host_id = vh.id
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON vhr.company_id = c.id
+             WHERE v.ref_code = ?
+             ORDER BY vp.created DESC",
         )
-        .bind(referral_id)
-        .bind(referral_id)
-        .bind(referral_id)
-        .fetch_one(&self.db)
+        .bind(code)
+        .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vm v
+             WHERE v.ref_code = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM vm_payment vp WHERE vp.vm_id = v.id AND vp.is_paid = 1
+               )",
+        )
+        .bind(code)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(count as u64)
     }
 }
 
