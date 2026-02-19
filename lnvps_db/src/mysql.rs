@@ -94,10 +94,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User> {
         Ok(
-            sqlx::query_as("select * from users where email_verify_token = ?")
-                .bind(token)
-                .fetch_one(&self.db)
-                .await?,
+            sqlx::query_as(
+                "select * from users where email_verify_token = ? and email_verify_token != ''",
+            )
+            .bind(token)
+            .fetch_one(&self.db)
+            .await?,
         )
     }
 

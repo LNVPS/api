@@ -520,6 +520,36 @@ impl Worker {
         Ok(())
     }
 
+    /// Shared function for sending an email via SMTP using the HTML email template.
+    async fn send_email(
+        smtp: &SmtpConfig,
+        to: &str,
+        subject: &str,
+        message: &str,
+    ) -> Result<()> {
+        let template = include_str!("../email.html");
+        let html = MultiPart::alternative_plain_html(
+            message.to_string(),
+            template
+                .replace("%%_MESSAGE_%%", message)
+                .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
+        );
+        let mut b = MessageBuilder::new().to(to.parse()?).subject(subject);
+        if let Some(f) = &smtp.from {
+            b = b.from(f.parse()?);
+        }
+        let msg = b.multipart(html)?;
+        let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+            .credentials(Credentials::new(
+                smtp.username.to_string(),
+                smtp.password.to_string(),
+            ))
+            .timeout(Some(Duration::from_secs(10)))
+            .build();
+        sender.send(msg).await?;
+        Ok(())
+    }
+
     async fn send_notification(
         &self,
         user_id: u64,
@@ -531,33 +561,9 @@ impl Worker {
             && user.contact_email
             && user.email.is_some()
         {
-            // send email
-            let mut b = MessageBuilder::new().to(user.email.unwrap().as_str().parse()?);
-            if let Some(t) = title {
-                b = b.subject(t);
-            }
-            if let Some(f) = &smtp.from {
-                b = b.from(f.parse()?);
-            }
-            let template = include_str!("../email.html");
-            let html = MultiPart::alternative_plain_html(
-                message.clone(),
-                template
-                    .replace("%%_MESSAGE_%%", &message)
-                    .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
-            );
-
-            let msg = b.multipart(html)?;
-
-            let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
-                .credentials(Credentials::new(
-                    smtp.username.to_string(),
-                    smtp.password.to_string(),
-                ))
-                .timeout(Some(Duration::from_secs(10)))
-                .build();
-
-            sender.send(msg).await?;
+            let to = user.email.as_ref().unwrap().as_str().to_string();
+            let subject = title.as_deref().unwrap_or("Notification");
+            Self::send_email(smtp, &to, subject, &message).await?;
         }
         if user.contact_nip17
             && let Some(c) = self.nostr.as_ref()
@@ -588,29 +594,7 @@ impl Worker {
             "Please verify your email address by clicking the link below:\n\n{}",
             verify_url
         );
-        let template = include_str!("../email.html");
-        let html = MultiPart::alternative_plain_html(
-            message.clone(),
-            template
-                .replace("%%_MESSAGE_%%", &message)
-                .replace("%%YEAR%%", Utc::now().year().to_string().as_str()),
-        );
-        let mut b = MessageBuilder::new()
-            .to(email.parse()?)
-            .subject("Verify your email address");
-        if let Some(f) = &smtp.from {
-            b = b.from(f.parse()?);
-        }
-        let msg = b.multipart(html)?;
-        let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
-            .credentials(Credentials::new(
-                smtp.username.to_string(),
-                smtp.password.to_string(),
-            ))
-            .timeout(Some(Duration::from_secs(10)))
-            .build();
-        sender.send(msg).await?;
-        Ok(())
+        Self::send_email(smtp, &email, "Verify your email address", &message).await
     }
 
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {

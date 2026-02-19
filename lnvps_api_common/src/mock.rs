@@ -307,7 +307,7 @@ impl LNVpsDbBase for MockDb {
         let users = self.users.lock().await;
         users
             .values()
-            .find(|u| u.email_verify_token.as_deref() == Some(token))
+            .find(|u| !u.email_verify_token.is_empty() && u.email_verify_token == token)
             .cloned()
             .ok_or_else(|| DbError::Other(anyhow!("no user with that token")))
     }

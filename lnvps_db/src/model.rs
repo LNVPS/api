@@ -22,8 +22,8 @@ pub struct User {
     pub email: Option<EncryptedString>,
     /// Whether the email address has been verified
     pub email_verified: bool,
-    /// Token used for email address verification (temporary)
-    pub email_verify_token: Option<String>,
+    /// Token used for email address verification (empty string means no pending verification)
+    pub email_verify_token: String,
     /// If user should be contacted via NIP-17 for notifications
     pub contact_nip17: bool,
     /// If user should be contacted via email for notifications

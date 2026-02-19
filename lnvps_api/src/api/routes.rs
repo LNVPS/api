@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
@@ -154,14 +154,11 @@ async fn v1_patch_account(
                 // Mark email as unverified and generate a verification token
                 let token = hex::encode(rand::random::<[u8; 32]>());
                 user.email_verified = false;
-                user.email_verify_token = Some(token.clone());
+                user.email_verify_token = token.clone();
                 pending_verification = Some(token);
             }
         } else {
-            // Email is being cleared
-            user.email = None;
-            user.email_verified = false;
-            user.email_verify_token = None;
+            return ApiData::err("Email address is required and cannot be removed");
         }
     }
 
@@ -230,18 +227,50 @@ async fn v1_patch_account(
 async fn v1_verify_email(
     State(this): State<RouterState>,
     Query(params): Query<VerifyEmailQuery>,
-) -> ApiResult<()> {
+) -> impl IntoResponse {
+    let make_page = |title: &str, message: &str, success: bool| {
+        let color = if success { "#2ecc71" } else { "#e74c3c" };
+        Html(format!(
+            r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{title}</title>
+<style>body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f5f5}}
+.card{{background:#fff;border-radius:8px;padding:2rem 3rem;box-shadow:0 2px 8px rgba(0,0,0,.1);text-align:center;max-width:400px}}
+h1{{color:{color}}}p{{color:#555}}</style></head>
+<body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>"#
+        ))
+    };
+
     if params.token.trim().is_empty() {
-        return ApiData::err("Verification token is required");
+        return make_page(
+            "Invalid Link",
+            "The verification link is missing a token.",
+            false,
+        );
     }
     let mut user = match this.db.get_user_by_email_verify_token(&params.token).await {
         Ok(u) => u,
-        Err(_) => return ApiData::err("Invalid or expired verification token"),
+        Err(_) => {
+            return make_page(
+                "Invalid or Expired Link",
+                "This verification link is invalid or has already been used.",
+                false,
+            );
+        }
     };
     user.email_verified = true;
-    user.email_verify_token = None;
-    this.db.update_user(&user).await?;
-    ApiData::ok(())
+    user.email_verify_token = String::new();
+    if let Err(e) = this.db.update_user(&user).await {
+        error!("Failed to mark email verified: {}", e);
+        return make_page(
+            "Error",
+            "An error occurred. Please try again later.",
+            false,
+        );
+    }
+    make_page(
+        "Email Verified",
+        "Your email address has been successfully verified.",
+        true,
+    )
 }
 
 #[derive(serde::Deserialize)]
