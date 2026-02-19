@@ -1,5 +1,5 @@
 use anyhow::Result;
-use axum::extract::ws::WebSocket;
+use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::response::Html;
 use axum::routing::{any, get, patch, post};
@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use isocountry::CountryCode;
-use log::{error, info, warn};
+use log::{error, info};
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use nostr_sdk::{ToBech32, Url};
@@ -724,8 +724,7 @@ async fn v1_terminal_proxy(
     this: RouterState,
     mut ws: WebSocket,
 ) -> Result<(), &'static str> {
-    return Err("Disabled");
-    let auth = Nip98Auth::from_base64(&auth).map_err(|e| "Missing or invalid auth param")?;
+    let auth = Nip98Auth::from_base64(&auth).map_err(|_| "Missing or invalid auth param")?;
     if auth
         .check(&format!("/api/v1/vm/{id}/console"), "GET")
         .is_err()
@@ -751,12 +750,50 @@ async fn v1_terminal_proxy(
     let client = get_host_client(&host, &this.settings.provisioner)
         .map_err(|_| "Failed to get host client")?;
 
-    let mut ws_upstream = client.connect_terminal(&vm).await.map_err(|e| {
+    let mut terminal = client.connect_terminal(&vm).await.map_err(|e| {
         error!("Failed to start terminal proxy: {}", e);
         "Failed to open terminal proxy"
     })?;
 
-    todo!()
+    // Bidirectional relay: WebSocket ↔ TerminalStream
+    loop {
+        tokio::select! {
+            // Data arriving from the VM serial port → forward to WebSocket client
+            msg = terminal.rx.recv() => {
+                match msg {
+                    Some(data) => {
+                        if ws.send(Message::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break, // terminal channel closed
+                }
+            }
+            // Data arriving from the WebSocket client → forward to VM serial port
+            frame = ws.recv() => {
+                match frame {
+                    Some(Ok(Message::Binary(data))) => {
+                        if terminal.tx.send(data.to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if terminal.tx.send(text.as_bytes().to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {} // ping/pong handled by axum automatically
+                    Some(Err(e)) => {
+                        error!("WebSocket error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn v1_get_payment_methods(State(this): State<RouterState>) -> ApiResult<Vec<ApiPaymentInfo>> {

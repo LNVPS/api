@@ -389,7 +389,20 @@ impl VmHostClient for MockVmHost {
     }
 
     async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
-        todo!()
+        use tokio::sync::mpsc::channel;
+        let (client_tx, client_rx) = channel::<Vec<u8>>(256);
+        let (server_tx, mut server_rx) = channel::<Vec<u8>>(256);
+        tokio::spawn(async move {
+            while let Some(buf) = server_rx.recv().await {
+                if client_tx.send(buf).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(TerminalStream {
+            rx: client_rx,
+            tx: server_tx,
+        })
     }
 }
 

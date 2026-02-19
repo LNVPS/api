@@ -40,6 +40,14 @@ impl SshClient {
             .map_err(|e| anyhow!(e))
     }
 
+    /// Toggle blocking mode on the underlying SSH session.
+    ///
+    /// Set to `false` before calling [`tunnel_unix_socket`] when you need
+    /// non-blocking I/O (e.g. for the terminal proxy bridge thread).
+    pub fn set_blocking(&self, blocking: bool) {
+        self.session.set_blocking(blocking);
+    }
+
     pub async fn execute(&mut self, command: &str) -> Result<(i32, String)> {
         info!("Executing command: {}", command);
         let mut channel = self.session.channel_session()?;

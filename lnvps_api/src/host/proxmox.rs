@@ -21,7 +21,6 @@ use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
-use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 
 #[derive(Clone)]
@@ -1238,24 +1237,47 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
-        let _vm_id: ProxmoxVmId = vm.id.into();
+        let ssh = self
+            .ssh
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SSH config required for terminal proxy"))
+            .map_err(OpError::Fatal)?;
 
-        let (client_tx, client_rx) = channel::<Vec<u8>>(1024);
-        let (server_tx, mut server_rx) = channel::<Vec<u8>>(1024);
-        tokio::spawn(async move {
-            // fire calls to read every 100ms
-            loop {
-                tokio::select! {
-                    Some(buf) = server_rx.recv() => {
-                        // echo
-                        client_tx.send(buf).await?;
-                    }
+        let vm_id: ProxmoxVmId = vm.id.into();
+        let socket_path = format!("/var/run/qemu-server/{}.serial0", vm_id);
 
-                }
-            }
-            info!("SSH connection terminated!");
-            Ok::<(), anyhow::Error>(())
+        let host = self.api.base().host().unwrap().to_string();
+        let ssh_user = ssh.user.clone();
+        let ssh_key = ssh.key.clone();
+
+        let mut client = SshClient::new().map_err(OpError::Transient)?;
+        client
+            .connect((host, 22), &ssh_user, &ssh_key)
+            .await
+            .map_err(OpError::Transient)?;
+
+        let ssh_channel = client
+            .tunnel_unix_socket(std::path::Path::new(&socket_path))
+            .map_err(OpError::Transient)?;
+
+        // Enable non-blocking mode *after* the channel is fully established.
+        // Setting it before causes the channel_direct_streamlocal handshake to
+        // fail with WouldBlock.
+        client.set_blocking(false);
+
+        // mpsc channels: the TerminalStream returned to the caller exposes
+        // client_rx (bytes from VM) and server_tx (bytes to VM).
+        use tokio::sync::mpsc::channel as mpsc_channel;
+        let (client_tx, client_rx) = mpsc_channel::<Vec<u8>>(256);
+        let (server_tx, server_rx) = mpsc_channel::<Vec<u8>>(256);
+
+        // Run the blocking I/O bridge in a dedicated thread so the non-Send
+        // ssh2::Channel does not cross async task boundaries.
+        tokio::task::spawn_blocking(move || {
+            ssh_terminal_bridge(ssh_channel, client_tx, server_rx);
         });
+
+        info!("Terminal proxy opened for VM {}", vm_id);
         Ok(TerminalStream {
             rx: client_rx,
             tx: server_tx,
@@ -1815,6 +1837,66 @@ pub struct VmFirewallRule {
     pub sport: Option<String>,
     #[serde(rename = "type")]
     pub rule_type: VmFirewallRuleType,
+}
+
+/// Blocking I/O bridge between an SSH channel (QEMU serial socket) and the
+/// async mpsc channels exposed as a [`TerminalStream`].
+///
+/// This function is intended to be executed via [`tokio::task::spawn_blocking`]
+/// so that the non-`Send` [`ssh2::Channel`] never crosses async task boundaries.
+fn ssh_terminal_bridge(
+    mut channel: ssh2::Channel,
+    client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut server_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    use std::io::{Read, Write};
+
+    // Non-blocking mode is already set on the session by the caller.
+    let mut buf = [0u8; 4096];
+    loop {
+        // --- upstream: serial socket → WebSocket client ---
+        match channel.stream(0).read(&mut buf) {
+            Ok(0) => {
+                // EOF: the channel was closed by the remote side.
+                break;
+            }
+            Ok(n) => {
+                if client_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    // Receiver dropped (WebSocket closed).
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available right now — fall through to check
+                // downstream direction, then sleep briefly.
+            }
+            Err(e) => {
+                log::warn!("Terminal read error: {}", e);
+                break;
+            }
+        }
+
+        // --- downstream: WebSocket client → serial socket ---
+        match server_rx.try_recv() {
+            Ok(data) => {
+                if let Err(e) = channel.stream(0).write_all(&data) {
+                    log::warn!("Terminal write error: {}", e);
+                    break;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                // Nothing to write right now.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                // Sender dropped (WebSocket closed).
+                break;
+            }
+        }
+    }
+
+    let _ = channel.close();
+    info!("Terminal proxy connection closed");
 }
 
 #[cfg(test)]
