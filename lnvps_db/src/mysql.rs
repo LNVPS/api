@@ -10,7 +10,7 @@ use crate::{
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 #[cfg(feature = "nostr-domain")]
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
@@ -228,6 +228,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 name: row.get("name"),
                 ip: row.get("ip"),
                 cpu: row.get("cpu"),
+                cpu_mfg: row.get("cpu_mfg"),
+                cpu_arch: row.get("cpu_arch"),
+                cpu_features: row.get("cpu_features"),
                 memory: row.get("memory"),
                 enabled: row.get("enabled"),
                 api_token: row.get("api_token"),
@@ -235,6 +238,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 load_memory: row.get("load_memory"),
                 load_disk: row.get("load_disk"),
                 vlan_id: row.get("vlan_id"),
+                ssh_user: row.get("ssh_user"),
+                ssh_key: row.get("ssh_key"),
             };
 
             let region = VmHostRegion {
@@ -258,41 +263,60 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_host(&self, host: &VmHost) -> DbResult<()> {
-        sqlx::query("update vm_host set kind = ?, region_id = ?, name = ?, ip = ?, cpu = ?, memory = ?, enabled = ?, api_token = ?, load_cpu = ?, load_memory = ?, load_disk = ?, vlan_id = ? where id = ?")
-            .bind(&host.kind)
-            .bind(host.region_id)
-            .bind(&host.name)
-            .bind(&host.ip)
-            .bind(host.cpu)
-            .bind(host.memory)
-            .bind(host.enabled)
-            .bind(&host.api_token)
-            .bind(host.load_cpu)
-            .bind(host.load_memory)
-            .bind(host.load_disk)
-            .bind(host.vlan_id)
-            .bind(host.id)
-            .execute(&self.db)
-            .await?;
+        sqlx::query(
+            "UPDATE vm_host SET kind = ?, region_id = ?, name = ?, ip = ?, cpu = ?, \
+             cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, memory = ?, enabled = ?, \
+             api_token = ?, load_cpu = ?, load_memory = ?, load_disk = ?, vlan_id = ?, \
+             ssh_user = ?, ssh_key = ? WHERE id = ?",
+        )
+        .bind(&host.kind)
+        .bind(host.region_id)
+        .bind(&host.name)
+        .bind(&host.ip)
+        .bind(host.cpu)
+        .bind(&host.cpu_mfg)
+        .bind(&host.cpu_arch)
+        .bind(&host.cpu_features)
+        .bind(host.memory)
+        .bind(host.enabled)
+        .bind(&host.api_token)
+        .bind(host.load_cpu)
+        .bind(host.load_memory)
+        .bind(host.load_disk)
+        .bind(host.vlan_id)
+        .bind(&host.ssh_user)
+        .bind(&host.ssh_key)
+        .bind(host.id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
     async fn create_host(&self, host: &VmHost) -> DbResult<u64> {
-        let result = sqlx::query("insert into vm_host (kind, region_id, name, ip, cpu, memory, enabled, api_token, load_cpu, load_memory, load_disk, vlan_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&host.kind)
-            .bind(host.region_id)
-            .bind(&host.name)
-            .bind(&host.ip)
-            .bind(host.cpu)
-            .bind(host.memory)
-            .bind(host.enabled)
-            .bind(&host.api_token)
-            .bind(host.load_cpu)
-            .bind(host.load_memory)
-            .bind(host.load_disk)
-            .bind(host.vlan_id)
-            .execute(&self.db)
-            .await?;
+        let result = sqlx::query(
+            "INSERT INTO vm_host (kind, region_id, name, ip, cpu, cpu_mfg, cpu_arch, \
+             cpu_features, memory, enabled, api_token, load_cpu, load_memory, load_disk, \
+             vlan_id, ssh_user, ssh_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&host.kind)
+        .bind(host.region_id)
+        .bind(&host.name)
+        .bind(&host.ip)
+        .bind(host.cpu)
+        .bind(&host.cpu_mfg)
+        .bind(&host.cpu_arch)
+        .bind(&host.cpu_features)
+        .bind(host.memory)
+        .bind(host.enabled)
+        .bind(&host.api_token)
+        .bind(host.load_cpu)
+        .bind(host.load_memory)
+        .bind(host.load_disk)
+        .bind(host.vlan_id)
+        .bind(&host.ssh_user)
+        .bind(&host.ssh_key)
+        .execute(&self.db)
+        .await?;
         Ok(result.last_insert_id())
     }
 
@@ -440,12 +464,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(?,?,?,?,?,?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,cpu_mfg,cpu_arch,cpu_features,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(&template.name)
             .bind(template.enabled)
             .bind(template.created)
             .bind(template.expires)
             .bind(template.cpu)
+            .bind(&template.cpu_mfg)
+            .bind(&template.cpu_arch)
+            .bind(&template.cpu_features)
             .bind(template.memory)
             .bind(template.disk_size)
             .bind(template.disk_type)
@@ -773,26 +800,32 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id) values(?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,cpu_mfg,cpu_arch,cpu_features) values(?,?,?,?,?,?,?,?,?) returning id")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
             .bind(template.disk_type)
             .bind(template.disk_interface)
             .bind(template.pricing_id)
+            .bind(&template.cpu_mfg)
+            .bind(&template.cpu_arch)
+            .bind(&template.cpu_features)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
     }
 
     async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
-        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=? where id=?")
+        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, cpu_mfg=?, cpu_arch=?, cpu_features=? where id=?")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
             .bind(template.disk_type)
             .bind(template.disk_interface)
             .bind(template.pricing_id)
+            .bind(&template.cpu_mfg)
+            .bind(&template.cpu_arch)
+            .bind(&template.cpu_features)
             .bind(template.id)
             .execute(&self.db)
             .await?;
@@ -1648,9 +1681,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
     // ========================================================================
 
     async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>> {
-        Ok(sqlx::query_as("SELECT * FROM payment_method_config ORDER BY company_id, payment_method, name")
-            .fetch_all(&self.db)
-            .await?)
+        Ok(sqlx::query_as(
+            "SELECT * FROM payment_method_config ORDER BY company_id, payment_method, name",
+        )
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn list_payment_method_configs_for_company(
@@ -1678,10 +1713,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_payment_method_config(&self, id: u64) -> DbResult<PaymentMethodConfig> {
-        Ok(sqlx::query_as("SELECT * FROM payment_method_config WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM payment_method_config WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
     async fn get_payment_method_config_for_company(
@@ -2544,7 +2581,7 @@ impl AdminDb for LNVpsDbMysql {
     async fn update_vm_template(&self, template: &VmTemplate) -> DbResult<()> {
         sqlx::query(
             r#"UPDATE vm_template SET 
-               name = ?, enabled = ?, expires = ?, cpu = ?, memory = ?, 
+               name = ?, enabled = ?, expires = ?, cpu = ?, cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, memory = ?,
                disk_size = ?, disk_type = ?, disk_interface = ?, 
                cost_plan_id = ?, region_id = ?
                WHERE id = ?"#,
@@ -2553,6 +2590,9 @@ impl AdminDb for LNVpsDbMysql {
         .bind(template.enabled)
         .bind(template.expires)
         .bind(template.cpu)
+        .bind(&template.cpu_mfg)
+        .bind(&template.cpu_arch)
+        .bind(&template.cpu_features)
         .bind(template.memory)
         .bind(template.disk_size)
         .bind(template.disk_type)
@@ -2633,8 +2673,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
         let query = r#"
-            INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#;
 
         let result = sqlx::query(query)
@@ -2644,6 +2684,9 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.expires)
             .bind(pricing.region_id)
             .bind(&pricing.currency)
+            .bind(&pricing.cpu_mfg)
+            .bind(&pricing.cpu_arch)
+            .bind(&pricing.cpu_features)
             .bind(pricing.cpu_cost)
             .bind(pricing.memory_cost)
             .bind(pricing.ip4_cost)
@@ -2662,7 +2705,7 @@ impl AdminDb for LNVpsDbMysql {
         let query = r#"
             UPDATE vm_custom_pricing 
             SET name = ?, enabled = ?, expires = ?, region_id = ?, currency = ?, 
-                cpu_cost = ?, memory_cost = ?, ip4_cost = ?, ip6_cost = ?, 
+                cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, cpu_cost = ?, memory_cost = ?, ip4_cost = ?, ip6_cost = ?, 
                 min_cpu = ?, max_cpu = ?, min_memory = ?, max_memory = ?
             WHERE id = ?
         "#;
@@ -2673,6 +2716,9 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.expires)
             .bind(pricing.region_id)
             .bind(&pricing.currency)
+            .bind(&pricing.cpu_mfg)
+            .bind(&pricing.cpu_arch)
+            .bind(&pricing.cpu_features)
             .bind(pricing.cpu_cost)
             .bind(pricing.memory_cost)
             .bind(pricing.ip4_cost)

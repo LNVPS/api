@@ -10,7 +10,7 @@ mod tests {
     use async_trait::async_trait;
     use lnvps_api_common::retry::{OpError, OpResult};
     use lnvps_api_common::{MockDb, VmRunningState};
-    use lnvps_db::{LNVpsDbBase, User, UserSshKey, Vm, VmHost};
+    use lnvps_db::{LNVpsDbBase, User, UserSshKey, Vm};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -159,8 +159,8 @@ mod tests {
             self.inner.get_time_series_data(vm, series).await
         }
 
-        async fn connect_terminal(&self, vm: &Vm, host: &VmHost) -> OpResult<crate::host::TerminalStream> {
-            self.inner.connect_terminal(vm, host).await
+        async fn connect_terminal(&self, vm: &Vm) -> OpResult<crate::host::TerminalStream> {
+            self.inner.connect_terminal(vm).await
         }
     }
 

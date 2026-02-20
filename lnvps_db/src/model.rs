@@ -1,5 +1,6 @@
+use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -79,6 +80,343 @@ impl Display for VmHostKind {
     }
 }
 
+/// CPU manufacturer
+#[derive(Clone, Debug, sqlx::Type, PartialEq, Eq, Default, Copy)]
+#[repr(u16)]
+pub enum CpuMfg {
+    #[default]
+    Unknown = 0,
+    Intel = 1,
+    Amd = 2,
+    Apple = 3,
+    Nvidia = 4,
+    Arm = 5,
+}
+
+impl Display for CpuMfg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CpuMfg::Unknown => write!(f, "unknown"),
+            CpuMfg::Intel => write!(f, "intel"),
+            CpuMfg::Amd => write!(f, "amd"),
+            CpuMfg::Apple => write!(f, "apple"),
+            CpuMfg::Nvidia => write!(f, "nvidia"),
+            CpuMfg::Arm => write!(f, "arm"),
+        }
+    }
+}
+
+impl std::str::FromStr for CpuMfg {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "intel" => Ok(CpuMfg::Intel),
+            "amd" => Ok(CpuMfg::Amd),
+            "apple" => Ok(CpuMfg::Apple),
+            "nvidia" => Ok(CpuMfg::Nvidia),
+            "arm" => Ok(CpuMfg::Arm),
+            "unknown" => Ok(CpuMfg::Unknown),
+            _ => Err(()),
+        }
+    }
+}
+
+/// CPU architecture
+#[derive(Clone, Debug, sqlx::Type, PartialEq, Eq, Default, Copy)]
+#[repr(u16)]
+pub enum CpuArch {
+    #[default]
+    Unknown = 0,
+    X86_64 = 1,
+    ARM64 = 2,
+}
+
+impl Display for CpuArch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CpuArch::Unknown => write!(f, "unknown"),
+            CpuArch::X86_64 => write!(f, "x86_64"),
+            CpuArch::ARM64 => write!(f, "arm64"),
+        }
+    }
+}
+
+impl std::str::FromStr for CpuArch {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "x86_64" | "x86-64" | "amd64" => Ok(CpuArch::X86_64),
+            "arm64" | "aarch64" => Ok(CpuArch::ARM64),
+            "unknown" => Ok(CpuArch::Unknown),
+            _ => Err(()),
+        }
+    }
+}
+
+/// CPU feature flags relevant for workload capability
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CpuFeature {
+    // ── SIMD instruction sets (x86) ──────────────────────────────────────────
+    SSE,
+    SSE2,
+    SSE3,
+    SSSE3,
+    SSE4_1,
+    SSE4_2,
+    AVX,
+    AVX2,
+    /// Fused Multiply-Add (FMA3)
+    FMA,
+    /// Half-precision floating point conversion
+    F16C,
+    /// AVX-512 Foundation
+    AVX512F,
+    /// AVX-512 Vector Neural Network Instructions (ML inference)
+    AVX512VNNI,
+    /// AVX-512 BFloat16 (ML training/inference)
+    AVX512BF16,
+    /// AVX-VNNI (VEX-encoded, non-AVX-512) - Alder Lake+
+    AVXVNNI,
+
+    // ── SIMD instruction sets (ARM) ──────────────────────────────────────────
+    /// ARM NEON SIMD
+    NEON,
+    /// ARM Scalable Vector Extension
+    SVE,
+    /// ARM SVE2
+    SVE2,
+
+    // ── Cryptographic acceleration ───────────────────────────────────────────
+    /// AES-NI (x86) / AES (ARM)
+    AES,
+    /// SHA extensions (SHA-1, SHA-256)
+    SHA,
+    /// SHA-512 extensions
+    SHA512,
+    /// Polynomial multiplication for GCM/CRC (x86 PCLMULQDQ / ARM PMULL)
+    PCLMULQDQ,
+    /// Hardware random number generation (RDRAND/RDSEED, ARM RNDR)
+    RNG,
+    /// Galois Field New Instructions (crypto, compression)
+    GFNI,
+    /// Vector AES (AVX-512 / AVX)
+    VAES,
+    /// Vector PCLMULQDQ (AVX-512 / AVX)
+    VPCLMULQDQ,
+
+    // ── Virtualization (CPU features) ────────────────────────────────────────
+    /// Hardware virtualization (Intel VT-x / AMD-V / ARM VHE)
+    VMX,
+    /// Nested virtualization support
+    NestedVirt,
+
+    // ── AI/ML acceleration (CPU integrated) ──────────────────────────────────
+    /// Intel AMX (Advanced Matrix Extensions) - Sapphire Rapids+
+    AMX,
+    /// ARM SME (Scalable Matrix Extension)
+    SME,
+
+    // ── Confidential computing (CPU features) ────────────────────────────────
+    /// Intel SGX (Software Guard Extensions)
+    SGX,
+    /// AMD SEV (Secure Encrypted Virtualization)
+    SEV,
+    /// Intel TDX (Trust Domain Extensions)
+    TDX,
+
+    // ── Hardware video encode (iGPU: Intel QSV, AMD VCN / dGPU: NVENC, AMF) ──
+    /// H.264/AVC hardware encode
+    EncodeH264,
+    /// H.265/HEVC hardware encode
+    EncodeHEVC,
+    /// AV1 hardware encode
+    EncodeAV1,
+    /// VP9 hardware encode
+    EncodeVP9,
+    /// JPEG hardware encode
+    EncodeJPEG,
+
+    // ── Hardware video decode (iGPU: Intel QSV, AMD VCN / dGPU: NVDEC, AMF) ──
+    /// H.264/AVC hardware decode
+    DecodeH264,
+    /// H.265/HEVC hardware decode
+    DecodeHEVC,
+    /// AV1 hardware decode
+    DecodeAV1,
+    /// VP9 hardware decode
+    DecodeVP9,
+    /// JPEG hardware decode
+    DecodeJPEG,
+    /// MPEG-2 hardware decode
+    DecodeMPEG2,
+    /// VC-1 hardware decode
+    DecodeVC1,
+
+    // ── Video processing ─────────────────────────────────────────────────────
+    /// Hardware video scaling/resize
+    VideoScaling,
+    /// Hardware deinterlacing
+    VideoDeinterlace,
+    /// Hardware color space conversion
+    VideoCSC,
+    /// Hardware video composition/overlay
+    VideoComposition,
+}
+
+/// Discrete GPU manufacturer
+#[derive(Clone, Debug, sqlx::Type, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum GpuMfg {
+    #[default]
+    None,
+    Nvidia,
+    Amd,
+}
+
+impl Display for GpuMfg {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuMfg::None => write!(f, "none"),
+            GpuMfg::Nvidia => write!(f, "nvidia"),
+            GpuMfg::Amd => write!(f, "amd"),
+        }
+    }
+}
+
+impl Display for CpuFeature {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            // SIMD (x86)
+            CpuFeature::SSE => "SSE",
+            CpuFeature::SSE2 => "SSE2",
+            CpuFeature::SSE3 => "SSE3",
+            CpuFeature::SSSE3 => "SSSE3",
+            CpuFeature::SSE4_1 => "SSE4_1",
+            CpuFeature::SSE4_2 => "SSE4_2",
+            CpuFeature::AVX => "AVX",
+            CpuFeature::AVX2 => "AVX2",
+            CpuFeature::FMA => "FMA",
+            CpuFeature::F16C => "F16C",
+            CpuFeature::AVX512F => "AVX512F",
+            CpuFeature::AVX512VNNI => "AVX512VNNI",
+            CpuFeature::AVX512BF16 => "AVX512BF16",
+            CpuFeature::AVXVNNI => "AVXVNNI",
+            // SIMD (ARM)
+            CpuFeature::NEON => "NEON",
+            CpuFeature::SVE => "SVE",
+            CpuFeature::SVE2 => "SVE2",
+            // Crypto
+            CpuFeature::AES => "AES",
+            CpuFeature::SHA => "SHA",
+            CpuFeature::SHA512 => "SHA512",
+            CpuFeature::PCLMULQDQ => "PCLMULQDQ",
+            CpuFeature::RNG => "RNG",
+            CpuFeature::GFNI => "GFNI",
+            CpuFeature::VAES => "VAES",
+            CpuFeature::VPCLMULQDQ => "VPCLMULQDQ",
+            // Virtualization
+            CpuFeature::VMX => "VMX",
+            CpuFeature::NestedVirt => "NestedVirt",
+            // AI/ML
+            CpuFeature::AMX => "AMX",
+            CpuFeature::SME => "SME",
+            // Confidential computing
+            CpuFeature::SGX => "SGX",
+            CpuFeature::SEV => "SEV",
+            CpuFeature::TDX => "TDX",
+            // iGPU video encode
+            CpuFeature::EncodeH264 => "EncodeH264",
+            CpuFeature::EncodeHEVC => "EncodeHEVC",
+            CpuFeature::EncodeAV1 => "EncodeAV1",
+            CpuFeature::EncodeVP9 => "EncodeVP9",
+            CpuFeature::EncodeJPEG => "EncodeJPEG",
+            // iGPU video decode
+            CpuFeature::DecodeH264 => "DecodeH264",
+            CpuFeature::DecodeHEVC => "DecodeHEVC",
+            CpuFeature::DecodeAV1 => "DecodeAV1",
+            CpuFeature::DecodeVP9 => "DecodeVP9",
+            CpuFeature::DecodeJPEG => "DecodeJPEG",
+            CpuFeature::DecodeMPEG2 => "DecodeMPEG2",
+            CpuFeature::DecodeVC1 => "DecodeVC1",
+            // Video processing
+            CpuFeature::VideoScaling => "VideoScaling",
+            CpuFeature::VideoDeinterlace => "VideoDeinterlace",
+            CpuFeature::VideoCSC => "VideoCSC",
+            CpuFeature::VideoComposition => "VideoComposition",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for CpuFeature {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            // SIMD (x86)
+            "SSE" => Ok(CpuFeature::SSE),
+            "SSE2" => Ok(CpuFeature::SSE2),
+            "SSE3" => Ok(CpuFeature::SSE3),
+            "SSSE3" => Ok(CpuFeature::SSSE3),
+            "SSE4_1" => Ok(CpuFeature::SSE4_1),
+            "SSE4_2" => Ok(CpuFeature::SSE4_2),
+            "AVX" => Ok(CpuFeature::AVX),
+            "AVX2" => Ok(CpuFeature::AVX2),
+            "FMA" => Ok(CpuFeature::FMA),
+            "F16C" => Ok(CpuFeature::F16C),
+            "AVX512F" => Ok(CpuFeature::AVX512F),
+            "AVX512VNNI" => Ok(CpuFeature::AVX512VNNI),
+            "AVX512BF16" => Ok(CpuFeature::AVX512BF16),
+            "AVXVNNI" => Ok(CpuFeature::AVXVNNI),
+            // SIMD (ARM)
+            "NEON" => Ok(CpuFeature::NEON),
+            "SVE" => Ok(CpuFeature::SVE),
+            "SVE2" => Ok(CpuFeature::SVE2),
+            // Crypto
+            "AES" => Ok(CpuFeature::AES),
+            "SHA" => Ok(CpuFeature::SHA),
+            "SHA512" => Ok(CpuFeature::SHA512),
+            "PCLMULQDQ" => Ok(CpuFeature::PCLMULQDQ),
+            "RNG" => Ok(CpuFeature::RNG),
+            "GFNI" => Ok(CpuFeature::GFNI),
+            "VAES" => Ok(CpuFeature::VAES),
+            "VPCLMULQDQ" => Ok(CpuFeature::VPCLMULQDQ),
+            // Virtualization
+            "VMX" => Ok(CpuFeature::VMX),
+            "NestedVirt" => Ok(CpuFeature::NestedVirt),
+            // AI/ML
+            "AMX" => Ok(CpuFeature::AMX),
+            "SME" => Ok(CpuFeature::SME),
+            // Confidential computing
+            "SGX" => Ok(CpuFeature::SGX),
+            "SEV" => Ok(CpuFeature::SEV),
+            "TDX" => Ok(CpuFeature::TDX),
+            // iGPU video encode
+            "EncodeH264" => Ok(CpuFeature::EncodeH264),
+            "EncodeHEVC" => Ok(CpuFeature::EncodeHEVC),
+            "EncodeAV1" => Ok(CpuFeature::EncodeAV1),
+            "EncodeVP9" => Ok(CpuFeature::EncodeVP9),
+            "EncodeJPEG" => Ok(CpuFeature::EncodeJPEG),
+            // iGPU video decode
+            "DecodeH264" => Ok(CpuFeature::DecodeH264),
+            "DecodeHEVC" => Ok(CpuFeature::DecodeHEVC),
+            "DecodeAV1" => Ok(CpuFeature::DecodeAV1),
+            "DecodeVP9" => Ok(CpuFeature::DecodeVP9),
+            "DecodeJPEG" => Ok(CpuFeature::DecodeJPEG),
+            "DecodeMPEG2" => Ok(CpuFeature::DecodeMPEG2),
+            "DecodeVC1" => Ok(CpuFeature::DecodeVC1),
+            // Video processing
+            "VideoScaling" => Ok(CpuFeature::VideoScaling),
+            "VideoDeinterlace" => Ok(CpuFeature::VideoDeinterlace),
+            "VideoCSC" => Ok(CpuFeature::VideoCSC),
+            "VideoComposition" => Ok(CpuFeature::VideoComposition),
+            other => Err(format!("unknown CpuFeature: {}", other)),
+        }
+    }
+}
+
 #[derive(FromRow, Clone, Debug)]
 pub struct VmHostRegion {
     pub id: u64,
@@ -102,6 +440,9 @@ pub struct VmHost {
     pub ip: String,
     /// Total number of CPU cores
     pub cpu: u16,
+    pub cpu_mfg: CpuMfg,
+    pub cpu_arch: CpuArch,
+    pub cpu_features: CommaSeparated<CpuFeature>,
     /// Total memory size in bytes
     pub memory: u64,
     /// If VM's should be provisioned on this host
@@ -116,6 +457,10 @@ pub struct VmHost {
     pub load_disk: f32,
     /// VLAN id assigned to all vms on the host
     pub vlan_id: Option<u64>,
+    /// SSH username for running host utilities (default: root)
+    pub ssh_user: Option<String>,
+    /// SSH private key for running host utilities (encrypted, PEM format)
+    pub ssh_key: Option<EncryptedString>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -392,6 +737,9 @@ pub struct VmTemplate {
     pub created: DateTime<Utc>,
     pub expires: Option<DateTime<Utc>>,
     pub cpu: u16,
+    pub cpu_mfg: CpuMfg,
+    pub cpu_arch: CpuArch,
+    pub cpu_features: CommaSeparated<CpuFeature>,
     pub memory: u64,
     pub disk_size: u64,
     pub disk_type: DiskType,
@@ -411,6 +759,9 @@ pub struct VmCustomTemplate {
     pub disk_type: DiskType,
     pub disk_interface: DiskInterface,
     pub pricing_id: u64,
+    pub cpu_mfg: CpuMfg,
+    pub cpu_arch: CpuArch,
+    pub cpu_features: CommaSeparated<CpuFeature>,
 }
 
 /// Custom pricing template, usually 1 per region
@@ -423,6 +774,9 @@ pub struct VmCustomPricing {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
+    pub cpu_mfg: CpuMfg,
+    pub cpu_arch: CpuArch,
+    pub cpu_features: CommaSeparated<CpuFeature>,
     /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
     pub cpu_cost: u64,
     /// Cost per GB ram in smallest currency units (cents for fiat, millisats for BTC)
@@ -1197,6 +1551,58 @@ mod tests {
         assert_eq!(InternetRegistry::APNIC.min_ipv6_prefix_size(), 48);
         assert_eq!(InternetRegistry::LACNIC.min_ipv6_prefix_size(), 48);
         assert_eq!(InternetRegistry::AFRINIC.min_ipv6_prefix_size(), 48);
+    }
+
+    #[test]
+    fn test_cpu_mfg_from_str() {
+        assert_eq!("intel".parse::<CpuMfg>().unwrap(), CpuMfg::Intel);
+        assert_eq!("Intel".parse::<CpuMfg>().unwrap(), CpuMfg::Intel);
+        assert_eq!("INTEL".parse::<CpuMfg>().unwrap(), CpuMfg::Intel);
+        assert_eq!("amd".parse::<CpuMfg>().unwrap(), CpuMfg::Amd);
+        assert_eq!("AMD".parse::<CpuMfg>().unwrap(), CpuMfg::Amd);
+        assert_eq!("apple".parse::<CpuMfg>().unwrap(), CpuMfg::Apple);
+        assert_eq!("nvidia".parse::<CpuMfg>().unwrap(), CpuMfg::Nvidia);
+        assert_eq!("unknown".parse::<CpuMfg>().unwrap(), CpuMfg::Unknown);
+        assert!("invalid".parse::<CpuMfg>().is_err());
+        assert!("".parse::<CpuMfg>().is_err());
+    }
+
+    #[test]
+    fn test_cpu_arch_from_str() {
+        assert_eq!("x86_64".parse::<CpuArch>().unwrap(), CpuArch::X86_64);
+        assert_eq!("X86_64".parse::<CpuArch>().unwrap(), CpuArch::X86_64);
+        assert_eq!("x86-64".parse::<CpuArch>().unwrap(), CpuArch::X86_64);
+        assert_eq!("amd64".parse::<CpuArch>().unwrap(), CpuArch::X86_64);
+        assert_eq!("arm64".parse::<CpuArch>().unwrap(), CpuArch::ARM64);
+        assert_eq!("ARM64".parse::<CpuArch>().unwrap(), CpuArch::ARM64);
+        assert_eq!("aarch64".parse::<CpuArch>().unwrap(), CpuArch::ARM64);
+        assert_eq!("unknown".parse::<CpuArch>().unwrap(), CpuArch::Unknown);
+        assert!("invalid".parse::<CpuArch>().is_err());
+        assert!("".parse::<CpuArch>().is_err());
+    }
+
+    #[test]
+    fn test_cpu_mfg_display_roundtrip() {
+        for mfg in [
+            CpuMfg::Unknown,
+            CpuMfg::Intel,
+            CpuMfg::Amd,
+            CpuMfg::Apple,
+            CpuMfg::Nvidia,
+        ] {
+            let s = mfg.to_string();
+            let parsed: CpuMfg = s.parse().unwrap();
+            assert_eq!(parsed, mfg);
+        }
+    }
+
+    #[test]
+    fn test_cpu_arch_display_roundtrip() {
+        for arch in [CpuArch::Unknown, CpuArch::X86_64, CpuArch::ARM64] {
+            let s = arch.to_string();
+            let parsed: CpuArch = s.parse().unwrap();
+            assert_eq!(parsed, arch);
+        }
     }
 }
 

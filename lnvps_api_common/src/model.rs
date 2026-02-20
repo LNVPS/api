@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
-    IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHostRegion, VmTemplate,
+    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHostRegion, VmTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,12 @@ pub trait Template {
     fn disk_size(&self) -> u64;
     fn disk_type(&self) -> lnvps_db::DiskType;
     fn disk_interface(&self) -> lnvps_db::DiskInterface;
+    /// Requested CPU manufacturer. [`CpuMfg::Unknown`] means "any".
+    fn cpu_mfg(&self) -> CpuMfg;
+    /// Requested CPU architecture. [`CpuArch::Unknown`] means "any".
+    fn cpu_arch(&self) -> CpuArch;
+    /// Required CPU feature flags. An empty list means "any".
+    fn cpu_features(&self) -> &[CpuFeature];
 }
 
 impl Template for VmTemplate {
@@ -41,6 +47,18 @@ impl Template for VmTemplate {
 
     fn disk_interface(&self) -> lnvps_db::DiskInterface {
         self.disk_interface
+    }
+
+    fn cpu_mfg(&self) -> CpuMfg {
+        self.cpu_mfg.clone()
+    }
+
+    fn cpu_arch(&self) -> CpuArch {
+        self.cpu_arch.clone()
+    }
+
+    fn cpu_features(&self) -> &[CpuFeature] {
+        &self.cpu_features
     }
 }
 
@@ -64,6 +82,18 @@ impl Template for VmCustomTemplate {
     fn disk_interface(&self) -> lnvps_db::DiskInterface {
         self.disk_interface
     }
+
+    fn cpu_mfg(&self) -> CpuMfg {
+        self.cpu_mfg.clone()
+    }
+
+    fn cpu_arch(&self) -> CpuArch {
+        self.cpu_arch.clone()
+    }
+
+    fn cpu_features(&self) -> &[CpuFeature] {
+        &self.cpu_features
+    }
 }
 
 impl ApiVmTemplate {
@@ -85,6 +115,21 @@ impl ApiVmTemplate {
             created: pricing.created,
             expires: pricing.expires,
             cpu: template.cpu,
+            cpu_features: template
+                .cpu_features
+                .iter()
+                .map(|x| x.to_string())
+                .collect(),
+            cpu_mfg: if matches!(template.cpu_mfg, CpuMfg::Unknown) {
+                None
+            } else {
+                Some(template.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(template.cpu_arch, CpuArch::Unknown) {
+                None
+            } else {
+                Some(template.cpu_arch.to_string())
+            },
             memory: template.memory,
             disk_size: template.disk_size,
             disk_type: template.disk_type.into(),
@@ -126,6 +171,21 @@ impl ApiVmTemplate {
             created: template.created,
             expires: template.expires,
             cpu: template.cpu,
+            cpu_features: template
+                .cpu_features
+                .iter()
+                .map(|x| x.to_string())
+                .collect(),
+            cpu_mfg: if matches!(template.cpu_mfg, CpuMfg::Unknown) {
+                None
+            } else {
+                Some(template.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(template.cpu_arch, CpuArch::Unknown) {
+                None
+            } else {
+                Some(template.cpu_arch.to_string())
+            },
             memory: template.memory,
             disk_size: template.disk_size,
             disk_type: template.disk_type.into(),
@@ -329,6 +389,12 @@ pub struct ApiVmTemplate {
     pub disk_interface: ApiDiskInterface,
     pub cost_plan: ApiVmCostPlan,
     pub region: ApiVmHostRegion,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mfg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -540,6 +606,12 @@ pub struct ApiCustomTemplateParams {
     pub id: u64,
     pub name: String,
     pub region: ApiVmHostRegion,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cpu_mfg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cpu_arch: Option<String>,
     pub max_cpu: u16,
     pub min_cpu: u16,
     pub min_memory: u64,
@@ -559,6 +631,21 @@ impl ApiCustomTemplateParams {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name.clone(),
+            },
+            cpu_features: pricing
+                .cpu_features
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            cpu_mfg: if matches!(pricing.cpu_mfg, CpuMfg::Unknown) {
+                None
+            } else {
+                Some(pricing.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(pricing.cpu_arch, CpuArch::Unknown) {
+                None
+            } else {
+                Some(pricing.cpu_arch.to_string())
             },
             max_cpu: pricing.max_cpu,
             min_cpu: pricing.min_cpu,

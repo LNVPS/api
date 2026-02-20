@@ -215,8 +215,7 @@ impl ApiInvoiceItem {
             .map_err(|_| anyhow::anyhow!("Invalid currency: {}", currency))?;
         let formatted_amount =
             payments_rs::currency::CurrencyAmount::from_u64(cur, amount).to_string();
-        let formatted_tax =
-            payments_rs::currency::CurrencyAmount::from_u64(cur, tax).to_string();
+        let formatted_tax = payments_rs::currency::CurrencyAmount::from_u64(cur, tax).to_string();
         let duration = Duration::from_secs(time_seconds);
         let formatted_duration = format_duration(duration).to_string();
         Ok(Self {
@@ -450,10 +449,24 @@ pub struct ApiCustomVmRequest {
     pub disk: u64,
     pub disk_type: ApiDiskType,
     pub disk_interface: ApiDiskInterface,
+    /// CPU manufacturer as string (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture as string (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features as strings (e.g. "AVX2", "AES", "VMX")
+    #[serde(default)]
+    pub cpu_feature: Vec<String>,
 }
 
 impl From<ApiCustomVmRequest> for VmCustomTemplate {
     fn from(value: ApiCustomVmRequest) -> Self {
+        // Parse CPU features from strings
+        let cpu_features: Vec<lnvps_db::CpuFeature> = value
+            .cpu_feature
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+
         VmCustomTemplate {
             id: 0,
             cpu: value.cpu,
@@ -462,6 +475,9 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
             disk_type: value.disk_type.into(),
             disk_interface: value.disk_interface.into(),
             pricing_id: value.pricing_id,
+            cpu_mfg: value.cpu_mfg.and_then(|s| s.parse().ok()).unwrap_or_default(),
+            cpu_arch: value.cpu_arch.and_then(|s| s.parse().ok()).unwrap_or_default(),
+            cpu_features: cpu_features.into(),
         }
     }
 }
@@ -737,7 +753,6 @@ impl From<lnvps_db::IpSpacePricing> for ApiIpSpacePricing {
 }
 
 #[derive(Serialize)]
-#[allow(dead_code)]
 pub struct ApiIpRangeSubscription {
     pub id: u64,
     pub cidr: String,
@@ -748,7 +763,6 @@ pub struct ApiIpRangeSubscription {
 }
 
 impl ApiIpRangeSubscription {
-    #[allow(dead_code)]
     pub async fn from_subscription_with_space(
         db: &dyn lnvps_db::LNVpsDbBase,
         sub: lnvps_db::IpRangeSubscription,
@@ -787,14 +801,12 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 
     #[serde(rename = "asn_sponsoring")]
     AsnSponsoring {
-        #[allow(dead_code)]
         asn: u32,
         // Add pricing/plan details here
     },
 
     #[serde(rename = "dns_hosting")]
     DnsHosting {
-        #[allow(dead_code)]
         domain: String,
         // Add pricing/plan details here
     },
@@ -806,7 +818,13 @@ mod tests {
     use chrono::Utc;
     use lnvps_db::{EncryptedString, PaymentMethod, PaymentType, VmPayment};
 
-    fn make_payment(currency: &str, amount: u64, tax: u64, processing_fee: u64, time_value: u64) -> VmPayment {
+    fn make_payment(
+        currency: &str,
+        amount: u64,
+        tax: u64,
+        processing_fee: u64,
+        time_value: u64,
+    ) -> VmPayment {
         VmPayment {
             id: vec![0u8; 32],
             vm_id: 1,

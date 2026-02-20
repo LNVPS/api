@@ -7,6 +7,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-20** - Added CPU-aware host filtering to VM Templates, Custom Pricing, and Hosts (Admin API)
+  - New enums: `CpuMfg`, `CpuArch`, `CpuFeature`, `GpuMfg`
+  - `POST /api/admin/v1/vm_templates` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields
+  - `PATCH /api/admin/v1/vm_templates/{id}` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields
+  - `POST /api/admin/v1/custom_pricing` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields
+  - `PATCH /api/admin/v1/custom_pricing/{id}` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields
+  - `AdminHostInfo` response now includes `cpu_mfg`, `cpu_arch`, `cpu_features` (detected via lnvps-host-info)
+  - When `cpu_mfg`/`cpu_arch` is "unknown" or `cpu_features` is empty, no filtering is applied (matches any host)
+
+- **2026-02-20** - Added SSH credentials for host utilities to Admin Host API
+  - `POST /api/admin/v1/hosts` — Added optional `ssh_user` and `ssh_key` fields for host creation
+  - `PATCH /api/admin/v1/hosts/{id}` — Added optional `ssh_user` and `ssh_key` fields for host update
+  - `AdminHostInfo` response now includes `ssh_user` (string or null) and `ssh_key_configured` (boolean)
+  - SSH key itself is never exposed in responses for security (only a boolean indicator)
+  - SSH credentials are used by the PatchHosts worker to run `lnvps-host-info` utility for CPU/GPU detection
+
+- **2026-02-20** - Added CPU feature requirements to custom VM requests (User API)
+  - `POST /api/v1/vm/custom` — `cpu_mfg`, `cpu_arch`, `cpu_feature` fields now accept strings instead of enums
+  - Valid `cpu_mfg` values: "intel", "amd", "apple", "nvidia", "unknown"
+  - Valid `cpu_arch` values: "x86_64", "arm64", "unknown"
+  - CPU features are parsed from strings (e.g. "AVX2", "AES", "VMX"); invalid values are silently ignored
+
 - **2026-02-17** - Added embedded API documentation served at root path (both User and Admin APIs)
   - `GET /` or `GET /index.html` - Renders API documentation with markdown viewer
   - `GET /docs/endpoints.md` - Raw markdown content of API endpoints documentation

@@ -87,7 +87,6 @@ async fn v1_get_ip_space(
 // ============================================================================
 
 // Helper function to find an available subnet
-#[allow(dead_code)]
 pub(super) async fn find_available_subnet(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     parent_network: &ipnetwork::IpNetwork,
@@ -206,7 +205,6 @@ pub(super) async fn find_available_subnet(
     ))
 }
 
-#[allow(dead_code)]
 fn subnets_overlap(a: &ipnetwork::IpNetwork, b: &ipnetwork::IpNetwork) -> bool {
     a.contains(b.network()) || b.contains(a.network())
 }

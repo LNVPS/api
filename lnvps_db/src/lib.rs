@@ -5,6 +5,7 @@ use thiserror::Error;
 
 #[cfg(feature = "admin")]
 mod admin;
+pub mod comma_separated;
 pub mod encrypted_string;
 pub mod encryption;
 mod model;
@@ -17,6 +18,7 @@ pub mod nostr;
 use crate::nostr::LNVPSNostrDb;
 #[cfg(feature = "admin")]
 pub use admin::*;
+pub use comma_separated::CommaSeparated;
 pub use encrypted_string::EncryptedString;
 pub use encryption::EncryptionContext;
 pub use model::*;

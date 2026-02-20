@@ -3,8 +3,8 @@ use anyhow::{Context, anyhow};
 use chrono::{TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, AvailableIpSpace, Company, DbResult, DiskInterface, DiskType, IpRange,
-    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
+    AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbResult, DiskInterface, DiskType,
+    IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
     NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Router, Subscription,
     SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
     Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
@@ -61,7 +61,7 @@ impl MockDb {
             id: 1,
             name: "mock".to_string(),
             created: Utc::now(),
-            amount: 132, // 132 cents = €1.32 (in smallest currency units)
+            amount: 132,                 // 132 cents = €1.32 (in smallest currency units)
             currency: "EUR".to_string(), // This can be overridden based on company config
             interval_amount: 1,
             interval_type: VmCostPlanIntervalType::Month,
@@ -76,6 +76,9 @@ impl MockDb {
             created: Utc::now(),
             expires: None,
             cpu: 2,
+            cpu_mfg: CpuMfg::Unknown,
+            cpu_arch: CpuArch::Unknown,
+            cpu_features: Default::default(),
             memory: crate::GB * 2,
             disk_size: crate::GB * 64,
             disk_type: DiskType::SSD,
@@ -153,6 +156,9 @@ impl Default for MockDb {
                 name: "mock-host".to_string(),
                 ip: "https://localhost".to_string(),
                 cpu: 4,
+                cpu_mfg: CpuMfg::Intel,
+                cpu_arch: CpuArch::X86_64,
+                cpu_features: Default::default(),
                 memory: 8 * crate::GB,
                 enabled: true,
                 api_token: "".into(),
@@ -160,6 +166,8 @@ impl Default for MockDb {
                 load_memory: 2.0,
                 load_disk: 3.0,
                 vlan_id: Some(100),
+                ssh_user: None,
+                ssh_key: None,
             },
         );
         let mut host_disks = HashMap::new();
@@ -426,7 +434,7 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_host_disks(&self, _tb: u64) -> DbResult<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, _TB: u64) -> DbResult<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
         Ok(disks.values().filter(|d| d.enabled).cloned().collect())
     }
@@ -802,7 +810,7 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
-    async fn list_custom_pricing(&self, _tb: u64) -> DbResult<Vec<VmCustomPricing>> {
+    async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().filter(|p| p.enabled).cloned().collect())
     }
@@ -1069,7 +1077,7 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("Subscription not found with external_id: {}", ext_id))?)
     }
 
-    async fn insert_subscription(&self, _subscription: &Subscription) -> DbResult<u64> {
+    async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         Ok(0)
     }
 
@@ -1288,101 +1296,101 @@ impl LNVpsDbBase for MockDb {
         todo!()
     }
 
-    async fn get_available_ip_space(&self, _id: u64) -> DbResult<AvailableIpSpace> {
+    async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
         todo!()
     }
 
-    async fn get_available_ip_space_by_cidr(&self, _cidr: &str) -> DbResult<AvailableIpSpace> {
+    async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace> {
         todo!()
     }
 
-    async fn insert_available_ip_space(&self, _space: &AvailableIpSpace) -> DbResult<u64> {
+    async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64> {
         todo!()
     }
 
-    async fn update_available_ip_space(&self, _space: &AvailableIpSpace) -> DbResult<()> {
+    async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<()> {
         todo!()
     }
 
-    async fn delete_available_ip_space(&self, _id: u64) -> DbResult<()> {
+    async fn delete_available_ip_space(&self, id: u64) -> DbResult<()> {
         todo!()
     }
 
     async fn list_ip_space_pricing_by_space(
         &self,
-        _available_ip_space_id: u64,
+        available_ip_space_id: u64,
     ) -> DbResult<Vec<IpSpacePricing>> {
         todo!()
     }
 
-    async fn get_ip_space_pricing(&self, _id: u64) -> DbResult<IpSpacePricing> {
+    async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing> {
         todo!()
     }
 
     async fn get_ip_space_pricing_by_prefix(
         &self,
-        _available_ip_space_id: u64,
-        _prefix_size: u16,
+        available_ip_space_id: u64,
+        prefix_size: u16,
     ) -> DbResult<IpSpacePricing> {
         todo!()
     }
 
-    async fn insert_ip_space_pricing(&self, _pricing: &IpSpacePricing) -> DbResult<u64> {
+    async fn insert_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<u64> {
         todo!()
     }
 
-    async fn update_ip_space_pricing(&self, _pricing: &IpSpacePricing) -> DbResult<()> {
+    async fn update_ip_space_pricing(&self, pricing: &IpSpacePricing) -> DbResult<()> {
         todo!()
     }
 
-    async fn delete_ip_space_pricing(&self, _id: u64) -> DbResult<()> {
+    async fn delete_ip_space_pricing(&self, id: u64) -> DbResult<()> {
         todo!()
     }
 
     async fn list_ip_range_subscriptions_by_line_item(
         &self,
-        _subscription_line_item_id: u64,
+        subscription_line_item_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
         todo!()
     }
 
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
-        _subscription_id: u64,
+        subscription_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
         todo!()
     }
 
     async fn list_ip_range_subscriptions_by_user(
         &self,
-        _user_id: u64,
+        user_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
         todo!()
     }
 
-    async fn get_ip_range_subscription(&self, _id: u64) -> DbResult<IpRangeSubscription> {
+    async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
         todo!()
     }
 
-    async fn get_ip_range_subscription_by_cidr(&self, _cidr: &str) -> DbResult<IpRangeSubscription> {
+    async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription> {
         todo!()
     }
 
     async fn insert_ip_range_subscription(
         &self,
-        _subscription: &IpRangeSubscription,
+        subscription: &IpRangeSubscription,
     ) -> DbResult<u64> {
         todo!()
     }
 
     async fn update_ip_range_subscription(
         &self,
-        _subscription: &IpRangeSubscription,
+        subscription: &IpRangeSubscription,
     ) -> DbResult<()> {
         todo!()
     }
 
-    async fn delete_ip_range_subscription(&self, _id: u64) -> DbResult<()> {
+    async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         todo!()
     }
 

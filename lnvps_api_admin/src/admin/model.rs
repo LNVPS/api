@@ -566,6 +566,10 @@ pub struct AdminHostInfo {
     pub disks: Vec<AdminHostDisk>,
     // Calculated load metrics
     pub calculated_load: CalculatedHostLoad,
+    /// SSH username for host utilities (None if not configured)
+    pub ssh_user: Option<String>,
+    /// Whether SSH key is configured (key itself is not exposed)
+    pub ssh_key_configured: bool,
 }
 
 #[derive(Serialize)]
@@ -645,6 +649,7 @@ pub struct UpdateRegionRequest {
 
 impl AdminHostInfo {
     pub fn from_host_and_region(host: lnvps_db::VmHost, region: lnvps_db::VmHostRegion) -> Self {
+        let ssh_key_configured = host.ssh_key.is_some();
         Self {
             id: host.id,
             name: host.name,
@@ -672,6 +677,8 @@ impl AdminHostInfo {
                 available_memory: host.memory,
                 active_vms: 0,
             },
+            ssh_user: host.ssh_user,
+            ssh_key_configured,
         }
     }
 
@@ -681,6 +688,7 @@ impl AdminHostInfo {
         disks: Vec<lnvps_db::VmHostDisk>,
     ) -> Self {
         let admin_disks = disks.into_iter().map(|disk| disk.into()).collect();
+        let ssh_key_configured = host.ssh_key.is_some();
 
         Self {
             id: host.id,
@@ -709,6 +717,8 @@ impl AdminHostInfo {
                 available_memory: host.memory,
                 active_vms: 0,
             },
+            ssh_user: host.ssh_user,
+            ssh_key_configured,
         }
     }
 
@@ -719,6 +729,7 @@ impl AdminHostInfo {
         active_vms: u64,
     ) -> Self {
         let admin_disks = disks.into_iter().map(|disk| disk.into()).collect();
+        let ssh_key_configured = capacity.host.ssh_key.is_some();
 
         Self {
             id: capacity.host.id,
@@ -747,6 +758,8 @@ impl AdminHostInfo {
                 available_memory: capacity.available_memory(),
                 active_vms,
             },
+            ssh_user: capacity.host.ssh_user.clone(),
+            ssh_key_configured,
         }
     }
 
@@ -757,10 +770,11 @@ impl AdminHostInfo {
             .into_iter()
             .map(|disk| disk.into())
             .collect();
+        let ssh_key_configured = admin_host.host.ssh_key.is_some();
 
         Self {
             id: admin_host.host.id,
-            name: admin_host.host.name,
+            name: admin_host.host.name.clone(),
             kind: AdminVmHostKind::from(admin_host.host.kind),
             region: AdminHostRegion {
                 id: admin_host.region_id,
@@ -785,6 +799,8 @@ impl AdminHostInfo {
                 available_memory: admin_host.host.memory,
                 active_vms: admin_host.active_vm_count as _,
             },
+            ssh_user: admin_host.host.ssh_user,
+            ssh_key_configured,
         }
     }
 
@@ -805,6 +821,7 @@ impl AdminHostInfo {
                     .into_iter()
                     .map(|disk| disk.into())
                     .collect();
+                let ssh_key_configured = capacity.host.ssh_key.is_some();
 
                 Self {
                     id: capacity.host.id,
@@ -833,6 +850,8 @@ impl AdminHostInfo {
                         available_memory: capacity.available_memory(),
                         active_vms: admin_host.active_vm_count as _,
                     },
+                    ssh_user: capacity.host.ssh_user.clone(),
+                    ssh_key_configured,
                 }
             }
             Err(_) => {
@@ -2409,7 +2428,10 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     api_version: cfg.api_version.clone(),
                     public_key: cfg.public_key.clone(),
                     has_token: !cfg.token.is_empty(),
-                    has_webhook_secret: cfg.webhook_secret.as_ref().map_or(false, |s| !s.is_empty()),
+                    has_webhook_secret: cfg
+                        .webhook_secret
+                        .as_ref()
+                        .map_or(false, |s| !s.is_empty()),
                 })
             }
             lnvps_db::ProviderConfig::Stripe(cfg) => {
@@ -2601,7 +2623,9 @@ impl PartialProviderConfig {
             (PartialProviderConfig::Lnd(partial), ProviderConfig::Lnd(existing)) => {
                 Ok(ProviderConfig::Lnd(lnvps_db::LndConfig {
                     url: partial.url.unwrap_or_else(|| existing.url.clone()),
-                    cert_path: partial.cert_path.unwrap_or_else(|| existing.cert_path.clone()),
+                    cert_path: partial
+                        .cert_path
+                        .unwrap_or_else(|| existing.cert_path.clone()),
                     macaroon_path: partial
                         .macaroon_path
                         .unwrap_or_else(|| existing.macaroon_path.clone()),

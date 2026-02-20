@@ -130,6 +130,12 @@ async fn admin_update_host(
     if let Some(load_disk) = req.load_disk {
         host.load_disk = load_disk;
     }
+    if let Some(ssh_user) = &req.ssh_user {
+        host.ssh_user = Some(ssh_user.clone());
+    }
+    if let Some(ssh_key) = &req.ssh_key {
+        host.ssh_key = ssh_key.clone().map(|k| k.into());
+    }
 
     // Save changes
     this.db.update_host(&host).await?;
@@ -173,6 +179,9 @@ async fn admin_create_host(
         name: req.name.clone(),
         ip: req.ip.clone(),
         cpu: req.cpu,
+        cpu_mfg: Default::default(),
+        cpu_arch: Default::default(),
+        cpu_features: Default::default(),
         memory: req.memory,
         enabled: req.enabled.unwrap_or(true),
         api_token: req.api_token.clone().into(),
@@ -180,6 +189,8 @@ async fn admin_create_host(
         load_memory: req.load_memory.unwrap_or(1.0),
         load_disk: req.load_disk.unwrap_or(1.0),
         vlan_id: req.vlan_id,
+        ssh_user: req.ssh_user.clone(),
+        ssh_key: req.ssh_key.clone().map(|k| k.into()),
     };
 
     // Create host in database
@@ -216,6 +227,11 @@ pub struct AdminHostUpdateRequest {
     pub load_cpu: Option<f32>,
     pub load_memory: Option<f32>,
     pub load_disk: Option<f32>,
+    /// SSH username for running host utilities (default: root)
+    pub ssh_user: Option<String>,
+    /// SSH private key for running host utilities (PEM format)
+    /// Use `None` to keep existing, use `Some(None)` to clear
+    pub ssh_key: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +248,10 @@ pub struct AdminHostCreateRequest {
     pub load_cpu: Option<f32>,
     pub load_memory: Option<f32>,
     pub load_disk: Option<f32>,
+    /// SSH username for running host utilities (default: root)
+    pub ssh_user: Option<String>,
+    /// SSH private key for running host utilities (PEM format)
+    pub ssh_key: Option<String>,
 }
 
 /// List host disks

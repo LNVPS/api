@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
@@ -13,7 +11,7 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use lnvps_api_common::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{VmRunningState, VmRunningStates, op_fatal, parse_gateway};
-use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmHost, VmOsImage};
+use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
 use reqwest::{Method, Url};
@@ -1238,7 +1236,7 @@ impl VmHostClient for ProxmoxClient {
         Ok(r.into_iter().map(TimeSeriesData::from).collect())
     }
 
-    async fn connect_terminal(&self, vm: &Vm, host: &VmHost) -> OpResult<TerminalStream> {
+    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
         let ssh = self
             .ssh
             .as_ref()
@@ -1248,14 +1246,7 @@ impl VmHostClient for ProxmoxClient {
         let vm_id: ProxmoxVmId = vm.id.into();
         let socket_path = format!("/var/run/qemu-server/{}.serial0", vm_id);
 
-        let host_url: Url = host
-            .ip
-            .parse()
-            .map_err(|e| OpError::Fatal(anyhow::anyhow!("Invalid VM host IP URL: {}", e)))?;
-        let host = host_url
-            .host()
-            .ok_or_else(|| OpError::Fatal(anyhow::anyhow!("VM host IP URL has no host")))
-            .map(|h| h.to_string())?;
+        let host = self.api.base().host().unwrap().to_string();
         let ssh_user = ssh.user.clone();
         let ssh_key = ssh.key.clone();
 

@@ -22,6 +22,15 @@ Admin API request/response format reference for LLM consumption.
 **SubscriptionPaymentType**: `"purchase"`, `"renewal"`
 **SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`
 **InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
+**CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
+**CpuArch**: `"unknown"`, `"x86_64"`, `"arm64"`
+**CpuFeature**: `"SSE"`, `"SSE2"`, `"SSE3"`, `"SSSE3"`, `"SSE4_1"`, `"SSE4_2"`, `"AVX"`, `"AVX2"`, `"FMA"`, `"F16C"`,
+`"AVX512F"`, `"AVX512VNNI"`, `"AVX512BF16"`, `"AVXVNNI"`, `"NEON"`, `"SVE"`, `"SVE2"`, `"AES"`, `"SHA"`, `"SHA512"`,
+`"PCLMULQDQ"`, `"RNG"`, `"GFNI"`, `"VAES"`, `"VPCLMULQDQ"`, `"VMX"`, `"NestedVirt"`, `"AMX"`, `"SME"`, `"SGX"`, `"SEV"`,
+`"TDX"`, `"EncodeH264"`, `"EncodeHEVC"`, `"EncodeAV1"`, `"EncodeVP9"`, `"EncodeJPEG"`, `"DecodeH264"`, `"DecodeHEVC"`,
+`"DecodeAV1"`, `"DecodeVP9"`, `"DecodeJPEG"`, `"DecodeMPEG2"`, `"DecodeVC1"`, `"VideoScaling"`, `"VideoDeinterlace"`,
+`"VideoCSC"`, `"VideoComposition"`
+**GpuMfg**: `"none"`, `"nvidia"`, `"amd"`
 
 ## Authentication
 
@@ -807,7 +816,13 @@ Body (all optional):
   "enabled": boolean,
   "load_cpu": number,
   "load_memory": number,
-  "load_disk": number
+  "load_disk": number,
+  "ssh_user": "string",
+  // SSH username for host utilities (default: root)
+  "ssh_key": "string"
+  |
+  null
+  // SSH private key (PEM format) - use null to clear
 }
 ```
 
@@ -846,8 +861,12 @@ Body:
   // Optional - default 1.0
   "load_memory": number,
   // Optional - default 1.0
-  "load_disk": number
+  "load_disk": number,
   // Optional - default 1.0
+  "ssh_user": "string",
+  // Optional - SSH username for host utilities (default: root)
+  "ssh_key": "string"
+  // Optional - SSH private key (PEM format)
 }
 ```
 
@@ -1123,6 +1142,12 @@ Body:
   // optional
   "cpu": number,
   // CPU cores
+  "cpu_mfg": "string",
+  // optional - CpuMfg enum, default "unknown" (matches any host)
+  "cpu_arch": "string",
+  // optional - CpuArch enum, default "unknown" (matches any host)
+  "cpu_features": ["string"],
+  // optional - array of CpuFeature enum values, default [] (matches any host)
   "memory": number,
   // Memory in bytes
   "disk_size": number,
@@ -1168,6 +1193,12 @@ Body (all optional):
   "enabled": boolean,
   "expires": "string (ISO 8601) | null",
   "cpu": number,
+  "cpu_mfg": "string",
+  // CpuMfg enum - filter hosts by CPU manufacturer
+  "cpu_arch": "string",
+  // CpuArch enum - filter hosts by CPU architecture
+  "cpu_features": ["string"],
+  // array of CpuFeature enum values - filter hosts by required CPU features
   "memory": number,
   "disk_size": number,
   "disk_type": "string",
@@ -1344,6 +1375,12 @@ Body:
   "region_id": number,
   "currency": "string",
   // e.g., "USD", "EUR", "BTC"
+  "cpu_mfg": "string",
+  // optional - CpuMfg enum, default "unknown" (matches any host)
+  "cpu_arch": "string",
+  // optional - CpuArch enum, default "unknown" (matches any host)
+  "cpu_features": ["string"],
+  // optional - array of CpuFeature enum values, default [] (matches any host)
   "cpu_cost": number,
   // Cost per CPU core per month in smallest currency units (cents/millisats)
   "memory_cost": number,
@@ -1395,6 +1432,12 @@ Body (all optional):
   "expires": "string (ISO 8601) | null",
   "region_id": number,
   "currency": "string",
+  "cpu_mfg": "string",
+  // CpuMfg enum - filter hosts by CPU manufacturer
+  "cpu_arch": "string",
+  // CpuArch enum - filter hosts by CPU architecture
+  "cpu_features": ["string"],
+  // array of CpuFeature enum values - filter hosts by required CPU features
   "cpu_cost": number,
   // Cost per CPU core in smallest currency units (cents/millisats)
   "memory_cost": number,
@@ -2740,6 +2783,12 @@ The RBAC system uses the following permission format: `resource::action`
   },
   "ip": "string",
   "cpu": number,
+  "cpu_mfg": "string",
+  // CpuMfg enum - detected CPU manufacturer
+  "cpu_arch": "string",
+  // CpuArch enum - detected CPU architecture
+  "cpu_features": ["string"],
+  // array of CpuFeature enum values - detected CPU features
   "memory": number,
   "enabled": boolean,
   "load_cpu": number,
@@ -2773,7 +2822,11 @@ The RBAC system uses the following permission format: `resource::action`
     // Available memory in bytes
     "active_vms": number
     // Number of active VMs on this host
-  }
+  },
+  "ssh_user": "string | null",
+  // SSH username for host utilities (null if not configured)
+  "ssh_key_configured": boolean
+  // Whether SSH key is configured (key itself is not exposed)
 }
 ```
 
