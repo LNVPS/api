@@ -121,6 +121,19 @@ async fn admin_update_host(
     if let Some(enabled) = req.enabled {
         host.enabled = enabled;
     }
+    if let Some(cpu_mfg) = &req.cpu_mfg {
+        host.cpu_mfg = cpu_mfg.parse().unwrap_or_default();
+    }
+    if let Some(cpu_arch) = &req.cpu_arch {
+        host.cpu_arch = cpu_arch.parse().unwrap_or_default();
+    }
+    if let Some(cpu_features) = &req.cpu_features {
+        host.cpu_features = cpu_features
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect::<Vec<_>>()
+            .into();
+    }
     if let Some(load_cpu) = req.load_cpu {
         host.load_cpu = load_cpu;
     }
@@ -179,9 +192,22 @@ async fn admin_create_host(
         name: req.name.clone(),
         ip: req.ip.clone(),
         cpu: req.cpu,
-        cpu_mfg: Default::default(),
-        cpu_arch: Default::default(),
-        cpu_features: Default::default(),
+        cpu_mfg: req
+            .cpu_mfg
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
+        cpu_arch: req
+            .cpu_arch
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
+        cpu_features: req
+            .cpu_features
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect::<Vec<_>>()
+            .into(),
         memory: req.memory,
         enabled: req.enabled.unwrap_or(true),
         api_token: req.api_token.clone().into(),
@@ -224,6 +250,12 @@ pub struct AdminHostUpdateRequest {
     pub kind: Option<AdminVmHostKind>,
     pub vlan_id: Option<Option<u64>>,
     pub enabled: Option<bool>,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    pub cpu_features: Option<Vec<String>>,
     pub load_cpu: Option<f32>,
     pub load_memory: Option<f32>,
     pub load_disk: Option<f32>,
@@ -243,6 +275,13 @@ pub struct AdminHostCreateRequest {
     pub kind: AdminVmHostKind,
     pub vlan_id: Option<u64>,
     pub cpu: u16,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    #[serde(default)]
+    pub cpu_features: Vec<String>,
     pub memory: u64,
     pub enabled: Option<bool>,
     pub load_cpu: Option<f32>,

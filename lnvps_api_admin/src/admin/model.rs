@@ -374,6 +374,15 @@ pub struct AdminVmInfo {
     // VM Resources
     /// Number of CPU cores allocated to this VM
     pub cpu: u16,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
     /// Memory in bytes allocated to this VM  
     pub memory: u64,
     /// Disk size in bytes
@@ -421,6 +430,9 @@ impl AdminVmInfo {
             custom_template_id,
             is_standard_template,
             cpu,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features,
             memory,
             disk_size,
             disk_type,
@@ -429,10 +441,25 @@ impl AdminVmInfo {
             let template = db.get_vm_template(template_id).await?;
             (
                 template_id,
-                template.name,
+                template.name.clone(),
                 None,
                 true,
                 template.cpu,
+                if matches!(template.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                    None
+                } else {
+                    Some(template.cpu_mfg.to_string())
+                },
+                if matches!(template.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                    None
+                } else {
+                    Some(template.cpu_arch.to_string())
+                },
+                template
+                    .cpu_features
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>(),
                 template.memory,
                 template.disk_size,
                 ApiDiskType::from(template.disk_type),
@@ -447,6 +474,21 @@ impl AdminVmInfo {
                 Some(custom_template_id),
                 false,
                 custom_template.cpu,
+                if matches!(custom_template.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                    None
+                } else {
+                    Some(custom_template.cpu_mfg.to_string())
+                },
+                if matches!(custom_template.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                    None
+                } else {
+                    Some(custom_template.cpu_arch.to_string())
+                },
+                custom_template
+                    .cpu_features
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>(),
                 custom_template.memory,
                 custom_template.disk_size,
                 ApiDiskType::from(custom_template.disk_type),
@@ -459,6 +501,9 @@ impl AdminVmInfo {
                 None,
                 true,
                 0,
+                None,
+                None,
+                Vec::new(),
                 0,
                 0,
                 ApiDiskType::HDD,
@@ -492,6 +537,9 @@ impl AdminVmInfo {
             running_state,
             auto_renewal_enabled: vm.auto_renewal_enabled,
             cpu,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features,
             memory,
             disk_size,
             disk_type,
@@ -560,6 +608,15 @@ pub struct AdminHostInfo {
     pub region: AdminHostRegion,
     pub ip: String,
     pub cpu: u16,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
     pub memory: u64,
     pub enabled: bool,
     pub load_cpu: f32,
@@ -664,6 +721,21 @@ impl AdminHostInfo {
             },
             ip: host.ip,
             cpu: host.cpu,
+            cpu_mfg: if matches!(host.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                None
+            } else {
+                Some(host.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(host.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(host.cpu_arch.to_string())
+            },
+            cpu_features: host
+                .cpu_features
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             memory: host.memory,
             enabled: host.enabled,
             load_cpu: host.load_cpu,
@@ -704,6 +776,21 @@ impl AdminHostInfo {
             },
             ip: host.ip,
             cpu: host.cpu,
+            cpu_mfg: if matches!(host.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                None
+            } else {
+                Some(host.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(host.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(host.cpu_arch.to_string())
+            },
+            cpu_features: host
+                .cpu_features
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             memory: host.memory,
             enabled: host.enabled,
             load_cpu: host.load_cpu,
@@ -745,6 +832,22 @@ impl AdminHostInfo {
             },
             ip: capacity.host.ip.clone(),
             cpu: capacity.host.cpu,
+            cpu_mfg: if matches!(capacity.host.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                None
+            } else {
+                Some(capacity.host.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(capacity.host.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(capacity.host.cpu_arch.to_string())
+            },
+            cpu_features: capacity
+                .host
+                .cpu_features
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             memory: capacity.host.memory,
             enabled: capacity.host.enabled,
             load_cpu: capacity.host.load_cpu,
@@ -778,14 +881,30 @@ impl AdminHostInfo {
         Self {
             id: admin_host.host.id,
             name: admin_host.host.name.clone(),
-            kind: AdminVmHostKind::from(admin_host.host.kind),
+            kind: AdminVmHostKind::from(admin_host.host.kind.clone()),
             region: AdminHostRegion {
                 id: admin_host.region_id,
                 name: admin_host.region_name,
                 enabled: admin_host.region_enabled,
             },
-            ip: admin_host.host.ip,
+            ip: admin_host.host.ip.clone(),
             cpu: admin_host.host.cpu,
+            cpu_mfg: if matches!(admin_host.host.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                None
+            } else {
+                Some(admin_host.host.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(admin_host.host.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(admin_host.host.cpu_arch.to_string())
+            },
+            cpu_features: admin_host
+                .host
+                .cpu_features
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             memory: admin_host.host.memory,
             enabled: admin_host.host.enabled,
             load_cpu: admin_host.host.load_cpu,
@@ -837,6 +956,22 @@ impl AdminHostInfo {
                     },
                     ip: capacity.host.ip.clone(),
                     cpu: capacity.host.cpu,
+                    cpu_mfg: if matches!(capacity.host.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                        None
+                    } else {
+                        Some(capacity.host.cpu_mfg.to_string())
+                    },
+                    cpu_arch: if matches!(capacity.host.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                        None
+                    } else {
+                        Some(capacity.host.cpu_arch.to_string())
+                    },
+                    cpu_features: capacity
+                        .host
+                        .cpu_features
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect(),
                     memory: capacity.host.memory,
                     enabled: capacity.host.enabled,
                     load_cpu: capacity.host.load_cpu,
@@ -982,6 +1117,12 @@ pub struct AdminVmTemplateInfo {
     pub created: DateTime<Utc>,
     pub expires: Option<DateTime<Utc>>,
     pub cpu: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mfg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
     pub memory: u64,
     pub disk_size: u64,
     pub disk_type: ApiDiskType,
@@ -999,6 +1140,13 @@ pub struct AdminCreateVmTemplateRequest {
     pub enabled: Option<bool>,
     pub expires: Option<DateTime<Utc>>,
     pub cpu: u16,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    #[serde(default)]
+    pub cpu_features: Vec<String>,
     pub memory: u64,
     pub disk_size: u64,
     pub disk_type: ApiDiskType,
@@ -1020,6 +1168,12 @@ pub struct AdminUpdateVmTemplateRequest {
     pub enabled: Option<bool>,
     pub expires: Option<Option<DateTime<Utc>>>,
     pub cpu: Option<u16>,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    pub cpu_features: Option<Vec<String>>,
     pub memory: Option<u64>,
     pub disk_size: Option<u64>,
     pub disk_type: Option<ApiDiskType>,
@@ -1060,6 +1214,15 @@ pub struct AdminCustomPricingInfo {
     pub region_id: u64,
     pub region_name: Option<String>,
     pub currency: String,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
     /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
     pub cpu_cost: u64,
     /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
@@ -1094,6 +1257,12 @@ pub struct UpdateCustomPricingRequest {
     pub expires: Option<Option<DateTime<Utc>>>,
     pub region_id: Option<u64>,
     pub currency: Option<String>,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    pub cpu_features: Option<Vec<String>>,
     /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
     pub cpu_cost: Option<u64>,
     /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
@@ -1116,6 +1285,13 @@ pub struct CreateCustomPricingRequest {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
+    /// CPU manufacturer (e.g. "intel", "amd", "apple")
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64")
+    pub cpu_arch: Option<String>,
+    /// CPU features (e.g. ["AVX2", "AES", "VMX"])
+    #[serde(default)]
+    pub cpu_features: Vec<String>,
     /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
     pub cpu_cost: u64,
     /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)

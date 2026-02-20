@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-20** - Added `cpu_mfg`, `cpu_arch`, `cpu_features` to all admin API response models
+  - `AdminVmInfo` — Now includes CPU specification fields from the VM's template
+  - `AdminVmTemplateInfo` — Now includes CPU specification fields
+  - `AdminCustomPricingInfo` — Now includes CPU specification fields
+  - `AdminHostInfo` — CPU fields are now consistently documented as optional (omitted when unknown/empty)
+  - `POST /api/admin/v1/hosts` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields for host creation
+  - `PATCH /api/admin/v1/hosts/{id}` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields for host update
+  - Fields are omitted from JSON when value is unknown (cpu_mfg/cpu_arch) or empty (cpu_features)
+
 - **2026-02-20** - Added `paid_at` timestamp to payment responses
   - `VmPayment` — New optional `paid_at` field (ISO 8601 datetime) indicating when the payment was completed
   - `SubscriptionPayment` — New optional `paid_at` field (ISO 8601 datetime) indicating when the payment was completed

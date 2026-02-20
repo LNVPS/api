@@ -81,6 +81,21 @@ impl AdminCustomPricingInfo {
             region_id: pricing.region_id,
             region_name: region.map(|r| r.name),
             currency: pricing.currency.clone(),
+            cpu_mfg: if matches!(pricing.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                None
+            } else {
+                Some(pricing.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(pricing.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(pricing.cpu_arch.to_string())
+            },
+            cpu_features: pricing
+                .cpu_features
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             cpu_cost: pricing.cpu_cost,
             memory_cost: pricing.memory_cost,
             ip4_cost: pricing.ip4_cost,
@@ -184,9 +199,22 @@ async fn admin_create_custom_pricing(
         expires: req.expires,
         region_id: req.region_id,
         currency: req.currency,
-        cpu_mfg: Default::default(),
-        cpu_arch: Default::default(),
-        cpu_features: Default::default(),
+        cpu_mfg: req
+            .cpu_mfg
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
+        cpu_arch: req
+            .cpu_arch
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
+        cpu_features: req
+            .cpu_features
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect::<Vec<_>>()
+            .into(),
         cpu_cost: req.cpu_cost,
         memory_cost: req.memory_cost,
         ip4_cost: req.ip4_cost,
@@ -252,6 +280,19 @@ async fn admin_update_custom_pricing(
     }
     if let Some(currency) = req.currency {
         pricing.currency = currency;
+    }
+    if let Some(cpu_mfg) = &req.cpu_mfg {
+        pricing.cpu_mfg = cpu_mfg.parse().unwrap_or_default();
+    }
+    if let Some(cpu_arch) = &req.cpu_arch {
+        pricing.cpu_arch = cpu_arch.parse().unwrap_or_default();
+    }
+    if let Some(cpu_features) = &req.cpu_features {
+        pricing.cpu_features = cpu_features
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect::<Vec<_>>()
+            .into();
     }
     if let Some(cpu_cost) = req.cpu_cost {
         pricing.cpu_cost = cpu_cost;
@@ -373,9 +414,9 @@ async fn admin_copy_custom_pricing(
         expires: source_pricing.expires,
         region_id: target_region_id,
         currency: source_pricing.currency,
-        cpu_mfg: Default::default(),
-        cpu_arch: Default::default(),
-        cpu_features: Default::default(),
+        cpu_mfg: source_pricing.cpu_mfg.clone(),
+        cpu_arch: source_pricing.cpu_arch.clone(),
+        cpu_features: source_pricing.cpu_features.clone(),
         cpu_cost: source_pricing.cpu_cost,
         memory_cost: source_pricing.memory_cost,
         ip4_cost: source_pricing.ip4_cost,

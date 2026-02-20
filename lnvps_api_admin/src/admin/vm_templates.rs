@@ -47,6 +47,21 @@ impl AdminVmTemplateInfo {
             created: template.created,
             expires: template.expires,
             cpu: template.cpu,
+            cpu_mfg: if matches!(template.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
+                None
+            } else {
+                Some(template.cpu_mfg.to_string())
+            },
+            cpu_arch: if matches!(template.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(template.cpu_arch.to_string())
+            },
+            cpu_features: template
+                .cpu_features
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             memory: template.memory,
             disk_size: template.disk_size,
             disk_type: template.disk_type.into(),
@@ -157,9 +172,20 @@ async fn admin_create_vm_template(
         created: Utc::now(),
         expires: req.expires,
         cpu: req.cpu,
-        cpu_mfg: Default::default(),
-        cpu_arch: Default::default(),
-        cpu_features: Default::default(),
+        cpu_mfg: req
+            .cpu_mfg
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
+        cpu_arch: req
+            .cpu_arch
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default(),
+        cpu_features: req
+            .cpu_features
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect::<Vec<_>>()
+            .into(),
         memory: req.memory,
         disk_size: req.disk_size,
         disk_type: req.disk_type.into(),
@@ -199,6 +225,19 @@ async fn admin_update_vm_template(
     }
     if let Some(cpu) = req.cpu {
         template.cpu = cpu;
+    }
+    if let Some(cpu_mfg) = req.cpu_mfg {
+        template.cpu_mfg = cpu_mfg.parse().unwrap_or_default();
+    }
+    if let Some(cpu_arch) = req.cpu_arch {
+        template.cpu_arch = cpu_arch.parse().unwrap_or_default();
+    }
+    if let Some(cpu_features) = req.cpu_features {
+        template.cpu_features = cpu_features
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect::<Vec<_>>()
+            .into();
     }
     if let Some(memory) = req.memory {
         template.memory = memory;

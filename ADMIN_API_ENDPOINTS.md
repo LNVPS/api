@@ -814,6 +814,12 @@ Body (all optional):
   |
   null,
   "enabled": boolean,
+  "cpu_mfg": "string",
+  // CPU manufacturer (e.g. "intel", "amd", "apple")
+  "cpu_arch": "string",
+  // CPU architecture (e.g. "x86_64", "arm64")
+  "cpu_features": ["string"],
+  // CPU features (e.g. ["AVX2", "AES", "VMX"])
   "load_cpu": number,
   "load_memory": number,
   "load_disk": number,
@@ -853,6 +859,12 @@ Body:
   null,
   "cpu": number,
   // Required
+  "cpu_mfg": "string",
+  // Optional - CPU manufacturer (e.g. "intel", "amd", "apple")
+  "cpu_arch": "string",
+  // Optional - CPU architecture (e.g. "x86_64", "arm64")
+  "cpu_features": ["string"],
+  // Optional - CPU features (e.g. ["AVX2", "AES", "VMX"])
   "memory": number,
   // Required
   "enabled": boolean,
@@ -2708,6 +2720,12 @@ The RBAC system uses the following permission format: `resource::action`
   // Whether automatic renewal via NWC is enabled
   "cpu": number,
   // Number of CPU cores allocated
+  "cpu_mfg": "string | null",
+  // CPU manufacturer (e.g. "intel", "amd", "apple") - omitted if unknown
+  "cpu_arch": "string | null",
+  // CPU architecture (e.g. "x86_64", "arm64") - omitted if unknown
+  "cpu_features": ["string"],
+  // CPU features (e.g. ["AVX2", "AES", "VMX"]) - omitted if empty
   "memory": number,
   // Memory in bytes allocated
   "disk_size": number,
@@ -2783,12 +2801,12 @@ The RBAC system uses the following permission format: `resource::action`
   },
   "ip": "string",
   "cpu": number,
-  "cpu_mfg": "string",
-  // CpuMfg enum - detected CPU manufacturer
-  "cpu_arch": "string",
-  // CpuArch enum - detected CPU architecture
+  "cpu_mfg": "string | null",
+  // CPU manufacturer (e.g. "intel", "amd", "apple") - omitted if unknown
+  "cpu_arch": "string | null",
+  // CPU architecture (e.g. "x86_64", "arm64") - omitted if unknown
   "cpu_features": ["string"],
-  // array of CpuFeature enum values - detected CPU features
+  // CPU features (e.g. ["AVX2", "AES", "VMX"]) - omitted if empty
   "memory": number,
   "enabled": boolean,
   "load_cpu": number,
@@ -3059,6 +3077,12 @@ The RBAC system uses the following permission format: `resource::action`
   "created": "string (ISO 8601)",
   "expires": "string (ISO 8601) | null",
   "cpu": number,
+  "cpu_mfg": "string | null",
+  // CPU manufacturer (e.g. "intel", "amd", "apple") - omitted if unknown
+  "cpu_arch": "string | null",
+  // CPU architecture (e.g. "x86_64", "arm64") - omitted if unknown
+  "cpu_features": ["string"],
+  // CPU features (e.g. ["AVX2", "AES", "VMX"]) - omitted if empty
   "memory": number,
   "disk_size": number,
   "disk_type": "ssd",
@@ -3090,6 +3114,12 @@ The RBAC system uses the following permission format: `resource::action`
   // Populated with region name
   "currency": "string",
   // e.g., "USD", "EUR", "BTC"
+  "cpu_mfg": "string | null",
+  // CPU manufacturer (e.g. "intel", "amd", "apple") - omitted if unknown
+  "cpu_arch": "string | null",
+  // CPU architecture (e.g. "x86_64", "arm64") - omitted if unknown
+  "cpu_features": ["string"],
+  // CPU features (e.g. ["AVX2", "AES", "VMX"]) - omitted if empty
   "cpu_cost": number,
   // Cost per CPU core per month
   "memory_cost": number,
