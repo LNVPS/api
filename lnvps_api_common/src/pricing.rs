@@ -4,15 +4,14 @@ use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
-    DiskInterface, DiskType, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomTemplate, VmPayment,
+    CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, LNVpsDb, PaymentMethod, PaymentType, Vm,
+    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomTemplate, VmPayment,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
-
 
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
@@ -47,7 +46,6 @@ pub struct PricingEngine {
     db: Arc<dyn LNVpsDb>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
-    #[allow(dead_code)]
     base_currency: Currency,
 }
 
@@ -64,7 +62,7 @@ impl PricingEngine {
         };
         base_seconds * interval_amount as i64
     }
-    
+
     /// Calculate processing fee for a payment based on payment method and amount
     /// Returns the processing fee in the same currency as the amount
     /// Queries the database for fee configuration
@@ -81,16 +79,28 @@ impl PricingEngine {
         }
 
         // Try to get fee config from database
-        let config = match self.db.get_payment_method_config_for_company(company_id, method).await {
+        let config = match self
+            .db
+            .get_payment_method_config_for_company(company_id, method)
+            .await
+        {
             Ok(config) => config,
             Err(e) => {
-                log::warn!("Failed to load payment method config for company {} method {:?}: {}", company_id, method, e);
+                log::warn!(
+                    "Failed to load payment method config for company {} method {:?}: {}",
+                    company_id,
+                    method,
+                    e
+                );
                 return 0;
             }
         };
 
         // Check if config is enabled and has fee settings
-        if !config.enabled || config.processing_fee_rate.is_none() || config.processing_fee_base.is_none() {
+        if !config.enabled
+            || config.processing_fee_rate.is_none()
+            || config.processing_fee_base.is_none()
+        {
             return 0;
         }
 
@@ -102,7 +112,8 @@ impl PricingEngine {
         // => fee = amount * rate / (1 - rate)
         // This ensures we net exactly `amount` after the provider deducts their cut.
         let rate_fraction = rate as f64 / 100.0;
-        let percentage_fee = ((amount as f64) * rate_fraction / (1.0 - rate_fraction)).ceil() as u64;
+        let percentage_fee =
+            ((amount as f64) * rate_fraction / (1.0 - rate_fraction)).ceil() as u64;
 
         // Get base fee, converting currency if needed
         let base_fee_currency = Currency::from_str(base_currency_str).unwrap_or_else(|_| {
@@ -136,7 +147,7 @@ impl PricingEngine {
 
         percentage_fee + base_fee
     }
-    
+
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         rates: Arc<dyn ExchangeRateService>,
@@ -196,7 +207,9 @@ impl PricingEngine {
             new_expiry: vm.expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
             tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
-            processing_fee: self.calculate_processing_fee(company_id, method, cost.currency, input.value()).await,
+            processing_fee: self
+                .calculate_processing_fee(company_id, method, cost.currency, input.value())
+                .await,
         }))
     }
 
@@ -243,10 +256,10 @@ impl PricingEngine {
         } else {
             let scaled_amount = base_cost.amount * intervals as u64;
             let scaled_time = expected_time_value;
-            let scaled_tax = self
-                .get_tax_for_user(vm.user_id, scaled_amount)
-                .await?;
-            let processing_fee = self.calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount).await;
+            let scaled_tax = self.get_tax_for_user(vm.user_id, scaled_amount).await?;
+            let processing_fee = self
+                .calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount)
+                .await;
             Ok(CostResult::New(NewPaymentInfo {
                 amount: scaled_amount,
                 tax: scaled_tax,
@@ -295,7 +308,7 @@ impl PricingEngine {
         // All costs are in smallest currency units (cents/millisats)
         let disk_size_gb = template.disk_size / crate::GB;
         let memory_gb = template.memory / crate::GB;
-        
+
         let disk_cost = disk_size_gb * disk_pricing.cost;
         let cpu_cost = pricing.cpu_cost * template.cpu as u64;
         let memory_cost = pricing.memory_cost * memory_gb;
@@ -318,7 +331,12 @@ impl PricingEngine {
     }
 
     /// Get the renewal cost of a custom VM
-    async fn get_custom_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: u64) -> Result<NewPaymentInfo> {
+    async fn get_custom_vm_cost(
+        &self,
+        vm: &Vm,
+        method: PaymentMethod,
+        company_id: u64,
+    ) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.custom_template_id {
             i
         } else {
@@ -341,7 +359,14 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
-            processing_fee: self.calculate_processing_fee(company_id, method, converted_amount.amount.currency(), converted_amount.amount.value()).await,
+            processing_fee: self
+                .calculate_processing_fee(
+                    company_id,
+                    method,
+                    converted_amount.amount.currency(),
+                    converted_amount.amount.value(),
+                )
+                .await,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -396,7 +421,12 @@ impl PricingEngine {
     }
 
     /// Gets the renewal cost of a standard VM
-    async fn get_template_vm_cost(&self, vm: &Vm, method: PaymentMethod, company_id: u64) -> Result<NewPaymentInfo> {
+    async fn get_template_vm_cost(
+        &self,
+        vm: &Vm,
+        method: PaymentMethod,
+        company_id: u64,
+    ) -> Result<NewPaymentInfo> {
         let template_id = if let Some(i) = vm.template_id {
             i
         } else {
@@ -415,7 +445,14 @@ impl PricingEngine {
             tax: self
                 .get_tax_for_user(vm.user_id, converted_amount.amount.value())
                 .await?,
-            processing_fee: self.calculate_processing_fee(company_id, method, converted_amount.amount.currency(), converted_amount.amount.value()).await,
+            processing_fee: self
+                .calculate_processing_fee(
+                    company_id,
+                    method,
+                    converted_amount.amount.currency(),
+                    converted_amount.amount.value(),
+                )
+                .await,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -428,6 +465,9 @@ impl PricingEngine {
         region_id: u64,
         disk_type: DiskType,
         disk_interface: DiskInterface,
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: &[CpuFeature],
     ) -> Result<VmCustomPricing> {
         // Get custom pricing for the region
         let custom_pricings = self.db.list_custom_pricing(region_id).await?;
@@ -436,6 +476,30 @@ impl PricingEngine {
         for pricing in custom_pricings {
             if !pricing.enabled {
                 continue;
+            }
+
+            // Check CPU manufacturer match (Unknown means any)
+            if cpu_mfg != CpuMfg::Unknown && pricing.cpu_mfg != CpuMfg::Unknown {
+                if pricing.cpu_mfg != cpu_mfg {
+                    continue;
+                }
+            }
+
+            // Check CPU architecture match (Unknown means any)
+            if cpu_arch != CpuArch::Unknown && pricing.cpu_arch != CpuArch::Unknown {
+                if pricing.cpu_arch != cpu_arch {
+                    continue;
+                }
+            }
+
+            // Check that pricing supports all required CPU features (empty list means any)
+            if !cpu_features.is_empty() && !pricing.cpu_features.is_empty() {
+                let has_all_features = cpu_features
+                    .iter()
+                    .all(|f| pricing.cpu_features.contains(f));
+                if !has_all_features {
+                    continue;
+                }
             }
 
             // Check if this pricing supports the required disk type and interface
@@ -468,37 +532,55 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
 
         // find a custom pricing model for the vm
-        let (pricing, cpu, memory, disk, disk_type, disk_interface) =
-            if let Some(template_id) = vm.template_id {
-                let template = self.db.get_vm_template(template_id).await?;
-                (
-                    self.find_custom_pricing(
-                        template.region_id,
-                        template.disk_type,
-                        template.disk_interface,
-                    )
-                    .await?,
-                    template.cpu,
-                    template.memory,
-                    template.disk_size,
+        let (
+            pricing,
+            cpu,
+            memory,
+            disk,
+            disk_type,
+            disk_interface,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features,
+        ) = if let Some(template_id) = vm.template_id {
+            let template = self.db.get_vm_template(template_id).await?;
+            (
+                self.find_custom_pricing(
+                    template.region_id,
                     template.disk_type,
                     template.disk_interface,
+                    template.cpu_mfg.clone(),
+                    template.cpu_arch.clone(),
+                    &template.cpu_features,
                 )
-            } else if let Some(custom_template_id) = vm.custom_template_id {
-                let custom_template = self.db.get_custom_vm_template(custom_template_id).await?;
-                (
-                    self.db
-                        .get_custom_pricing(custom_template.pricing_id)
-                        .await?,
-                    custom_template.cpu,
-                    custom_template.memory,
-                    custom_template.disk_size,
-                    custom_template.disk_type,
-                    custom_template.disk_interface,
-                )
-            } else {
-                bail!("VM must have either a standard template or custom template to upgrade");
-            };
+                .await?,
+                template.cpu,
+                template.memory,
+                template.disk_size,
+                template.disk_type,
+                template.disk_interface,
+                template.cpu_mfg,
+                template.cpu_arch,
+                template.cpu_features,
+            )
+        } else if let Some(custom_template_id) = vm.custom_template_id {
+            let custom_template = self.db.get_custom_vm_template(custom_template_id).await?;
+            (
+                self.db
+                    .get_custom_pricing(custom_template.pricing_id)
+                    .await?,
+                custom_template.cpu,
+                custom_template.memory,
+                custom_template.disk_size,
+                custom_template.disk_type,
+                custom_template.disk_interface,
+                custom_template.cpu_mfg,
+                custom_template.cpu_arch,
+                custom_template.cpu_features,
+            )
+        } else {
+            bail!("VM must have either a standard template or custom template to upgrade");
+        };
 
         // Build the new custom template with upgraded specs
         let new_custom_template = VmCustomTemplate {
@@ -509,6 +591,9 @@ impl PricingEngine {
             disk_type,
             disk_interface,
             pricing_id: pricing.id,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features,
         };
         Ok(new_custom_template)
     }
@@ -732,7 +817,8 @@ mod tests {
     use super::*;
     use crate::{MockDb, MockExchangeRate};
     use lnvps_db::{
-        DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+        CpuMfg, DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing,
+        VmCustomPricingDisk, VmCustomTemplate,
     };
 
     const MOCK_RATE: f32 = 100_000.0;
@@ -773,10 +859,13 @@ mod tests {
                 expires: None,
                 region_id: 1,
                 currency: "EUR".to_string(),
-                cpu_cost: 150,    // €1.50 in cents per CPU core
-                memory_cost: 50,  // €0.50 in cents per GB RAM
-                ip4_cost: 50,     // €0.50 in cents per IPv4
-                ip6_cost: 5,      // €0.05 in cents per IPv6
+                cpu_mfg: Default::default(),
+                cpu_arch: Default::default(),
+                cpu_features: Default::default(),
+                cpu_cost: 150,   // €1.50 in cents per CPU core
+                memory_cost: 50, // €0.50 in cents per GB RAM
+                ip4_cost: 50,    // €0.50 in cents per IPv4
+                ip6_cost: 5,     // €0.05 in cents per IPv6
                 min_cpu: 1,
                 max_cpu: 16,
                 min_memory: 1 * crate::GB,
@@ -794,6 +883,9 @@ mod tests {
                 disk_type: DiskType::SSD,
                 disk_interface: Default::default(),
                 pricing_id: 1,
+                cpu_mfg: Default::default(),
+                cpu_arch: Default::default(),
+                cpu_features: Default::default(),
             },
         );
         let mut d = db.custom_pricing_disk.lock().await;
@@ -804,7 +896,7 @@ mod tests {
                 pricing_id: 1,
                 kind: DiskType::SSD,
                 interface: Default::default(),
-                cost: 5,  // €0.05 in cents per GB disk
+                cost: 5, // €0.05 in cents per GB disk
                 min_disk_size: 5 * crate::GB,
                 max_disk_size: 1 * crate::TB,
             },
@@ -926,7 +1018,10 @@ mod tests {
         let revolut_cut = (order_total as f64 * 0.028).floor() as u64 + 20;
         let net = order_total - revolut_cut;
         assert!(net >= amount, "net {net} must be >= amount {amount}");
-        assert!(net <= amount + 1, "net {net} must not exceed amount {amount} by more than 1 cent");
+        assert!(
+            net <= amount + 1,
+            "net {net} must not exceed amount {amount} by more than 1 cent"
+        );
 
         Ok(())
     }
@@ -1123,6 +1218,9 @@ mod tests {
                     expires: None,
                     region_id: 1,
                     currency: "EUR".to_string(),
+                    cpu_mfg: Default::default(),
+                    cpu_arch: Default::default(),
+                    cpu_features: Default::default(),
                     cpu_cost: 200,    // €2.00 in cents per CPU per month
                     memory_cost: 100, // €1.00 in cents per GB per month
                     ip4_cost: 0,
@@ -1677,7 +1775,7 @@ mod tests {
     async fn test_processing_fees() -> Result<()> {
         let db = MockDb::default();
         let rates = Arc::new(MockExchangeRate::new());
-        
+
         // Set up EUR rate
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -1685,7 +1783,7 @@ mod tests {
         {
             let mut v = db.vms.lock().await;
             v.insert(1, MockDb::mock_vm());
-            
+
             let mut u = db.users.lock().await;
             u.insert(
                 1,
@@ -1708,7 +1806,10 @@ mod tests {
         let price_lightning = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
         match price_lightning {
             CostResult::New(payment_info) => {
-                assert_eq!(0, payment_info.processing_fee, "Lightning should have no processing fee");
+                assert_eq!(
+                    0, payment_info.processing_fee,
+                    "Lightning should have no processing fee"
+                );
             }
             _ => bail!("Expected new payment"),
         }
@@ -1720,16 +1821,15 @@ mod tests {
                 let plan = MockDb::mock_cost_plan();
                 // plan.amount is already in cents (132 cents = €1.32)
                 let expected_amount_cents = plan.amount;
-                
+
                 // Processing fee gross-up: ensure we net exactly `amount` after provider takes 2.8%
                 // percentage: ceil(132 * 0.028 / 0.972) = ceil(3.804) = 4 cents
                 // flat:       ceil(20  / 0.972)         = ceil(20.576) = 21 cents
                 // total = 25 cents
                 let expected_fee = 25u64;
-                
+
                 assert_eq!(
-                    expected_fee, 
-                    payment_info.processing_fee,
+                    expected_fee, payment_info.processing_fee,
                     "Revolut processing fee should be 2.8% + 0.20 EUR"
                 );
                 assert_eq!(Currency::EUR, payment_info.currency, "Should be EUR");
@@ -1737,6 +1837,275 @@ mod tests {
             _ => bail!("Expected new payment"),
         }
 
+        Ok(())
+    }
+
+    // ── CPU filtering tests for find_custom_pricing ──────────────────────────
+
+    use lnvps_db::{CpuArch, CpuFeature, DiskInterface, Vm};
+
+    /// Helper to insert a custom pricing with specific CPU requirements
+    async fn insert_pricing_with_cpu(
+        db: &MockDb,
+        id: u64,
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: Vec<CpuFeature>,
+    ) {
+        let mut p = db.custom_pricing.lock().await;
+        p.insert(
+            id,
+            VmCustomPricing {
+                id,
+                name: format!("pricing-{}", id),
+                enabled: true,
+                created: Utc::now(),
+                expires: None,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_mfg,
+                cpu_arch,
+                cpu_features: cpu_features.into(),
+                cpu_cost: 150,
+                memory_cost: 50,
+                ip4_cost: 50,
+                ip6_cost: 5,
+                min_cpu: 1,
+                max_cpu: 16,
+                min_memory: crate::GB,
+                max_memory: 64 * crate::GB,
+            },
+        );
+        let mut d = db.custom_pricing_disk.lock().await;
+        d.insert(
+            id,
+            VmCustomPricingDisk {
+                id,
+                pricing_id: id,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                cost: 5,
+                min_disk_size: crate::GB,
+                max_disk_size: crate::TB,
+            },
+        );
+    }
+
+    /// Helper to update the mock template's CPU fields
+    async fn set_template_cpu(
+        db: &MockDb,
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: Vec<CpuFeature>,
+    ) {
+        let mut t = db.templates.lock().await;
+        if let Some(template) = t.get_mut(&1) {
+            template.cpu_mfg = cpu_mfg;
+            template.cpu_arch = cpu_arch;
+            template.cpu_features = cpu_features.into();
+        }
+    }
+
+    /// Helper to insert a VM pointing at template 1
+    async fn insert_vm_for_template(db: &MockDb) -> u64 {
+        let user_id = db.upsert_user(&[0u8; 32]).await.unwrap();
+        let mut ssh_keys = db.user_ssh_keys.lock().await;
+        ssh_keys.insert(
+            1,
+            lnvps_db::UserSshKey {
+                id: 1,
+                user_id,
+                name: "test".to_string(),
+                key_data: "ssh-rsa AAA".into(),
+                created: Utc::now(),
+            },
+        );
+        drop(ssh_keys);
+
+        let mut vms = db.vms.lock().await;
+        let vm_id = 1;
+        vms.insert(
+            vm_id,
+            Vm {
+                id: vm_id,
+                host_id: 1,
+                user_id,
+                image_id: 1,
+                template_id: Some(1),
+                custom_template_id: None,
+                ssh_key_id: 1,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                expires: Utc::now() + TimeDelta::days(30),
+                ..Default::default()
+            },
+        );
+        vm_id
+    }
+
+    /// find_custom_pricing should match pricing with Unknown cpu_mfg to any template
+    #[tokio::test]
+    async fn test_find_custom_pricing_unknown_mfg_matches() -> Result<()> {
+        let db = MockDb::default();
+        insert_pricing_with_cpu(&db, 1, CpuMfg::Unknown, CpuArch::Unknown, vec![]).await;
+        set_template_cpu(&db, CpuMfg::Intel, CpuArch::X86_64, vec![]).await;
+        let vm_id = insert_vm_for_template(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let cfg = crate::UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = pe.create_upgrade_template(vm_id, &cfg).await;
+        assert!(result.is_ok(), "Should find pricing with Unknown cpu_mfg");
+        assert_eq!(result.unwrap().pricing_id, 1);
+        Ok(())
+    }
+
+    /// find_custom_pricing should match pricing with matching cpu_mfg
+    #[tokio::test]
+    async fn test_find_custom_pricing_matching_mfg() -> Result<()> {
+        let db = MockDb::default();
+        insert_pricing_with_cpu(&db, 1, CpuMfg::Intel, CpuArch::Unknown, vec![]).await;
+        set_template_cpu(&db, CpuMfg::Intel, CpuArch::X86_64, vec![]).await;
+        let vm_id = insert_vm_for_template(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let cfg = crate::UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = pe.create_upgrade_template(vm_id, &cfg).await;
+        assert!(
+            result.is_ok(),
+            "Should find pricing with matching Intel cpu_mfg"
+        );
+        assert_eq!(result.unwrap().pricing_id, 1);
+        Ok(())
+    }
+
+    /// find_custom_pricing should skip pricing with mismatched cpu_mfg
+    #[tokio::test]
+    async fn test_find_custom_pricing_mismatched_mfg_skipped() -> Result<()> {
+        let db = MockDb::default();
+        // Pricing requires AMD, template is Intel
+        insert_pricing_with_cpu(&db, 1, CpuMfg::Amd, CpuArch::Unknown, vec![]).await;
+        set_template_cpu(&db, CpuMfg::Intel, CpuArch::X86_64, vec![]).await;
+        let vm_id = insert_vm_for_template(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let cfg = crate::UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = pe.create_upgrade_template(vm_id, &cfg).await;
+        assert!(
+            result.is_err(),
+            "Should not find pricing with mismatched cpu_mfg"
+        );
+        Ok(())
+    }
+
+    /// find_custom_pricing should select the first compatible pricing by CPU
+    #[tokio::test]
+    async fn test_find_custom_pricing_selects_first_compatible() -> Result<()> {
+        let db = MockDb::default();
+        // First pricing: AMD only (incompatible)
+        insert_pricing_with_cpu(&db, 1, CpuMfg::Amd, CpuArch::Unknown, vec![]).await;
+        // Second pricing: Intel (compatible)
+        insert_pricing_with_cpu(&db, 2, CpuMfg::Intel, CpuArch::Unknown, vec![]).await;
+        set_template_cpu(&db, CpuMfg::Intel, CpuArch::X86_64, vec![]).await;
+        let vm_id = insert_vm_for_template(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let cfg = crate::UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = pe.create_upgrade_template(vm_id, &cfg).await;
+        assert!(result.is_ok(), "Should find second pricing");
+        assert_eq!(result.unwrap().pricing_id, 2, "Should select Intel pricing");
+        Ok(())
+    }
+
+    /// find_custom_pricing should filter by cpu_arch
+    #[tokio::test]
+    async fn test_find_custom_pricing_arch_filtering() -> Result<()> {
+        let db = MockDb::default();
+        // Pricing requires ARM64, template is X86_64
+        insert_pricing_with_cpu(&db, 1, CpuMfg::Unknown, CpuArch::ARM64, vec![]).await;
+        set_template_cpu(&db, CpuMfg::Intel, CpuArch::X86_64, vec![]).await;
+        let vm_id = insert_vm_for_template(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let cfg = crate::UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = pe.create_upgrade_template(vm_id, &cfg).await;
+        assert!(
+            result.is_err(),
+            "Should not find pricing with mismatched cpu_arch"
+        );
+        Ok(())
+    }
+
+    /// find_custom_pricing should filter by cpu_features
+    #[tokio::test]
+    async fn test_find_custom_pricing_features_filtering() -> Result<()> {
+        let db = MockDb::default();
+        // Pricing requires AVX512F, template only has AVX2
+        insert_pricing_with_cpu(
+            &db,
+            1,
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            vec![CpuFeature::AVX512F],
+        )
+        .await;
+        set_template_cpu(
+            &db,
+            CpuMfg::Intel,
+            CpuArch::X86_64,
+            vec![CpuFeature::AVX, CpuFeature::AVX2],
+        )
+        .await;
+        let vm_id = insert_vm_for_template(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let rates = Arc::new(MockExchangeRate::new());
+        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+
+        let cfg = crate::UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = pe.create_upgrade_template(vm_id, &cfg).await;
+        assert!(
+            result.is_err(),
+            "Should not find pricing when template lacks required features"
+        );
         Ok(())
     }
 }

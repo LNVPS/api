@@ -1,6 +1,7 @@
 use crate::host::{FullVmInfo, get_host_client};
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
+use crate::ssh_client::SshClient;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Days, Utc};
 use hickory_resolver::TokioResolver;
@@ -15,14 +16,75 @@ use lnvps_api_common::{
     WorkFeedback, WorkJob, WorkJobMessage, op_fatal,
     retry::{OpError, Pipeline, RetryPolicy},
 };
-use lnvps_db::{LNVpsDb, Vm, VmHost, VmIpAssignment};
+use lnvps_db::{CpuArch, CpuFeature, CpuMfg, LNVpsDb, Vm, VmHost, VmIpAssignment};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+
+/// Name of the host-info binary for x86_64 (expected in same directory as current executable)
+const HOST_INFO_BINARY_NAME_X86_64: &str = "lnvps-host-info";
+/// Name of the host-info binary for arm64 (expected in same directory as current executable)
+const HOST_INFO_BINARY_NAME_ARM64: &str = "lnvps-host-info-arm64";
+/// Remote path where the binary will be uploaded and executed on hosts
+const HOST_INFO_REMOTE_PATH: &str = "/tmp/lnvps-host-info";
+
+/// Get the path to the host-info binary for x86_64 (in same directory as current executable)
+fn get_host_info_path() -> Option<std::path::PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let exe_dir = current_exe.parent()?;
+    Some(exe_dir.join(HOST_INFO_BINARY_NAME_X86_64))
+}
+
+/// Get the path to the host-info binary for the specified architecture
+fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let exe_dir = current_exe.parent()?;
+    let binary_name = match arch {
+        CpuArch::ARM64 => HOST_INFO_BINARY_NAME_ARM64,
+        _ => HOST_INFO_BINARY_NAME_X86_64, // Default to x86_64
+    };
+    Some(exe_dir.join(binary_name))
+}
+
+/// Extract hostname/IP from a URL or return the input if it's already a plain host
+/// e.g. "https://192.168.1.1:8006/" -> "192.168.1.1"
+///      "192.168.1.1" -> "192.168.1.1"
+fn extract_host_from_url(input: &str) -> String {
+    // Strip protocol prefix if present
+    let without_protocol = input
+        .strip_prefix("https://")
+        .or_else(|| input.strip_prefix("http://"))
+        .unwrap_or(input);
+    
+    // Take everything before the first ':' or '/' (to strip port and path)
+    without_protocol
+        .split(|c| c == ':' || c == '/')
+        .next()
+        .unwrap_or(input)
+        .to_string()
+}
+
+/// Host info output from lnvps-host-info utility
+#[derive(Debug, Deserialize)]
+struct HostInfoOutput {
+    cpu_mfg: String,
+    cpu_arch: String,
+    cpu_features: Vec<String>,
+    #[allow(dead_code)]
+    cpu_model: Option<String>,
+    #[allow(dead_code)]
+    gpu_mfg: String,
+    #[allow(dead_code)]
+    gpu_model: Option<String>,
+    #[allow(dead_code)]
+    gpu_features: Vec<String>,
+}
 
 /// Primary background worker logic
 /// Handles deleting expired VMs and sending notifications
@@ -641,6 +703,21 @@ impl Worker {
             }
         }
 
+        // Run host-info utility to detect CPU/GPU features (only if binary exists)
+        match get_host_info_path() {
+            Some(p) if p.exists() => {
+                if let Err(e) = self.run_host_info(host).await {
+                    warn!("Failed to run host-info on {}: {:?}", host.name, e);
+                }
+            }
+            _ => {
+                warn!(
+                    "Host-info detection disabled: binary not found (expected at {:?})",
+                    get_host_info_path()
+                );
+            }
+        }
+
         // Patch firewall configuration for all VMs on this host
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
@@ -657,6 +734,130 @@ impl Worker {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Install and run lnvps-host-info on a host to detect CPU/GPU features
+    async fn run_host_info(&self, host: &mut VmHost) -> Result<()> {
+        // Check if SSH credentials are configured
+        let ssh_key = match &host.ssh_key {
+            Some(key) => key.as_str().to_string(),
+            None => {
+                warn!("No SSH key configured for host {}, skipping host-info", host.name);
+                return Ok(());
+            }
+        };
+        let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
+
+        // Extract hostname/IP from the host.ip field (may be a URL like https://1.2.3.4:8006/)
+        let ssh_host = extract_host_from_url(&host.ip);
+
+        // Connect to host via SSH
+        let mut ssh = SshClient::new()?;
+        ssh.connect_with_key(
+            (ssh_host.as_str(), 22),
+            ssh_user,
+            &ssh_key,
+        )
+        .await
+        .with_context(|| format!("Failed to SSH connect to host {} ({}@{}:22)", host.name, ssh_user, ssh_host))?;
+
+        // Detect the host's architecture via uname -m
+        let (exit_code, arch_output) = ssh
+            .execute("uname -m")
+            .await
+            .with_context(|| format!("Failed to detect architecture on host {}", host.name))?;
+
+        if exit_code != 0 {
+            bail!("uname -m failed with exit code {} on {}", exit_code, host.name);
+        }
+
+        let remote_arch = match arch_output.trim() {
+            "x86_64" | "amd64" => CpuArch::X86_64,
+            "aarch64" | "arm64" => CpuArch::ARM64,
+            other => {
+                warn!("Unknown architecture '{}' on host {}, skipping host-info", other, host.name);
+                return Ok(());
+            }
+        };
+
+        // Select the correct binary based on the detected architecture
+        let binary_path = get_host_info_path_for_arch(remote_arch)
+            .with_context(|| "Failed to get host-info binary path")?;
+
+        // Check if the binary exists for this architecture
+        if !binary_path.exists() {
+            warn!(
+                "Host-info binary for {:?} not found at {:?}, skipping host {}",
+                remote_arch, binary_path, host.name
+            );
+            return Ok(());
+        }
+
+        // Read the local binary
+        let binary_data = std::fs::read(&binary_path)
+            .with_context(|| format!("Failed to read host-info binary from {:?}", binary_path))?;
+
+        // Upload the binary
+        ssh.scp_upload(
+            &binary_data,
+            Path::new(HOST_INFO_REMOTE_PATH),
+            0o755,
+        )
+        .with_context(|| format!("Failed to upload host-info to {}", host.name))?;
+
+        info!("Uploaded host-info to {}", host.name);
+
+        // Execute the binary and capture output
+        let (exit_code, output) = ssh
+            .execute(HOST_INFO_REMOTE_PATH)
+            .await
+            .with_context(|| format!("Failed to execute host-info on {}", host.name))?;
+
+        if exit_code != 0 {
+            bail!("host-info exited with code {} on {}: {}", exit_code, host.name, output);
+        }
+
+        // Parse the JSON output
+        let host_info: HostInfoOutput = serde_json::from_str(&output)
+            .with_context(|| format!("Failed to parse host-info output from {}", host.name))?;
+
+        // Update host with detected features
+        let cpu_mfg = match host_info.cpu_mfg.as_str() {
+            "intel" => CpuMfg::Intel,
+            "amd" => CpuMfg::Amd,
+            "apple" => CpuMfg::Apple,
+            _ => CpuMfg::Unknown,
+        };
+
+        let cpu_arch = match host_info.cpu_arch.as_str() {
+            "x86_64" => CpuArch::X86_64,
+            "arm64" => CpuArch::ARM64,
+            _ => CpuArch::Unknown,
+        };
+
+        // Parse CPU features
+        let cpu_features: Vec<CpuFeature> = host_info
+            .cpu_features
+            .iter()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+
+        let features_changed = host.cpu_mfg != cpu_mfg
+            || host.cpu_arch != cpu_arch
+            || host.cpu_features.0 != cpu_features;
+
+        if features_changed {
+            host.cpu_mfg = cpu_mfg;
+            host.cpu_arch = cpu_arch;
+            host.cpu_features = cpu_features.into();
+            self.db.update_host(host).await?;
+            info!(
+                "Updated host {} CPU info: mfg={:?}, arch={:?}, features={:?}",
+                host.name, host.cpu_mfg, host.cpu_arch, host.cpu_features
+            );
         }
 
         Ok(())

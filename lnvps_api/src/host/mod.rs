@@ -78,7 +78,7 @@ pub trait VmHostClient: Send + Sync {
     ) -> OpResult<Vec<TimeSeriesData>>;
 
     /// Connect to terminal serial port
-    async fn connect_terminal(&self, vm: &Vm, host: &VmHost) -> OpResult<TerminalStream>;
+    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream>;
 }
 
 pub async fn get_vm_host_client(
@@ -282,6 +282,9 @@ mod tests {
             created: Default::default(),
             expires: None,
             cpu: 2,
+            cpu_mfg: Default::default(),
+            cpu_arch: Default::default(),
+            cpu_features: Default::default(),
             memory: 2 * GB,
             disk_size: 100 * GB,
             disk_type: DiskType::SSD,
@@ -313,6 +316,9 @@ mod tests {
                 name: "mock".to_string(),
                 ip: "https://localhost:8006".to_string(),
                 cpu: 20,
+                cpu_mfg: Default::default(),
+                cpu_arch: Default::default(),
+                cpu_features: Default::default(),
                 memory: 128 * GB,
                 enabled: true,
                 api_token: "mock".into(),
@@ -320,6 +326,8 @@ mod tests {
                 load_memory: 1.0,
                 load_disk: 1.0,
                 vlan_id: Some(100),
+                ssh_user: None,
+                ssh_key: None,
             },
             disk: VmHostDisk {
                 id: 1,

@@ -144,7 +144,7 @@ async fn v1_create_subscription(
 
     // Calculate total setup fee and recurring amount
     let mut total_setup_fee = 0u64;
-    let mut _total_recurring_amount = 0u64;
+    let mut total_recurring_amount = 0u64;
     let mut line_items_to_create = Vec::new();
     let mut derived_company_id: Option<u64> = None;
 
@@ -179,7 +179,7 @@ async fn v1_create_subscription(
                 }
 
                 total_setup_fee += pricing.setup_fee as u64;
-                _total_recurring_amount += pricing.price_per_month as u64;
+                total_recurring_amount += pricing.price_per_month as u64;
 
                 line_items_to_create.push((
                     format!("IP Range: /{} from {}", pricing.prefix_size, ip_space.cidr),

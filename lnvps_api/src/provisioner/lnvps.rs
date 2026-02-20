@@ -230,11 +230,11 @@ impl LNVpsProvisioner {
         );
 
         // Parse NWC connection string
-        let nwc_uri = nwc::prelude::NostrWalletConnectUri::from_str(nwc_connection_string)
+        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
             .context("Invalid NWC connection string")?;
 
         // Create nostr client for NWC
-        let client = nwc::NostrWalletConnect::new(nwc_uri);
+        let client = nwc::NWC::new(nwc_uri);
         client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
         info!("Successful NWC auto-renewal payment for VM {}", vm_id);
         Ok(vm_payment)
@@ -325,7 +325,7 @@ impl LNVpsProvisioner {
 
         // Parse subscription currency
         let subscription_currency = Currency::from_str(&subscription.currency)
-            .map_err(|_e| anyhow::anyhow!("Invalid currency"))?;
+            .map_err(|e| anyhow::anyhow!("Invalid currency"))?;
         let list_price = CurrencyAmount::from_u64(subscription_currency, list_price_amount);
 
         // Create pricing engine for currency conversion
@@ -343,9 +343,16 @@ impl LNVpsProvisioner {
         let tax = pe
             .get_tax_for_user(user.id, converted.amount.value())
             .await?;
-        
+
         // Calculate processing fee using subscription's company_id
-        let processing_fee = pe.calculate_processing_fee(subscription.company_id, method, converted.amount.currency(), converted.amount.value()).await;
+        let processing_fee = pe
+            .calculate_processing_fee(
+                subscription.company_id,
+                method,
+                converted.amount.currency(),
+                converted.amount.value(),
+            )
+            .await;
 
         // Generate payment based on method
         let subscription_payment = match method {
@@ -532,7 +539,10 @@ impl LNVpsProvisioner {
                         let order = rev
                             .create_order(
                                 &desc,
-                                CurrencyAmount::from_u64(p.currency, p.amount + p.tax + p.processing_fee),
+                                CurrencyAmount::from_u64(
+                                    p.currency,
+                                    p.amount + p.tax + p.processing_fee,
+                                ),
                                 None,
                             )
                             .await?;
@@ -809,7 +819,7 @@ impl LNVpsProvisioner {
             rate: cost_difference.upgrade.rate,
             time_value: 0, //upgrades dont add time
             new_expiry: Default::default(),
-            tax: 0, // No tax on upgrades for now
+            tax: 0,            // No tax on upgrades for now
             processing_fee: 0, // No processing fee on upgrades for now
         };
         let upgrade_params_json = serde_json::to_string(cfg)?;
@@ -879,6 +889,9 @@ impl LNVpsProvisioner {
             disk_type: current_template.disk_type,
             disk_interface: current_template.disk_interface,
             pricing_id: custom_pricing.id,
+            cpu_mfg: current_template.cpu_mfg.clone(),
+            cpu_arch: current_template.cpu_arch.clone(),
+            cpu_features: current_template.cpu_features.clone(),
         };
 
         // Validate the upgrade (ensure we're not downgrading)
@@ -1053,10 +1066,10 @@ mod tests {
     use super::*;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
-    use lnvps_api_common::{InMemoryRateCache, MockDb, MockExchangeRate, Ticker};
+    use lnvps_api_common::{GB, InMemoryRateCache, MockDb, MockExchangeRate, TB, Ticker};
     use lnvps_db::{
         AccessPolicy, DiskInterface, DiskType, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
-        UserSshKey, VmTemplate,
+        UserSshKey, VmCustomPricing, VmCustomPricingDisk, VmTemplate,
     };
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -1272,8 +1285,11 @@ mod tests {
             created: Default::default(),
             expires: None,
             cpu: 64,
-            memory: 512 * lnvps_api_common::GB,
-            disk_size: 20 * lnvps_api_common::TB,
+            cpu_mfg: Default::default(),
+            cpu_arch: Default::default(),
+            cpu_features: Default::default(),
+            memory: 512 * GB,
+            disk_size: 20 * TB,
             disk_type: DiskType::SSD,
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,
@@ -1289,6 +1305,373 @@ mod tests {
             println!("{}", e);
             assert!(e.to_string().to_lowercase().contains("no available host"))
         }
+        Ok(())
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Build a minimal provisioner backed by the given MockDb (no DNS, no rates needed).
+    fn make_provisioner(db: Arc<MockDb>) -> LNVpsProvisioner {
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        LNVpsProvisioner::new(mock_settings(), db, node, rates, None)
+    }
+
+    /// Insert a VmCustomPricing + one VmCustomPricingDisk into db and return the pricing id.
+    async fn insert_custom_pricing(
+        db: &MockDb,
+        disk_type: DiskType,
+        disk_interface: DiskInterface,
+    ) -> Result<u64> {
+        let mut pricing_map = db.custom_pricing.lock().await;
+        let pricing_id = pricing_map.keys().max().unwrap_or(&0) + 1;
+        pricing_map.insert(
+            pricing_id,
+            VmCustomPricing {
+                id: pricing_id,
+                name: "test-pricing".to_string(),
+                enabled: true,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_cost: 100,
+                memory_cost: 50,
+                ip4_cost: 150,
+                ip6_cost: 5,
+                min_cpu: 1,
+                max_cpu: 32,
+                min_memory: GB,
+                max_memory: 128 * GB,
+                ..Default::default()
+            },
+        );
+        drop(pricing_map);
+
+        let mut disk_map = db.custom_pricing_disk.lock().await;
+        let disk_id = disk_map.keys().max().unwrap_or(&0) + 1;
+        disk_map.insert(
+            disk_id,
+            VmCustomPricingDisk {
+                id: disk_id,
+                pricing_id,
+                kind: disk_type,
+                interface: disk_interface,
+                cost: 5,
+                min_disk_size: GB,
+                max_disk_size: 10 * TB,
+            },
+        );
+        Ok(pricing_id)
+    }
+
+    /// Insert a VM that uses the default mock standard template (template_id = 1).
+    async fn insert_standard_template_vm(db: &Arc<MockDb>) -> Result<u64> {
+        let (user, ssh_key) = add_user(db).await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: Some(1),
+                custom_template_id: None,
+                ssh_key_id: ssh_key.id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+        Ok(vm_id)
+    }
+
+    // ── create_upgrade_template tests ────────────────────────────────────────
+
+    /// CPU-only upgrade: new_cpu is applied; memory and disk come from the template.
+    #[tokio::test]
+    async fn test_create_upgrade_template_cpu_upgrade() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+
+        assert_eq!(new_tpl.cpu, 4, "cpu should be upgraded value");
+        assert_eq!(
+            new_tpl.memory, template.memory,
+            "memory should be unchanged"
+        );
+        assert_eq!(
+            new_tpl.disk_size, template.disk_size,
+            "disk should be unchanged"
+        );
+        assert_eq!(new_tpl.disk_type, template.disk_type);
+        assert_eq!(new_tpl.disk_interface, template.disk_interface);
+        assert_eq!(new_tpl.pricing_id, pricing_id);
+        Ok(())
+    }
+
+    /// Memory-only upgrade: new_memory is applied; cpu and disk come from the template.
+    #[tokio::test]
+    async fn test_create_upgrade_template_memory_upgrade() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        let cfg = UpgradeConfig {
+            new_cpu: None,
+            new_memory: Some(8 * GB),
+            new_disk: None,
+        };
+        let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+
+        assert_eq!(new_tpl.cpu, template.cpu, "cpu should be unchanged");
+        assert_eq!(new_tpl.memory, 8 * GB, "memory should be upgraded value");
+        assert_eq!(
+            new_tpl.disk_size, template.disk_size,
+            "disk should be unchanged"
+        );
+        assert_eq!(new_tpl.pricing_id, pricing_id);
+        Ok(())
+    }
+
+    /// Disk-only upgrade: new_disk is applied; cpu and memory come from the template.
+    #[tokio::test]
+    async fn test_create_upgrade_template_disk_upgrade() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        let cfg = UpgradeConfig {
+            new_cpu: None,
+            new_memory: None,
+            new_disk: Some(128 * GB),
+        };
+        let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+
+        assert_eq!(new_tpl.cpu, template.cpu, "cpu should be unchanged");
+        assert_eq!(
+            new_tpl.memory, template.memory,
+            "memory should be unchanged"
+        );
+        assert_eq!(new_tpl.disk_size, 128 * GB, "disk should be upgraded value");
+        assert_eq!(new_tpl.pricing_id, pricing_id);
+        Ok(())
+    }
+
+    /// All fields upgraded together.
+    #[tokio::test]
+    async fn test_create_upgrade_template_all_fields() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(8),
+            new_memory: Some(16 * GB),
+            new_disk: Some(256 * GB),
+        };
+        let (_, _, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+
+        assert_eq!(new_tpl.cpu, 8);
+        assert_eq!(new_tpl.memory, 16 * GB);
+        assert_eq!(new_tpl.disk_size, 256 * GB);
+        assert_eq!(new_tpl.pricing_id, pricing_id);
+        Ok(())
+    }
+
+    /// All UpgradeConfig fields None: every prop must be copied from the current template.
+    #[tokio::test]
+    async fn test_create_upgrade_template_no_changes() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        let cfg = UpgradeConfig {
+            new_cpu: None,
+            new_memory: None,
+            new_disk: None,
+        };
+        let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+
+        assert_eq!(new_tpl.cpu, template.cpu);
+        assert_eq!(new_tpl.memory, template.memory);
+        assert_eq!(new_tpl.disk_size, template.disk_size);
+        assert_eq!(new_tpl.disk_type, template.disk_type);
+        assert_eq!(new_tpl.disk_interface, template.disk_interface);
+        Ok(())
+    }
+
+    /// Error: VM has a custom template instead of a standard template.
+    #[tokio::test]
+    async fn test_create_upgrade_template_custom_template_vm_errors() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+
+        let (user, ssh_key) = add_user(&db).await?;
+        let custom_tpl_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 2 * GB,
+                disk_size: 64 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ..Default::default()
+            })
+            .await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(custom_tpl_id),
+                ssh_key_id: ssh_key.id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:f0".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+
+        let prov = make_provisioner(db);
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = prov.create_upgrade_template(vm_id, &cfg).await;
+        assert!(result.is_err(), "should fail for custom-template VMs");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("standard template"),
+            "error should mention standard template"
+        );
+        Ok(())
+    }
+
+    /// Error: attempting to downgrade CPU.
+    #[tokio::test]
+    async fn test_create_upgrade_template_cpu_downgrade_errors() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        // Mock template has cpu = 2; requesting 1 is a downgrade.
+        let cfg = UpgradeConfig {
+            new_cpu: Some(1),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = prov.create_upgrade_template(vm_id, &cfg).await;
+        assert!(result.is_err(), "should fail for CPU downgrade");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("downgrade"),
+            "error should mention downgrade"
+        );
+        Ok(())
+    }
+
+    /// Error: attempting to downgrade memory.
+    #[tokio::test]
+    async fn test_create_upgrade_template_memory_downgrade_errors() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        // Mock template has memory = 2 GB; requesting 1 GB is a downgrade.
+        let cfg = UpgradeConfig {
+            new_cpu: None,
+            new_memory: Some(GB),
+            new_disk: None,
+        };
+        let result = prov.create_upgrade_template(vm_id, &cfg).await;
+        assert!(result.is_err(), "should fail for memory downgrade");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("downgrade"),
+            "error should mention downgrade"
+        );
+        Ok(())
+    }
+
+    /// Error: attempting to downgrade disk.
+    #[tokio::test]
+    async fn test_create_upgrade_template_disk_downgrade_errors() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        // Mock template has disk_size = 64 GB; requesting 32 GB is a downgrade.
+        let cfg = UpgradeConfig {
+            new_cpu: None,
+            new_memory: None,
+            new_disk: Some(32 * GB),
+        };
+        let result = prov.create_upgrade_template(vm_id, &cfg).await;
+        assert!(result.is_err(), "should fail for disk downgrade");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("downgrade"),
+            "error should mention downgrade"
+        );
+        Ok(())
+    }
+
+    /// Error: no custom pricing available that matches the template's disk type/interface.
+    #[tokio::test]
+    async fn test_create_upgrade_template_no_compatible_pricing_errors() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Insert pricing for HDD/SATA only — incompatible with the mock template (SSD/PCIe).
+        insert_custom_pricing(&*db, DiskType::HDD, DiskInterface::SATA).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db);
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        let result = prov.create_upgrade_template(vm_id, &cfg).await;
+        assert!(
+            result.is_err(),
+            "should fail when no compatible pricing exists"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("no custom pricing"),
+            "error should mention missing custom pricing"
+        );
         Ok(())
     }
 }

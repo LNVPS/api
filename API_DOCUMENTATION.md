@@ -10,6 +10,23 @@ This document provides comprehensive API specifications for generating TypeScrip
 - **Error Response Format**: `{ "error": "Error message" }`
 - **Success Response Format**: `{ "data": <response_data> }`
 
+## Enums
+
+**DiskType**: `"hdd"`, `"ssd"`
+**DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
+**VmState**: `"running"`, `"stopped"`, `"pending"`, `"error"`, `"unknown"`
+**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**OsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
+`"redhatenterprise"`
+**CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
+**CpuArch**: `"unknown"`, `"x86_64"`, `"arm64"`
+**CpuFeature**: `"SSE"`, `"SSE2"`, `"SSE3"`, `"SSSE3"`, `"SSE4_1"`, `"SSE4_2"`, `"AVX"`, `"AVX2"`, `"FMA"`, `"F16C"`,
+`"AVX512F"`, `"AVX512VNNI"`, `"AVX512BF16"`, `"AVXVNNI"`, `"NEON"`, `"SVE"`, `"SVE2"`, `"AES"`, `"SHA"`, `"SHA512"`,
+`"PCLMULQDQ"`, `"RNG"`, `"GFNI"`, `"VAES"`, `"VPCLMULQDQ"`, `"VMX"`, `"NestedVirt"`, `"AMX"`, `"SME"`, `"SGX"`, `"SEV"`,
+`"TDX"`, `"EncodeH264"`, `"EncodeHEVC"`, `"EncodeAV1"`, `"EncodeVP9"`, `"EncodeJPEG"`, `"DecodeH264"`, `"DecodeHEVC"`,
+`"DecodeAV1"`, `"DecodeVP9"`, `"DecodeJPEG"`, `"DecodeMPEG2"`, `"DecodeVC1"`, `"VideoScaling"`, `"VideoDeinterlace"`,
+`"VideoCSC"`, `"VideoComposition"`
+
 ## Authentication Types
 
 ```typescript
@@ -69,6 +86,9 @@ interface VmTemplate {
   created: string; // ISO 8601 datetime
   expires?: string; // ISO 8601 datetime
   cpu: number; // Number of CPU cores
+  cpu_mfg?: string; // CPU manufacturer (e.g. "intel", "amd"; omitted if unknown)
+  cpu_arch?: string; // CPU architecture (e.g. "x86_64", "arm64"; omitted if unknown)
+  cpu_features?: string[]; // Required CPU features (e.g. ["AVX2", "AES"]; omitted if empty)
   memory: number; // Memory in bytes
   disk_size: number; // Disk size in bytes
   disk_type: 'hdd' | 'ssd';
@@ -120,6 +140,9 @@ interface CustomTemplateParams {
   id: number;
   name: string;
   region: VmHostRegion;
+  cpu_mfg?: string; // CPU manufacturer (e.g. "intel", "amd"; omitted if unknown)
+  cpu_arch?: string; // CPU architecture (e.g. "x86_64", "arm64"; omitted if unknown)
+  cpu_features?: string[]; // Required CPU features (e.g. ["AVX2", "AES"]; omitted if empty)
   max_cpu: number;
   min_cpu: number;
   min_memory: number; // In bytes

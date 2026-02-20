@@ -90,7 +90,6 @@ impl VmStateCacheBackend for LocalVmStateCache {
 /// Redis-backed cache backend
 #[derive(Clone)]
 pub struct RedisVmStateCache {
-    #[allow(dead_code)]
     client: redis::Client,
     conn: MultiplexedConnection,
     ttl: Duration,

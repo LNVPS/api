@@ -4,8 +4,8 @@ use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
-    DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost, VmHostDisk,
-    VmIpAssignment, VmTemplate,
+    CpuArch, CpuMfg, DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate,
+    VmHost, VmHostDisk, VmIpAssignment, VmTemplate,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -102,9 +102,35 @@ impl HostCapacityService {
 
         // Now apply the calculated limits to each template in place
         for template in &mut templates {
-            let hosts_in_region = caps
-                .iter()
-                .filter(|c| c.host.region_id == template.region.id);
+            // Filter hosts by region and CPU requirements
+            let hosts_in_region = caps.iter().filter(|c| {
+                if c.host.region_id != template.region.id {
+                    return false;
+                }
+                // Check CPU manufacturer match (None means any)
+                if let Some(ref mfg) = template.cpu_mfg {
+                    if c.host.cpu_mfg != CpuMfg::Unknown && c.host.cpu_mfg.to_string() != *mfg {
+                        return false;
+                    }
+                }
+                // Check CPU architecture match (None means any)
+                if let Some(ref arch) = template.cpu_arch {
+                    if c.host.cpu_arch != CpuArch::Unknown && c.host.cpu_arch.to_string() != *arch {
+                        return false;
+                    }
+                }
+                // Check CPU features (empty list means any)
+                if !template.cpu_features.is_empty() {
+                    let has_all = template
+                        .cpu_features
+                        .iter()
+                        .all(|f| c.host.cpu_features.iter().any(|hf| hf.to_string() == *f));
+                    if !has_all {
+                        return false;
+                    }
+                }
+                true
+            });
             let max_cpu = hosts_in_region
                 .clone()
                 .map(|h| h.available_cpu())
@@ -339,7 +365,23 @@ impl HostCapacity {
 
     /// Can this host and its available capacity accommodate the given template
     pub fn can_accommodate(&self, template: &impl Template) -> bool {
-        self.available_cpu() >= template.cpu()
+        // Check cpu manufacturer match (Unknown means any)
+        let mfg_ok = template.cpu_mfg() == CpuMfg::Unknown
+            || self.host.cpu_mfg == template.cpu_mfg();
+        // Check cpu architecture match (Unknown means any)
+        let arch_ok = template.cpu_arch() == CpuArch::Unknown
+            || self.host.cpu_arch == template.cpu_arch();
+        // Check that the host has all required CPU features (empty list means any)
+        let features_ok = template.cpu_features().is_empty()
+            || template
+                .cpu_features()
+                .iter()
+                .all(|f| self.host.cpu_features.contains(f));
+
+        mfg_ok
+            && arch_ok
+            && features_ok
+            && self.available_cpu() >= template.cpu()
             && self.available_memory() >= template.memory()
             && self
                 .disks
@@ -401,7 +443,8 @@ impl IPRangeCapacity {
 mod tests {
     use super::*;
     use crate::mock::MockDb;
-    use lnvps_db::LNVpsDbBase;
+    use crate::GB;
+    use lnvps_db::{CpuFeature, DiskInterface, DiskType, LNVpsDbBase};
 
     #[test]
     fn loads() {
@@ -507,5 +550,198 @@ mod tests {
             assert_eq!(0, disk.usage);
         }
         Ok(())
+    }
+
+    // ── CPU filtering tests ──────────────────────────────────────────────────
+
+    /// Helper to create a minimal VmTemplate for testing CPU filtering
+    fn make_template(
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: Vec<CpuFeature>,
+    ) -> VmTemplate {
+        VmTemplate {
+            id: 99,
+            name: "test-template".to_string(),
+            enabled: true,
+            cpu: 1,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features: cpu_features.into(),
+            memory: GB,
+            disk_size: GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            region_id: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Helper to create a HostCapacity with specific CPU fields
+    fn make_host_capacity(
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: Vec<CpuFeature>,
+    ) -> HostCapacity {
+        HostCapacity {
+            load_factor: LoadFactors {
+                cpu: 1.0,
+                memory: 1.0,
+                disk: 1.0,
+            },
+            host: VmHost {
+                id: 1,
+                region_id: 1,
+                cpu: 4,
+                cpu_mfg,
+                cpu_arch,
+                cpu_features: cpu_features.into(),
+                memory: 8 * GB,
+                enabled: true,
+                ..Default::default()
+            },
+            cpu: 0,
+            memory: 0,
+            disks: vec![DiskCapacity {
+                load_factor: 1.0,
+                disk: VmHostDisk {
+                    id: 1,
+                    host_id: 1,
+                    size: 100 * GB,
+                    kind: DiskType::SSD,
+                    interface: DiskInterface::PCIe,
+                    ..Default::default()
+                },
+                usage: 0,
+            }],
+            ranges: vec![IPRangeCapacity {
+                range: IpRange {
+                    id: 1,
+                    cidr: "10.0.0.0/24".to_string(),
+                    gateway: "10.0.0.1".to_string(),
+                    enabled: true,
+                    region_id: 1,
+                    ..Default::default()
+                },
+                usage: 0,
+            }],
+        }
+    }
+
+    /// Template with Unknown cpu_mfg should match any host
+    #[test]
+    fn can_accommodate_unknown_mfg_matches_any() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![]);
+        let template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Template requesting Intel should match Intel host
+    #[test]
+    fn can_accommodate_matching_mfg() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![]);
+        let template = make_template(CpuMfg::Intel, CpuArch::Unknown, vec![]);
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Template requesting AMD should NOT match Intel host
+    #[test]
+    fn can_accommodate_mismatched_mfg() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![]);
+        let template = make_template(CpuMfg::Amd, CpuArch::Unknown, vec![]);
+        assert!(!cap.can_accommodate(&template));
+    }
+
+    /// Template requesting X86_64 should match X86_64 host
+    #[test]
+    fn can_accommodate_matching_arch() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![]);
+        let template = make_template(CpuMfg::Unknown, CpuArch::X86_64, vec![]);
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Template requesting ARM64 should NOT match X86_64 host
+    #[test]
+    fn can_accommodate_mismatched_arch() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![]);
+        let template = make_template(CpuMfg::Unknown, CpuArch::ARM64, vec![]);
+        assert!(!cap.can_accommodate(&template));
+    }
+
+    /// Template with no required features should match any host
+    #[test]
+    fn can_accommodate_empty_features_matches_any() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX2]);
+        let template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Template requiring AVX2 should match host with AVX2
+    #[test]
+    fn can_accommodate_matching_features() {
+        let cap = make_host_capacity(
+            CpuMfg::Intel,
+            CpuArch::X86_64,
+            vec![CpuFeature::AVX, CpuFeature::AVX2],
+        );
+        let template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![CpuFeature::AVX2]);
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Template requiring AVX512F should NOT match host with only AVX2
+    #[test]
+    fn can_accommodate_missing_features() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX2]);
+        let template =
+            make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![CpuFeature::AVX512F]);
+        assert!(!cap.can_accommodate(&template));
+    }
+
+    /// Template requiring multiple features should match host with all of them
+    #[test]
+    fn can_accommodate_multiple_features_all_present() {
+        let cap = make_host_capacity(
+            CpuMfg::Intel,
+            CpuArch::X86_64,
+            vec![CpuFeature::AVX, CpuFeature::AVX2, CpuFeature::AES],
+        );
+        let template = make_template(
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            vec![CpuFeature::AVX, CpuFeature::AES],
+        );
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Template requiring multiple features should NOT match host missing one
+    #[test]
+    fn can_accommodate_multiple_features_one_missing() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX]);
+        let template = make_template(
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            vec![CpuFeature::AVX, CpuFeature::AES],
+        );
+        assert!(!cap.can_accommodate(&template));
+    }
+
+    /// Combined: Intel + X86_64 + AVX2 should match when all requirements met
+    #[test]
+    fn can_accommodate_combined_requirements_match() {
+        let cap = make_host_capacity(
+            CpuMfg::Intel,
+            CpuArch::X86_64,
+            vec![CpuFeature::AVX, CpuFeature::AVX2],
+        );
+        let template = make_template(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX2]);
+        assert!(cap.can_accommodate(&template));
+    }
+
+    /// Combined: AMD + X86_64 should NOT match Intel host even with correct arch
+    #[test]
+    fn can_accommodate_combined_requirements_mfg_mismatch() {
+        let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX2]);
+        let template = make_template(CpuMfg::Amd, CpuArch::X86_64, vec![]);
+        assert!(!cap.can_accommodate(&template));
     }
 }

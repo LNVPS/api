@@ -352,6 +352,9 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result<Vec
             name: name.to_string(),
             ip: ip.to_string(),
             cpu: cpu as u16,
+            cpu_mfg: Default::default(),
+            cpu_arch: Default::default(),
+            cpu_features: Default::default(),
             memory,
             enabled: true,
             api_token: EncryptedString::new(api_token.to_string()),
@@ -359,6 +362,8 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result<Vec
             load_memory: 1.0,
             load_disk: 1.0,
             vlan_id: None,
+            ssh_user: None,
+            ssh_key: None,
         };
 
         let id = db.create_host(&host).await?;
@@ -777,6 +782,9 @@ async fn create_vm_templates(
             created: created_date,
             expires: None,
             cpu: cpu as u16,
+            cpu_mfg: Default::default(),
+            cpu_arch: Default::default(),
+            cpu_features: Default::default(),
             memory,
             disk_size,
             disk_type,
@@ -805,15 +813,28 @@ async fn create_custom_pricing(
     // - ip4_cost: per IPv4 address per month
     // - ip6_cost: per IPv6 address per month
     // BTC: amounts in millisats, Fiat: amounts in cents
-    let pricing_data: Vec<(&str, u64, &str, u64, u64, u64, u64, i32, i32, u64, u64, DateTime<Utc>)> = vec![
+    let pricing_data: Vec<(
+        &str,
+        u64,
+        &str,
+        u64,
+        u64,
+        u64,
+        u64,
+        i32,
+        i32,
+        u64,
+        u64,
+        DateTime<Utc>,
+    )> = vec![
         (
             "US-East Flex Pricing",
             regions[0].id,
             "BTC",
-            5_000_000,    // cpu_cost: 0.00005 BTC = 5000 sats = 5,000,000 millisats per CPU
-            250_000,      // memory_cost: 0.0000025 BTC = 250 sats = 250,000 millisats per GB
-            10_000_000,   // ip4_cost: 0.0001 BTC = 10000 sats = 10,000,000 millisats per IPv4
-            5_000_000,    // ip6_cost: 0.00005 BTC = 5000 sats = 5,000,000 millisats per IPv6
+            5_000_000,  // cpu_cost: 0.00005 BTC = 5000 sats = 5,000,000 millisats per CPU
+            250_000,    // memory_cost: 0.0000025 BTC = 250 sats = 250,000 millisats per GB
+            10_000_000, // ip4_cost: 0.0001 BTC = 10000 sats = 10,000,000 millisats per IPv4
+            5_000_000,  // ip6_cost: 0.00005 BTC = 5000 sats = 5,000,000 millisats per IPv6
             1,
             32,
             1073741824u64,
@@ -824,10 +845,10 @@ async fn create_custom_pricing(
             "EU-Central GDPR Compliant",
             regions[2].id,
             "EUR",
-            14,   // cpu_cost: €0.135 ≈ 14 cents per CPU
-            1,    // memory_cost: €0.0007 ≈ 1 cent per GB (rounded up)
-            5,    // ip4_cost: €0.045 ≈ 5 cents per IPv4
-            2,    // ip6_cost: €0.0225 ≈ 2 cents per IPv6
+            14, // cpu_cost: €0.135 ≈ 14 cents per CPU
+            1,  // memory_cost: €0.0007 ≈ 1 cent per GB (rounded up)
+            5,  // ip4_cost: €0.045 ≈ 5 cents per IPv4
+            2,  // ip6_cost: €0.0225 ≈ 2 cents per IPv6
             1,
             40,
             1073741824u64,
@@ -838,10 +859,10 @@ async fn create_custom_pricing(
             "Asia-Pacific Budget",
             regions[4].id,
             "USD",
-            8,    // cpu_cost: $0.08 = 8 cents per CPU
-            1,    // memory_cost: $0.00005 ≈ 0 cents (min 1)
-            3,    // ip4_cost: $0.03 = 3 cents per IPv4
-            2,    // ip6_cost: $0.015 ≈ 2 cents per IPv6
+            8, // cpu_cost: $0.08 = 8 cents per CPU
+            1, // memory_cost: $0.00005 ≈ 0 cents (min 1)
+            3, // ip4_cost: $0.03 = 3 cents per IPv4
+            2, // ip6_cost: $0.015 ≈ 2 cents per IPv6
             1,
             24,
             1073741824u64,
@@ -852,10 +873,10 @@ async fn create_custom_pricing(
             "Canada Premium",
             regions[5].id,
             "USD",
-            15,   // cpu_cost: $0.15 = 15 cents per CPU
-            1,    // memory_cost: $0.00008 ≈ 0 cents (min 1)
-            5,    // ip4_cost: $0.05 = 5 cents per IPv4
-            3,    // ip6_cost: $0.025 ≈ 3 cents per IPv6
+            15, // cpu_cost: $0.15 = 15 cents per CPU
+            1,  // memory_cost: $0.00008 ≈ 0 cents (min 1)
+            5,  // ip4_cost: $0.05 = 5 cents per IPv4
+            3,  // ip6_cost: $0.025 ≈ 3 cents per IPv6
             2,
             48,
             2147483648u64,
@@ -866,10 +887,10 @@ async fn create_custom_pricing(
             "EU-North Lightning",
             regions[7].id,
             "BTC",
-            8_000_000,    // cpu_cost: 0.00008 BTC = 8000 sats = 8,000,000 millisats per CPU
-            400_000,      // memory_cost: 0.000004 BTC = 400 sats = 400,000 millisats per GB
-            15_000_000,   // ip4_cost: 0.00015 BTC = 15000 sats = 15,000,000 millisats per IPv4
-            8_000_000,    // ip6_cost: 0.00008 BTC = 8000 sats = 8,000,000 millisats per IPv6
+            8_000_000,  // cpu_cost: 0.00008 BTC = 8000 sats = 8,000,000 millisats per CPU
+            400_000,    // memory_cost: 0.000004 BTC = 400 sats = 400,000 millisats per GB
+            15_000_000, // ip4_cost: 0.00015 BTC = 15000 sats = 15,000,000 millisats per IPv4
+            8_000_000,  // ip6_cost: 0.00008 BTC = 8000 sats = 8,000,000 millisats per IPv6
             1,
             64,
             1073741824u64,
@@ -880,10 +901,10 @@ async fn create_custom_pricing(
             "US-Central Enterprise",
             regions[6].id,
             "USD",
-            25,   // cpu_cost: $0.25 = 25 cents per CPU
-            1,    // memory_cost: $0.00012 ≈ 0 cents (min 1)
-            8,    // ip4_cost: $0.08 = 8 cents per IPv4
-            4,    // ip6_cost: $0.04 = 4 cents per IPv6
+            25, // cpu_cost: $0.25 = 25 cents per CPU
+            1,  // memory_cost: $0.00012 ≈ 0 cents (min 1)
+            8,  // ip4_cost: $0.08 = 8 cents per IPv4
+            4,  // ip6_cost: $0.04 = 4 cents per IPv6
             4,
             128,
             8589934592u64,
@@ -916,6 +937,9 @@ async fn create_custom_pricing(
             expires: None,
             region_id,
             currency: currency.to_string(),
+            cpu_mfg: Default::default(),
+            cpu_arch: Default::default(),
+            cpu_features: Default::default(),
             cpu_cost,
             memory_cost,
             ip4_cost,
@@ -969,6 +993,9 @@ async fn create_custom_templates(
             disk_type,
             disk_interface,
             pricing_id,
+            cpu_mfg: Default::default(),
+            cpu_arch: Default::default(),
+            cpu_features: Default::default(),
         };
 
         let id = db.insert_custom_vm_template(&template).await?;

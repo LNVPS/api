@@ -3,6 +3,7 @@ use crate::data_migration::dns::DnsDataMigration;
 use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::data_migration::payment_method_config::PaymentMethodConfigMigration;
+use crate::data_migration::ssh_key_migration::SshKeyMigration;
 use crate::provisioner::LNVpsProvisioner;
 use crate::settings::Settings;
 use anyhow::Result;
@@ -17,6 +18,7 @@ mod dns;
 mod encryption_migration;
 mod ip6_init;
 mod payment_method_config;
+mod ssh_key_migration;
 
 /// Basic data migration to run at startup
 pub trait DataMigration: Send + Sync {
@@ -49,6 +51,9 @@ pub async fn run_data_migrations(
         db.clone(),
         settings.clone(),
     )));
+
+    // Migrate SSH key from proxmox config to database
+    migrations.push(Box::new(SshKeyMigration::new(db.clone(), settings.clone())));
 
     info!("Running {} data migrations", migrations.len());
     for migration in migrations {

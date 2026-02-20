@@ -6,9 +6,54 @@ on:
       - master
   pull_request:
 
+env:
+  REGISTRY: registry.v0l.io
+  HOST_INFO_IMAGE: registry.v0l.io/lnvps-host-info
+
 jobs:
+  # Build host-info for multiple architectures first
+  build-host-info:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            tag_suffix: amd64
+          - platform: linux/arm64
+            tag_suffix: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: registry
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Build and push lnvps-host-info (${{ matrix.tag_suffix }})
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: lnvps_host_util/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          tags: ${{ env.HOST_INFO_IMAGE }}:latest-${{ matrix.tag_suffix }}
+
+  # Build main images after host-info is ready
   build:
     runs-on: ubuntu-latest
+    needs: build-host-info
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +82,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: docker/login-action@v3
         with:
-          registry: registry.v0l.io
+          registry: ${{ env.REGISTRY }}
           username: registry
           password: ${{ secrets.REGISTRY_TOKEN }}
 
@@ -48,3 +93,5 @@ jobs:
           file: ${{ matrix.file }}
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: ${{ matrix.image }}
+          build-args: |
+            HOST_INFO_IMAGE=${{ env.HOST_INFO_IMAGE }}

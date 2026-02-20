@@ -87,6 +87,9 @@ impl DVMHandler for LnvpsDvm {
                 disk_type: DiskType::from_str(disk_type)?,
                 disk_interface: DiskInterface::from_str(disk_interface)?,
                 pricing_id: pricing.id,
+                cpu_mfg: Default::default(),
+                cpu_arch: Default::default(),
+                cpu_features: Default::default(),
             };
             let uid = db.upsert_user(request.event.pubkey.as_bytes()).await?;
 
@@ -179,10 +182,13 @@ mod tests {
                     expires: None,
                     region_id: 1,
                     currency: "EUR".to_string(),
-                    cpu_cost: 150,     // €1.50 in cents per CPU
-                    memory_cost: 50,   // €0.50 in cents per GB
-                    ip4_cost: 150,     // €1.50 in cents per IPv4
-                    ip6_cost: 5,       // €0.05 in cents per IPv6
+                    cpu_mfg: Default::default(),
+                    cpu_arch: Default::default(),
+                    cpu_features: Default::default(),
+                    cpu_cost: 150,   // €1.50 in cents per CPU
+                    memory_cost: 50, // €0.50 in cents per GB
+                    ip4_cost: 150,   // €1.50 in cents per IPv4
+                    ip6_cost: 5,     // €0.05 in cents per IPv6
                     min_cpu: 0,
                     max_cpu: 0,
                     min_memory: 0,
@@ -197,7 +203,7 @@ mod tests {
                     pricing_id: 1,
                     kind: DiskType::SSD,
                     interface: DiskInterface::PCIe,
-                    cost: 5,           // €0.05 in cents per GB
+                    cost: 5, // €0.05 in cents per GB
                     min_disk_size: 5 * crate::GB,
                     max_disk_size: 1 * crate::TB,
                 },
