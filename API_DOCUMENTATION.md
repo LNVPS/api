@@ -227,6 +227,9 @@ interface PaymentMethod {
   name: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc';
   metadata: Record<string, string>;
   currencies: ('BTC' | 'EUR' | 'USD')[];
+  processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
+  processing_fee_base?: number; // Base amount in smallest currency units (cents for fiat, millisats for BTC)
+  processing_fee_currency?: string; // Currency for the base fee (e.g., "EUR")
 }
 ```
 

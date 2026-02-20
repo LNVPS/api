@@ -301,6 +301,18 @@ pub struct ApiPaymentInfo {
     pub metadata: HashMap<String, String>,
 
     pub currencies: Vec<ApiCurrency>,
+
+    /// Processing fee percentage rate (e.g., 1.0 for 1%)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_fee_rate: Option<f32>,
+
+    /// Processing fee base amount in smallest currency units (cents for fiat, millisats for BTC)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_fee_base: Option<u64>,
+
+    /// Currency for the processing fee base
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_fee_currency: Option<String>,
 }
 
 /// Payment data related to the payment method
@@ -321,7 +333,7 @@ pub enum ApiPaymentData {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiPaymentMethod {
     #[default]

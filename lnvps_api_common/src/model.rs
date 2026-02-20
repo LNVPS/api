@@ -425,7 +425,7 @@ impl From<ApiVmCostPlanIntervalType> for lnvps_db::VmCostPlanIntervalType {
     }
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiCurrency {
     EUR,
     BTC,

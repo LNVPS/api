@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-20** - Added processing fee information to payment methods response
+  - `GET /api/v1/payment/methods` — Response now includes optional `processing_fee_rate`, `processing_fee_base`, and `processing_fee_currency` fields
+  - `processing_fee_rate`: Percentage rate (e.g., 1.0 for 1%)
+  - `processing_fee_base`: Base amount in smallest currency units (cents for fiat, millisats for BTC)
+  - `processing_fee_currency`: Currency for the base fee (e.g., "EUR")
+  - NWC payment method is now only returned when Lightning is enabled
+
 - **2026-02-20** - Added CPU-aware host filtering to VM Templates, Custom Pricing, and Hosts (Admin API)
   - New enums: `CpuMfg`, `CpuArch`, `CpuFeature`, `GpuMfg`
   - `POST /api/admin/v1/vm_templates` — Added optional `cpu_mfg`, `cpu_arch`, `cpu_features` fields

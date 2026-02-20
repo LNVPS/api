@@ -913,27 +913,49 @@ async fn v1_terminal_proxy(
 }
 
 async fn v1_get_payment_methods(State(this): State<RouterState>) -> ApiResult<Vec<ApiPaymentInfo>> {
-    let mut ret = vec![ApiPaymentInfo {
-        name: ApiPaymentMethod::Lightning,
-        metadata: HashMap::new(),
-        currencies: vec![ApiCurrency::BTC],
-    }];
-    #[cfg(feature = "nostr-nwc")]
-    ret.push(ApiPaymentInfo {
-        name: ApiPaymentMethod::NWC,
-        metadata: HashMap::new(),
-        currencies: vec![ApiCurrency::BTC],
-    });
-    #[cfg(feature = "revolut")]
-    if let Some(r) = &this.settings.revolut {
-        ret.push(ApiPaymentInfo {
-            name: ApiPaymentMethod::Revolut,
-            metadata: HashMap::from([("pubkey".to_string(), r.public_key.to_string())]),
-            currencies: vec![ApiCurrency::EUR, ApiCurrency::USD],
+    let configs = this.db.list_payment_method_configs().await?;
+    ApiData::ok(build_payment_methods_response(configs))
+}
+
+fn build_payment_methods_response(configs: Vec<lnvps_db::PaymentMethodConfig>) -> Vec<ApiPaymentInfo> {
+    let has_lightning = configs
+        .iter()
+        .any(|c| c.enabled && c.payment_method == PaymentMethod::Lightning);
+
+    let mut ret: Vec<ApiPaymentInfo> = configs
+        .into_iter()
+        .filter(|c| c.enabled)
+        .map(|config| {
+            let currencies = match config.payment_method {
+                PaymentMethod::Lightning => vec![ApiCurrency::BTC],
+                PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
+                PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
+                PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
+            };
+            ApiPaymentInfo {
+                name: config.payment_method.into(),
+                metadata: HashMap::new(),
+                currencies,
+                processing_fee_rate: config.processing_fee_rate,
+                processing_fee_base: config.processing_fee_base,
+                processing_fee_currency: config.processing_fee_currency,
+            }
         })
+        .collect();
+
+    // NWC is a client-side payment method (user's own wallet) available when Lightning is enabled
+    if has_lightning {
+        ret.push(ApiPaymentInfo {
+            name: ApiPaymentMethod::NWC,
+            metadata: HashMap::new(),
+            currencies: vec![ApiCurrency::BTC],
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+        });
     }
 
-    ApiData::ok(ret)
+    ret
 }
 
 /// Get payment status (for polling)
@@ -1230,4 +1252,133 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
         return Err(ApiError::new("VM does not belong to you"));
     }
     Ok((uid, vm))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use lnvps_db::PaymentMethodConfig;
+
+    fn make_config(
+        id: u64,
+        method: PaymentMethod,
+        enabled: bool,
+        fee_rate: Option<f32>,
+        fee_base: Option<u64>,
+        fee_currency: Option<&str>,
+    ) -> PaymentMethodConfig {
+        PaymentMethodConfig {
+            id,
+            company_id: 1,
+            payment_method: method,
+            name: format!("{:?}", method),
+            enabled,
+            provider_type: "test".to_string(),
+            config: None,
+            processing_fee_rate: fee_rate,
+            processing_fee_base: fee_base,
+            processing_fee_currency: fee_currency.map(String::from),
+            created: Utc::now(),
+            modified: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_payment_methods_empty_configs() {
+        let result = build_payment_methods_response(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_payment_methods_lightning_includes_nwc() {
+        let configs = vec![make_config(1, PaymentMethod::Lightning, true, None, None, None)];
+        let result = build_payment_methods_response(configs);
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0].name, ApiPaymentMethod::Lightning));
+        assert!(matches!(result[1].name, ApiPaymentMethod::NWC));
+        assert_eq!(result[0].currencies, vec![ApiCurrency::BTC]);
+        assert_eq!(result[1].currencies, vec![ApiCurrency::BTC]);
+    }
+
+    #[test]
+    fn test_payment_methods_disabled_lightning_no_nwc() {
+        let configs = vec![make_config(1, PaymentMethod::Lightning, false, None, None, None)];
+        let result = build_payment_methods_response(configs);
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_payment_methods_fiat_only_no_nwc() {
+        let configs = vec![
+            make_config(1, PaymentMethod::Revolut, true, Some(2.5), Some(30), Some("EUR")),
+        ];
+        let result = build_payment_methods_response(configs);
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0].name, ApiPaymentMethod::Revolut));
+        assert_eq!(result[0].currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);
+        // No NWC since no Lightning
+    }
+
+    #[test]
+    fn test_payment_methods_processing_fees_included() {
+        let configs = vec![
+            make_config(1, PaymentMethod::Stripe, true, Some(2.9), Some(30), Some("USD")),
+        ];
+        let result = build_payment_methods_response(configs);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].processing_fee_rate, Some(2.9));
+        assert_eq!(result[0].processing_fee_base, Some(30));
+        assert_eq!(result[0].processing_fee_currency, Some("USD".to_string()));
+    }
+
+    #[test]
+    fn test_payment_methods_mixed_enabled_disabled() {
+        let configs = vec![
+            make_config(1, PaymentMethod::Lightning, true, None, None, None),
+            make_config(2, PaymentMethod::Revolut, false, Some(1.5), None, None),
+            make_config(3, PaymentMethod::Stripe, true, Some(2.9), Some(30), Some("EUR")),
+        ];
+        let result = build_payment_methods_response(configs);
+
+        // Lightning + Stripe + NWC (because Lightning is enabled)
+        assert_eq!(result.len(), 3);
+
+        let names: Vec<_> = result.iter().map(|p| p.name).collect();
+        assert!(names.contains(&ApiPaymentMethod::Lightning));
+        assert!(names.contains(&ApiPaymentMethod::Stripe));
+        assert!(names.contains(&ApiPaymentMethod::NWC));
+        assert!(!names.contains(&ApiPaymentMethod::Revolut)); // disabled
+    }
+
+    #[test]
+    fn test_payment_methods_all_payment_types_currencies() {
+        let configs = vec![
+            make_config(1, PaymentMethod::Lightning, true, None, None, None),
+            make_config(2, PaymentMethod::Revolut, true, None, None, None),
+            make_config(3, PaymentMethod::Paypal, true, None, None, None),
+            make_config(4, PaymentMethod::Stripe, true, None, None, None),
+        ];
+        let result = build_payment_methods_response(configs);
+
+        // 4 methods + NWC = 5
+        assert_eq!(result.len(), 5);
+
+        for info in &result {
+            match info.name {
+                ApiPaymentMethod::Lightning | ApiPaymentMethod::NWC => {
+                    assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
+                }
+                ApiPaymentMethod::Revolut
+                | ApiPaymentMethod::Paypal
+                | ApiPaymentMethod::Stripe => {
+                    assert_eq!(info.currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);
+                }
+            }
+        }
+    }
 }
