@@ -40,6 +40,7 @@ These docs apply to all projects using this agent structure:
 | [docs/agents/build-and-test.md](docs/agents/build-and-test.md) | Running builds, tests, clippy, or formatting |
 | [docs/agents/code-style.md](docs/agents/code-style.md) | Writing or reviewing Rust code (imports, errors, naming, async, derives, serde, tests) |
 | [docs/agents/api-guidelines.md](docs/agents/api-guidelines.md) | Modifying any user-facing or admin API endpoint |
+| [docs/agents/migrations.md](docs/agents/migrations.md) | Adding or modifying database migrations |
 | [docs/agents/currency.md](docs/agents/currency.md) | Working with money amounts, pricing, or payments |
 | [docs/agents/bug-fixes.md](docs/agents/bug-fixes.md) | Resolving bugs — LNVPS-specific additions |
 | [docs/agents/coverage.md](docs/agents/coverage.md) | Function coverage — LNVPS-specific additions |

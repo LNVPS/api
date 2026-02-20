@@ -223,6 +223,13 @@ async fn v1_patch_account(
     ApiData::ok(())
 }
 
+#[derive(serde::Serialize)]
+struct VerifyEmailPage {
+    title: String,
+    message: String,
+    color: String,
+}
+
 /// Verify email address using the token sent to the user's email
 async fn v1_verify_email(
     State(this): State<RouterState>,
@@ -231,14 +238,13 @@ async fn v1_verify_email(
     let make_page = |title: &str, message: &str, color: &str| {
         let template = mustache::compile_str(include_str!("../../verify-email.html"))
             .expect("valid verify-email template");
+        let data = VerifyEmailPage {
+            title: title.to_string(),
+            message: message.to_string(),
+            color: color.to_string(),
+        };
         let rendered = template
-            .render_to_string(
-                &mustache::MapBuilder::new()
-                    .insert_str("title", title)
-                    .insert_str("message", message)
-                    .insert_str("color", color)
-                    .build(),
-            )
+            .render_to_string(&data)
             .unwrap_or_else(|_| format!("<h1>{title}</h1><p>{message}</p>"));
         Html(rendered)
     };

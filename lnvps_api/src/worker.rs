@@ -521,31 +521,52 @@ impl Worker {
     }
 
     /// Shared function for sending an email via SMTP using the HTML email template.
+    /// If `html_message` is provided, it will be used in the HTML template instead of `plain_message`.
+    /// Returns `OpError::Fatal` for permanent SMTP errors (5xx) and `OpError::Transient` for temporary failures.
     async fn send_email(
         smtp: &SmtpConfig,
         to: &str,
         subject: &str,
-        message: &str,
-    ) -> Result<()> {
-        let template = mustache::compile_str(include_str!("../email.html"))?;
-        let rendered = template.render_to_string(&mustache::MapBuilder::new()
-            .insert_str("message", message)
-            .insert_str("year", Utc::now().year().to_string())
-            .build())?;
-        let html = MultiPart::alternative_plain_html(message.to_string(), rendered);
-        let mut b = MessageBuilder::new().to(to.parse()?).subject(subject);
-        if let Some(f) = &smtp.from {
-            b = b.from(f.parse()?);
+        plain_message: &str,
+        html_message: Option<&str>,
+    ) -> Result<(), OpError<anyhow::Error>> {
+        #[derive(serde::Serialize)]
+        struct EmailData {
+            message: String,
+            year: String,
         }
-        let msg = b.multipart(html)?;
-        let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)?
+        let template =
+            mustache::compile_str(include_str!("../email.html")).map_err(|e| OpError::Fatal(e.into()))?;
+        let data = EmailData {
+            message: html_message.unwrap_or(plain_message).to_string(),
+            year: Utc::now().year().to_string(),
+        };
+        let rendered = template
+            .render_to_string(&data)
+            .map_err(|e| OpError::Fatal(e.into()))?;
+        let html = MultiPart::alternative_plain_html(plain_message.to_string(), rendered);
+        let mut b = MessageBuilder::new()
+            .to(to.parse().map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?)
+            .subject(subject);
+        if let Some(f) = &smtp.from {
+            b = b.from(f.parse().map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?);
+        }
+        let msg = b.multipart(html).map_err(|e| OpError::Fatal(e.into()))?;
+        let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)
+            .map_err(|e| OpError::Transient(e.into()))?
             .credentials(Credentials::new(
                 smtp.username.to_string(),
                 smtp.password.to_string(),
             ))
             .timeout(Some(Duration::from_secs(10)))
             .build();
-        sender.send(msg).await?;
+        sender.send(msg).await.map_err(|e| {
+            if e.is_permanent() {
+                OpError::Fatal(e.into())
+            } else {
+                OpError::Transient(e.into())
+            }
+        })?;
         Ok(())
     }
 
@@ -562,7 +583,12 @@ impl Worker {
         {
             let to = user.email.as_str().to_string();
             let subject = title.as_deref().unwrap_or("Notification");
-            Self::send_email(smtp, &to, subject, &message).await?;
+            if let Err(e) = Self::send_email(smtp, &to, subject, &message, None).await {
+                match e {
+                    OpError::Fatal(e) => warn!("Permanent email error to {}, skipping: {}", to, e),
+                    OpError::Transient(e) => return Err(e),
+                }
+            }
         }
         if user.contact_nip17
             && let Some(c) = self.nostr.as_ref()
@@ -580,19 +606,23 @@ impl Worker {
         Ok(())
     }
 
-    async fn send_email_verification(&self, user_id: u64, verify_url: &str) -> Result<()> {
-        let user = self.db.get_user(user_id).await?;
+    async fn send_email_verification(&self, user_id: u64, verify_url: &str) -> Result<(), OpError<anyhow::Error>> {
+        let user = self.db.get_user(user_id).await.map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
         if user.email.is_empty() {
             return Ok(()); // No email, nothing to do
         }
         let Some(smtp) = self.settings.smtp.as_ref() else {
             return Ok(());
         };
-        let message = format!(
+        let plain_text = format!(
             "Please verify your email address by clicking the link below:\n\n{}",
             verify_url
         );
-        Self::send_email(smtp, user.email.as_str(), "Verify your email address", &message).await
+        let html_message = format!(
+            r#"Please verify your email address by clicking the link below:<br><br><a href="{}">Verify Email Address</a>"#,
+            verify_url
+        );
+        Self::send_email(smtp, user.email.as_str(), "Verify your email address", &plain_text, Some(&html_message)).await
     }
 
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
@@ -1691,7 +1721,12 @@ impl Worker {
                 )));
             }
             WorkJob::SendEmailVerification { user_id, verify_url } => {
-                self.send_email_verification(*user_id, verify_url).await?;
+                if let Err(e) = self.send_email_verification(*user_id, verify_url).await {
+                    match e {
+                        OpError::Fatal(e) => warn!("Permanent email error for user {}, skipping: {}", user_id, e),
+                        OpError::Transient(e) => return Err(e),
+                    }
+                }
             }
         }
         Ok(None)
