@@ -2919,6 +2919,8 @@ The RBAC system uses the following permission format: `resource::action`
   // External payment provider ID
   "is_paid": boolean,
   // Whether payment has been completed
+  "paid_at": "string (ISO 8601) | null",
+  // When payment was completed (null if unpaid)
   "rate": number
   // Exchange rate to base currency (EUR)
 }
@@ -3016,6 +3018,8 @@ The RBAC system uses the following permission format: `resource::action`
   "external_id": "string | null",
   // External payment processor ID
   "is_paid": boolean,
+  "paid_at": "string (ISO 8601) | null",
+  // When payment was completed (null if unpaid)
   "rate": number
   |
   null,

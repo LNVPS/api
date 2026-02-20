@@ -208,6 +208,7 @@ interface VmPayment {
   processing_fee: number; // Processing fee in smallest currency unit (cents for fiat, millisats for BTC)
   currency: string;
   is_paid: boolean;
+  paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
   data: PaymentData;
   time: number; // Seconds this payment adds to VM expiry
   is_upgrade: boolean;
@@ -266,6 +267,7 @@ interface SubscriptionPayment {
   payment_method: 'lightning' | 'revolut' | 'paypal' | 'stripe';
   payment_type: 'Purchase' | 'Renewal';
   is_paid: boolean;
+  paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
   tax: Price; // Tax amount
 }
 ```

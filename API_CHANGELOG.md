@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-20** - Added `paid_at` timestamp to payment responses
+  - `VmPayment` — New optional `paid_at` field (ISO 8601 datetime) indicating when the payment was completed
+  - `SubscriptionPayment` — New optional `paid_at` field (ISO 8601 datetime) indicating when the payment was completed
+  - `AdminVmPaymentInfo` — New optional `paid_at` field for admin payment views
+  - `AdminSubscriptionPaymentInfo` — New optional `paid_at` field for admin payment views
+  - Field is only present when `is_paid` is true; null/omitted for unpaid payments
+
 - **2026-02-20** - Added processing fee information to payment methods response
   - `GET /api/v1/payment/methods` — Response now includes optional `processing_fee_rate`, `processing_fee_base`, and `processing_fee_currency` fields
   - `processing_fee_rate`: Percentage rate (e.g., 1.0 for 1%)
