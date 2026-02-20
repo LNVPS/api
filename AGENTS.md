@@ -18,6 +18,8 @@ If the estimate is XL, create a work file in `work/` that decomposes the task in
 
 **2. Check `work/`** for an active task file on the same topic before starting new work. If one exists, resume from the first unchecked task. **Never pick up a work file unless the user explicitly asks you to work on that topic.**
 
+**3. Git commits** — Never auto-commit changes. Always ask the user before committing.
+
 | File | Description |
 |---|---|
 | [work/agent-rules-compliance.md](work/agent-rules-compliance.md) | Bringing codebase into full compliance with all agent rules |

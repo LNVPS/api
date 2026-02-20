@@ -11,18 +11,9 @@ env:
   HOST_INFO_IMAGE: registry.v0l.io/lnvps-host-info
 
 jobs:
-  # Build host-info for multiple architectures first
+  # Build host-info as a multi-arch image first
   build-host-info:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            tag_suffix: amd64
-          - platform: linux/arm64
-            tag_suffix: arm64
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -41,14 +32,14 @@ jobs:
           username: registry
           password: ${{ secrets.REGISTRY_TOKEN }}
 
-      - name: Build and push lnvps-host-info (${{ matrix.tag_suffix }})
+      - name: Build and push lnvps-host-info
         uses: docker/build-push-action@v5
         with:
           context: .
           file: lnvps_host_util/Dockerfile
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          tags: ${{ env.HOST_INFO_IMAGE }}:latest-${{ matrix.tag_suffix }}
+          tags: ${{ env.HOST_INFO_IMAGE }}:latest
 
   # Build main images after host-info is ready
   build:
@@ -94,4 +85,6 @@ jobs:
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: ${{ matrix.image }}
           build-args: |
-            HOST_INFO_IMAGE=${{ env.HOST_INFO_IMAGE }}
+            HOST_INFO_IMAGE=${{ env.HOST_INFO_IMAGE }}:latest
+            REGISTRY_USER=registry
+            REGISTRY_PASS=${{ secrets.REGISTRY_TOKEN }}
