@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::response::Html;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
@@ -40,6 +40,10 @@ pub fn routes() -> Router<RouterState> {
         .route(
             "/api/v1/account",
             get(v1_get_account).patch(v1_patch_account),
+        )
+        .route(
+            "/api/v1/account/verify-email",
+            get(v1_verify_email),
         )
         .route("/api/v1/vm", get(v1_list_vms))
         .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
@@ -131,10 +135,38 @@ async fn v1_patch_account(
         }
     }
 
-    // Update fields only if they are present in the request
-    if let Some(email) = &req.email {
-        user.email = email.clone().map(|s| s.into());
+    // validate and handle email change
+    let mut pending_verification: Option<String> = None;
+    if let Some(new_email_opt) = &req.email {
+        if let Some(new_email) = new_email_opt {
+            // Validate email format
+            if new_email.trim().is_empty() {
+                return ApiData::err("Email address cannot be empty");
+            }
+            if !new_email.contains('@') || !new_email.contains('.') {
+                return ApiData::err("Invalid email address");
+            }
+            // Check if email is changing
+            let old_email = user.email.as_str().to_string();
+            let email_changed = old_email != new_email.as_str();
+            user.email = new_email.clone().into();
+            if email_changed {
+                // Mark email as unverified and generate a verification token
+                let token = hex::encode(rand::random::<[u8; 32]>());
+                user.email_verified = false;
+                user.email_verify_token = token.clone();
+                pending_verification = Some(token);
+            }
+        } else {
+            return ApiData::err("Email address is required and cannot be removed");
+        }
     }
+
+    // If contact_email is enabled, email must be set
+    if req.contact_email && user.email.is_empty() {
+        return ApiData::err("An email address is required to enable email notifications");
+    }
+
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
     if let Some(country_code) = &req.country_code {
@@ -169,7 +201,91 @@ async fn v1_patch_account(
     }
 
     this.db.update_user(&user).await?;
+
+    // Queue verification email after successful save
+    if let Some(token) = pending_verification {
+        let verify_url = format!(
+            "{}/api/v1/account/verify-email?token={}",
+            this.settings.public_url, token
+        );
+        if let Err(e) = this
+            .work_sender
+            .send(WorkJob::SendEmailVerification {
+                user_id: uid,
+                verify_url,
+            })
+            .await
+        {
+            error!("Failed to queue email verification: {}", e);
+        }
+    }
+
     ApiData::ok(())
+}
+
+#[derive(serde::Serialize)]
+struct VerifyEmailPage {
+    title: String,
+    message: String,
+    color: String,
+}
+
+/// Verify email address using the token sent to the user's email
+async fn v1_verify_email(
+    State(this): State<RouterState>,
+    Query(params): Query<VerifyEmailQuery>,
+) -> impl IntoResponse {
+    let make_page = |title: &str, message: &str, color: &str| {
+        let template = mustache::compile_str(include_str!("../../verify-email.html"))
+            .expect("valid verify-email template");
+        let data = VerifyEmailPage {
+            title: title.to_string(),
+            message: message.to_string(),
+            color: color.to_string(),
+        };
+        let rendered = template
+            .render_to_string(&data)
+            .unwrap_or_else(|_| format!("<h1>{title}</h1><p>{message}</p>"));
+        Html(rendered)
+    };
+
+    if params.token.trim().is_empty() {
+        return make_page(
+            "Invalid Link",
+            "The verification link is missing a token.",
+            "#e74c3c",
+        );
+    }
+    let mut user = match this.db.get_user_by_email_verify_token(&params.token).await {
+        Ok(u) => u,
+        Err(_) => {
+            return make_page(
+                "Invalid or Expired Link",
+                "This verification link is invalid or has already been used.",
+                "#e74c3c",
+            );
+        }
+    };
+    user.email_verified = true;
+    user.email_verify_token = String::new();
+    if let Err(e) = this.db.update_user(&user).await {
+        error!("Failed to mark email verified: {}", e);
+        return make_page(
+            "Error",
+            "An error occurred. Please try again later.",
+            "#e74c3c",
+        );
+    }
+    make_page(
+        "Email Verified",
+        "Your email address has been successfully verified.",
+        "#2ecc71",
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct VerifyEmailQuery {
+    token: String,
 }
 
 /// Get user account detail

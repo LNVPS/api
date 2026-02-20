@@ -44,6 +44,7 @@ interface AuthHeaders {
 ```typescript
 interface AccountInfo {
   email?: string;
+  email_verified?: boolean; // Present when email is set; true if email has been verified
   contact_nip17: boolean;
   contact_email: boolean;
   country_code?: string; // ISO 3166-1 alpha-3 country code
@@ -328,6 +329,15 @@ interface VmUpgradeQuote {
 - **PATCH** `/api/v1/account`
 - **Auth**: Required
 - **Body**: `AccountInfo`
+- **Notes**:
+  - Setting `contact_email: true` requires an email address to be present
+  - When email is changed, a verification email is sent and `email_verified` is reset to `false`
+- **Response**: `null`
+
+#### Verify Email Address
+- **GET** `/api/v1/account/verify-email?token=<token>`
+- **Auth**: Not required
+- **Query**: `token` — the verification token from the verification email
 - **Response**: `null`
 
 ### Automatic Renewal with Nostr Wallet Connect

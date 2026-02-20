@@ -1061,7 +1061,9 @@ async fn create_users(db: &LNVpsDbMysql) -> Result<Vec<User>> {
             id: 0, // Will be auto-generated
             pubkey: pubkey_bytes.clone(),
             created,
-            email: Some(EncryptedString::new(email.to_string())),
+            email: EncryptedString::new(email.to_string()),
+            email_verified: true,
+            email_verify_token: String::new(),
             contact_nip17: true,
             contact_email: true,
             country_code: None,

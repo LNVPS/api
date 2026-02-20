@@ -91,7 +91,7 @@ async fn admin_update_user(
 
     // Update user fields if provided
     if let Some(email) = &req.email {
-        user.email = Some(email.into());
+        user.email = email.into();
     }
     if let Some(contact_nip17) = req.contact_nip17 {
         user.contact_nip17 = contact_nip17;

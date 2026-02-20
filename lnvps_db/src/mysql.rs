@@ -64,9 +64,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_user(&self, user: &User) -> DbResult<()> {
         sqlx::query(
-            "update users set email=?, contact_nip17=?, contact_email=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
+            "update users set email=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
         )
             .bind(&user.email)
+            .bind(user.email_verified)
+            .bind(&user.email_verify_token)
             .bind(user.contact_nip17)
             .bind(user.contact_email)
             .bind(&user.country_code)
@@ -88,6 +90,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Err(DbError::Source(
             anyhow!("Deleting users is not supported").into_boxed_dyn_error(),
         ))
+    }
+
+    async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User> {
+        Ok(
+            sqlx::query_as(
+                "select * from users where email_verify_token = ? and email_verify_token != ''",
+            )
+            .bind(token)
+            .fetch_one(&self.db)
+            .await?,
+        )
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {
@@ -1005,6 +1018,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 u.pubkey,
                 u.created,
                 u.email,
+                u.email_verified,
+                u.email_verify_token,
                 u.contact_nip17,
                 u.contact_email,
                 u.country_code,
@@ -1020,7 +1035,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             INNER JOIN vm ON u.id = vm.user_id
             WHERE vm.deleted = 0 
             AND (
-                (u.contact_email = 1 AND u.email IS NOT NULL) 
+                (u.contact_email = 1 AND u.email != '') 
                 OR 
                 u.contact_nip17 = 1
             )
@@ -2397,6 +2412,8 @@ impl AdminDb for LNVpsDbMysql {
                 u.pubkey,
                 u.created,
                 u.email,
+                u.email_verified,
+                u.email_verify_token,
                 u.contact_nip17,
                 u.contact_email,
                 u.country_code,
