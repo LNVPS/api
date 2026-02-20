@@ -156,6 +156,12 @@ async fn v1_patch_account(
                 user.email_verified = false;
                 user.email_verify_token = token.clone();
                 pending_verification = Some(token);
+            } else if !user.email_verified && user.email_verify_token.is_empty() {
+                // Email is the same but was never verified and no token exists
+                // Generate a new token and send verification email
+                let token = hex::encode(rand::random::<[u8; 32]>());
+                user.email_verify_token = token.clone();
+                pending_verification = Some(token);
             }
         } else {
             return ApiData::err("Email address is required and cannot be removed");
