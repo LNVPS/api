@@ -7,9 +7,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use isocountry::CountryCode;
-use log::{error, info};
 use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
+use log::{error, info};
 use nostr_sdk::{ToBech32, Url};
 use payments_rs::currency::CurrencyAmount;
 use serde::Serialize;
@@ -19,8 +19,10 @@ use std::io::Cursor;
 use std::str::FromStr;
 
 use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
-use lnvps_api_common::{ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey,
-    ApiVmOsImage, ApiVmTemplate, EuVatClient, Nip98Auth, PageQuery, UpgradeConfig, WorkJob};
+use lnvps_api_common::{
+    ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey, ApiVmOsImage,
+    ApiVmTemplate, EuVatClient, Nip98Auth, PageQuery, UpgradeConfig, WorkJob,
+};
 use lnvps_db::{
     PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
 };
@@ -41,10 +43,7 @@ pub fn routes() -> Router<RouterState> {
             "/api/v1/account",
             get(v1_get_account).patch(v1_patch_account),
         )
-        .route(
-            "/api/v1/account/verify-email",
-            get(v1_verify_email),
-        )
+        .route("/api/v1/account/verify-email", get(v1_verify_email))
         .route("/api/v1/vm", get(v1_list_vms))
         .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
         .route("/api/v1/image", get(v1_list_vm_images))
@@ -104,9 +103,11 @@ async fn v1_patch_account(
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
-    // validate nwc string
+    // validate nwc string (skip validation if empty - treat as clearing the value)
     #[cfg(feature = "nostr-nwc")]
-    if let Some(Some(nwc)) = &req.nwc_connection_string {
+    if let Some(Some(nwc)) = &req.nwc_connection_string
+        && !nwc.is_empty()
+    {
         match nwc::prelude::NostrWalletConnectURI::parse(nwc) {
             Ok(s) => {
                 // test connection
@@ -203,7 +204,11 @@ async fn v1_patch_account(
         user.billing_tax_id = tax_id.clone();
     }
     if let Some(nwc_connection_string) = &req.nwc_connection_string {
-        user.nwc_connection_string = nwc_connection_string.clone().map(|s| s.into());
+        // Treat empty string as None (clear the value)
+        user.nwc_connection_string = nwc_connection_string
+            .clone()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.into());
     }
 
     this.db.update_user(&user).await?;
@@ -923,7 +928,9 @@ async fn v1_get_payment_methods(State(this): State<RouterState>) -> ApiResult<Ve
     ApiData::ok(build_payment_methods_response(configs))
 }
 
-fn build_payment_methods_response(configs: Vec<lnvps_db::PaymentMethodConfig>) -> Vec<ApiPaymentInfo> {
+fn build_payment_methods_response(
+    configs: Vec<lnvps_db::PaymentMethodConfig>,
+) -> Vec<ApiPaymentInfo> {
     let has_lightning = configs
         .iter()
         .any(|c| c.enabled && c.payment_method == PaymentMethod::Lightning);
@@ -1298,7 +1305,14 @@ mod tests {
 
     #[test]
     fn test_payment_methods_lightning_includes_nwc() {
-        let configs = vec![make_config(1, PaymentMethod::Lightning, true, None, None, None)];
+        let configs = vec![make_config(
+            1,
+            PaymentMethod::Lightning,
+            true,
+            None,
+            None,
+            None,
+        )];
         let result = build_payment_methods_response(configs);
 
         assert_eq!(result.len(), 2);
@@ -1310,7 +1324,14 @@ mod tests {
 
     #[test]
     fn test_payment_methods_disabled_lightning_no_nwc() {
-        let configs = vec![make_config(1, PaymentMethod::Lightning, false, None, None, None)];
+        let configs = vec![make_config(
+            1,
+            PaymentMethod::Lightning,
+            false,
+            None,
+            None,
+            None,
+        )];
         let result = build_payment_methods_response(configs);
 
         assert!(result.is_empty());
@@ -1318,22 +1339,35 @@ mod tests {
 
     #[test]
     fn test_payment_methods_fiat_only_no_nwc() {
-        let configs = vec![
-            make_config(1, PaymentMethod::Revolut, true, Some(2.5), Some(30), Some("EUR")),
-        ];
+        let configs = vec![make_config(
+            1,
+            PaymentMethod::Revolut,
+            true,
+            Some(2.5),
+            Some(30),
+            Some("EUR"),
+        )];
         let result = build_payment_methods_response(configs);
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].name, ApiPaymentMethod::Revolut));
-        assert_eq!(result[0].currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);
+        assert_eq!(
+            result[0].currencies,
+            vec![ApiCurrency::EUR, ApiCurrency::USD]
+        );
         // No NWC since no Lightning
     }
 
     #[test]
     fn test_payment_methods_processing_fees_included() {
-        let configs = vec![
-            make_config(1, PaymentMethod::Stripe, true, Some(2.9), Some(30), Some("USD")),
-        ];
+        let configs = vec![make_config(
+            1,
+            PaymentMethod::Stripe,
+            true,
+            Some(2.9),
+            Some(30),
+            Some("USD"),
+        )];
         let result = build_payment_methods_response(configs);
 
         assert_eq!(result.len(), 1);
@@ -1347,7 +1381,14 @@ mod tests {
         let configs = vec![
             make_config(1, PaymentMethod::Lightning, true, None, None, None),
             make_config(2, PaymentMethod::Revolut, false, Some(1.5), None, None),
-            make_config(3, PaymentMethod::Stripe, true, Some(2.9), Some(30), Some("EUR")),
+            make_config(
+                3,
+                PaymentMethod::Stripe,
+                true,
+                Some(2.9),
+                Some(30),
+                Some("EUR"),
+            ),
         ];
         let result = build_payment_methods_response(configs);
 
@@ -1379,9 +1420,7 @@ mod tests {
                 ApiPaymentMethod::Lightning | ApiPaymentMethod::NWC => {
                     assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
                 }
-                ApiPaymentMethod::Revolut
-                | ApiPaymentMethod::Paypal
-                | ApiPaymentMethod::Stripe => {
+                ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {
                     assert_eq!(info.currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);
                 }
             }
