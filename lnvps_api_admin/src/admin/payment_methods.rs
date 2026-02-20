@@ -140,6 +140,13 @@ async fn admin_update_payment_method(
         .into());
     }
 
+    // Update supported currencies if provided
+    if let Some(currencies) = &request.supported_currencies {
+        config.supported_currencies = lnvps_db::CommaSeparated::new(
+            currencies.iter().map(|s| s.trim().to_uppercase()).collect(),
+        );
+    }
+
     this.db.update_payment_method_config(&config).await?;
 
     let updated_config = this.db.get_payment_method_config(id).await?;

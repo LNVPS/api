@@ -939,11 +939,11 @@ fn build_payment_methods_response(
         .into_iter()
         .filter(|c| c.enabled)
         .map(|config| {
-            let currencies = match config.payment_method {
-                PaymentMethod::Lightning => vec![ApiCurrency::BTC],
-                PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
-                PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
-                PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
+            // Use supported_currencies from DB if set, otherwise fall back to defaults
+            let currencies = if config.supported_currencies.is_empty() {
+                default_currencies_for_method(config.payment_method)
+            } else {
+                parse_currencies(&config.supported_currencies)
             };
             ApiPaymentInfo {
                 name: config.payment_method.into(),
@@ -969,6 +969,26 @@ fn build_payment_methods_response(
     }
 
     ret
+}
+
+/// Parse currency codes into ApiCurrency list, skipping invalid ones
+fn parse_currencies(codes: &[String]) -> Vec<ApiCurrency> {
+    use payments_rs::currency::Currency;
+    codes
+        .iter()
+        .filter_map(|c| Currency::from_str(c).ok())
+        .map(ApiCurrency::from)
+        .collect()
+}
+
+/// Get default currencies for a payment method type
+fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
+    match method {
+        PaymentMethod::Lightning => vec![ApiCurrency::BTC],
+        PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
+        PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
+        PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
+    }
 }
 
 /// Get payment status (for polling)
@@ -1281,6 +1301,18 @@ mod tests {
         fee_base: Option<u64>,
         fee_currency: Option<&str>,
     ) -> PaymentMethodConfig {
+        make_config_with_currencies(id, method, enabled, fee_rate, fee_base, fee_currency, vec![])
+    }
+
+    fn make_config_with_currencies(
+        id: u64,
+        method: PaymentMethod,
+        enabled: bool,
+        fee_rate: Option<f32>,
+        fee_base: Option<u64>,
+        fee_currency: Option<&str>,
+        supported_currencies: Vec<&str>,
+    ) -> PaymentMethodConfig {
         PaymentMethodConfig {
             id,
             company_id: 1,
@@ -1292,6 +1324,9 @@ mod tests {
             processing_fee_rate: fee_rate,
             processing_fee_base: fee_base,
             processing_fee_currency: fee_currency.map(String::from),
+            supported_currencies: lnvps_db::CommaSeparated::new(
+                supported_currencies.into_iter().map(String::from).collect(),
+            ),
             created: Utc::now(),
             modified: Utc::now(),
         }
@@ -1425,5 +1460,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_payment_methods_custom_currencies() {
+        let configs = vec![make_config_with_currencies(
+            1,
+            PaymentMethod::Stripe,
+            true,
+            None,
+            None,
+            None,
+            vec!["GBP", "CHF", "EUR"],
+        )];
+        let result = build_payment_methods_response(configs);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].currencies,
+            vec![ApiCurrency::GBP, ApiCurrency::CHF, ApiCurrency::EUR]
+        );
+    }
+
+    #[test]
+    fn test_payment_methods_custom_currencies_invalid_ignored() {
+        let configs = vec![make_config_with_currencies(
+            1,
+            PaymentMethod::Stripe,
+            true,
+            None,
+            None,
+            None,
+            vec!["EUR", "INVALID", "USD"],
+        )];
+        let result = build_payment_methods_response(configs);
+
+        assert_eq!(result.len(), 1);
+        // INVALID should be skipped
+        assert_eq!(
+            result[0].currencies,
+            vec![ApiCurrency::EUR, ApiCurrency::USD]
+        );
     }
 }

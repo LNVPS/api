@@ -1757,8 +1757,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
             r#"
             INSERT INTO payment_method_config 
             (company_id, payment_method, name, enabled, provider_type, config, 
-             processing_fee_rate, processing_fee_base, processing_fee_currency)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             processing_fee_rate, processing_fee_base, processing_fee_currency, supported_currencies)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(config.company_id)
@@ -1770,6 +1770,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(config.processing_fee_rate)
         .bind(config.processing_fee_base)
         .bind(&config.processing_fee_currency)
+        .bind(&config.supported_currencies)
         .execute(&self.db)
         .await?;
 
@@ -1781,7 +1782,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             r#"
             UPDATE payment_method_config 
             SET company_id = ?, payment_method = ?, name = ?, enabled = ?, provider_type = ?, config = ?,
-                processing_fee_rate = ?, processing_fee_base = ?, processing_fee_currency = ?
+                processing_fee_rate = ?, processing_fee_base = ?, processing_fee_currency = ?, supported_currencies = ?
             WHERE id = ?
             "#,
         )
@@ -1794,6 +1795,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(config.processing_fee_rate)
         .bind(config.processing_fee_base)
         .bind(&config.processing_fee_currency)
+        .bind(&config.supported_currencies)
         .bind(config.id)
         .execute(&self.db)
         .await?;

@@ -2656,6 +2656,8 @@ pub struct AdminPaymentMethodConfigInfo {
     pub processing_fee_base: Option<u64>,
     /// Currency for the processing fee base
     pub processing_fee_currency: Option<String>,
+    /// Supported currency codes (e.g., ["EUR", "USD"])
+    pub supported_currencies: Vec<String>,
     pub created: DateTime<Utc>,
     pub modified: DateTime<Utc>,
 }
@@ -2676,6 +2678,7 @@ impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
             processing_fee_rate: config.processing_fee_rate,
             processing_fee_base: config.processing_fee_base,
             processing_fee_currency: config.processing_fee_currency,
+            supported_currencies: config.supported_currencies.into_inner(),
             created: config.created,
             modified: config.modified,
         }
@@ -2695,6 +2698,8 @@ pub struct CreatePaymentMethodConfigRequest {
     /// Processing fee base in smallest currency units (cents for fiat, millisats for BTC)
     pub processing_fee_base: Option<u64>,
     pub processing_fee_currency: Option<String>,
+    /// Supported currency codes (e.g., ["EUR", "USD"])
+    pub supported_currencies: Option<Vec<String>>,
 }
 
 impl CreatePaymentMethodConfigRequest {
@@ -2723,6 +2728,11 @@ impl CreatePaymentMethodConfigRequest {
             .processing_fee_currency
             .as_ref()
             .map(|s| s.trim().to_uppercase());
+        if let Some(currencies) = &self.supported_currencies {
+            payment_config.supported_currencies = lnvps_db::CommaSeparated::new(
+                currencies.iter().map(|s| s.trim().to_uppercase()).collect(),
+            );
+        }
 
         Ok(payment_config)
     }
@@ -2739,6 +2749,8 @@ pub struct UpdatePaymentMethodConfigRequest {
     /// Processing fee base in smallest currency units (cents for fiat, millisats for BTC)
     pub processing_fee_base: Option<Option<u64>>,
     pub processing_fee_currency: Option<Option<String>>,
+    /// Supported currency codes (e.g., ["EUR", "USD"])
+    pub supported_currencies: Option<Vec<String>>,
 }
 
 // Partial provider config types for updates - all fields are optional

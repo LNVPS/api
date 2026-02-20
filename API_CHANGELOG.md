@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-20** - Added `supported_currencies` to payment method configuration
+  - `AdminPaymentMethodConfigInfo` — New `supported_currencies` field (array of currency codes)
+  - `CreatePaymentMethodConfigRequest` — New optional `supported_currencies` field
+  - `UpdatePaymentMethodConfigRequest` — New optional `supported_currencies` field
+  - `GET /api/v1/payment/methods` — Now returns currencies from DB config instead of hardcoded defaults
+  - Empty array means use default currencies based on payment method type (Lightning: BTC, others: EUR/USD)
+
 - **2026-02-20** - Added `cpu_mfg`, `cpu_arch`, `cpu_features` to all admin API response models
   - `AdminVmInfo` — Now includes CPU specification fields from the VM's template
   - `AdminVmTemplateInfo` — Now includes CPU specification fields

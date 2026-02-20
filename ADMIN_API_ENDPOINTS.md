@@ -4151,6 +4151,8 @@ Instead, the config contains boolean indicators showing whether these values are
   // Base fee in smallest currency units (e.g., 20 for €0.20)
   "processing_fee_currency": "string | null",
   // Currency code for base fee
+  "supported_currencies": ["string"],
+  // Supported currency codes (e.g., ["EUR", "USD"]). Empty array means use defaults.
   "created": "string (ISO 8601)",
   "modified": "string (ISO 8601)"
 }
@@ -4176,8 +4178,10 @@ Instead, the config contains boolean indicators showing whether these values are
   |
   null,
   // Optional - Base fee in smallest currency units (e.g., 20 for €0.20)
-  "processing_fee_currency": "string | null"
+  "processing_fee_currency": "string | null",
   // Required if base fee is set
+  "supported_currencies": ["string"] | null
+  // Optional - Supported currency codes (e.g., ["EUR", "USD"])
 }
 ```
 
@@ -4203,8 +4207,10 @@ Instead, the config contains boolean indicators showing whether these values are
   |
   null,
   // Optional - Base fee in smallest currency units (null to clear)
-  "processing_fee_currency": "string | null"
+  "processing_fee_currency": "string | null",
   // Optional - Currency (null to clear)
+  "supported_currencies": ["string"] | null
+  // Optional - Supported currency codes (e.g., ["EUR", "USD"])
 }
 ```
 

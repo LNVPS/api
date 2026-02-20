@@ -1859,6 +1859,9 @@ pub struct PaymentMethodConfig {
     pub processing_fee_base: Option<u64>,
     /// Currency for the processing fee base
     pub processing_fee_currency: Option<String>,
+    /// Supported currency codes (e.g., "EUR", "USD", "BTC")
+    /// Empty means use default currencies based on payment method type
+    pub supported_currencies: CommaSeparated<String>,
     /// Created timestamp
     pub created: DateTime<Utc>,
     /// Last modified timestamp
@@ -1902,6 +1905,7 @@ impl PaymentMethodConfig {
             processing_fee_rate: None,
             processing_fee_base: None,
             processing_fee_currency: None,
+            supported_currencies: CommaSeparated::default(),
             created: Utc::now(),
             modified: Utc::now(),
         }

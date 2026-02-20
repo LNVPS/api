@@ -216,7 +216,7 @@ impl LightningNode for MockNode {
         Ok(AddInvoiceResponse::from_invoice(&pr, None)?)
     }
 
-    async fn cancel_invoice(&self, id: &Vec<u8>) -> anyhow::Result<()> {
+    async fn cancel_invoice(&self, id: &[u8]) -> anyhow::Result<()> {
         todo!()
     }
 
