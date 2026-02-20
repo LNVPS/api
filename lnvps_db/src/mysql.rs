@@ -707,7 +707,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,processing_fee,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,processing_fee,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params,paid_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&vm_payment.id)
             .bind(vm_payment.vm_id)
             .bind(vm_payment.created)
@@ -724,6 +724,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&vm_payment.external_id)
             .bind(&vm_payment.external_data)
             .bind(&vm_payment.upgrade_params)
+            .bind(vm_payment.paid_at)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -763,7 +764,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         let mut tx = self.db.begin().await?;
 
-        sqlx::query("update vm_payment set is_paid = true, external_data = ? where id = ?")
+        sqlx::query("update vm_payment set is_paid = true, external_data = ?, paid_at = NOW() where id = ?")
             .bind(&vm_payment.external_data)
             .bind(&vm_payment.id)
             .execute(&mut *tx)
@@ -1359,7 +1360,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, paid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&payment.id)
         .bind(payment.subscription_id)
@@ -1375,6 +1376,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(payment.is_paid)
         .bind(payment.rate)
         .bind(payment.tax)
+        .bind(payment.paid_at)
         .execute(&self.db)
         .await?;
 
@@ -1409,7 +1411,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let mut tx = self.db.begin().await?;
 
         // Mark payment as paid
-        sqlx::query("UPDATE subscription_payment SET is_paid = 1 WHERE id = ?")
+        sqlx::query("UPDATE subscription_payment SET is_paid = 1, paid_at = NOW() WHERE id = ?")
             .bind(&payment.id)
             .execute(tx.as_mut())
             .await?;

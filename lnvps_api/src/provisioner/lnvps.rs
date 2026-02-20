@@ -403,6 +403,7 @@ impl LNVpsProvisioner {
                     rate: converted.rate.rate,
                     tax,
                     processing_fee,
+                    paid_at: None,
                 }
             }
             PaymentMethod::Revolut => {
@@ -448,6 +449,7 @@ impl LNVpsProvisioner {
                     rate: converted.rate.rate,
                     tax,
                     processing_fee,
+                    paid_at: None,
                 }
             }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
@@ -524,6 +526,7 @@ impl LNVpsProvisioner {
                             external_data: invoice.pr().into(),
                             external_id: invoice.external_id,
                             upgrade_params,
+                            paid_at: None,
                         }
                     }
                     PaymentMethod::Revolut => {
@@ -564,6 +567,7 @@ impl LNVpsProvisioner {
                             external_data: order.raw_data.into(),
                             external_id: Some(order.external_id),
                             upgrade_params,
+                            paid_at: None,
                         }
                     }
                     PaymentMethod::Paypal => todo!(),

@@ -1675,6 +1675,8 @@ pub struct AdminVmPaymentInfo {
     pub payment_method: AdminPaymentMethod,
     pub external_id: Option<String>,
     pub is_paid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<DateTime<Utc>>,
     pub rate: f32, // Exchange rate to base currency (EUR)
                    // Note: external_data is omitted as it may contain sensitive payment provider data
 }
@@ -1693,6 +1695,7 @@ impl AdminVmPaymentInfo {
             payment_method: AdminPaymentMethod::from(payment.payment_method),
             external_id: payment.external_id.clone(),
             is_paid: payment.is_paid,
+            paid_at: payment.paid_at,
             rate: payment.rate,
         }
     }
@@ -1974,6 +1977,8 @@ pub struct AdminSubscriptionPaymentInfo {
     pub payment_type: ApiSubscriptionPaymentType,
     pub external_id: Option<String>,
     pub is_paid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<DateTime<Utc>>,
     pub rate: f32,
     pub tax: u64,
     pub processing_fee: u64,
@@ -2017,6 +2022,7 @@ impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             external_id: payment.external_id,
             is_paid: payment.is_paid,
+            paid_at: payment.paid_at,
             rate: payment.rate,
             tax: payment.tax,
             processing_fee: payment.processing_fee,

@@ -901,6 +901,8 @@ pub struct VmPayment {
     pub processing_fee: u64,
     /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
     pub upgrade_params: Option<String>,
+    /// Timestamp when the payment was completed
+    pub paid_at: Option<DateTime<Utc>>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -1501,6 +1503,8 @@ pub struct SubscriptionPayment {
     pub rate: f32,
     pub tax: u64,
     pub processing_fee: u64,
+    /// Timestamp when the payment was completed
+    pub paid_at: Option<DateTime<Utc>>,
 }
 
 /// Subscription payment with company info (for admin views)
@@ -1521,6 +1525,8 @@ pub struct SubscriptionPaymentWithCompany {
     pub rate: f32,
     pub tax: u64,
     pub processing_fee: u64,
+    /// Timestamp when the payment was completed
+    pub paid_at: Option<DateTime<Utc>>,
     pub company_base_currency: String,
 }
 

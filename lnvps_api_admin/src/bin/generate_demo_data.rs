@@ -1305,6 +1305,7 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             tax: 0,
             processing_fee: 0,
             upgrade_params: None,
+            paid_at: Some(vm.created), // Demo data: assume paid immediately
         };
 
         db.insert_vm_payment(&payment).await?;

@@ -804,15 +804,20 @@ impl LNVpsDbBase for MockDb {
         let mut p = self.payments.lock().await;
         if let Some(p) = p.iter_mut().find(|p| p.id == *vm_payment.id) {
             p.is_paid = vm_payment.is_paid;
+            p.paid_at = vm_payment.paid_at;
         }
         Ok(())
     }
 
-    async fn vm_payment_paid(&self, p: &VmPayment) -> DbResult<()> {
+    async fn vm_payment_paid(&self, payment: &VmPayment) -> DbResult<()> {
         let mut v = self.vms.lock().await;
-        self.update_vm_payment(p).await?;
-        if let Some(v) = v.get_mut(&p.vm_id) {
-            v.expires = v.expires.add(TimeDelta::seconds(p.time_value as i64));
+        let mut p = self.payments.lock().await;
+        if let Some(p) = p.iter_mut().find(|p| p.id == *payment.id) {
+            p.is_paid = true;
+            p.paid_at = Some(Utc::now());
+        }
+        if let Some(v) = v.get_mut(&payment.vm_id) {
+            v.expires = v.expires.add(TimeDelta::seconds(payment.time_value as i64));
         }
         Ok(())
     }
@@ -1259,6 +1264,7 @@ impl LNVpsDbBase for MockDb {
             rate: payment.rate,
             tax: payment.tax,
             processing_fee: payment.processing_fee,
+            paid_at: payment.paid_at,
             company_base_currency: "EUR".to_string(),
         })
     }
@@ -1273,6 +1279,7 @@ impl LNVpsDbBase for MockDb {
         let mut payments = self.subscription_payments.lock().await;
         if let Some(p) = payments.iter_mut().find(|p| p.id == payment.id) {
             p.is_paid = payment.is_paid;
+            p.paid_at = payment.paid_at;
             Ok(())
         } else {
             Err(anyhow!("Subscription payment not found").into())
@@ -1280,8 +1287,13 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()> {
-        // Mark payment as paid
-        self.update_subscription_payment(payment).await?;
+        // Mark payment as paid with timestamp
+        let mut payments = self.subscription_payments.lock().await;
+        if let Some(p) = payments.iter_mut().find(|p| p.id == payment.id) {
+            p.is_paid = true;
+            p.paid_at = Some(Utc::now());
+        }
+        drop(payments);
 
         // Extend subscription expiration by 30 days (subscriptions are always monthly)
         let mut subscriptions = self.subscriptions.lock().await;

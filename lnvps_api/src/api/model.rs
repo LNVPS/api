@@ -180,6 +180,8 @@ pub struct ApiVmPayment {
     pub processing_fee: u64,
     pub currency: String,
     pub is_paid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<DateTime<Utc>>,
     pub data: ApiPaymentData,
     pub time: u64,
     pub is_upgrade: bool,
@@ -260,6 +262,7 @@ impl From<lnvps_db::VmPayment> for ApiVmPayment {
             processing_fee: value.processing_fee,
             currency: value.currency,
             is_paid: value.is_paid,
+            paid_at: value.paid_at,
             time: value.time_value,
             is_upgrade: value.payment_type == PaymentType::Upgrade,
             upgrade_params: value.upgrade_params.clone(),
@@ -596,6 +599,8 @@ pub struct ApiSubscriptionPayment {
     pub payment_method: ApiPaymentMethod,
     pub payment_type: ApiSubscriptionPaymentType,
     pub is_paid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paid_at: Option<DateTime<Utc>>,
     pub tax: ApiPrice,
     pub processing_fee: ApiPrice,
 }
@@ -636,6 +641,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             payment_method: ApiPaymentMethod::from(payment.payment_method),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             is_paid: payment.is_paid,
+            paid_at: payment.paid_at,
             tax: tax.into(),
             processing_fee: processing_fee.into(),
         }
@@ -860,6 +866,7 @@ mod tests {
             tax,
             processing_fee,
             upgrade_params: None,
+            paid_at: Some(Utc::now()),
         }
     }
 
