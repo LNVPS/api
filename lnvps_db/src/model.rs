@@ -905,7 +905,7 @@ pub struct Referral {
     pub id: u64,
     /// The user that owns this referral
     pub user_id: u64,
-    /// The auto-generated referral code (base32, 8 characters)
+    /// The auto-generated referral code (base63, 8 characters)
     pub code: String,
     /// Lightning address for automatic payouts
     pub lightning_address: Option<String>,

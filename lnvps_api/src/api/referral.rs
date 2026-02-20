@@ -1,13 +1,14 @@
-use crate::api::RouterState;
-use axum::Json;
-use axum::Router;
 use axum::extract::State;
-use axum::routing::{get, patch, post};
+use axum::routing::get;
+use axum::{Json, Router};
 use chrono::Utc;
-use lnvps_api_common::{ApiData, ApiError, ApiResult, Nip98Auth};
-use lnvps_db::{Referral, ReferralCostUsage, ReferralPayout};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use lnvps_api_common::{ApiData, ApiError, ApiResult, Nip98Auth};
+use lnvps_db::{Referral, ReferralCostUsage, ReferralPayout};
+
+use crate::api::RouterState;
 
 pub fn router() -> Router<RouterState> {
     Router::new().route(
