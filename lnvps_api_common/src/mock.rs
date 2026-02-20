@@ -5,10 +5,11 @@ use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbResult, DiskInterface, DiskType,
     IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Router, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
-    Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
+    ReferralCostUsage, ReferralPayout, Router, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
+    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
     VmTemplate,
 };
 
@@ -47,6 +48,8 @@ pub struct MockDb {
     pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
+    pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
+    pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
 }
 
 impl MockDb {
@@ -246,6 +249,8 @@ impl Default for MockDb {
             subscription_line_items: Arc::new(Default::default()),
             subscription_payments: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
+            referrals: Arc::new(Default::default()),
+            referral_payouts: Arc::new(Default::default()),
         }
     }
 }
@@ -1475,6 +1480,105 @@ impl LNVpsDbBase for MockDb {
         let mut configs = self.payment_method_configs.lock().await;
         configs.remove(&id);
         Ok(())
+    }
+
+    async fn get_referral_by_user(&self, user_id: u64) -> DbResult<Referral> {
+        let referrals = self.referrals.lock().await;
+        referrals
+            .values()
+            .find(|r| r.user_id == user_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Referral not found for user {}", user_id).into())
+    }
+
+    async fn get_referral_by_code(&self, code: &str) -> DbResult<Referral> {
+        let referrals = self.referrals.lock().await;
+        referrals
+            .values()
+            .find(|r| r.code == code)
+            .cloned()
+            .ok_or_else(|| anyhow!("Referral not found for code {}", code).into())
+    }
+
+    async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
+        let mut referrals = self.referrals.lock().await;
+        let max_id = referrals.keys().max().copied().unwrap_or(0);
+        let new_id = max_id + 1;
+        referrals.insert(new_id, Referral { id: new_id, ..referral.clone() });
+        Ok(new_id)
+    }
+
+    async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
+        let mut referrals = self.referrals.lock().await;
+        if let Some(r) = referrals.get_mut(&referral.id) {
+            r.lightning_address = referral.lightning_address.clone();
+            r.use_nwc = referral.use_nwc;
+        }
+        Ok(())
+    }
+
+    async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
+        let mut payouts = self.referral_payouts.lock().await;
+        let new_id = payouts.len() as u64 + 1;
+        payouts.push(ReferralPayout {
+            id: new_id,
+            ..payout.clone()
+        });
+        Ok(new_id)
+    }
+
+    async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
+        let mut payouts = self.referral_payouts.lock().await;
+        if let Some(p) = payouts.iter_mut().find(|p| p.id == payout.id) {
+            p.is_paid = payout.is_paid;
+            p.pre_image = payout.pre_image.clone();
+        }
+        Ok(())
+    }
+
+    async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>> {
+        let payouts = self.referral_payouts.lock().await;
+        Ok(payouts
+            .iter()
+            .filter(|p| p.referral_id == referral_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
+        let vms = self.vms.lock().await;
+        let payments = self.payments.lock().await;
+        let mut result = Vec::new();
+        for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
+            let mut vm_payments: Vec<&VmPayment> = payments
+                .iter()
+                .filter(|p| p.vm_id == vm.id && p.is_paid)
+                .collect();
+            vm_payments.sort_by_key(|p| p.created);
+            if let Some(first) = vm_payments.first() {
+                result.push(ReferralCostUsage {
+                    vm_id: vm.id,
+                    ref_code: code.to_string(),
+                    created: first.created,
+                    amount: first.amount,
+                    currency: first.currency.clone(),
+                    rate: first.rate,
+                    base_currency: "EUR".to_string(),
+                });
+            }
+        }
+        result.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(result)
+    }
+
+    async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
+        let vms = self.vms.lock().await;
+        let payments = self.payments.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| v.ref_code.as_deref() == Some(code))
+            .filter(|v| !payments.iter().any(|p| p.vm_id == v.id && p.is_paid))
+            .count() as u64)
     }
 }
 

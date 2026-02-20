@@ -899,6 +899,42 @@ pub struct VmPayment {
     pub upgrade_params: Option<String>,
 }
 
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct Referral {
+    /// Unique id of this referral entry
+    pub id: u64,
+    /// The user that owns this referral
+    pub user_id: u64,
+    /// The auto-generated referral code (base63, 8 characters)
+    pub code: String,
+    /// Lightning address for automatic payouts
+    pub lightning_address: Option<String>,
+    /// If true, use the user's NWC connection for payouts
+    pub use_nwc: bool,
+    /// When this referral entry was created
+    pub created: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct ReferralPayout {
+    /// Unique id of this payout record
+    pub id: u64,
+    /// The referral this payout belongs to
+    pub referral_id: u64,
+    /// Amount in smallest currency unit
+    pub amount: u64,
+    /// Currency of this payout
+    pub currency: String,
+    /// When this payout record was created
+    pub created: DateTime<Utc>,
+    /// Whether this payout has been completed
+    pub is_paid: bool,
+    /// Lightning invoice for this payout
+    pub invoice: Option<String>,
+    /// Preimage revealed when the invoice was paid (32 bytes, SHA256)
+    pub pre_image: Option<Vec<u8>>,
+}
+
 #[derive(FromRow, Clone, Debug)]
 pub struct ReferralCostUsage {
     pub vm_id: u64,

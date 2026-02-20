@@ -29,6 +29,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Valid `cpu_arch` values: "x86_64", "arm64", "unknown"
   - CPU features are parsed from strings (e.g. "AVX2", "AES", "VMX"); invalid values are silently ignored
 
+- **2026-02-19** - Added Referral Program API endpoints
+  - `POST /api/v1/referral` - Enroll in referral program with lightning address or NWC payout options
+  - `GET /api/v1/referral` - Get referral state including per-currency earnings, payout history, and success/failed counts
+  - `PATCH /api/v1/referral` - Update payout options (lightning_address, use_nwc)
+
 - **2026-02-17** - Added embedded API documentation served at root path (both User and Admin APIs)
   - `GET /` or `GET /index.html` - Renders API documentation with markdown viewer
   - `GET /docs/endpoints.md` - Raw markdown content of API endpoints documentation

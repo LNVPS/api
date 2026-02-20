@@ -621,6 +621,71 @@ const result: ApiResponse<Subscription> = await response.json();
 // Returns: PaginatedResponse<SubscriptionPayment>
 ```
 
+### Referral Program
+
+Users can enroll in the referral program to earn payouts when others sign up using their code.
+
+#### Sign Up for Referral Program
+- **POST** `/api/v1/referral`
+- **Auth**: Required
+- **Body**:
+```typescript
+interface ReferralSignupRequest {
+  lightning_address?: string; // Lightning address for automatic payouts
+  use_nwc?: boolean;          // Use NWC wallet for payouts (requires NWC configured on account)
+}
+```
+- **Response**: `Referral`
+- **Error**: Returns error if already enrolled, or if no payout method is provided, or if `use_nwc` is true but NWC is not configured
+
+#### Get Referral State
+- **GET** `/api/v1/referral`
+- **Auth**: Required
+- **Response**: `ReferralState`
+
+#### Update Referral Payout Options
+- **PATCH** `/api/v1/referral`
+- **Auth**: Required
+- **Body**:
+```typescript
+interface ReferralPatchRequest {
+  lightning_address?: string | null; // Set or clear lightning address
+  use_nwc?: boolean;                 // Enable/disable NWC payout
+}
+```
+- **Response**: `Referral`
+
+**Response Types:**
+```typescript
+interface Referral {
+  code: string;                    // 8-character base63 referral code to share
+  lightning_address?: string;      // Lightning address for payouts
+  use_nwc: boolean;                // Whether to use NWC for payouts
+  created: string;                 // ISO 8601 datetime
+}
+
+interface ReferralEarning {
+  currency: string;   // Currency code (e.g. "EUR", "BTC")
+  amount: number;     // Total earned in this currency (smallest currency unit)
+}
+
+interface ReferralPayout {
+  id: number;
+  amount: number;
+  currency: string;
+  created: string;    // ISO 8601 datetime
+  is_paid: boolean;
+  invoice?: string;   // BOLT11 lightning invoice
+}
+
+interface ReferralState extends Referral {
+  earned: ReferralEarning[];     // Per-currency breakdown of referral earnings
+  payouts: ReferralPayout[];     // Complete payout history (most recent first)
+  referrals_success: number;     // Number of referred users that made a payment
+  referrals_failed: number;      // Number of referred users that never paid
+}
+```
+
 ### Monitoring and History
 
 #### Get VM Time Series Data

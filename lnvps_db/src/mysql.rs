@@ -1,7 +1,7 @@
 use crate::{
     AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType,
-    ReferralCostUsage, RegionStats, Router, Subscription, SubscriptionLineItem,
+    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
     VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
@@ -1791,6 +1791,118 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
 
         Ok(())
+    }
+
+    async fn get_referral_by_user(&self, user_id: u64) -> DbResult<Referral> {
+        Ok(sqlx::query_as("SELECT * FROM referral WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_referral_by_code(&self, code: &str) -> DbResult<Referral> {
+        Ok(sqlx::query_as("SELECT * FROM referral WHERE code = ?")
+            .bind(code)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO referral (user_id, code, lightning_address, use_nwc) VALUES (?, ?, ?, ?) returning id",
+        )
+        .bind(referral.user_id)
+        .bind(&referral.code)
+        .bind(&referral.lightning_address)
+        .bind(referral.use_nwc)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE referral SET lightning_address = ?, use_nwc = ? WHERE id = ?",
+        )
+        .bind(&referral.lightning_address)
+        .bind(referral.use_nwc)
+        .bind(referral.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO referral_payout (referral_id, amount, currency, invoice) VALUES (?, ?, ?, ?) returning id",
+        )
+        .bind(payout.referral_id)
+        .bind(payout.amount)
+        .bind(&payout.currency)
+        .bind(&payout.invoice)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
+        sqlx::query("UPDATE referral_payout SET is_paid = ?, pre_image = ? WHERE id = ?")
+            .bind(payout.is_paid)
+            .bind(&payout.pre_image)
+            .bind(payout.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM referral_payout WHERE referral_id = ? ORDER BY created DESC")
+                .bind(referral_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
+        Ok(sqlx::query_as(
+            "SELECT v.id as vm_id,
+                    v.ref_code,
+                    vp.created,
+                    vp.amount,
+                    vp.currency,
+                    vp.rate,
+                    c.base_currency
+             FROM vm v
+             JOIN (
+                 SELECT vm_id, currency, amount, created, rate,
+                        ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) AS rn
+                 FROM vm_payment
+                 WHERE is_paid = 1
+             ) vp ON v.id = vp.vm_id AND vp.rn = 1
+             JOIN vm_host vh ON v.host_id = vh.id
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON vhr.company_id = c.id
+             WHERE v.ref_code = ?
+             ORDER BY vp.created DESC",
+        )
+        .bind(code)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vm v
+             WHERE v.ref_code = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM vm_payment vp WHERE vp.vm_id = v.id AND vp.is_paid = 1
+               )",
+        )
+        .bind(code)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(count as u64)
     }
 }
 

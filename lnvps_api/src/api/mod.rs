@@ -4,6 +4,7 @@ mod ip_space;
 mod model;
 #[cfg(feature = "nostr-domain")]
 mod nostr_domain;
+mod referral;
 mod routes;
 mod subscriptions;
 mod webhook;
@@ -46,6 +47,7 @@ use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkC
 use lnvps_db::LNVpsDb;
 #[cfg(feature = "nostr-domain")]
 pub use nostr_domain::router as nostr_domain_router;
+pub use referral::router as referral_router;
 pub use routes::routes as main_router;
 use serde::Deserialize;
 use std::sync::Arc;

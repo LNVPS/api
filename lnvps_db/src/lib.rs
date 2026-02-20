@@ -506,6 +506,38 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Delete a payment method configuration
     async fn delete_payment_method_config(&self, id: u64) -> DbResult<()>;
+
+    // ========================================================================
+    // Referral Program
+    // ========================================================================
+
+    /// Get a user's referral entry by user id
+    async fn get_referral_by_user(&self, user_id: u64) -> DbResult<Referral>;
+
+    /// Get a referral entry by its code
+    async fn get_referral_by_code(&self, code: &str) -> DbResult<Referral>;
+
+    /// Insert a new referral entry
+    async fn insert_referral(&self, referral: &Referral) -> DbResult<u64>;
+
+    /// Update an existing referral entry
+    async fn update_referral(&self, referral: &Referral) -> DbResult<()>;
+
+    /// Insert a new referral payout record
+    async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64>;
+
+    /// Update a referral payout record
+    async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()>;
+
+    /// List all payout records for a referral
+    async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>>;
+
+    /// List the first paid VM payment per VM that used this referral code.
+    /// This is the basis for computing earned amounts (per currency).
+    async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>>;
+
+    /// Count VMs that used this referral code but have never made a paid payment.
+    async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 }
 
 /// Super trait that combines all database functionality based on enabled features
