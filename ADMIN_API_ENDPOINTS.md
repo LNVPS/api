@@ -1886,6 +1886,33 @@ Required Permission: `ip_range::delete`
 Note: IP ranges with active IP assignments cannot be deleted. You must first remove all IP assignments before deleting
 an IP range.
 
+#### List Free IPs in Range
+
+```
+GET /api/admin/v1/ip_ranges/{id}/free_ips
+```
+
+Required Permission: `ip_range::view`
+
+Returns a list of all unassigned (free) IP addresses in the specified IPv4 range.
+
+**Limitations:**
+- Only available for IPv4 ranges. IPv6 ranges are too large to enumerate and will return an error.
+- Reserved IPs (gateway, network address, broadcast address) are excluded from the list.
+
+Response:
+
+```json
+{
+  "data": [
+    "192.168.1.2",
+    "192.168.1.3",
+    "192.168.1.5",
+    "..."
+  ]
+}
+```
+
 ### Access Policy Management
 
 #### List Access Policies
