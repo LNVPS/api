@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-21** - Added endpoint to list free IPs in an IPv4 range (Admin API)
+  - `GET /api/admin/v1/ip_ranges/{id}/free_ips` — Returns list of unassigned IP addresses
+  - Only available for IPv4 ranges; IPv6 ranges return an error (too large to enumerate)
+  - Excludes reserved IPs (gateway, network address, broadcast address)
+
 - **2026-02-20** - Added `supported_currencies` to payment method configuration
   - `AdminPaymentMethodConfigInfo` — New `supported_currencies` field (array of currency codes)
   - `CreatePaymentMethodConfigRequest` — New optional `supported_currencies` field

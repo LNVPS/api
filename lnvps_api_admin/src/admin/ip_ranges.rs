@@ -24,6 +24,10 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_update_ip_range)
                 .delete(admin_delete_ip_range),
         )
+        .route(
+            "/api/admin/v1/ip_ranges/{id}/free_ips",
+            get(admin_list_free_ips),
+        )
 }
 
 /// Validate and normalize gateway format for API responses.
@@ -348,4 +352,24 @@ async fn admin_delete_ip_range(
     this.db.admin_delete_ip_range(id).await?;
 
     ApiData::ok(())
+}
+
+/// List free (unassigned) IPs in an IPv4 range.
+/// Returns an error for IPv6 ranges since they're too large to enumerate.
+async fn admin_list_free_ips(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<String>> {
+    // Check permission
+    auth.require_permission(AdminResource::IpRange, AdminAction::View)?;
+
+    // Use NetworkProvisioner to compute free IPs
+    let provisioner = NetworkProvisioner::new(this.db.clone());
+    let free_ips = provisioner.list_free_ips_in_range(id).await?;
+
+    // Convert IpAddr to String for API response
+    let free_ip_strings: Vec<String> = free_ips.iter().map(|ip| ip.to_string()).collect();
+
+    ApiData::ok(free_ip_strings)
 }
