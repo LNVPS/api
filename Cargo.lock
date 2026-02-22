@@ -2520,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_api_admin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2592,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_api_common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2619,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_health"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2661,7 +2661,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_host_util"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cros-libva",
  "nvml-wrapper",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_nostr"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2688,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_operator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5224,7 +5224,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "try-procedure"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "log 0.4.29",

@@ -20,6 +20,8 @@ If the estimate is XL, create a work file in `work/` that decomposes the task in
 
 **3. Git commits** — Never auto-commit changes. Always ask the user before committing.
 
+**4. Git push** — Always push using the HTTPS URL directly: `git push https://github.com/LNVPS/api.git`
+
 | File | Description |
 |---|---|
 | [work/agent-rules-compliance.md](work/agent-rules-compliance.md) | Bringing codebase into full compliance with all agent rules |
@@ -46,3 +48,13 @@ These docs apply to all projects using this agent structure:
 | [docs/agents/currency.md](docs/agents/currency.md) | Working with money amounts, pricing, or payments |
 | [docs/agents/bug-fixes.md](docs/agents/bug-fixes.md) | Resolving bugs — LNVPS-specific additions |
 | [docs/agents/coverage.md](docs/agents/coverage.md) | Function coverage — LNVPS-specific additions |
+
+## Release Procedure
+
+When the user asks to create a release:
+
+1. **Update `API_CHANGELOG.md`** — Change `## [Unreleased]` to `## [vX.Y.Z] - YYYY-MM-DD` with the current date
+2. **Update `Cargo.toml` versions** — Bump the version in the root `Cargo.toml` under `[workspace.package]` (all crates inherit via `version.workspace = true`)
+3. **Commit the changes** — `git commit -m "chore: release vX.Y.Z"`
+4. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+5. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`

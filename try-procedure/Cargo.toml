@@ -1,6 +1,6 @@
 [package]
 name = "try-procedure"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Retry with error classification (transient vs fatal) and step-based rollback pipelines"
 license = "MIT"

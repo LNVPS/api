@@ -4,7 +4,7 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [v0.2.0] - 2026-02-22
 
 ### Changed
 - **2026-02-22** - Reduced unpaid VM deletion time from 24 hours to 1 hour

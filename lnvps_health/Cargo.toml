@@ -1,6 +1,6 @@
 [package]
 name = "lnvps_health"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 description = "Standalone network health monitoring service (MSS, DNS, PMTU checks)"
 
