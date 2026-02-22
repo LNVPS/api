@@ -567,6 +567,7 @@ mod tests {
             ref_code: None,
             deleted: false,
             auto_renewal_enabled: false,
+            disabled: false,
         };
         let vm_id = db.insert_vm(&vm).await?;
         vm.id = vm_id;

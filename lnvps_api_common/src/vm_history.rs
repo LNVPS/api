@@ -476,6 +476,7 @@ mod tests {
             deleted: false,
             ref_code: None,
             auto_renewal_enabled: false,
+            disabled: false,
         };
         logger.log_vm_created(&vm, Some(1), None).await.unwrap();
         let history = logger.db.list_vm_history(42).await.unwrap();
@@ -645,6 +646,7 @@ mod tests {
             deleted: false,
             ref_code: None,
             auto_renewal_enabled: false,
+            disabled: false,
         };
         let mut new_vm = old_vm.clone();
         new_vm.image_id = 2;

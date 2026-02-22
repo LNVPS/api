@@ -217,6 +217,7 @@ mod tests {
                 deleted: false,
                 ref_code: None,
                 auto_renewal_enabled: false,
+                disabled: false,
             })
             .await?;
 

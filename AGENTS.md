@@ -18,7 +18,7 @@ If the estimate is XL, create a work file in `work/` that decomposes the task in
 
 **2. Check `work/`** for an active task file on the same topic before starting new work. If one exists, resume from the first unchecked task. **Never pick up a work file unless the user explicitly asks you to work on that topic.**
 
-**3. Git commits** — Never auto-commit changes. Always ask the user before committing.
+**3. Git commits** — Never auto-commit changes. Always ask the user before committing. Before committing, re-read this file (AGENTS.md) to load any required context documents for the changes being committed.
 
 **4. Git push** — Always push using the HTTPS URL directly: `git push https://github.com/LNVPS/api.git`
 
