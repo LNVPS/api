@@ -2,25 +2,9 @@
 
 This file is an index. Load only the specific doc(s) relevant to your task to minimize context usage.
 
-## Before Starting Any Task
+**Always load [docs/agents-common/common.md](docs/agents-common/common.md) first** — it contains essential guidelines for task sizing, git commits, and git push that apply to all tasks.
 
-**1. Estimate the size** of the change using t-shirt sizing:
-
-| Size | Lines of change | Action |
-|------|----------------|--------|
-| XS | < 50 | Proceed directly |
-| S | 50–250 | Proceed directly |
-| M | 250–750 | Proceed directly |
-| L | 750–2,500 | Proceed directly |
-| XL | > 2,500 | **Stop — split into increments first** |
-
-If the estimate is XL, create a work file in `work/` that decomposes the task into L-or-smaller increments, then work through them one PR at a time. See [docs/agents-common/incremental-work.md](docs/agents-common/incremental-work.md) for the work file format.
-
-**2. Check `work/`** for an active task file on the same topic before starting new work. If one exists, resume from the first unchecked task. **Never pick up a work file unless the user explicitly asks you to work on that topic.**
-
-**3. Git commits** — Never auto-commit changes. Always ask the user before committing. Before committing, re-read this file (AGENTS.md) to load any required context documents for the changes being committed.
-
-**4. Git push** — Always push using the HTTPS URL directly: `git push https://github.com/LNVPS/api.git`
+**Git push** — Always push using the HTTPS URL directly: `git push https://github.com/LNVPS/api.git`
 
 | File | Description |
 |---|---|
