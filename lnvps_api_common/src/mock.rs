@@ -2093,6 +2093,11 @@ impl lnvps_db::AdminDb for MockDb {
                                 company_id: region_company_id,
                                 company_name: company.name.clone(),
                                 company_base_currency: company.base_currency.clone(),
+                                user_id: vm.user_id,
+                                host_id: host.id,
+                                host_name: host.name.clone(),
+                                region_id: region.id,
+                                region_name: region.name.clone(),
                             });
                         }
                     }

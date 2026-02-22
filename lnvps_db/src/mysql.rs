@@ -3165,41 +3165,36 @@ impl AdminDb for LNVpsDbMysql {
         company_id: u64,
         currency: Option<&str>,
     ) -> DbResult<Vec<VmPaymentWithCompany>> {
-        match currency {
-            Some(currency) => {
-                Ok(sqlx::query_as(
-                    "SELECT vp.*, c.id as company_id, c.name as company_name, c.base_currency as company_base_currency
-                     FROM vm_payment vp
-                     JOIN vm v ON vp.vm_id = v.id
-                     JOIN vm_host vh ON v.host_id = vh.id
-                     JOIN vm_host_region vhr ON vh.region_id = vhr.id
-                     JOIN company c ON vhr.company_id = c.id
-                     WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND c.id = ? AND vp.currency = ?
-                     ORDER BY vp.created"
-                )
-                .bind(start_date)
-                .bind(end_date)
-                .bind(company_id)
-                .bind(currency)
-                .fetch_all(&self.db).await?)
-            },
-            None => {
-                Ok(sqlx::query_as(
-                    "SELECT vp.*, c.id as company_id, c.name as company_name, c.base_currency as company_base_currency
-                     FROM vm_payment vp
-                     JOIN vm v ON vp.vm_id = v.id
-                     JOIN vm_host vh ON v.host_id = vh.id
-                     JOIN vm_host_region vhr ON vh.region_id = vhr.id
-                     JOIN company c ON vhr.company_id = c.id
-                     WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND c.id = ?
-                     ORDER BY vp.created"
-                )
-                .bind(start_date)
-                .bind(end_date)
-                .bind(company_id)
-                .fetch_all(&self.db).await?)
-            }
+        let mut query = QueryBuilder::new(
+            "SELECT vp.*, 
+             c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
+             v.user_id,
+             vh.id as host_id, vh.name as host_name,
+             vhr.id as region_id, vhr.name as region_name
+             FROM vm_payment vp
+             JOIN vm v ON vp.vm_id = v.id
+             JOIN vm_host vh ON v.host_id = vh.id
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON vhr.company_id = c.id
+             WHERE vp.created >= ",
+        );
+        query.push_bind(start_date);
+        query.push(" AND vp.created < ");
+        query.push_bind(end_date);
+        query.push(" AND vp.is_paid = true AND c.id = ");
+        query.push_bind(company_id);
+
+        if let Some(currency) = currency {
+            query.push(" AND vp.currency = ");
+            query.push_bind(currency);
         }
+
+        query.push(" ORDER BY vp.created");
+
+        Ok(query
+            .build_query_as::<VmPaymentWithCompany>()
+            .fetch_all(&self.db)
+            .await?)
     }
 
     async fn admin_get_referral_usage_by_date_range(

@@ -76,6 +76,14 @@ struct TimeSeriesPayment {
     company_id: u64,
     company_name: String,
     company_base_currency: String,
+    // User information
+    user_id: u64,
+    // Host information
+    host_id: u64,
+    host_name: String,
+    // Region information
+    region_id: u64,
+    region_name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,6 +164,11 @@ async fn admin_time_series_report(
             company_id: payment.company_id,
             company_name: payment.company_name.clone(),
             company_base_currency: payment.company_base_currency.clone(),
+            user_id: payment.user_id,
+            host_id: payment.host_id,
+            host_name: payment.host_name.clone(),
+            region_id: payment.region_id,
+            region_name: payment.region_name.clone(),
         });
     }
 

@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- **2026-02-22** - Added additional fields to sales time-series report
+  - `GET /api/admin/v1/reports/time-series` — Response now includes `user_id`, `host_id`, `host_name`, `region_id`, `region_name` fields in each payment record
+  - Enables client-side filtering by user, host, or region
+
 - **2026-02-21** - Added endpoint to list free IPs in an IPv4 range (Admin API)
   - `GET /api/admin/v1/ip_ranges/{id}/free_ips` — Returns list of unassigned IP addresses
   - Only available for IPv4 ranges; IPv6 ranges return an error (too large to enumerate)

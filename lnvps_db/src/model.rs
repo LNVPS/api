@@ -982,6 +982,14 @@ pub struct VmPaymentWithCompany {
     pub company_id: u64,
     pub company_name: String,
     pub company_base_currency: String,
+    // User information
+    pub user_id: u64,
+    // Host information
+    pub host_id: u64,
+    pub host_name: String,
+    // Region information
+    pub region_id: u64,
+    pub region_name: String,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
