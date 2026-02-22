@@ -40,6 +40,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: ${{ env.HOST_INFO_IMAGE }}:latest
+          cache-from: type=gha,scope=host-info
+          cache-to: type=gha,mode=max,scope=host-info
 
   # Build main images after host-info is ready
   build:
@@ -84,6 +86,8 @@ jobs:
           file: ${{ matrix.file }}
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: ${{ matrix.image }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
           build-args: |
             HOST_INFO_IMAGE=${{ env.HOST_INFO_IMAGE }}:latest
             REGISTRY_USER=registry
