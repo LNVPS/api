@@ -10,7 +10,7 @@ use isocountry::CountryCode;
 use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
-    PricingEngine, UpgradeConfig, UpgradeCostQuote,
+    PricingEngine, UpgradeConfig, UpgradeCostQuote, round_msat_to_sat,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
@@ -362,7 +362,8 @@ impl LNVpsProvisioner {
                     "Lightning payment must be in BTC"
                 );
                 const INVOICE_EXPIRE: u64 = 600;
-                let invoice_amount = converted.amount.value() + tax;
+                // Round to nearest satoshi for wallet compatibility
+                let invoice_amount = round_msat_to_sat(converted.amount.value() + tax);
                 let desc = match payment_type {
                     SubscriptionPaymentType::Purchase => {
                         format!("Subscription purchase: {}", subscription.name)
@@ -496,7 +497,8 @@ impl LNVpsProvisioner {
                             "Cannot create invoices for non-BTC currency"
                         );
                         const INVOICE_EXPIRE: u64 = 600;
-                        let total_amount = p.amount + p.tax;
+                        // Round to nearest satoshi for wallet compatibility
+                        let total_amount = round_msat_to_sat(p.amount + p.tax);
                         info!(
                             "Creating invoice for {vm_id} for {} sats",
                             total_amount / 1000
@@ -1163,10 +1165,10 @@ mod tests {
         assert_eq!(vm.id, payment.vm_id);
         assert_eq!(payment.tax, (payment.amount as f64 * 0.01).floor() as u64);
 
-        // check invoice amount matches amount+tax
+        // check invoice amount matches rounded amount+tax
         let inv = node.invoices.lock().await;
         if let Some(i) = inv.get(&hex::encode(payment.id)) {
-            assert_eq!(i.amount, payment.amount + payment.tax);
+            assert_eq!(i.amount, round_msat_to_sat(payment.amount + payment.tax));
         } else {
             bail!("Invoice doesnt exist");
         }
