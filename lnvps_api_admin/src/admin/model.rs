@@ -402,6 +402,7 @@ pub struct AdminVmInfo {
     pub region_name: String,
     pub deleted: bool,
     pub ref_code: Option<String>,
+    pub disabled: bool,
 }
 
 impl AdminVmInfo {
@@ -553,6 +554,7 @@ impl AdminVmInfo {
             region_name,
             deleted,
             ref_code,
+            disabled: vm.disabled,
         })
     }
 }
@@ -623,6 +625,8 @@ pub struct AdminHostInfo {
     pub load_memory: f32,
     pub load_disk: f32,
     pub vlan_id: Option<u64>,
+    /// MTU setting for network configuration
+    pub mtu: Option<u16>,
     pub disks: Vec<AdminHostDisk>,
     // Calculated load metrics
     pub calculated_load: CalculatedHostLoad,
@@ -742,6 +746,7 @@ impl AdminHostInfo {
             load_memory: host.load_memory,
             load_disk: host.load_disk,
             vlan_id: host.vlan_id,
+            mtu: host.mtu,
             disks: Vec::new(), // Empty disks - should be populated separately
             calculated_load: CalculatedHostLoad {
                 overall_load: 0.0,
@@ -797,6 +802,7 @@ impl AdminHostInfo {
             load_memory: host.load_memory,
             load_disk: host.load_disk,
             vlan_id: host.vlan_id,
+            mtu: host.mtu,
             disks: admin_disks,
             calculated_load: CalculatedHostLoad {
                 overall_load: 0.0,
@@ -854,6 +860,7 @@ impl AdminHostInfo {
             load_memory: capacity.host.load_memory,
             load_disk: capacity.host.load_disk,
             vlan_id: capacity.host.vlan_id,
+            mtu: capacity.host.mtu,
             disks: admin_disks,
             calculated_load: CalculatedHostLoad {
                 overall_load: capacity.load(),
@@ -911,6 +918,7 @@ impl AdminHostInfo {
             load_memory: admin_host.host.load_memory,
             load_disk: admin_host.host.load_disk,
             vlan_id: admin_host.host.vlan_id,
+            mtu: admin_host.host.mtu,
             disks: admin_disks,
             calculated_load: CalculatedHostLoad {
                 overall_load: 0.0,
@@ -978,6 +986,7 @@ impl AdminHostInfo {
                     load_memory: capacity.host.load_memory,
                     load_disk: capacity.host.load_disk,
                     vlan_id: capacity.host.vlan_id,
+                    mtu: capacity.host.mtu,
                     disks: admin_disks,
                     calculated_load: CalculatedHostLoad {
                         overall_load: capacity.load(),

@@ -251,6 +251,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 load_memory: row.get("load_memory"),
                 load_disk: row.get("load_disk"),
                 vlan_id: row.get("vlan_id"),
+                mtu: row.get("mtu"),
                 ssh_user: row.get("ssh_user"),
                 ssh_key: row.get("ssh_key"),
             };
@@ -280,7 +281,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "UPDATE vm_host SET kind = ?, region_id = ?, name = ?, ip = ?, cpu = ?, \
              cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, memory = ?, enabled = ?, \
              api_token = ?, load_cpu = ?, load_memory = ?, load_disk = ?, vlan_id = ?, \
-             ssh_user = ?, ssh_key = ? WHERE id = ?",
+             mtu = ?, ssh_user = ?, ssh_key = ? WHERE id = ?",
         )
         .bind(&host.kind)
         .bind(host.region_id)
@@ -297,6 +298,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(host.load_memory)
         .bind(host.load_disk)
         .bind(host.vlan_id)
+        .bind(host.mtu)
         .bind(&host.ssh_user)
         .bind(&host.ssh_key)
         .bind(host.id)
@@ -309,7 +311,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let result = sqlx::query(
             "INSERT INTO vm_host (kind, region_id, name, ip, cpu, cpu_mfg, cpu_arch, \
              cpu_features, memory, enabled, api_token, load_cpu, load_memory, load_disk, \
-             vlan_id, ssh_user, ssh_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             vlan_id, mtu, ssh_user, ssh_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&host.kind)
         .bind(host.region_id)
@@ -326,6 +328,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(host.load_memory)
         .bind(host.load_disk)
         .bind(host.vlan_id)
+        .bind(host.mtu)
         .bind(&host.ssh_user)
         .bind(&host.ssh_key)
         .execute(&self.db)
@@ -574,7 +577,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
@@ -584,6 +587,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(vm.auto_renewal_enabled)
+            .bind(vm.disabled)
             .bind(vm.id)
             .execute(&self.db)
             .await?;

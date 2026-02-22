@@ -118,6 +118,9 @@ async fn admin_update_host(
     if let Some(vlan_id) = req.vlan_id {
         host.vlan_id = vlan_id;
     }
+    if let Some(mtu) = req.mtu {
+        host.mtu = mtu;
+    }
     if let Some(enabled) = req.enabled {
         host.enabled = enabled;
     }
@@ -215,6 +218,7 @@ async fn admin_create_host(
         load_memory: req.load_memory.unwrap_or(1.0),
         load_disk: req.load_disk.unwrap_or(1.0),
         vlan_id: req.vlan_id,
+        mtu: req.mtu,
         ssh_user: req.ssh_user.clone(),
         ssh_key: req.ssh_key.clone().map(|k| k.into()),
     };
@@ -249,6 +253,8 @@ pub struct AdminHostUpdateRequest {
     pub region_id: Option<u64>,
     pub kind: Option<AdminVmHostKind>,
     pub vlan_id: Option<Option<u64>>,
+    /// MTU setting for network configuration (use `Some(None)` to clear)
+    pub mtu: Option<Option<u16>>,
     pub enabled: Option<bool>,
     /// CPU manufacturer (e.g. "intel", "amd", "apple")
     pub cpu_mfg: Option<String>,
@@ -274,6 +280,8 @@ pub struct AdminHostCreateRequest {
     pub region_id: u64,
     pub kind: AdminVmHostKind,
     pub vlan_id: Option<u64>,
+    /// MTU setting for network configuration
+    pub mtu: Option<u16>,
     pub cpu: u16,
     /// CPU manufacturer (e.g. "intel", "amd", "apple")
     pub cpu_mfg: Option<String>,

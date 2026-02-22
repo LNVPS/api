@@ -6,7 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **2026-02-22** - Reduced unpaid VM deletion time from 24 hours to 1 hour
+  - Unpaid VM orders are now deleted after 1 hour instead of 24 hours
+  - Fixes #63
+
 ### Added
+- **2026-02-22** - Added `disabled` field to VM model and admin PATCH endpoint
+  - `vm` table now includes `disabled` column (default: false)
+  - `AdminVmInfo` response now includes `disabled` field in all GET endpoints
+  - `PATCH /api/admin/v1/vms/{id}` — New endpoint to update VM properties
+  - Allows admins to disable/enable VMs without deleting them
+  - When disabled state changes, a `ConfigureVm` work job is dispatched to reconfigure the VM on the host
+  - On Proxmox hosts, disabled VMs have `link_down=1` set on their network interface
+
+- **2026-02-22** - Added `mtu` field to host configuration
+  - `vm_host` table now includes `mtu` column (optional, SMALLINT UNSIGNED)
+  - `AdminHostInfo` response now includes `mtu` field in all GET endpoints
+  - `POST /api/admin/v1/hosts` — Added optional `mtu` field for host creation
+  - `PATCH /api/admin/v1/hosts/{id}` — Added optional `mtu` field for host update (use `null` to clear)
+
 - **2026-02-22** - Added additional fields to sales time-series report
   - `GET /api/admin/v1/reports/time-series` — Response now includes `user_id`, `host_id`, `host_name`, `region_id`, `region_name` fields in each payment record
   - Enables client-side filtering by user, host, or region

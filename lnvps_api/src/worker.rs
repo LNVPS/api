@@ -3,7 +3,7 @@ use crate::provisioner::LNVpsProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::ssh_client::SshClient;
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Days, Utc};
+use chrono::{DateTime, Datelike, Days, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
 use lettre::AsyncTransport;
 use lettre::message::{MessageBuilder, MultiPart};
@@ -479,8 +479,11 @@ impl Worker {
                 vms_by_host.entry(vm.host_id).or_default().push(vm);
             }
 
-            // delete vm if not paid (in new state)
-            if is_new_vm && !vm.deleted && vm.expires < Utc::now().sub(Days::new(1)) {
+            // delete vm if not paid (in new state) after 1 hour
+            if is_new_vm
+                && !vm.deleted
+                && vm.expires < Utc::now().sub(TimeDelta::hours(1))
+            {
                 vms_to_delete.push(vm);
             }
         }

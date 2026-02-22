@@ -504,7 +504,7 @@ async fn v1_custom_template_calc(
 /// After order is created please use /api/v1/vm/{id}/renew to pay for VM,
 /// VM's are initially created in "expired" state
 ///
-/// Unpaid VM orders will be deleted after 24hrs
+/// Unpaid VM orders will be deleted after 1 hour
 async fn v1_create_custom_vm_order(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -583,7 +583,7 @@ async fn v1_add_ssh_key(
 /// After order is created please use /api/v1/vm/{id}/renew to pay for VM,
 /// VM's are initially created in "expired" state
 ///
-/// Unpaid VM orders will be deleted after 24hrs
+/// Unpaid VM orders will be deleted after 1 hour
 async fn v1_create_vm_order(
     auth: Nip98Auth,
     State(this): State<RouterState>,

@@ -107,6 +107,7 @@ impl MockDb {
             deleted: false,
             ref_code: None,
             auto_renewal_enabled: false,
+            disabled: false,
         }
     }
 }
@@ -168,6 +169,7 @@ impl Default for MockDb {
                 load_memory: 2.0,
                 load_disk: 3.0,
                 vlan_id: Some(100),
+                mtu: None,
                 ssh_user: None,
                 ssh_key: None,
             },
@@ -659,6 +661,8 @@ impl LNVpsDbBase for MockDb {
             v.expires = vm.expires;
             v.disk_id = vm.disk_id;
             v.mac_address = vm.mac_address.clone();
+            v.auto_renewal_enabled = vm.auto_renewal_enabled;
+            v.disabled = vm.disabled;
         }
         Ok(())
     }

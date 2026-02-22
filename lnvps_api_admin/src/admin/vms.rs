@@ -5,7 +5,7 @@ use crate::admin::model::{
     AdminVmPaymentInfo, JobResponse,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
@@ -24,7 +24,7 @@ pub fn router() -> Router<RouterState> {
         )
         .route(
             "/api/admin/v1/vms/{id}",
-            get(admin_get_vm).delete(admin_delete_vm),
+            get(admin_get_vm).patch(admin_patch_vm).delete(admin_delete_vm),
         )
         .route("/api/admin/v1/vms/{id}/start", post(admin_start_vm))
         .route("/api/admin/v1/vms/{id}/stop", post(admin_stop_vm))
@@ -236,6 +236,71 @@ async fn admin_get_vm(
     .await?;
 
     ApiData::ok(admin_vm)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AdminPatchVmRequest {
+    /// Set the disabled state of the VM
+    disabled: Option<bool>,
+}
+
+/// Patch (update) a VM
+async fn admin_patch_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminPatchVmRequest>,
+) -> ApiResult<JobResponse> {
+    // Check permission
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+
+    // Verify VM exists
+    let mut vm = this.db.get_vm(id).await?;
+
+    if vm.deleted {
+        return ApiData::err("Cannot update a deleted VM");
+    }
+
+    let mut needs_reconfigure = false;
+
+    // Handle disabled state change
+    if let Some(disabled) = req.disabled {
+        if vm.disabled != disabled {
+            vm.disabled = disabled;
+            needs_reconfigure = true;
+        }
+    }
+
+    if needs_reconfigure {
+        this.db.update_vm(&vm).await?;
+        info!(
+            "Admin {} updated VM {}: disabled={}",
+            auth.user_id, id, vm.disabled
+        );
+
+        // Send work job to reconfigure the VM on the host
+        let configure_job = WorkJob::ConfigureVm {
+            vm_id: id,
+            admin_user_id: Some(auth.user_id),
+        };
+
+        match this.work_commander.send(configure_job).await {
+            Ok(stream_id) => {
+                info!("VM configure job queued with stream ID: {}", stream_id);
+                return ApiData::ok(JobResponse { job_id: stream_id });
+            }
+            Err(e) => {
+                error!("Failed to queue VM configure job: {}", e);
+                return ApiData::err("VM updated but failed to queue reconfigure job");
+            }
+        }
+    }
+
+    // No changes were made, return empty job_id
+    ApiData::ok(JobResponse {
+        job_id: String::new(),
+    })
 }
 
 /// Start a VM

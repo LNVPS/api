@@ -461,6 +461,8 @@ pub struct VmHost {
     pub load_disk: f32,
     /// VLAN id assigned to all vms on the host
     pub vlan_id: Option<u64>,
+    /// MTU setting for network configuration
+    pub mtu: Option<u16>,
     /// SSH username for running host utilities (default: root)
     pub ssh_user: Option<String>,
     /// SSH private key for running host utilities (encrypted, PEM format)
@@ -844,6 +846,8 @@ pub struct Vm {
     pub ref_code: Option<String>,
     /// Enable automatic renewal
     pub auto_renewal_enabled: bool,
+    /// Whether the VM is disabled by admin
+    pub disabled: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

@@ -308,6 +308,7 @@ mod tests {
                 deleted: false,
                 ref_code: None,
                 auto_renewal_enabled: false,
+                disabled: false,
             },
             host: VmHost {
                 id: 1,
@@ -326,6 +327,7 @@ mod tests {
                 load_memory: 1.0,
                 load_disk: 1.0,
                 vlan_id: Some(100),
+                mtu: None,
                 ssh_user: None,
                 ssh_key: None,
             },

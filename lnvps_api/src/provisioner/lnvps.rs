@@ -145,6 +145,7 @@ impl LNVpsProvisioner {
             deleted: false,
             ref_code,
             auto_renewal_enabled: false, // Default to disabled for new VMs
+            disabled: false,
         };
 
         let new_id = self.db.insert_vm(&new_vm).await?;
@@ -201,6 +202,7 @@ impl LNVpsProvisioner {
             deleted: false,
             ref_code,
             auto_renewal_enabled: false, // Default to disabled for new VMs
+            disabled: false,
         };
 
         let new_id = self.db.insert_vm(&new_vm).await?;

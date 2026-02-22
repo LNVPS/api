@@ -362,6 +362,7 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result<Vec
             load_memory: 1.0,
             load_disk: 1.0,
             vlan_id: None,
+            mtu: None,
             ssh_user: None,
             ssh_key: None,
         };
@@ -1174,6 +1175,7 @@ async fn create_vms(
             deleted: false,
             ref_code: ref_code.clone(),
             auto_renewal_enabled: false,
+            disabled: false,
         };
 
         let id = db.insert_vm(&vm).await?;
@@ -1219,6 +1221,7 @@ async fn create_vms(
             deleted: false,
             ref_code: None,
             auto_renewal_enabled: false,
+            disabled: false,
         };
 
         let id = db.insert_vm(&vm).await?;

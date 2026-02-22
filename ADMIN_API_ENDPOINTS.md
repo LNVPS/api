@@ -263,6 +263,34 @@ Response:
 }
 ```
 
+#### Update VM
+
+```
+PATCH /api/admin/v1/vms/{id}
+```
+
+Required Permission: `virtual_machines::update`
+
+Body (all optional):
+
+```json
+{
+  "disabled": boolean  // Enable/disable the VM
+}
+```
+
+Response:
+
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
+**Note:** The `disabled` field allows admins to disable a VM without deleting it. When the disabled state changes, a reconfigure job is dispatched to update the VM on the host (e.g., setting `link_down=1` on the network interface). The `job_id` will be empty if no changes were made.
+
 #### Delete VM
 
 ```
@@ -813,6 +841,10 @@ Body (all optional):
   "vlan_id": number
   |
   null,
+  "mtu": number
+  |
+  null,
+  // MTU setting for network configuration - use null to clear
   "enabled": boolean,
   "cpu_mfg": "string",
   // CPU manufacturer (e.g. "intel", "amd", "apple")
@@ -857,6 +889,8 @@ Body:
   "vlan_id": number
   |
   null,
+  "mtu": number,
+  // Optional - MTU setting for network configuration
   "cpu": number,
   // Required
   "cpu_mfg": "string",

@@ -718,6 +718,12 @@ impl ProxmoxClient {
         if let Some(t) = value.host.vlan_id {
             net.push(format!("tag={}", t));
         }
+        if let Some(mtu) = value.host.mtu {
+            net.push(format!("mtu={}", mtu));
+        }
+        if value.vm.disabled {
+            net.push("link_down=1".to_string());
+        }
 
         let vm_resources = value.resources()?;
         Ok(VmConfig {
