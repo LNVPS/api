@@ -13,6 +13,19 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Round milli-satoshi amount up to the nearest satoshi.
+///
+/// Some Lightning wallets don't handle milli-sats correctly, so we round
+/// amounts to whole satoshis. We round up to avoid underpayment.
+pub fn round_msat_to_sat(msat: u64) -> u64 {
+    msat.div_ceil(1000) * 1000
+}
+
+fn round_to_sat(amount: CurrencyAmount) -> CurrencyAmount {
+    debug_assert_eq!(amount.currency(), Currency::BTC);
+    CurrencyAmount::from_u64(Currency::BTC, round_msat_to_sat(amount.value()))
+}
+
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
 pub struct UpgradeCostQuote {
@@ -739,12 +752,15 @@ impl PricingEngine {
             (c, PaymentMethod::Lightning) if c != Currency::BTC => {
                 // convert to BTC if price is not already in bitcoin
                 let ticker = self.get_ticker(Currency::BTC, c).await?;
-                ticker.convert_with_rate(list_price)?
+                let mut converted = ticker.convert_with_rate(list_price)?;
+                // Round to nearest satoshi for wallet compatibility
+                converted.amount = round_to_sat(converted.amount);
+                converted
             }
             (c, PaymentMethod::Lightning) if c == Currency::BTC => {
-                // pass-through price as BTC
+                // pass-through price as BTC, rounded to nearest satoshi
                 ConvertedCurrencyAmount {
-                    amount: CurrencyAmount::from_u64(list_price.currency(), list_price.value()),
+                    amount: round_to_sat(list_price),
                     rate: TickerRate::passthrough(Currency::BTC),
                 }
             }
@@ -820,6 +836,24 @@ mod tests {
         CpuMfg, DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing,
         VmCustomPricingDisk, VmCustomTemplate,
     };
+
+    #[test]
+    fn test_round_msat_to_sat_exact() {
+        // Exact satoshi amounts should stay the same
+        assert_eq!(round_msat_to_sat(1000), 1000);
+        assert_eq!(round_msat_to_sat(5000), 5000);
+        assert_eq!(round_msat_to_sat(0), 0);
+    }
+
+    #[test]
+    fn test_round_msat_to_sat_rounds_up() {
+        // Sub-satoshi amounts should round up to the next satoshi
+        assert_eq!(round_msat_to_sat(1), 1000);
+        assert_eq!(round_msat_to_sat(999), 1000);
+        assert_eq!(round_msat_to_sat(1001), 2000);
+        assert_eq!(round_msat_to_sat(1500), 2000);
+        assert_eq!(round_msat_to_sat(1999), 2000);
+    }
 
     const MOCK_RATE: f32 = 100_000.0;
     const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0; // 30 days * 24 hours * 3600 seconds
