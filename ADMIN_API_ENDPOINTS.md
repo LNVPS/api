@@ -2494,7 +2494,12 @@ Response:
         "tax": 26250,
         "company_id": 1,
         "company_name": "Acme Corp",
-        "company_base_currency": "USD"
+        "company_base_currency": "USD",
+        "user_id": 456,
+        "host_id": 2,
+        "host_name": "host-01",
+        "region_id": 1,
+        "region_name": "US East"
       }
     ]
   }
