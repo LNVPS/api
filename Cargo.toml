@@ -8,7 +8,6 @@ members = [
     "lnvps_nostr",
     "lnvps_operator",
     "lnvps_health",
-    "lnvps_host_util",
     "try-procedure",
 ]
 

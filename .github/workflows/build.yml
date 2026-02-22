@@ -35,7 +35,7 @@ jobs:
       - name: Build and push lnvps-host-info
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: lnvps_host_util
           file: lnvps_host_util/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}

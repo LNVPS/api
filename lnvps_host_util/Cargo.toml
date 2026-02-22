@@ -1,8 +1,10 @@
 [package]
 name = "lnvps_host_util"
-version.workspace = true
-edition.workspace = true
+version = "0.2.0"
+edition = "2024"
 description = "Host CPU detection utility for LNVPS"
+
+[workspace]
 
 [[bin]]
 name = "lnvps-host-info"
@@ -14,8 +16,8 @@ vaapi = ["dep:cros-libva"]
 nvml = ["dep:nvml-wrapper"]
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 raw-cpuid = "11"
 cros-libva = { version = "0.0", optional = true }
 nvml-wrapper = { version = "0.10", optional = true }
