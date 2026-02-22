@@ -269,6 +269,71 @@ impl NetworkProvisioner {
             .saturating_sub(assignment_count);
         Some(available)
     }
+
+    /// List all free (unassigned) IPs in an IPv4 range.
+    ///
+    /// Returns an error for IPv6 ranges since they're too large to enumerate.
+    ///
+    /// # Arguments
+    /// * `range_id` - The ID of the IP range to list free IPs for
+    ///
+    /// # Returns
+    /// * `Ok(Vec<IpAddr>)` - List of free IP addresses
+    /// * `Err` - If the range is IPv6, doesn't exist, or has an invalid CIDR
+    pub async fn list_free_ips_in_range(&self, range_id: u64) -> Result<Vec<IpAddr>> {
+        let range = self.db.get_ip_range(range_id).await?;
+        Self::compute_free_ips(&range, &self.db).await
+    }
+
+    /// Compute the list of free IPs for a given IP range.
+    ///
+    /// This is an internal method that takes the range and database reference.
+    /// Only works for IPv4 ranges.
+    async fn compute_free_ips(range: &IpRange, db: &Arc<dyn LNVpsDb>) -> Result<Vec<IpAddr>> {
+        let network: IpNetwork = range
+            .cidr
+            .parse()
+            .with_context(|| format!("Invalid CIDR format: {}", range.cidr))?;
+
+        // Only allow IPv4 ranges
+        if !network.is_ipv4() {
+            bail!(
+                "Free IP listing is only available for IPv4 ranges. IPv6 ranges are too large to enumerate."
+            );
+        }
+
+        // Get all assigned IPs in this range (non-deleted)
+        let assignments = db.list_vm_ip_assignments_in_range(range.id).await?;
+        let assigned_ips: HashSet<IpAddr> = assignments
+            .iter()
+            .filter_map(|a| a.ip.parse().ok())
+            .collect();
+
+        // Parse gateway to get reserved IPs
+        let gateway = parse_gateway(&range.gateway)?;
+
+        // Build set of reserved IPs
+        let mut reserved_ips: HashSet<IpAddr> = HashSet::new();
+        reserved_ips.insert(gateway.ip());
+
+        // If not using full range, reserve first and last IPs (network + broadcast)
+        if !range.use_full_range {
+            if let Some(first) = network.iter().next() {
+                reserved_ips.insert(first);
+            }
+            if let Some(last) = network.iter().last() {
+                reserved_ips.insert(last);
+            }
+        }
+
+        // Collect free IPs
+        let free_ips: Vec<IpAddr> = network
+            .iter()
+            .filter(|ip| !assigned_ips.contains(ip) && !reserved_ips.contains(ip))
+            .collect();
+
+        Ok(free_ips)
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +535,155 @@ mod tests {
             64,
             "IP should have /64 prefix from gateway"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_free_ips_basic() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+
+        // Create a small /30 range (4 IPs total)
+        let range = IpRange {
+            id: 101,
+            cidr: "192.168.1.0/30".to_string(),
+            gateway: "192.168.1.1".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: false,
+            ..Default::default()
+        };
+
+        db.ip_range.lock().await.insert(101, range);
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+
+        let free_ips = mgr.list_free_ips_in_range(101).await.unwrap();
+
+        // /30 has 4 IPs: .0, .1, .2, .3
+        // Reserved: .0 (network), .3 (broadcast), .1 (gateway)
+        // Free: .2
+        assert_eq!(free_ips.len(), 1);
+        assert_eq!(free_ips[0].to_string(), "192.168.1.2");
+    }
+
+    #[tokio::test]
+    async fn test_list_free_ips_with_assignments() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+
+        // Create a /29 range (8 IPs total)
+        let range = IpRange {
+            id: 102,
+            cidr: "192.168.1.0/29".to_string(),
+            gateway: "192.168.1.1".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: false,
+            ..Default::default()
+        };
+
+        db.ip_range.lock().await.insert(102, range);
+
+        // Add some assignments
+        db.ip_assignments.lock().await.insert(
+            1,
+            VmIpAssignment {
+                id: 1,
+                vm_id: 1,
+                ip_range_id: 102,
+                ip: "192.168.1.2".to_string(),
+                ..Default::default()
+            },
+        );
+        db.ip_assignments.lock().await.insert(
+            2,
+            VmIpAssignment {
+                id: 2,
+                vm_id: 2,
+                ip_range_id: 102,
+                ip: "192.168.1.4".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+
+        let free_ips = mgr.list_free_ips_in_range(102).await.unwrap();
+
+        // /29 has 8 IPs: .0, .1, .2, .3, .4, .5, .6, .7
+        // Reserved: .0 (network), .7 (broadcast), .1 (gateway)
+        // Assigned: .2, .4
+        // Free: .3, .5, .6
+        assert_eq!(free_ips.len(), 3);
+        let free_ip_strs: Vec<String> = free_ips.iter().map(|ip| ip.to_string()).collect();
+        assert!(free_ip_strs.contains(&"192.168.1.3".to_string()));
+        assert!(free_ip_strs.contains(&"192.168.1.5".to_string()));
+        assert!(free_ip_strs.contains(&"192.168.1.6".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_free_ips_use_full_range() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+
+        // Create a /30 range with use_full_range=true
+        let range = IpRange {
+            id: 103,
+            cidr: "192.168.1.0/30".to_string(),
+            gateway: "192.168.1.1".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: true,
+            ..Default::default()
+        };
+
+        db.ip_range.lock().await.insert(103, range);
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+
+        let free_ips = mgr.list_free_ips_in_range(103).await.unwrap();
+
+        // /30 has 4 IPs: .0, .1, .2, .3
+        // Reserved: .1 (gateway only)
+        // Free: .0, .2, .3
+        assert_eq!(free_ips.len(), 3);
+        let free_ip_strs: Vec<String> = free_ips.iter().map(|ip| ip.to_string()).collect();
+        assert!(free_ip_strs.contains(&"192.168.1.0".to_string()));
+        assert!(free_ip_strs.contains(&"192.168.1.2".to_string()));
+        assert!(free_ip_strs.contains(&"192.168.1.3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_free_ips_ipv6_error() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+
+        // Create an IPv6 range
+        let range = IpRange {
+            id: 104,
+            cidr: "2001:db8::/64".to_string(),
+            gateway: "2001:db8::1".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: false,
+            ..Default::default()
+        };
+
+        db.ip_range.lock().await.insert(104, range);
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+
+        let result = mgr.list_free_ips_in_range(104).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("IPv4 ranges"));
     }
 }
