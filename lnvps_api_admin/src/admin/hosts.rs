@@ -124,14 +124,19 @@ async fn admin_update_host(
     if let Some(enabled) = req.enabled {
         host.enabled = enabled;
     }
-    if let Some(cpu_mfg) = &req.cpu_mfg {
-        host.cpu_mfg = cpu_mfg.parse().unwrap_or_default();
+    if let Some(cpu_mfg) = req.cpu_mfg {
+        host.cpu_mfg = cpu_mfg
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
     }
-    if let Some(cpu_arch) = &req.cpu_arch {
-        host.cpu_arch = cpu_arch.parse().unwrap_or_default();
+    if let Some(cpu_arch) = req.cpu_arch {
+        host.cpu_arch = cpu_arch
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
     }
-    if let Some(cpu_features) = &req.cpu_features {
+    if let Some(cpu_features) = req.cpu_features {
         host.cpu_features = cpu_features
+            .unwrap_or_default()
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect::<Vec<_>>()
@@ -257,11 +262,26 @@ pub struct AdminHostUpdateRequest {
     pub mtu: Option<Option<u16>>,
     pub enabled: Option<bool>,
     /// CPU manufacturer (e.g. "intel", "amd", "apple")
-    pub cpu_mfg: Option<String>,
+    /// Use `Some(None)` or `null` to clear (reset to unknown)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_mfg: Option<Option<String>>,
     /// CPU architecture (e.g. "x86_64", "arm64")
-    pub cpu_arch: Option<String>,
+    /// Use `Some(None)` or `null` to clear (reset to unknown)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_arch: Option<Option<String>>,
     /// CPU features (e.g. ["AVX2", "AES", "VMX"])
-    pub cpu_features: Option<Vec<String>>,
+    /// Use `Some(None)` or `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_features: Option<Option<Vec<String>>>,
     pub load_cpu: Option<f32>,
     pub load_memory: Option<f32>,
     pub load_disk: Option<f32>,
@@ -436,4 +456,44 @@ pub struct AdminHostDiskUpdateRequest {
     pub kind: Option<ApiDiskType>,
     pub interface: Option<ApiDiskInterface>,
     pub enabled: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_host_update_cpu_mfg_can_be_unset_with_null() {
+        let json = r#"{"cpu_mfg": null}"#;
+        let req: AdminHostUpdateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, Some(None));
+    }
+
+    #[test]
+    fn test_host_update_cpu_mfg_can_be_omitted() {
+        let json = r#"{}"#;
+        let req: AdminHostUpdateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, None);
+    }
+
+    #[test]
+    fn test_host_update_cpu_mfg_can_be_set() {
+        let json = r#"{"cpu_mfg": "intel"}"#;
+        let req: AdminHostUpdateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, Some(Some("intel".to_string())));
+    }
+
+    #[test]
+    fn test_host_update_cpu_arch_can_be_unset_with_null() {
+        let json = r#"{"cpu_arch": null}"#;
+        let req: AdminHostUpdateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_arch, Some(None));
+    }
+
+    #[test]
+    fn test_host_update_cpu_features_can_be_unset_with_null() {
+        let json = r#"{"cpu_features": null}"#;
+        let req: AdminHostUpdateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_features, Some(None));
+    }
 }

@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [v0.2.0] - 2026-02-22
 
+### Fixed
+- **2026-02-23** - Fixed inability to unset `cpu_mfg`, `cpu_arch`, `cpu_features` fields via PATCH endpoints
+  - `PATCH /api/admin/v1/vm_templates/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - `PATCH /api/admin/v1/custom_pricing/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - `PATCH /api/admin/v1/hosts/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - Previously, sending `null` for these fields was treated the same as omitting them (no change)
+
 ### Changed
 - **2026-02-22** - Reduced unpaid VM deletion time from 24 hours to 1 hour
   - Unpaid VM orders are now deleted after 1 hour instead of 24 hours

@@ -1178,11 +1178,26 @@ pub struct AdminUpdateVmTemplateRequest {
     pub expires: Option<Option<DateTime<Utc>>>,
     pub cpu: Option<u16>,
     /// CPU manufacturer (e.g. "intel", "amd", "apple")
-    pub cpu_mfg: Option<String>,
+    /// Use `Some(None)` or `null` to clear (reset to unknown)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_mfg: Option<Option<String>>,
     /// CPU architecture (e.g. "x86_64", "arm64")
-    pub cpu_arch: Option<String>,
+    /// Use `Some(None)` or `null` to clear (reset to unknown)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_arch: Option<Option<String>>,
     /// CPU features (e.g. ["AVX2", "AES", "VMX"])
-    pub cpu_features: Option<Vec<String>>,
+    /// Use `Some(None)` or `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_features: Option<Option<Vec<String>>>,
     pub memory: Option<u64>,
     pub disk_size: Option<u64>,
     pub disk_type: Option<ApiDiskType>,
@@ -1267,11 +1282,26 @@ pub struct UpdateCustomPricingRequest {
     pub region_id: Option<u64>,
     pub currency: Option<String>,
     /// CPU manufacturer (e.g. "intel", "amd", "apple")
-    pub cpu_mfg: Option<String>,
+    /// Use `Some(None)` or `null` to clear (reset to unknown)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_mfg: Option<Option<String>>,
     /// CPU architecture (e.g. "x86_64", "arm64")
-    pub cpu_arch: Option<String>,
+    /// Use `Some(None)` or `null` to clear (reset to unknown)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_arch: Option<Option<String>>,
     /// CPU features (e.g. ["AVX2", "AES", "VMX"])
-    pub cpu_features: Option<Vec<String>>,
+    /// Use `Some(None)` or `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_features: Option<Option<Vec<String>>>,
     /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
     pub cpu_cost: Option<u64>,
     /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
@@ -2899,5 +2929,77 @@ impl PartialProviderConfig {
             PartialProviderConfig::Stripe(_) => "stripe",
             PartialProviderConfig::Paypal(_) => "paypal",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vm_template_update_cpu_mfg_can_be_unset_with_null() {
+        // When cpu_mfg is null in JSON, it should deserialize to Some(None)
+        // allowing us to distinguish "unset to null" from "not provided"
+        let json = r#"{"cpu_mfg": null}"#;
+        let req: AdminUpdateVmTemplateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, Some(None));
+    }
+
+    #[test]
+    fn test_vm_template_update_cpu_mfg_can_be_omitted() {
+        // When cpu_mfg is not present in JSON, it should deserialize to None
+        let json = r#"{}"#;
+        let req: AdminUpdateVmTemplateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, None);
+    }
+
+    #[test]
+    fn test_vm_template_update_cpu_mfg_can_be_set() {
+        // When cpu_mfg has a value, it should deserialize to Some(Some(value))
+        let json = r#"{"cpu_mfg": "intel"}"#;
+        let req: AdminUpdateVmTemplateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, Some(Some("intel".to_string())));
+    }
+
+    #[test]
+    fn test_vm_template_update_cpu_arch_can_be_unset_with_null() {
+        let json = r#"{"cpu_arch": null}"#;
+        let req: AdminUpdateVmTemplateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_arch, Some(None));
+    }
+
+    #[test]
+    fn test_vm_template_update_cpu_features_can_be_unset_with_null() {
+        let json = r#"{"cpu_features": null}"#;
+        let req: AdminUpdateVmTemplateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_features, Some(None));
+    }
+
+    #[test]
+    fn test_vm_template_update_cpu_features_can_be_set_to_empty() {
+        let json = r#"{"cpu_features": []}"#;
+        let req: AdminUpdateVmTemplateRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_features, Some(Some(vec![])));
+    }
+
+    #[test]
+    fn test_custom_pricing_update_cpu_mfg_can_be_unset_with_null() {
+        let json = r#"{"cpu_mfg": null}"#;
+        let req: UpdateCustomPricingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, Some(None));
+    }
+
+    #[test]
+    fn test_custom_pricing_update_cpu_mfg_can_be_omitted() {
+        let json = r#"{}"#;
+        let req: UpdateCustomPricingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, None);
+    }
+
+    #[test]
+    fn test_custom_pricing_update_cpu_mfg_can_be_set() {
+        let json = r#"{"cpu_mfg": "amd"}"#;
+        let req: UpdateCustomPricingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_mfg, Some(Some("amd".to_string())));
     }
 }

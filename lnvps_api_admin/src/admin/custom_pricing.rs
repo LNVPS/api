@@ -281,14 +281,19 @@ async fn admin_update_custom_pricing(
     if let Some(currency) = req.currency {
         pricing.currency = currency;
     }
-    if let Some(cpu_mfg) = &req.cpu_mfg {
-        pricing.cpu_mfg = cpu_mfg.parse().unwrap_or_default();
+    if let Some(cpu_mfg) = req.cpu_mfg {
+        pricing.cpu_mfg = cpu_mfg
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
     }
-    if let Some(cpu_arch) = &req.cpu_arch {
-        pricing.cpu_arch = cpu_arch.parse().unwrap_or_default();
+    if let Some(cpu_arch) = req.cpu_arch {
+        pricing.cpu_arch = cpu_arch
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
     }
-    if let Some(cpu_features) = &req.cpu_features {
+    if let Some(cpu_features) = req.cpu_features {
         pricing.cpu_features = cpu_features
+            .unwrap_or_default()
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect::<Vec<_>>()
