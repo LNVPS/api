@@ -60,7 +60,10 @@ impl PaymentMethodFactory {
         config: &PaymentMethodConfig,
     ) -> Result<Arc<dyn LightningNode>> {
         if config.payment_method != PaymentMethod::Lightning {
-            bail!("Cannot create Lightning node from {:?} config", config.payment_method);
+            bail!(
+                "Cannot create Lightning node from {:?} config",
+                config.payment_method
+            );
         }
 
         if !config.enabled {
@@ -96,7 +99,10 @@ impl PaymentMethodFactory {
             }
             #[allow(unreachable_patterns)]
             other => {
-                bail!("Unsupported Lightning provider type: {}", other.provider_type())
+                bail!(
+                    "Unsupported Lightning provider type: {}",
+                    other.provider_type()
+                )
             }
         }
     }
@@ -232,7 +238,11 @@ mod tests {
     use std::path::PathBuf;
 
     #[allow(dead_code)]
-    fn make_lightning_config(provider: &str, enabled: bool, company_id: u64) -> PaymentMethodConfig {
+    fn make_lightning_config(
+        provider: &str,
+        enabled: bool,
+        company_id: u64,
+    ) -> PaymentMethodConfig {
         let provider_config = match provider {
             "lnd" => ProviderConfig::Lnd(LndConfig {
                 url: "https://localhost:8080".to_string(),
@@ -341,7 +351,9 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let factory = PaymentMethodFactory::new(db);
 
-        let result = factory.get_fiat_service_for_company(1, PaymentMethod::Lightning).await;
+        let result = factory
+            .get_fiat_service_for_company(1, PaymentMethod::Lightning)
+            .await;
 
         match result {
             Err(e) => assert!(

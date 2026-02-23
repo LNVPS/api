@@ -172,10 +172,7 @@ async fn admin_create_vm_template(
         created: Utc::now(),
         expires: req.expires,
         cpu: req.cpu,
-        cpu_mfg: req
-            .cpu_mfg
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default(),
+        cpu_mfg: req.cpu_mfg.and_then(|s| s.parse().ok()).unwrap_or_default(),
         cpu_arch: req
             .cpu_arch
             .and_then(|s| s.parse().ok())
@@ -227,14 +224,10 @@ async fn admin_update_vm_template(
         template.cpu = cpu;
     }
     if let Some(cpu_mfg) = req.cpu_mfg {
-        template.cpu_mfg = cpu_mfg
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        template.cpu_mfg = cpu_mfg.and_then(|s| s.parse().ok()).unwrap_or_default();
     }
     if let Some(cpu_arch) = req.cpu_arch {
-        template.cpu_arch = cpu_arch
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        template.cpu_arch = cpu_arch.and_then(|s| s.parse().ok()).unwrap_or_default();
     }
     if let Some(cpu_features) = req.cpu_features {
         template.cpu_features = cpu_features

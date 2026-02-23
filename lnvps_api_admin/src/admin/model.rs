@@ -262,7 +262,11 @@ impl From<lnvps_db::User> for AdminUserInfo {
             id: user.id,
             pubkey: hex::encode(&user.pubkey),
             created: user.created,
-            email: if user.email.is_empty() { None } else { Some(user.email.into()) },
+            email: if user.email.is_empty() {
+                None
+            } else {
+                Some(user.email.into())
+            },
             email_verified: user.email_verified,
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
@@ -289,7 +293,11 @@ impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
             id: user.user_info.id,
             pubkey: hex::encode(&user.user_info.pubkey),
             created: user.user_info.created,
-            email: if user.user_info.email.is_empty() { None } else { Some(user.user_info.email.into()) },
+            email: if user.user_info.email.is_empty() {
+                None
+            } else {
+                Some(user.user_info.email.into())
+            },
             email_verified: user.user_info.email_verified,
             contact_nip17: user.user_info.contact_nip17,
             contact_email: user.user_info.contact_email,
@@ -735,11 +743,7 @@ impl AdminHostInfo {
             } else {
                 Some(host.cpu_arch.to_string())
             },
-            cpu_features: host
-                .cpu_features
-                .iter()
-                .map(|f| f.to_string())
-                .collect(),
+            cpu_features: host.cpu_features.iter().map(|f| f.to_string()).collect(),
             memory: host.memory,
             enabled: host.enabled,
             load_cpu: host.load_cpu,
@@ -791,11 +795,7 @@ impl AdminHostInfo {
             } else {
                 Some(host.cpu_arch.to_string())
             },
-            cpu_features: host
-                .cpu_features
-                .iter()
-                .map(|f| f.to_string())
-                .collect(),
+            cpu_features: host.cpu_features.iter().map(|f| f.to_string()).collect(),
             memory: host.memory,
             enabled: host.enabled,
             load_cpu: host.load_cpu,
@@ -1825,7 +1825,11 @@ impl AdminVmHistoryInfo {
             && let Ok(user) = db.get_user(user_id).await
         {
             initiated_by_user_pubkey = Some(hex::encode(&user.pubkey));
-            initiated_by_user_email = if user.email.is_empty() { None } else { Some(user.email.into()) };
+            initiated_by_user_email = if user.email.is_empty() {
+                None
+            } else {
+                Some(user.email.into())
+            };
         }
 
         Ok(Self {

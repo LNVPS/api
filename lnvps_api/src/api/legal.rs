@@ -1,7 +1,7 @@
+use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use axum::routing::get;
-use axum::Router;
 use base64::Engine;
 use chrono::Utc;
 use isocountry::CountryCode;
@@ -135,8 +135,8 @@ async fn v1_get_sponsoring_lir_agreement(
     // Decode base64-encoded JSON
     let json_bytes = base64::Engine::decode(&base64::prelude::BASE64_URL_SAFE, &q.data)
         .map_err(|_| "Invalid base64 encoding")?;
-    let data: AgreementData = serde_json::from_slice(&json_bytes)
-        .map_err(|_| "Invalid agreement data JSON")?;
+    let data: AgreementData =
+        serde_json::from_slice(&json_bytes).map_err(|_| "Invalid agreement data JSON")?;
 
     // Ensure there's no cryptographic proof in unsigned agreements
     if data.cryptographic_proof.is_some() {
@@ -170,7 +170,10 @@ async fn v1_generate_lir_agreement_from_subscription(
     let company = this.db.get_company(subscription.company_id).await?;
 
     // Get line items for this subscription
-    let line_items = this.db.list_subscription_line_items(subscription_id).await?;
+    let line_items = this
+        .db
+        .list_subscription_line_items(subscription_id)
+        .await?;
 
     // Build provider address from company fields
     let provider_address = [
@@ -209,7 +212,11 @@ async fn v1_generate_lir_agreement_from_subscription(
         .unwrap_or_else(|| "Ireland".to_string());
 
     let now = Utc::now();
-    let document_reference = format!("LNVPS-LIR-{}-{}", subscription_id, now.format("%Y%m%d%H%M%S"));
+    let document_reference = format!(
+        "LNVPS-LIR-{}-{}",
+        subscription_id,
+        now.format("%Y%m%d%H%M%S")
+    );
 
     // Calculate total recurring fees
     let total_recurring: u64 = line_items.iter().map(|li| li.amount).sum();
@@ -280,15 +287,9 @@ async fn v1_generate_lir_agreement_from_subscription(
         provider_trading_name: company.name.clone(),
         provider_legal_name: company.name.clone(),
         provider_address,
-        provider_register: company
-            .tax_id
-            .clone()
-            .unwrap_or_else(|| "—".to_string()),
+        provider_register: company.tax_id.clone().unwrap_or_else(|| "—".to_string()),
 
-        end_user_name: user
-            .billing_name
-            .clone()
-            .unwrap_or_else(|| "—".to_string()),
+        end_user_name: user.billing_name.clone().unwrap_or_else(|| "—".to_string()),
         end_user_legal_form: "—".to_string(),
         end_user_address,
         end_user_registration_number: user
@@ -326,31 +327,30 @@ async fn v1_generate_lir_agreement_from_subscription(
         let keys = Keys::parse(&nostr_config.nsec)
             .map_err(|e| ApiError::internal(format!("Invalid nostr key: {}", e)))?;
         let provider_pubkey = keys.public_key();
-        let provider_npub = provider_pubkey.to_bech32()
+        let provider_npub = provider_pubkey
+            .to_bech32()
             .unwrap_or_else(|_| hex::encode(provider_pubkey.to_bytes()));
         data.provider_npub = Some(provider_npub.clone());
 
         // Serialize the data WITHOUT the proof section for the signature
-        let signed_json = serde_json::to_string(&data)
-            .map_err(|e| ApiError::internal(format!("Failed to serialize agreement data: {}", e)))?;
+        let signed_json = serde_json::to_string(&data).map_err(|e| {
+            ApiError::internal(format!("Failed to serialize agreement data: {}", e))
+        })?;
 
         // Create a Nostr event signing the JSON data
-        let event = EventBuilder::new(
-            Kind::TextNote,
-            signed_json.clone(),
-        )
-        .tags([
-            Tag::identifier(&document_reference),
-            Tag::from_standardized(TagStandard::PublicKey {
-                public_key: end_user_pubkey,
-                relay_url: None,
-                alias: None,
-                uppercase: false,
-            }),
-            Tag::custom(TagKind::from("type"), ["sponsoring-lir-agreement"]),
-        ])
-        .sign_with_keys(&keys)
-        .map_err(|e| ApiError::internal(format!("Failed to sign event: {}", e)))?;
+        let event = EventBuilder::new(Kind::TextNote, signed_json.clone())
+            .tags([
+                Tag::identifier(&document_reference),
+                Tag::from_standardized(TagStandard::PublicKey {
+                    public_key: end_user_pubkey,
+                    relay_url: None,
+                    alias: None,
+                    uppercase: false,
+                }),
+                Tag::custom(TagKind::from("type"), ["sponsoring-lir-agreement"]),
+            ])
+            .sign_with_keys(&keys)
+            .map_err(|e| ApiError::internal(format!("Failed to sign event: {}", e)))?;
 
         data.cryptographic_proof = Some(CryptographicProof {
             provider_npub,
@@ -371,7 +371,7 @@ async fn v1_generate_lir_agreement_from_subscription(
 
     // Build the full URL to the signed agreement
     let url = format!("/api/v1/legal/sponsoring-lir-agreement?data={}", encoded);
-    
+
     ApiData::ok(SignedAgreementUrlResponse {
         url,
         agreement_data: data,

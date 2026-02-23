@@ -1,0 +1,97 @@
+name: E2E Integration Tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: e2e-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            e2e-${{ runner.os }}-cargo-
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq
+
+      - name: Start infrastructure (DB, Redis, bitcoind, LND)
+        run: docker compose -f docker-compose.e2e.yaml up -d
+
+      - name: Wait for LND and copy credentials
+        run: .github/e2e/wait-for-lnd.sh 120
+
+      - name: Build API servers
+        run: |
+          cargo build -p lnvps_api -p lnvps_api_admin
+
+      - name: Start user API
+        run: |
+          cargo run -p lnvps_api -- --config .github/e2e/api-config.yaml &
+          echo $! > /tmp/api.pid
+          # Wait for user API to be ready
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/ >/dev/null 2>&1; then
+              echo "User API ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "User API failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Start admin API
+        run: |
+          cargo run -p lnvps_api_admin -- --config .github/e2e/admin-config.yaml &
+          echo $! > /tmp/admin-api.pid
+          # Wait for admin API to be ready
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8001/ >/dev/null 2>&1; then
+              echo "Admin API ready after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "Admin API failed to start"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run E2E tests
+        run: cargo test -p lnvps_e2e -- --test-threads=1
+
+      - name: Dump server logs on failure
+        if: failure()
+        run: |
+          echo "=== Docker compose logs ==="
+          docker compose -f docker-compose.e2e.yaml logs --tail=50
+          echo "=== User API process ==="
+          cat /tmp/api.pid 2>/dev/null || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kill "$(cat /tmp/api.pid 2>/dev/null)" 2>/dev/null || true
+          kill "$(cat /tmp/admin-api.pid 2>/dev/null)" 2>/dev/null || true
+          docker compose -f docker-compose.e2e.yaml down -v

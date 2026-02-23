@@ -46,9 +46,16 @@ pub async fn listen_all_payments(
             .collect::<Vec<_>>();
 
         for config in revolut_configs {
-            info!("Starting Revolut payment handler for config: {}", config.name);
-            match RevolutPaymentHandler::new(&config, &settings.public_url, db.clone(), sender.clone())
-            {
+            info!(
+                "Starting Revolut payment handler for config: {}",
+                config.name
+            );
+            match RevolutPaymentHandler::new(
+                &config,
+                &settings.public_url,
+                db.clone(),
+                sender.clone(),
+            ) {
                 Ok(mut handler) => {
                     ret.push(tokio::spawn(async move {
                         loop {

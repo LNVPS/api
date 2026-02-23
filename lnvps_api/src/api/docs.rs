@@ -17,12 +17,18 @@ async fn index() -> Html<&'static str> {
 
 /// Handler for raw API endpoints markdown
 async fn endpoints_md() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], API_DOCS)
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        API_DOCS,
+    )
 }
 
 /// Handler for raw changelog markdown
 async fn changelog_md() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], API_CHANGELOG)
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        API_CHANGELOG,
+    )
 }
 
 pub fn router() -> Router<RouterState> {

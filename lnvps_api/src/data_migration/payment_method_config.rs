@@ -41,11 +41,16 @@ impl DataMigration for PaymentMethodConfigMigration {
 
             // Get the first company to assign configs to
             let companies = db.list_companies().await?;
-            let company = companies
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("No companies found in database, cannot migrate payment method configs"))?;
+            let company = companies.first().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No companies found in database, cannot migrate payment method configs"
+                )
+            })?;
             let company_id = company.id;
-            info!("Using company '{}' (id={}) for payment method config migration", company.name, company_id);
+            info!(
+                "Using company '{}' (id={}) for payment method config migration",
+                company.name, company_id
+            );
 
             let mut migrated_count = 0;
 
@@ -92,7 +97,10 @@ impl DataMigration for PaymentMethodConfigMigration {
                     );
 
                     db.insert_payment_method_config(&payment_config).await?;
-                    info!("Migrated Bitvora Lightning config for company {}", company_id);
+                    info!(
+                        "Migrated Bitvora Lightning config for company {}",
+                        company_id
+                    );
                     migrated_count += 1;
                 }
             }
@@ -125,8 +133,7 @@ impl DataMigration for PaymentMethodConfigMigration {
 
             info!(
                 "Payment method config migration completed: {} configs migrated for company {}",
-                migrated_count,
-                company_id
+                migrated_count, company_id
             );
 
             Ok(())

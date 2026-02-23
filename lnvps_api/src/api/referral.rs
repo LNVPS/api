@@ -196,7 +196,12 @@ async fn v1_get_referral(
         this.db.count_failed_referrals(&referral.code),
     )?;
 
-    ApiData::ok(ApiReferralState::build(referral, usage, payouts, referrals_failed))
+    ApiData::ok(ApiReferralState::build(
+        referral,
+        usage,
+        payouts,
+        referrals_failed,
+    ))
 }
 
 /// Sign up for the referral program
@@ -215,7 +220,9 @@ async fn v1_signup_referral(
 
     // Validate that at least one payout method is specified
     if req.lightning_address.is_none() && !req.use_nwc {
-        return ApiData::err("At least one payout method (lightning_address or use_nwc) is required");
+        return ApiData::err(
+            "At least one payout method (lightning_address or use_nwc) is required",
+        );
     }
 
     // Validate lightning address
