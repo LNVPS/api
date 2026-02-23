@@ -22,3 +22,4 @@ provisioner:
       bridge: "vmbr0"
       cpu: "host"
       kvm: false
+      arch: "x86_64"
