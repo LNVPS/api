@@ -47,6 +47,10 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/subscription_payments/{id}",
             get(admin_get_subscription_payment),
         )
+        .route(
+            "/api/admin/v1/subscription_payments/{id}/complete",
+            post(admin_complete_subscription_payment),
+        )
 }
 
 #[derive(Deserialize, Default)]
@@ -396,4 +400,37 @@ async fn admin_get_subscription_payment(
 
     let payment = this.db.get_subscription_payment(&payment_id).await?;
     ApiData::ok(AdminSubscriptionPaymentInfo::from(payment))
+}
+
+/// Manually mark a subscription payment as paid (admin override).
+///
+/// This calls `subscription_payment_paid` which sets `is_paid=true`,
+/// records `paid_at`, extends the subscription by 30 days, and activates it.
+async fn admin_complete_subscription_payment(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<String>,
+) -> ApiResult<AdminSubscriptionPaymentInfo> {
+    auth.require_permission(AdminResource::SubscriptionPayments, AdminAction::Update)?;
+
+    let payment_id = hex::decode(&id).map_err(|_| anyhow::anyhow!("Invalid payment ID format"))?;
+
+    let payment = this.db.get_subscription_payment(&payment_id).await?;
+
+    if payment.is_paid {
+        return ApiData::err("Payment is already completed");
+    }
+
+    this.db.subscription_payment_paid(&payment).await?;
+
+    log::info!(
+        "Admin {} manually completed subscription payment {} for subscription {}",
+        auth.user_id,
+        id,
+        payment.subscription_id
+    );
+
+    // Re-read the payment to get updated state
+    let updated = this.db.get_subscription_payment(&payment_id).await?;
+    ApiData::ok(AdminSubscriptionPaymentInfo::from(updated))
 }

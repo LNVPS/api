@@ -9,6 +9,7 @@ members = [
     "lnvps_operator",
     "lnvps_health",
     "try-procedure",
+    "lnvps_e2e",
 ]
 
 [workspace.package]
@@ -28,7 +29,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 config = { version = "0.15", features = ["yaml"] }
 hex = "0.4"
 ipnetwork = { git = "https://git.v0l.io/Kieran/ipnetwork.git", rev = "f01575cbf2fc596c0a1761c122aa92525cbb7974" }
-payments-rs = { git = "https://github.com/v0l/payments-rs.git", rev = "2804e8eaf0e019fe2a0bac845f22f60e0c8c776e", default-features = false }
+payments-rs = { git = "https://github.com/v0l/payments-rs.git", rev = "4e7d5fb80902973a7eb241ba6bad178012b6f169", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json"] }

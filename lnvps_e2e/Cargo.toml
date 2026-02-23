@@ -1,0 +1,20 @@
+[package]
+name = "lnvps_e2e"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lnvps_e2e"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+nostr = { version = "0.44", default-features = false, features = ["std"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio", "macros"] }
+hex = "0.4"

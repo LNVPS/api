@@ -449,6 +449,25 @@ GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}
 
 Required Permission: `payments::view`
 
+#### Complete VM Payment
+
+```
+POST /api/admin/v1/vms/{vm_id}/payments/{payment_id}/complete
+```
+
+Required Permission: `payments::update`
+
+Manually marks a VM payment as paid. Atomically sets `is_paid=true`, records `paid_at`, and extends the VM expiry by the payment's `time_value`. For upgrade payments, dispatches a `ProcessVmUpgrade` work job; otherwise dispatches `CheckVm`.
+
+**No request body required.**
+
+Returns the updated `AdminVmPaymentInfo`.
+
+Errors:
+- `400` if the payment is already completed
+- `400` if the payment does not belong to the specified VM
+- `400` if the payment ID format is invalid
+
 ### Subscription Management
 
 #### List Subscriptions
@@ -683,6 +702,24 @@ GET /api/admin/v1/subscription_payments/{hex_id}
 Required Permission: `subscription_payments::view`
 
 Returns detailed payment information including company details if available.
+
+#### Complete Subscription Payment
+
+```
+POST /api/admin/v1/subscription_payments/{hex_id}/complete
+```
+
+Required Permission: `subscription_payments::update`
+
+Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it.
+
+**No request body required.**
+
+Returns the updated `AdminSubscriptionPaymentInfo`.
+
+Errors:
+- `400` if the payment is already completed
+- `400` if the payment ID format is invalid
 
 ### Role Management
 

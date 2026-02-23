@@ -2571,6 +2571,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_e2e"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "nostr 0.44.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "lnvps_health"
 version = "0.2.0"
 dependencies = [
@@ -3142,7 +3158,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 [[package]]
 name = "payments-rs"
 version = "0.2.0"
-source = "git+https://github.com/v0l/payments-rs.git?rev=2804e8eaf0e019fe2a0bac845f22f60e0c8c776e#2804e8eaf0e019fe2a0bac845f22f60e0c8c776e"
+source = "git+https://github.com/v0l/payments-rs.git?rev=4e7d5fb80902973a7eb241ba6bad178012b6f169#4e7d5fb80902973a7eb241ba6bad178012b6f169"
 dependencies = [
  "anyhow",
  "async-trait",

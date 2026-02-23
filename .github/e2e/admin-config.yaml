@@ -1,0 +1,7 @@
+db: "mysql://root:root@localhost:3376/lnvps"
+redis:
+  url: "redis://localhost:6398"
+  ttl: 30
+encryption:
+  key-file: "/tmp/e2e-encryption.key"
+  auto-generate: true
