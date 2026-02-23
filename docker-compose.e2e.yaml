@@ -30,7 +30,7 @@ services:
       retries: 10
 
   bitcoind:
-    image: btcpayserver/bitcoin:28.0
+    image: btcpayserver/bitcoin:26.0
     environment:
       BITCOIN_NETWORK: regtest
       BITCOIN_EXTRA_ARGS: |
