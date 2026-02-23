@@ -2,6 +2,7 @@ volumes:
   e2e-db:
   e2e-lnd:
   e2e-bitcoind:
+  e2e-nostr-relay:
 
 services:
   db:
@@ -89,3 +90,15 @@ services:
       timeout: 10s
       retries: 30
       start_period: 10s
+
+  nostr-relay:
+    image: dockurr/strfry
+    ports:
+      - "7766:7777"
+    volumes:
+      - "e2e-nostr-relay:/app/strfry-db"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7777"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
