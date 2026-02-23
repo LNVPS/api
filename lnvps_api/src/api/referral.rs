@@ -2,8 +2,11 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
+use lnurl::lightning_address::LightningAddress;
+use lnurl::pay::PayResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use lnvps_api_common::{ApiData, ApiError, ApiResult, Nip98Auth};
 use lnvps_db::{Referral, ReferralCostUsage, ReferralPayout};
@@ -143,6 +146,26 @@ pub struct ApiReferralPatchRequest {
     pub use_nwc: Option<bool>,
 }
 
+/// Validate a lightning address by parsing its format and resolving the LNURL pay endpoint
+async fn validate_lightning_address(addr: &str) -> Result<(), ApiError> {
+    let ln_addr = LightningAddress::from_str(addr)
+        .map_err(|_| ApiError::new("Invalid lightning address format"))?;
+
+    let url = ln_addr.lnurlp_url();
+    let rsp = reqwest::get(&url)
+        .await
+        .map_err(|_| ApiError::new("Failed to resolve lightning address"))?;
+
+    if !rsp.status().is_success() {
+        return Err(ApiError::new("Lightning address not found"));
+    }
+
+    rsp.json::<PayResponse>()
+        .await
+        .map(|_| ())
+        .map_err(|_| ApiError::new("Lightning address returned invalid LNURL pay response"))
+}
+
 /// Generate a random 8-character base63 referral code (A-Za-z0-9_)
 fn generate_referral_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
@@ -195,6 +218,11 @@ async fn v1_signup_referral(
         return ApiData::err("At least one payout method (lightning_address or use_nwc) is required");
     }
 
+    // Validate lightning address
+    if let Some(ref addr) = req.lightning_address {
+        validate_lightning_address(addr).await?;
+    }
+
     // If use_nwc is requested, ensure user has NWC configured
     if req.use_nwc {
         let user = this.db.get_user(uid).await?;
@@ -234,8 +262,11 @@ async fn v1_update_referral(
         .await
         .map_err(|_| ApiError::new("Not enrolled in referral program"))?;
 
-    if let Some(addr) = req.lightning_address {
-        referral.lightning_address = addr;
+    if let Some(ref addr) = req.lightning_address {
+        if let Some(a) = addr {
+            validate_lightning_address(a).await?;
+        }
+        referral.lightning_address = addr.clone();
     }
     if let Some(use_nwc) = req.use_nwc {
         if use_nwc {
@@ -279,5 +310,41 @@ mod tests {
         let codes: Vec<String> = (0..20).map(|_| generate_referral_code()).collect();
         let unique: std::collections::HashSet<&String> = codes.iter().collect();
         assert!(unique.len() > 1, "All generated codes were identical");
+    }
+
+    #[tokio::test]
+    async fn test_validate_lightning_address_rejects_invalid_format() {
+        let result = validate_lightning_address("notanaddress").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_lightning_address_rejects_empty() {
+        let result = validate_lightning_address("").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_lightning_address_rejects_no_domain() {
+        let result = validate_lightning_address("user@").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_lightning_address_rejects_no_user() {
+        let result = validate_lightning_address("@domain.com").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_lightning_address_rejects_nonexistent_domain() {
+        let result = validate_lightning_address("user@thisdomain.doesnotexist.invalid").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_lightning_address_accepts_valid() {
+        let result = validate_lightning_address("kieran@zap.stream").await;
+        assert!(result.is_ok());
     }
 }
