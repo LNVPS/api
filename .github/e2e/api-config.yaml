@@ -10,6 +10,10 @@
  redis:
    url: "redis://localhost:6398"
    ttl: 30
+ nostr:
+   relays:
+     - "wss://nostr.example.com"
+   nsec: ""
  encryption:
    key-file: "/tmp/e2e-encryption.key"
    auto-generate: true
