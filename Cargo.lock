@@ -2474,6 +2474,7 @@ dependencies = [
  "lnvps_db",
  "log 0.4.29",
  "mustache",
+ "nostr 0.44.2",
  "nostr-sdk",
  "nwc",
  "openapi-build-gen",

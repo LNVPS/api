@@ -1,6 +1,7 @@
 mod contact;
 mod docs;
 mod ip_space;
+mod legal;
 mod model;
 #[cfg(feature = "nostr-domain")]
 mod nostr_domain;
@@ -43,6 +44,7 @@ use crate::settings::Settings;
 pub use contact::router as contacts_router;
 pub use docs::router as docs_router;
 pub use ip_space::router as ip_space_router;
+pub use legal::router as legal_router;
 use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander};
 use lnvps_db::LNVpsDb;
 #[cfg(feature = "nostr-domain")]

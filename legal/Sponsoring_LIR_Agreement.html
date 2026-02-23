@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sponsoring LIR Agreement - Independent Assignment Request and Maintenance Agreement</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Times New Roman', Times, serif;
+            font-size: 11pt;
+            line-height: 1.5;
+            max-width: 210mm;
+            margin: 0 auto;
+            padding: 20mm;
+            color: #000;
+            background: #fff;
+        }
+
+        @media print {
+            body {
+                padding: 0;
+                margin: 0;
+            }
+
+            .page-break {
+                page-break-before: always;
+            }
+        }
+
+        h1 {
+            font-size: 16pt;
+            text-align: center;
+            margin-bottom: 0.5em;
+            font-weight: bold;
+        }
+
+        h2 {
+            font-size: 12pt;
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+            font-weight: bold;
+            border-bottom: 1px solid #000;
+            padding-bottom: 0.25em;
+        }
+
+        h3 {
+            font-size: 11pt;
+            margin-top: 1em;
+            margin-bottom: 0.5em;
+            font-weight: bold;
+        }
+
+        p {
+            margin: 0.5em 0;
+            text-align: justify;
+        }
+
+        .version {
+            text-align: center;
+            font-weight: bold;
+            margin-bottom: 2em;
+        }
+
+        .preamble {
+            text-align: center;
+            font-style: italic;
+            margin-bottom: 2em;
+        }
+
+        .parties {
+            margin: 2em 0;
+        }
+
+        .party-block {
+            margin: 1em 0;
+        }
+
+        .party-label {
+            font-weight: bold;
+        }
+
+        .article-number {
+            font-weight: bold;
+        }
+
+        .sub-article {
+            margin-left: 2em;
+            margin-top: 0.5em;
+        }
+
+        .sub-sub-article {
+            margin-left: 4em;
+            margin-top: 0.25em;
+        }
+
+        .definition {
+            margin: 0.5em 0;
+        }
+
+        .definition-term {
+            font-weight: bold;
+        }
+
+        ul {
+            margin: 0.5em 0;
+            padding-left: 2em;
+        }
+
+        li {
+            margin: 0.25em 0;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1em 0;
+        }
+
+        th, td {
+            border: 1px solid #000;
+            padding: 0.5em;
+            text-align: left;
+        }
+
+        th {
+            background-color: #f0f0f0;
+            font-weight: bold;
+        }
+
+        .signature-section {
+            margin-top: 3em;
+        }
+
+        .signature-block {
+            display: inline-block;
+            width: 45%;
+            vertical-align: top;
+            margin-bottom: 2em;
+        }
+
+        .signature-block:first-child {
+            margin-right: 8%;
+        }
+
+        .signature-line {
+            margin-top: 1em;
+            border-bottom: 1px solid #000;
+            height: 2em;
+        }
+
+        .signature-label {
+            margin-top: 0.5em;
+            margin-bottom: 1em;
+        }
+
+        .checkbox-item {
+            margin: 0.5em 0;
+        }
+
+        .checkbox {
+            display: inline-block;
+            width: 1em;
+            height: 1em;
+            border: 1px solid #000;
+            margin-right: 0.5em;
+            vertical-align: middle;
+        }
+
+        .footer-note {
+            margin-top: 3em;
+            font-style: italic;
+            font-size: 10pt;
+            border-top: 1px solid #ccc;
+            padding-top: 1em;
+        }
+
+        .document-reference {
+            text-align: right;
+            font-size: 10pt;
+            color: #666;
+        }
+
+        .technical-justification {
+            min-height: 4em;
+            border: 1px solid #ccc;
+            padding: 0.5em;
+            margin: 0.5em 0;
+            background-color: #fafafa;
+        }
+
+        a {
+            color: #000;
+        }
+    </style>
+</head>
+<body>
+
+<h1>Sponsoring LIR Agreement</h1>
+<h2 style="text-align: center; border: none; margin-top: 0;">Independent Assignment Request and Maintenance Agreement</h2>
+
+<p class="version">Version 1.0 - Effective Date: {{effective_date}}</p>
+
+<p class="preamble">This Agreement ("Agreement") is entered into between the parties identified below regarding the
+    assignment and maintenance of Internet Number Resources.</p>
+
+<hr>
+
+<div class="parties">
+    <h2>Parties</h2>
+
+    <div class="party-block">
+        <p><span class="party-label">{{provider_trading_name}}</span> (operated by {{provider_legal_name}}),<br>
+            with registered offices at {{provider_address}},<br>
+            registered with {{provider_register}},<br>
+            hereinafter "<strong>Provider</strong>" or "<strong>Sponsoring LIR</strong>"</p>
+    </div>
+
+    <p style="text-align: center;"><em>and</em></p>
+
+    <div class="party-block">
+        <p><span class="party-label">End User:</span></p>
+        <table>
+            <tr>
+                <td style="width: 30%;"><strong>Name:</strong></td>
+                <td>{{end_user_name}}</td>
+            </tr>
+            <tr>
+                <td><strong>Legal form:</strong></td>
+                <td>{{end_user_legal_form}}</td>
+            </tr>
+            <tr>
+                <td><strong>Registered address:</strong></td>
+                <td>{{end_user_address}}</td>
+            </tr>
+            <tr>
+                <td><strong>Registration number:</strong></td>
+                <td>{{end_user_registration_number}}</td>
+            </tr>
+            <tr>
+                <td><strong>Email address:</strong></td>
+                <td>{{end_user_email}}</td>
+            </tr>
+            <tr>
+                <td><strong>Nostr Public Key (login):</strong></td>
+                <td style="word-break: break-all; font-family: monospace; font-size: 9pt;">{{end_user_npub}}</td>
+            </tr>
+        </table>
+        <p>hereinafter "<strong>End User</strong>" or "<strong>Customer</strong>"</p>
+    </div>
+</div>
+
+<hr>
+
+<h2>Article 1 - Definitions</h2>
+
+<p class="definition"><span class="definition-term">Agreement:</span> This Independent IP Address Assignment and
+    Maintenance Agreement.</p>
+
+<p class="definition"><span class="definition-term">Administration Fee:</span> The one-time fee payable by the End User
+    to the Provider for processing the initial request for Assignment.</p>
+
+<p class="definition"><span class="definition-term">Assignment:</span> The act by which the RIPE NCC enables the End
+    User to use Independent Internet Number Resources for its internal use, which may involve publication in the RIPE
+    Database of the End User as the assignee of the respective Internet Number Resources.</p>
+
+<p class="definition"><span class="definition-term">End User:</span> A natural person or legal entity that has entered
+    into this Agreement to receive Internet Number Resources for internal purposes.</p>
+
+<p class="definition"><span class="definition-term">Independent Internet Number Resources:</span> Internet Number
+    Resources including but not limited to:</p>
+<ul>
+    <li>Provider Independent (PI) IPv4 addresses</li>
+    <li>Provider Independent (PI) IPv6 addresses</li>
+    <li>Autonomous System (AS) Numbers</li>
+    <li>Internet Exchange Point (IXP) assignments</li>
+    <li>Anycasting assignments</li>
+</ul>
+
+<p class="definition"><span class="definition-term">Maintenance Fee:</span> The periodic fee payable by the End User to
+    the Provider for maintaining Assignments and handling ongoing administrative requirements.</p>
+
+<p class="definition"><span class="definition-term">Provider:</span> {{provider_trading_name}}, acting as a Local
+    Internet Registry (LIR) that receives allocations for Internet Number Resources from the RIPE NCC.</p>
+
+<p class="definition"><span class="definition-term">Reverse DNS Delegation:</span> Reverse Domain Name System (DNS)
+    delegations allowing applications to map to a domain name from an IP address, using the special domain names
+    in-addr.arpa (IPv4) and ip6.arpa (IPv6).</p>
+
+<p class="definition"><span class="definition-term">RIPE Database:</span> The database operated by the RIPE NCC
+    containing IP addresses, Autonomous System (AS) Numbers, and organisations or customers associated with these
+    resources, along with related Points of Contact (POC).</p>
+
+<p class="definition"><span class="definition-term">RIPE NCC:</span> Réseaux IP Européens Network Coordination Centre, a
+    membership association under Dutch law established in Amsterdam, the Netherlands, which serves as the Regional
+    Internet Registry with authority to delegate Internet Number Resources in its service region.</p>
+
+<p class="definition"><span class="definition-term">RIPE Policy:</span> Policy relating to Internet Number Resources
+    developed, adopted, and published by the RIPE community in accordance with the Policy Development Process described
+    at <a href="https://www.ripe.net">https://www.ripe.net</a>.</p>
+
+<p class="definition"><span class="definition-term">Service Agreement:</span> The Standard Service Agreement between the
+    Provider and the RIPE NCC under which the Provider operates as a Local Internet Registry.</p>
+
+<hr>
+
+<h2>Article 2 - General Provisions</h2>
+
+<p><span class="article-number">2.1</span> This Agreement shall come into effect upon:</p>
+<p class="sub-article">(a) Execution of this Agreement by both parties; and</p>
+<p class="sub-article">(b) Receipt by the Provider of an extract from the Commercial Trade Register or equivalent
+    document proving the registration of the End User's business with their national authorities.</p>
+<p class="sub-article">If the End User's business has not been incorporated or registered with the Commercial Trade
+    Register, the End User shall instead provide a legible copy of a valid government-issued identity document.</p>
+
+<p><span class="article-number">2.2</span> Upon receipt of the signed Agreement and supporting documents, the Provider
+    shall issue an invoice for the Administration Fee as specified in Schedule A.</p>
+
+<p><span class="article-number">2.3</span> The Provider reserves the right to amend and/or supplement the terms of this
+    Agreement. The Provider shall notify the End User and the RIPE NCC of any changes at least thirty (30) days prior to
+    such amendment or supplement coming into effect. The End User's continued use of the Internet Number Resources after
+    such notice period constitutes acceptance of the amended terms.</p>
+
+<p><span class="article-number">2.4</span> Communication under this Agreement shall be conducted via the email addresses
+    provided by each party. The End User is responsible for ensuring their contact information remains current.</p>
+
+<hr>
+
+<h2>Article 3 - Request for Assignment</h2>
+
+<p><span class="article-number">3.1</span> The End User may request an Assignment by contacting the Provider through the
+    designated support channels. Upon receipt of a valid request, the Provider shall submit a request form via the LIR
+    Portal to the RIPE NCC.</p>
+
+<p><span class="article-number">3.2</span> The Provider may suspend processing of an initial Assignment request until:
+</p>
+<p class="sub-article">(a) The Administration Fee specified in paragraph 2.2 has been received; and</p>
+<p class="sub-article">(b) The Maintenance Fee specified in paragraph 4.2 for the current billing period has been
+    received.</p>
+
+<p><span class="article-number">3.3</span> The Assignment is made by the RIPE NCC. The following conditions must be met
+    before the RIPE NCC will assign Independent Internet Number Resources:</p>
+<p class="sub-article">(a) The Provider has submitted a valid request form to the RIPE NCC;</p>
+<p class="sub-article">(b) The RIPE NCC has established that the request complies with current RIPE policies for
+    Assignment to End Users.</p>
+<p class="sub-article">Current RIPE documents are available at: <a href="https://www.ripe.net/publications/docs/">https://www.ripe.net/publications/docs/</a>
+</p>
+
+<p><span class="article-number">3.4</span> The Provider does not guarantee approval of any Assignment request. The RIPE
+    NCC has sole discretion over whether an Assignment complies with applicable policies.</p>
+
+<hr>
+
+<h2>Article 4 - Maintenance; Conditions for Maintenance</h2>
+
+<p><span class="article-number">4.1</span> Subject to the provisions of this Article, the Provider shall maintain the
+    Assignments made by the RIPE NCC pursuant to this Agreement.</p>
+
+<p><span class="article-number">4.2</span> The End User shall pay a periodic Maintenance Fee as specified in Schedule A.
+    The Provider may amend the Maintenance Fee during the term of the Agreement, with such amendment to be communicated
+    at least sixty (60) days prior to taking effect.</p>
+
+<p><span class="article-number">4.3</span> The End User understands and agrees that the Provider can only maintain
+    Assignments as long as the assigned Independent Internet Number Resources are used in accordance with RIPE policies.
+    Specifically, the Provider shall maintain Assignments subject to the following conditions:</p>
+
+<p class="sub-article">(a) <strong>Internal Use Only:</strong> The End User shall use the Independent Internet Number
+    Resources assigned to it for internal purposes within its own network only.</p>
+
+<p class="sub-article">(b) <strong>No Proprietary Rights:</strong> The End User understands and agrees that the
+    Assignment does not confer upon the End User any proprietary or transferable rights in respect of the Independent
+    Internet Number Resources. The End User shall not assign, delegate, sub-delegate, sell, lease, or otherwise allow
+    third parties to use the Independent Internet Number Resources assigned to it pursuant to this Agreement.</p>
+
+<p class="sub-article">(c) <strong>Purpose Limitation:</strong> The End User shall use the assigned Independent Internet
+    Number Resources solely for the purpose specified in the request on the basis of which the Independent Internet
+    Number Resources have been assigned.</p>
+
+<p class="sub-article">(d) <strong>Policy Compliance:</strong> The End User shall comply with current RIPE policies
+    relevant to End Users as published at <a href="https://www.ripe.net">https://www.ripe.net</a>, which may be amended
+    from time to time by the RIPE community.</p>
+
+<p class="sub-article">(e) <strong>Accurate Registration:</strong> The End User shall provide the Provider with correct
+    and up-to-date information for recording of the Assignment in the RIPE Database during the entire term of this
+    Agreement.</p>
+
+<p class="sub-article">(f) <strong>Correspondence:</strong> The End User shall respond to correspondence from the
+    Provider and/or the RIPE NCC regarding Assignments made pursuant to this Agreement within a reasonable timeframe,
+    not to exceed thirty (30) days.</p>
+
+<p><span class="article-number">4.4</span> The End User understands and agrees that the RIPE NCC may revoke Assignments
+    if the End User does not use the assigned Independent Internet Number Resources in accordance with RIPE policies as
+    specified in paragraph 4.3.</p>
+
+<p><span class="article-number">4.5</span> The Provider shall maintain appropriate records of all Assignments and make
+    such records available to the RIPE NCC upon request for audit or compliance purposes.</p>
+
+<hr>
+
+<h2>Article 5 - Payment</h2>
+
+<p><span class="article-number">5.1</span> The End User shall pay the Administration Fee and Maintenance Fee within
+    thirty (30) days of the invoice date. The End User shall be in default immediately upon failure to pay within this
+    period, with no notice of default being required.</p>
+
+<p><span class="article-number">5.2</span> All fees are payable in {{currency}}. Payment may be made via:</p>
+<ul>
+    <li>Bitcoin Lightning Network</li>
+    <li>Bank transfer</li>
+    <li>Other payment methods as may be specified by the Provider</li>
+</ul>
+
+<p><span class="article-number">5.3</span> With effect from the day on which the End User defaults on its payment
+    obligations, the End User shall owe the Provider:</p>
+<p class="sub-article">(a) Interest at the statutory commercial rate on the amounts unpaid; and</p>
+<p class="sub-article">(b) All reasonable collection costs incurred by the Provider.</p>
+
+<p><span class="article-number">5.4</span> Failure to pay the Maintenance Fee may result in suspension of services and,
+    ultimately, termination of this Agreement and revocation of the Assignment.</p>
+
+<hr>
+
+<h2>Article 6 - Liability</h2>
+
+<p><span class="article-number">6.1</span> The Provider does not warrant that requested Independent Internet Number
+    Resources will be assigned upon request.</p>
+
+<p><span class="article-number">6.2</span> The Provider does not warrant that assigned Independent Internet Number
+    Resources will be routable on any part of the Internet. Routability depends on third-party network operators over
+    whom the Provider has no control.</p>
+
+<p><span class="article-number">6.3</span> The End User shall be solely liable for all aspects of the use of the
+    Independent Internet Number Resources assigned to it and all consequences arising from such use.</p>
+
+<p><span class="article-number">6.4</span> The Provider excludes all liability for any direct or indirect damages,
+    including but not limited to:</p>
+<ul>
+    <li>Loss of business or profits</li>
+    <li>Damages to third parties</li>
+    <li>Personal injury or property damage</li>
+    <li>Consequential or incidental damages</li>
+</ul>
+<p>This exclusion does not apply in cases of wilful misconduct or gross negligence on the part of the Provider or its
+    management.</p>
+
+<p><span class="article-number">6.5</span> The Provider shall not be liable for damages caused by:</p>
+<p class="sub-article">(a) Failure by the RIPE NCC to make Independent Internet Number Resources available or to do so
+    in a timely manner;</p>
+<p class="sub-article">(b) Any act or omission of the RIPE NCC;</p>
+<p class="sub-article">(c) Changes to RIPE policy affecting the End User's use of the resources.</p>
+
+<p><span class="article-number">6.6</span> The Provider shall not be liable for non-performance or damages where such is
+    not due to the Provider's fault or is due to circumstances beyond the Provider's reasonable control, including but
+    not limited to acts of God, war, terrorism, civil unrest, or failure of third-party infrastructure.</p>
+
+<p><span class="article-number">6.7</span> The End User shall indemnify and hold harmless the Provider against any and
+    all third-party claims, damages, costs, and expenses (including reasonable legal fees) arising from or related to
+    the End User's use of the Independent Internet Number Resources assigned pursuant to this Agreement.</p>
+
+<p><span class="article-number">6.8</span> In all cases, the Provider's total aggregate liability under or in connection
+    with this Agreement shall not exceed the total amount of fees actually paid by the End User to the Provider under
+    this Agreement during the twelve (12) months preceding the event giving rise to liability.</p>
+
+<hr>
+
+<div class="page-break"></div>
+
+<h2>Article 7 - Term and Termination</h2>
+
+<p><span class="article-number">7.1</span> This Agreement shall commence on the Effective Date and continue for an
+    indefinite period until terminated in accordance with this Article 7.</p>
+
+<p><span class="article-number">7.2</span> <strong>Termination by End User:</strong> The End User may terminate this
+    Agreement with one (1) month's written notice sent to the Provider by email or registered mail.</p>
+
+<p><span class="article-number">7.3</span> <strong>Termination by Provider:</strong> The Provider may terminate this
+    Agreement with three (3) months' written notice sent to the End User by email or registered mail.</p>
+
+<p><span class="article-number">7.4</span> <strong>Termination for Cause:</strong> The Provider may terminate this
+    Agreement immediately upon written notice to the End User, without liability and without prejudice to any other
+    remedies, if:</p>
+<p class="sub-article">(a) The End User fails to comply with paragraphs 4.3(a), (b), (c), or (d);</p>
+<p class="sub-article">(b) The End User fails to fulfil any other obligation under this Agreement and fails to remedy
+    such failure within fourteen (14) days of receiving written notice;</p>
+<p class="sub-article">(c) The End User violates any applicable law in a manner that, in the Provider's reasonable
+    opinion, justifies immediate termination;</p>
+<p class="sub-article">(d) Bankruptcy, insolvency, or similar proceedings are filed by or against the End User;</p>
+<p class="sub-article">(e) The End User goes into liquidation or becomes insolvent;</p>
+<p class="sub-article">(f) The End User uses the Internet Number Resources in connection with illegal activities,
+    including but not limited to spamming, distribution of malware, or cyberattacks.</p>
+
+<p><span class="article-number">7.5</span> <strong>Effect on Fees:</strong> Termination shall not affect Administration
+    or Maintenance Fees that have become due or have been paid prior to the date of termination. No refunds shall be
+    provided for prepaid fees.</p>
+
+<p><span class="article-number">7.6</span> <strong>Post-Termination Actions:</strong> Upon termination:</p>
+<p class="sub-article">(a) The Provider shall request the RIPE NCC to delete the RIPE Database records for the
+    Independent Internet Number Resources assigned pursuant to this Agreement;</p>
+<p class="sub-article">(b) The Provider shall request the RIPE NCC to revoke Reverse DNS delegations for the respective
+    resources;</p>
+<p class="sub-article">(c) The Provider and RIPE NCC may take any other measures necessary to enable the Independent
+    Internet Number Resources to become eligible for reassignment.</p>
+
+<p><span class="article-number">7.7</span> <strong>Cessation of Use:</strong> Upon termination, and except for
+    replacement of this Agreement by another agreement for the same Independent Internet Number Resources as described
+    in paragraph 7.9:</p>
+<p class="sub-article">(a) The End User shall immediately cease all use of the Independent Internet Number
+    Resources;</p>
+<p class="sub-article">(b) The resources may be reassigned by the RIPE NCC to other End Users;</p>
+<p class="sub-article">(c) The End User waives any claim against the Provider or the RIPE NCC for continued use of the
+    resources.</p>
+
+<p><span class="article-number">7.8</span> <strong>Automatic Expiry:</strong> This Agreement shall automatically expire
+    upon:</p>
+<p class="sub-article">(a) Declaration of bankruptcy of the Provider;</p>
+<p class="sub-article">(b) Liquidation of the Provider; or</p>
+<p class="sub-article">(c) Termination of the Service Agreement between the Provider and the RIPE NCC.</p>
+
+<p><span class="article-number">7.9</span> <strong>Continuity Options:</strong> After termination under paragraphs 7.2,
+    7.3, or expiry under paragraph 7.8, the End User may seek to continue using the same Independent Internet Number
+    Resources by:</p>
+<p class="sub-article">(a) Entering into an End User Assignment Agreement directly with the RIPE NCC; or</p>
+<p class="sub-article">(b) Entering into an agreement with another LIR.</p>
+<p class="sub-article">The End User acknowledges that the Independent Internet Number Resources may be reassigned if the
+    End User does not arrange alternative sponsorship within three (3) months of termination.</p>
+
+<hr>
+
+<h2>Article 8 - Governing Law and Dispute Resolution</h2>
+
+<p><span class="article-number">8.1</span> This Agreement shall be governed by and construed in accordance with the laws
+    of {{governing_law_country}}.</p>
+
+<p><span class="article-number">8.2</span> Any dispute arising from or in connection with this Agreement shall first be
+    attempted to be resolved through good-faith negotiation between the parties.</p>
+
+<p><span class="article-number">8.3</span> If a dispute cannot be resolved through negotiation within thirty (30) days,
+    either party may submit the dispute to the courts of {{jurisdiction_country}}, which shall have exclusive
+    jurisdiction.</p>
+
+<p><span class="article-number">8.4</span> Notwithstanding the foregoing, disputes concerning the application of RIPE
+    policies or the actions of the RIPE NCC may be subject to the RIPE NCC's arbitration procedures as described at <a
+            href="https://www.ripe.net/about-us/legal/arbitration/">https://www.ripe.net/about-us/legal/arbitration/</a>.
+</p>
+
+<hr>
+
+<h2>Article 9 - Third-Party Rights</h2>
+
+<p><span class="article-number">9.1</span> The rights and remedies granted to the RIPE NCC under paragraphs 4.4, 7.6,
+    7.7, 7.8, 7.9, and 10.2 are granted irrevocably for the sole benefit of the RIPE NCC without the RIPE NCC being due
+    any consideration.</p>
+
+<p><span class="article-number">9.2</span> Except as expressly stated in paragraph 9.1, this Agreement does not create
+    any rights in favour of any third party, and no third party shall have the right to enforce any term of this
+    Agreement.</p>
+
+<hr>
+
+<h2>Article 10 - Miscellaneous</h2>
+
+<p><span class="article-number">10.1</span> <strong>Assignment:</strong> The End User may not assign any rights or
+    obligations under this Agreement without the Provider's prior written consent.</p>
+
+<p><span class="article-number">10.2</span> <strong>Disclosure to RIPE NCC:</strong> The Provider shall submit to the
+    RIPE NCC copies of this Agreement and supporting documents as required for verifying the status of the Independent
+    Internet Number Resources and compliance with RIPE policies.</p>
+
+<p><span class="article-number">10.3</span> <strong>Address Changes:</strong> The End User shall notify the Provider
+    immediately of any change of address, email, or billing details. Until such notification, the last notified details
+    shall be presumed correct.</p>
+
+<p><span class="article-number">10.4</span> <strong>Notices:</strong> Unless otherwise provided, the Provider may send
+    notifications under this Agreement to the last notified email and mail address of the End User.</p>
+
+<p><span class="article-number">10.5</span> <strong>Severability:</strong> If any provision of this Agreement is held to
+    be invalid or unenforceable by a court of competent jurisdiction, the remaining provisions shall continue in full
+    force and effect.</p>
+
+<p><span class="article-number">10.6</span> <strong>Entire Agreement:</strong> This Agreement, together with any
+    schedules and annexes, constitutes the entire agreement between the parties concerning its subject matter and
+    supersedes all prior agreements, understandings, negotiations, and discussions.</p>
+
+<p><span class="article-number">10.7</span> <strong>Amendments:</strong> Except as provided in paragraphs 2.3 and 4.2,
+    this Agreement may only be amended by written agreement signed by both parties.</p>
+
+<p><span class="article-number">10.8</span> <strong>Waiver:</strong> No failure or delay by either party in exercising
+    any right under this Agreement shall constitute a waiver of that right.</p>
+
+<p><span class="article-number">10.9</span> <strong>Force Majeure:</strong> Neither party shall be liable for failure to
+    perform its obligations under this Agreement if such failure results from circumstances beyond its reasonable
+    control, including but not limited to natural disasters, war, terrorism, labour disputes, or failure of third-party
+    telecommunications.</p>
+
+<hr>
+
+<div class="page-break"></div>
+
+<h2>Schedule A - Fees</h2>
+
+<table>
+    <thead>
+    <tr>
+        <th>Fee Type</th>
+        <th>Amount</th>
+        <th>Frequency</th>
+    </tr>
+    </thead>
+    <tbody>
+    <tr>
+        <td>Administration Fee</td>
+        <td>{{administration_fee}} {{currency}}</td>
+        <td>One-time</td>
+    </tr>
+    <tr>
+        <td>Maintenance Fee</td>
+        <td>{{maintenance_fee}} {{currency}}</td>
+        <td>{{maintenance_fee_frequency}}</td>
+    </tr>
+    </tbody>
+</table>
+
+<h3>Payment Methods</h3>
+<ul>
+    <li>Bitcoin Lightning Network (preferred)</li>
+    <li>Bank Transfer ({{currency}})</li>
+    <li>Other methods as agreed</li>
+</ul>
+
+<h3>Invoicing</h3>
+<ul>
+    <li>Administration Fee: Invoiced upon execution of this Agreement</li>
+    <li>Maintenance Fee: Invoiced {{maintenance_fee_invoicing}}</li>
+</ul>
+
+<hr>
+
+<h2>Schedule B - Requested Internet Number Resources</h2>
+
+<table>
+    <thead>
+    <tr>
+        <th>Resource Type</th>
+        <th>Quantity/Size</th>
+        <th>Purpose</th>
+    </tr>
+    </thead>
+    <tbody>
+    {{#resources}}
+    <tr>
+        <td>{{type}}</td>
+        <td>{{quantity}}</td>
+        <td>{{purpose}}</td>
+    </tr>
+    {{/resources}}
+    {{^resources}}
+    <tr>
+        <td>IPv4 PI</td>
+        <td>—</td>
+        <td>—</td>
+    </tr>
+    <tr>
+        <td>IPv6 PI</td>
+        <td>—</td>
+        <td>—</td>
+    </tr>
+    <tr>
+        <td>AS Number</td>
+        <td>—</td>
+        <td>—</td>
+    </tr>
+    {{/resources}}
+    </tbody>
+</table>
+
+<h3>Technical Justification</h3>
+<div class="technical-justification">
+    {{#technical_justification}}
+    {{technical_justification}}
+    {{/technical_justification}}
+    {{^technical_justification}}
+    <em>To be completed by End User</em>
+    {{/technical_justification}}
+</div>
+
+<hr>
+
+<div class="page-break"></div>
+
+<h2>Signatures</h2>
+
+<div class="signature-section">
+    <div class="signature-block">
+        <h3>For the Provider ({{provider_trading_name}})</h3>
+        <p class="signature-label"><strong>Name:</strong> {{provider_signatory_name}}</p>
+        <p class="signature-label"><strong>Title:</strong> {{provider_signatory_title}}</p>
+        <p class="signature-label"><strong>Date:</strong> {{provider_signature_date}}</p>
+        <p class="signature-label"><strong>Signature:</strong></p>
+        <div class="signature-line"></div>
+    </div>
+
+    <div class="signature-block">
+        <h3>For the End User</h3>
+        <p class="signature-label"><strong>Name:</strong> {{end_user_signatory_name}}</p>
+        <p class="signature-label"><strong>Title:</strong> {{end_user_signatory_title}}</p>
+        <p class="signature-label"><strong>Date:</strong> {{end_user_signature_date}}</p>
+        <p class="signature-label"><strong>Signature:</strong></p>
+        <div class="signature-line"></div>
+    </div>
+</div>
+
+<hr>
+
+<h2>Annexes</h2>
+
+<h3>Required Documentation</h3>
+
+<div class="checkbox-item">
+    <span class="checkbox"></span> Copy of Commercial Trade Register extract or equivalent national registration
+    document
+</div>
+<div class="checkbox-item">
+    <span class="checkbox"></span> Copy of valid government-issued identity document (if unincorporated)
+</div>
+<div class="checkbox-item">
+    <span class="checkbox"></span> Technical justification for requested resources
+</div>
+<div class="checkbox-item">
+    <span class="checkbox"></span> Network diagram (if applicable)
+</div>
+
+<hr>
+
+{{#cryptographic_proof}}
+<div class="page-break"></div>
+
+<h2>Cryptographic Proof of Document Generation</h2>
+
+<p>This document was generated by the Provider's system and is cryptographically signed to prove authenticity. The signature below covers the JSON representation of the agreement data contained in the Nostr event content.</p>
+
+<table style="font-family: monospace; font-size: 9pt;">
+    <tr>
+        <td style="width: 25%;"><strong>Provider Public Key (npub):</strong></td>
+        <td style="word-break: break-all;">{{provider_npub}}</td>
+    </tr>
+    <tr>
+        <td><strong>End User Public Key (npub):</strong></td>
+        <td style="word-break: break-all;">{{end_user_npub}}</td>
+    </tr>
+    <tr>
+        <td><strong>Generated At:</strong></td>
+        <td>{{generated_at}}</td>
+    </tr>
+    <tr>
+        <td><strong>Nostr Event ID:</strong></td>
+        <td style="word-break: break-all;">{{event_id}}</td>
+    </tr>
+    <tr>
+        <td><strong>Signature:</strong></td>
+        <td style="word-break: break-all;">{{signature}}</td>
+    </tr>
+</table>
+
+<h3>Signed JSON Content</h3>
+<div style="background-color: #f5f5f5; padding: 1em; border: 1px solid #ccc; font-family: monospace; font-size: 8pt; white-space: pre-wrap; word-break: break-all;">{{signed_json}}</div>
+
+<p style="font-size: 9pt; margin-top: 1em;"><em>To verify: The signature signs the JSON content shown above. 
+Verification confirms that this agreement with the exact data shown in the JSON was generated by {{provider_trading_name}} for the End User.</em></p>
+{{/cryptographic_proof}}
+
+<hr>
+
+<p class="footer-note">This Agreement template is based on the RIPE NCC's Independent Assignment Request and Maintenance
+    Agreement and has been adapted for use by {{provider_trading_name}}. End Users are encouraged to seek independent
+    legal advice before signing.</p>
+
+<p class="document-reference"><strong>Document Reference:</strong> {{document_reference}}</p>
+
+</body>
+</html>

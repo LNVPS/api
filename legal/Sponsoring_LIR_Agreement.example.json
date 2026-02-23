@@ -1,0 +1,53 @@
+{
+  "effective_date": "2026-02-23",
+  
+  "provider_trading_name": "LNVPS",
+  "provider_legal_name": "LNVPS Limited",
+  "provider_address": "123 Example Street, Dublin, Ireland",
+  "provider_register": "Companies Registration Office Ireland; Registration No. 123456",
+  
+  "end_user_name": "Example Customer Ltd",
+  "end_user_legal_form": "Private Limited Company",
+  "end_user_address": "456 Customer Road, London, UK",
+  "end_user_registration_number": "UK12345678",
+  "end_user_email": "admin@example-customer.com",
+  
+  "currency": "EUR",
+  "administration_fee": "50.00",
+  "maintenance_fee": "10.00",
+  "maintenance_fee_frequency": "Annual",
+  "maintenance_fee_invoicing": "annually in advance",
+  
+  "governing_law_country": "Ireland",
+  "jurisdiction_country": "Ireland",
+  
+  "resources": [
+    {
+      "type": "IPv4 PI",
+      "quantity": "/29 (8 addresses)",
+      "purpose": "Web hosting infrastructure"
+    },
+    {
+      "type": "IPv6 PI", 
+      "quantity": "/48",
+      "purpose": "Web hosting infrastructure"
+    },
+    {
+      "type": "AS Number",
+      "quantity": "1",
+      "purpose": "Multi-homed network connectivity"
+    }
+  ],
+  
+  "technical_justification": "The End User operates a web hosting platform requiring provider-independent addressing to enable multi-homing across multiple upstream providers for redundancy and improved routing.",
+  
+  "provider_signatory_name": "John Smith",
+  "provider_signatory_title": "Director",
+  "provider_signature_date": "2026-02-23",
+  
+  "end_user_signatory_name": "Jane Doe",
+  "end_user_signatory_title": "CEO",
+  "end_user_signature_date": "2026-02-23",
+  
+  "document_reference": "LNVPS-LIR-AGR-001-v1.0"
+}

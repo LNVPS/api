@@ -70,6 +70,9 @@ isocountry = "0.3"
 hickory-resolver = "0.25"
 humantime = "2.2"
 
+# nostr (for signing agreements)
+nostr = { version = "0.44", default-features = false, features = ["std"] }
+
 #nostr-dm
 nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", optional = true, default-features = false }
 
