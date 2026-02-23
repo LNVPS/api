@@ -1,0 +1,29 @@
+db: "mysql://root:root@localhost:3376/lnvps"
+lightning:
+  lnd:
+    url: "https://localhost:10009"
+    cert: "/tmp/e2e-lnd/tls.cert"
+    macaroon: "/tmp/e2e-lnd/data/chain/bitcoin/regtest/admin.macaroon"
+delete-after: 3
+public-url: "http://localhost:8000"
+read-only: true
+redis:
+  url: "redis://localhost:6398"
+  ttl: 30
+nostr:
+  relays:
+    - "ws://localhost:7766"
+  nsec: "nsec1q6qm0rwu7ws4pcrqmyhrks2p0c8ht95c5u0r44ukt5fzwur5sg4s0msjlw"
+encryption:
+  key-file: "/tmp/e2e-encryption.key"
+  auto-generate: true
+provisioner:
+  proxmox:
+    qemu:
+      bios: "ovmf"
+      machine: "q35"
+      os-type: "l26"
+      bridge: "vmbr0"
+      cpu: "host"
+      kvm: false
+      arch: "x86_64"

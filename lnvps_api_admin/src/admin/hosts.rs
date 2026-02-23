@@ -125,14 +125,10 @@ async fn admin_update_host(
         host.enabled = enabled;
     }
     if let Some(cpu_mfg) = req.cpu_mfg {
-        host.cpu_mfg = cpu_mfg
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        host.cpu_mfg = cpu_mfg.and_then(|s| s.parse().ok()).unwrap_or_default();
     }
     if let Some(cpu_arch) = req.cpu_arch {
-        host.cpu_arch = cpu_arch
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        host.cpu_arch = cpu_arch.and_then(|s| s.parse().ok()).unwrap_or_default();
     }
     if let Some(cpu_features) = req.cpu_features {
         host.cpu_features = cpu_features

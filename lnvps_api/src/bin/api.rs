@@ -85,9 +85,10 @@ async fn main() -> Result<(), Error> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
     #[cfg(debug_assertions)]
-    {
+    if std::env::var("LNVPS_DEV_SETUP").is_ok() {
         let setup_script = include_str!("../../dev_setup.sql");
         db.execute(setup_script).await?;
+        info!("Executed dev_setup.sql");
     }
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
     let nostr_client = if let Some(ref c) = settings.nostr {
@@ -141,12 +142,9 @@ async fn main() -> Result<(), Error> {
     }
 
     // setup payment handlers
-    tasks.extend(listen_all_payments(
-        &settings,
-        node.clone(),
-        db.clone(),
-        worker.commander(),
-    ).await?);
+    tasks.extend(
+        listen_all_payments(&settings, node.clone(), db.clone(), worker.commander()).await?,
+    );
 
     // refresh rates every 1min
     let rates = exchange.clone();

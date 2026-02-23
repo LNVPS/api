@@ -61,7 +61,7 @@ fn extract_host_from_url(input: &str) -> String {
         .strip_prefix("https://")
         .or_else(|| input.strip_prefix("http://"))
         .unwrap_or(input);
-    
+
     // Take everything before the first ':' or '/' (to strip port and path)
     without_protocol
         .split(|c| c == ':' || c == '/')
@@ -480,10 +480,7 @@ impl Worker {
             }
 
             // delete vm if not paid (in new state) after 1 hour
-            if is_new_vm
-                && !vm.deleted
-                && vm.expires < Utc::now().sub(TimeDelta::hours(1))
-            {
+            if is_new_vm && !vm.deleted && vm.expires < Utc::now().sub(TimeDelta::hours(1)) {
                 vms_to_delete.push(vm);
             }
         }
@@ -538,8 +535,8 @@ impl Worker {
             message: String,
             year: String,
         }
-        let template =
-            mustache::compile_str(include_str!("../email.html")).map_err(|e| OpError::Fatal(e.into()))?;
+        let template = mustache::compile_str(include_str!("../email.html"))
+            .map_err(|e| OpError::Fatal(e.into()))?;
         let data = EmailData {
             message: html_message.unwrap_or(plain_message).to_string(),
             year: Utc::now().year().to_string(),
@@ -549,10 +546,15 @@ impl Worker {
             .map_err(|e| OpError::Fatal(e.into()))?;
         let html = MultiPart::alternative_plain_html(plain_message.to_string(), rendered);
         let mut b = MessageBuilder::new()
-            .to(to.parse().map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?)
+            .to(to
+                .parse()
+                .map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?)
             .subject(subject);
         if let Some(f) = &smtp.from {
-            b = b.from(f.parse().map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?);
+            b = b.from(
+                f.parse()
+                    .map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?,
+            );
         }
         let msg = b.multipart(html).map_err(|e| OpError::Fatal(e.into()))?;
         let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)
@@ -609,8 +611,16 @@ impl Worker {
         Ok(())
     }
 
-    async fn send_email_verification(&self, user_id: u64, verify_url: &str) -> Result<(), OpError<anyhow::Error>> {
-        let user = self.db.get_user(user_id).await.map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
+    async fn send_email_verification(
+        &self,
+        user_id: u64,
+        verify_url: &str,
+    ) -> Result<(), OpError<anyhow::Error>> {
+        let user = self
+            .db
+            .get_user(user_id)
+            .await
+            .map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
         if user.email.is_empty() {
             return Ok(()); // No email, nothing to do
         }
@@ -625,7 +635,14 @@ impl Worker {
             r#"Please verify your email address by clicking the link below:<br><br><a href="{}">Verify Email Address</a>"#,
             verify_url
         );
-        Self::send_email(smtp, user.email.as_str(), "Verify your email address", &plain_text, Some(&html_message)).await
+        Self::send_email(
+            smtp,
+            user.email.as_str(),
+            "Verify your email address",
+            &plain_text,
+            Some(&html_message),
+        )
+        .await
     }
 
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
@@ -798,7 +815,10 @@ impl Worker {
         let ssh_key = match &host.ssh_key {
             Some(key) => key.as_str().to_string(),
             None => {
-                warn!("No SSH key configured for host {}, skipping host-info", host.name);
+                warn!(
+                    "No SSH key configured for host {}, skipping host-info",
+                    host.name
+                );
                 return Ok(());
             }
         };
@@ -809,13 +829,14 @@ impl Worker {
 
         // Connect to host via SSH
         let mut ssh = SshClient::new()?;
-        ssh.connect_with_key(
-            (ssh_host.as_str(), 22),
-            ssh_user,
-            &ssh_key,
-        )
-        .await
-        .with_context(|| format!("Failed to SSH connect to host {} ({}@{}:22)", host.name, ssh_user, ssh_host))?;
+        ssh.connect_with_key((ssh_host.as_str(), 22), ssh_user, &ssh_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to SSH connect to host {} ({}@{}:22)",
+                    host.name, ssh_user, ssh_host
+                )
+            })?;
 
         // Detect the host's architecture via uname -m
         let (exit_code, arch_output) = ssh
@@ -824,14 +845,21 @@ impl Worker {
             .with_context(|| format!("Failed to detect architecture on host {}", host.name))?;
 
         if exit_code != 0 {
-            bail!("uname -m failed with exit code {} on {}", exit_code, host.name);
+            bail!(
+                "uname -m failed with exit code {} on {}",
+                exit_code,
+                host.name
+            );
         }
 
         let remote_arch = match arch_output.trim() {
             "x86_64" | "amd64" => CpuArch::X86_64,
             "aarch64" | "arm64" => CpuArch::ARM64,
             other => {
-                warn!("Unknown architecture '{}' on host {}, skipping host-info", other, host.name);
+                warn!(
+                    "Unknown architecture '{}' on host {}, skipping host-info",
+                    other, host.name
+                );
                 return Ok(());
             }
         };
@@ -854,12 +882,8 @@ impl Worker {
             .with_context(|| format!("Failed to read host-info binary from {:?}", binary_path))?;
 
         // Upload the binary
-        ssh.scp_upload(
-            &binary_data,
-            Path::new(HOST_INFO_REMOTE_PATH),
-            0o755,
-        )
-        .with_context(|| format!("Failed to upload host-info to {}", host.name))?;
+        ssh.scp_upload(&binary_data, Path::new(HOST_INFO_REMOTE_PATH), 0o755)
+            .with_context(|| format!("Failed to upload host-info to {}", host.name))?;
 
         info!("Uploaded host-info to {}", host.name);
 
@@ -870,7 +894,12 @@ impl Worker {
             .with_context(|| format!("Failed to execute host-info on {}", host.name))?;
 
         if exit_code != 0 {
-            bail!("host-info exited with code {} on {}: {}", exit_code, host.name, output);
+            bail!(
+                "host-info exited with code {} on {}: {}",
+                exit_code,
+                host.name,
+                output
+            );
         }
 
         // Parse the JSON output
@@ -1024,10 +1053,7 @@ impl Worker {
                             .map(|m| m.is_empty())
                             .unwrap_or(false);
                         if names_empty {
-                            debug!(
-                                "Path activation check succeeded for domain {}",
-                                domain.name
-                            );
+                            debug!("Path activation check succeeded for domain {}", domain.name);
                             Ok(true)
                         } else {
                             debug!(
@@ -1723,10 +1749,16 @@ impl Worker {
                     vm.id, user_id
                 )));
             }
-            WorkJob::SendEmailVerification { user_id, verify_url } => {
+            WorkJob::SendEmailVerification {
+                user_id,
+                verify_url,
+            } => {
                 if let Err(e) = self.send_email_verification(*user_id, verify_url).await {
                     match e {
-                        OpError::Fatal(e) => warn!("Permanent email error for user {}, skipping: {}", user_id, e),
+                        OpError::Fatal(e) => warn!(
+                            "Permanent email error for user {}, skipping: {}",
+                            user_id, e
+                        ),
                         OpError::Transient(e) => return Err(e),
                     }
                 }

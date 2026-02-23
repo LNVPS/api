@@ -138,7 +138,11 @@ impl From<lnvps_db::User> for AccountPatchRequest {
         let has_email = !user.email.is_empty();
         let email_str: String = user.email.into();
         AccountPatchRequest {
-            email: if has_email { Some(Some(email_str)) } else { None },
+            email: if has_email {
+                Some(Some(email_str))
+            } else {
+                None
+            },
             email_verified: has_email.then_some(user.email_verified),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
@@ -497,8 +501,14 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
             disk_type: value.disk_type.into(),
             disk_interface: value.disk_interface.into(),
             pricing_id: value.pricing_id,
-            cpu_mfg: value.cpu_mfg.and_then(|s| s.parse().ok()).unwrap_or_default(),
-            cpu_arch: value.cpu_arch.and_then(|s| s.parse().ok()).unwrap_or_default(),
+            cpu_mfg: value
+                .cpu_mfg
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
+            cpu_arch: value
+                .cpu_arch
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
             cpu_features: cpu_features.into(),
         }
     }

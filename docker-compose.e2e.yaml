@@ -1,0 +1,104 @@
+volumes:
+  e2e-db:
+  e2e-lnd:
+  e2e-bitcoind:
+  e2e-nostr-relay:
+
+services:
+  db:
+    image: mariadb:latest
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: lnvps
+    ports:
+      - "3376:3306"
+    volumes:
+      - "e2e-db:/var/lib/mysql"
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6398:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  bitcoind:
+    image: btcpayserver/bitcoin:26.0
+    environment:
+      BITCOIN_NETWORK: regtest
+      BITCOIN_EXTRA_ARGS: |
+        rpcuser=polaruser
+        rpcpassword=polarpass
+        rpcallowip=0.0.0.0/0
+        rpcbind=0.0.0.0
+        server=1
+        listen=1
+        txindex=1
+        fallbackfee=0.00001
+        zmqpubrawblock=tcp://0.0.0.0:28332
+        zmqpubrawtx=tcp://0.0.0.0:28333
+    ports:
+      - "18443:18443"
+      - "28332:28332"
+      - "28333:28333"
+    volumes:
+      - "e2e-bitcoind:/home/bitcoin/.bitcoin"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=polaruser", "-rpcpassword=polarpass", "getblockchaininfo"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  lnd:
+    image: lightninglabs/lnd:v0.18.5-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      LND_ENVIRONMENT: regtest
+    command:
+      - lnd
+      - --noseedbackup
+      - --norest
+      - --debuglevel=info
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=polaruser
+      - --bitcoind.rpcpass=polarpass
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --rpclisten=0.0.0.0:10009
+      - --tlsextradomain=lnd
+      - --tlsextraip=0.0.0.0
+    ports:
+      - "10009:10009"
+    volumes:
+      - "e2e-lnd:/root/.lnd"
+    healthcheck:
+      test: ["CMD", "lncli", "--network=regtest", "getinfo"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  nostr-relay:
+    image: dockurr/strfry
+    ports:
+      - "7766:7777"
+    volumes:
+      - "e2e-nostr-relay:/app/strfry-db"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7777"]
+      interval: 3s
+      timeout: 5s
+      retries: 10

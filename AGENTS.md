@@ -32,6 +32,7 @@ These docs apply to all projects using this agent structure:
 | [docs/agents/currency.md](docs/agents/currency.md) | Working with money amounts, pricing, or payments |
 | [docs/agents/bug-fixes.md](docs/agents/bug-fixes.md) | Resolving bugs — LNVPS-specific additions |
 | [docs/agents/coverage.md](docs/agents/coverage.md) | Function coverage — LNVPS-specific additions |
+| [docs/agents/e2e-tests.md](docs/agents/e2e-tests.md) | Writing or running E2E integration tests (`lnvps_e2e` crate) |
 
 ## Release Procedure
 

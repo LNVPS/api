@@ -127,7 +127,8 @@ async fn admin_update_payment_method(
             (Some(_), None) => {
                 return Err(anyhow::anyhow!(
                     "Processing fee currency is required when processing fee base is set"
-                ).into());
+                )
+                .into());
             }
         };
     }

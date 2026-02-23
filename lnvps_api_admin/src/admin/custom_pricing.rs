@@ -91,11 +91,7 @@ impl AdminCustomPricingInfo {
             } else {
                 Some(pricing.cpu_arch.to_string())
             },
-            cpu_features: pricing
-                .cpu_features
-                .iter()
-                .map(|f| f.to_string())
-                .collect(),
+            cpu_features: pricing.cpu_features.iter().map(|f| f.to_string()).collect(),
             cpu_cost: pricing.cpu_cost,
             memory_cost: pricing.memory_cost,
             ip4_cost: pricing.ip4_cost,
@@ -282,14 +278,10 @@ async fn admin_update_custom_pricing(
         pricing.currency = currency;
     }
     if let Some(cpu_mfg) = req.cpu_mfg {
-        pricing.cpu_mfg = cpu_mfg
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        pricing.cpu_mfg = cpu_mfg.and_then(|s| s.parse().ok()).unwrap_or_default();
     }
     if let Some(cpu_arch) = req.cpu_arch {
-        pricing.cpu_arch = cpu_arch
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default();
+        pricing.cpu_arch = cpu_arch.and_then(|s| s.parse().ok()).unwrap_or_default();
     }
     if let Some(cpu_features) = req.cpu_features {
         pricing.cpu_features = cpu_features

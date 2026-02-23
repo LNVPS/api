@@ -1309,7 +1309,15 @@ mod tests {
         fee_base: Option<u64>,
         fee_currency: Option<&str>,
     ) -> PaymentMethodConfig {
-        make_config_with_currencies(id, method, enabled, fee_rate, fee_base, fee_currency, vec![])
+        make_config_with_currencies(
+            id,
+            method,
+            enabled,
+            fee_rate,
+            fee_base,
+            fee_currency,
+            vec![],
+        )
     }
 
     fn make_config_with_currencies(

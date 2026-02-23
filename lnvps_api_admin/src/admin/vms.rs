@@ -5,14 +5,14 @@ use crate::admin::model::{
     AdminVmPaymentInfo, JobResponse,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, patch, post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
-    VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
+    UpgradeConfig, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
 };
-use lnvps_db::{AdminAction, AdminResource};
+use lnvps_db::{AdminAction, AdminResource, PaymentType};
 use log::{error, info};
 use serde::Deserialize;
 
@@ -24,7 +24,9 @@ pub fn router() -> Router<RouterState> {
         )
         .route(
             "/api/admin/v1/vms/{id}",
-            get(admin_get_vm).patch(admin_patch_vm).delete(admin_delete_vm),
+            get(admin_get_vm)
+                .patch(admin_patch_vm)
+                .delete(admin_delete_vm),
         )
         .route("/api/admin/v1/vms/{id}/start", post(admin_start_vm))
         .route("/api/admin/v1/vms/{id}/stop", post(admin_stop_vm))
@@ -45,6 +47,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/vms/{id}/refund",
             get(admin_calculate_vm_refund).post(admin_process_vm_refund),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}/payments/{payment_id}/complete",
+            post(admin_complete_vm_payment),
         )
 }
 
@@ -155,7 +161,11 @@ async fn admin_list_vms(
             vm.host_id,
             vm.user_id,
             hex::encode(&user.pubkey),
-            if user.email.is_empty() { None } else { Some(user.email.into()) },
+            if user.email.is_empty() {
+                None
+            } else {
+                Some(user.email.into())
+            },
             host.name.clone(),
             region.id,
             region.name.clone(),
@@ -226,7 +236,11 @@ async fn admin_get_vm(
         vm.host_id,
         vm.user_id,
         hex::encode(&user.pubkey),
-        if user.email.is_empty() { None } else { Some(user.email.into()) },
+        if user.email.is_empty() {
+            None
+        } else {
+            Some(user.email.into())
+        },
         host_name,
         region_id,
         region_name,
@@ -781,4 +795,65 @@ async fn admin_create_vm(
             ApiData::err("Failed to queue VM creation job")
         }
     }
+}
+
+/// Manually mark a VM payment as paid (admin override).
+///
+/// This calls `vm_payment_paid` which atomically sets `is_paid=true`,
+/// records `paid_at`, and extends the VM expiry by the payment's `time_value`.
+/// After that it dispatches a `CheckVm` work job (or `ProcessVmUpgrade`
+/// for upgrade payments) exactly like the normal payment-provider flow.
+async fn admin_complete_vm_payment(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((vm_id, payment_id)): Path<(u64, String)>,
+) -> ApiResult<AdminVmPaymentInfo> {
+    auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+
+    // Verify VM exists
+    let _vm = this.db.get_vm(vm_id).await?;
+
+    // Decode payment ID from hex
+    let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
+
+    // Get payment and verify it belongs to this VM
+    let payment = this.db.get_vm_payment(&payment_id_bytes).await?;
+    if payment.vm_id != vm_id {
+        return ApiData::err("Payment does not belong to this VM");
+    }
+
+    if payment.is_paid {
+        return ApiData::err("Payment is already completed");
+    }
+
+    // Mark as paid (atomically sets is_paid, paid_at, extends VM expiry)
+    this.db.vm_payment_paid(&payment).await?;
+
+    info!(
+        "Admin {} manually completed VM payment {} for VM {}",
+        auth.user_id, payment_id, vm_id
+    );
+
+    // Dispatch the appropriate work job
+    let job = if payment.payment_type == PaymentType::Upgrade {
+        // Parse upgrade config from the payment's upgrade_params field
+        let config = payment
+            .upgrade_params
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<UpgradeConfig>(json).ok())
+            .unwrap_or_else(|| UpgradeConfig::new(None, None, None));
+        WorkJob::ProcessVmUpgrade { vm_id, config }
+    } else {
+        WorkJob::CheckVm { vm_id }
+    };
+    if let Err(e) = this.work_commander.send(job).await {
+        error!(
+            "Payment completed but failed to dispatch work job for VM {}: {}",
+            vm_id, e
+        );
+    }
+
+    // Re-read the payment to get updated paid_at / is_paid
+    let updated = this.db.get_vm_payment(&payment_id_bytes).await?;
+    ApiData::ok(AdminVmPaymentInfo::from_vm_payment(&updated))
 }

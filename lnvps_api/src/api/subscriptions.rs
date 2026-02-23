@@ -166,9 +166,7 @@ async fn v1_create_subscription(
                 match derived_company_id {
                     None => derived_company_id = Some(ip_space.company_id),
                     Some(cid) if cid != ip_space.company_id => {
-                        return ApiData::err(
-                            "All line items must belong to the same company",
-                        );
+                        return ApiData::err("All line items must belong to the same company");
                     }
                     _ => {}
                 }

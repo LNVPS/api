@@ -63,10 +63,7 @@ impl DataMigration for SshKeyMigration {
                 host.ssh_key = Some(key_content.clone().into());
                 db.update_host(&host).await?;
 
-                info!(
-                    "Migrated SSH key to host '{}' (id={})",
-                    host.name, host.id
-                );
+                info!("Migrated SSH key to host '{}' (id={})", host.name, host.id);
                 migrated_count += 1;
             }
 

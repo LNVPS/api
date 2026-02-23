@@ -70,10 +70,7 @@ impl Router for MockRouter {
     async fn generate_mac(&self, ip: &str, comment: &str) -> anyhow::Result<Option<ArpEntry>> {
         // Generate a deterministic but distinct MAC from the IP so tests can verify
         // that vm.mac_address is set from ArpEntry.mac_address, not ArpEntry.address
-        let bytes: Vec<u8> = ip
-            .split('.')
-            .filter_map(|o| o.parse::<u8>().ok())
-            .collect();
+        let bytes: Vec<u8> = ip.split('.').filter_map(|o| o.parse::<u8>().ok()).collect();
         let mac = format!(
             "02:00:{:02x}:{:02x}:{:02x}:{:02x}",
             bytes.first().copied().unwrap_or(0),
