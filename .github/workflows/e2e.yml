@@ -63,9 +63,8 @@ jobs:
 
       - name: Start admin API
         run: |
-          cargo run -p lnvps_api_admin -- --config .github/e2e/admin-config.yaml &
+          cargo run -p lnvps_api_admin --bin lnvps_api_admin -- --config .github/e2e/admin-config.yaml &
           echo $! > /tmp/admin-api.pid
-          # Wait for admin API to be ready
           for i in $(seq 1 60); do
             if curl -sf http://localhost:8001/ >/dev/null 2>&1; then
               echo "Admin API ready after ${i}s"
