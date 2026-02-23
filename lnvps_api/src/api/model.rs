@@ -345,6 +345,7 @@ pub enum ApiPaymentMethod {
     Paypal,
     Stripe,
     NWC,
+    LNURL,
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {

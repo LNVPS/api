@@ -956,10 +956,18 @@ fn build_payment_methods_response(
         })
         .collect();
 
-    // NWC is a client-side payment method (user's own wallet) available when Lightning is enabled
+    // NWC and LNURL are client-side payment methods available when Lightning is enabled
     if has_lightning {
         ret.push(ApiPaymentInfo {
             name: ApiPaymentMethod::NWC,
+            metadata: HashMap::new(),
+            currencies: vec![ApiCurrency::BTC],
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+        });
+        ret.push(ApiPaymentInfo {
+            name: ApiPaymentMethod::LNURL,
             metadata: HashMap::new(),
             currencies: vec![ApiCurrency::BTC],
             processing_fee_rate: None,
@@ -1339,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn test_payment_methods_lightning_includes_nwc() {
+    fn test_payment_methods_lightning_includes_nwc_and_lnurl() {
         let configs = vec![make_config(
             1,
             PaymentMethod::Lightning,
@@ -1350,11 +1358,13 @@ mod tests {
         )];
         let result = build_payment_methods_response(configs);
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 3);
         assert!(matches!(result[0].name, ApiPaymentMethod::Lightning));
         assert!(matches!(result[1].name, ApiPaymentMethod::NWC));
+        assert!(matches!(result[2].name, ApiPaymentMethod::LNURL));
         assert_eq!(result[0].currencies, vec![ApiCurrency::BTC]);
         assert_eq!(result[1].currencies, vec![ApiCurrency::BTC]);
+        assert_eq!(result[2].currencies, vec![ApiCurrency::BTC]);
     }
 
     #[test]
@@ -1427,13 +1437,14 @@ mod tests {
         ];
         let result = build_payment_methods_response(configs);
 
-        // Lightning + Stripe + NWC (because Lightning is enabled)
-        assert_eq!(result.len(), 3);
+        // Lightning + Stripe + NWC + LNURL (because Lightning is enabled)
+        assert_eq!(result.len(), 4);
 
         let names: Vec<_> = result.iter().map(|p| p.name).collect();
         assert!(names.contains(&ApiPaymentMethod::Lightning));
         assert!(names.contains(&ApiPaymentMethod::Stripe));
         assert!(names.contains(&ApiPaymentMethod::NWC));
+        assert!(names.contains(&ApiPaymentMethod::LNURL));
         assert!(!names.contains(&ApiPaymentMethod::Revolut)); // disabled
     }
 
@@ -1447,12 +1458,12 @@ mod tests {
         ];
         let result = build_payment_methods_response(configs);
 
-        // 4 methods + NWC = 5
-        assert_eq!(result.len(), 5);
+        // 4 methods + NWC + LNURL = 6
+        assert_eq!(result.len(), 6);
 
         for info in &result {
             match info.name {
-                ApiPaymentMethod::Lightning | ApiPaymentMethod::NWC => {
+                ApiPaymentMethod::Lightning | ApiPaymentMethod::NWC | ApiPaymentMethod::LNURL => {
                     assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
                 }
                 ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {
