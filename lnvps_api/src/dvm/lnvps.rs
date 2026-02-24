@@ -72,7 +72,10 @@ impl DVMHandler for LnvpsDvm {
                     .next()
                     .context("no host region")?
             };
-            let pricing = db.list_custom_pricing(host_region.id).await?;
+            let mut pricing = db.list_custom_pricing(host_region.id).await?;
+
+            // Filter to only enabled pricing
+            pricing.retain(|p| p.enabled);
 
             // we expect only 1 pricing per region
             let pricing = pricing

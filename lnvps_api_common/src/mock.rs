@@ -838,7 +838,7 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
-        Ok(p.values().filter(|p| p.enabled).cloned().collect())
+        Ok(p.values().cloned().collect())
     }
 
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
