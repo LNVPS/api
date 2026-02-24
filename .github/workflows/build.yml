@@ -19,6 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up QEMU
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
@@ -37,7 +38,7 @@ jobs:
         with:
           context: lnvps_host_util
           file: lnvps_host_util/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           tags: ${{ env.HOST_INFO_IMAGE }}:latest
           cache-from: type=gha,scope=host-info
