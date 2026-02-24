@@ -16,7 +16,7 @@ use lnvps_api_common::{
     WorkFeedback, WorkJob, WorkJobMessage, op_fatal,
     retry::{OpError, Pipeline, RetryPolicy},
 };
-use lnvps_db::{CpuArch, CpuFeature, CpuMfg, LNVpsDb, Vm, VmHost, VmIpAssignment};
+use lnvps_db::{CpuArch, CpuFeature, CpuMfg, LNVpsDb, Vm, VmHost, VmIpAssignment, VmOsImage};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
 use serde::Deserialize;
@@ -55,7 +55,7 @@ fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
 /// Extract hostname/IP from a URL or return the input if it's already a plain host
 /// e.g. "https://192.168.1.1:8006/" -> "192.168.1.1"
 ///      "192.168.1.1" -> "192.168.1.1"
-fn extract_host_from_url(input: &str) -> String {
+pub(crate) fn extract_host_from_url(input: &str) -> String {
     // Strip protocol prefix if present
     let without_protocol = input
         .strip_prefix("https://")
@@ -1763,8 +1763,89 @@ impl Worker {
                     }
                 }
             }
+            WorkJob::DownloadOsImages { image_id } => {
+                self.download_os_images(*image_id).await?;
+            }
         }
         Ok(None)
+    }
+
+    async fn download_os_images(&self, image_id: Option<u64>) -> Result<()> {
+        let images = if let Some(id) = image_id {
+            vec![self.db.get_os_image(id).await?]
+        } else {
+            self.db.list_os_image().await?
+        };
+
+        // Resolve and persist sha2/sha2_url for any image that is missing them
+        let mut images = images;
+        for image in &mut images {
+            if image.sha2.is_none() {
+                self.resolve_and_persist_sha2(image).await;
+            }
+        }
+
+        let hosts = self.db.list_hosts().await?;
+        for host in &hosts {
+            let client = match get_host_client(host, &self.settings.provisioner_config) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to get client for host {}: {}", host.name, e);
+                    continue;
+                }
+            };
+            for image in &images {
+                info!("Checking image {} on host {}", image.url, host.name);
+                if let Err(e) = client.download_os_image(image).await {
+                    warn!(
+                        "Failed to download image {} on host {}: {}",
+                        image.url, host.name, e
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve sha2/sha2_url for an image that is missing them, then persist
+    /// the result to the database so future runs and host downloads can use it.
+    async fn resolve_and_persist_sha2(&self, image: &mut VmOsImage) {
+        let filename = match image.url_filename() {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("Could not determine filename for {}: {}", image.url, e);
+                return;
+            }
+        };
+
+        let resolved = if let Some(sha2_url) = image.sha2_url.clone() {
+            match lnvps_api_common::shasum::fetch_checksum_for_file(&sha2_url, &filename).await {
+                Ok(entry) => Some((entry.checksum, sha2_url)),
+                Err(e) => {
+                    warn!("Failed to fetch sha2 from {}: {}", sha2_url, e);
+                    None
+                }
+            }
+        } else {
+            match lnvps_api_common::shasum::probe_checksum_from_image_url(&image.url, &filename)
+                .await
+            {
+                Some((entry, sums_url)) => Some((entry.checksum, sums_url)),
+                None => {
+                    warn!("Could not find a SHASUMS file for {}", image.url);
+                    None
+                }
+            }
+        };
+
+        if let Some((checksum, sums_url)) = resolved {
+            info!("Resolved sha2 for {}: {}", image.url, checksum);
+            image.sha2 = Some(checksum);
+            image.sha2_url = Some(sums_url);
+            if let Err(e) = self.db.update_os_image(image).await {
+                warn!("Failed to persist sha2 for image {}: {}", image.id, e);
+            }
+        }
     }
 
     async fn process_vm_upgrade(&self, vm_id: u64, cfg: &UpgradeConfig) -> Result<()> {

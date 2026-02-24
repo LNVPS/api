@@ -116,6 +116,9 @@ pub enum WorkJob {
     },
     /// Send an email verification link to the user
     SendEmailVerification { user_id: u64, verify_url: String },
+    /// Download OS images to all hosts, verifying checksums and re-downloading if stale.
+    /// If `image_id` is Some, only that image is processed; otherwise all images are checked.
+    DownloadOsImages { image_id: Option<u64> },
 }
 
 impl WorkJob {
@@ -153,6 +156,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
             WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
+            WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
         }
     }
 }

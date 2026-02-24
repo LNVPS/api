@@ -393,6 +393,25 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE vm_os_image SET distribution=?, flavour=?, version=?, enabled=?, release_date=?, url=?, default_username=?, sha2=?, sha2_url=? WHERE id=?"
+        )
+        .bind(image.distribution as u16)
+        .bind(&image.flavour)
+        .bind(&image.version)
+        .bind(image.enabled)
+        .bind(image.release_date)
+        .bind(&image.url)
+        .bind(&image.default_username)
+        .bind(&image.sha2)
+        .bind(&image.sha2_url)
+        .bind(image.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     async fn get_ip_range(&self, id: u64) -> DbResult<IpRange> {
         Ok(sqlx::query_as("select * from ip_range where id=?")
             .bind(id)

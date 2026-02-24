@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [v0.2.0] - 2026-02-22
 
 ### Added
+- **2026-02-24** - Cloud image checksum verification and on-demand download (closes #69)
+  - `POST /api/admin/v1/vm_os_images/{id}/download` — Enqueue an immediate download/re-check of an OS image on all hosts (requires `vm_os_image::update`)
+  - `PATCH /api/admin/v1/vm_os_images/{id}` — Now correctly applies `sha2` and `sha2_url` updates
+  - Worker: `DownloadOsImages` job fetches `sha2_url`, compares checksum via SSH, and re-downloads stale images; checksum is also passed to Proxmox `download-url` API for in-flight verification
 - **2026-02-24** - Added `company_base_currency` field to `AdminVmPaymentInfo`
   - `GET /api/admin/v1/vms/{id}/payments` — Response now includes `company_base_currency`
   - `GET /api/admin/v1/vms/{id}/payments/{payment_id}` — Response now includes `company_base_currency`

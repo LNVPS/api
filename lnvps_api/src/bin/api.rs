@@ -139,6 +139,15 @@ async fn main() -> Result<(), Error> {
                 worker.spawn_job_interval(WorkJob::CheckNostrDomains, Duration::from_secs(600)),
             );
         }
+
+        // enqueue an image download/checksum check on startup
+        if let Err(e) = worker
+            .commander()
+            .send(WorkJob::DownloadOsImages { image_id: None })
+            .await
+        {
+            error!("Failed to enqueue startup image download: {}", e);
+        }
     }
 
     // setup payment handlers

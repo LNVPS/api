@@ -877,21 +877,93 @@ impl VmHostClient for ProxmoxClient {
         let files = self.list_storage_files(&self.node, &iso_storage).await?;
 
         info!("Downloading image {} on {}", image.url, &self.node);
-        let i_name = image.filename()?;
-        if files
+        // storage_name: how Proxmox stores the file (e.g. foo.img)
+        // url_name: the original filename from the URL, used in SHASUMS (e.g. foo.qcow2)
+        let storage_name = image.filename()?;
+        let url_name = image.url_filename()?;
+
+        // Resolve the expected checksum from sha2_url if present
+        let expected_sha2 = if let Some(sha2_url) = &image.sha2_url {
+            match Self::fetch_sha2_from_url(sha2_url, &url_name).await {
+                Ok(s) => {
+                    info!("Resolved checksum for {} from {}: {}", url_name, sha2_url, s);
+                    Some(s)
+                }
+                Err(e) => {
+                    warn!("Failed to fetch sha2 from {}: {}", sha2_url, e);
+                    image.sha2.clone()
+                }
+            }
+        } else {
+            image.sha2.clone()
+        };
+
+        // Determine the checksum algorithm from the digest length
+        let checksum_algorithm = expected_sha2
+            .as_deref()
+            .and_then(|s| lnvps_api_common::shasum::ShasumAlgorithm::from_hex_len(s.len()))
+            .map(|a| a.as_str().to_owned());
+
+        let already_present = files
             .iter()
-            .any(|v| v.vol_id.ends_with(&format!("iso/{i_name}")))
-        {
-            info!("Already downloaded, skipping");
-            return Ok(());
+            .any(|v| v.vol_id.ends_with(&format!("iso/{storage_name}")));
+
+        if already_present {
+            // If we have an expected checksum, verify the stored file via SSH
+            let stale = if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm)
+            {
+                match self
+                    .verify_image_checksum(&storage_name, &iso_storage, expected, algo)
+                    .await
+                {
+                    Ok(matches) => {
+                        if matches {
+                            info!("Checksum verified for {}, skipping download", storage_name);
+                            false
+                        } else {
+                            info!("Checksum mismatch for {}, will re-download", storage_name);
+                            true
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to verify checksum for {}: {}, will re-download",
+                            storage_name, e
+                        );
+                        true
+                    }
+                }
+            } else {
+                info!(
+                    "No checksum available for {}, skipping re-download check",
+                    storage_name
+                );
+                false
+            };
+
+            if !stale {
+                return Ok(());
+            }
+
+            // Delete the stale image before re-downloading
+            info!("Deleting stale image {} from {}", storage_name, &self.node);
+            if let Err(e) = self
+                .delete_storage_file(&self.node, &iso_storage, &storage_name)
+                .await
+            {
+                warn!("Failed to delete stale image {}: {}", storage_name, e);
+            }
         }
+
         let t_download = self
             .download_image(DownloadUrlRequest {
                 content: StorageContent::ISO,
                 node: self.node.clone(),
                 storage: iso_storage.clone(),
                 url: image.url.clone(),
-                filename: i_name,
+                filename: storage_name,
+                checksum: expected_sha2,
+                checksum_algorithm,
             })
             .await?;
         self.wait_for_task(&t_download).await?;
@@ -1291,6 +1363,77 @@ impl VmHostClient for ProxmoxClient {
     }
 }
 
+impl ProxmoxClient {
+    /// Fetch a SHA2SUMS file and extract the checksum for the given filename.
+    /// Delegates to the common [`lnvps_api_common::shasum`] parser.
+    pub async fn fetch_sha2_from_url(sha2_url: &str, filename: &str) -> Result<String> {
+        let entry = lnvps_api_common::shasum::fetch_checksum_for_file(sha2_url, filename).await?;
+        Ok(entry.checksum)
+    }
+
+    /// Verify an already-downloaded image's checksum via SSH by running the appropriate
+    /// sum utility on the Proxmox node.  Returns `true` if the checksum matches.
+    pub async fn verify_image_checksum(
+        &self,
+        filename: &str,
+        _storage: &str,
+        expected: &str,
+        algorithm: &str,
+    ) -> Result<bool> {
+        let ssh_cfg = match &self.ssh {
+            Some(s) => s,
+            None => anyhow::bail!("SSH not configured, cannot verify checksum"),
+        };
+
+        // Proxmox stores ISOs under /var/lib/vz/template/iso/ by default
+        let iso_path = format!("/var/lib/vz/template/iso/{filename}");
+        let cmd = match algorithm {
+            "sha256" | "sha384" | "sha512" => format!("{algorithm}sum {iso_path}"),
+            other => anyhow::bail!("Unknown checksum algorithm: {other}"),
+        };
+
+        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
+        let ssh_user = ssh_cfg.user.clone();
+        let ssh_key = ssh_cfg.key.clone();
+
+        let mut ssh = SshClient::new()?;
+        ssh.connect((host.as_str(), 22), &ssh_user, &ssh_key)
+            .await?;
+        let (exit_code, output) = ssh.execute(&cmd).await?;
+        if exit_code != 0 {
+            anyhow::bail!("Checksum command failed (exit {}): {}", exit_code, output);
+        }
+
+        let actual = output.split_whitespace().next().unwrap_or("").to_lowercase();
+        let expected_lower = expected.to_lowercase();
+        Ok(actual == expected_lower)
+    }
+
+    /// Delete a storage file on the Proxmox node
+    pub async fn delete_storage_file(
+        &self,
+        node: &str,
+        storage: &str,
+        filename: &str,
+    ) -> OpResult<()> {
+        let vol_id = format!("{storage}:iso/{filename}");
+        let _: ResponseBase<Option<String>> = self
+            .api
+            .req::<_, ()>(
+                Method::DELETE,
+                &format!(
+                    "/api2/json/nodes/{}/storage/{}/content/{}",
+                    node,
+                    storage,
+                    urlencoding::encode(&vol_id)
+                ),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 /// Wrap a database vm id
 #[derive(Debug, Copy, Clone, Default)]
 pub struct ProxmoxVmId(u64);
@@ -1548,6 +1691,10 @@ pub struct DownloadUrlRequest {
     pub storage: String,
     pub url: String,
     pub filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    #[serde(rename = "checksum-algorithm", skip_serializing_if = "Option::is_none")]
+    pub checksum_algorithm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

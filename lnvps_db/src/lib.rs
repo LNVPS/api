@@ -164,6 +164,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List available OS images
     async fn list_os_image(&self) -> DbResult<Vec<VmOsImage>>;
 
+    /// Update an OS image (sha2, sha2_url, and other fields)
+    async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()>;
+
     /// List available IP Ranges
     async fn get_ip_range(&self, id: u64) -> DbResult<IpRange>;
 
