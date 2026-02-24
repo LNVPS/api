@@ -794,7 +794,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>> {
         Ok(
-            sqlx::query_as("select * from vm_custom_pricing where region_id = ? and enabled = 1")
+            sqlx::query_as("select * from vm_custom_pricing where region_id = ?")
                 .bind(region_id)
                 .fetch_all(&self.db)
                 .await?,
@@ -802,10 +802,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
-        Ok(sqlx::query_as("select * from vm_custom_pricing where id=?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await?)
+        Ok(
+            sqlx::query_as("select * from vm_custom_pricing where id=?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
     }
 
     async fn get_custom_vm_template(&self, id: u64) -> DbResult<VmCustomTemplate> {

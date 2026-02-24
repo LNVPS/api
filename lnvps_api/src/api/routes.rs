@@ -447,7 +447,9 @@ async fn v1_list_vm_templates(State(this): State<RouterState>) -> ApiResult<ApiT
             .into_iter()
             .filter_map(|r| r.ok())
             .flatten()
+            .filter(|r| r.enabled)
             .collect();
+
     let custom_template_disks: Vec<VmCustomPricingDisk> = join_all(
         custom_templates
             .iter()

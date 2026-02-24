@@ -117,6 +117,18 @@ impl LNVpsProvisioner {
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
 
+        if !template.enabled {
+            bail!("Cant create VM from disabled template");
+        }
+        if let Some(exp) = template.expires.as_ref()
+            && exp < &Utc::now()
+        {
+            bail!("Cant create VM from expired template");
+        }
+        if !image.enabled {
+            bail!("Cant create VM from disabled os image");
+        }
+
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
@@ -171,7 +183,17 @@ impl LNVpsProvisioner {
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
 
-        // TODO: cache capacity somewhere
+        if !pricing.enabled {
+            bail!("Cant create VM from disabled custom pricing");
+        }
+        if let Some(exp) = pricing.expires.as_ref()
+            && exp < &Utc::now()
+        {
+            bail!("Cant create VM from expired custom pricing");
+        }
+        if !image.enabled {
+            bail!("Cant create VM from disabled os image");
+        }
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
             .get_host_for_template(pricing.region_id, &template)
@@ -1325,6 +1347,15 @@ mod tests {
         LNVpsProvisioner::new(mock_settings(), db, node, rates, None)
     }
 
+    /// Build a provisioner with a BTC/EUR exchange rate set (needed for renewal).
+    async fn make_provisioner_with_rates(db: Arc<MockDb>) -> Result<LNVpsProvisioner> {
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        const MOCK_RATE: f32 = 69_420.0;
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        Ok(LNVpsProvisioner::new(mock_settings(), db, node, rates, None))
+    }
+
     /// Insert a VmCustomPricing + one VmCustomPricingDisk into db and return the pricing id.
     async fn insert_custom_pricing(
         db: &MockDb,
@@ -1680,6 +1711,279 @@ mod tests {
                 .contains("no custom pricing"),
             "error should mention missing custom pricing"
         );
+        Ok(())
+    }
+
+    /// Insert a disabled custom pricing + disk into the mock db, returns pricing_id
+    async fn insert_disabled_custom_pricing(db: &MockDb) -> Result<u64> {
+        let mut pricing_map = db.custom_pricing.lock().await;
+        let pricing_id = pricing_map.keys().max().unwrap_or(&0) + 1;
+        pricing_map.insert(
+            pricing_id,
+            VmCustomPricing {
+                id: pricing_id,
+                name: "test-disabled".to_string(),
+                enabled: false,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_cost: 100,
+                memory_cost: 50,
+                ip4_cost: 200,
+                ip6_cost: 0,
+                min_cpu: 1,
+                max_cpu: 8,
+                min_memory: GB,
+                max_memory: 128 * GB,
+                ..Default::default()
+            },
+        );
+        drop(pricing_map);
+
+        let mut disk_map = db.custom_pricing_disk.lock().await;
+        let disk_id = disk_map.keys().max().unwrap_or(&0) + 1;
+        disk_map.insert(
+            disk_id,
+            VmCustomPricingDisk {
+                id: disk_id,
+                pricing_id,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                cost: 10,
+                min_disk_size: GB,
+                max_disk_size: 10 * TB,
+            },
+        );
+        Ok(pricing_id)
+    }
+
+    #[tokio::test]
+    async fn test_provision_custom_fails_with_disabled_pricing() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_disabled_custom_pricing(&db).await?;
+
+        let (user, ssh_key) = add_user(&db).await?;
+        let template = VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+
+        let prov = make_provisioner(db);
+        let result = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "provision_custom should fail with disabled pricing"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("disabled"),
+            "error should mention disabled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_renew_vm_with_disabled_pricing_succeeds() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_disabled_custom_pricing(&db).await?;
+
+        // Insert a custom template linked to the disabled pricing
+        let (user, ssh_key) = add_user(&db).await?;
+        let custom_template_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 4 * GB,
+                disk_size: 50 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ..Default::default()
+            })
+            .await?;
+
+        // Directly insert VM (bypassing provision_custom) to simulate an existing VM
+        // that was created before the pricing was disabled
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(custom_template_id),
+                ssh_key_id: ssh_key.id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+
+        let prov = make_provisioner_with_rates(db).await?;
+        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
+
+        assert_eq!(payment.vm_id, vm_id);
+        Ok(())
+    }
+
+    // ── standard template disabled/expired tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_provision_fails_with_disabled_template() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut templates = db.templates.lock().await;
+            templates.get_mut(&1).unwrap().enabled = false;
+        }
+        let (user, ssh_key) = add_user(&db).await?;
+        let result = make_provisioner(db)
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await;
+        assert!(result.is_err(), "should fail with disabled template");
+        assert!(
+            result.unwrap_err().to_string().to_lowercase().contains("disabled"),
+            "error should mention disabled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provision_fails_with_expired_template() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut templates = db.templates.lock().await;
+            templates.get_mut(&1).unwrap().expires =
+                Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        let (user, ssh_key) = add_user(&db).await?;
+        let result = make_provisioner(db)
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await;
+        assert!(result.is_err(), "should fail with expired template");
+        assert!(
+            result.unwrap_err().to_string().to_lowercase().contains("expired"),
+            "error should mention expired"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_renew_vm_with_disabled_template_succeeds() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        {
+            let mut templates = db.templates.lock().await;
+            templates.get_mut(&1).unwrap().enabled = false;
+        }
+        let prov = make_provisioner_with_rates(db).await?;
+        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
+        assert_eq!(payment.vm_id, vm_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_renew_vm_with_expired_template_succeeds() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        {
+            let mut templates = db.templates.lock().await;
+            templates.get_mut(&1).unwrap().expires =
+                Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        let prov = make_provisioner_with_rates(db).await?;
+        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
+        assert_eq!(payment.vm_id, vm_id);
+        Ok(())
+    }
+
+    // ── custom pricing expired tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_provision_custom_fails_with_expired_pricing() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut pricing_map = db.custom_pricing.lock().await;
+            pricing_map.get_mut(&pricing_id).unwrap().expires =
+                Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        let (user, ssh_key) = add_user(&db).await?;
+        let template = VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+        let result = make_provisioner(db)
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await;
+        assert!(result.is_err(), "should fail with expired custom pricing");
+        assert!(
+            result.unwrap_err().to_string().to_lowercase().contains("expired"),
+            "error should mention expired"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_renew_vm_with_expired_custom_pricing_succeeds() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_disabled_custom_pricing(&db).await?;
+        {
+            let mut pricing_map = db.custom_pricing.lock().await;
+            let p = pricing_map.get_mut(&pricing_id).unwrap();
+            p.enabled = true;
+            p.expires = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        let (user, ssh_key) = add_user(&db).await?;
+        let custom_template_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 4 * GB,
+                disk_size: 50 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ..Default::default()
+            })
+            .await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(custom_template_id),
+                ssh_key_id: ssh_key.id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+        let prov = make_provisioner_with_rates(db).await?;
+        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
+        assert_eq!(payment.vm_id, vm_id);
         Ok(())
     }
 }
