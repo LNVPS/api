@@ -1,3 +1,4 @@
+use crate::network::parse_gateway;
 use crate::Template;
 use anyhow::{Result, bail};
 use chrono::Utc;
@@ -387,7 +388,10 @@ impl HostCapacity {
                 .disks
                 .iter()
                 .any(|d| d.available_capacity() >= template.disk_size())
-            && self.ranges.iter().any(|r| r.available_capacity() >= 1)
+            && self
+                .ranges
+                .iter()
+                .any(|r| r.is_ipv4() && r.available_capacity() >= 1)
     }
 }
 
@@ -427,15 +431,36 @@ impl IPRangeCapacity {
     pub fn available_capacity(&self) -> u128 {
         let net: IpNetwork = self.range.cidr.parse().unwrap();
 
-        match net.size() {
-            NetworkSize::V4(s) => (s as u128).saturating_sub(self.usage),
-            NetworkSize::V6(s) => s.saturating_sub(self.usage),
-        }
-        .saturating_sub(if self.range.use_full_range {
-            1 // gw
+        let total = match net.size() {
+            NetworkSize::V4(s) => s as u128,
+            NetworkSize::V6(s) => s,
+        };
+
+        // Only count the gateway as reserved if it actually falls within the CIDR.
+        // Gateways may be outside the range (e.g. a shared upstream gateway), in
+        // which case they do not consume a slot in this range.
+        let gw_reserved: u128 = if let Ok(gw) = parse_gateway(&self.range.gateway) {
+            if net.contains(gw.ip()) { 1 } else { 0 }
         } else {
-            3 // first/last/gw
-        })
+            0
+        };
+
+        // If not using the full range, network and broadcast addresses are reserved.
+        let boundary_reserved: u128 = if self.range.use_full_range { 0 } else { 2 };
+
+        total
+            .saturating_sub(self.usage)
+            .saturating_sub(gw_reserved)
+            .saturating_sub(boundary_reserved)
+    }
+
+    /// Returns true if this range is an IPv4 range
+    pub fn is_ipv4(&self) -> bool {
+        self.range
+            .cidr
+            .parse::<IpNetwork>()
+            .map(|n| n.is_ipv4())
+            .unwrap_or(false)
     }
 }
 
@@ -743,5 +768,133 @@ mod tests {
         let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX2]);
         let template = make_template(CpuMfg::Amd, CpuArch::X86_64, vec![]);
         assert!(!cap.can_accommodate(&template));
+    }
+
+    // ── IP range capacity tests ──────────────────────────────────────────────
+
+    /// Gateway outside CIDR must NOT be counted as a reserved slot.
+    /// Previously the capacity was always decremented by 1 for the gateway
+    /// regardless of whether the gateway IP fell inside the range.
+    #[test]
+    fn ip_range_capacity_external_gateway_not_counted() {
+        // /30 has 4 IPs total; with use_full_range=false, 2 are reserved (network+broadcast).
+        // Gateway 192.168.1.1 is outside 10.0.0.0/30, so it does NOT consume a slot.
+        // Available = 4 - 2 (network/broadcast) - 0 (gateway outside range) - 0 (usage) = 2
+        let cap = IPRangeCapacity {
+            range: IpRange {
+                id: 1,
+                cidr: "10.0.0.0/30".to_string(),
+                gateway: "192.168.1.1".to_string(),
+                enabled: true,
+                region_id: 1,
+                use_full_range: false,
+                ..Default::default()
+            },
+            usage: 0,
+        };
+        assert_eq!(cap.available_capacity(), 2);
+    }
+
+    /// Gateway inside CIDR must still be counted as a reserved slot.
+    #[test]
+    fn ip_range_capacity_internal_gateway_counted() {
+        // /30 has 4 IPs total; with use_full_range=false, 2 are reserved (network+broadcast).
+        // Gateway 10.0.0.1 is inside 10.0.0.0/30, so it consumes a slot.
+        // Available = 4 - 2 (network/broadcast) - 1 (gateway inside range) - 0 (usage) = 1
+        let cap = IPRangeCapacity {
+            range: IpRange {
+                id: 1,
+                cidr: "10.0.0.0/30".to_string(),
+                gateway: "10.0.0.1".to_string(),
+                enabled: true,
+                region_id: 1,
+                use_full_range: false,
+                ..Default::default()
+            },
+            usage: 0,
+        };
+        assert_eq!(cap.available_capacity(), 1);
+    }
+
+    /// When all IPv4 addresses are exhausted but IPv6 still has space,
+    /// can_accommodate must return false — not true because of IPv6 capacity.
+    /// This was the root cause of regions showing capacity when IPv4 was gone.
+    #[test]
+    fn can_accommodate_false_when_ipv4_exhausted_ipv6_available() {
+        let template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+
+        // /30: 4 total, 2 reserved (network+broadcast), gateway outside => 2 usable.
+        // usage=2 means both IPv4 slots are taken.
+        let cap = HostCapacity {
+            load_factor: LoadFactors {
+                cpu: 1.0,
+                memory: 1.0,
+                disk: 1.0,
+            },
+            host: VmHost {
+                id: 1,
+                region_id: 1,
+                cpu: 4,
+                memory: 8 * GB,
+                enabled: true,
+                ..Default::default()
+            },
+            cpu: 0,
+            memory: 0,
+            disks: vec![DiskCapacity {
+                load_factor: 1.0,
+                disk: VmHostDisk {
+                    id: 1,
+                    host_id: 1,
+                    size: 100 * GB,
+                    kind: DiskType::SSD,
+                    interface: DiskInterface::PCIe,
+                    ..Default::default()
+                },
+                usage: 0,
+            }],
+            ranges: vec![
+                // IPv4 range — fully exhausted
+                IPRangeCapacity {
+                    range: IpRange {
+                        id: 1,
+                        cidr: "10.0.0.0/30".to_string(),
+                        gateway: "192.168.1.1".to_string(), // external gateway
+                        enabled: true,
+                        region_id: 1,
+                        use_full_range: false,
+                        ..Default::default()
+                    },
+                    usage: 2, // all 2 usable IPv4 slots consumed
+                },
+                // IPv6 range — still has space
+                IPRangeCapacity {
+                    range: IpRange {
+                        id: 2,
+                        cidr: "fd00::/64".to_string(),
+                        gateway: "fd00::1".to_string(),
+                        enabled: true,
+                        region_id: 1,
+                        use_full_range: true,
+                        ..Default::default()
+                    },
+                    usage: 0,
+                },
+            ],
+        };
+
+        assert_eq!(
+            cap.ranges[0].available_capacity(),
+            0,
+            "IPv4 range should be fully exhausted"
+        );
+        assert!(
+            cap.ranges[1].available_capacity() > 0,
+            "IPv6 range should have capacity"
+        );
+        assert!(
+            !cap.can_accommodate(&template),
+            "should not accommodate when IPv4 is exhausted, even with IPv6 space"
+        );
     }
 }
