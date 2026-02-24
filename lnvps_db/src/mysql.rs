@@ -2650,7 +2650,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"
             UPDATE vm_os_image 
-            SET distribution = ?, flavour = ?, version = ?, enabled = ?, release_date = ?, url = ?, default_username = ?
+            SET distribution = ?, flavour = ?, version = ?, enabled = ?, release_date = ?, url = ?, default_username = ?, sha2 = ?, sha2_url = ?
             WHERE id = ?
             "#
         )
@@ -2661,6 +2661,8 @@ impl AdminDb for LNVpsDbMysql {
         .bind(image.release_date)
         .bind(&image.url)
         .bind(&image.default_username)
+        .bind(&image.sha2)
+        .bind(&image.sha2_url)
         .bind(image.id)
         .execute(&self.db)
         .await?;
