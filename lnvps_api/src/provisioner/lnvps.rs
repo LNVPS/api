@@ -17,7 +17,7 @@ use lnvps_db::{
     IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCustomTemplate,
     VmIpAssignment, VmPayment, VmTemplate,
 };
-use log::{debug, info, warn};
+use log::{debug, info};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
@@ -78,19 +78,6 @@ impl LNVpsProvisioner {
 
     /// Do any necessary initialization
     pub async fn init(&self) -> Result<()> {
-        let hosts = self.db.list_hosts().await?;
-        let images = self.db.list_os_image().await?;
-        for host in hosts {
-            let client = get_host_client(&host, &self.provisioner_config)?;
-            for image in &images {
-                if let Err(e) = client.download_os_image(image).await {
-                    warn!(
-                        "Error downloading image {} on {}: {}",
-                        image.url, host.name, e
-                    );
-                }
-            }
-        }
         Ok(())
     }
 

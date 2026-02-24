@@ -495,6 +495,12 @@ impl LNVpsDbBase for MockDb {
         Ok(os_images.values().filter(|i| i.enabled).cloned().collect())
     }
 
+    async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()> {
+        let mut os_images = self.os_images.lock().await;
+        os_images.insert(image.id, image.clone());
+        Ok(())
+    }
+
     async fn get_ip_range(&self, id: u64) -> DbResult<IpRange> {
         let ip_range = self.ip_range.lock().await;
         Ok(ip_range.get(&id).ok_or(anyhow!("no ip range"))?.clone())

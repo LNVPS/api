@@ -1177,6 +1177,22 @@ Body (all optional):
 }
 ```
 
+#### Trigger Image Download
+
+```
+POST /api/admin/v1/vm_os_images/{id}/download
+```
+
+Required Permission: `vm_os_image::update`
+
+Enqueues a `DownloadOsImages` work job for the specified image. The worker will download the image to all configured hosts, verifying the checksum against `sha2_url` (or `sha2`) and re-downloading if the file is stale or missing.
+
+Returns:
+
+```json
+"Download job enqueued"
+```
+
 #### Delete VM OS Image
 
 ```

@@ -8,6 +8,7 @@ mod nip98;
 mod pricing;
 pub mod retry;
 mod routes;
+pub mod shasum;
 mod status;
 mod vat;
 mod vm_history;

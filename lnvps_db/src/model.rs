@@ -631,6 +631,7 @@ pub struct VmOsImage {
 }
 
 impl VmOsImage {
+    /// The filename as it will be stored on the host (original extension replaced with `.img`).
     pub fn filename(&self) -> Result<String> {
         let u: Url = self.url.parse()?;
         let mut name: PathBuf = u
@@ -641,6 +642,16 @@ impl VmOsImage {
             .parse()?;
         name.set_extension("img");
         Ok(name.to_string_lossy().to_string())
+    }
+
+    /// The original filename from the download URL, as it appears in SHASUMS files.
+    pub fn url_filename(&self) -> Result<String> {
+        let u: Url = self.url.parse()?;
+        u.path_segments()
+            .ok_or(anyhow!("Invalid URL"))?
+            .next_back()
+            .ok_or(anyhow!("Invalid URL"))
+            .map(str::to_owned)
     }
 }
 
