@@ -593,9 +593,11 @@ async fn admin_list_vm_payments(
     let all_payments = this.db.list_vm_payment(vm_id).await?;
     let total = all_payments.len() as u64;
 
+    let base_currency = this.db.get_vm_base_currency(vm_id).await?;
+
     let admin_payments: Vec<AdminVmPaymentInfo> = payments
         .iter()
-        .map(AdminVmPaymentInfo::from_vm_payment)
+        .map(|p| AdminVmPaymentInfo::from_vm_payment(p, base_currency.clone()))
         .collect();
 
     ApiPaginatedData::ok(admin_payments, total, limit, offset)
@@ -624,7 +626,8 @@ async fn admin_get_vm_payment(
         return ApiData::err("Payment does not belong to this VM");
     }
 
-    let admin_payment_info = AdminVmPaymentInfo::from_vm_payment(&payment);
+    let base_currency = this.db.get_vm_base_currency(vm_id).await?;
+    let admin_payment_info = AdminVmPaymentInfo::from_vm_payment(&payment, base_currency);
 
     ApiData::ok(admin_payment_info)
 }
@@ -855,5 +858,6 @@ async fn admin_complete_vm_payment(
 
     // Re-read the payment to get updated paid_at / is_paid
     let updated = this.db.get_vm_payment(&payment_id_bytes).await?;
-    ApiData::ok(AdminVmPaymentInfo::from_vm_payment(&updated))
+    let base_currency = this.db.get_vm_base_currency(vm_id).await?;
+    ApiData::ok(AdminVmPaymentInfo::from_vm_payment(&updated, base_currency))
 }
