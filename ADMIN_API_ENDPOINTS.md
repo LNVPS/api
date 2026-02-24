@@ -1141,8 +1141,12 @@ Body:
   "release_date": "string (ISO 8601)",
   "url": "string",
   // URL to the cloud image
-  "default_username": "string (optional)"
-  // Default SSH username
+   "default_username": "string (optional)",
+   // Default SSH username
+   "sha2": "string (optional)",
+   // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
+   "sha2_url": "string (optional)"
+   // URL to the SHA-2 checksums file (e.g., https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS)
 }
 ```
 
@@ -1165,7 +1169,11 @@ Body (all optional):
   "enabled": boolean,
   "release_date": "string (ISO 8601)",
   "url": "string",
-  "default_username": "string"
+   "default_username": "string",
+   "sha2": "string (optional)",
+   // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
+   "sha2_url": "string (optional)"
+   // URL to the SHA-2 checksums file (e.g., https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS)
 }
 ```
 
