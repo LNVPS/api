@@ -260,9 +260,21 @@ impl NetworkProvisioner {
             NetworkSize::V6(_) => return None,
         };
 
-        // Reserved IPs: gateway is always reserved
-        // If use_full_range is false, first and last IPs are also reserved (network + broadcast)
-        let reserved = if range.use_full_range { 1 } else { 3 };
+        // Count reserved IPs that actually fall within the CIDR.
+        // The gateway may be outside the range (e.g. a shared upstream gateway),
+        // in which case it does not consume a slot in this range.
+        let mut reserved: u64 = 0;
+
+        if let Ok(gw) = parse_gateway(&range.gateway) {
+            if network.contains(gw.ip()) {
+                reserved += 1;
+            }
+        }
+
+        // If not using the full range, network and broadcast addresses are also reserved.
+        if !range.use_full_range {
+            reserved += 2;
+        }
 
         let available = total_ips
             .saturating_sub(reserved)
@@ -657,6 +669,98 @@ mod tests {
         assert!(free_ip_strs.contains(&"192.168.1.0".to_string()));
         assert!(free_ip_strs.contains(&"192.168.1.2".to_string()));
         assert!(free_ip_strs.contains(&"192.168.1.3".to_string()));
+    }
+
+    /// Reproduces the bug where available_ips showed 0 but free_ips returned 1 entry
+    /// because the gateway was outside the CIDR and was incorrectly counted as reserved.
+    #[test]
+    fn test_count_available_ips_gateway_outside_range() {
+        // /28 = 16 IPs, gateway is outside the range, use_full_range = true
+        // 15 assigned → 1 should be available
+        let range = IpRange {
+            id: 1,
+            cidr: "15.235.3.224/28".to_string(),
+            gateway: "148.113.164.254".to_string(), // outside the /28
+            enabled: true,
+            region_id: 1,
+            use_full_range: true,
+            ..Default::default()
+        };
+        let available = NetworkProvisioner::count_available_ips(&range, 15);
+        assert_eq!(available, Some(1), "should have 1 free IP when gateway is outside range");
+    }
+
+    #[test]
+    fn test_count_available_ips_gateway_inside_range() {
+        // /28 = 16 IPs, gateway is inside the range, use_full_range = true
+        // 15 assigned → 0 should be available (gateway takes 1 slot)
+        let range = IpRange {
+            id: 1,
+            cidr: "15.235.3.224/28".to_string(),
+            gateway: "15.235.3.225".to_string(), // inside the /28
+            enabled: true,
+            region_id: 1,
+            use_full_range: true,
+            ..Default::default()
+        };
+        let available = NetworkProvisioner::count_available_ips(&range, 15);
+        assert_eq!(available, Some(0), "should have 0 free IPs when gateway is inside range");
+    }
+
+    #[tokio::test]
+    async fn test_list_free_ips_gateway_outside_range() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+
+        // /28 = 16 IPs, gateway outside range, use_full_range = true, 15 assigned → 1 free
+        let range = IpRange {
+            id: 105,
+            cidr: "15.235.3.224/28".to_string(),
+            gateway: "148.113.164.254".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: true,
+            ..Default::default()
+        };
+        db.ip_range.lock().await.insert(105, range);
+
+        // Assign 15 of the 16 IPs
+        let mut assignments = db.ip_assignments.lock().await;
+        for i in 0..15u8 {
+            let id = (i + 1) as u64;
+            assignments.insert(
+                id,
+                VmIpAssignment {
+                    id,
+                    vm_id: id,
+                    ip_range_id: 105,
+                    ip: format!("15.235.3.{}", 224 + i),
+                    ..Default::default()
+                },
+            );
+        }
+        drop(assignments);
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+
+        let free_ips = mgr.list_free_ips_in_range(105).await.unwrap();
+        assert_eq!(free_ips.len(), 1);
+        assert_eq!(free_ips[0].to_string(), "15.235.3.239");
+
+        // available_ips count should match free_ips count
+        let range = IpRange {
+            id: 105,
+            cidr: "15.235.3.224/28".to_string(),
+            gateway: "148.113.164.254".to_string(),
+            enabled: true,
+            region_id: 1,
+            use_full_range: true,
+            ..Default::default()
+        };
+        let available = NetworkProvisioner::count_available_ips(&range, 15);
+        assert_eq!(available, Some(free_ips.len() as u64));
     }
 
     #[tokio::test]
