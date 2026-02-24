@@ -2206,7 +2206,10 @@ impl Worker {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to listen on commander channel: {}", e);
+                    let msg = e.to_string();
+                    if !msg.contains("timed out") {
+                        error!("Failed to listen on commander channel: {}", e);
+                    }
                 }
             }
         }
