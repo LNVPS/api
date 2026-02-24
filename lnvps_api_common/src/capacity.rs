@@ -143,8 +143,18 @@ impl HostCapacityService {
                 .max()
                 .unwrap_or(0);
 
+            // If no host in this region has a free IPv4 slot, the template cannot
+            // be ordered regardless of CPU/memory availability.
+            let has_ipv4_capacity = hosts_in_region
+                .clone()
+                .any(|h| h.ranges.iter().any(|r| r.is_ipv4() && r.available_capacity() >= 1));
+
             // Limit the template maximums to what's actually available
-            template.max_cpu = template.max_cpu.min(max_cpu);
+            template.max_cpu = if has_ipv4_capacity {
+                template.max_cpu.min(max_cpu)
+            } else {
+                0
+            };
             template.max_memory = template.max_memory.min(max_memory);
 
             // Limit disk maximums based on actual host capacity
@@ -896,5 +906,87 @@ mod tests {
             !cap.can_accommodate(&template),
             "should not accommodate when IPv4 is exhausted, even with IPv6 space"
         );
+    }
+
+    // ── apply_host_capacity_limits tests ────────────────────────────────────
+
+    /// Helper to build a minimal ApiCustomTemplateParams for region 1
+    fn make_custom_template_params(max_cpu: u16, max_memory: u64) -> crate::ApiCustomTemplateParams {
+        use crate::model::{ApiCustomTemplateDiskParam, ApiDiskInterface, ApiDiskType, ApiVmHostRegion};
+        crate::ApiCustomTemplateParams {
+            id: 1,
+            name: "test".to_string(),
+            region: ApiVmHostRegion { id: 1, name: "test-region".to_string() },
+            cpu_features: vec![],
+            cpu_mfg: None,
+            cpu_arch: None,
+            max_cpu,
+            min_cpu: 1,
+            min_memory: GB,
+            max_memory,
+            disks: vec![ApiCustomTemplateDiskParam {
+                min_disk: GB,
+                max_disk: 100 * GB,
+                disk_type: ApiDiskType::SSD,
+                disk_interface: ApiDiskInterface::PCIe,
+            }],
+        }
+    }
+
+    /// When IPv4 is exhausted, apply_host_capacity_limits must remove the
+    /// custom template (set max_cpu=0 so it is filtered out).
+    #[tokio::test]
+    async fn apply_host_capacity_limits_removes_template_when_ipv4_exhausted() -> Result<()> {
+        use lnvps_db::VmIpAssignment;
+
+        let db = Arc::new(MockDb::default());
+
+        // The default MockDb has a /24 IPv4 range (id=1) with 253 usable slots.
+        // Fill all of them so available_capacity() == 0.
+        {
+            let mut assignments = db.ip_assignments.lock().await;
+            for i in 0u64..253 {
+                assignments.insert(
+                    i + 1,
+                    VmIpAssignment {
+                        id: i + 1,
+                        vm_id: 1,
+                        ip_range_id: 1,
+                        ip: format!("10.0.0.{}", i + 2),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let hc = HostCapacityService::new(db.clone() as Arc<dyn LNVpsDb>);
+        let template = make_custom_template_params(16, 64 * GB);
+
+        let result = hc.apply_host_capacity_limits(&vec![template]).await?;
+
+        assert!(
+            result.is_empty(),
+            "custom template should be removed when IPv4 is exhausted"
+        );
+        Ok(())
+    }
+
+    /// When IPv4 has capacity, apply_host_capacity_limits must keep the template.
+    #[tokio::test]
+    async fn apply_host_capacity_limits_keeps_template_when_ipv4_available() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // No IP assignments — full IPv4 capacity available.
+
+        let hc = HostCapacityService::new(db.clone() as Arc<dyn LNVpsDb>);
+        let template = make_custom_template_params(4, 8 * GB);
+
+        let result = hc.apply_host_capacity_limits(&vec![template]).await?;
+
+        assert_eq!(
+            result.len(),
+            1,
+            "custom template should be kept when IPv4 is available"
+        );
+        Ok(())
     }
 }
