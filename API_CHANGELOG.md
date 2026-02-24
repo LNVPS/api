@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [v0.2.0] - 2026-02-22
 
 ### Added
+- **2026-02-24** - Added `company_base_currency` field to `AdminVmPaymentInfo`
+  - `GET /api/admin/v1/vms/{id}/payments` — Response now includes `company_base_currency`
+  - `GET /api/admin/v1/vms/{id}/payments/{payment_id}` — Response now includes `company_base_currency`
+  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Response now includes `company_base_currency`
 - **2026-02-23** - Admin endpoints to manually complete payments
   - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Mark a VM payment as paid, extend VM expiry, and dispatch provisioning (requires `payments::update`)
   - `POST /api/admin/v1/subscription_payments/{id}/complete` — Mark a subscription payment as paid, extend subscription by 30 days, and activate it (requires `subscription_payments::update`)

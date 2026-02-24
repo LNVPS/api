@@ -1903,6 +1903,7 @@ pub struct AdminVmPaymentInfo {
     pub tax: u64,    // Tax amount in smallest currency unit
     pub processing_fee: u64, // Processing fee in smallest currency unit
     pub currency: String,
+    pub company_base_currency: String, // Base currency of the company that owns this VM
     pub payment_method: AdminPaymentMethod,
     pub external_id: Option<String>,
     pub is_paid: bool,
@@ -1913,7 +1914,7 @@ pub struct AdminVmPaymentInfo {
 }
 
 impl AdminVmPaymentInfo {
-    pub fn from_vm_payment(payment: &VmPayment) -> Self {
+    pub fn from_vm_payment(payment: &VmPayment, company_base_currency: String) -> Self {
         Self {
             id: hex::encode(&payment.id),
             vm_id: payment.vm_id,
@@ -1923,6 +1924,7 @@ impl AdminVmPaymentInfo {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             currency: payment.currency.clone(),
+            company_base_currency,
             payment_method: AdminPaymentMethod::from(payment.payment_method),
             external_id: payment.external_id.clone(),
             is_paid: payment.is_paid,
