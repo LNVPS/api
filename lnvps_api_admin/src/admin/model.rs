@@ -1021,6 +1021,8 @@ pub struct AdminVmOsImageInfo {
     pub url: String,
     pub default_username: Option<String>,
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this image
+    pub sha2: Option<String>,
+    pub sha2_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1032,6 +1034,8 @@ pub struct CreateVmOsImageRequest {
     pub release_date: DateTime<Utc>,
     pub url: String,
     pub default_username: Option<String>,
+    pub sha2: Option<String>,
+    pub sha2_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1043,6 +1047,8 @@ pub struct UpdateVmOsImageRequest {
     pub release_date: Option<DateTime<Utc>>,
     pub url: Option<String>,
     pub default_username: Option<String>,
+    pub sha2: Option<Option<String>>,
+    pub sha2_url: Option<Option<String>>,
 }
 
 impl AdminVmOsImageInfo {
@@ -1066,6 +1072,8 @@ impl AdminVmOsImageInfo {
             release_date: image.release_date,
             url: image.url,
             default_username: image.default_username,
+            sha2: image.sha2,
+            sha2_url: image.sha2_url,
             active_vm_count,
         })
     }
@@ -1082,6 +1090,8 @@ impl From<lnvps_db::VmOsImage> for AdminVmOsImageInfo {
             release_date: image.release_date,
             url: image.url,
             default_username: image.default_username,
+            sha2: image.sha2,
+            sha2_url: image.sha2_url,
             active_vm_count: 0, // Default when not using the async method
         }
     }
@@ -1113,6 +1123,8 @@ impl CreateVmOsImageRequest {
             release_date: self.release_date,
             url: self.url.clone(),
             default_username: self.default_username.clone(),
+            sha2: self.sha2.clone(),
+            sha2_url: self.sha2_url.clone(),
         })
     }
 }

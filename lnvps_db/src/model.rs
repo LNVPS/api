@@ -624,6 +624,10 @@ pub struct VmOsImage {
     /// URL location of cloud image
     pub url: String,
     pub default_username: Option<String>,
+    /// SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
+    pub sha2: Option<String>,
+    /// URL to the SHA-2 checksums file (e.g., SHA512SUMS)
+    pub sha2_url: Option<String>,
 }
 
 impl VmOsImage {

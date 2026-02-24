@@ -351,6 +351,8 @@ mod tests {
                 release_date: Utc::now(),
                 url: "http://localhost.com/ubuntu_server_24.04.img".to_string(),
                 default_username: None,
+                sha2: None,
+                sha2_url: None,
             },
             ips: vec![
                 VmIpAssignment {
