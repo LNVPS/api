@@ -3034,6 +3034,8 @@ The RBAC system uses the following permission format: `resource::action`
   // Processing fee in smallest currency unit
   "currency": "string",
   // Currency code (e.g., "EUR", "USD", "BTC")
+  "company_base_currency": "string",
+  // Base currency of the company that owns this VM (e.g., "EUR")
   "payment_method": "lightning",
   // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe"
   "external_id": "string | null",
@@ -3043,7 +3045,7 @@ The RBAC system uses the following permission format: `resource::action`
   "paid_at": "string (ISO 8601) | null",
   // When payment was completed (null if unpaid)
   "rate": number
-  // Exchange rate to base currency (EUR)
+  // Exchange rate to company_base_currency
 }
 ```
 
