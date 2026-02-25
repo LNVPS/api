@@ -1528,6 +1528,18 @@ Body:
   // Minimum memory in bytes
   "max_memory": number,
   // Maximum memory in bytes
+  "disk_iops_read": number,
+  // optional - Maximum disk read IOPS (omit or null = uncapped)
+  "disk_iops_write": number,
+  // optional - Maximum disk write IOPS (omit or null = uncapped)
+  "disk_mbps_read": number,
+  // optional - Maximum disk read throughput in MB/s (omit or null = uncapped)
+  "disk_mbps_write": number,
+  // optional - Maximum disk write throughput in MB/s (omit or null = uncapped)
+  "network_mbps": number,
+  // optional - Maximum network bandwidth in Mbit/s (omit or null = uncapped)
+  "cpu_limit": number,
+  // optional - Maximum CPU usage as a fraction of allocated cores e.g. 0.5 = 50% (omit or null = uncapped)
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -1585,6 +1597,18 @@ Body (all optional):
   // Minimum memory in bytes
   "max_memory": number,
   // Maximum memory in bytes
+  "disk_iops_read": "number | null",
+  // Maximum disk read IOPS - send null to clear
+  "disk_iops_write": "number | null",
+  // Maximum disk write IOPS - send null to clear
+  "disk_mbps_read": "number | null",
+  // Maximum disk read throughput in MB/s - send null to clear
+  "disk_mbps_write": "number | null",
+  // Maximum disk write throughput in MB/s - send null to clear
+  "network_mbps": "number | null",
+  // Maximum network bandwidth in Mbit/s - send null to clear
+  "cpu_limit": "number | null",
+  // Maximum CPU usage as fraction of allocated cores e.g. 0.5 = 50% - send null to clear
   "disk_pricing": [
     {
       "kind": "ssd",
@@ -3301,6 +3325,18 @@ The RBAC system uses the following permission format: `resource::action`
   // Minimum memory in bytes
   "max_memory": number,
   // Maximum memory in bytes
+  "disk_iops_read": number,
+  // Maximum disk read IOPS - omitted when uncapped
+  "disk_iops_write": number,
+  // Maximum disk write IOPS - omitted when uncapped
+  "disk_mbps_read": number,
+  // Maximum disk read throughput in MB/s - omitted when uncapped
+  "disk_mbps_write": number,
+  // Maximum disk write throughput in MB/s - omitted when uncapped
+  "network_mbps": number,
+  // Maximum network bandwidth in Mbit/s - omitted when uncapped
+  "cpu_limit": number,
+  // Maximum CPU usage as a fraction of allocated cores e.g. 0.5 = 50% - omitted when uncapped
   "disk_pricing": [
     // Array of disk pricing configurations
     {
