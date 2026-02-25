@@ -1047,7 +1047,15 @@ pub struct UpdateVmOsImageRequest {
     pub release_date: Option<DateTime<Utc>>,
     pub url: Option<String>,
     pub default_username: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub sha2: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub sha2_url: Option<Option<String>>,
 }
 
@@ -1217,6 +1225,10 @@ pub struct AdminCreateVmTemplateRequest {
 pub struct AdminUpdateVmTemplateRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub expires: Option<Option<DateTime<Utc>>>,
     pub cpu: Option<u16>,
     /// CPU manufacturer (e.g. "intel", "amd", "apple")
@@ -1356,6 +1368,10 @@ pub struct AdminCustomPricingDisk {
 pub struct UpdateCustomPricingRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub expires: Option<Option<DateTime<Utc>>>,
     pub region_id: Option<u64>,
     pub currency: Option<String>,
@@ -1548,8 +1564,16 @@ pub struct UpdateIpRangeRequest {
     pub gateway: Option<String>,
     pub enabled: Option<bool>,
     pub region_id: Option<u64>,
-    pub reverse_zone_id: Option<Option<String>>, // Use Option<Option<String>> to allow setting to null
-    pub access_policy_id: Option<Option<u64>>,   // Use Option<Option<u64>> to allow setting to null
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub reverse_zone_id: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub access_policy_id: Option<Option<u64>>,
     pub allocation_mode: Option<AdminIpRangeAllocationMode>,
     pub use_full_range: Option<bool>,
 }
@@ -1645,8 +1669,16 @@ pub struct CreateAccessPolicyRequest {
 pub struct UpdateAccessPolicyRequest {
     pub name: Option<String>,
     pub kind: Option<AdminNetworkAccessPolicy>,
-    pub router_id: Option<Option<u64>>, // Use Option<Option<u64>> to allow setting to null
-    pub interface: Option<Option<String>>, // Use Option<Option<String>> to allow setting to null
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub router_id: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub interface: Option<Option<String>>,
 }
 
 // Router Models for access policy management
@@ -2074,8 +2106,20 @@ pub struct CreateVmIpAssignmentRequest {
 #[derive(Deserialize)]
 pub struct UpdateVmIpAssignmentRequest {
     pub ip: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub arp_ref: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub dns_forward: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub dns_reverse: Option<Option<String>>,
 }
 
@@ -2141,11 +2185,19 @@ pub struct AdminCreateSubscriptionRequest {
 pub struct AdminUpdateSubscriptionRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub expires: Option<Option<DateTime<Utc>>>,
     pub is_active: Option<bool>,
     pub currency: Option<String>,
     pub setup_fee: Option<u64>,
     pub auto_renewal_enabled: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub external_id: Option<Option<String>>,
 }
 
@@ -2379,9 +2431,17 @@ pub struct UpdateAvailableIpSpaceRequest {
     pub min_prefix_size: Option<u16>,
     pub max_prefix_size: Option<u16>,
     pub registry: Option<u8>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub external_id: Option<Option<String>>,
     pub is_available: Option<bool>,
     pub is_reserved: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub metadata: Option<Option<serde_json::Value>>,
 }
 
@@ -2868,9 +2928,21 @@ pub struct UpdatePaymentMethodConfigRequest {
     pub enabled: Option<bool>,
     /// Partial provider configuration - only provided fields will be updated
     pub config: Option<PartialProviderConfig>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub processing_fee_rate: Option<Option<f32>>,
     /// Processing fee base in smallest currency units (cents for fiat, millisats for BTC)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub processing_fee_base: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub processing_fee_currency: Option<Option<String>>,
     /// Supported currency codes (e.g., ["EUR", "USD"])
     pub supported_currencies: Option<Vec<String>>,
@@ -2900,6 +2972,10 @@ pub struct PartialRevolutConfig {
     pub token: Option<String>,
     pub api_version: Option<String>,
     pub public_key: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
     pub webhook_secret: Option<Option<String>>,
 }
 
