@@ -194,6 +194,7 @@ mod tests {
                     max_cpu: 0,
                     min_memory: 0,
                     max_memory: 0,
+                    ..Default::default()
                 },
             );
             let mut cpd = db.custom_pricing_disk.lock().await;

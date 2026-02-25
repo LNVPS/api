@@ -160,7 +160,7 @@ impl LNVpsProvisioner {
     pub async fn provision_custom(
         &self,
         user_id: u64,
-        template: VmCustomTemplate,
+        mut template: VmCustomTemplate,
         image_id: u64,
         ssh_key_id: u64,
         ref_code: Option<String>,
@@ -181,6 +181,15 @@ impl LNVpsProvisioner {
         if !image.enabled {
             bail!("Cant create VM from disabled os image");
         }
+
+        // Copy resource limits from the pricing plan into the template
+        template.disk_iops_read = pricing.disk_iops_read;
+        template.disk_iops_write = pricing.disk_iops_write;
+        template.disk_mbps_read = pricing.disk_mbps_read;
+        template.disk_mbps_write = pricing.disk_mbps_write;
+        template.network_mbps = pricing.network_mbps;
+        template.cpu_limit = pricing.cpu_limit;
+
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
             .get_host_for_template(pricing.region_id, &template)
@@ -897,7 +906,7 @@ impl LNVpsProvisioner {
                 current_template.disk_interface
             ))?;
 
-        // Build the new custom template with upgraded specs
+        // Build the new custom template with upgraded specs, copying resource limits from pricing
         let new_custom_template = VmCustomTemplate {
             id: 0,
             cpu: cfg.new_cpu.unwrap_or(current_template.cpu),
@@ -909,6 +918,12 @@ impl LNVpsProvisioner {
             cpu_mfg: current_template.cpu_mfg.clone(),
             cpu_arch: current_template.cpu_arch.clone(),
             cpu_features: current_template.cpu_features.clone(),
+            disk_iops_read: custom_pricing.disk_iops_read,
+            disk_iops_write: custom_pricing.disk_iops_write,
+            disk_mbps_read: custom_pricing.disk_mbps_read,
+            disk_mbps_write: custom_pricing.disk_mbps_write,
+            network_mbps: custom_pricing.network_mbps,
+            cpu_limit: custom_pricing.cpu_limit,
             ..Default::default()
         };
 

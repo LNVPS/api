@@ -1351,6 +1351,24 @@ pub struct AdminCustomPricingInfo {
     pub max_memory: u64,
     pub disk_pricing: Vec<AdminCustomPricingDisk>,
     pub template_count: u64,
+    /// Maximum disk read IOPS (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -1409,6 +1427,42 @@ pub struct UpdateCustomPricingRequest {
     pub min_memory: Option<u64>,
     pub max_memory: Option<u64>,
     pub disk_pricing: Option<Vec<CreateCustomPricingDisk>>,
+    /// Maximum disk read IOPS — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_iops_read: Option<Option<u32>>,
+    /// Maximum disk write IOPS — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_iops_write: Option<Option<u32>>,
+    /// Maximum disk read throughput in MB/s — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_mbps_read: Option<Option<u32>>,
+    /// Maximum disk write throughput in MB/s — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_mbps_write: Option<Option<u32>>,
+    /// Maximum network bandwidth in Mbit/s — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub network_mbps: Option<Option<u32>>,
+    /// Maximum CPU usage as a fraction of allocated cores — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_limit: Option<Option<f32>>,
 }
 
 #[derive(Deserialize)]
@@ -1438,6 +1492,18 @@ pub struct CreateCustomPricingRequest {
     pub min_memory: u64,
     pub max_memory: u64,
     pub disk_pricing: Vec<CreateCustomPricingDisk>,
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores, e.g. 0.5 = 50% (None = uncapped)
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Deserialize)]

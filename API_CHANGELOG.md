@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [v0.2.0] - 2026-02-22
 
 ### Added
+- **2026-02-25** - Resource limits on custom pricing plans, propagated to custom templates
+  - `POST /api/admin/v1/custom_pricing` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
+  - `PATCH /api/admin/v1/custom_pricing/{id}` — Accepts the same limit fields; send `null` to remove a limit
+  - `GET /api/admin/v1/custom_pricing` / `GET /api/admin/v1/custom_pricing/{id}` — Response now includes limit fields (omitted when uncapped)
+  - Limits are copied from the pricing plan into each `VmCustomTemplate` at VM provisioning time (new VMs and template upgrades)
+  - `None` / omitted = uncapped
 - **2026-02-25** - Template resource limits for fair-use and SLA enforcement (closes #26)
   - `POST /api/admin/v1/vm_templates` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
   - `PATCH /api/admin/v1/vm_templates/{id}` — Accepts the same limit fields; send `null` to remove a limit
