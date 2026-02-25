@@ -767,6 +767,18 @@ pub struct VmTemplate {
     pub disk_interface: DiskInterface,
     pub cost_plan_id: u64,
     pub region_id: u64,
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%; None = uncapped)
+    pub cpu_limit: Option<f32>,
 }
 
 /// A custom pricing template, used for billing calculation of a specific VM
@@ -783,6 +795,18 @@ pub struct VmCustomTemplate {
     pub cpu_mfg: CpuMfg,
     pub cpu_arch: CpuArch,
     pub cpu_features: CommaSeparated<CpuFeature>,
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%; None = uncapped)
+    pub cpu_limit: Option<f32>,
 }
 
 /// Custom pricing template, usually 1 per region

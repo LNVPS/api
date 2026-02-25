@@ -724,6 +724,10 @@ impl ProxmoxClient {
         if value.vm.disabled {
             net.push("link_down=1".to_string());
         }
+        let limits = value.limits();
+        if let Some(mbps) = limits.network_mbps {
+            net.push(format!("rate={}", mbps));
+        }
 
         let vm_resources = value.resources()?;
         Ok(VmConfig {
@@ -744,8 +748,68 @@ impl ProxmoxClient {
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
             ssh_keys: Some(urlencoding::encode(value.ssh_key.key_data.as_str()).to_string()),
             efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
+            cpu_limit: limits.cpu_limit,
             ..Default::default()
         })
+    }
+
+    /// Apply disk I/O throttle limits to the primary disk of a VM.
+    ///
+    /// Fetches the current scsi0 device string from Proxmox, appends the
+    /// throttle parameters, and sends a PATCH to update the VM config.
+    async fn apply_disk_limits(&self, req: &FullVmInfo) -> OpResult<()> {
+        let limits = req.limits();
+        let has_disk_limits = limits.disk_iops_read.is_some()
+            || limits.disk_iops_write.is_some()
+            || limits.disk_mbps_read.is_some()
+            || limits.disk_mbps_write.is_some();
+
+        if !has_disk_limits {
+            return Ok(());
+        }
+
+        // Fetch the current config to get the live scsi0 disk path
+        let current = self.get_vm_config(&self.node, req.vm.id.into()).await?;
+        let scsi0_base = match current.config.scsi_0 {
+            Some(v) => v,
+            None => op_fatal!("scsi0 not found in VM config"),
+        };
+
+        // Strip any pre-existing throttle params so we get the bare volume ref
+        let volume_part = scsi0_base
+            .split(',')
+            .next()
+            .unwrap_or(&scsi0_base)
+            .to_string();
+
+        let mut parts = vec![volume_part];
+        if let Some(v) = limits.disk_mbps_read {
+            parts.push(format!("mbps_rd={}", v));
+        }
+        if let Some(v) = limits.disk_mbps_write {
+            parts.push(format!("mbps_wr={}", v));
+        }
+        if let Some(v) = limits.disk_iops_read {
+            parts.push(format!("iops_rd={}", v));
+        }
+        if let Some(v) = limits.disk_iops_write {
+            parts.push(format!("iops_wr={}", v));
+        }
+
+        self.configure_vm(ConfigureVm {
+            node: self.node.clone(),
+            vm_id: req.vm.id.into(),
+            current: None,
+            snapshot: None,
+            digest: None,
+            config: VmConfig {
+                scsi_0: Some(parts.join(",")),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+        Ok(())
     }
 
     /// Import main disk image from the template (without resizing)
@@ -1048,6 +1112,9 @@ impl VmHostClient for ProxmoxClient {
             .step("resize_disk", |ctx| {
                 Box::pin(async move { ctx.client.resize_main_disk(ctx.req).await })
             })
+            .step("apply_disk_limits", |ctx| {
+                Box::pin(async move { ctx.client.apply_disk_limits(ctx.req).await })
+            })
             .step("patch_firewall", |ctx| {
                 Box::pin(async move { ctx.client.patch_firewall(ctx.req).await })
             })
@@ -1133,6 +1200,10 @@ impl VmHostClient for ProxmoxClient {
             config,
         })
         .await?;
+
+        // Apply disk I/O throttle limits (requires reading live scsi0 path)
+        self.apply_disk_limits(cfg).await?;
+
         Ok(())
     }
 
@@ -1834,6 +1905,10 @@ pub struct VmConfig {
     #[serde(rename = "serial0")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial_0: Option<String>,
+    /// CPU usage limit as a fraction of allocated cores (e.g. 0.5 = 50%; 0 = uncapped)
+    #[serde(rename = "cpulimit")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

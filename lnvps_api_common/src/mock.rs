@@ -87,6 +87,12 @@ impl MockDb {
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,
             region_id: 1,
+            disk_iops_read: None,
+            disk_iops_write: None,
+            disk_mbps_read: None,
+            disk_mbps_write: None,
+            network_mbps: None,
+            cpu_limit: None,
         }
     }
 

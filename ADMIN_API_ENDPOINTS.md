@@ -1279,8 +1279,20 @@ Body:
   |
   "month"
   |
-  "year"
+  "year",
   // optional, defaults to "month"
+  "disk_iops_read": number,
+  // optional - max disk read IOPS (default uncapped)
+  "disk_iops_write": number,
+  // optional - max disk write IOPS (default uncapped)
+  "disk_mbps_read": number,
+  // optional - max disk read throughput in MB/s (default uncapped)
+  "disk_mbps_write": number,
+  // optional - max disk write throughput in MB/s (default uncapped)
+  "network_mbps": number,
+  // optional - max network bandwidth in Mbit/s (default uncapped)
+  "cpu_limit": number
+  // optional - max CPU usage as fraction of allocated cores, e.g. 0.5 (default uncapped)
 }
 ```
 
@@ -1300,12 +1312,12 @@ Body (all optional):
   "enabled": boolean,
   "expires": "string (ISO 8601) | null",
   "cpu": number,
-  "cpu_mfg": "string",
-  // CpuMfg enum - filter hosts by CPU manufacturer
-  "cpu_arch": "string",
-  // CpuArch enum - filter hosts by CPU architecture
-  "cpu_features": ["string"],
-  // array of CpuFeature enum values - filter hosts by required CPU features
+  "cpu_mfg": "string | null",
+  // CpuMfg enum - set null to clear (reset to unknown)
+  "cpu_arch": "string | null",
+  // CpuArch enum - set null to clear (reset to unknown)
+  "cpu_features": ["string"] | null,
+  // array of CpuFeature enum values - set null to clear
   "memory": number,
   "disk_size": number,
   "disk_type": "string",
@@ -1324,8 +1336,20 @@ Body (all optional):
   |
   "month"
   |
-  "year"
+  "year",
   // Update associated cost plan interval type
+  "disk_iops_read": number | null,
+  // Max disk read IOPS — set null to remove limit
+  "disk_iops_write": number | null,
+  // Max disk write IOPS — set null to remove limit
+  "disk_mbps_read": number | null,
+  // Max disk read throughput in MB/s — set null to remove limit
+  "disk_mbps_write": number | null,
+  // Max disk write throughput in MB/s — set null to remove limit
+  "network_mbps": number | null,
+  // Max network bandwidth in Mbit/s — set null to remove limit
+  "cpu_limit": number | null
+  // Max CPU usage as fraction of allocated cores — set null to remove limit
 }
 ```
 
@@ -3224,8 +3248,20 @@ The RBAC system uses the following permission format: `resource::action`
   // Populated with region name
   "cost_plan_name": "string | null",
   // Populated with cost plan name
-  "active_vm_count": number
+  "active_vm_count": number,
   // Number of active (non-deleted) VMs using this template
+  "disk_iops_read": number | null,
+  // Maximum disk read IOPS — omitted if uncapped
+  "disk_iops_write": number | null,
+  // Maximum disk write IOPS — omitted if uncapped
+  "disk_mbps_read": number | null,
+  // Maximum disk read throughput in MB/s — omitted if uncapped
+  "disk_mbps_write": number | null,
+  // Maximum disk write throughput in MB/s — omitted if uncapped
+  "network_mbps": number | null,
+  // Maximum network bandwidth in Mbit/s — omitted if uncapped
+  "cpu_limit": number | null
+  // Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%) — omitted if uncapped
 }
 ```
 

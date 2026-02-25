@@ -607,6 +607,7 @@ impl PricingEngine {
             cpu_mfg,
             cpu_arch,
             cpu_features,
+            ..Default::default()
         };
         Ok(new_custom_template)
     }
@@ -917,9 +918,7 @@ mod tests {
                 disk_type: DiskType::SSD,
                 disk_interface: Default::default(),
                 pricing_id: 1,
-                cpu_mfg: Default::default(),
-                cpu_arch: Default::default(),
-                cpu_features: Default::default(),
+                ..Default::default()
             },
         );
         let mut d = db.custom_pricing_disk.lock().await;

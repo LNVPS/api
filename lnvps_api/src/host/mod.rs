@@ -220,6 +220,32 @@ impl FullVmInfo {
             bail!("Invalid VM config, no template");
         }
     }
+
+    /// Resource limits for this VM (derived from template or custom template).
+    /// Returns `VmLimits::default()` (all `None`) if no limits are configured.
+    pub fn limits(&self) -> VmLimits {
+        if let Some(t) = &self.template {
+            VmLimits {
+                disk_iops_read: t.disk_iops_read,
+                disk_iops_write: t.disk_iops_write,
+                disk_mbps_read: t.disk_mbps_read,
+                disk_mbps_write: t.disk_mbps_write,
+                network_mbps: t.network_mbps,
+                cpu_limit: t.cpu_limit,
+            }
+        } else if let Some(t) = &self.custom_template {
+            VmLimits {
+                disk_iops_read: t.disk_iops_read,
+                disk_iops_write: t.disk_iops_write,
+                disk_mbps_read: t.disk_mbps_read,
+                disk_mbps_write: t.disk_mbps_write,
+                network_mbps: t.network_mbps,
+                cpu_limit: t.cpu_limit,
+            }
+        } else {
+            VmLimits::default()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -227,6 +253,23 @@ pub struct VmResources {
     pub cpu: u16,
     pub memory: u64,
     pub disk_size: u64,
+}
+
+/// Optional resource limits for a VM.  `None` fields mean uncapped.
+#[derive(Clone, Default)]
+pub struct VmLimits {
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +334,7 @@ mod tests {
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,
             region_id: 1,
+            ..Default::default()
         };
         FullVmInfo {
             vm: Vm {

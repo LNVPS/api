@@ -909,6 +909,7 @@ impl LNVpsProvisioner {
             cpu_mfg: current_template.cpu_mfg.clone(),
             cpu_arch: current_template.cpu_arch.clone(),
             cpu_features: current_template.cpu_features.clone(),
+            ..Default::default()
         };
 
         // Validate the upgrade (ensure we're not downgrading)
@@ -1311,6 +1312,7 @@ mod tests {
             disk_interface: DiskInterface::PCIe,
             cost_plan_id: 1,
             region_id: 1,
+            ..Default::default()
         };
         let id = db.insert_vm_template(&large_template).await?;
 
