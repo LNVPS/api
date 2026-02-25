@@ -726,7 +726,8 @@ impl ProxmoxClient {
         }
         let limits = value.limits();
         if let Some(mbps) = limits.network_mbps {
-            net.push(format!("rate={}", mbps));
+            // Proxmox rate= is in MB/s; our field is stored in Mbit/s
+            net.push(format!("rate={}", mbps as f32 / 8.0));
         }
 
         let vm_resources = value.resources()?;
@@ -2205,5 +2206,103 @@ mod tests {
             .expect("Should deserialize actual Proxmox JSON");
         assert_eq!(config.kvm, Some(true)); // kvm:1 should become Some(true)
         assert_eq!(config.on_boot, Some(true)); // onboot:1 should become Some(true)
+    }
+
+    #[test]
+    fn test_network_rate_converts_mbps_to_mb_per_sec() -> Result<()> {
+        // network_mbps is stored in Mbit/s; Proxmox rate= expects MB/s, so we divide by 8
+        let mut cfg = mock_full_vm();
+        cfg.template.as_mut().unwrap().network_mbps = Some(800);
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        let net = vm.net.unwrap();
+        // 800 Mbit/s ÷ 8 = 100 MB/s
+        assert!(
+            net.contains("rate=100"),
+            "expected rate=100 in net string, got: {}",
+            net
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cpu_limit_propagated() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        cfg.template.as_mut().unwrap().cpu_limit = Some(0.5);
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        assert_eq!(vm.cpu_limit, Some(0.5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_limits_produces_no_rate_or_cpulimit() -> Result<()> {
+        // When no limits are set, rate= must not appear in net and cpu_limit must be None
+        let cfg = mock_full_vm(); // template has all limits as None
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        assert!(
+            !vm.net.as_deref().unwrap_or("").contains("rate="),
+            "rate= must not appear when network_mbps is None"
+        );
+        assert_eq!(vm.cpu_limit, None);
+        Ok(())
     }
 }
