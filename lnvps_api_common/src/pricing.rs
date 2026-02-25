@@ -595,7 +595,7 @@ impl PricingEngine {
             bail!("VM must have either a standard template or custom template to upgrade");
         };
 
-        // Build the new custom template with upgraded specs
+        // Build the new custom template with upgraded specs, copying resource limits from pricing
         let new_custom_template = VmCustomTemplate {
             id: 0, // Will be set when inserted
             cpu: cfg.new_cpu.unwrap_or(cpu),
@@ -607,7 +607,12 @@ impl PricingEngine {
             cpu_mfg,
             cpu_arch,
             cpu_features,
-            ..Default::default()
+            disk_iops_read: pricing.disk_iops_read,
+            disk_iops_write: pricing.disk_iops_write,
+            disk_mbps_read: pricing.disk_mbps_read,
+            disk_mbps_write: pricing.disk_mbps_write,
+            network_mbps: pricing.network_mbps,
+            cpu_limit: pricing.cpu_limit,
         };
         Ok(new_custom_template)
     }
@@ -905,6 +910,7 @@ mod tests {
                 max_cpu: 16,
                 min_memory: 1 * crate::GB,
                 max_memory: 64 * crate::GB,
+                ..Default::default()
             },
         );
         let mut p = db.custom_template.lock().await;
@@ -1262,6 +1268,7 @@ mod tests {
                     max_cpu: 16,
                     min_memory: 1 * crate::GB,
                     max_memory: 64 * crate::GB,
+                    ..Default::default()
                 },
             );
         }
@@ -1907,6 +1914,7 @@ mod tests {
                 max_cpu: 16,
                 min_memory: crate::GB,
                 max_memory: 64 * crate::GB,
+                ..Default::default()
             },
         );
         let mut d = db.custom_pricing_disk.lock().await;

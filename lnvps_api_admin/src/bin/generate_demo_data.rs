@@ -952,6 +952,12 @@ async fn create_custom_pricing(
             max_cpu: max_cpu as u16,
             min_memory,
             max_memory,
+            disk_iops_read: None,
+            disk_iops_write: None,
+            disk_mbps_read: None,
+            disk_mbps_write: None,
+            network_mbps: None,
+            cpu_limit: None,
         };
 
         let id = db.insert_custom_pricing(&pricing).await?;

@@ -838,6 +838,18 @@ pub struct VmCustomPricing {
     pub min_memory: u64,
     /// Maximum memory in bytes
     pub max_memory: u64,
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%; None = uncapped)
+    pub cpu_limit: Option<f32>,
 }
 
 /// Pricing per GB on a disk type (SSD/HDD)

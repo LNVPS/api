@@ -102,6 +102,12 @@ impl AdminCustomPricingInfo {
             max_memory: pricing.max_memory,
             disk_pricing: disk_pricing_info,
             template_count,
+            disk_iops_read: pricing.disk_iops_read,
+            disk_iops_write: pricing.disk_iops_write,
+            disk_mbps_read: pricing.disk_mbps_read,
+            disk_mbps_write: pricing.disk_mbps_write,
+            network_mbps: pricing.network_mbps,
+            cpu_limit: pricing.cpu_limit,
         })
     }
 }
@@ -219,6 +225,12 @@ async fn admin_create_custom_pricing(
         max_cpu: req.max_cpu,
         min_memory: req.min_memory,
         max_memory: req.max_memory,
+        disk_iops_read: req.disk_iops_read,
+        disk_iops_write: req.disk_iops_write,
+        disk_mbps_read: req.disk_mbps_read,
+        disk_mbps_write: req.disk_mbps_write,
+        network_mbps: req.network_mbps,
+        cpu_limit: req.cpu_limit,
     };
 
     let pricing_id = this.db.insert_custom_pricing(&pricing).await?;
@@ -314,6 +326,24 @@ async fn admin_update_custom_pricing(
     }
     if let Some(max_memory) = req.max_memory {
         pricing.max_memory = max_memory;
+    }
+    if let Some(v) = req.disk_iops_read {
+        pricing.disk_iops_read = v;
+    }
+    if let Some(v) = req.disk_iops_write {
+        pricing.disk_iops_write = v;
+    }
+    if let Some(v) = req.disk_mbps_read {
+        pricing.disk_mbps_read = v;
+    }
+    if let Some(v) = req.disk_mbps_write {
+        pricing.disk_mbps_write = v;
+    }
+    if let Some(v) = req.network_mbps {
+        pricing.network_mbps = v;
+    }
+    if let Some(v) = req.cpu_limit {
+        pricing.cpu_limit = v;
     }
 
     this.db.update_custom_pricing(&pricing).await?;
@@ -422,6 +452,12 @@ async fn admin_copy_custom_pricing(
         max_cpu: source_pricing.max_cpu,
         min_memory: source_pricing.min_memory,
         max_memory: source_pricing.max_memory,
+        disk_iops_read: source_pricing.disk_iops_read,
+        disk_iops_write: source_pricing.disk_iops_write,
+        disk_mbps_read: source_pricing.disk_mbps_read,
+        disk_mbps_write: source_pricing.disk_mbps_write,
+        network_mbps: source_pricing.network_mbps,
+        cpu_limit: source_pricing.cpu_limit,
     };
 
     let new_pricing_id = this.db.insert_custom_pricing(&new_pricing).await?;
