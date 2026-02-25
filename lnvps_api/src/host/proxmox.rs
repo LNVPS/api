@@ -312,20 +312,6 @@ impl ProxmoxClient {
                 disk_args.insert("ssd", "1".to_string());
             }
 
-            // Disk I/O throttle limits
-            if let Some(v) = req.mbps_rd {
-                disk_args.insert("mbps_rd", v.to_string());
-            }
-            if let Some(v) = req.mbps_wr {
-                disk_args.insert("mbps_wr", v.to_string());
-            }
-            if let Some(v) = req.iops_rd {
-                disk_args.insert("iops_rd", v.to_string());
-            }
-            if let Some(v) = req.iops_wr {
-                disk_args.insert("iops_wr", v.to_string());
-            }
-
             let cmd = format!(
                 "/usr/sbin/qm set {} --{} {}:0,{}",
                 req.vm_id,
@@ -830,7 +816,6 @@ impl ProxmoxClient {
     /// Import main disk image from the template (without resizing)
     async fn import_disk(&self, req: &FullVmInfo) -> OpResult<()> {
         let vm_id = req.vm.id.into();
-        let limits = req.limits();
 
         // import primary disk from image (scsi0)
         self.import_disk_image(ImportDiskImageRequest {
@@ -840,10 +825,6 @@ impl ProxmoxClient {
             disk: "scsi0".to_string(),
             image: req.image.filename()?,
             is_ssd: matches!(req.disk.kind, DiskType::SSD),
-            mbps_rd: limits.disk_mbps_read,
-            mbps_wr: limits.disk_mbps_write,
-            iops_rd: limits.disk_iops_read,
-            iops_wr: limits.disk_iops_write,
         })
         .await?;
 
@@ -1825,14 +1806,6 @@ pub struct ImportDiskImageRequest {
     pub image: String,
     /// If the disk is an SSD and discard should be enabled
     pub is_ssd: bool,
-    /// Maximum disk read IOPS (None = uncapped)
-    pub iops_rd: Option<u32>,
-    /// Maximum disk write IOPS (None = uncapped)
-    pub iops_wr: Option<u32>,
-    /// Maximum disk read throughput in MB/s (None = uncapped)
-    pub mbps_rd: Option<u32>,
-    /// Maximum disk write throughput in MB/s (None = uncapped)
-    pub mbps_wr: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
