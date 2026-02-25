@@ -1040,12 +1040,24 @@ impl VmHostClient for ProxmoxClient {
             }
         }
 
+        // Resolve any HTTP redirects before handing the URL to Proxmox.
+        // Proxmox's download-url API does not always follow redirects itself,
+        // so we probe for the final location here and pass that instead.
+        let resolved_url =
+            lnvps_api_common::shasum::resolve_redirect(&image.url).await;
+        if resolved_url != image.url {
+            info!(
+                "Resolved redirect for image {}: {} -> {}",
+                storage_name, image.url, resolved_url
+            );
+        }
+
         let t_download = self
             .download_image(DownloadUrlRequest {
                 content: StorageContent::ISO,
                 node: self.node.clone(),
                 storage: iso_storage.clone(),
-                url: image.url.clone(),
+                url: resolved_url,
                 filename: storage_name,
                 checksum: expected_sha2,
                 checksum_algorithm,
