@@ -515,6 +515,11 @@ async fn v1_create_custom_vm_order(
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
 
+    let user = this.db.get_user(uid).await?;
+    if !user.email_verified {
+        return Err(ApiError::new("Email verification is required before creating a VM"));
+    }
+
     // create a fake template from the request to generate the order
     let template = req.spec.clone().into();
 
@@ -593,6 +598,11 @@ async fn v1_create_vm_order(
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
+
+    let user = this.db.get_user(uid).await?;
+    if !user.email_verified {
+        return Err(ApiError::new("Email verification is required before creating a VM"));
+    }
 
     let rsp = this
         .provisioner
