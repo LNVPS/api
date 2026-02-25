@@ -90,9 +90,7 @@ impl DVMHandler for LnvpsDvm {
                 disk_type: DiskType::from_str(disk_type)?,
                 disk_interface: DiskInterface::from_str(disk_interface)?,
                 pricing_id: pricing.id,
-                cpu_mfg: Default::default(),
-                cpu_arch: Default::default(),
-                cpu_features: Default::default(),
+                ..Default::default()
             };
             let uid = db.upsert_user(request.event.pubkey.as_bytes()).await?;
 

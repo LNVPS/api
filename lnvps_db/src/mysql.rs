@@ -499,7 +499,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,cpu_mfg,cpu_arch,cpu_features,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,cpu_mfg,cpu_arch,cpu_features,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(&template.name)
             .bind(template.enabled)
             .bind(template.created)
@@ -514,6 +514,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.disk_interface)
             .bind(template.cost_plan_id)
             .bind(template.region_id)
+            .bind(template.disk_iops_read)
+            .bind(template.disk_iops_write)
+            .bind(template.disk_mbps_read)
+            .bind(template.disk_mbps_write)
+            .bind(template.network_mbps)
+            .bind(template.cpu_limit)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
@@ -839,7 +845,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,cpu_mfg,cpu_arch,cpu_features) values(?,?,?,?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,cpu_mfg,cpu_arch,cpu_features,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
@@ -849,13 +855,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&template.cpu_mfg)
             .bind(&template.cpu_arch)
             .bind(&template.cpu_features)
+            .bind(template.disk_iops_read)
+            .bind(template.disk_iops_write)
+            .bind(template.disk_mbps_read)
+            .bind(template.disk_mbps_write)
+            .bind(template.network_mbps)
+            .bind(template.cpu_limit)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
     }
 
     async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
-        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, cpu_mfg=?, cpu_arch=?, cpu_features=? where id=?")
+        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, cpu_mfg=?, cpu_arch=?, cpu_features=?, disk_iops_read=?, disk_iops_write=?, disk_mbps_read=?, disk_mbps_write=?, network_mbps=?, cpu_limit=? where id=?")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
@@ -865,6 +877,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&template.cpu_mfg)
             .bind(&template.cpu_arch)
             .bind(&template.cpu_features)
+            .bind(template.disk_iops_read)
+            .bind(template.disk_iops_write)
+            .bind(template.disk_mbps_read)
+            .bind(template.disk_mbps_write)
+            .bind(template.network_mbps)
+            .bind(template.cpu_limit)
             .bind(template.id)
             .execute(&self.db)
             .await?;
@@ -2743,7 +2761,9 @@ impl AdminDb for LNVpsDbMysql {
             r#"UPDATE vm_template SET 
                name = ?, enabled = ?, expires = ?, cpu = ?, cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, memory = ?,
                disk_size = ?, disk_type = ?, disk_interface = ?, 
-               cost_plan_id = ?, region_id = ?
+               cost_plan_id = ?, region_id = ?,
+               disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
+               network_mbps = ?, cpu_limit = ?
                WHERE id = ?"#,
         )
         .bind(&template.name)
@@ -2759,6 +2779,12 @@ impl AdminDb for LNVpsDbMysql {
         .bind(template.disk_interface)
         .bind(template.cost_plan_id)
         .bind(template.region_id)
+        .bind(template.disk_iops_read)
+        .bind(template.disk_iops_write)
+        .bind(template.disk_mbps_read)
+        .bind(template.disk_mbps_write)
+        .bind(template.network_mbps)
+        .bind(template.cpu_limit)
         .bind(template.id)
         .execute(&self.db)
         .await?;
@@ -2979,8 +3005,9 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
         let query = r#"
-            INSERT INTO vm_custom_template (cpu, memory, disk_size, disk_type, disk_interface, pricing_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO vm_custom_template (cpu, memory, disk_size, disk_type, disk_interface, pricing_id,
+                disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#;
 
         let result = sqlx::query(query)
@@ -2990,6 +3017,12 @@ impl AdminDb for LNVpsDbMysql {
             .bind(template.disk_type as u16)
             .bind(template.disk_interface as u16)
             .bind(template.pricing_id)
+            .bind(template.disk_iops_read)
+            .bind(template.disk_iops_write)
+            .bind(template.disk_mbps_read)
+            .bind(template.disk_mbps_write)
+            .bind(template.network_mbps)
+            .bind(template.cpu_limit)
             .execute(&self.db)
             .await?;
 
@@ -2999,7 +3032,9 @@ impl AdminDb for LNVpsDbMysql {
     async fn update_custom_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
         let query = r#"
             UPDATE vm_custom_template 
-            SET cpu = ?, memory = ?, disk_size = ?, disk_type = ?, disk_interface = ?, pricing_id = ?
+            SET cpu = ?, memory = ?, disk_size = ?, disk_type = ?, disk_interface = ?, pricing_id = ?,
+                disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
+                network_mbps = ?, cpu_limit = ?
             WHERE id = ?
         "#;
 
@@ -3010,6 +3045,12 @@ impl AdminDb for LNVpsDbMysql {
             .bind(template.disk_type as u16)
             .bind(template.disk_interface as u16)
             .bind(template.pricing_id)
+            .bind(template.disk_iops_read)
+            .bind(template.disk_iops_write)
+            .bind(template.disk_mbps_read)
+            .bind(template.disk_mbps_write)
+            .bind(template.network_mbps)
+            .bind(template.cpu_limit)
             .bind(template.id)
             .execute(&self.db)
             .await?;

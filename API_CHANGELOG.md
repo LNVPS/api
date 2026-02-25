@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [v0.2.0] - 2026-02-22
 
 ### Added
+- **2026-02-25** - Template resource limits for fair-use and SLA enforcement (closes #26)
+  - `POST /api/admin/v1/vm_templates` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
+  - `PATCH /api/admin/v1/vm_templates/{id}` — Accepts the same limit fields; send `null` to remove a limit
+  - `GET /api/admin/v1/vm_templates` / `GET /api/admin/v1/vm_templates/{id}` — Response now includes limit fields (omitted when uncapped)
+  - Limits are applied at VM create time and on any VM configure/upgrade:
+    - **Disk IO**: `mbps_rd`/`mbps_wr`/`iops_rd`/`iops_wr` on the primary disk via Proxmox API
+    - **Network bandwidth**: `rate=N` on `net0` interface
+    - **CPU limit**: `cpulimit` VM config option (fraction of allocated cores)
+  - `None` / omitted = uncapped (preserves existing behaviour for all current VMs)
 - **2026-02-24** - Cloud image checksum verification and on-demand download (closes #69)
   - `POST /api/admin/v1/vm_os_images/{id}/download` — Enqueue an immediate download/re-check of an OS image on all hosts (requires `vm_os_image::update`)
   - `PATCH /api/admin/v1/vm_os_images/{id}` — Now correctly applies `sha2` and `sha2_url` updates

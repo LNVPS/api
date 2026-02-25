@@ -71,6 +71,12 @@ impl AdminVmTemplateInfo {
             region_name: region.map(|r| r.name),
             cost_plan_name: cost_plan.map(|cp| cp.name),
             active_vm_count,
+            disk_iops_read: template.disk_iops_read,
+            disk_iops_write: template.disk_iops_write,
+            disk_mbps_read: template.disk_mbps_read,
+            disk_mbps_write: template.disk_mbps_write,
+            network_mbps: template.network_mbps,
+            cpu_limit: template.cpu_limit,
         })
     }
 }
@@ -189,6 +195,12 @@ async fn admin_create_vm_template(
         disk_interface: req.disk_interface.into(),
         cost_plan_id,
         region_id: req.region_id,
+        disk_iops_read: req.disk_iops_read,
+        disk_iops_write: req.disk_iops_write,
+        disk_mbps_read: req.disk_mbps_read,
+        disk_mbps_write: req.disk_mbps_write,
+        network_mbps: req.network_mbps,
+        cpu_limit: req.cpu_limit,
     };
 
     let template_id = this.db.insert_vm_template(&template).await?;
@@ -299,6 +311,24 @@ async fn admin_update_vm_template(
         // Validate that region exists
         let _region = this.db.get_host_region(region_id).await?;
         template.region_id = region_id;
+    }
+    if let Some(v) = req.disk_iops_read {
+        template.disk_iops_read = v;
+    }
+    if let Some(v) = req.disk_iops_write {
+        template.disk_iops_write = v;
+    }
+    if let Some(v) = req.disk_mbps_read {
+        template.disk_mbps_read = v;
+    }
+    if let Some(v) = req.disk_mbps_write {
+        template.disk_mbps_write = v;
+    }
+    if let Some(v) = req.network_mbps {
+        template.network_mbps = v;
+    }
+    if let Some(v) = req.cpu_limit {
+        template.cpu_limit = v;
     }
 
     this.db.update_vm_template(&template).await?;

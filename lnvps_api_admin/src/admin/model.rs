@@ -1153,6 +1153,24 @@ pub struct AdminVmTemplateInfo {
     pub region_name: Option<String>,
     pub cost_plan_name: Option<String>,
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this template
+    /// Maximum disk read IOPS (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1181,6 +1199,18 @@ pub struct AdminCreateVmTemplateRequest {
     pub cost_plan_currency: Option<String>, // Defaults to "USD"
     pub cost_plan_interval_amount: Option<u64>, // Defaults to 1
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores, e.g. 0.5 = 50% (None = uncapped)
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1223,6 +1253,42 @@ pub struct AdminUpdateVmTemplateRequest {
     pub cost_plan_currency: Option<String>,
     pub cost_plan_interval_amount: Option<u64>,
     pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>,
+    /// Maximum disk read IOPS — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_iops_read: Option<Option<u32>>,
+    /// Maximum disk write IOPS — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_iops_write: Option<Option<u32>>,
+    /// Maximum disk read throughput in MB/s — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_mbps_read: Option<Option<u32>>,
+    /// Maximum disk write throughput in MB/s — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_mbps_write: Option<Option<u32>>,
+    /// Maximum network bandwidth in Mbit/s — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub network_mbps: Option<Option<u32>>,
+    /// Maximum CPU usage as a fraction of allocated cores — use `null` to clear
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_limit: Option<Option<f32>>,
 }
 
 // Common response structures

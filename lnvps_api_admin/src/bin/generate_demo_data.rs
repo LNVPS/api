@@ -794,6 +794,7 @@ async fn create_vm_templates(
             disk_interface,
             cost_plan_id,
             region_id,
+            ..Default::default()
         };
 
         let id = db.insert_vm_template(&template).await?;
@@ -996,9 +997,7 @@ async fn create_custom_templates(
             disk_type,
             disk_interface,
             pricing_id,
-            cpu_mfg: Default::default(),
-            cpu_arch: Default::default(),
-            cpu_features: Default::default(),
+            ..Default::default()
         };
 
         let id = db.insert_custom_vm_template(&template).await?;

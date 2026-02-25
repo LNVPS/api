@@ -510,6 +510,7 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_default(),
             cpu_features: cpu_features.into(),
+            ..Default::default()
         }
     }
 }

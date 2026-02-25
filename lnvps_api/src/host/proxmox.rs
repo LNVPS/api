@@ -312,6 +312,20 @@ impl ProxmoxClient {
                 disk_args.insert("ssd", "1".to_string());
             }
 
+            // Disk I/O throttle limits — set at import time alongside discard/ssd
+            if let Some(v) = req.mbps_rd {
+                disk_args.insert("mbps_rd", v.to_string());
+            }
+            if let Some(v) = req.mbps_wr {
+                disk_args.insert("mbps_wr", v.to_string());
+            }
+            if let Some(v) = req.iops_rd {
+                disk_args.insert("iops_rd", v.to_string());
+            }
+            if let Some(v) = req.iops_wr {
+                disk_args.insert("iops_wr", v.to_string());
+            }
+
             let cmd = format!(
                 "/usr/sbin/qm set {} --{} {}:0,{}",
                 req.vm_id,
@@ -724,6 +738,11 @@ impl ProxmoxClient {
         if value.vm.disabled {
             net.push("link_down=1".to_string());
         }
+        let limits = value.limits();
+        if let Some(mbps) = limits.network_mbps {
+            // Proxmox rate= is in MB/s; our field is stored in Mbit/s
+            net.push(format!("rate={}", mbps as f32 / 8.0));
+        }
 
         let vm_resources = value.resources()?;
         Ok(VmConfig {
@@ -744,15 +763,77 @@ impl ProxmoxClient {
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
             ssh_keys: Some(urlencoding::encode(value.ssh_key.key_data.as_str()).to_string()),
             efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
+            cpu_limit: limits.cpu_limit,
             ..Default::default()
         })
+    }
+
+    /// Apply disk I/O throttle limits to the primary disk of a VM.
+    ///
+    /// Fetches the current scsi0 device string from Proxmox, appends the
+    /// throttle parameters, and sends a PATCH to update the VM config.
+    async fn apply_disk_limits(&self, req: &FullVmInfo) -> OpResult<()> {
+        let limits = req.limits();
+        let has_disk_limits = limits.disk_iops_read.is_some()
+            || limits.disk_iops_write.is_some()
+            || limits.disk_mbps_read.is_some()
+            || limits.disk_mbps_write.is_some();
+
+        if !has_disk_limits {
+            return Ok(());
+        }
+
+        // Fetch the current config to get the live scsi0 disk path
+        let current = self.get_vm_config(&self.node, req.vm.id.into()).await?;
+        let scsi0_base = match current.config.scsi_0 {
+            Some(v) => v,
+            None => op_fatal!("scsi0 not found in VM config"),
+        };
+
+        // Strip any pre-existing throttle params so we get the bare volume ref
+        let volume_part = scsi0_base
+            .split(',')
+            .next()
+            .unwrap_or(&scsi0_base)
+            .to_string();
+
+        let mut parts = vec![volume_part];
+        if let Some(v) = limits.disk_mbps_read {
+            parts.push(format!("mbps_rd={}", v));
+        }
+        if let Some(v) = limits.disk_mbps_write {
+            parts.push(format!("mbps_wr={}", v));
+        }
+        if let Some(v) = limits.disk_iops_read {
+            parts.push(format!("iops_rd={}", v));
+        }
+        if let Some(v) = limits.disk_iops_write {
+            parts.push(format!("iops_wr={}", v));
+        }
+
+        self.configure_vm(ConfigureVm {
+            node: self.node.clone(),
+            vm_id: req.vm.id.into(),
+            current: None,
+            snapshot: None,
+            digest: None,
+            config: VmConfig {
+                scsi_0: Some(parts.join(",")),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+        Ok(())
     }
 
     /// Import main disk image from the template (without resizing)
     async fn import_disk(&self, req: &FullVmInfo) -> OpResult<()> {
         let vm_id = req.vm.id.into();
+        let limits = req.limits();
 
-        // import primary disk from image (scsi0)
+        // import primary disk from image (scsi0); throttle limits are set here
+        // alongside discard/ssd and apply to the resulting disk without a second request
         self.import_disk_image(ImportDiskImageRequest {
             vm_id,
             node: self.node.clone(),
@@ -760,6 +841,10 @@ impl ProxmoxClient {
             disk: "scsi0".to_string(),
             image: req.image.filename()?,
             is_ssd: matches!(req.disk.kind, DiskType::SSD),
+            mbps_rd: limits.disk_mbps_read,
+            mbps_wr: limits.disk_mbps_write,
+            iops_rd: limits.disk_iops_read,
+            iops_wr: limits.disk_iops_write,
         })
         .await?;
 
@@ -1133,6 +1218,10 @@ impl VmHostClient for ProxmoxClient {
             config,
         })
         .await?;
+
+        // Apply disk I/O throttle limits (requires reading live scsi0 path)
+        self.apply_disk_limits(cfg).await?;
+
         Ok(())
     }
 
@@ -1734,6 +1823,14 @@ pub struct ImportDiskImageRequest {
     pub image: String,
     /// If the disk is an SSD and discard should be enabled
     pub is_ssd: bool,
+    /// Maximum disk read IOPS (None = uncapped)
+    pub iops_rd: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub iops_wr: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub mbps_rd: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub mbps_wr: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1834,6 +1931,10 @@ pub struct VmConfig {
     #[serde(rename = "serial0")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial_0: Option<String>,
+    /// CPU usage limit as a fraction of allocated cores (e.g. 0.5 = 50%; 0 = uncapped)
+    #[serde(rename = "cpulimit")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2130,5 +2231,103 @@ mod tests {
             .expect("Should deserialize actual Proxmox JSON");
         assert_eq!(config.kvm, Some(true)); // kvm:1 should become Some(true)
         assert_eq!(config.on_boot, Some(true)); // onboot:1 should become Some(true)
+    }
+
+    #[test]
+    fn test_network_rate_converts_mbps_to_mb_per_sec() -> Result<()> {
+        // network_mbps is stored in Mbit/s; Proxmox rate= expects MB/s, so we divide by 8
+        let mut cfg = mock_full_vm();
+        cfg.template.as_mut().unwrap().network_mbps = Some(800);
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        let net = vm.net.unwrap();
+        // 800 Mbit/s ÷ 8 = 100 MB/s
+        assert!(
+            net.contains("rate=100"),
+            "expected rate=100 in net string, got: {}",
+            net
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_cpu_limit_propagated() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        cfg.template.as_mut().unwrap().cpu_limit = Some(0.5);
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        assert_eq!(vm.cpu_limit, Some(0.5));
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_limits_produces_no_rate_or_cpulimit() -> Result<()> {
+        // When no limits are set, rate= must not appear in net and cpu_limit must be None
+        let cfg = mock_full_vm(); // template has all limits as None
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let vm = p.make_config(&cfg)?;
+        assert!(
+            !vm.net.as_deref().unwrap_or("").contains("rate="),
+            "rate= must not appear when network_mbps is None"
+        );
+        assert_eq!(vm.cpu_limit, None);
+        Ok(())
     }
 }
