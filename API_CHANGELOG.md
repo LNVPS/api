@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [v0.2.0] - 2026-02-22
 
+### Changed
+- **2026-02-25** - Email verification is now required before creating a VM (closes #92)
+  - `POST /api/v1/vm` — Returns `400` with error message if the user's email is not verified
+  - `POST /api/v1/vm/custom-template` — Same gate applied
+
 ### Added
 - **2026-02-25** - Resource limits on custom pricing plans, propagated to custom templates
   - `POST /api/admin/v1/custom_pricing` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
