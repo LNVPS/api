@@ -101,6 +101,48 @@ pub async fn fetch_checksum_for_file(sha2_url: &str, filename: &str) -> Result<S
     }
 }
 
+/// Follow HTTP redirects for the given URL and return the final resolved URL.
+///
+/// Issues a HEAD request (falling back to GET if HEAD is not supported) and
+/// returns the URL of the last response after all redirects have been followed.
+/// If the request fails the original `url` is returned unchanged.
+pub async fn resolve_redirect(url: &str) -> String {
+    // reqwest follows redirects by default (up to 10).  The final response URL
+    // is the resolved location after all hops.
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return url.to_owned(),
+    };
+
+    // Try HEAD first (lightweight — no body transfer).
+    let result = client.head(url).send().await;
+    let response = match result {
+        Ok(r) => r,
+        // Some servers reject HEAD; fall back to GET.
+        Err(_) => match client.get(url).send().await {
+            Ok(r) => r,
+            Err(_) => return url.to_owned(),
+        },
+    };
+
+    // If HEAD returned Method Not Allowed / Not Implemented, retry with GET.
+    let response = if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        || response.status() == reqwest::StatusCode::NOT_IMPLEMENTED
+    {
+        match client.get(url).send().await {
+            Ok(r) => r,
+            Err(_) => return url.to_owned(),
+        }
+    } else {
+        response
+    };
+
+    response.url().to_string()
+}
+
 /// Well-known shared SHASUMS filenames probed in the image's directory.
 /// Ordered from strongest to weakest algorithm.
 const CANDIDATE_SUMS_FILES: &[&str] = &["SHA512SUMS", "SHA256SUMS", "SHA512SUMS.txt", "SHA256SUMS.txt"];
@@ -304,6 +346,47 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
         assert!(find_checksum(&entries, "file-a.iso").is_some());
         assert!(find_checksum(&entries, "file-b.qcow2").is_some());
         assert!(find_checksum(&entries, "file-c.img").is_some());
+    }
+
+    // ---- resolve_redirect --------------------------------------------------
+
+    #[tokio::test]
+    async fn test_resolve_redirect_no_redirect() {
+        // A stable HTTPS URL that should not redirect further.
+        let url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
+        let resolved = resolve_redirect(url).await;
+        // The resolved URL must be non-empty and a valid URL.
+        assert!(!resolved.is_empty());
+        assert!(resolved.starts_with("https://"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_redirect_follows_redirect() {
+        // github.com redirects HTTP -> HTTPS.  Verify that resolve_redirect
+        // follows the redirect and returns the https:// URL.
+        let url = "http://github.com/";
+        let resolved = resolve_redirect(url).await;
+        assert!(
+            resolved.starts_with("https://"),
+            "expected https redirect, got: {resolved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_redirect_debian_raw_image() {
+        // cloud.debian.org issues a 302 redirect to a mirror for raw images.
+        // Verify that resolve_redirect follows it and returns a different (mirror) URL.
+        let url =
+            "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw";
+        let resolved = resolve_redirect(url).await;
+        assert_ne!(
+            resolved, url,
+            "expected a redirect to a mirror, but URL was unchanged"
+        );
+        assert!(
+            resolved.starts_with("https://"),
+            "resolved URL should still be https://, got: {resolved}"
+        );
     }
 
     // ---- Network test against real Debian SHA512SUMS -----------------------
