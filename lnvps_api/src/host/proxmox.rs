@@ -967,7 +967,10 @@ impl VmHostClient for ProxmoxClient {
         let storage_name = image.filename()?;
         let url_name = image.url_filename()?;
 
-        // Resolve the expected checksum from sha2_url if present
+        // Resolve the expected checksum from sha2_url if present.
+        // This is used only for SSH-based verification of already-present files;
+        // we do NOT pass it to the Proxmox download-url API because that has proven
+        // unreliable and causes download failures on the client side.
         let expected_sha2 = if let Some(sha2_url) = &image.sha2_url {
             match Self::fetch_sha2_from_url(sha2_url, &url_name).await {
                 Ok(s) => {
@@ -1043,8 +1046,7 @@ impl VmHostClient for ProxmoxClient {
         // Resolve any HTTP redirects before handing the URL to Proxmox.
         // Proxmox's download-url API does not always follow redirects itself,
         // so we probe for the final location here and pass that instead.
-        let resolved_url =
-            lnvps_api_common::shasum::resolve_redirect(&image.url).await;
+        let resolved_url = lnvps_api_common::shasum::resolve_redirect(&image.url).await;
         if resolved_url != image.url {
             info!(
                 "Resolved redirect for image {}: {} -> {}",
@@ -1052,6 +1054,10 @@ impl VmHostClient for ProxmoxClient {
             );
         }
 
+        // Do not include checksum/checksum-algorithm in the download-url request.
+        // Proxmox's built-in hash verification has proven buggy and causes download
+        // failures. Integrity is verified separately via SSH after the download
+        // completes (see verify_image_checksum).
         let t_download = self
             .download_image(DownloadUrlRequest {
                 content: StorageContent::ISO,
@@ -1059,8 +1065,8 @@ impl VmHostClient for ProxmoxClient {
                 storage: iso_storage.clone(),
                 url: resolved_url,
                 filename: storage_name,
-                checksum: expected_sha2,
-                checksum_algorithm,
+                checksum: None,
+                checksum_algorithm: None,
             })
             .await?;
         self.wait_for_task(&t_download).await?;

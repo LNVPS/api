@@ -140,14 +140,6 @@ async fn main() -> Result<(), Error> {
             );
         }
 
-        // enqueue an image download/checksum check on startup
-        if let Err(e) = worker
-            .commander()
-            .send(WorkJob::DownloadOsImages { image_id: None })
-            .await
-        {
-            error!("Failed to enqueue startup image download: {}", e);
-        }
     }
 
     // setup payment handlers
