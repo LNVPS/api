@@ -136,7 +136,7 @@ impl NetworkProvisioner {
         let range_cidr: IpNetwork = range.cidr.parse()?;
         let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
         // Parse stored IPs (stored as plain IP addresses)
-        let mut ips: HashSet<IpAddr> = ips.iter().map_while(|i| i.ip.parse().ok()).collect();
+        let mut ips: HashSet<IpAddr> = ips.iter().filter_map(|i| i.ip.parse().ok()).collect();
 
         let gateway: IpNetwork = parse_gateway(&range.gateway)?;
 
@@ -154,6 +154,13 @@ impl NetworkProvisioner {
             ips.insert(range_cidr.iter().last().unwrap());
         }
         ips.insert(gateway.ip());
+
+        // Early exit if the range is already full
+        if let NetworkSize::V4(size) = range_cidr.size() {
+            if ips.len() as u32 >= size {
+                bail!("No IPs available in range {}", range.cidr);
+            }
+        }
 
         // pick an IP from the range
         let ip_pick = {
