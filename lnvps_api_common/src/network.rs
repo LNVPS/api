@@ -687,7 +687,11 @@ mod tests {
             ..Default::default()
         };
         let available = NetworkProvisioner::count_available_ips(&range, 15);
-        assert_eq!(available, Some(1), "should have 1 free IP when gateway is outside range");
+        assert_eq!(
+            available,
+            Some(1),
+            "should have 1 free IP when gateway is outside range"
+        );
     }
 
     #[test]
@@ -704,7 +708,11 @@ mod tests {
             ..Default::default()
         };
         let available = NetworkProvisioner::count_available_ips(&range, 15);
-        assert_eq!(available, Some(0), "should have 0 free IPs when gateway is inside range");
+        assert_eq!(
+            available,
+            Some(0),
+            "should have 0 free IPs when gateway is inside range"
+        );
     }
 
     #[tokio::test]

@@ -482,7 +482,13 @@ mod tests {
         let history = logger.db.list_vm_history(42).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].action_type.to_string(), "created");
-        assert!(history[0].description.as_deref().unwrap_or("").contains("42"));
+        assert!(
+            history[0]
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("42")
+        );
     }
 
     #[tokio::test]
@@ -519,11 +525,13 @@ mod tests {
             .unwrap();
         let history = logger.db.list_vm_history(10).await.unwrap();
         assert_eq!(history[0].action_type.to_string(), "deleted");
-        assert!(history[0]
-            .description
-            .as_deref()
-            .unwrap_or("")
-            .contains("test reason"));
+        assert!(
+            history[0]
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("test reason")
+        );
     }
 
     #[tokio::test]
@@ -568,16 +576,26 @@ mod tests {
         let old = chrono::Utc::now();
         let new = old + chrono::TimeDelta::days(7);
         logger
-            .log_vm_extended(14, Some(99), old, new, 7, Some("admin gift".to_string()), None)
+            .log_vm_extended(
+                14,
+                Some(99),
+                old,
+                new,
+                7,
+                Some("admin gift".to_string()),
+                None,
+            )
             .await
             .unwrap();
         let history = logger.db.list_vm_history(14).await.unwrap();
         assert_eq!(history[0].action_type.to_string(), "renewed");
-        assert!(history[0]
-            .description
-            .as_deref()
-            .unwrap_or("")
-            .contains("admin gift"));
+        assert!(
+            history[0]
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .contains("admin gift")
+        );
         let meta: serde_json::Value =
             serde_json::from_slice(history[0].metadata.as_ref().unwrap()).unwrap();
         assert_eq!(meta["days_extended"], 7);

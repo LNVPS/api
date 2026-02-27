@@ -1544,7 +1544,13 @@ impl LNVpsDbBase for MockDb {
         let mut referrals = self.referrals.lock().await;
         let max_id = referrals.keys().max().copied().unwrap_or(0);
         let new_id = max_id + 1;
-        referrals.insert(new_id, Referral { id: new_id, ..referral.clone() });
+        referrals.insert(
+            new_id,
+            Referral {
+                id: new_id,
+                ..referral.clone()
+            },
+        );
         Ok(new_id)
     }
 

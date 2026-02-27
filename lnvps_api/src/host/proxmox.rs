@@ -258,6 +258,46 @@ impl ProxmoxClient {
         }
     }
 
+    /// Poll VM status until it reports `Stopped`, or until the timeout expires.
+    ///
+    /// Proxmox marks the stop *task* as complete before the VM process has fully
+    /// terminated.  Attempting to unlink (delete) the primary disk while the VM
+    /// is still shutting down can leave the disk as an unattached volume instead
+    /// of removing it.  Calling this after `wait_for_task` on the stop task
+    /// ensures the disk is truly free before any disk operations proceed.
+    pub async fn wait_for_vm_stopped(&self, vm_id: ProxmoxVmId) -> OpResult<()> {
+        self.wait_for_vm_stopped_with_interval(vm_id, Duration::from_secs(2))
+            .await
+    }
+
+    async fn wait_for_vm_stopped_with_interval(
+        &self,
+        vm_id: ProxmoxVmId,
+        poll_interval: Duration,
+    ) -> OpResult<()> {
+        let max_wait_time = Duration::from_secs(120); // 2 minutes max
+        let start_time = std::time::Instant::now();
+
+        loop {
+            if start_time.elapsed() > max_wait_time {
+                op_fatal!("VM {} did not reach stopped state within 2 minutes", vm_id);
+            }
+
+            match self.get_vm_status(&self.node, vm_id).await {
+                Ok(info) if info.status == VmStatus::Stopped => return Ok(()),
+                Ok(_) => {}
+                Err(e) => {
+                    // Log and retry — transient API errors should not abort the wait
+                    warn!(
+                        "Error polling VM {} status while waiting for stop: {}",
+                        vm_id, e
+                    );
+                }
+            }
+            sleep(poll_interval).await;
+        }
+    }
+
     async fn get_iso_storage(&self, node: &str) -> OpResult<String> {
         let storages = self.list_storage(node).await?;
         if let Some(s) = storages
@@ -974,7 +1014,10 @@ impl VmHostClient for ProxmoxClient {
         let expected_sha2 = if let Some(sha2_url) = &image.sha2_url {
             match Self::fetch_sha2_from_url(sha2_url, &url_name).await {
                 Ok(s) => {
-                    info!("Resolved checksum for {} from {}: {}", url_name, sha2_url, s);
+                    info!(
+                        "Resolved checksum for {} from {}: {}",
+                        url_name, sha2_url, s
+                    );
                     Some(s)
                 }
                 Err(e) => {
@@ -1132,6 +1175,11 @@ impl VmHostClient for ProxmoxClient {
     async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
         let task = self.stop_vm(&self.node, vm.id.into()).await?;
         self.wait_for_task(&task).await?;
+        // Wait until the VM process has fully terminated before returning.
+        // The stop task completing only means the stop command was accepted;
+        // the VM may still be shutting down.  Disk operations (e.g. unlink
+        // during reinstall) must not run while the VM is still live.
+        self.wait_for_vm_stopped(vm.id.into()).await?;
         Ok(())
     }
 
@@ -1547,7 +1595,11 @@ impl ProxmoxClient {
             anyhow::bail!("Checksum command failed (exit {}): {}", exit_code, output);
         }
 
-        let actual = output.split_whitespace().next().unwrap_or("").to_lowercase();
+        let actual = output
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
         let expected_lower = expected.to_lowercase();
         Ok(actual == expected_lower)
     }
@@ -2212,6 +2264,8 @@ mod tests {
     use super::*;
     use crate::MB;
     use crate::host::tests::mock_full_vm;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_config() -> Result<()> {
@@ -2303,14 +2357,7 @@ mod tests {
             firewall_config: None,
         };
 
-        let p = ProxmoxClient::new(
-            "http://localhost:8006".parse()?,
-            "",
-            "",
-            None,
-            q_cfg,
-            None,
-        );
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         let vm = p.make_config(&cfg)?;
         let net = vm.net.unwrap();
@@ -2338,14 +2385,7 @@ mod tests {
             firewall_config: None,
         };
 
-        let p = ProxmoxClient::new(
-            "http://localhost:8006".parse()?,
-            "",
-            "",
-            None,
-            q_cfg,
-            None,
-        );
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         let vm = p.make_config(&cfg)?;
         assert_eq!(vm.cpu_limit, Some(0.5));
@@ -2367,14 +2407,7 @@ mod tests {
             firewall_config: None,
         };
 
-        let p = ProxmoxClient::new(
-            "http://localhost:8006".parse()?,
-            "",
-            "",
-            None,
-            q_cfg,
-            None,
-        );
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         let vm = p.make_config(&cfg)?;
         assert!(
@@ -2382,6 +2415,64 @@ mod tests {
             "rate= must not appear when network_mbps is None"
         );
         assert_eq!(vm.cpu_limit, None);
+        Ok(())
+    }
+
+    /// Regression test for issue #94.
+    ///
+    /// `wait_for_vm_stopped` must keep polling until the Proxmox API reports
+    /// `stopped`, even when earlier responses report `running`.  Before the fix,
+    /// `stop_vm` returned as soon as the Proxmox *task* completed, without
+    /// verifying the VM process had actually halted — allowing `unlink_primary_disk`
+    /// to race with a still-live VM and leave an orphaned disk.
+    #[tokio::test]
+    async fn test_wait_for_vm_stopped_polls_until_stopped() -> Result<()> {
+        let server = MockServer::start().await;
+
+        let running_body = serde_json::json!({
+            "data": { "vmid": 100, "status": "running" }
+        });
+        let stopped_body = serde_json::json!({
+            "data": { "vmid": 100, "status": "stopped" }
+        });
+
+        // First two polls return "running"; third returns "stopped"
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/status/current$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&running_body))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/status/current$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&stopped_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
+
+        // Use a short poll interval so the test completes quickly
+        client
+            .wait_for_vm_stopped_with_interval(
+                ProxmoxVmId(100),
+                std::time::Duration::from_millis(10),
+            )
+            .await
+            .expect("wait_for_vm_stopped should succeed once status is stopped");
+
+        // wiremock verifies the expected call counts on drop
         Ok(())
     }
 }

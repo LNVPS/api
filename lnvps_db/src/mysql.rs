@@ -93,14 +93,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User> {
-        Ok(
-            sqlx::query_as(
-                "select * from users where email_verify_token = ? and email_verify_token != ''",
-            )
-            .bind(token)
-            .fetch_one(&self.db)
-            .await?,
+        Ok(sqlx::query_as(
+            "select * from users where email_verify_token = ? and email_verify_token != ''",
         )
+        .bind(token)
+        .fetch_one(&self.db)
+        .await?)
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {
@@ -793,11 +791,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         let mut tx = self.db.begin().await?;
 
-        sqlx::query("update vm_payment set is_paid = true, external_data = ?, paid_at = NOW() where id = ?")
-            .bind(&vm_payment.external_data)
-            .bind(&vm_payment.id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "update vm_payment set is_paid = true, external_data = ?, paid_at = NOW() where id = ?",
+        )
+        .bind(&vm_payment.external_data)
+        .bind(&vm_payment.id)
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ?")
             .bind(vm_payment.time_value)
@@ -827,12 +827,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
-        Ok(
-            sqlx::query_as("select * from vm_custom_pricing where id=?")
-                .bind(id)
-                .fetch_one(&self.db)
-                .await?,
-        )
+        Ok(sqlx::query_as("select * from vm_custom_pricing where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
     }
 
     async fn get_custom_vm_template(&self, id: u64) -> DbResult<VmCustomTemplate> {
@@ -1883,14 +1881,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
-        sqlx::query(
-            "UPDATE referral SET lightning_address = ?, use_nwc = ? WHERE id = ?",
-        )
-        .bind(&referral.lightning_address)
-        .bind(referral.use_nwc)
-        .bind(referral.id)
-        .execute(&self.db)
-        .await?;
+        sqlx::query("UPDATE referral SET lightning_address = ?, use_nwc = ? WHERE id = ?")
+            .bind(&referral.lightning_address)
+            .bind(referral.use_nwc)
+            .bind(referral.id)
+            .execute(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -1918,12 +1914,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>> {
-        Ok(
-            sqlx::query_as("SELECT * FROM referral_payout WHERE referral_id = ? ORDER BY created DESC")
-                .bind(referral_id)
-                .fetch_all(&self.db)
-                .await?,
+        Ok(sqlx::query_as(
+            "SELECT * FROM referral_payout WHERE referral_id = ? ORDER BY created DESC",
         )
+        .bind(referral_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
@@ -2857,44 +2853,44 @@ impl AdminDb for LNVpsDbMysql {
         Ok((hosts, total as u64))
     }
 
-     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
-         let query = r#"
+    async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
+        let query = r#"
              INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          "#;
 
-         let result = sqlx::query(query)
-             .bind(&pricing.name)
-             .bind(pricing.enabled)
-             .bind(pricing.created)
-             .bind(pricing.expires)
-             .bind(pricing.region_id)
-             .bind(&pricing.currency)
-             .bind(&pricing.cpu_mfg)
-             .bind(&pricing.cpu_arch)
-             .bind(&pricing.cpu_features)
-             .bind(pricing.cpu_cost)
-             .bind(pricing.memory_cost)
-             .bind(pricing.ip4_cost)
-             .bind(pricing.ip6_cost)
-             .bind(pricing.min_cpu)
-             .bind(pricing.max_cpu)
-             .bind(pricing.min_memory)
-             .bind(pricing.max_memory)
-             .bind(pricing.disk_iops_read)
-             .bind(pricing.disk_iops_write)
-             .bind(pricing.disk_mbps_read)
-             .bind(pricing.disk_mbps_write)
-             .bind(pricing.network_mbps)
-             .bind(pricing.cpu_limit)
-             .execute(&self.db)
-             .await?;
+        let result = sqlx::query(query)
+            .bind(&pricing.name)
+            .bind(pricing.enabled)
+            .bind(pricing.created)
+            .bind(pricing.expires)
+            .bind(pricing.region_id)
+            .bind(&pricing.currency)
+            .bind(&pricing.cpu_mfg)
+            .bind(&pricing.cpu_arch)
+            .bind(&pricing.cpu_features)
+            .bind(pricing.cpu_cost)
+            .bind(pricing.memory_cost)
+            .bind(pricing.ip4_cost)
+            .bind(pricing.ip6_cost)
+            .bind(pricing.min_cpu)
+            .bind(pricing.max_cpu)
+            .bind(pricing.min_memory)
+            .bind(pricing.max_memory)
+            .bind(pricing.disk_iops_read)
+            .bind(pricing.disk_iops_write)
+            .bind(pricing.disk_mbps_read)
+            .bind(pricing.disk_mbps_write)
+            .bind(pricing.network_mbps)
+            .bind(pricing.cpu_limit)
+            .execute(&self.db)
+            .await?;
 
         Ok(result.last_insert_id())
     }
 
-     async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<()> {
-         let query = r#"
+    async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<()> {
+        let query = r#"
              UPDATE vm_custom_pricing 
              SET name = ?, enabled = ?, expires = ?, region_id = ?, currency = ?, 
                  cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, cpu_cost = ?, memory_cost = ?, ip4_cost = ?, ip6_cost = ?, 
@@ -2904,32 +2900,32 @@ impl AdminDb for LNVpsDbMysql {
              WHERE id = ?
          "#;
 
-         let result = sqlx::query(query)
-             .bind(&pricing.name)
-             .bind(pricing.enabled)
-             .bind(pricing.expires)
-             .bind(pricing.region_id)
-             .bind(&pricing.currency)
-             .bind(&pricing.cpu_mfg)
-             .bind(&pricing.cpu_arch)
-             .bind(&pricing.cpu_features)
-             .bind(pricing.cpu_cost)
-             .bind(pricing.memory_cost)
-             .bind(pricing.ip4_cost)
-             .bind(pricing.ip6_cost)
-             .bind(pricing.min_cpu)
-             .bind(pricing.max_cpu)
-             .bind(pricing.min_memory)
-             .bind(pricing.max_memory)
-             .bind(pricing.disk_iops_read)
-             .bind(pricing.disk_iops_write)
-             .bind(pricing.disk_mbps_read)
-             .bind(pricing.disk_mbps_write)
-             .bind(pricing.network_mbps)
-             .bind(pricing.cpu_limit)
-             .bind(pricing.id)
-             .execute(&self.db)
-             .await?;
+        let result = sqlx::query(query)
+            .bind(&pricing.name)
+            .bind(pricing.enabled)
+            .bind(pricing.expires)
+            .bind(pricing.region_id)
+            .bind(&pricing.currency)
+            .bind(&pricing.cpu_mfg)
+            .bind(&pricing.cpu_arch)
+            .bind(&pricing.cpu_features)
+            .bind(pricing.cpu_cost)
+            .bind(pricing.memory_cost)
+            .bind(pricing.ip4_cost)
+            .bind(pricing.ip6_cost)
+            .bind(pricing.min_cpu)
+            .bind(pricing.max_cpu)
+            .bind(pricing.min_memory)
+            .bind(pricing.max_memory)
+            .bind(pricing.disk_iops_read)
+            .bind(pricing.disk_iops_write)
+            .bind(pricing.disk_mbps_read)
+            .bind(pricing.disk_mbps_write)
+            .bind(pricing.network_mbps)
+            .bind(pricing.cpu_limit)
+            .bind(pricing.id)
+            .execute(&self.db)
+            .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::Source(

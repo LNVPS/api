@@ -517,7 +517,9 @@ async fn v1_create_custom_vm_order(
 
     let user = this.db.get_user(uid).await?;
     if !user.email_verified {
-        return Err(ApiError::new("Email verification is required before creating a VM"));
+        return Err(ApiError::new(
+            "Email verification is required before creating a VM",
+        ));
     }
 
     // create a fake template from the request to generate the order
@@ -601,7 +603,9 @@ async fn v1_create_vm_order(
 
     let user = this.db.get_user(uid).await?;
     if !user.email_verified {
-        return Err(ApiError::new("Email verification is required before creating a VM"));
+        return Err(ApiError::new(
+            "Email verification is required before creating a VM",
+        ));
     }
 
     let rsp = this

@@ -139,7 +139,6 @@ async fn main() -> Result<(), Error> {
                 worker.spawn_job_interval(WorkJob::CheckNostrDomains, Duration::from_secs(600)),
             );
         }
-
     }
 
     // setup payment handlers
