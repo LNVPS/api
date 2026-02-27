@@ -34,6 +34,21 @@ These docs apply to all projects using this agent structure:
 | [docs/agents/coverage.md](docs/agents/coverage.md) | Function coverage — LNVPS-specific additions |
 | [docs/agents/e2e-tests.md](docs/agents/e2e-tests.md) | Writing or running E2E integration tests (`lnvps_e2e` crate) |
 
+## Pull Request Procedure
+
+When creating a PR that closes a GitHub issue:
+
+1. **Label the issue** — Before opening the PR, apply appropriate labels to the linked issue using `gh issue edit <number> --add-label "<label>"`. Choose from existing repo labels; create a new one with `gh label create` only if no existing label fits. Typical labels:
+   - `bug` — something is broken
+   - `enhancement` — new feature or improvement
+   - `host:proxmox` / `host:libvirt` — host-specific changes
+   - `api` — user-facing or admin API changes
+   - `database` — migration or schema changes
+   - `payments` — payment/invoice logic
+   - `refactor` — internal restructuring without behaviour change
+   - `documentation` — docs-only change
+2. **Open the PR** — Reference the issue in the PR body (`Fixes #N`).
+
 ## Release Procedure
 
 When the user asks to create a release:
