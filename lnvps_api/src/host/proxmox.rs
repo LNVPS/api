@@ -727,7 +727,7 @@ impl ProxmoxClient {
         let ip_config = value
             .ips
             .iter()
-            .map_while(|ip| {
+            .filter_map(|ip| {
                 if let Ok(addr) = ip.ip.parse::<IpAddr>() {
                     Some(match addr {
                         IpAddr::V4(_) => {
@@ -1871,7 +1871,7 @@ impl NodeStorage {
     pub fn contents(&self) -> Vec<StorageContent> {
         self.content
             .split(",")
-            .map_while(|s| StorageContent::from_str(s).ok())
+            .filter_map(|s| StorageContent::from_str(s).ok())
             .collect()
     }
 }
