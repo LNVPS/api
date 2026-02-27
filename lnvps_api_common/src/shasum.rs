@@ -145,7 +145,12 @@ pub async fn resolve_redirect(url: &str) -> String {
 
 /// Well-known shared SHASUMS filenames probed in the image's directory.
 /// Ordered from strongest to weakest algorithm.
-const CANDIDATE_SUMS_FILES: &[&str] = &["SHA512SUMS", "SHA256SUMS", "SHA512SUMS.txt", "SHA256SUMS.txt"];
+const CANDIDATE_SUMS_FILES: &[&str] = &[
+    "SHA512SUMS",
+    "SHA256SUMS",
+    "SHA512SUMS.txt",
+    "SHA256SUMS.txt",
+];
 
 /// Per-file sidecar extensions appended directly to the image filename
 /// (e.g. `foo.qcow2.SHA256`).  Ordered from strongest to weakest.
@@ -376,8 +381,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     async fn test_resolve_redirect_debian_raw_image() {
         // cloud.debian.org issues a 302 redirect to a mirror for raw images.
         // Verify that resolve_redirect follows it and returns a different (mirror) URL.
-        let url =
-            "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw";
+        let url = "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw";
         let resolved = resolve_redirect(url).await;
         assert_ne!(
             resolved, url,
@@ -473,7 +477,10 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
         let result = probe_checksum_from_image_url(image_url, filename).await;
         let (entry, sums_url) = result.expect("should find sidecar SHA256 file");
 
-        assert!(sums_url.ends_with(".SHA256"), "unexpected sums_url: {sums_url}");
+        assert!(
+            sums_url.ends_with(".SHA256"),
+            "unexpected sums_url: {sums_url}"
+        );
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
         assert_eq!(entry.checksum.len(), 64);
         Ok(())

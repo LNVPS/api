@@ -5,7 +5,9 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use lnvps_api_common::shasum::{fetch_checksum_for_file, probe_checksum_from_image_url};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
+};
 use lnvps_db::{AdminAction, AdminResource, VmOsImage};
 use log::warn;
 

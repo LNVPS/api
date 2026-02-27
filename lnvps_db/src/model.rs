@@ -1,6 +1,6 @@
 use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};

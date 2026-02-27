@@ -1,12 +1,12 @@
-use crate::network::parse_gateway;
 use crate::Template;
+use crate::network::parse_gateway;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
-    CpuArch, CpuMfg, DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate,
-    VmHost, VmHostDisk, VmIpAssignment, VmTemplate,
+    CpuArch, CpuMfg, DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost,
+    VmHostDisk, VmIpAssignment, VmTemplate,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -145,9 +145,11 @@ impl HostCapacityService {
 
             // If no host in this region has a free IPv4 slot, the template cannot
             // be ordered regardless of CPU/memory availability.
-            let has_ipv4_capacity = hosts_in_region
-                .clone()
-                .any(|h| h.ranges.iter().any(|r| r.is_ipv4() && r.available_capacity() >= 1));
+            let has_ipv4_capacity = hosts_in_region.clone().any(|h| {
+                h.ranges
+                    .iter()
+                    .any(|r| r.is_ipv4() && r.available_capacity() >= 1)
+            });
 
             // Limit the template maximums to what's actually available
             template.max_cpu = if has_ipv4_capacity {
@@ -377,11 +379,11 @@ impl HostCapacity {
     /// Can this host and its available capacity accommodate the given template
     pub fn can_accommodate(&self, template: &impl Template) -> bool {
         // Check cpu manufacturer match (Unknown means any)
-        let mfg_ok = template.cpu_mfg() == CpuMfg::Unknown
-            || self.host.cpu_mfg == template.cpu_mfg();
+        let mfg_ok =
+            template.cpu_mfg() == CpuMfg::Unknown || self.host.cpu_mfg == template.cpu_mfg();
         // Check cpu architecture match (Unknown means any)
-        let arch_ok = template.cpu_arch() == CpuArch::Unknown
-            || self.host.cpu_arch == template.cpu_arch();
+        let arch_ok =
+            template.cpu_arch() == CpuArch::Unknown || self.host.cpu_arch == template.cpu_arch();
         // Check that the host has all required CPU features (empty list means any)
         let features_ok = template.cpu_features().is_empty()
             || template
@@ -477,8 +479,8 @@ impl IPRangeCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::MockDb;
     use crate::GB;
+    use crate::mock::MockDb;
     use lnvps_db::{CpuFeature, DiskInterface, DiskType, LNVpsDbBase};
 
     #[test]
@@ -727,8 +729,7 @@ mod tests {
     #[test]
     fn can_accommodate_missing_features() {
         let cap = make_host_capacity(CpuMfg::Intel, CpuArch::X86_64, vec![CpuFeature::AVX2]);
-        let template =
-            make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![CpuFeature::AVX512F]);
+        let template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![CpuFeature::AVX512F]);
         assert!(!cap.can_accommodate(&template));
     }
 
@@ -911,12 +912,20 @@ mod tests {
     // ── apply_host_capacity_limits tests ────────────────────────────────────
 
     /// Helper to build a minimal ApiCustomTemplateParams for region 1
-    fn make_custom_template_params(max_cpu: u16, max_memory: u64) -> crate::ApiCustomTemplateParams {
-        use crate::model::{ApiCustomTemplateDiskParam, ApiDiskInterface, ApiDiskType, ApiVmHostRegion};
+    fn make_custom_template_params(
+        max_cpu: u16,
+        max_memory: u64,
+    ) -> crate::ApiCustomTemplateParams {
+        use crate::model::{
+            ApiCustomTemplateDiskParam, ApiDiskInterface, ApiDiskType, ApiVmHostRegion,
+        };
         crate::ApiCustomTemplateParams {
             id: 1,
             name: "test".to_string(),
-            region: ApiVmHostRegion { id: 1, name: "test-region".to_string() },
+            region: ApiVmHostRegion {
+                id: 1,
+                name: "test-region".to_string(),
+            },
             cpu_features: vec![],
             cpu_mfg: None,
             cpu_arch: None,

@@ -1357,7 +1357,13 @@ mod tests {
         let rates = Arc::new(MockExchangeRate::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
-        Ok(LNVpsProvisioner::new(mock_settings(), db, node, rates, None))
+        Ok(LNVpsProvisioner::new(
+            mock_settings(),
+            db,
+            node,
+            rates,
+            None,
+        ))
     }
 
     /// Insert a VmCustomPricing + one VmCustomPricingDisk into db and return the pricing id.
@@ -1857,7 +1863,11 @@ mod tests {
             .await;
         assert!(result.is_err(), "should fail with disabled template");
         assert!(
-            result.unwrap_err().to_string().to_lowercase().contains("disabled"),
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("disabled"),
             "error should mention disabled"
         );
         Ok(())
@@ -1877,7 +1887,11 @@ mod tests {
             .await;
         assert!(result.is_err(), "should fail with expired template");
         assert!(
-            result.unwrap_err().to_string().to_lowercase().contains("expired"),
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("expired"),
             "error should mention expired"
         );
         Ok(())
@@ -1941,7 +1955,11 @@ mod tests {
             .await;
         assert!(result.is_err(), "should fail with expired custom pricing");
         assert!(
-            result.unwrap_err().to_string().to_lowercase().contains("expired"),
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("expired"),
             "error should mention expired"
         );
         Ok(())
