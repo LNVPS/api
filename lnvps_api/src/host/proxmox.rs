@@ -1064,12 +1064,48 @@ impl VmHostClient for ProxmoxClient {
                 node: self.node.clone(),
                 storage: iso_storage.clone(),
                 url: resolved_url,
-                filename: storage_name,
+                filename: storage_name.clone(),
                 checksum: None,
                 checksum_algorithm: None,
             })
             .await?;
         self.wait_for_task(&t_download).await?;
+
+        // Verify the freshly-downloaded file via SSH to confirm integrity.
+        if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm) {
+            match self
+                .verify_image_checksum(&storage_name, &iso_storage, expected, algo)
+                .await
+            {
+                Ok(true) => {
+                    info!("Post-download checksum verified for {}", storage_name);
+                }
+                Ok(false) => {
+                    // Delete the corrupt file so the next run re-downloads it.
+                    warn!(
+                        "Post-download checksum mismatch for {}, deleting corrupt file",
+                        storage_name
+                    );
+                    if let Err(e) = self
+                        .delete_storage_file(&self.node, &iso_storage, &storage_name)
+                        .await
+                    {
+                        warn!("Failed to delete corrupt image {}: {}", storage_name, e);
+                    }
+                    return Err(OpError::Fatal(anyhow::anyhow!(
+                        "Checksum mismatch after download of {}",
+                        storage_name
+                    )));
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not verify post-download checksum for {}: {}",
+                        storage_name, e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
