@@ -42,7 +42,7 @@ impl Default for RedisConfig {
     fn default() -> Self {
         Self {
             url: "redis://localhost:6379".to_string(),
-            ttl: 300, // 5 minutes
+            ttl: 14400, // 4 hours
         }
     }
 }
