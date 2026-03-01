@@ -734,9 +734,10 @@ impl ProxmoxClient {
                             let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
                             let range: IpNetwork = ip_range.cidr.parse().ok()?;
                             let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
+                            let prefix = range.prefix().min(range_gw.prefix());
                             format!(
                                 "ip={},gw={}",
-                                IpNetwork::new(addr, range.prefix()).ok()?,
+                                IpNetwork::new(addr, prefix).ok()?,
                                 range_gw.ip()
                             )
                         }
@@ -750,9 +751,10 @@ impl ProxmoxClient {
                             } else {
                                 let range: IpNetwork = ip_range.cidr.parse().ok()?;
                                 let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
+                                let prefix = range.prefix().min(range_gw.prefix());
                                 format!(
                                     "ip6={},gw6={}",
-                                    IpNetwork::new(addr, range.prefix()).ok()?,
+                                    IpNetwork::new(addr, prefix).ok()?,
                                     range_gw.ip(),
                                 )
                             }
@@ -2264,6 +2266,7 @@ mod tests {
     use super::*;
     use crate::MB;
     use crate::host::tests::mock_full_vm;
+    use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2301,9 +2304,55 @@ mod tests {
         assert_eq!(
             vm.ip_config,
             Some(
-                "ip=192.168.1.2/24,gw=192.168.1.1,ip=192.168.2.2/24,gw=10.10.10.10,ip6=auto"
+                "ip=192.168.1.2/16,gw=192.168.1.1,ip=192.168.2.2/24,gw=10.10.10.10,ip6=auto"
                     .to_string()
             )
+        );
+        Ok(())
+    }
+
+    /// Regression test: when the gateway CIDR is wider than the allocation range,
+    /// the IP config should use the gateway's prefix so the OS sees the gateway
+    /// as inside the subnet (fixes Debian 13 compatibility).
+    #[test]
+    fn test_config_widens_cidr_to_gateway() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        // Override range 1: allocation /26 (185.18.221.64-127), gateway in wider /24
+        cfg.ranges[0] = IpRange {
+            id: 1,
+            cidr: "185.18.221.64/26".to_string(),
+            gateway: "185.18.221.1/24".to_string(),
+            enabled: true,
+            region_id: 1,
+            ..Default::default()
+        };
+        // Update the assigned IP to be within the /26 allocation range
+        cfg.ips[0].ip = "185.18.221.65".to_string();
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
+
+        let vm = p.make_config(&cfg)?;
+        let ip_config = vm.ip_config.unwrap();
+        // The IP should use /24 (gateway prefix), not /26 (range prefix),
+        // so the gateway 185.18.221.1 is inside the VM's subnet.
+        assert!(
+            ip_config.contains("185.18.221.65/24"),
+            "expected /24 (gateway prefix) but got: {}",
+            ip_config
+        );
+        assert!(
+            ip_config.contains("gw=185.18.221.1"),
+            "expected gateway 185.18.221.1 but got: {}",
+            ip_config
         );
         Ok(())
     }
