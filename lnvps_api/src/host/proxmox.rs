@@ -2266,6 +2266,7 @@ mod tests {
     use super::*;
     use crate::MB;
     use crate::host::tests::mock_full_vm;
+    use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
