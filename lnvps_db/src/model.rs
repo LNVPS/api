@@ -1515,6 +1515,9 @@ pub struct Subscription {
     pub created: DateTime<Utc>,
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
+    /// Whether the initial setup (purchase) payment has been confirmed.
+    /// Used to determine if setup fees apply on the next renewal invoice.
+    pub is_setup: bool,
     pub currency: String,
     /// Number of intervals per billing cycle (e.g. 1 for "every 1 month")
     pub interval_amount: u64,

@@ -222,6 +222,7 @@ async fn v1_create_subscription(
         created: Utc::now(),
         expires: None,    // Will be set after first payment
         is_active: false, // Inactive until first payment
+        is_setup: false,  // Set to true once purchase payment is confirmed
         currency,
         interval_amount: 1,
         interval_type: IntervalType::Month,

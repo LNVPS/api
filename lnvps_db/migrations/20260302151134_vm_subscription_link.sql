@@ -1,8 +1,11 @@
 -- Re-add interval columns to subscription (were dropped in 20260130000003)
--- Needed so VMs can use subscriptions with configurable billing intervals
+-- Needed so VMs can use subscriptions with configurable billing intervals.
+-- Add is_setup flag: true once the first (purchase) payment has been confirmed.
+-- Replaces scanning payment history to determine whether setup fees apply.
 ALTER TABLE subscription
     ADD COLUMN interval_amount INTEGER UNSIGNED NOT NULL DEFAULT 1 AFTER currency,
-    ADD COLUMN interval_type SMALLINT UNSIGNED NOT NULL DEFAULT 1 AFTER interval_amount;
+    ADD COLUMN interval_type SMALLINT UNSIGNED NOT NULL DEFAULT 1 AFTER interval_amount,
+    ADD COLUMN is_setup BIT(1) NOT NULL DEFAULT 0 AFTER is_active;
 -- interval_type: 0=Day, 1=Month, 2=Year (default Month)
 
 -- Re-add time_value and add metadata to subscription_payment

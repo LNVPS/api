@@ -142,6 +142,7 @@ impl LNVpsProvisioner {
             created: Utc::now(),
             expires: None,
             is_active: false,
+            is_setup: false,
             currency: cost_plan.currency.clone(),
             interval_amount: cost_plan.interval_amount,
             interval_type: cost_plan.interval_type,
@@ -241,7 +242,6 @@ impl LNVpsProvisioner {
 
         // insert custom templates
         let template_id = self.db.insert_custom_vm_template(&template).await?;
-
         let region = self.db.get_host_region(pricing.region_id).await?;
 
         // Create subscription for this custom VM (1-month interval, amount computed at payment time)
@@ -249,11 +249,12 @@ impl LNVpsProvisioner {
             id: 0,
             user_id: user.id,
             company_id: region.company_id,
-            name: format!("Custom VM subscription"),
+            name: "Custom VM subscription".to_string(),
             description: None,
             created: Utc::now(),
             expires: None,
             is_active: false,
+            is_setup: false,
             currency: pricing.currency.clone(),
             interval_amount: 1,
             interval_type: IntervalType::Month,
@@ -392,24 +393,40 @@ impl LNVpsProvisioner {
         // Get user for tax calculation
         let user = self.db.get_user(subscription.user_id).await?;
 
-        // Calculate total cost in subscription currency
+        // Calculate total cost in subscription currency.
+        // VmRenewal line items always compute their current cost via the
+        // pricing engine — never use the stored amount, which may be stale
+        // (or zero for custom VMs with dynamic pricing).
+        // Non-VM line items use their stored amount directly.
         let mut monthly_cost: u64 = 0;
         let mut setup_fee: u64 = 0;
 
         for item in &line_items {
-            monthly_cost += item.amount;
+            let item_amount = if item.subscription_type == SubscriptionType::VmRenewal {
+                let vm = self.db.get_vm_by_line_item(item.id).await?;
+                let pe = PricingEngine::new_for_vm(
+                    self.db.clone(),
+                    self.rates.clone(),
+                    self.tax_rates.clone(),
+                    vm.id,
+                )
+                .await?;
+                match pe.get_vm_cost_for_intervals(vm.id, method, 1).await? {
+                    CostResult::New(p) => p.amount,
+                    CostResult::Existing(p) => p.amount,
+                }
+            } else {
+                item.amount
+            };
+            monthly_cost += item_amount;
             setup_fee += item.setup_amount;
         }
 
-        // Check if this is first payment (purchase) or renewal
-        let existing_payments = self.db.list_subscription_payments(subscription_id).await?;
-        let has_paid = existing_payments.iter().any(|p| p.is_paid);
-
-        let (list_price_amount, payment_type) = if has_paid {
-            // Renewal - monthly cost only
+        // is_setup is set to true once the first (purchase) payment is confirmed.
+        // Use it directly instead of scanning payment history.
+        let (list_price_amount, payment_type) = if subscription.is_setup {
             (monthly_cost, SubscriptionPaymentType::Renewal)
         } else {
-            // Purchase - monthly cost + setup fees
             (monthly_cost + setup_fee, SubscriptionPaymentType::Purchase)
         };
 
@@ -1523,6 +1540,7 @@ mod tests {
                     created: Utc::now(),
                     expires: None,
                     is_active: false,
+                    is_setup: false,
                     currency: "BTC".to_string(),
                     interval_amount: 1,
                     interval_type: IntervalType::Month,

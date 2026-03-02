@@ -268,6 +268,7 @@ impl Default for MockDb {
                         created: Utc::now(),
                         expires: None,
                         is_active: false,
+                        is_setup: false,
                         currency: "BTC".to_string(),
                         interval_amount: 1,
                         interval_type: IntervalType::Month,
@@ -1454,6 +1455,7 @@ impl LNVpsDbBase for MockDb {
             };
             subscription.expires = Some(new_expires);
             subscription.is_active = true;
+            subscription.is_setup = true;
         }
 
         Ok(())
