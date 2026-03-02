@@ -310,6 +310,102 @@ impl ProxmoxClient {
         }
     }
 
+    /// Find a storage pool that supports snippets content type
+    async fn get_snippet_storage(&self, node: &str) -> OpResult<Option<String>> {
+        let storages = self.list_storage(node).await?;
+        Ok(storages
+            .iter()
+            .find(|s| s.contents().contains(&StorageContent::Snippets))
+            .map(|s| s.storage.clone()))
+    }
+
+    /// Ensure the shared vendor-data snippet for cloud-init exists on the host.
+    ///
+    /// This snippet disables SSH host key regeneration so that cloud-init
+    /// reconfiguration (IP changes, SSH key updates, etc.) does not cause
+    /// host-key warnings for users connecting via SSH.
+    ///
+    /// The snippet is written once via SSH to the storage's snippet directory.
+    /// Returns the Proxmox volume reference (e.g. `local:snippets/lnvps-vendor.yaml`)
+    /// or `None` if SSH is not configured or no snippet storage is available.
+    async fn ensure_vendor_snippet(&self) -> OpResult<Option<String>> {
+        let ssh_config = match &self.ssh {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let storage_name = match self.get_snippet_storage(&self.node).await? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let snippet_filename = "lnvps-vendor.yaml";
+        let snippet_content = "#cloud-config\nssh_deletekeys: false\nssh_genkeytypes: []\n";
+
+        // Snippet storage path depends on the storage type; for the default
+        // `local` storage this is `/var/lib/vz/snippets/`.  For other directory-
+        // based storages it varies.  We use `pvesm path` to resolve it.
+        let host = self.api.base().host().unwrap().to_string();
+        let ssh_user = ssh_config.user.clone();
+        let ssh_key = ssh_config.key.clone();
+
+        let mut ssh = SshClient::new().map_err(OpError::Transient)?;
+        ssh.connect((host.clone(), 22), &ssh_user, &ssh_key)
+            .await
+            .map_err(OpError::Transient)?;
+
+        let vol_ref = format!("{storage_name}:snippets/{snippet_filename}");
+
+        // Resolve the on-disk path for the snippet volume reference
+        let (exit_code, path_output) = ssh
+            .execute(&format!("pvesm path '{vol_ref}'"))
+            .await
+            .map_err(OpError::Transient)?;
+
+        if exit_code != 0 {
+            info!(
+                "Cannot resolve snippet path for {}: {}",
+                vol_ref,
+                path_output.trim()
+            );
+            return Ok(None);
+        }
+        let snippet_path = path_output.trim();
+
+        // Ensure parent directory exists and write only if missing or changed
+        let (_, existing) = ssh
+            .execute(&format!("cat '{snippet_path}' 2>/dev/null || true"))
+            .await
+            .map_err(OpError::Transient)?;
+
+        if existing.trim() != snippet_content.trim() {
+            let parent = snippet_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/tmp");
+            ssh.execute(&format!("mkdir -p '{parent}'"))
+                .await
+                .map_err(OpError::Transient)?;
+
+            let (code, output) = ssh
+                .execute(&format!(
+                    "printf '%s' '{}' > '{}'",
+                    snippet_content, snippet_path
+                ))
+                .await
+                .map_err(OpError::Transient)?;
+
+            if code != 0 {
+                info!(
+                    "Failed to write vendor snippet to {}: {}",
+                    snippet_path,
+                    output.trim()
+                );
+                return Ok(None);
+            }
+            info!("Wrote cloud-init vendor snippet to {}", snippet_path);
+        }
+
+        Ok(Some(vol_ref))
+    }
+
     /// Download an image to the host disk
     pub async fn download_image(&self, req: DownloadUrlRequest) -> OpResult<TaskId> {
         let api = &self.api;
@@ -723,7 +819,11 @@ impl ProxmoxClient {
         }
     }
 
-    fn make_config(&self, value: &FullVmInfo) -> Result<VmConfig> {
+    fn make_config(
+        &self,
+        value: &FullVmInfo,
+        vendor_snippet: Option<&str>,
+    ) -> Result<VmConfig> {
         let ip_config = value
             .ips
             .iter()
@@ -786,6 +886,8 @@ impl ProxmoxClient {
             net.push(format!("rate={}", mbps as f32 / 8.0));
         }
 
+        let cicustom = vendor_snippet.map(|vol_ref| format!("vendor={vol_ref}"));
+
         let vm_resources = value.resources()?;
         Ok(VmConfig {
             name: Some(format!("VM{}", value.vm.id)), // set name to DB name
@@ -806,6 +908,7 @@ impl ProxmoxClient {
             ssh_keys: Some(urlencoding::encode(value.ssh_key.key_data.as_str()).to_string()),
             efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
             cpu_limit: limits.cpu_limit,
+            cicustom,
             ..Default::default()
         })
     }
@@ -1192,7 +1295,8 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn create_vm(&self, req: &FullVmInfo) -> OpResult<()> {
-        let config = self.make_config(req)?;
+        let vendor_snippet = self.ensure_vendor_snippet().await?;
+        let config = self.make_config(req, vendor_snippet.as_deref())?;
         let vm_id: ProxmoxVmId = req.vm.id.into();
 
         let ctx = CreateVmContext {
@@ -1303,7 +1407,8 @@ impl VmHostClient for ProxmoxClient {
     async fn configure_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
         let current_config = self.get_vm_config(&self.node, cfg.vm.id.into()).await?;
 
-        let mut config = self.make_config(cfg)?;
+        let vendor_snippet = self.ensure_vendor_snippet().await?;
+        let mut config = self.make_config(cfg, vendor_snippet.as_deref())?;
 
         // dont re-create the disks
         config.scsi_0 = None;
@@ -1311,6 +1416,9 @@ impl VmHostClient for ProxmoxClient {
         config.efi_disk_0 = None;
         if current_config.config.ssh_keys == config.ssh_keys {
             config.ssh_keys = None;
+        }
+        if current_config.config.cicustom == config.cicustom {
+            config.cicustom = None;
         }
 
         self.configure_vm(ConfigureVm {
@@ -1334,7 +1442,7 @@ impl VmHostClient for ProxmoxClient {
 
         // Check and fix cloud-init IP config if it doesn't match expected
         let current_config = self.get_vm_config(&self.node, vm_id).await?;
-        let expected_config = self.make_config(cfg)?;
+        let expected_config = self.make_config(cfg, None)?;
         if current_config.config.ip_config != expected_config.ip_config {
             info!(
                 "IP config mismatch for VM {}: current={:?}, expected={:?}",
@@ -2043,6 +2151,9 @@ pub struct VmConfig {
     #[serde(rename = "cpulimit")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit: Option<f32>,
+    /// Custom cloud-init config files (e.g. "vendor=local:snippets/lnvps-vendor.yaml")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cicustom: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2294,7 +2405,7 @@ mod tests {
             None,
         );
 
-        let vm = p.make_config(&cfg)?;
+        let vm = p.make_config(&cfg, None)?;
         assert_eq!(vm.cpu, Some(q_cfg.cpu));
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
@@ -2340,7 +2451,7 @@ mod tests {
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg)?;
+        let vm = p.make_config(&cfg, None)?;
         let ip_config = vm.ip_config.unwrap();
         // The IP should use /24 (gateway prefix), not /26 (range prefix),
         // so the gateway 185.18.221.1 is inside the VM's subnet.
@@ -2408,7 +2519,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg)?;
+        let vm = p.make_config(&cfg, None)?;
         let net = vm.net.unwrap();
         // 800 Mbit/s ÷ 8 = 100 MB/s
         assert!(
@@ -2436,7 +2547,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg)?;
+        let vm = p.make_config(&cfg, None)?;
         assert_eq!(vm.cpu_limit, Some(0.5));
         Ok(())
     }
@@ -2458,12 +2569,47 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg)?;
+        let vm = p.make_config(&cfg, None)?;
         assert!(
             !vm.net.as_deref().unwrap_or("").contains("rate="),
             "rate= must not appear when network_mbps is None"
         );
         assert_eq!(vm.cpu_limit, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cicustom_set_when_vendor_snippet_provided() -> Result<()> {
+        let cfg = mock_full_vm();
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "host".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        // With vendor snippet
+        let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"))?;
+        assert_eq!(
+            vm.cicustom,
+            Some("vendor=local:snippets/lnvps-vendor.yaml".to_string())
+        );
+
+        // Without vendor snippet
+        let vm = p.make_config(&cfg, None)?;
+        assert_eq!(vm.cicustom, None);
+
         Ok(())
     }
 
