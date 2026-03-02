@@ -136,6 +136,7 @@ impl LNVpsProvisioner {
             image_id: image.id,
             template_id: Some(template.id),
             custom_template_id: None,
+            subscription_id: None,
             ssh_key_id: ssh_key.id,
             created: now,
             expires: now,
@@ -212,6 +213,7 @@ impl LNVpsProvisioner {
             image_id: image.id,
             template_id: None,
             custom_template_id: Some(template_id),
+            subscription_id: None,
             ssh_key_id: ssh_key.id,
             created: now,
             expires: now,
@@ -391,6 +393,9 @@ impl LNVpsProvisioner {
                     SubscriptionPaymentType::Renewal => {
                         format!("Subscription renewal: {}", subscription.name)
                     }
+                    SubscriptionPaymentType::Upgrade => {
+                        format!("Subscription upgrade: {}", subscription.name)
+                    }
                 };
 
                 info!(
@@ -422,6 +427,8 @@ impl LNVpsProvisioner {
                     external_id: invoice.external_id,
                     is_paid: false,
                     rate: converted.rate.rate,
+                    time_value: None,
+                    metadata: None,
                     tax,
                     processing_fee,
                     paid_at: None,
@@ -444,6 +451,9 @@ impl LNVpsProvisioner {
                     }
                     SubscriptionPaymentType::Renewal => {
                         format!("Subscription renewal: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Upgrade => {
+                        format!("Subscription upgrade: {}", subscription.name)
                     }
                 };
 
@@ -468,6 +478,8 @@ impl LNVpsProvisioner {
                     external_id: Some(order.external_id),
                     is_paid: false,
                     rate: converted.rate.rate,
+                    time_value: None,
+                    metadata: None,
                     tax,
                     processing_fee,
                     paid_at: None,

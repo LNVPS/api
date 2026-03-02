@@ -2226,6 +2226,8 @@ pub struct AdminSubscriptionInfo {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
@@ -2242,9 +2244,23 @@ pub struct AdminCreateSubscriptionRequest {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub currency: String,
+    /// Number of intervals per billing cycle (default 1)
+    #[serde(default = "default_interval_amount")]
+    pub interval_amount: u64,
+    /// Interval unit: "day", "month", or "year" (default "month")
+    #[serde(default = "default_interval_type")]
+    pub interval_type: ApiIntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
+}
+
+fn default_interval_amount() -> u64 {
+    1
+}
+
+fn default_interval_type() -> ApiIntervalType {
+    ApiIntervalType::Month
 }
 
 #[derive(Deserialize)]
@@ -2278,6 +2294,8 @@ impl From<lnvps_db::Subscription> for AdminSubscriptionInfo {
             expires: subscription.expires,
             is_active: subscription.is_active,
             currency: subscription.currency,
+            interval_amount: subscription.interval_amount,
+            interval_type: ApiIntervalType::from(subscription.interval_type),
             setup_fee: subscription.setup_fee,
             auto_renewal_enabled: subscription.auto_renewal_enabled,
             external_id: subscription.external_id,
@@ -2307,6 +2325,8 @@ impl AdminCreateSubscriptionRequest {
             expires: self.expires,
             is_active: self.is_active,
             currency: self.currency.trim().to_uppercase(),
+            interval_amount: self.interval_amount,
+            interval_type: lnvps_db::IntervalType::from(self.interval_type),
             setup_fee: self.setup_fee,
             auto_renewal_enabled: self.auto_renewal_enabled,
             external_id: self.external_id.clone(),
@@ -2397,6 +2417,10 @@ pub struct AdminSubscriptionPaymentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paid_at: Option<DateTime<Utc>>,
     pub rate: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_value: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     pub tax: u64,
     pub processing_fee: u64,
 }
@@ -2405,6 +2429,7 @@ pub struct AdminSubscriptionPaymentInfo {
 pub enum ApiSubscriptionPaymentType {
     Purchase,
     Renewal,
+    Upgrade,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -2412,6 +2437,7 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
         match payment_type {
             lnvps_db::SubscriptionPaymentType::Purchase => ApiSubscriptionPaymentType::Purchase,
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
+            lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
         }
     }
 }
@@ -2421,6 +2447,7 @@ impl From<ApiSubscriptionPaymentType> for lnvps_db::SubscriptionPaymentType {
         match payment_type {
             ApiSubscriptionPaymentType::Purchase => lnvps_db::SubscriptionPaymentType::Purchase,
             ApiSubscriptionPaymentType::Renewal => lnvps_db::SubscriptionPaymentType::Renewal,
+            ApiSubscriptionPaymentType::Upgrade => lnvps_db::SubscriptionPaymentType::Upgrade,
         }
     }
 }
@@ -2441,6 +2468,8 @@ impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
             is_paid: payment.is_paid,
             paid_at: payment.paid_at,
             rate: payment.rate,
+            time_value: payment.time_value,
+            metadata: payment.metadata,
             tax: payment.tax,
             processing_fee: payment.processing_fee,
         }

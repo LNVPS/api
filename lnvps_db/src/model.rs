@@ -881,6 +881,8 @@ pub struct Vm {
     pub template_id: Option<u64>,
     /// Custom pricing specification used for this vm [VmCustomTemplate]
     pub custom_template_id: Option<u64>,
+    /// Subscription linked to this VM (nullable during migration)
+    pub subscription_id: Option<u64>,
     /// Users ssh-key assigned to this VM
     pub ssh_key_id: u64,
     /// When the VM was created
@@ -1488,6 +1490,8 @@ pub enum SubscriptionPaymentType {
     Purchase = 0,
     /// Recurring renewal payment
     Renewal = 1,
+    /// VM upgrade payment
+    Upgrade = 2,
 }
 
 impl Display for SubscriptionPaymentType {
@@ -1495,11 +1499,12 @@ impl Display for SubscriptionPaymentType {
         match self {
             SubscriptionPaymentType::Purchase => write!(f, "Purchase"),
             SubscriptionPaymentType::Renewal => write!(f, "Renewal"),
+            SubscriptionPaymentType::Upgrade => write!(f, "Upgrade"),
         }
     }
 }
 
-/// Subscription for a recurring service (always monthly billing)
+/// Subscription for a recurring service
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: u64,
@@ -1511,6 +1516,10 @@ pub struct Subscription {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub currency: String,
+    /// Number of intervals per billing cycle (e.g. 1 for "every 1 month")
+    pub interval_amount: u64,
+    /// Interval unit (Day, Month, Year)
+    pub interval_type: IntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
@@ -1523,6 +1532,8 @@ pub enum SubscriptionType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
+    VmRenewal = 3,     // VM renewal subscription
+    VmUpgrade = 4,     // VM upgrade subscription
 }
 
 impl Display for SubscriptionType {
@@ -1531,6 +1542,8 @@ impl Display for SubscriptionType {
             SubscriptionType::IpRange => write!(f, "IP Range"),
             SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
             SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
+            SubscriptionType::VmRenewal => write!(f, "VM Renewal"),
+            SubscriptionType::VmUpgrade => write!(f, "VM Upgrade"),
         }
     }
 }
@@ -1564,6 +1577,10 @@ pub struct SubscriptionPayment {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
+    /// Number of seconds this payment adds to subscription expiry
+    pub time_value: Option<u64>,
+    /// JSON metadata (e.g. upgrade parameters)
+    pub metadata: Option<serde_json::Value>,
     pub tax: u64,
     pub processing_fee: u64,
     /// Timestamp when the payment was completed
@@ -1586,6 +1603,10 @@ pub struct SubscriptionPaymentWithCompany {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
+    /// Number of seconds this payment adds to subscription expiry
+    pub time_value: Option<u64>,
+    /// JSON metadata (e.g. upgrade parameters)
+    pub metadata: Option<serde_json::Value>,
     pub tax: u64,
     pub processing_fee: u64,
     /// Timestamp when the payment was completed

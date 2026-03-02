@@ -29,20 +29,19 @@ Full plan details captured in this work file.
 - [x] Verify build + tests pass
 
 ### Increment 1: Schema migration + database layer
-- [ ] Create SQL migration: add `time_value`, `metadata` to `subscription_payment`
-- [ ] Create SQL migration: re-add `interval_amount`, `interval_type` to `subscription`
-- [ ] Create SQL migration: add `subscription_id` to `vm` (nullable)
-- [ ] Create SQL migration: add `subscription_id` to `ip_range_subscription` (nullable)
-- [ ] Backfill existing subscriptions with `interval_amount=1, interval_type=1` (Month)
-- [ ] Add `VmRenewal=3`, `VmUpgrade=4` to `SubscriptionType` enum
-- [ ] Add `Upgrade=2` to `PaymentType` enum (rename from `SubscriptionPaymentType`)
-- [ ] Update `SubscriptionPayment` struct: add `time_value`, `metadata`
-- [ ] Update `Subscription` struct: add `interval_amount`, `interval_type`
-- [ ] Update `Vm` struct: add `subscription_id`
-- [ ] Update `subscription_payment_paid()`: VM path (extend by time_value) + regular path (read interval from subscription)
-- [ ] Add `list_vm_payments()` query (via vm.subscription_id)
-- [ ] Add `get_vm_by_subscription()` query
-- [ ] Verify build + tests pass
+- [x] Create SQL migration `20260302151134_vm_subscription_link.sql`: re-add `interval_amount`, `interval_type` to `subscription`; add `time_value`, `metadata` to `subscription_payment`; add `subscription_id` to `vm`
+- [x] Backfill via DEFAULT values (interval_amount=1, interval_type=1=Month)
+- [x] Add `VmRenewal=3`, `VmUpgrade=4` to `SubscriptionType` enum
+- [x] Add `Upgrade=2` to `SubscriptionPaymentType` enum
+- [x] Update `SubscriptionPayment` / `SubscriptionPaymentWithCompany` structs: add `time_value`, `metadata`
+- [x] Update `Subscription` struct: add `interval_amount`, `interval_type`
+- [x] Update `Vm` struct: add `subscription_id` (nullable)
+- [x] Fix `subscription_payment_paid()` transaction bug; add VM path (time_value) + regular path (interval from subscription)
+- [x] Add `get_vm_by_subscription()` and `list_vm_subscription_payments()` to trait + MySQL + mock
+- [x] Update `insert_vm` / `update_vm` SQL to include `subscription_id`
+- [x] Propagate new fields through all API models (admin + user-facing)
+- [x] Fix all `Subscription {}` / `SubscriptionPayment {}` / `Vm {}` struct literals in source + tests
+- [x] Verify build + tests pass
 
 ### Increment 2: Data migration tool
 - [ ] Create `lnvps_db/src/data_migrations/mod.rs` with registry

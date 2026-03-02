@@ -227,6 +227,15 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
 
+    /// Get a VM by its subscription ID
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm>;
+
+    /// List subscription payments for a VM (via vm.subscription_id)
+    async fn list_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
+
     /// List VM ip assignments
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64>;
 

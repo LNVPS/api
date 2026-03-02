@@ -8,7 +8,7 @@ use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
 };
-use lnvps_db::{PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
+use lnvps_db::{IntervalType, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
 use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
@@ -212,7 +212,7 @@ async fn v1_create_subscription(
     let company_id = derived_company_id
         .ok_or_else(|| anyhow::anyhow!("Could not determine company from line items"))?;
 
-    // Create the subscription (always monthly interval)
+    // Create the subscription (always monthly interval for IP/ASN/DNS subscriptions)
     let subscription = Subscription {
         id: 0, // Will be set by database
         user_id: uid,
@@ -223,6 +223,8 @@ async fn v1_create_subscription(
         expires: None,    // Will be set after first payment
         is_active: false, // Inactive until first payment
         currency,
+        interval_amount: 1,
+        interval_type: IntervalType::Month,
         setup_fee: total_setup_fee,
         auto_renewal_enabled: auto_renewal,
         external_id: None,

@@ -1,6 +1,6 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow};
-use chrono::{TimeDelta, Utc};
+use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
@@ -105,6 +105,7 @@ impl MockDb {
             image_id: 1,
             template_id: Some(template.id),
             custom_template_id: None,
+            subscription_id: None,
             ssh_key_id: 1,
             created: Utc::now(),
             expires: Default::default(),
@@ -671,6 +672,7 @@ impl LNVpsDbBase for MockDb {
             v.image_id = vm.image_id;
             v.template_id = vm.template_id;
             v.custom_template_id = vm.custom_template_id;
+            v.subscription_id = vm.subscription_id;
             v.ssh_key_id = vm.ssh_key_id;
             v.expires = vm.expires;
             v.disk_id = vm.disk_id;
@@ -679,6 +681,37 @@ impl LNVpsDbBase for MockDb {
             v.disabled = vm.disabled;
         }
         Ok(())
+    }
+
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+        let vms = self.vms.lock().await;
+        vms.values()
+            .find(|v| v.subscription_id == Some(subscription_id) && !v.deleted)
+            .cloned()
+            .ok_or_else(|| anyhow!("VM not found for subscription {}", subscription_id).into())
+    }
+
+    async fn list_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let vms = self.vms.lock().await;
+        let vm = vms
+            .get(&vm_id)
+            .ok_or_else(|| DbError::Other(anyhow!("VM not found")))?;
+        let subscription_id = vm
+            .subscription_id
+            .ok_or_else(|| DbError::Other(anyhow!("VM has no subscription")))?;
+        drop(vms);
+
+        let payments = self.subscription_payments.lock().await;
+        let mut result: Vec<_> = payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(result)
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
@@ -1280,6 +1313,8 @@ impl LNVpsDbBase for MockDb {
             external_id: payment.external_id,
             is_paid: payment.is_paid,
             rate: payment.rate,
+            time_value: payment.time_value,
+            metadata: payment.metadata,
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             paid_at: payment.paid_at,
@@ -1313,15 +1348,29 @@ impl LNVpsDbBase for MockDb {
         }
         drop(payments);
 
-        // Extend subscription expiration by 30 days (subscriptions are always monthly)
         let mut subscriptions = self.subscriptions.lock().await;
         if let Some(subscription) = subscriptions.get_mut(&payment.subscription_id) {
-            if let Some(expires) = subscription.expires {
-                subscription.expires = Some(expires.add(TimeDelta::days(30)));
+            let base = subscription
+                .expires
+                .unwrap_or_else(Utc::now)
+                .max(Utc::now());
+
+            let new_expires = if let Some(time_value) = payment.time_value {
+                // VM path: extend by explicit time_value seconds
+                base.add(TimeDelta::seconds(time_value as i64))
             } else {
-                // If no expiration yet, set it from now
-                subscription.expires = Some(Utc::now().add(TimeDelta::days(30)));
-            }
+                // Regular subscription path: use interval from subscription
+                match subscription.interval_type {
+                    IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
+                    IntervalType::Month => {
+                        base.add(Months::new(subscription.interval_amount as u32))
+                    }
+                    IntervalType::Year => {
+                        base.add(Months::new((12 * subscription.interval_amount) as u32))
+                    }
+                }
+            };
+            subscription.expires = Some(new_expires);
             subscription.is_active = true;
         }
 

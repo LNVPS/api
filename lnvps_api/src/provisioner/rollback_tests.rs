@@ -560,6 +560,7 @@ mod tests {
             ssh_key_id: ssh_key.id,
             template_id: Some(1),
             custom_template_id: None,
+            subscription_id: None,
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
             expires: chrono::Utc::now() + chrono::Duration::days(30),

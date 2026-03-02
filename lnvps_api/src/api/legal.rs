@@ -244,6 +244,8 @@ async fn v1_generate_lir_agreement_from_subscription(
                 }
                 lnvps_db::SubscriptionType::AsnSponsoring => "AS Number".to_string(),
                 lnvps_db::SubscriptionType::DnsHosting => "DNS Hosting".to_string(),
+                lnvps_db::SubscriptionType::VmRenewal => "VM Renewal".to_string(),
+                lnvps_db::SubscriptionType::VmUpgrade => "VM Upgrade".to_string(),
             };
 
             let quantity = li

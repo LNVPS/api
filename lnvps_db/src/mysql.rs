@@ -1,6 +1,7 @@
 use crate::{
-    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IntervalType, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
+    PaymentType, Referral,
     ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
@@ -572,12 +573,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
+            .bind(vm.subscription_id)
             .bind(vm.ssh_key_id)
             .bind(vm.created)
             .bind(vm.expires)
@@ -600,11 +602,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
+            .bind(vm.subscription_id)
             .bind(vm.ssh_key_id)
             .bind(vm.expires)
             .bind(vm.disk_id)
@@ -615,6 +618,30 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm WHERE subscription_id = ? AND deleted = 0")
+                .bind(subscription_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT sp.* FROM subscription_payment sp \
+             INNER JOIN vm v ON v.subscription_id = sp.subscription_id \
+             WHERE v.id = ? \
+             ORDER BY sp.created DESC",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
@@ -1457,14 +1484,39 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(tx.as_mut())
             .await?;
 
-        // Subscriptions are always monthly - extend by 30 days and activate
-        sqlx::query(
-            "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL 30 DAY), is_active = 1 WHERE id = ?"
-        )
-        .bind(payment.subscription_id)
-        .execute(&self.db)
-        .await?;
+        if let Some(time_value) = payment.time_value {
+            // VM path: extend by explicit time_value seconds
+            sqlx::query(
+                "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? SECOND), is_active = 1 WHERE id = ?",
+            )
+            .bind(time_value)
+            .bind(payment.subscription_id)
+            .execute(tx.as_mut())
+            .await?;
+        } else {
+            // Regular subscription path: read interval from the subscription itself
+            let sub: Subscription =
+                sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
+                    .bind(payment.subscription_id)
+                    .fetch_one(tx.as_mut())
+                    .await?;
+            let interval_sql = match sub.interval_type {
+                IntervalType::Day => "DAY",
+                IntervalType::Month => "MONTH",
+                IntervalType::Year => "YEAR",
+            };
+            let sql = format!(
+                "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? {}), is_active = 1 WHERE id = ?",
+                interval_sql
+            );
+            sqlx::query(&sql)
+                .bind(sub.interval_amount)
+                .bind(payment.subscription_id)
+                .execute(tx.as_mut())
+                .await?;
+        }
 
+        tx.commit().await?;
         Ok(())
     }
 
