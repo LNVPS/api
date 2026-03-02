@@ -345,14 +345,14 @@ impl LNVpsProvisioner {
         &self,
         vm_id: u64,
         method: PaymentMethod,
-        _intervals: u32,
+        intervals: u32,
     ) -> Result<lnvps_db::SubscriptionPayment> {
         let vm = self.db.get_vm(vm_id).await?;
         let line_item = self
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
-        self.renew_subscription(line_item.subscription_id, method)
+        self.renew_subscription(line_item.subscription_id, method, intervals)
             .await
     }
 
@@ -379,8 +379,11 @@ impl LNVpsProvisioner {
         &self,
         subscription_id: u64,
         method: PaymentMethod,
+        intervals: u32,
     ) -> Result<lnvps_db::SubscriptionPayment> {
         use lnvps_db::{SubscriptionPayment, SubscriptionPaymentType};
+
+        let intervals = intervals.max(1);
 
         // Get subscription and line items
         let subscription = self.db.get_subscription(subscription_id).await?;
@@ -393,12 +396,12 @@ impl LNVpsProvisioner {
         // Get user for tax calculation
         let user = self.db.get_user(subscription.user_id).await?;
 
-        // Calculate total cost in subscription currency.
+        // Calculate total cost per interval in subscription currency.
         // VmRenewal line items always compute their current cost via the
         // pricing engine — never use the stored amount, which may be stale
         // (or zero for custom VMs with dynamic pricing).
         // Non-VM line items use their stored amount directly.
-        let mut monthly_cost: u64 = 0;
+        let mut per_interval_cost: u64 = 0;
         let mut setup_fee: u64 = 0;
 
         for item in &line_items {
@@ -411,23 +414,23 @@ impl LNVpsProvisioner {
                     vm.id,
                 )
                 .await?;
-                match pe.get_vm_cost_for_intervals(vm.id, method, 1).await? {
+                match pe.get_vm_cost_for_intervals(vm.id, method, intervals).await? {
                     CostResult::New(p) => p.amount,
                     CostResult::Existing(p) => p.amount,
                 }
             } else {
-                item.amount
+                item.amount * intervals as u64
             };
-            monthly_cost += item_amount;
+            per_interval_cost += item_amount;
             setup_fee += item.setup_amount;
         }
 
         // is_setup is set to true once the first (purchase) payment is confirmed.
         // Use it directly instead of scanning payment history.
         let (list_price_amount, payment_type) = if subscription.is_setup {
-            (monthly_cost, SubscriptionPaymentType::Renewal)
+            (per_interval_cost, SubscriptionPaymentType::Renewal)
         } else {
-            (monthly_cost + setup_fee, SubscriptionPaymentType::Purchase)
+            (per_interval_cost + setup_fee, SubscriptionPaymentType::Purchase)
         };
 
         // Parse subscription currency

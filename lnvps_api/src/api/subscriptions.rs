@@ -295,7 +295,7 @@ async fn v1_renew_subscription(
     // Generate payment via provisioner
     let payment = this
         .provisioner
-        .renew_subscription(id, method)
+        .renew_subscription(id, method, 1)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
 
