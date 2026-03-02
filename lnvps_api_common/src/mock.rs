@@ -8,7 +8,7 @@ use lnvps_db::{
     NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
     ReferralCostUsage, ReferralPayout, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
+    IntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
@@ -66,7 +66,7 @@ impl MockDb {
             amount: 132,                 // 132 cents = €1.32 (in smallest currency units)
             currency: "EUR".to_string(), // This can be overridden based on company config
             interval_amount: 1,
-            interval_type: VmCostPlanIntervalType::Month,
+            interval_type: IntervalType::Month,
         }
     }
 

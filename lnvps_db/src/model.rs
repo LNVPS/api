@@ -1,6 +1,6 @@
 use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -730,7 +730,7 @@ pub enum NetworkAccessPolicy {
 
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize)]
 #[repr(u16)]
-pub enum VmCostPlanIntervalType {
+pub enum IntervalType {
     Day = 0,
     Month = 1,
     Year = 2,
@@ -745,7 +745,7 @@ pub struct VmCostPlan {
     pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
-    pub interval_type: VmCostPlanIntervalType,
+    pub interval_type: IntervalType,
 }
 
 /// Offers.

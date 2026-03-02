@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-02-23
-**Last updated:** 2026-02-23
+**Last updated:** 2026-03-02
 
 ## Goal
 
@@ -22,13 +22,11 @@ Full plan details captured in this work file.
 
 ## Tasks
 
-### Increment 0: Rename VmCostPlanIntervalType → IntervalType
-- [ ] Rename `VmCostPlanIntervalType` → `IntervalType` in `lnvps_db/src/model.rs`
-- [ ] Add type alias `pub type VmCostPlanIntervalType = IntervalType;`
-- [ ] Rename `ApiVmCostPlanIntervalType` → `ApiIntervalType` in `lnvps_api_common/src/model.rs`
-- [ ] Add type alias `pub type ApiVmCostPlanIntervalType = ApiIntervalType;`
-- [ ] Update all direct references to use new names (incremental via alias)
-- [ ] Verify build + tests pass
+### Increment 0: Rename VmCostPlanIntervalType → IntervalType ✓
+- [x] Rename `VmCostPlanIntervalType` → `IntervalType` in `lnvps_db/src/model.rs`
+- [x] Rename `ApiVmCostPlanIntervalType` → `ApiIntervalType` in `lnvps_api_common/src/model.rs`
+- [x] Update all direct references across codebase to use new names (no aliases)
+- [x] Verify build + tests pass
 
 ### Increment 1: Schema migration + database layer
 - [ ] Create SQL migration: add `time_value`, `metadata` to `subscription_payment`

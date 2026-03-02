@@ -141,7 +141,7 @@ impl ApiVmTemplate {
                 currency: price.currency.into(),
                 other_price: vec![], // filled externally
                 interval_amount: 1,
-                interval_type: ApiVmCostPlanIntervalType::Month,
+                interval_type: ApiIntervalType::Month,
             },
             region: ApiVmHostRegion {
                 id: region.id,
@@ -399,28 +399,28 @@ pub struct ApiVmTemplate {
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
-pub enum ApiVmCostPlanIntervalType {
+pub enum ApiIntervalType {
     Day = 0,
     Month = 1,
     Year = 2,
 }
 
-impl From<lnvps_db::VmCostPlanIntervalType> for ApiVmCostPlanIntervalType {
-    fn from(value: lnvps_db::VmCostPlanIntervalType) -> Self {
+impl From<lnvps_db::IntervalType> for ApiIntervalType {
+    fn from(value: lnvps_db::IntervalType) -> Self {
         match value {
-            lnvps_db::VmCostPlanIntervalType::Day => Self::Day,
-            lnvps_db::VmCostPlanIntervalType::Month => Self::Month,
-            lnvps_db::VmCostPlanIntervalType::Year => Self::Year,
+            lnvps_db::IntervalType::Day => Self::Day,
+            lnvps_db::IntervalType::Month => Self::Month,
+            lnvps_db::IntervalType::Year => Self::Year,
         }
     }
 }
 
-impl From<ApiVmCostPlanIntervalType> for lnvps_db::VmCostPlanIntervalType {
-    fn from(value: ApiVmCostPlanIntervalType) -> Self {
+impl From<ApiIntervalType> for lnvps_db::IntervalType {
+    fn from(value: ApiIntervalType) -> Self {
         match value {
-            ApiVmCostPlanIntervalType::Day => Self::Day,
-            ApiVmCostPlanIntervalType::Month => Self::Month,
-            ApiVmCostPlanIntervalType::Year => Self::Year,
+            ApiIntervalType::Day => Self::Day,
+            ApiIntervalType::Month => Self::Month,
+            ApiIntervalType::Year => Self::Year,
         }
     }
 }
@@ -476,7 +476,7 @@ pub struct ApiVmCostPlan {
     pub amount: u64,
     pub other_price: Vec<ApiPrice>,
     pub interval_amount: u64,
-    pub interval_type: ApiVmCostPlanIntervalType,
+    pub interval_type: ApiIntervalType,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

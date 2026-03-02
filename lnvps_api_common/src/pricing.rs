@@ -5,7 +5,7 @@ use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, LNVpsDb, PaymentMethod, PaymentType, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomTemplate, VmPayment,
+    IntervalType, VmCostPlan, VmCustomPricing, VmCustomTemplate, VmPayment,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
@@ -65,13 +65,13 @@ pub struct PricingEngine {
 impl PricingEngine {
     /// Convert cost plan interval to seconds
     fn cost_plan_interval_to_seconds(
-        interval_type: VmCostPlanIntervalType,
+        interval_type: IntervalType,
         interval_amount: u64,
     ) -> i64 {
         let base_seconds = match interval_type {
-            VmCostPlanIntervalType::Day => 24 * 60 * 60, // 86,400 seconds per day
-            VmCostPlanIntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
-            VmCostPlanIntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
+            IntervalType::Day => 24 * 60 * 60, // 86,400 seconds per day
+            IntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
+            IntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
         };
         base_seconds * interval_amount as i64
     }
@@ -421,11 +421,11 @@ impl PricingEngine {
 
     pub fn next_template_expire(vm: &Vm, cost_plan: &VmCostPlan) -> u64 {
         let next_expire = match cost_plan.interval_type {
-            VmCostPlanIntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
-            VmCostPlanIntervalType::Month => vm
+            IntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
+            IntervalType::Month => vm
                 .expires
                 .add(Months::new(cost_plan.interval_amount as u32)),
-            VmCostPlanIntervalType::Year => vm
+            IntervalType::Year => vm
                 .expires
                 .add(Months::new((12 * cost_plan.interval_amount) as u32)),
         };
@@ -658,7 +658,7 @@ impl PricingEngine {
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
             let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
-            let time_value = Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
+            let time_value = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
             (
                 CurrencyAmount::from_u64(price.currency, price.total()),
                 time_value,
@@ -723,7 +723,7 @@ impl PricingEngine {
 
         // Get the time value for the custom template
         let custom_plan_seconds =
-            Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
+            Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
         let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
 
         // calculate the cost based on the time until the vm expires

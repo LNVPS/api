@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use lnvps_api_common::{
-    ApiDiskInterface, ApiDiskType, ApiOsDistribution, ApiVmCostPlanIntervalType, VmRunningState,
+    ApiDiskInterface, ApiDiskType, ApiIntervalType, ApiOsDistribution, VmRunningState,
 };
 use lnvps_db::{
     AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
@@ -1206,7 +1206,7 @@ pub struct AdminCreateVmTemplateRequest {
     pub cost_plan_amount: Option<u64>,
     pub cost_plan_currency: Option<String>, // Defaults to "USD"
     pub cost_plan_interval_amount: Option<u64>, // Defaults to 1
-    pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>, // Defaults to Month
+    pub cost_plan_interval_type: Option<ApiIntervalType>, // Defaults to Month
     /// Maximum disk read IOPS (None = uncapped)
     pub disk_iops_read: Option<u32>,
     /// Maximum disk write IOPS (None = uncapped)
@@ -1264,7 +1264,7 @@ pub struct AdminUpdateVmTemplateRequest {
     pub cost_plan_amount: Option<u64>,
     pub cost_plan_currency: Option<String>,
     pub cost_plan_interval_amount: Option<u64>,
-    pub cost_plan_interval_type: Option<ApiVmCostPlanIntervalType>,
+    pub cost_plan_interval_type: Option<ApiIntervalType>,
     /// Maximum disk read IOPS — use `null` to clear
     #[serde(
         default,
@@ -1869,7 +1869,7 @@ pub struct AdminCostPlanInfo {
     pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
-    pub interval_type: ApiVmCostPlanIntervalType,
+    pub interval_type: ApiIntervalType,
     pub template_count: u64, // Number of VM templates using this cost plan
 }
 
@@ -1880,7 +1880,7 @@ pub struct AdminCreateCostPlanRequest {
     pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
-    pub interval_type: ApiVmCostPlanIntervalType,
+    pub interval_type: ApiIntervalType,
 }
 
 #[derive(Deserialize)]
@@ -1890,7 +1890,7 @@ pub struct AdminUpdateCostPlanRequest {
     pub amount: Option<u64>,
     pub currency: Option<String>,
     pub interval_amount: Option<u64>,
-    pub interval_type: Option<ApiVmCostPlanIntervalType>,
+    pub interval_type: Option<ApiIntervalType>,
 }
 
 impl From<lnvps_db::VmCostPlan> for AdminCostPlanInfo {
@@ -1902,7 +1902,7 @@ impl From<lnvps_db::VmCostPlan> for AdminCostPlanInfo {
             amount: cost_plan.amount,
             currency: cost_plan.currency,
             interval_amount: cost_plan.interval_amount,
-            interval_type: ApiVmCostPlanIntervalType::from(cost_plan.interval_type),
+            interval_type: ApiIntervalType::from(cost_plan.interval_type),
             template_count: 0, // Will be filled by handler
         }
     }
