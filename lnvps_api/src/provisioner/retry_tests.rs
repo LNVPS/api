@@ -209,7 +209,7 @@ mod tests {
                 image_id: 1,
                 template_id: Some(1),
                 custom_template_id: None,
-                subscription_id: 0,
+                subscription_line_item_id: 0,
                 ssh_key_id: ssh_key.id,
                 created: chrono::Utc::now(),
                 expires: chrono::Utc::now(),

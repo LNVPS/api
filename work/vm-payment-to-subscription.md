@@ -6,7 +6,7 @@
 
 ## Goal
 
-Consolidate `vm_payment` into `subscription_payment` so there is a single unified payment table. VMs link to subscriptions via `vm.subscription_id`. Drop `vm_payment` when complete.
+Consolidate `vm_payment` into `subscription_payment` so there is a single unified payment table. VMs link to subscriptions via `vm.subscription_line_item_id` (mirroring the `ip_range_subscription` → `subscription_line_item` pattern), so a single subscription can contain VMs, extra IPs, and other products as line items. Drop `vm_payment` when complete.
 
 Full plan details captured in this work file.
 

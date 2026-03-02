@@ -881,8 +881,8 @@ pub struct Vm {
     pub template_id: Option<u64>,
     /// Custom pricing specification used for this vm [VmCustomTemplate]
     pub custom_template_id: Option<u64>,
-    /// Subscription managing billing for this VM
-    pub subscription_id: u64,
+    /// The subscription line item managing billing for this VM (mirrors ip_range_subscription pattern)
+    pub subscription_line_item_id: u64,
     /// Users ssh-key assigned to this VM
     pub ssh_key_id: u64,
     /// When the VM was created
@@ -1532,8 +1532,8 @@ pub enum SubscriptionType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
-    VmRenewal = 3,     // VM renewal subscription
-    VmUpgrade = 4,     // VM upgrade subscription
+    VmRenewal = 3,     // VM (links to vm table via vm.subscription_line_item_id)
+    VmUpgrade = 4,     // VM upgrade (links to vm table via vm.subscription_line_item_id)
 }
 
 impl Display for SubscriptionType {
@@ -1553,6 +1553,7 @@ impl Display for SubscriptionType {
 pub struct SubscriptionLineItem {
     pub id: u64,
     pub subscription_id: u64,
+    /// Discriminant indicating which product table owns this line item
     pub subscription_type: SubscriptionType,
     pub name: String,
     pub description: Option<String>,

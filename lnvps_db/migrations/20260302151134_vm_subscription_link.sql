@@ -12,8 +12,15 @@ ALTER TABLE subscription_payment
     ADD COLUMN time_value BIGINT UNSIGNED AFTER rate,
     ADD COLUMN metadata JSON AFTER time_value;
 
--- Link VMs to subscriptions (nullable during migration)
+-- Link VMs to their subscription line item (mirrors ip_range_subscription pattern).
+-- A VM belongs to exactly one line item, and the subscription is found via the line item.
+-- Run migrate_vm_subscriptions binary to backfill existing rows before applying NOT NULL.
 ALTER TABLE vm
-    ADD COLUMN subscription_id INTEGER UNSIGNED AFTER custom_template_id,
-    ADD CONSTRAINT fk_vm_subscription FOREIGN KEY (subscription_id) REFERENCES subscription (id);
-CREATE INDEX idx_vm_subscription ON vm (subscription_id);
+    ADD COLUMN subscription_line_item_id INTEGER UNSIGNED AFTER custom_template_id,
+    ADD CONSTRAINT fk_vm_subscription_line_item
+        FOREIGN KEY (subscription_line_item_id) REFERENCES subscription_line_item (id);
+CREATE INDEX idx_vm_subscription_line_item ON vm (subscription_line_item_id);
+
+-- Add VmRenewal(3) and VmUpgrade(4) to the subscription_type enum stored in
+-- subscription_line_item.subscription_type. No DDL change needed — the column
+-- is SMALLINT UNSIGNED, so the new values are valid immediately.

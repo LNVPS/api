@@ -237,7 +237,7 @@ async fn v1_create_subscription(
             |(name, description, amount, setup_amount, subscription_type, configuration)| {
                 SubscriptionLineItem {
                     id: 0,
-                    subscription_id: 0, // Will be set below
+                    subscription_id: 0, // Will be set by insert
                     subscription_type,
                     name,
                     description,
@@ -250,7 +250,7 @@ async fn v1_create_subscription(
         .collect();
 
     // Insert subscription and line items in a single transaction
-    let subscription_id = this
+    let (subscription_id, _line_item_ids) = this
         .db
         .insert_subscription_with_line_items(&subscription, line_items)
         .await?;

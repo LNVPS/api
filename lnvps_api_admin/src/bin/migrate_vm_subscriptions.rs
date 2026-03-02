@@ -92,7 +92,7 @@ async fn run_migration(db: Arc<dyn LNVpsDb>, dry_run: bool) -> Result<()> {
             continue;
         }
         // Skip VMs already linked to a subscription
-        if vm.subscription_id != 0 {
+        if vm.subscription_line_item_id != 0 {
             skipped += 1;
             continue;
         }
@@ -211,21 +211,22 @@ async fn migrate_vm(db: Arc<dyn LNVpsDb>, vm_id: u64, dry_run: bool) -> Result<(
         configuration: None,
     };
 
-    let subscription_id = db
+    let (_subscription_id, line_item_ids) = db
         .insert_subscription_with_line_items(&subscription, vec![line_item])
         .await
         .context("Failed to insert subscription")?;
+    let subscription_line_item_id = line_item_ids[0];
 
-    // Link the VM to the new subscription
+    // Link the VM to the new subscription line item
     let mut updated_vm = vm;
-    updated_vm.subscription_id = subscription_id;
+    updated_vm.subscription_line_item_id = subscription_line_item_id;
     db.update_vm(&updated_vm)
         .await
-        .context("Failed to update VM with subscription_id")?;
+        .context("Failed to update VM with subscription_line_item_id")?;
 
     info!(
-        "VM {} → subscription {} (time_value={}s)",
-        vm_id, subscription_id, time_value
+        "VM {} → subscription line item {} (time_value={}s)",
+        vm_id, subscription_line_item_id, time_value
     );
 
     Ok(())

@@ -167,10 +167,11 @@ impl LNVpsProvisioner {
             setup_amount: 0,
             configuration: None,
         };
-        let subscription_id = self
+        let (_subscription_id, line_item_ids) = self
             .db
             .insert_subscription_with_line_items(&subscription, vec![line_item])
             .await?;
+        let subscription_line_item_id = line_item_ids[0];
 
         let now = Utc::now();
         let mut new_vm = Vm {
@@ -180,7 +181,7 @@ impl LNVpsProvisioner {
             image_id: image.id,
             template_id: Some(template.id),
             custom_template_id: None,
-            subscription_id,
+            subscription_line_item_id,
             ssh_key_id: ssh_key.id,
             created: now,
             expires: now,
@@ -286,10 +287,11 @@ impl LNVpsProvisioner {
             setup_amount: 0,
             configuration: None,
         };
-        let subscription_id = self
+        let (_subscription_id, line_item_ids) = self
             .db
             .insert_subscription_with_line_items(&subscription, vec![line_item])
             .await?;
+        let subscription_line_item_id = line_item_ids[0];
 
         let now = Utc::now();
         let mut new_vm = Vm {
@@ -299,7 +301,7 @@ impl LNVpsProvisioner {
             image_id: image.id,
             template_id: None,
             custom_template_id: Some(template_id),
-            subscription_id,
+            subscription_line_item_id,
             ssh_key_id: ssh_key.id,
             created: now,
             expires: now,
@@ -361,7 +363,12 @@ impl LNVpsProvisioner {
         _intervals: u32,
     ) -> Result<lnvps_db::SubscriptionPayment> {
         let vm = self.db.get_vm(vm_id).await?;
-        self.renew_subscription(vm.subscription_id, method).await
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        self.renew_subscription(line_item.subscription_id, method)
+            .await
     }
 
     /// Renew a VM using a specific amount
@@ -602,6 +609,11 @@ impl LNVpsProvisioner {
             CostResult::Existing(p) => Ok(p),
             CostResult::New(p) => {
                 let vm = self.db.get_vm(vm_id).await?;
+                let line_item = self
+                    .db
+                    .get_subscription_line_item(vm.subscription_line_item_id)
+                    .await?;
+                let subscription_id = line_item.subscription_id;
                 let desc = match payment_type {
                     SubscriptionPaymentType::Renewal => {
                         format!("VM renewal {vm_id} to {}", p.new_expiry)
@@ -631,7 +643,7 @@ impl LNVpsProvisioner {
                             .await?;
                         SubscriptionPayment {
                             id: hex::decode(invoice.payment_hash())?,
-                            subscription_id: vm.subscription_id,
+                            subscription_id,
                             user_id: vm.user_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
@@ -673,7 +685,7 @@ impl LNVpsProvisioner {
                         let new_id: [u8; 32] = rand::random();
                         SubscriptionPayment {
                             id: new_id.to_vec(),
-                            subscription_id: vm.subscription_id,
+                            subscription_id,
                             user_id: vm.user_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(3600)),
@@ -1290,7 +1302,7 @@ mod tests {
 
         // renew vm
         let payment = provisioner.renew(vm.id, PaymentMethod::Lightning).await?;
-        assert_eq!(vm.subscription_id, payment.subscription_id);
+        assert!(vm.subscription_line_item_id > 0, "VM must have a subscription line item");
         assert_eq!(payment.tax, (payment.amount as f64 * 0.01).floor() as u64);
 
         // check invoice amount matches rounded amount+tax
@@ -1513,43 +1525,46 @@ mod tests {
         Ok(pricing_id)
     }
 
-    /// Create a minimal subscription for test VMs.
+    /// Create a minimal subscription + line item for test VMs.
+    /// Returns the line_item_id to set on the Vm.
     async fn make_test_subscription(db: &Arc<MockDb>, user_id: u64) -> Result<u64> {
-        Ok(db.insert_subscription_with_line_items(
-            &Subscription {
-                id: 0,
-                user_id,
-                company_id: 1,
-                name: "test sub".to_string(),
-                description: None,
-                created: Utc::now(),
-                expires: None,
-                is_active: false,
-                currency: "BTC".to_string(),
-                interval_amount: 1,
-                interval_type: IntervalType::Month,
-                setup_fee: 0,
-                auto_renewal_enabled: false,
-                external_id: None,
-            },
-            vec![lnvps_db::SubscriptionLineItem {
-                id: 0,
-                subscription_id: 0,
-                subscription_type: lnvps_db::SubscriptionType::VmRenewal,
-                name: "test item".to_string(),
-                description: None,
-                amount: 1000,
-                setup_amount: 0,
-                configuration: None,
-            }],
-        )
-        .await?)
+        let (_sub_id, line_item_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "test sub".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![lnvps_db::SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: lnvps_db::SubscriptionType::VmRenewal,
+                    name: "test item".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+        Ok(line_item_ids[0])
     }
 
     /// Insert a VM that uses the default mock standard template (template_id = 1).
     async fn insert_standard_template_vm(db: &Arc<MockDb>) -> Result<u64> {
         let (user, ssh_key) = add_user(db).await?;
-        let subscription_id = make_test_subscription(db, user.id).await?;
+        let subscription_line_item_id = make_test_subscription(db, user.id).await?;
         let vm_id = db
             .insert_vm(&Vm {
                 id: 0,
@@ -1558,7 +1573,7 @@ mod tests {
                 image_id: 1,
                 template_id: Some(1),
                 custom_template_id: None,
-                subscription_id,
+                subscription_line_item_id,
                 ssh_key_id: ssh_key.id,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1961,7 +1976,7 @@ mod tests {
 
         // Directly insert VM (bypassing provision_custom) to simulate an existing VM
         // that was created before the pricing was disabled
-        let subscription_id = make_test_subscription(&db, user.id).await?;
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
         let vm_id = db
             .insert_vm(&Vm {
                 id: 0,
@@ -1970,7 +1985,7 @@ mod tests {
                 image_id: 1,
                 template_id: None,
                 custom_template_id: Some(custom_template_id),
-                subscription_id,
+                subscription_line_item_id,
                 ssh_key_id: ssh_key.id,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -2126,7 +2141,7 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        let subscription_id = make_test_subscription(&db, user.id).await?;
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
         let vm_id = db
             .insert_vm(&Vm {
                 id: 0,
@@ -2135,7 +2150,7 @@ mod tests {
                 image_id: 1,
                 template_id: None,
                 custom_template_id: Some(custom_template_id),
-                subscription_id,
+                subscription_line_item_id,
                 ssh_key_id: ssh_key.id,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),

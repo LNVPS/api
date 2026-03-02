@@ -228,17 +228,10 @@ async fn v1_generate_lir_agreement_from_subscription(
         .map(|li| {
             let resource_type = match li.subscription_type {
                 lnvps_db::SubscriptionType::IpRange => {
-                    // Try to extract IP range info from configuration
                     li.configuration
                         .as_ref()
                         .and_then(|cfg| cfg.get("cidr").and_then(|c| c.as_str()))
-                        .map(|cidr| {
-                            if cidr.contains(':') {
-                                "IPv6 PI"
-                            } else {
-                                "IPv4 PI"
-                            }
-                        })
+                        .map(|cidr| if cidr.contains(':') { "IPv6 PI" } else { "IPv4 PI" })
                         .unwrap_or("IP Range")
                         .to_string()
                 }

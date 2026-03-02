@@ -573,13 +573,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
-            .bind(vm.subscription_id)
+            .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
             .bind(vm.created)
             .bind(vm.expires)
@@ -602,12 +602,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
-            .bind(vm.subscription_id)
+            .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
             .bind(vm.expires)
             .bind(vm.disk_id)
@@ -620,13 +620,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+    async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
         Ok(
-            sqlx::query_as("SELECT * FROM vm WHERE subscription_id = ? AND deleted = 0")
-                .bind(subscription_id)
+            sqlx::query_as("SELECT * FROM vm WHERE subscription_line_item_id = ? AND deleted = 0")
+                .bind(line_item_id)
                 .fetch_one(&self.db)
                 .await?,
         )
+    }
+
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+        Ok(sqlx::query_as(
+            "SELECT v.* FROM vm v \
+             INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             WHERE sli.subscription_id = ? \
+               AND sli.subscription_type IN (3, 4) \
+               AND v.deleted = 0 \
+             LIMIT 1",
+        )
+        .bind(subscription_id)
+        .fetch_one(&self.db)
+        .await?)
     }
 
     async fn list_vm_subscription_payments(
@@ -635,7 +649,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     ) -> DbResult<Vec<SubscriptionPayment>> {
         Ok(sqlx::query_as(
             "SELECT sp.* FROM subscription_payment sp \
-             INNER JOIN vm v ON v.subscription_id = sp.subscription_id \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
              WHERE v.id = ? \
              ORDER BY sp.created DESC",
         )
@@ -1203,7 +1218,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         subscription: &Subscription,
         mut line_items: Vec<SubscriptionLineItem>,
-    ) -> DbResult<u64> {
+    ) -> DbResult<(u64, Vec<u64>)> {
         let mut tx = self.db.begin().await?;
 
         // Insert subscription
@@ -1227,12 +1242,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?;
 
         let subscription_id = res.last_insert_id();
+        let mut line_item_ids = Vec::with_capacity(line_items.len());
 
         // Insert all line items with the subscription_id
         for line_item in &mut line_items {
             line_item.subscription_id = subscription_id;
 
-            sqlx::query(
+            let li_res = sqlx::query(
                 "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(line_item.subscription_id)
@@ -1244,10 +1260,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&line_item.configuration)
             .execute(&mut *tx)
             .await?;
+
+            line_item_ids.push(li_res.last_insert_id());
         }
 
         tx.commit().await?;
-        Ok(subscription_id)
+        Ok((subscription_id, line_item_ids))
     }
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {

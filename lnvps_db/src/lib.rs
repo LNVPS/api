@@ -227,10 +227,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
 
-    /// Get a VM by its subscription ID
+    /// Get a VM by its subscription line item ID
+    async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
+
+    /// Get a VM by subscription ID — finds the VM(Renewal/Upgrade) line item for the subscription
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm>;
 
-    /// List subscription payments for a VM (via vm.subscription_id)
+    /// List subscription payments for a VM (via vm → line_item → subscription)
     async fn list_vm_subscription_payments(
         &self,
         vm_id: u64,
@@ -389,11 +392,13 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription>;
     async fn get_subscription_by_ext_id(&self, external_id: &str) -> DbResult<Subscription>;
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64>;
+    /// Insert a subscription with its line items.
+    /// Returns `(subscription_id, line_item_ids)`.
     async fn insert_subscription_with_line_items(
         &self,
         subscription: &Subscription,
         line_items: Vec<SubscriptionLineItem>,
-    ) -> DbResult<u64>;
+    ) -> DbResult<(u64, Vec<u64>)>;
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()>;
     async fn delete_subscription(&self, id: u64) -> DbResult<()>;
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String>;

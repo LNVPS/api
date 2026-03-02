@@ -105,7 +105,7 @@ impl MockDb {
             image_id: 1,
             template_id: Some(template.id),
             custom_template_id: None,
-            subscription_id: 0,
+            subscription_line_item_id: 1,
             ssh_key_id: 1,
             created: Utc::now(),
             expires: Default::default(),
@@ -255,8 +255,46 @@ impl Default for MockDb {
                 companies
             })),
             vm_history: Arc::new(Default::default()),
-            subscriptions: Arc::new(Default::default()),
-            subscription_line_items: Arc::new(Default::default()),
+            subscriptions: Arc::new(Mutex::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    1u64,
+                    Subscription {
+                        id: 1,
+                        user_id: 1,
+                        company_id: 1,
+                        name: "mock subscription".to_string(),
+                        description: None,
+                        created: Utc::now(),
+                        expires: None,
+                        is_active: false,
+                        currency: "BTC".to_string(),
+                        interval_amount: 1,
+                        interval_type: IntervalType::Month,
+                        setup_fee: 0,
+                        auto_renewal_enabled: false,
+                        external_id: None,
+                    },
+                );
+                m
+            })),
+            subscription_line_items: Arc::new(Mutex::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    1u64,
+                    SubscriptionLineItem {
+                        id: 1,
+                        subscription_id: 1,
+                        subscription_type: lnvps_db::SubscriptionType::VmRenewal,
+                        name: "mock vm renewal".to_string(),
+                        description: None,
+                        amount: 1000,
+                        setup_amount: 0,
+                        configuration: None,
+                    },
+                );
+                m
+            })),
             subscription_payments: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
@@ -672,7 +710,7 @@ impl LNVpsDbBase for MockDb {
             v.image_id = vm.image_id;
             v.template_id = vm.template_id;
             v.custom_template_id = vm.custom_template_id;
-            v.subscription_id = vm.subscription_id;
+            v.subscription_line_item_id = vm.subscription_line_item_id;
             v.ssh_key_id = vm.ssh_key_id;
             v.expires = vm.expires;
             v.disk_id = vm.disk_id;
@@ -683,12 +721,35 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+    async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
         let vms = self.vms.lock().await;
         vms.values()
-            .find(|v| v.subscription_id == subscription_id && !v.deleted)
+            .find(|v| v.subscription_line_item_id == line_item_id && !v.deleted)
             .cloned()
-            .ok_or_else(|| anyhow!("VM not found for subscription {}", subscription_id).into())
+            .ok_or_else(|| anyhow!("VM not found for line item {}", line_item_id).into())
+    }
+
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+        use lnvps_db::SubscriptionType;
+        let items = self.subscription_line_items.lock().await;
+        let line_item_id = items
+            .values()
+            .find(|li| {
+                li.subscription_id == subscription_id
+                    && matches!(
+                        li.subscription_type,
+                        SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
+                    )
+            })
+            .map(|li| li.id)
+            .ok_or_else(|| {
+                DbError::Other(anyhow!(
+                    "No VM line item for subscription {}",
+                    subscription_id
+                ))
+            })?;
+        drop(items);
+        self.get_vm_by_line_item(line_item_id).await
     }
 
     async fn list_vm_subscription_payments(
@@ -699,8 +760,16 @@ impl LNVpsDbBase for MockDb {
         let vm = vms
             .get(&vm_id)
             .ok_or_else(|| DbError::Other(anyhow!("VM not found")))?;
-        let subscription_id = vm.subscription_id;
+        let line_item_id = vm.subscription_line_item_id;
         drop(vms);
+
+        // resolve subscription_id via line_item
+        let items = self.subscription_line_items.lock().await;
+        let subscription_id = items
+            .get(&line_item_id)
+            .ok_or_else(|| DbError::Other(anyhow!("Line item {} not found", line_item_id)))?
+            .subscription_id;
+        drop(items);
 
         let payments = self.subscription_payments.lock().await;
         let mut result: Vec<_> = payments
@@ -1159,16 +1228,18 @@ impl LNVpsDbBase for MockDb {
         &self,
         subscription: &Subscription,
         line_items: Vec<SubscriptionLineItem>,
-    ) -> DbResult<u64> {
-        let id = self.insert_subscription(subscription).await?;
+    ) -> DbResult<(u64, Vec<u64>)> {
+        let subscription_id = self.insert_subscription(subscription).await?;
         let mut items = self.subscription_line_items.lock().await;
+        let mut line_item_ids = Vec::with_capacity(line_items.len());
         for mut item in line_items {
             let item_id = items.keys().max().copied().unwrap_or(0) + 1;
             item.id = item_id;
-            item.subscription_id = id;
+            item.subscription_id = subscription_id;
             items.insert(item_id, item);
+            line_item_ids.push(item_id);
         }
-        Ok(id)
+        Ok((subscription_id, line_item_ids))
     }
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
