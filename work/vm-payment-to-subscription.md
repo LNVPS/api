@@ -53,19 +53,31 @@ Full plan details captured in this work file.
 - [x] Fix `insert_subscription` / `insert_subscription_with_line_items` / `update_subscription` SQL to bind `interval_amount` and `interval_type`
 - [ ] Test against local backup: `~/Downloads/lnvps_lnvps-20250316020007.sql.gz`
 
-### Increment 3: VM payment creation updates
-- [ ] Update `renew()` / `renew_intervals()` to create `SubscriptionPayment` with `vm.subscription_id`
-- [ ] Update `create_upgrade_payment()` to create `SubscriptionPayment` with `payment_type=Upgrade`, `metadata`
-- [ ] Update `GET /api/v1/vm/{id}/renew` to return SubscriptionPayment
-- [ ] Update `GET /api/v1/vm/{id}/invoice/{payment_id}` to query subscription_payment
-- [ ] Update `GET /api/v1/vm/{id}/invoices` to query via vm.subscription_id
-- [ ] Verify build + tests pass
-
-### Increment 4: Payment processing updates
-- [ ] Update Lightning webhook handler to use `subscription_payment`
-- [ ] Update Revolut webhook handler to use `subscription_payment`
-- [ ] Handle upgrades: check `metadata.upgrade_params`, look up VM via `get_vm_by_subscription()`
-- [ ] Verify build + tests pass
+### Increment 3 + 4: VM payment creation + payment processing ✓
+- [x] `vm.subscription_id` changed from `Option<u64>` to `u64` (NOT NULL)
+- [x] Migration `20260302154256_vm_subscription_not_null.sql` to enforce NOT NULL
+- [x] `provision()` creates Subscription + SubscriptionLineItem(VmRenewal) before inserting VM
+- [x] `provision_custom()` does the same with 1-Month interval
+- [x] `CostResult::Existing` changed to hold `SubscriptionPayment` (deduplication via `list_vm_subscription_payments`)
+- [x] `price_to_payment_with_type` rewritten to create `SubscriptionPayment` (uses `vm.subscription_id`)
+- [x] `renew()` / `renew_intervals()` return `SubscriptionPayment` via `renew_subscription(vm.subscription_id)`
+- [x] `renew_amount()` returns `SubscriptionPayment`
+- [x] `create_upgrade_payment()` uses `SubscriptionPaymentType::Upgrade`, stores config in `metadata` JSON
+- [x] `auto_renew_via_nwc()` returns `SubscriptionPayment`
+- [x] `handle_upgrade()` updated to accept `SubscriptionPayment`, reads `metadata`
+- [x] Lightning invoice handler uses `get_subscription_payment` + `subscription_payment_paid`
+- [x] Revolut handler uses `get_subscription_payment_by_ext_id` + `subscription_payment_paid`
+- [x] Both handlers look up VM via `get_vm_by_subscription(subscription_id)` for history logging
+- [x] Cancel other upgrade payments via `list_vm_subscription_payments` + `update_subscription_payment`
+- [x] `v1_renew_vm` → `ApiVmPayment::from_subscription_payment`
+- [x] `v1_get_payment` → `get_subscription_payment`
+- [x] `v1_get_payment_invoice` → `get_subscription_payment` + `from_subscription_payment`
+- [x] `v1_payment_history` → `list_vm_subscription_payments`
+- [x] `v1_vm_upgrade` → `ApiVmPayment::from_subscription_payment`
+- [x] `ApiInvoiceItem::from_subscription_payment` added
+- [x] `insert_subscription` / `insert_subscription_with_line_items` mock fixed to actually insert
+- [x] Test helpers updated to create subscriptions for VMs
+- [x] Verify build + all 214 unit tests pass
 
 ### Increment 5: VM upgrade updates subscription & line item
 - [ ] Update `convert_to_custom_template()` to update subscription interval to `1 Month`

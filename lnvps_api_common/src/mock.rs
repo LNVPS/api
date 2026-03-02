@@ -105,7 +105,7 @@ impl MockDb {
             image_id: 1,
             template_id: Some(template.id),
             custom_template_id: None,
-            subscription_id: None,
+            subscription_id: 0,
             ssh_key_id: 1,
             created: Utc::now(),
             expires: Default::default(),
@@ -686,7 +686,7 @@ impl LNVpsDbBase for MockDb {
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
         let vms = self.vms.lock().await;
         vms.values()
-            .find(|v| v.subscription_id == Some(subscription_id) && !v.deleted)
+            .find(|v| v.subscription_id == subscription_id && !v.deleted)
             .cloned()
             .ok_or_else(|| anyhow!("VM not found for subscription {}", subscription_id).into())
     }
@@ -699,9 +699,7 @@ impl LNVpsDbBase for MockDb {
         let vm = vms
             .get(&vm_id)
             .ok_or_else(|| DbError::Other(anyhow!("VM not found")))?;
-        let subscription_id = vm
-            .subscription_id
-            .ok_or_else(|| DbError::Other(anyhow!("VM has no subscription")))?;
+        let subscription_id = vm.subscription_id;
         drop(vms);
 
         let payments = self.subscription_payments.lock().await;
@@ -1149,15 +1147,28 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
-        Ok(0)
+        let mut subscriptions = self.subscriptions.lock().await;
+        let id = subscriptions.keys().max().copied().unwrap_or(0) + 1;
+        let mut s = subscription.clone();
+        s.id = id;
+        subscriptions.insert(id, s);
+        Ok(id)
     }
 
     async fn insert_subscription_with_line_items(
         &self,
-        _subscription: &Subscription,
-        _line_items: Vec<SubscriptionLineItem>,
+        subscription: &Subscription,
+        line_items: Vec<SubscriptionLineItem>,
     ) -> DbResult<u64> {
-        Ok(0)
+        let id = self.insert_subscription(subscription).await?;
+        let mut items = self.subscription_line_items.lock().await;
+        for mut item in line_items {
+            let item_id = items.keys().max().copied().unwrap_or(0) + 1;
+            item.id = item_id;
+            item.subscription_id = id;
+            items.insert(item_id, item);
+        }
+        Ok(id)
     }
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {

@@ -4,8 +4,9 @@ use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, LNVpsDb, PaymentMethod, PaymentType, Vm,
-    IntervalType, VmCostPlan, VmCustomPricing, VmCustomTemplate, VmPayment,
+    CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
+    PaymentType, SubscriptionPayment, SubscriptionPaymentType, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomTemplate, VmPayment,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
@@ -251,15 +252,14 @@ impl PricingEngine {
 
         let expected_time_value = base_cost.time_value * intervals as u64;
 
-        // Check for existing payment with matching time value
-        let payments = self
-            .db
-            .list_vm_payment_by_method_and_type(vm.id, method, PaymentType::Renewal)
-            .await?;
-        if let Some(px) = payments
-            .into_iter()
-            .find(|p| p.time_value == expected_time_value)
-        {
+        // Check for existing unpaid subscription payment with matching time value
+        let payments = self.db.list_vm_subscription_payments(vm.id).await?;
+        if let Some(px) = payments.into_iter().find(|p| {
+            !p.is_paid
+                && p.time_value == Some(expected_time_value)
+                && p.payment_method == method
+                && p.payment_type == SubscriptionPaymentType::Renewal
+        }) {
             return Ok(CostResult::Existing(px));
         }
 
@@ -783,8 +783,8 @@ impl PricingEngine {
 
 #[derive(Clone)]
 pub enum CostResult {
-    /// An existing payment already exists and should be used
-    Existing(VmPayment),
+    /// An existing unpaid subscription payment already exists and should be reused
+    Existing(SubscriptionPayment),
     /// A new payment can be created with the specified amount
     New(NewPaymentInfo),
 }

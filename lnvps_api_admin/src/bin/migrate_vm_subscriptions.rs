@@ -92,7 +92,7 @@ async fn run_migration(db: Arc<dyn LNVpsDb>, dry_run: bool) -> Result<()> {
             continue;
         }
         // Skip VMs already linked to a subscription
-        if vm.subscription_id.is_some() {
+        if vm.subscription_id != 0 {
             skipped += 1;
             continue;
         }
@@ -218,7 +218,7 @@ async fn migrate_vm(db: Arc<dyn LNVpsDb>, vm_id: u64, dry_run: bool) -> Result<(
 
     // Link the VM to the new subscription
     let mut updated_vm = vm;
-    updated_vm.subscription_id = Some(subscription_id);
+    updated_vm.subscription_id = subscription_id;
     db.update_vm(&updated_vm)
         .await
         .context("Failed to update VM with subscription_id")?;

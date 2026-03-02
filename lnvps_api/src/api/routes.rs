@@ -640,7 +640,7 @@ async fn v1_renew_vm(
     let intervals = q.intervals.unwrap_or(1);
 
     // handle "nwc" payments automatically
-    let rsp = if q.method.as_deref() == Some("nwc") && user.nwc_connection_string.is_some() {
+    let payment = if q.method.as_deref() == Some("nwc") && user.nwc_connection_string.is_some() {
         this.provisioner
             .auto_renew_via_nwc(id, user.nwc_connection_string.unwrap().as_str())
             .await?
@@ -656,7 +656,7 @@ async fn v1_renew_vm(
             .await?
     };
 
-    ApiData::ok(rsp.into())
+    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id))
 }
 
 /// Extend a VM by LNURL payment
@@ -1029,13 +1029,13 @@ async fn v1_get_payment(
         return ApiData::err("Invalid payment id");
     };
 
-    let payment = this.db.get_vm_payment(&id).await?;
-    let vm = this.db.get_vm(payment.vm_id).await?;
+    let payment = this.db.get_subscription_payment(&id).await?;
+    let vm = this.db.get_vm_by_subscription(payment.subscription_id).await?;
     if vm.user_id != uid {
         return ApiData::err("VM does not belong to you");
     }
 
-    ApiData::ok(payment.into())
+    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, vm.id))
 }
 
 /// Print payment invoice
@@ -1065,17 +1065,18 @@ async fn v1_get_payment_invoice(
 
     let payment = this
         .db
-        .get_vm_payment(&id)
+        .get_subscription_payment(&id)
         .await
         .map_err(|_| "Payment not found")?;
     let vm = this
         .db
-        .get_vm(payment.vm_id)
+        .get_vm_by_subscription(payment.subscription_id)
         .await
         .map_err(|_| "VM not found")?;
     if vm.user_id != uid {
         return Err("VM does not belong to you");
     }
+    let vm_id_for_payment = vm.id;
 
     if !payment.is_paid {
         return Err("Payment is not paid, can't generate invoice");
@@ -1127,11 +1128,11 @@ async fn v1_get_payment_invoice(
         .map_err(|_| "Invalid template")?;
 
     // Parse upgrade details if this is an upgrade payment
-    let upgrade_details = if payment.payment_type == lnvps_db::PaymentType::Upgrade {
+    let upgrade_details = if payment.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade {
         payment
-            .upgrade_params
+            .metadata
             .as_ref()
-            .and_then(|s| serde_json::from_str::<UpgradeConfig>(s).ok())
+            .and_then(|m| serde_json::from_value::<UpgradeConfig>(m.clone()).ok())
             .map(|c| UpgradeDetails {
                 cpu_upgrade: c.new_cpu,
                 memory_upgrade: c.new_memory.map(|m| m / crate::GB),
@@ -1142,7 +1143,7 @@ async fn v1_get_payment_invoice(
     };
 
     let now = Utc::now();
-    let invoice_item = ApiInvoiceItem::from_vm_payment(&payment)
+    let invoice_item = ApiInvoiceItem::from_subscription_payment(&payment)
         .map_err(|_| "Failed to create formatted invoice item")?;
 
     let mut html = Cursor::new(Vec::new());
@@ -1161,7 +1162,7 @@ async fn v1_get_payment_invoice(
                     payment.amount + payment.tax + payment.processing_fee,
                 )
                 .to_string(),
-                payment: payment.into(),
+                payment: ApiVmPayment::from_subscription_payment(payment, vm_id_for_payment),
                 invoice_item,
                 npub: nostr_sdk::PublicKey::from_slice(&user.pubkey)
                     .map_err(|_| "Invalid pubkey")?
@@ -1189,8 +1190,13 @@ async fn v1_payment_history(
         return ApiData::err("VM does not belong to you");
     }
 
-    let payments = this.db.list_vm_payment(id).await?;
-    ApiData::ok(payments.into_iter().map(|i| i.into()).collect())
+    let payments = this.db.list_vm_subscription_payments(id).await?;
+    ApiData::ok(
+        payments
+            .into_iter()
+            .map(|p| ApiVmPayment::from_subscription_payment(p, id))
+            .collect(),
+    )
 }
 
 /// List action history of a VM
@@ -1298,7 +1304,7 @@ async fn v1_vm_upgrade(
         .await?;
 
     // Note: The actual upgrade happens after payment is confirmed
-    ApiData::ok(payment.into())
+    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id))
 }
 
 async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u64, Vm), ApiError> {

@@ -881,8 +881,8 @@ pub struct Vm {
     pub template_id: Option<u64>,
     /// Custom pricing specification used for this vm [VmCustomTemplate]
     pub custom_template_id: Option<u64>,
-    /// Subscription linked to this VM (nullable during migration)
-    pub subscription_id: Option<u64>,
+    /// Subscription managing billing for this VM
+    pub subscription_id: u64,
     /// Users ssh-key assigned to this VM
     pub ssh_key_id: u64,
     /// When the VM was created

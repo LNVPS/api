@@ -2,7 +2,7 @@ use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
 use anyhow::Result;
 use lnvps_api_common::{UpgradeConfig, WorkCommander, WorkJob};
-use lnvps_db::{LNVpsDb, PaymentMethod, VmPayment};
+use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::LightningNode;
 use std::sync::Arc;
@@ -80,34 +80,35 @@ pub async fn listen_all_payments(
 }
 
 pub(crate) async fn handle_upgrade(
-    payment: &VmPayment,
+    payment: &SubscriptionPayment,
+    vm_id: u64,
     tx: &Arc<dyn WorkCommander>,
     _db: Arc<dyn LNVpsDb>,
 ) -> Result<()> {
-    // Parse upgrade parameters from the dedicated upgrade_params field
-    if let Some(upgrade_params_json) = &payment.upgrade_params {
-        if let Ok(upgrade_params) = serde_json::from_str::<UpgradeConfig>(upgrade_params_json) {
+    // Parse upgrade parameters from the metadata field
+    if let Some(metadata) = &payment.metadata {
+        if let Ok(upgrade_params) = serde_json::from_value::<UpgradeConfig>(metadata.clone()) {
             info!(
                 "Processing upgrade payment for VM {} with params: CPU={:?}, Memory={:?}, Disk={:?}",
-                payment.vm_id,
+                vm_id,
                 upgrade_params.new_cpu,
                 upgrade_params.new_memory,
                 upgrade_params.new_disk
             );
             tx.send(WorkJob::ProcessVmUpgrade {
-                vm_id: payment.vm_id,
+                vm_id,
                 config: upgrade_params,
             })
             .await?;
         } else {
             warn!(
-                "Upgrade payment {} has invalid upgrade parameters JSON",
+                "Upgrade payment {} has invalid upgrade parameters in metadata",
                 hex::encode(&payment.id)
             );
         }
     } else {
         warn!(
-            "Upgrade payment {} missing upgrade_params field",
+            "Upgrade payment {} missing metadata field",
             hex::encode(&payment.id)
         );
     }

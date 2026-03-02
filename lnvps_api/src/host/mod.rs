@@ -344,7 +344,7 @@ mod tests {
                 image_id: 1,
                 template_id: Some(template.id),
                 custom_template_id: None,
-                subscription_id: None,
+                subscription_id: 0,
                 ssh_key_id: 1,
                 created: Default::default(),
                 expires: Default::default(),

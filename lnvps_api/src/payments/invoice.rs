@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use lnvps_api_common::WorkJob;
 use lnvps_api_common::{VmHistoryLogger, WorkCommander};
-use lnvps_db::{LNVpsDb, PaymentMethod, PaymentType, VmPayment};
+use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::{InvoiceUpdate, LightningNode};
 use std::sync::Arc;
@@ -32,25 +32,27 @@ impl NodeInvoiceHandler {
     }
 
     async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
-        let p = self.db.get_vm_payment(id).await?;
-        self.mark_payment_paid(&p).await
+        let p = self.db.get_subscription_payment(id).await?;
+        let vm = self.db.get_vm_by_subscription(p.subscription_id).await?;
+        self.mark_payment_paid(&p, vm.id).await
     }
 
     async fn mark_paid_ext_id(&self, external_id: &str) -> Result<()> {
-        let p = self.db.get_vm_payment_by_ext_id(external_id).await?;
-        self.mark_payment_paid(&p).await
+        let p = self
+            .db
+            .get_subscription_payment_by_ext_id(external_id)
+            .await?;
+        let vm = self.db.get_vm_by_subscription(p.subscription_id).await?;
+        self.mark_payment_paid(&p, vm.id).await
     }
 
-    async fn mark_payment_paid(&self, payment: &VmPayment) -> Result<()> {
-        // Get VM state before payment processing
-        let vm_before = self.db.get_vm(payment.vm_id).await?;
+    async fn mark_payment_paid(&self, payment: &SubscriptionPayment, vm_id: u64) -> Result<()> {
+        let vm_before = self.db.get_vm(vm_id).await?;
 
-        self.db.vm_payment_paid(payment).await?;
+        self.db.subscription_payment_paid(payment).await?;
 
-        // Get VM state after payment processing
-        let vm_after = self.db.get_vm(payment.vm_id).await?;
+        let vm_after = self.db.get_vm(vm_id).await?;
 
-        // Log payment received in VM history
         let payment_metadata = serde_json::json!({
             "payment_id": hex::encode(&payment.id),
             "payment_method": "lightning"
@@ -59,77 +61,76 @@ impl NodeInvoiceHandler {
         if let Err(e) = self
             .vm_history_logger
             .log_vm_payment_received(
-                payment.vm_id,
+                vm_id,
                 payment.amount + payment.tax + payment.processing_fee,
                 &payment.currency,
-                payment.time_value,
+                payment.time_value.unwrap_or(0),
                 Some(payment_metadata),
             )
             .await
         {
-            warn!("Failed to log payment for VM {}: {}", payment.vm_id, e);
+            warn!("Failed to log payment for VM {}: {}", vm_id, e);
         }
 
-        // Log VM renewal if this extends the expiration
-        if payment.time_value > 0
+        let time_value = payment.time_value.unwrap_or(0);
+        if time_value > 0
             && let Err(e) = self
                 .vm_history_logger
                 .log_vm_renewed(
-                    payment.vm_id,
+                    vm_id,
                     None,
                     vm_before.expires,
                     vm_after.expires,
                     Some(payment.amount + payment.tax + payment.processing_fee),
                     Some(&payment.currency),
                     Some(serde_json::json!({
-                        "time_added_seconds": payment.time_value,
+                        "time_added_seconds": time_value,
                         "payment_id": hex::encode(&payment.id)
                     })),
                 )
                 .await
         {
-            warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
+            warn!("Failed to log VM {} renewal: {}", vm_id, e);
         }
 
         info!(
-            "VM payment {} for {}, paid",
+            "Subscription payment {} for VM {}, paid",
             hex::encode(&payment.id),
-            payment.vm_id
+            vm_id
         );
 
-        // Handle upgrade payments differently - trigger upgrade processing instead of just checking VM
-        if payment.payment_type == PaymentType::Upgrade {
-            handle_upgrade(payment, &self.tx, self.db.clone()).await?;
+        if payment.payment_type == SubscriptionPaymentType::Upgrade {
+            handle_upgrade(payment, vm_id, &self.tx, self.db.clone()).await?;
 
-            // cancel other upgrade payments
+            // cancel other pending upgrade payments for this VM
             let other_upgrades = self
                 .db
-                .list_vm_payment_by_method_and_type(
-                    payment.vm_id,
-                    PaymentMethod::Lightning,
-                    PaymentType::Upgrade,
-                )
-                .await?;
-            for mut ugp in other_upgrades {
-                if ugp.id == payment.id {
-                    continue;
-                }
+                .list_vm_subscription_payments(vm_id)
+                .await?
+                .into_iter()
+                .filter(|p| {
+                    !p.is_paid
+                        && p.payment_type == SubscriptionPaymentType::Upgrade
+                        && p.payment_method == PaymentMethod::Lightning
+                        && p.id != payment.id
+                })
+                .collect::<Vec<_>>();
 
-                ugp.expires = Utc::now();
+            for ugp in other_upgrades {
                 let hex_id = hex::encode(&ugp.id);
                 if let Err(e) = self.node.cancel_invoice(&ugp.id).await {
                     warn!("Failed to cancel invoice {}: {}", hex_id, e);
                 }
-                if let Err(e) = self.db.update_vm_payment(&ugp).await {
+                // mark as expired via update
+                let mut expired = ugp;
+                expired.expires = Utc::now();
+                if let Err(e) = self.db.update_subscription_payment(&expired).await {
                     warn!("Failed to update invoice {}: {}", hex_id, e);
                 }
             }
         } else {
-            // Regular renewal payment - just check the VM
             self.tx
-                .send(WorkJob::CheckVm {
-                    vm_id: payment.vm_id,
-                })
+                .send(WorkJob::CheckVm { vm_id })
                 .await?;
         }
 
@@ -137,7 +138,11 @@ impl NodeInvoiceHandler {
     }
 
     pub async fn listen(&mut self) -> Result<()> {
-        let from_ph = self.db.last_paid_invoice().await?.map(|i| i.id.clone());
+        let from_ph = self
+            .db
+            .last_paid_subscription_invoice()
+            .await?
+            .map(|i| i.id.clone());
         info!(
             "Listening for invoices from {}",
             from_ph
