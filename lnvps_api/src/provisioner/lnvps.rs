@@ -129,22 +129,14 @@ impl LNVpsProvisioner {
             bail!("No host disk found")
         };
 
-        // Determine company and currency for the subscription
-        let company_id = self
-            .db
-            .list_companies()
-            .await?
-            .into_iter()
-            .find(|c| true) // first company; refined when multi-company is fully supported
-            .map(|c| c.id)
-            .unwrap_or(1);
+        let region = self.db.get_host_region(template.region_id).await?;
         let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
 
         // Create subscription for this VM
         let subscription = Subscription {
             id: 0,
             user_id: user.id,
-            company_id,
+            company_id: region.company_id,
             name: format!("{} subscription", template.name),
             description: None,
             created: Utc::now(),
@@ -250,21 +242,13 @@ impl LNVpsProvisioner {
         // insert custom templates
         let template_id = self.db.insert_custom_vm_template(&template).await?;
 
-        // Determine company for the subscription
-        let company_id = self
-            .db
-            .list_companies()
-            .await?
-            .into_iter()
-            .find(|_| true)
-            .map(|c| c.id)
-            .unwrap_or(1);
+        let region = self.db.get_host_region(pricing.region_id).await?;
 
         // Create subscription for this custom VM (1-month interval, amount computed at payment time)
         let subscription = Subscription {
             id: 0,
             user_id: user.id,
-            company_id,
+            company_id: region.company_id,
             name: format!("Custom VM subscription"),
             description: None,
             created: Utc::now(),
