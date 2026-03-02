@@ -1178,7 +1178,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
         .bind(subscription.company_id)
@@ -1188,6 +1188,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.expires)
         .bind(subscription.is_active)
         .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1206,7 +1208,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         // Insert subscription
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
         .bind(subscription.company_id)
@@ -1216,6 +1218,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.expires)
         .bind(subscription.is_active)
         .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1248,7 +1252,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription SET user_id = ?, company_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
+            "UPDATE subscription SET user_id = ?, company_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
         )
         .bind(subscription.user_id)
         .bind(subscription.company_id)
@@ -1257,6 +1261,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.expires)
         .bind(subscription.is_active)
         .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)

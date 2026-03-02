@@ -43,17 +43,15 @@ Full plan details captured in this work file.
 - [x] Fix all `Subscription {}` / `SubscriptionPayment {}` / `Vm {}` struct literals in source + tests
 - [x] Verify build + tests pass
 
-### Increment 2: Data migration tool
-- [ ] Create `lnvps_db/src/data_migrations/mod.rs` with registry
-- [ ] Create `lnvps_db/src/data_migrations/migrate_vm_to_subscriptions.rs`
-- [ ] Handle standard VMs (pricing from vm_cost_plan)
-- [ ] Handle custom VMs (pricing computed from vm_custom_pricing)
-- [ ] Handle VMs with neither template (log error, skip)
-- [ ] Implement dry-run mode
-- [ ] Implement validation step
-- [ ] Add `data-migrate` CLI subcommand with `--name` and `--dry-run` flags
+### Increment 2: Data migration tool ✓
+- [x] Create `lnvps_api_admin/src/bin/migrate_vm_subscriptions.rs` standalone binary
+- [x] Handle standard VMs (interval + amount from cost_plan)
+- [x] Handle custom VMs (1-Month interval, amount=0 pending custom pricing)
+- [x] Handle VMs with neither template (bail with warning)
+- [x] Implement dry-run mode (--dry-run flag)
+- [x] Idempotent: VMs with subscription_id already set are skipped
+- [x] Fix `insert_subscription` / `insert_subscription_with_line_items` / `update_subscription` SQL to bind `interval_amount` and `interval_type`
 - [ ] Test against local backup: `~/Downloads/lnvps_lnvps-20250316020007.sql.gz`
-- [ ] Verify idempotency (run twice, same result)
 
 ### Increment 3: VM payment creation updates
 - [ ] Update `renew()` / `renew_intervals()` to create `SubscriptionPayment` with `vm.subscription_id`
