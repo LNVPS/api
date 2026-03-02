@@ -340,7 +340,7 @@ impl ProxmoxClient {
         };
 
         let snippet_filename = "lnvps-vendor.yaml";
-        let snippet_content = "#cloud-config\nssh_deletekeys: false\nssh_genkeytypes: []\n";
+        let snippet_content = "#cloud-config\nssh_deletekeys: false\n";
 
         // Snippet storage path depends on the storage type; for the default
         // `local` storage this is `/var/lib/vz/snippets/`.  For other directory-
