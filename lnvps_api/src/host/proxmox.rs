@@ -2695,7 +2695,7 @@ mod tests {
 
         // GET /config — returns existing VM config
         Mock::given(method("GET"))
-            .and(path_regex(r".*/qemu/1/config$"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&config_body))
             .expect(1)
             .mount(&server)
@@ -2703,7 +2703,7 @@ mod tests {
 
         // POST /config — accept the update; return a task ID
         Mock::given(method("POST"))
-            .and(path_regex(r".*/qemu/1/config$"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
