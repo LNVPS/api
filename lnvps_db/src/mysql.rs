@@ -159,7 +159,7 @@ impl LNVpsDbMysql {
     pub async fn get_vm_for_migration(&self, vm_id: u64) -> DbResult<VmForMigration> {
         Ok(sqlx::query_as(
             "SELECT id, user_id, template_id, custom_template_id, expires, \
-             auto_renewal_enabled, subscription_line_item_id \
+             auto_renewal_enabled, subscription_line_item_id, deleted \
              FROM vm WHERE id = ?",
         )
         .bind(vm_id)

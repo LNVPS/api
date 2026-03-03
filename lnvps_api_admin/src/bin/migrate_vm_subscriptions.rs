@@ -213,6 +213,9 @@ async fn migrate_vm_subscription(
         return Ok(());
     }
 
+    // Deleted VMs should have inactive subscriptions — they are no longer running.
+    let is_active = !vm.deleted;
+
     let subscription = Subscription {
         id: 0,
         user_id: vm.user_id,
@@ -221,7 +224,7 @@ async fn migrate_vm_subscription(
         description: Some(description.clone()),
         created: Utc::now(),
         expires: Some(vm.expires),
-        is_active: true,
+        is_active,
         is_setup: true,
         currency,
         interval_amount,

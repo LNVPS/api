@@ -937,6 +937,7 @@ pub struct VmForMigration {
     pub expires: DateTime<Utc>,
     pub auto_renewal_enabled: bool,
     pub subscription_line_item_id: Option<u64>,
+    pub deleted: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
