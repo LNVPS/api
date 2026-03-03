@@ -659,6 +659,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_vm_subscription_payments_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT sp.* FROM subscription_payment sp \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ? \
+             ORDER BY sp.created DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(vm_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
         Ok(sqlx::query(
             "insert into vm_ip_assignment(vm_id,ip_range_id,ip,arp_ref,dns_forward,dns_forward_ref,dns_reverse,dns_reverse_ref) values(?,?,?,?,?,?,?,?) returning id",

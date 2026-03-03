@@ -1182,6 +1182,7 @@ async fn v1_payment_history(
     auth: Nip98Auth,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
+    Query(q): Query<PageQuery>,
 ) -> ApiResult<Vec<ApiVmPayment>> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
@@ -1190,7 +1191,14 @@ async fn v1_payment_history(
         return ApiData::err("VM does not belong to you");
     }
 
-    let payments = this.db.list_vm_subscription_payments(id).await?;
+    let payments = match (q.limit, q.offset) {
+        (Some(limit), Some(offset)) => {
+            this.db
+                .list_vm_subscription_payments_paginated(id, limit, offset)
+                .await?
+        }
+        _ => this.db.list_vm_subscription_payments(id).await?,
+    };
     ApiData::ok(
         payments
             .into_iter()

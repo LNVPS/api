@@ -942,6 +942,24 @@ impl LNVpsProvisioner {
 
         self.db.update_vm(&vm).await?;
 
+        // Update the subscription to 1-Month billing (custom VMs are always monthly)
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let mut subscription = self.db.get_subscription(line_item.subscription_id).await?;
+        subscription.interval_amount = 1;
+        subscription.interval_type = IntervalType::Month;
+        self.db.update_subscription(&subscription).await?;
+
+        // Update the line item: mark as VmRenewal (no longer VmUpgrade) and store the new config
+        let mut updated_line_item = line_item;
+        updated_line_item.subscription_type = SubscriptionType::VmRenewal;
+        updated_line_item.configuration = Some(serde_json::to_value(cfg)?);
+        self.db
+            .update_subscription_line_item(&updated_line_item)
+            .await?;
+
         Ok(())
     }
 

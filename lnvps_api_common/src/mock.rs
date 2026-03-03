@@ -782,6 +782,20 @@ impl LNVpsDbBase for MockDb {
         Ok(result)
     }
 
+    async fn list_vm_subscription_payments_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let all = self.list_vm_subscription_payments(vm_id).await?;
+        Ok(all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         let max = *ip_assignments.keys().max().unwrap_or(&0);

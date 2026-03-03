@@ -10,8 +10,8 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
-    OsDistribution, PaymentMethod, RouterKind, SubscriptionType, VmHistory, VmHistoryActionType,
-    VmHostKind, VmPayment,
+    OsDistribution, PaymentMethod, RouterKind, SubscriptionPayment, SubscriptionType, VmHistory,
+    VmHistoryActionType, VmHostKind, VmPayment,
 };
 
 // Admin API Enums - Using enums from common crate where available, creating new ones only where needed
@@ -2082,6 +2082,29 @@ impl AdminVmPaymentInfo {
         Self {
             id: hex::encode(&payment.id),
             vm_id: payment.vm_id,
+            created: payment.created,
+            expires: payment.expires,
+            amount: payment.amount,
+            tax: payment.tax,
+            processing_fee: payment.processing_fee,
+            currency: payment.currency.clone(),
+            company_base_currency,
+            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            external_id: payment.external_id.clone(),
+            is_paid: payment.is_paid,
+            paid_at: payment.paid_at,
+            rate: payment.rate,
+        }
+    }
+
+    pub fn from_subscription_payment(
+        payment: &SubscriptionPayment,
+        vm_id: u64,
+        company_base_currency: String,
+    ) -> Self {
+        Self {
+            id: hex::encode(&payment.id),
+            vm_id,
             created: payment.created,
             expires: payment.expires,
             amount: payment.amount,

@@ -79,15 +79,17 @@ Full plan details captured in this work file.
 - [x] Test helpers updated to create subscriptions for VMs
 - [x] Verify build + all 214 unit tests pass
 
-### Increment 5: VM upgrade updates subscription & line item
-- [ ] Update `convert_to_custom_template()` to update subscription interval to `1 Month`
-- [ ] Update `convert_to_custom_template()` to update line item amount + configuration
-- [ ] Verify build + tests pass
+### Increment 5: VM upgrade updates subscription & line item ✓
+- [x] Update `convert_to_custom_template()` to update subscription interval to `1 Month`
+- [x] Update `convert_to_custom_template()` to update line item `subscription_type` → `VmRenewal` and store config
+- [x] Verify build + tests pass
 
-### Increment 6: Admin API updates
-- [ ] Update `GET /api/admin/v1/vms/{id}/payments` to query via vm.subscription_id
-- [ ] Update `GET /api/admin/v1/vm_payments/{id}` to query subscription_payment
-- [ ] Verify build + tests pass
+### Increment 6: Admin API updates ✓
+- [x] `admin_list_vm_payments` — use `list_vm_subscription_payments` with manual pagination
+- [x] `admin_get_vm_payment` — use `get_subscription_payment` + `get_vm_by_subscription` for ownership check
+- [x] `admin_complete_vm_payment` — use `subscription_payment_paid`; read upgrade config from `metadata`
+- [x] `AdminVmPaymentInfo::from_subscription_payment()` added to model
+- [x] Verify build + all 214 unit tests pass
 
 ### Increment 7: Reporting updates
 - [ ] Update revenue report queries to use subscription_payment
