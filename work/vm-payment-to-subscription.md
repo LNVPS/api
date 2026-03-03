@@ -114,11 +114,10 @@ Full plan details captured in this work file.
 - [ ] Data migration tests against backup
 - [ ] Validation endpoint: VMs without subscriptions, missing time_value, duplicates
 
-### Increment 10: Documentation & cleanup
-- [ ] Update API_DOCUMENTATION.md
-- [ ] Update API_CHANGELOG.md
-- [ ] Add migration notes to docs/agents/migrations.md
-- [ ] Remove deprecated vm_payment code after finalization migration
+### Increment 10: Documentation & cleanup ✓
+- [x] Update API_CHANGELOG.md
+- [x] Add migration notes to docs/agents/migrations.md
+- [ ] Remove deprecated vm_payment code after finalization migration (blocked on production verification)
 
 ### Finalization (after production verification)
 - [ ] Apply finalization migration: `ALTER TABLE vm MODIFY subscription_id NOT NULL`

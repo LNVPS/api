@@ -4,6 +4,39 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **2026-03-03** - VM payments now use the unified `subscription_payment` table
+  - All VM renewal, purchase, and upgrade payments are now stored in `subscription_payment` instead of `vm_payment`
+  - `GET /api/v1/vm/{id}/payments` — Response format unchanged; now backed by `subscription_payment`; supports pagination via `?limit=N&offset=N` query params
+  - `GET /api/v1/vm/{id}/payments/{payment_id}` — Now looks up by `subscription_payment.id`
+  - `GET /api/v1/vm/{id}/payments/{payment_id}/invoice` — Now backed by `subscription_payment`
+  - `POST /api/v1/vm/{id}/renew` — Returns payment from `subscription_payment`
+  - `POST /api/v1/vm/{id}/upgrade` — Returns payment from `subscription_payment`; upgrade parameters stored in `metadata` JSON field
+  - `GET /api/admin/v1/vms/{id}/payments` — Now backed by `subscription_payment`; uses real DB-level pagination
+  - `GET /api/admin/v1/vms/{id}/payments/{payment_id}` — Now looks up by `subscription_payment.id`
+  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Now completes a `subscription_payment`
+  - `GET /api/admin/v1/reports/time-series` — Revenue data now sourced from `subscription_payment`
+  - `GET /api/admin/v1/reports/referral-usage/time-series` — Referral data now sourced from `subscription_payment`
+  - **Requires data migration**: Run `migrate_vm_subscriptions` binary to backfill existing VMs with subscriptions before upgrading
+  - **Schema migrations**: `20260302151134_vm_subscription_link.sql` and `20260302154256_vm_subscription_not_null.sql`
+
+- **2026-03-03** - Every VM is now linked to a `subscription` and `subscription_line_item`
+  - `vm` table has a new `subscription_line_item_id` column (NOT NULL) linking it to the subscriptions system
+  - New VMs provisioned via `POST /api/v1/vm` or `POST /api/v1/vm/custom` automatically get a subscription created
+  - The subscription interval is copied from the cost plan (standard VMs) or defaults to 1 month (custom VMs)
+
+- **2026-03-03** - `IntervalType` enum renamed from `VmCostPlanIntervalType`
+  - Affects admin responses that include cost plan or subscription interval information
+
+### Added
+
+- **2026-03-03** - Multi-interval VM renewal support
+  - `POST /api/v1/vm/{id}/renew` — Accepts optional `intervals` query parameter to pre-pay multiple billing periods at once
+  - `POST /api/admin/v1/vms/{id}/renew` — Same `intervals` support in admin renewal endpoint
+
 ## [v0.2.0] - 2026-02-22
 
 ### Changed
