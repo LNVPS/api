@@ -1007,13 +1007,44 @@ impl LNVpsProvisioner {
         subscription.interval_type = IntervalType::Month;
         self.db.update_subscription(&subscription).await?;
 
-        // Update the line item: mark as VmRenewal (no longer VmUpgrade) and store the new config
+        // Calculate the new base-currency cost for the new custom template and update the line
+        // item's amount so the displayed subscription cost reflects the upgraded specs.
+        let new_price =
+            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template)
+                .await?;
+
+        // Update the line item: mark as VmRenewal (no longer VmUpgrade), store the new config,
+        // and update the renewal amount to the new template's base-currency cost.
         let mut updated_line_item = line_item;
         updated_line_item.subscription_type = SubscriptionType::VmRenewal;
         updated_line_item.configuration = Some(serde_json::to_value(cfg)?);
+        updated_line_item.amount = new_price.total();
         self.db
             .update_subscription_line_item(&updated_line_item)
             .await?;
+
+        Ok(())
+    }
+
+    /// Update the subscription line item's renewal amount for a VM that already uses a custom
+    /// template.  Called after the custom template's specs have been updated in the database so
+    /// that `ApiSubscriptionLineItem.price` reflects the new cost.
+    pub async fn update_line_item_cost_for_custom_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let custom_template_id = vm
+            .custom_template_id
+            .ok_or_else(|| anyhow::anyhow!("VM does not have a custom template"))?;
+        let template = self.db.get_custom_vm_template(custom_template_id).await?;
+
+        let new_price =
+            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &template).await?;
+
+        let mut line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        line_item.amount = new_price.total();
+        self.db.update_subscription_line_item(&line_item).await?;
 
         Ok(())
     }
@@ -2377,6 +2408,127 @@ mod tests {
         assert!(!sub.is_active);
         assert!(!sub.is_setup);
 
+        Ok(())
+    }
+
+    // ── subscription line item amount update tests ───────────────────────────
+
+    /// Regression: convert_to_custom_template must update line_item.amount to the new
+    /// base-currency cost of the custom template so that the subscription's displayed
+    /// renewal cost is not stale after a standard→custom upgrade.
+    #[tokio::test]
+    async fn test_convert_to_custom_template_updates_line_item_amount() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db.clone());
+
+        // Record the old line item amount before the upgrade.
+        let vm = db.get_vm(vm_id).await?;
+        let old_line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let old_amount = old_line_item.amount;
+
+        // Upgrade: add more CPU so the new cost will be higher.
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        prov.convert_to_custom_template(vm_id, &cfg).await?;
+
+        // After conversion the line item amount must reflect the new custom template cost
+        // and must differ from the old standard-template amount.
+        let vm_after = db.get_vm(vm_id).await?;
+        let new_line_item = db
+            .get_subscription_line_item(vm_after.subscription_line_item_id)
+            .await?;
+
+        assert_ne!(
+            new_line_item.amount, old_amount,
+            "line_item.amount must be updated after upgrade (was stale: {})",
+            old_amount
+        );
+        assert!(
+            new_line_item.amount > 0,
+            "new line_item.amount must be positive"
+        );
+        Ok(())
+    }
+
+    /// Regression: update_line_item_cost_for_custom_vm must update line_item.amount for a VM
+    /// that already uses a custom template after its specs are changed.
+    #[tokio::test]
+    async fn test_update_line_item_cost_for_custom_vm_updates_amount() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id =
+            insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+
+        let (user, ssh_key) = add_user(&db).await?;
+
+        // Start with a small custom template (2 CPU).
+        let small_template_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 4 * GB,
+                disk_size: 64 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ..Default::default()
+            })
+            .await?;
+
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(small_template_id),
+                subscription_line_item_id,
+                ssh_key_id: ssh_key.id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:f1".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+
+        let prov = make_provisioner(db.clone());
+
+        // Read the amount before the template update.
+        let vm = db.get_vm(vm_id).await?;
+        let old_amount = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?
+            .amount;
+
+        // Simulate the worker upgrading the template to 4 CPU.
+        {
+            let mut custom_template_map = db.custom_template.lock().await;
+            let tpl = custom_template_map.get_mut(&small_template_id).unwrap();
+            tpl.cpu = 4;
+        }
+
+        // Now call the helper that should refresh the line item cost.
+        prov.update_line_item_cost_for_custom_vm(vm_id).await?;
+
+        let new_amount = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?
+            .amount;
+
+        assert_ne!(
+            new_amount, old_amount,
+            "line_item.amount must be updated after custom template spec change (was stale: {})",
+            old_amount
+        );
+        assert!(new_amount > 0, "new line_item.amount must be positive");
         Ok(())
     }
 

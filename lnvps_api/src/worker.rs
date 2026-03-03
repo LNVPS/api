@@ -1923,6 +1923,12 @@ impl Worker {
                         // Update the custom template in the database
                         ctx.db.update_custom_vm_template(&new_template).await?;
 
+                        // Update the subscription line item's renewal amount so that the
+                        // displayed subscription cost reflects the upgraded specs.
+                        ctx.provisioner
+                            .update_line_item_cost_for_custom_vm(ctx.vm_id)
+                            .await?;
+
                         // Log the upgrade in VM history
                         let upgrade_metadata = serde_json::json!({
                             "upgrade_type": "custom_template_update",
