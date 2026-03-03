@@ -560,11 +560,11 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all payout records for a referral
     async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>>;
 
-    /// List the first paid VM payment per VM that used this referral code.
+    /// List the first paid subscription payment per VM that used this referral code.
     /// This is the basis for computing earned amounts (per currency).
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>>;
 
-    /// Count VMs that used this referral code but have never made a paid payment.
+    /// Count VMs that used this referral code but have never made a paid subscription payment.
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 }
 

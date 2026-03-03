@@ -5,7 +5,7 @@ use crate::{
     ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -1462,11 +1462,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         id: &Vec<u8>,
     ) -> DbResult<SubscriptionPaymentWithCompany> {
         Ok(sqlx::query_as(
-            "SELECT sp.*, c.base_currency as company_base_currency
+            "SELECT sp.*,
+             c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
+             v.id as vm_id,
+             vh.id as host_id, vh.name as host_name,
+             vhr.id as region_id, vhr.name as region_name
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
-             JOIN users u ON s.user_id = u.id
-             JOIN company c ON u.id = c.id
+             LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
+                 AND sli.subscription_type IN (3, 4)
+             LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
+             LEFT JOIN vm_host vh ON v.host_id = vh.id
+             LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
+                                     THEN vhr.company_id
+                                     ELSE s.user_id END) = c.id
              WHERE sp.id = ?",
         )
         .bind(id)
@@ -2026,23 +2036,26 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as(
             "SELECT v.id as vm_id,
                     v.ref_code,
-                    vp.created,
-                    vp.amount,
-                    vp.currency,
-                    vp.rate,
+                    sp.created,
+                    sp.amount,
+                    sp.currency,
+                    sp.rate,
                     c.base_currency
              FROM vm v
              JOIN (
-                 SELECT vm_id, currency, amount, created, rate,
-                        ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) AS rn
-                 FROM vm_payment
-                 WHERE is_paid = 1
-             ) vp ON v.id = vp.vm_id AND vp.rn = 1
+                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
+                 FROM subscription_payment sp2
+                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+                     AND sli2.subscription_type IN (3, 4)
+                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+                 WHERE sp2.is_paid = 1
+             ) sp ON v.id = sp.vm_id AND sp.rn = 1
              JOIN vm_host vh ON v.host_id = vh.id
              JOIN vm_host_region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
              WHERE v.ref_code = ?
-             ORDER BY vp.created DESC",
+             ORDER BY sp.created DESC",
         )
         .bind(code)
         .fetch_all(&self.db)
@@ -2054,7 +2067,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "SELECT COUNT(*) FROM vm v
              WHERE v.ref_code = ?
                AND NOT EXISTS (
-                   SELECT 1 FROM vm_payment vp WHERE vp.vm_id = v.id AND vp.is_paid = 1
+                   SELECT 1
+                   FROM subscription_payment sp
+                   JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id
+                       AND sli.subscription_type IN (3, 4)
+                   WHERE v.subscription_line_item_id = sli.id AND sp.is_paid = 1
                )",
         )
         .bind(code)
@@ -3301,76 +3318,46 @@ impl AdminDb for LNVpsDbMysql {
         Ok(count as u64)
     }
 
-    async fn admin_get_payments_by_date_range(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-    ) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as(
-            "SELECT * FROM vm_payment WHERE created >= ? AND created < ? AND is_paid = true ORDER BY created",
-        )
-        .bind(start_date)
-        .bind(end_date)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
-    async fn admin_get_payments_by_date_range_and_company(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-        company_id: u64,
-    ) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as(
-            "SELECT vp.* FROM vm_payment vp
-             JOIN vm v ON vp.vm_id = v.id
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
-             WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND vhr.company_id = ?
-             ORDER BY vp.created",
-        )
-        .bind(start_date)
-        .bind(end_date)
-        .bind(company_id)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> DbResult<Vec<VmPaymentWithCompany>> {
+    ) -> DbResult<Vec<SubscriptionPaymentWithCompany>> {
         let mut query = QueryBuilder::new(
-            "SELECT vp.*, 
+            "SELECT sp.*,
              c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
-             v.user_id,
+             v.id as vm_id,
              vh.id as host_id, vh.name as host_name,
              vhr.id as region_id, vhr.name as region_name
-             FROM vm_payment vp
-             JOIN vm v ON vp.vm_id = v.id
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             WHERE vp.created >= ",
+             FROM subscription_payment sp
+             JOIN subscription s ON sp.subscription_id = s.id
+             LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
+                 AND sli.subscription_type IN (3, 4)
+             LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
+             LEFT JOIN vm_host vh ON v.host_id = vh.id
+             LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
+                                     THEN vhr.company_id
+                                     ELSE s.user_id END) = c.id
+             WHERE sp.created >= ",
         );
         query.push_bind(start_date);
-        query.push(" AND vp.created < ");
+        query.push(" AND sp.created < ");
         query.push_bind(end_date);
-        query.push(" AND vp.is_paid = true AND c.id = ");
+        query.push(" AND sp.is_paid = true AND c.id = ");
         query.push_bind(company_id);
 
         if let Some(currency) = currency {
-            query.push(" AND vp.currency = ");
+            query.push(" AND sp.currency = ");
             query.push_bind(currency);
         }
 
-        query.push(" ORDER BY vp.created");
+        query.push(" ORDER BY sp.created");
 
         Ok(query
-            .build_query_as::<VmPaymentWithCompany>()
+            .build_query_as::<SubscriptionPaymentWithCompany>()
             .fetch_all(&self.db)
             .await?)
     }
@@ -3384,31 +3371,34 @@ impl AdminDb for LNVpsDbMysql {
     ) -> DbResult<Vec<ReferralCostUsage>> {
         let mut query = "SELECT v.id as vm_id,
                                 v.ref_code,
-                                vp.created,
-                                vp.amount,
-                                vp.currency,
-                                vp.rate,
+                                sp.created,
+                                sp.amount,
+                                sp.currency,
+                                sp.rate,
                                 c.base_currency
                          FROM vm v
                          JOIN (
-                             SELECT vm_id, currency, amount, created, rate,
-                                    ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) as rn
-                             FROM vm_payment
-                             WHERE is_paid = 1
-                         ) vp ON v.id = vp.vm_id AND vp.rn = 1
+                             SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                                    ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) as rn
+                             FROM subscription_payment sp2
+                             JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+                                 AND sli2.subscription_type IN (3, 4)
+                             JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+                             WHERE sp2.is_paid = 1
+                         ) sp ON v.id = sp.vm_id AND sp.rn = 1
                          JOIN vm_host vh ON v.host_id = vh.id
                          JOIN vm_host_region vhr ON vh.region_id = vhr.id
                          JOIN company c ON vhr.company_id = c.id
-                         WHERE v.ref_code IS NOT NULL 
-                           AND vp.created >= ? 
-                           AND vp.created <= ?
+                         WHERE v.ref_code IS NOT NULL
+                           AND sp.created >= ?
+                           AND sp.created <= ?
                            AND c.id = ?".to_string();
 
         if ref_code.is_some() {
             query.push_str(" AND v.ref_code = ?");
         }
 
-        query.push_str(" ORDER BY vp.created DESC");
+        query.push_str(" ORDER BY sp.created DESC");
 
         let mut db_query = sqlx::query_as(&query)
             .bind(start_date)

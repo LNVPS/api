@@ -15,7 +15,7 @@ use lnvps_db::{
 use async_trait::async_trait;
 #[cfg(feature = "admin")]
 use lnvps_db::{
-    AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats, VmPaymentWithCompany,
+    AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats,
 };
 use std::collections::HashMap;
 use std::ops::Add;
@@ -1395,7 +1395,7 @@ impl LNVpsDbBase for MockDb {
             .cloned()
             .context("Subscription payment not found")?;
 
-        // For mock, we'll just use EUR as the base currency
+        // For mock, use placeholder company/host/region data
         Ok(SubscriptionPaymentWithCompany {
             id: payment.id,
             subscription_id: payment.subscription_id,
@@ -1415,7 +1415,14 @@ impl LNVpsDbBase for MockDb {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             paid_at: payment.paid_at,
+            company_id: 0,
+            company_name: String::new(),
             company_base_currency: "EUR".to_string(),
+            vm_id: None,
+            host_id: None,
+            host_name: None,
+            region_id: None,
+            region_name: None,
         })
     }
 
@@ -1740,24 +1747,30 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
         let vms = self.vms.lock().await;
-        let payments = self.payments.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let sub_payments = self.subscription_payments.lock().await;
         let mut result = Vec::new();
         for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
-            let mut vm_payments: Vec<&VmPayment> = payments
-                .iter()
-                .filter(|p| p.vm_id == vm.id && p.is_paid)
-                .collect();
-            vm_payments.sort_by_key(|p| p.created);
-            if let Some(first) = vm_payments.first() {
-                result.push(ReferralCostUsage {
-                    vm_id: vm.id,
-                    ref_code: code.to_string(),
-                    created: first.created,
-                    amount: first.amount,
-                    currency: first.currency.clone(),
-                    rate: first.rate,
-                    base_currency: "EUR".to_string(),
-                });
+            let subscription_id = line_items
+                .get(&vm.subscription_line_item_id)
+                .map(|sli| sli.subscription_id);
+            if let Some(sid) = subscription_id {
+                let mut vm_payments: Vec<&SubscriptionPayment> = sub_payments
+                    .iter()
+                    .filter(|p| p.subscription_id == sid && p.is_paid)
+                    .collect();
+                vm_payments.sort_by_key(|p| p.created);
+                if let Some(first) = vm_payments.first() {
+                    result.push(ReferralCostUsage {
+                        vm_id: vm.id,
+                        ref_code: code.to_string(),
+                        created: first.created,
+                        amount: first.amount,
+                        currency: first.currency.clone(),
+                        rate: first.rate,
+                        base_currency: "EUR".to_string(),
+                    });
+                }
             }
         }
         result.sort_by(|a, b| b.created.cmp(&a.created));
@@ -1766,11 +1779,18 @@ impl LNVpsDbBase for MockDb {
 
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
         let vms = self.vms.lock().await;
-        let payments = self.payments.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let sub_payments = self.subscription_payments.lock().await;
         Ok(vms
             .values()
             .filter(|v| v.ref_code.as_deref() == Some(code))
-            .filter(|v| !payments.iter().any(|p| p.vm_id == v.id && p.is_paid))
+            .filter(|v| {
+                let sid = line_items
+                    .get(&v.subscription_line_item_id)
+                    .map(|sli| sli.subscription_id);
+                !sid.map(|s| sub_payments.iter().any(|p| p.subscription_id == s && p.is_paid))
+                    .unwrap_or(false)
+            })
             .count() as u64)
     }
 }
@@ -2165,120 +2185,101 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_count_company_regions(&self, _company_id: u64) -> DbResult<u64> {
         Ok(0)
     }
-    async fn admin_get_payments_by_date_range(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-    ) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
-            .cloned()
-            .collect())
-    }
-    async fn admin_get_payments_by_date_range_and_company(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-        company_id: u64,
-    ) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        let vms = self.vms.lock().await;
-        let hosts = self.hosts.lock().await;
-        let regions = self.regions.lock().await;
-
-        Ok(p.iter()
-            .filter(|payment| {
-                if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
-                    return false;
-                }
-
-                // Follow VM -> Host -> Region -> Company chain
-                if let Some(vm) = vms.get(&payment.vm_id) {
-                    if let Some(host) = hosts.get(&vm.host_id) {
-                        if let Some(region) = regions.get(&host.region_id) {
-                            return region.company_id == company_id;
-                        }
-                    }
-                }
-                false
-            })
-            .cloned()
-            .collect())
-    }
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> DbResult<Vec<VmPaymentWithCompany>> {
-        let p = self.payments.lock().await;
+    ) -> DbResult<Vec<SubscriptionPaymentWithCompany>> {
+        let sub_payments = self.subscription_payments.lock().await;
         let vms = self.vms.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let companies = self.companies.lock().await;
 
         let mut result = Vec::new();
 
-        for payment in p.iter() {
+        for payment in sub_payments.iter() {
             if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
                 continue;
             }
 
-            // Filter by currency if specified
             if let Some(filter_currency) = currency {
                 if payment.currency != filter_currency {
                     continue;
                 }
             }
 
-            // Follow VM -> Host -> Region -> Company chain
-            if let Some(vm) = vms.get(&payment.vm_id) {
-                if let Some(host) = hosts.get(&vm.host_id) {
-                    if let Some(region) = regions.get(&host.region_id) {
-                        let region_company_id = region.company_id;
-                        // Filter by company (always required)
-                        if region_company_id != company_id {
-                            continue;
-                        }
+            // Find VM via subscription → line_item (VmRenewal/VmUpgrade) → vm
+            let vm = vms.values().find(|v| {
+                line_items
+                    .get(&v.subscription_line_item_id)
+                    .map(|sli| sli.subscription_id == payment.subscription_id)
+                    .unwrap_or(false)
+            });
 
-                        if let Some(company) = companies.get(&region_company_id) {
-                            result.push(VmPaymentWithCompany {
-                                id: payment.id.clone(),
-                                vm_id: payment.vm_id,
-                                created: payment.created,
-                                expires: payment.expires,
-                                amount: payment.amount,
-                                currency: payment.currency.clone(),
-                                payment_method: payment.payment_method,
-                                payment_type: payment.payment_type,
-                                external_data: payment.external_data.clone(),
-                                external_id: payment.external_id.clone(),
-                                is_paid: payment.is_paid,
-                                rate: payment.rate,
-                                time_value: payment.time_value,
-                                tax: payment.tax,
-                                processing_fee: payment.processing_fee,
-                                upgrade_params: payment.upgrade_params.clone(),
-                                company_id: region_company_id,
-                                company_name: company.name.clone(),
-                                company_base_currency: company.base_currency.clone(),
-                                user_id: vm.user_id,
-                                host_id: host.id,
-                                host_name: host.name.clone(),
-                                region_id: region.id,
-                                region_name: region.name.clone(),
-                            });
+            let (vm_id, host_id, host_name, region_id, region_name, region_company_id) =
+                if let Some(vm) = vm {
+                    if let Some(host) = hosts.get(&vm.host_id) {
+                        if let Some(region) = regions.get(&host.region_id) {
+                            (
+                                Some(vm.id),
+                                Some(host.id),
+                                Some(host.name.clone()),
+                                Some(region.id),
+                                Some(region.name.clone()),
+                                Some(region.company_id),
+                            )
+                        } else {
+                            (Some(vm.id), Some(host.id), Some(host.name.clone()), None, None, None)
                         }
+                    } else {
+                        (Some(vm.id), None, None, None, None, None)
                     }
-                }
+                } else {
+                    (None, None, None, None, None, None)
+                };
+
+            // Resolve company
+            let cid = region_company_id.unwrap_or(0);
+            if cid != company_id {
+                continue;
+            }
+            if let Some(company) = companies.get(&cid) {
+                result.push(SubscriptionPaymentWithCompany {
+                    id: payment.id.clone(),
+                    subscription_id: payment.subscription_id,
+                    user_id: payment.user_id,
+                    created: payment.created,
+                    expires: payment.expires,
+                    amount: payment.amount,
+                    currency: payment.currency.clone(),
+                    payment_method: payment.payment_method,
+                    payment_type: payment.payment_type,
+                    external_data: payment.external_data.clone(),
+                    external_id: payment.external_id.clone(),
+                    is_paid: payment.is_paid,
+                    rate: payment.rate,
+                    time_value: payment.time_value,
+                    metadata: payment.metadata.clone(),
+                    tax: payment.tax,
+                    processing_fee: payment.processing_fee,
+                    paid_at: payment.paid_at,
+                    company_id: cid,
+                    company_name: company.name.clone(),
+                    company_base_currency: company.base_currency.clone(),
+                    vm_id,
+                    host_id,
+                    host_name,
+                    region_id,
+                    region_name,
+                });
             }
         }
 
-        // Sort by created timestamp
         result.sort_by(|a, b| a.created.cmp(&b.created));
-
         Ok(result)
     }
     async fn admin_get_referral_usage_by_date_range(

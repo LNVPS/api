@@ -91,11 +91,11 @@ Full plan details captured in this work file.
 - [x] `AdminVmPaymentInfo::from_subscription_payment()` added to model
 - [x] Verify build + all 214 unit tests pass
 
-### Increment 7: Reporting updates
-- [ ] Update revenue report queries to use subscription_payment
-- [ ] Update company report queries
-- [ ] Update referral cost tracking to join via vm.subscription_id
-- [ ] Verify build + tests pass
+### Increment 7: Reporting updates ✓
+- [x] Update revenue report queries to use subscription_payment
+- [x] Update company report queries
+- [x] Update referral cost tracking to join via vm.subscription_id
+- [x] Verify build + tests pass
 
 ### Increment 8: Subscription creation for new VMs
 - [ ] Update standard VM provisioning to create subscription + line item

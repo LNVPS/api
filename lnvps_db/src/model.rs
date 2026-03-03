@@ -1591,7 +1591,7 @@ pub struct SubscriptionPayment {
     pub paid_at: Option<DateTime<Utc>>,
 }
 
-/// Subscription payment with company info (for admin views)
+/// Subscription payment with company info (for admin views and time-series reporting)
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct SubscriptionPaymentWithCompany {
     pub id: Vec<u8>,
@@ -1615,7 +1615,18 @@ pub struct SubscriptionPaymentWithCompany {
     pub processing_fee: u64,
     /// Timestamp when the payment was completed
     pub paid_at: Option<DateTime<Utc>>,
+    // Company information
+    pub company_id: u64,
+    pub company_name: String,
     pub company_base_currency: String,
+    // VM information (NULL for non-VM subscriptions)
+    pub vm_id: Option<u64>,
+    // Host information
+    pub host_id: Option<u64>,
+    pub host_name: Option<String>,
+    // Region information
+    pub region_id: Option<u64>,
+    pub region_name: Option<String>,
 }
 
 /// Internet Registry - Regional Internet Registry
