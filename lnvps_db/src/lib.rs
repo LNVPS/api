@@ -182,6 +182,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all VM cost plans
     async fn list_cost_plans(&self) -> DbResult<Vec<VmCostPlan>>;
 
+    /// List VM cost plans with database-level pagination. Returns (rows, total_count).
+    async fn list_cost_plans_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCostPlan>, u64)>;
+
     /// Insert a new VM cost plan
     async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64>;
 
@@ -315,6 +322,17 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>>;
 
+    /// List all custom pricing models with optional filters and database-level pagination.
+    /// `region_id = None` returns all regions. `enabled = None` returns all.
+    /// Returns (rows, total_count).
+    async fn list_custom_pricing_paginated(
+        &self,
+        region_id: Option<u64>,
+        enabled: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCustomPricing>, u64)>;
+
     /// Get a custom pricing model
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing>;
 
@@ -402,6 +420,15 @@ pub trait LNVpsDbBase: Send + Sync {
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>>;
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
+
+    /// List subscriptions with database-level pagination. `user_id = None` returns all users.
+    /// Returns (rows, total_count).
+    async fn list_subscriptions_paginated(
+        &self,
+        user_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)>;
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription>;
     async fn get_subscription_by_ext_id(&self, external_id: &str) -> DbResult<Subscription>;
@@ -436,6 +463,15 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>>;
+
+    /// List subscription payments with database-level pagination. Returns (rows, total_count).
+    async fn list_subscription_payments_paginated(
+        &self,
+        subscription_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SubscriptionPayment>, u64)>;
+
     async fn list_subscription_payments_by_user(
         &self,
         user_id: u64,
@@ -456,6 +492,17 @@ pub trait LNVpsDbBase: Send + Sync {
 
     // Available IP Space
     async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>>;
+
+    /// List available IP spaces with optional filters and database-level pagination.
+    /// Returns (rows, total_count).
+    async fn list_available_ip_space_paginated(
+        &self,
+        is_available: Option<bool>,
+        is_reserved: Option<bool>,
+        registry: Option<u8>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AvailableIpSpace>, u64)>;
     async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace>;
     async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace>;
     async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64>;
@@ -467,6 +514,14 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         available_ip_space_id: u64,
     ) -> DbResult<Vec<IpSpacePricing>>;
+
+    /// List pricing for an IP space with database-level pagination. Returns (rows, total_count).
+    async fn list_ip_space_pricing_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpSpacePricing>, u64)>;
     async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing>;
     async fn get_ip_space_pricing_by_prefix(
         &self,
@@ -490,6 +545,17 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         user_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>>;
+
+    /// List IP range subscriptions for a given space with optional filters and DB-level pagination.
+    /// Returns (rows, total_count).
+    async fn list_ip_range_subscriptions_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        user_id: Option<u64>,
+        is_active: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpRangeSubscription>, u64)>;
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription>;
     async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription>;
     async fn insert_ip_range_subscription(
@@ -508,6 +574,13 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List all payment method configurations
     async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>>;
+
+    /// List payment method configurations with database-level pagination. Returns (rows, total_count).
+    async fn list_payment_method_configs_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentMethodConfig>, u64)>;
 
     /// List payment method configurations for a company
     async fn list_payment_method_configs_for_company(

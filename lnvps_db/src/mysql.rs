@@ -584,6 +584,25 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_cost_plans_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCostPlan>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_cost_plan")
+                .fetch_one(&self.db)
+                .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM vm_cost_plan ORDER BY created DESC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
     async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_cost_plan(name,created,amount,currency,interval_amount,interval_type) values(?,?,?,?,?,?) returning id")
             .bind(&cost_plan.name)
@@ -1041,6 +1060,57 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_custom_pricing_paginated(
+        &self,
+        region_id: Option<u64>,
+        enabled: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCustomPricing>, u64)> {
+        // Build WHERE clauses dynamically
+        let mut conditions = Vec::new();
+        if region_id.is_some() {
+            conditions.push("region_id = ?");
+        }
+        if enabled.is_some() {
+            conditions.push("enabled = ?");
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM vm_custom_pricing {}", where_clause);
+        let data_sql = format!(
+            "SELECT * FROM vm_custom_pricing {} ORDER BY id DESC LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        // Build and execute count query
+        let mut count_q = sqlx::query_scalar(&count_sql);
+        if let Some(r) = region_id {
+            count_q = count_q.bind(r);
+        }
+        if let Some(e) = enabled {
+            count_q = count_q.bind(e);
+        }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        // Build and execute data query
+        let mut data_q = sqlx::query_as(&data_sql);
+        if let Some(r) = region_id {
+            data_q = data_q.bind(r);
+        }
+        if let Some(e) = enabled {
+            data_q = data_q.bind(e);
+        }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
+    }
+
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
         Ok(sqlx::query_as("select * from vm_custom_pricing where id=?")
             .bind(id)
@@ -1339,6 +1409,43 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_subscriptions_paginated(
+        &self,
+        user_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)> {
+        let (total, rows) = if let Some(uid) = user_id {
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM subscription WHERE user_id = ?")
+                    .bind(uid)
+                    .fetch_one(&self.db)
+                    .await?;
+            let rows = sqlx::query_as(
+                "SELECT * FROM subscription WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(uid)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription")
+                .fetch_one(&self.db)
+                .await?;
+            let rows = sqlx::query_as(
+                "SELECT * FROM subscription ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+            (total, rows)
+        };
+        Ok((rows, total as u64))
+    }
+
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         Ok(
             sqlx::query_as("SELECT * FROM subscription WHERE user_id = ? AND is_active = 1")
@@ -1578,6 +1685,29 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_subscription_payments_paginated(
+        &self,
+        subscription_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SubscriptionPayment>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscription_payment WHERE subscription_id = ?",
+        )
+        .bind(subscription_id)
+        .fetch_one(&self.db)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE subscription_id = ? ORDER BY created DESC LIMIT ? OFFSET ?",
+        )
+        .bind(subscription_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
     async fn list_subscription_payments_by_user(
         &self,
         user_id: u64,
@@ -1769,6 +1899,52 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_available_ip_space_paginated(
+        &self,
+        is_available: Option<bool>,
+        is_reserved: Option<bool>,
+        registry: Option<u8>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AvailableIpSpace>, u64)> {
+        let mut conditions: Vec<&str> = Vec::new();
+        if is_available.is_some() {
+            conditions.push("is_available = ?");
+        }
+        if is_reserved.is_some() {
+            conditions.push("is_reserved = ?");
+        }
+        if registry.is_some() {
+            conditions.push("registry = ?");
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM available_ip_space {}", where_clause);
+        let data_sql = format!(
+            "SELECT * FROM available_ip_space {} ORDER BY created DESC LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        let mut count_q = sqlx::query_scalar(&count_sql);
+        if let Some(v) = is_available { count_q = count_q.bind(v); }
+        if let Some(v) = is_reserved { count_q = count_q.bind(v); }
+        if let Some(v) = registry { count_q = count_q.bind(v); }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        let mut data_q = sqlx::query_as(&data_sql);
+        if let Some(v) = is_available { data_q = data_q.bind(v); }
+        if let Some(v) = is_reserved { data_q = data_q.bind(v); }
+        if let Some(v) = registry { data_q = data_q.bind(v); }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
+    }
+
     async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
         Ok(
             sqlx::query_as("SELECT * FROM available_ip_space WHERE id = ?")
@@ -1844,6 +2020,29 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_ip_space_pricing_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpSpacePricing>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ip_space_pricing WHERE available_ip_space_id = ?",
+        )
+        .bind(available_ip_space_id)
+        .fetch_one(&self.db)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(available_ip_space_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing> {
@@ -1950,6 +2149,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_ip_range_subscriptions_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        user_id: Option<u64>,
+        is_active: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpRangeSubscription>, u64)> {
+        let mut extra = String::from("AND ips.available_ip_space_id = ?");
+        if user_id.is_some() {
+            extra.push_str(" AND s.user_id = ?");
+        }
+        if is_active.is_some() {
+            extra.push_str(" AND ips.is_active = ?");
+        }
+
+        let base = "SELECT ips.* FROM ip_range_subscription ips \
+                    INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id \
+                    INNER JOIN subscription s ON sli.subscription_id = s.id \
+                    WHERE 1=1";
+
+        let count_sql = format!("{} {}", base, extra);
+        let data_sql = format!(
+            "{} {} ORDER BY ips.id DESC LIMIT ? OFFSET ?",
+            base, extra
+        );
+
+        let mut count_q = sqlx::query_scalar(&count_sql).bind(available_ip_space_id);
+        if let Some(u) = user_id { count_q = count_q.bind(u); }
+        if let Some(a) = is_active { count_q = count_q.bind(a); }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        let mut data_q = sqlx::query_as(&data_sql).bind(available_ip_space_id);
+        if let Some(u) = user_id { data_q = data_q.bind(u); }
+        if let Some(a) = is_active { data_q = data_q.bind(a); }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
+    }
+
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
         Ok(
             sqlx::query_as("SELECT * FROM ip_range_subscription WHERE id = ?")
@@ -2028,6 +2268,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn list_payment_method_configs_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentMethodConfig>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_method_config")
+            .fetch_one(&self.db)
+            .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM payment_method_config ORDER BY company_id, payment_method, name LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn list_payment_method_configs_for_company(
@@ -2572,6 +2830,24 @@ impl AdminDb for LNVpsDbMysql {
             .await?;
 
         Ok(roles)
+    }
+
+    async fn list_roles_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AdminRole>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_roles")
+            .fetch_one(&self.db)
+            .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM admin_roles ORDER BY is_system_role DESC, name ASC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn update_role(&self, role: &AdminRole) -> DbResult<()> {

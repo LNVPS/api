@@ -44,15 +44,10 @@ async fn v1_list_subscriptions(
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
 
-    let all_subscriptions = this.db.list_subscriptions_by_user(uid).await?;
-    let total = all_subscriptions.len() as u64;
+    let (page, total) = this.db.list_subscriptions_paginated(Some(uid), limit, offset).await?;
 
     let mut subscriptions = Vec::new();
-    for subscription in all_subscriptions
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-    {
+    for subscription in page {
         subscriptions
             .push(ApiSubscription::from_subscription(this.db.as_ref(), subscription).await?);
     }
@@ -98,15 +93,13 @@ pub async fn v1_list_subscription_payments(
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
 
-    let all_payments = this.db.list_subscription_payments(id).await?;
-    let total = all_payments.len() as u64;
+    let (page, total) = this
+        .db
+        .list_subscription_payments_paginated(id, limit, offset)
+        .await?;
 
-    let payments: Vec<ApiSubscriptionPayment> = all_payments
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .map(ApiSubscriptionPayment::from)
-        .collect();
+    let payments: Vec<ApiSubscriptionPayment> =
+        page.into_iter().map(ApiSubscriptionPayment::from).collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
 }

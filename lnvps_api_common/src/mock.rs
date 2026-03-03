@@ -576,6 +576,19 @@ impl LNVpsDbBase for MockDb {
         Ok(cost_plans.values().cloned().collect())
     }
 
+    async fn list_cost_plans_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCostPlan>, u64)> {
+        let cost_plans = self.cost_plans.lock().await;
+        let mut all: Vec<_> = cost_plans.values().cloned().collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        Ok((page, total))
+    }
+
     async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64> {
         let mut cost_plans = self.cost_plans.lock().await;
         let max = *cost_plans.keys().max().unwrap_or(&0);
@@ -980,6 +993,26 @@ impl LNVpsDbBase for MockDb {
         Ok(p.values().cloned().collect())
     }
 
+    async fn list_custom_pricing_paginated(
+        &self,
+        region_id: Option<u64>,
+        enabled: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCustomPricing>, u64)> {
+        let p = self.custom_pricing.lock().await;
+        let mut all: Vec<_> = p
+            .values()
+            .filter(|v| region_id.map_or(true, |r| v.region_id == r))
+            .filter(|v| enabled.map_or(true, |e| v.enabled == e))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        Ok((page, total))
+    }
+
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
         let p = self.custom_pricing.lock().await;
         Ok(p.get(&id).cloned().context("no custom pricing")?)
@@ -1216,6 +1249,24 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_subscriptions_paginated(
+        &self,
+        user_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)> {
+        let subscriptions = self.subscriptions.lock().await;
+        let mut all: Vec<_> = subscriptions
+            .values()
+            .filter(|s| user_id.map_or(true, |u| s.user_id == u))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        Ok((page, total))
+    }
+
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions
@@ -1361,6 +1412,24 @@ impl LNVpsDbBase for MockDb {
             .filter(|p| p.subscription_id == subscription_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_subscription_payments_paginated(
+        &self,
+        subscription_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SubscriptionPayment>, u64)> {
+        let payments = self.subscription_payments.lock().await;
+        let mut all: Vec<_> = payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.created.cmp(&a.created));
+        let total = all.len() as u64;
+        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        Ok((page, total))
     }
 
     async fn list_subscription_payments_by_user(
@@ -1530,6 +1599,17 @@ impl LNVpsDbBase for MockDb {
         todo!()
     }
 
+    async fn list_available_ip_space_paginated(
+        &self,
+        _is_available: Option<bool>,
+        _is_reserved: Option<bool>,
+        _registry: Option<u8>,
+        _limit: u64,
+        _offset: u64,
+    ) -> DbResult<(Vec<AvailableIpSpace>, u64)> {
+        todo!()
+    }
+
     async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
         todo!()
     }
@@ -1554,6 +1634,15 @@ impl LNVpsDbBase for MockDb {
         &self,
         available_ip_space_id: u64,
     ) -> DbResult<Vec<IpSpacePricing>> {
+        todo!()
+    }
+
+    async fn list_ip_space_pricing_by_space_paginated(
+        &self,
+        _available_ip_space_id: u64,
+        _limit: u64,
+        _offset: u64,
+    ) -> DbResult<(Vec<IpSpacePricing>, u64)> {
         todo!()
     }
 
@@ -1602,6 +1691,17 @@ impl LNVpsDbBase for MockDb {
         todo!()
     }
 
+    async fn list_ip_range_subscriptions_by_space_paginated(
+        &self,
+        _available_ip_space_id: u64,
+        _user_id: Option<u64>,
+        _is_active: Option<bool>,
+        _limit: u64,
+        _offset: u64,
+    ) -> DbResult<(Vec<IpRangeSubscription>, u64)> {
+        todo!()
+    }
+
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
         todo!()
     }
@@ -1632,6 +1732,19 @@ impl LNVpsDbBase for MockDb {
     async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>> {
         let configs = self.payment_method_configs.lock().await;
         Ok(configs.values().cloned().collect())
+    }
+
+    async fn list_payment_method_configs_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentMethodConfig>, u64)> {
+        let configs = self.payment_method_configs.lock().await;
+        let mut all: Vec<_> = configs.values().cloned().collect();
+        all.sort_by(|a, b| a.company_id.cmp(&b.company_id).then(a.id.cmp(&b.id)));
+        let total = all.len() as u64;
+        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        Ok((page, total))
     }
 
     async fn list_payment_method_configs_for_company(
@@ -1925,6 +2038,19 @@ impl lnvps_db::AdminDb for MockDb {
 
     async fn list_roles(&self) -> DbResult<Vec<AdminRole>> {
         Ok(vec![])
+    }
+
+    async fn list_roles_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AdminRole>, u64)> {
+        let page: Vec<AdminRole> = vec![]
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, 0))
     }
 
     async fn update_role(&self, _role: &AdminRole) -> DbResult<()> {

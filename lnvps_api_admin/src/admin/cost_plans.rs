@@ -54,14 +54,7 @@ async fn admin_list_cost_plans(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let all_cost_plans = this.db.list_cost_plans().await?;
-    let total = all_cost_plans.len() as u64;
-
-    let cost_plans = all_cost_plans
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect::<Vec<_>>();
+    let (cost_plans, total) = this.db.list_cost_plans_paginated(limit, offset).await?;
 
     let mut cost_plan_infos = Vec::new();
     for cost_plan in cost_plans {

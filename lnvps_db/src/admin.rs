@@ -33,6 +33,13 @@ pub trait AdminDb: Send + Sync {
     /// List all roles
     async fn list_roles(&self) -> DbResult<Vec<AdminRole>>;
 
+    /// List roles with database-level pagination. Returns (rows, total_count).
+    async fn list_roles_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AdminRole>, u64)>;
+
     /// Update role information
     async fn update_role(&self, role: &AdminRole) -> DbResult<()>;
 

@@ -109,19 +109,10 @@ async fn admin_list_subscriptions(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let all_subscriptions = if let Some(uid) = params.user_id {
-        this.db.list_subscriptions_by_user(uid).await?
-    } else {
-        this.db.list_subscriptions().await?
-    };
-
-    let total = all_subscriptions.len() as u64;
-
-    let subscriptions = all_subscriptions
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect::<Vec<_>>();
+    let (subscriptions, total) = this
+        .db
+        .list_subscriptions_paginated(params.user_id, limit, offset)
+        .await?;
 
     let mut subscription_infos = Vec::new();
     for subscription in subscriptions {
@@ -377,13 +368,13 @@ async fn admin_list_subscription_payments(
     let company = this.db.get_company(subscription.company_id).await?;
     let base_currency = company.base_currency;
 
-    let all_payments = this.db.list_subscription_payments(subscription_id).await?;
-    let total = all_payments.len() as u64;
+    let (page, total) = this
+        .db
+        .list_subscription_payments_paginated(subscription_id, limit, offset)
+        .await?;
 
-    let payments: Vec<AdminSubscriptionPaymentInfo> = all_payments
+    let payments: Vec<AdminSubscriptionPaymentInfo> = page
         .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
         .map(|p| AdminSubscriptionPaymentInfo::new(p, base_currency.clone()))
         .collect();
 
