@@ -23,8 +23,7 @@ use config::{Config, File};
 use lnvps_api_admin::settings::Settings;
 use lnvps_db::{
     EncryptionContext, IntervalType, LNVpsDb, LNVpsDbBase, LNVpsDbMysql, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType, SubscriptionType,
-    VmForMigration, VmPaymentRaw,
+    SubscriptionLineItem, SubscriptionPaymentType, SubscriptionType, VmForMigration, VmPaymentRaw,
 };
 use log::{info, warn};
 use std::path::PathBuf;
@@ -291,16 +290,13 @@ async fn migrate_vm_payments(
         .await
         .context("Failed to list vm_payments")?;
 
-    // Load already-copied subscription_payments for this subscription so we can
-    // detect duplicates by matching the original id stored in external_id field.
-    // We use the hex-encoded vm_payment.id as a sentinel in external_id to detect
-    // already-copied rows (only for rows that had no real external_id).
-    let existing = db
-        .list_vm_subscription_payments(vm_id)
+    // Idempotency check: find already-copied ids via raw query to avoid decryption.
+    let existing_ids: std::collections::HashSet<Vec<u8>> = db_impl
+        .list_subscription_payment_ids_for_subscription(subscription_id)
         .await
-        .context("Failed to list existing subscription payments")?;
-    let existing_ids: std::collections::HashSet<Vec<u8>> =
-        existing.iter().map(|p| p.id.clone()).collect();
+        .context("Failed to list existing subscription payment ids")?
+        .into_iter()
+        .collect();
 
     let mut copied = 0usize;
 
@@ -328,28 +324,9 @@ async fn migrate_vm_payments(
             None
         };
 
-        // Copy external_data as-is (already encrypted in production; plain in dev).
-        // EncryptedString::from(String) stores the value without re-encrypting.
-        let sp = SubscriptionPayment {
-            id: vp.id.clone(),
-            subscription_id,
-            user_id: vm.user_id,
-            created: vp.created,
-            expires: vp.expires,
-            amount: vp.amount,
-            currency: vp.currency.clone(),
-            payment_method: vp.payment_method,
-            payment_type,
-            external_data: vp.external_data.clone().into(),
-            external_id: vp.external_id.clone(),
-            is_paid: vp.is_paid,
-            rate: vp.rate,
-            time_value,
-            metadata,
-            tax: vp.tax,
-            processing_fee: vp.processing_fee,
-            paid_at: vp.paid_at,
-        };
+        let payment_type_u16 = payment_type as u16;
+        let metadata_str: Option<String> =
+            metadata.as_ref().map(|v: &serde_json::Value| v.to_string());
 
         if dry_run {
             info!(
@@ -361,7 +338,15 @@ async fn migrate_vm_payments(
                 vp.currency
             );
         } else {
-            db.insert_subscription_payment(&sp)
+            db_impl
+                .insert_subscription_payment_raw(
+                    vp,
+                    subscription_id,
+                    vm.user_id,
+                    payment_type_u16,
+                    time_value,
+                    metadata_str.as_deref(),
+                )
                 .await
                 .with_context(|| {
                     format!(

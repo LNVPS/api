@@ -51,6 +51,60 @@ impl LNVpsDbMysql {
             .collect())
     }
 
+    /// Insert a subscription_payment row by copying a vm_payment row verbatim,
+    /// writing external_data as raw bytes (no encrypt/decrypt round-trip).
+    pub async fn insert_subscription_payment_raw(
+        &self,
+        vp: &VmPaymentRaw,
+        subscription_id: u64,
+        user_id: u64,
+        payment_type: u16,
+        time_value: Option<u64>,
+        metadata: Option<&str>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO subscription_payment \
+             (id, subscription_id, user_id, created, expires, amount, currency, \
+              payment_method, payment_type, external_data, external_id, is_paid, rate, \
+              time_value, metadata, tax, processing_fee, paid_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&vp.id)
+        .bind(subscription_id)
+        .bind(user_id)
+        .bind(vp.created)
+        .bind(vp.expires)
+        .bind(vp.amount)
+        .bind(&vp.currency)
+        .bind(vp.payment_method as u16)
+        .bind(payment_type)
+        .bind(&vp.external_data) // raw string — no encryption
+        .bind(&vp.external_id)
+        .bind(vp.is_paid)
+        .bind(vp.rate)
+        .bind(time_value)
+        .bind(metadata)
+        .bind(vp.tax)
+        .bind(vp.processing_fee)
+        .bind(vp.paid_at)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// List the binary ids of all subscription_payments for a subscription.
+    /// Used by the migration tool for idempotency checking without decrypting external_data.
+    pub async fn list_subscription_payment_ids_for_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<Vec<u8>>> {
+        let rows = sqlx::query("SELECT id FROM subscription_payment WHERE subscription_id = ?")
+            .bind(subscription_id)
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<Vec<u8>, _>("id")).collect())
+    }
+
     /// List VM ids that have vm_payment rows not yet copied to subscription_payment.
     /// Identifies by id: a vm_payment is considered copied if a subscription_payment
     /// with the same binary id exists.
