@@ -411,6 +411,9 @@ pub struct AdminVmInfo {
     pub deleted: bool,
     pub ref_code: Option<String>,
     pub disabled: bool,
+    /// Subscription linked to this VM (includes line items and payment count)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<AdminSubscriptionInfo>,
 }
 
 impl AdminVmInfo {
@@ -529,6 +532,26 @@ impl AdminVmInfo {
             });
         }
 
+        // Fetch subscription via the VM's subscription line item
+        let subscription = {
+            let line_item = db
+                .get_subscription_line_item(vm.subscription_line_item_id)
+                .await
+                .ok();
+            if let Some(line_item) = line_item {
+                let sub = db.get_subscription(line_item.subscription_id).await.ok();
+                if let Some(sub) = sub {
+                    AdminSubscriptionInfo::from_subscription(db, &sub)
+                        .await
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
         Ok(Self {
             id: vm.id,
             created: vm.created,
@@ -563,6 +586,7 @@ impl AdminVmInfo {
             deleted,
             ref_code,
             disabled: vm.disabled,
+            subscription,
         })
     }
 }
