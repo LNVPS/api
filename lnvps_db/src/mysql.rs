@@ -1455,6 +1455,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_expiring_subscriptions(
+        &self,
+        within_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription WHERE is_active = 1 AND expires IS NOT NULL \
+             AND expires < DATE_ADD(NOW(), INTERVAL ? SECOND) AND expires > NOW()",
+        )
+        .bind(within_seconds)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription WHERE is_active = 1 AND expires IS NOT NULL \
+             AND expires < NOW()",
+        )
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+        sqlx::query("UPDATE subscription SET is_active = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE ip_range_subscription ips \
+             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id \
+             SET ips.is_active = 0, ips.ended_at = NOW() \
+             WHERE sli.subscription_id = ? AND ips.ended_at IS NULL",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription> {
         Ok(sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
             .bind(id)

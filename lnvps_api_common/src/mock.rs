@@ -46,6 +46,7 @@ pub struct MockDb {
     pub subscriptions: Arc<Mutex<HashMap<u64, Subscription>>>,
     pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
+    pub ip_range_subscriptions: Arc<Mutex<HashMap<u64, IpRangeSubscription>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -297,6 +298,7 @@ impl Default for MockDb {
                 m
             })),
             subscription_payments: Arc::new(Default::default()),
+            ip_range_subscriptions: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
@@ -1276,6 +1278,58 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_expiring_subscriptions(
+        &self,
+        within_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        let deadline = Utc::now() + chrono::Duration::seconds(within_seconds as i64);
+        Ok(subscriptions
+            .values()
+            .filter(|s| {
+                s.is_active
+                    && s.expires
+                        .map(|e| e > Utc::now() && e < deadline)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| {
+                s.is_active && s.expires.map(|e| e < Utc::now()).unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
+        let mut subscriptions = self.subscriptions.lock().await;
+        if let Some(sub) = subscriptions.get_mut(&id) {
+            sub.is_active = false;
+        }
+        drop(subscriptions);
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| li.subscription_id == id)
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        for ips in ip_subs.values_mut() {
+            if line_item_ids.contains(&ips.subscription_line_item_id) && ips.ended_at.is_none() {
+                ips.is_active = false;
+                ips.ended_at = Some(Utc::now());
+            }
+        }
+        Ok(())
+    }
+
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription> {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions
@@ -1674,58 +1728,147 @@ impl LNVpsDbBase for MockDb {
         &self,
         subscription_line_item_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
-        todo!()
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| s.subscription_line_item_id == subscription_line_item_id)
+            .cloned()
+            .collect())
     }
 
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
         subscription_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
-        todo!()
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| li.subscription_id == subscription_id)
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| line_item_ids.contains(&s.subscription_line_item_id))
+            .cloned()
+            .collect())
     }
 
     async fn list_ip_range_subscriptions_by_user(
         &self,
         user_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
-        todo!()
+        let subscriptions = self.subscriptions.lock().await;
+        let sub_ids: Vec<u64> = subscriptions
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .map(|s| s.id)
+            .collect();
+        drop(subscriptions);
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| sub_ids.contains(&li.subscription_id))
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| line_item_ids.contains(&s.subscription_line_item_id))
+            .cloned()
+            .collect())
     }
 
     async fn list_ip_range_subscriptions_by_space_paginated(
         &self,
-        _available_ip_space_id: u64,
-        _user_id: Option<u64>,
-        _is_active: Option<bool>,
-        _limit: u64,
-        _offset: u64,
+        available_ip_space_id: u64,
+        user_id: Option<u64>,
+        is_active: Option<bool>,
+        limit: u64,
+        offset: u64,
     ) -> DbResult<(Vec<IpRangeSubscription>, u64)> {
-        todo!()
+        let subscriptions = self.subscriptions.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        let mut all: Vec<IpRangeSubscription> = ip_subs
+            .values()
+            .filter(|s| {
+                if s.available_ip_space_id != available_ip_space_id {
+                    return false;
+                }
+                if let Some(active) = is_active {
+                    if s.is_active != active {
+                        return false;
+                    }
+                }
+                if let Some(uid) = user_id {
+                    let li_id = s.subscription_line_item_id;
+                    let sub_id = line_items
+                        .values()
+                        .find(|li| li.id == li_id)
+                        .map(|li| li.subscription_id);
+                    if let Some(sid) = sub_id {
+                        if !subscriptions.get(&sid).map(|s| s.user_id == uid).unwrap_or(false) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        Ok((page, total))
     }
 
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
-        todo!()
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IpRangeSubscription not found: {}", id).into())
     }
 
     async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription> {
-        todo!()
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs
+            .values()
+            .find(|s| s.cidr == cidr)
+            .cloned()
+            .ok_or_else(|| anyhow!("IpRangeSubscription not found for cidr: {}", cidr).into())
     }
 
     async fn insert_ip_range_subscription(
         &self,
         subscription: &IpRangeSubscription,
     ) -> DbResult<u64> {
-        todo!()
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        let id = ip_subs.len() as u64 + 1;
+        let mut new = subscription.clone();
+        new.id = id;
+        ip_subs.insert(id, new);
+        Ok(id)
     }
 
     async fn update_ip_range_subscription(
         &self,
         subscription: &IpRangeSubscription,
     ) -> DbResult<()> {
-        todo!()
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs.insert(subscription.id, subscription.clone());
+        Ok(())
     }
 
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
-        todo!()
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs.remove(&id);
+        Ok(())
     }
 
     // Payment Method Config

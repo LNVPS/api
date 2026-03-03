@@ -199,91 +199,217 @@ impl Worker {
         Ok(())
     }
 
-    /// Handle VM state
-    /// 1. Expire VM and send notification
-    /// 2. Stop VM if expired and still running
-    /// 3. Send notification for expiring soon
-    async fn handle_vm_state(&self, vm: &Vm, state: &VmRunningState) -> Result<()> {
-        const BEFORE_EXPIRE_NOTIFICATION: u64 = 1;
+    pub async fn get_last_check_subscriptions(&self) -> Result<DateTime<Utc>> {
+        let Some(v) = self.kv.get("worker-last-check-subscriptions").await? else {
+            return Ok(DateTime::UNIX_EPOCH);
+        };
+        let timestamp = if v.len() == 8 {
+            u64::from_le_bytes(v.as_slice().try_into()?)
+        } else {
+            0
+        };
+        Ok(DateTime::from_timestamp(timestamp as _, 0).unwrap())
+    }
 
-        let last_check = self.get_last_check_vms().await?;
+    pub async fn set_last_check_subscriptions(&self, ts: DateTime<Utc>) -> Result<()> {
+        let t = ts.timestamp() as u64;
+        self.kv
+            .store("worker-last-check-subscriptions", &t.to_le_bytes())
+            .await?;
+        Ok(())
+    }
 
-        // Attempt automatic renewal or send notification of VM expiring soon
-        if vm.expires < Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
-            && vm.expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION))
-        {
-            // Try automatic renewal via NWC if both user NWC and VM auto-renewal are enabled
-            let user = self.db.get_user(vm.user_id).await?;
+    /// Handle subscription lifecycle state:
+    /// 1. Expiring soon: attempt NWC auto-renewal; if not possible, notify user
+    /// 2. Expired: deactivate subscription (non-VM products); VM products handled by check_vms
+    /// 3. Grace period exceeded: notify user of deletion
+    async fn handle_subscription_state(
+        &self,
+        sub: &lnvps_db::Subscription,
+        last_check: DateTime<Utc>,
+    ) -> Result<()> {
+        use lnvps_db::SubscriptionType;
+
+        const BEFORE_EXPIRE_NOTIFICATION_DAYS: u64 = 1;
+        let Some(expires) = sub.expires else {
+            // Subscription has never been paid — no lifecycle action needed
+            return Ok(());
+        };
+
+        let expiry_window = Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
+
+        // --- Expiring soon ---
+        if expires < expiry_window && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS)) {
+            let user = self.db.get_user(sub.user_id).await?;
             let mut renewal_attempted = false;
             let mut renewal_successful = false;
             let mut nwc_error = String::new();
 
             #[cfg(feature = "nostr-nwc")]
-            if vm.auto_renewal_enabled {
+            if sub.auto_renewal_enabled {
                 if let Some(ref nwc_connection) = user.nwc_connection_string {
                     let nwc_string: String = nwc_connection.clone().into();
                     if !nwc_string.is_empty() {
                         info!(
-                            "Attempting automatic renewal for VM {} via NWC (user has NWC configured and VM auto-renewal is enabled)",
-                            vm.id
+                            "Attempting auto-renewal for subscription {} via NWC",
+                            sub.id
                         );
                         renewal_attempted = true;
-
-                        match self
-                            .provisioner
-                            .auto_renew_via_nwc(vm.id, &nwc_string)
-                            .await
-                        {
+                        // Look up the VM linked to this subscription (if any)
+                        let vm_id_result = self.db.get_vm_by_subscription(sub.id).await;
+                        let nwc_result = match vm_id_result {
+                            Ok(vm) => self.provisioner.auto_renew_via_nwc(vm.id, &nwc_string).await,
+                            Err(_) => Err(anyhow::anyhow!("No VM linked to subscription {}", sub.id)),
+                        };
+                        match nwc_result {
                             Ok(_) => {
                                 renewal_successful = true;
-                                info!("Successfully auto-renewed VM {} via NWC", vm.id);
-                                self.queue_notification(vm.user_id, format!("Your VM #{} has been automatically renewed via Nostr Wallet Connect and will continue running.", vm.id), Some(format!("[VM{}] Auto-Renewed", vm.id))).await;
+                                info!("Successfully auto-renewed subscription {} via NWC", sub.id);
+                                self.queue_notification(
+                                    sub.user_id,
+                                    format!(
+                                        "Your subscription '{}' has been automatically renewed via Nostr Wallet Connect.",
+                                        sub.name
+                                    ),
+                                    Some(format!("[Sub{}] Auto-Renewed", sub.id)),
+                                )
+                                .await;
                             }
                             Err(e) => {
-                                warn!("Auto-renewal error for VM {}: {}", vm.id, e);
+                                warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
                                 nwc_error = e.to_string();
                             }
                         }
-                    } else {
-                        info!(
-                            "VM {} has auto-renewal enabled but user has no NWC connection configured",
-                            vm.id
-                        );
                     }
-                } else {
-                    info!(
-                        "VM {} has auto-renewal enabled but user has no NWC connection configured",
-                        vm.id
-                    );
                 }
             }
 
-            // If no renewal was attempted or renewal failed, send the expiry notification
             if !renewal_attempted || !renewal_successful {
-                info!("Sending expire soon notification VM {}", vm.id);
                 let message = if renewal_attempted {
                     format!(
-                        "Your VM #{} will expire soon.\nAutomatic renewal failed, please manually renew in the next {} days or your VM will be stopped.\nError: '{}'",
-                        vm.id, BEFORE_EXPIRE_NOTIFICATION, nwc_error
+                        "Your subscription '{}' will expire soon.\nAutomatic renewal failed: '{}'\nPlease renew manually in the next {} day(s).",
+                        sub.name, nwc_error, BEFORE_EXPIRE_NOTIFICATION_DAYS
                     )
                 } else {
                     format!(
-                        "Your VM #{} will expire soon, please renew in the next {} days or your VM will be stopped.",
-                        vm.id, BEFORE_EXPIRE_NOTIFICATION
+                        "Your subscription '{}' will expire soon. Please renew in the next {} day(s).",
+                        sub.name, BEFORE_EXPIRE_NOTIFICATION_DAYS
                     )
                 };
-
                 self.queue_notification(
-                    vm.user_id,
+                    sub.user_id,
                     message,
-                    Some(format!("[VM{}] Expiring Soon", vm.id)),
+                    Some(format!("[Sub{}] Expiring Soon", sub.id)),
                 )
                 .await;
             }
         }
 
+        // --- Expired: deactivate non-VM subscriptions ---
+        if expires < Utc::now() {
+            let line_items = self.db.list_subscription_line_items(sub.id).await?;
+            let has_vm = line_items.iter().any(|li| {
+                matches!(
+                    li.subscription_type,
+                    SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
+                )
+            });
+            // VM subscriptions are handled by check_vms / handle_vm_state
+            if !has_vm {
+                info!("Deactivating expired subscription {}", sub.id);
+                if let Err(e) = self.db.deactivate_subscription(sub.id).await {
+                    warn!("Failed to deactivate subscription {}: {}", sub.id, e);
+                } else {
+                    self.queue_notification(
+                        sub.user_id,
+                        format!(
+                            "Your subscription '{}' has expired and has been deactivated. Please renew to restore service.",
+                            sub.name
+                        ),
+                        Some(format!("[Sub{}] Expired", sub.id)),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // --- Grace period exceeded: notify (non-VM) ---
+        if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
+            let line_items = self.db.list_subscription_line_items(sub.id).await?;
+            let has_vm = line_items.iter().any(|li| {
+                matches!(
+                    li.subscription_type,
+                    SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
+                )
+            });
+            if !has_vm {
+                self.queue_notification(
+                    sub.user_id,
+                    format!(
+                        "Your subscription '{}' has been cancelled after the grace period.",
+                        sub.name
+                    ),
+                    Some(format!("[Sub{}] Cancelled", sub.id)),
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
+    pub async fn check_subscriptions(&self) -> Result<()> {
+        let last_check = self.get_last_check_subscriptions().await?;
+        let time_since = Utc::now().signed_duration_since(last_check);
+        if time_since.num_seconds() < Self::CHECK_VMS_SECONDS as i64 {
+            debug!(
+                "Skipping CheckSubscriptions - only {}s since last check",
+                time_since.num_seconds()
+            );
+            return Ok(());
+        }
+
+        let subscriptions = self.db.list_subscriptions().await?;
+        for sub in &subscriptions {
+            if !sub.is_active {
+                continue;
+            }
+            if let Err(e) = self.handle_subscription_state(sub, last_check).await {
+                error!("Failed to handle subscription {} state: {}", sub.id, e);
+            }
+        }
+
+        self.set_last_check_subscriptions(Utc::now()).await?;
+        Ok(())
+    }
+
+    /// Resolve the authoritative expiry for a VM.
+    /// Uses `subscription.expires` (via subscription_line_item) if available; falls back to `vm.expires`.
+    async fn vm_expires(&self, vm: &Vm) -> DateTime<Utc> {
+        let result = async {
+            let line_item = self
+                .db
+                .get_subscription_line_item(vm.subscription_line_item_id)
+                .await?;
+            let sub = self.db.get_subscription(line_item.subscription_id).await?;
+            anyhow::Ok(sub.expires.unwrap_or(vm.expires))
+        }
+        .await;
+        result.unwrap_or(vm.expires)
+    }
+
+    /// Handle VM hypervisor state:
+    /// - Stop VM if subscription has expired and it is still running
+    /// - Delete VM if subscription expiry has exceeded the grace period
+    ///
+    /// Expiry notifications and NWC auto-renewal are handled by `handle_subscription_state`
+    /// (driven by `check_subscriptions`), not here.
+    async fn handle_vm_state(&self, vm: &Vm, state: &VmRunningState) -> Result<()> {
+        let expires = self.vm_expires(vm).await;
+
         // Stop VM if expired and is running
-        if vm.expires < Utc::now() && state.state == VmRunningStates::Running {
+        if expires < Utc::now() && state.state == VmRunningStates::Running {
             info!("Stopping expired VM {}", vm.id);
             if let Err(e) = self.provisioner.stop_vm(vm.id).await {
                 warn!("Failed to stop VM {}: {}", vm.id, e);
@@ -298,8 +424,7 @@ impl Worker {
         }
 
         // Delete VM if expired > self.settings.delete_after days
-        if vm.expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() && !vm.deleted
-        {
+        if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() && !vm.deleted {
             info!("Deleting expired VM {}", vm.id);
             self.provisioner.delete_vm(vm.id).await?;
 
@@ -339,7 +464,7 @@ impl Worker {
             }
             Err(e) => {
                 warn!("Failed to get VM{} state: {}", vm.id, e);
-                if vm.expires > Utc::now() {
+                if self.vm_expires(vm).await > Utc::now() {
                     self.spawn_vm_internal(vm).await?;
                 }
             }
@@ -365,7 +490,7 @@ impl Worker {
             } else {
                 // VM not found in bulk response, handle as missing
                 warn!("VM {} not found in bulk response", vm.id);
-                if vm.expires > Utc::now() {
+                if self.vm_expires(vm).await > Utc::now() {
                     self.spawn_vm_internal(vm).await?;
                 }
             }
@@ -1483,6 +1608,9 @@ impl Worker {
             }
             WorkJob::CheckVms => {
                 self.check_vms().await?;
+            }
+            WorkJob::CheckSubscriptions => {
+                self.check_subscriptions().await?;
             }
             WorkJob::DeleteVm {
                 vm_id,

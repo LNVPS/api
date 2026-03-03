@@ -421,6 +421,19 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>>;
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
 
+    /// List all active subscriptions expiring within `within_seconds` seconds from now.
+    async fn list_expiring_subscriptions(
+        &self,
+        within_seconds: u64,
+    ) -> DbResult<Vec<Subscription>>;
+
+    /// List all active subscriptions that have already expired.
+    async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>>;
+
+    /// Deactivate a subscription: set `is_active = false`.
+    /// Also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows.
+    async fn deactivate_subscription(&self, id: u64) -> DbResult<()>;
+
     /// List subscriptions with database-level pagination. `user_id = None` returns all users.
     /// Returns (rows, total_count).
     async fn list_subscriptions_paginated(

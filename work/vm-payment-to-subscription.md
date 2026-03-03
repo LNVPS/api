@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-02-23
-**Last updated:** 2026-03-03
+**Last updated:** 2026-03-04
 
 ## Goal
 
@@ -140,33 +140,27 @@ The lifecycle worker currently has VM-specific logic (`check_vms`, `handle_vm_st
 - `check_vms` and `handle_vm_state` in `worker.rs` are the only lifecycle enforcement points; they must be extended or their logic extracted.
 - VM lifecycle decisions read `vm.expires` directly. After this phase, `vm.expires` should remain authoritative for hypervisor decisions, but it must continue to be driven by `subscription.expires` (already the case via `subscription_payment_paid`).
 
-### Increment 11: DB layer — subscription lifecycle queries
+### Increment 11: DB layer — subscription lifecycle queries ✓
+- [x] Add `list_expiring_subscriptions(within_seconds: u64) -> Vec<Subscription>` to DB trait + MySQL + mock
+- [x] Add `list_expired_subscriptions() -> Vec<Subscription>` to DB trait + MySQL + mock
+- [x] Add `deactivate_subscription(id: u64)` to DB trait + MySQL + mock: sets `is_active = false` + flips `ip_range_subscription.ended_at`
+- [x] Implement all `ip_range_subscription` mock methods (were `todo!()`); add `ip_range_subscriptions` field to `MockDb`
+- [x] Verify build + 116 unit tests pass
 
-- [ ] Add `list_expiring_subscriptions(within: Duration) -> Vec<Subscription>` to DB trait + MySQL + mock: returns subscriptions where `expires < NOW() + within` and `is_active = true`
-- [ ] Add `list_expired_subscriptions() -> Vec<Subscription>` to DB trait + MySQL + mock: returns subscriptions where `expires < NOW()` and `is_active = true`
-- [ ] Add `deactivate_subscription(id: u64)` to DB trait + MySQL + mock: sets `is_active = false` on subscription; also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows
-- [ ] Add `list_subscription_line_items_by_type(subscription_id, SubscriptionType)` if not already present (needed to find VMs, IP ranges, etc. from a subscription)
-- [ ] Verify build + tests pass
+### Increment 12: Worker — generalised `check_subscriptions` loop ✓
+- [x] Add `WorkJob::CheckSubscriptions` variant + `can_skip` + `Display` to `lnvps_api_common/src/work/mod.rs`
+- [x] Add `check_subscriptions()` to `Worker`: iterates all active subscriptions, calls `handle_subscription_state`
+- [x] Add `handle_subscription_state(sub, last_check)`: expiring-soon NWC attempt / notify; expired non-VM deactivation; grace-period cancellation notify
+- [x] Add `get_last_check_subscriptions` / `set_last_check_subscriptions` KV helpers
+- [x] Wire `WorkJob::CheckSubscriptions` into `try_job`
+- [x] Schedule at 30-second interval in `bin/api.rs`
+- [x] Verify build + 116 unit tests pass
 
-### Increment 12: Worker — generalised `check_subscriptions` loop
-
-- [ ] Add `WorkJob::CheckSubscriptions` variant to `lnvps_api_common/src/work/mod.rs`
-- [ ] Add `check_subscriptions()` to `Worker`: loads all active subscriptions, groups by type, drives lifecycle actions
-- [ ] Add `handle_subscription_state(sub: &Subscription)` to `Worker`:
-  - Expiring soon (within 1 day): attempt NWC auto-renewal via `renew_subscription(sub.id)` if `sub.auto_renewal_enabled` and user has NWC; otherwise send "expiring soon" notification
-  - Expired (expires < now): call `deactivate_subscription` for non-VM subscriptions; for VM subscriptions delegate to existing `handle_vm_state` (stop the VM)
-  - Grace period exceeded (expires + delete_after < now): for non-VM subscriptions send deletion/cancellation notification; for VM subscriptions delegate to existing deletion path
-- [ ] Add `get_last_check_subscriptions` / `set_last_check_subscriptions` KV helpers (rate-limit key: `"worker-last-check-subscriptions"`)
-- [ ] Schedule `WorkJob::CheckSubscriptions` at the same 30-second interval in `bin/api.rs`
-- [ ] Verify build + tests pass
-
-### Increment 13: VM lifecycle — drive from subscription, not vm.expires
-
-- [ ] `handle_vm_state` currently reads `vm.expires` for stop/delete decisions. Change it to load `vm.subscription_id → subscription.expires` and use that as the authoritative expiry timestamp. `vm.expires` stays for hypervisor last-known-state but stops being the policy source.
-- [ ] Remove the `vm.auto_renewal_enabled` NWC path from `handle_vm_state`; NWC auto-renewal is now driven by `handle_subscription_state` via `sub.auto_renewal_enabled`.
-- [ ] `auto_renew_via_nwc` is currently called with `vm.id`; change signature to accept `subscription_id` so it works for any product type.
-- [ ] Update `check_vms` to skip expired/lifecycle decisions (delegate to `check_subscriptions`); it retains only the hypervisor-state sync (spawning missing VMs, updating run-state cache).
-- [ ] Verify build + tests pass
+### Increment 13: VM lifecycle — drive from subscription.expires ✓
+- [x] Add `vm_expires(vm)` helper: resolves `vm.subscription_line_item_id → subscription.expires`, falls back to `vm.expires`
+- [x] Rewrite `handle_vm_state`: uses `vm_expires()` for stop/delete decisions; remove NWC auto-renewal path (now owned by `handle_subscription_state`)
+- [x] Update `check_vm` and `check_vms_on_host` spawn guards to use `vm_expires()`
+- [x] Verify build + 116 unit tests pass
 
 ### Increment 14: IP range deactivation on expiry
 
