@@ -207,7 +207,7 @@ impl RevolutPaymentHandler {
         let api = self.api.clone();
         let payment_id = payment.id.clone();
 
-        complete_payment(&self.db, &payment, handler.as_ref(), |paid_payment| {
+        complete_payment(&self.db, &payment, &handler, |paid_payment| {
             let db = db.clone();
             let api = api.clone();
             async move {

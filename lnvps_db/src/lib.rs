@@ -239,6 +239,7 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Get a VM by subscription ID — finds the VM(Renewal/Upgrade) line item for the subscription
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm>;
+    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
 
     /// List subscription payments for a VM (via vm → line_item → subscription)
     async fn list_vm_subscription_payments(

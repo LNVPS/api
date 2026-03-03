@@ -44,7 +44,7 @@ impl NodeInvoiceHandler {
         let node = self.node.clone();
         let payment_id = payment.id.clone();
 
-        complete_payment(&self.db, payment, handler.as_ref(), |paid_payment| {
+        complete_payment(&self.db, payment, &handler, |paid_payment| {
             let db = db.clone();
             let node = node.clone();
             async move {

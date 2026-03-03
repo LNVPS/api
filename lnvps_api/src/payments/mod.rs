@@ -131,30 +131,109 @@ impl PaymentCompletionHandler for VmPaymentCompletionHandler {
 }
 
 // =========================================================================
-// NonVmPaymentCompletionHandler — generic handler for non-VM subscriptions
+// IpRangePaymentCompletionHandler
 // =========================================================================
 
-pub(crate) struct NonVmPaymentCompletionHandler {
+pub(crate) struct IpRangePaymentCompletionHandler {
     tx: Arc<dyn WorkCommander>,
 }
 
-impl NonVmPaymentCompletionHandler {
+impl IpRangePaymentCompletionHandler {
     pub(crate) fn new(tx: Arc<dyn WorkCommander>) -> Self {
         Self { tx }
     }
 }
 
 #[async_trait]
-impl PaymentCompletionHandler for NonVmPaymentCompletionHandler {
+impl PaymentCompletionHandler for IpRangePaymentCompletionHandler {
     async fn on_payment_complete(&self, _payment: &SubscriptionPayment) -> Result<()> {
         // Trigger the subscription lifecycle check so the new expiry is picked up
+        // and any resource activation (CIDR allocation, is_active flip) is handled
         self.tx.send(WorkJob::CheckSubscriptions).await?;
         Ok(())
     }
 }
 
 // =========================================================================
-// Composite dispatcher — selects the right handler by subscription type
+// CompositeLineItemHandler — fires one handler per subscription line item
+// =========================================================================
+
+/// Builds one `PaymentCompletionHandler` per line item on the subscription
+/// and calls each in sequence.  This ensures every resource type gets its
+/// own side-effects even when a single subscription contains a mix (e.g. a
+/// VM *and* an IP range on the same subscription).
+pub(crate) struct CompositeLineItemHandler {
+    handlers: Vec<Box<dyn PaymentCompletionHandler>>,
+}
+
+impl CompositeLineItemHandler {
+    pub(crate) async fn build(
+        payment: &SubscriptionPayment,
+        db: Arc<dyn LNVpsDb>,
+        tx: Arc<dyn WorkCommander>,
+        payment_method_label: &'static str,
+    ) -> Result<Self> {
+        let line_items = db.list_subscription_line_items(payment.subscription_id).await?;
+        let mut handlers: Vec<Box<dyn PaymentCompletionHandler>> = Vec::new();
+
+        for li in &line_items {
+            match li.subscription_type {
+                SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade => {
+                    // Look up the VM that owns this specific line item
+                    match db.get_vm_by_subscription_line_item(li.id).await {
+                        Ok(vm) => {
+                            match VmPaymentCompletionHandler::new(
+                                vm.id,
+                                db.clone(),
+                                tx.clone(),
+                                payment_method_label,
+                            )
+                            .await
+                            {
+                                Ok(h) => handlers.push(Box::new(h)),
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to build VM handler for line item {}: {}",
+                                        li.id, e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "No VM found for line item {} (subscription {}): {}",
+                                li.id, payment.subscription_id, e
+                            );
+                        }
+                    }
+                }
+                SubscriptionType::IpRange => {
+                    handlers.push(Box::new(IpRangePaymentCompletionHandler::new(tx.clone())));
+                }
+                SubscriptionType::AsnSponsoring | SubscriptionType::DnsHosting => {
+                    // Future product types: dispatch CheckSubscriptions so the lifecycle
+                    // worker picks up the new expiry when these are implemented.
+                    handlers.push(Box::new(IpRangePaymentCompletionHandler::new(tx.clone())));
+                }
+            }
+        }
+
+        Ok(Self { handlers })
+    }
+}
+
+#[async_trait]
+impl PaymentCompletionHandler for CompositeLineItemHandler {
+    async fn on_payment_complete(&self, payment: &SubscriptionPayment) -> Result<()> {
+        for handler in &self.handlers {
+            handler.on_payment_complete(payment).await?;
+        }
+        Ok(())
+    }
+}
+
+// =========================================================================
+// make_completion_handler — public entry point
 // =========================================================================
 
 pub(crate) async fn make_completion_handler(
@@ -162,22 +241,8 @@ pub(crate) async fn make_completion_handler(
     db: Arc<dyn LNVpsDb>,
     tx: Arc<dyn WorkCommander>,
     payment_method_label: &'static str,
-) -> Result<Box<dyn PaymentCompletionHandler>> {
-    let line_items = db.list_subscription_line_items(payment.subscription_id).await?;
-    let has_vm = line_items.iter().any(|li| {
-        matches!(
-            li.subscription_type,
-            SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
-        )
-    });
-
-    if has_vm {
-        let vm = db.get_vm_by_subscription(payment.subscription_id).await?;
-        let handler = VmPaymentCompletionHandler::new(vm.id, db, tx, payment_method_label).await?;
-        Ok(Box::new(handler))
-    } else {
-        Ok(Box::new(NonVmPaymentCompletionHandler::new(tx)))
-    }
+) -> Result<CompositeLineItemHandler> {
+    CompositeLineItemHandler::build(payment, db, tx, payment_method_label).await
 }
 
 // =========================================================================

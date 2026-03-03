@@ -798,6 +798,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM vm WHERE subscription_line_item_id = ? AND deleted = 0 LIMIT 1",
+        )
+        .bind(line_item_id)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
     async fn list_vm_subscription_payments(
         &self,
         vm_id: u64,

@@ -745,6 +745,10 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("VM not found for line item {}", line_item_id).into())
     }
 
+    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
+        self.get_vm_by_line_item(line_item_id).await
+    }
+
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
         use lnvps_db::SubscriptionType;
         let items = self.subscription_line_items.lock().await;
