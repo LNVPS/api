@@ -126,9 +126,138 @@ Full plan details captured in this work file.
 - [ ] Apply finalization migration: `ALTER TABLE vm MODIFY subscription_id NOT NULL`
 - [ ] Apply finalization migration: `DROP TABLE vm_payment`
 
+---
+
+## Phase 2: General-Purpose Subscription Lifecycle
+
+The lifecycle worker currently has VM-specific logic (`check_vms`, `handle_vm_state`). The goal is to generalise it so that *any* subscription product (IP ranges, ASN sponsoring, DNS hosting, future products) benefits from the same expiry detection, auto-renewal, suspension, and deletion behaviour.
+
+### Context
+
+- `Subscription.expires` is already extended atomically by `subscription_payment_paid()` for all product types (VM and non-VM).
+- `Subscription.auto_renewal_enabled` exists on the subscription record but is only read for VMs today.
+- Non-VM subscriptions (e.g. `IpRangeSubscription`) have `is_active` / `ended_at` fields that serve as the "suspension" state, but nothing flips them today.
+- `check_vms` and `handle_vm_state` in `worker.rs` are the only lifecycle enforcement points; they must be extended or their logic extracted.
+- VM lifecycle decisions read `vm.expires` directly. After this phase, `vm.expires` should remain authoritative for hypervisor decisions, but it must continue to be driven by `subscription.expires` (already the case via `subscription_payment_paid`).
+
+### Increment 11: DB layer — subscription lifecycle queries
+
+- [ ] Add `list_expiring_subscriptions(within: Duration) -> Vec<Subscription>` to DB trait + MySQL + mock: returns subscriptions where `expires < NOW() + within` and `is_active = true`
+- [ ] Add `list_expired_subscriptions() -> Vec<Subscription>` to DB trait + MySQL + mock: returns subscriptions where `expires < NOW()` and `is_active = true`
+- [ ] Add `deactivate_subscription(id: u64)` to DB trait + MySQL + mock: sets `is_active = false` on subscription; also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows
+- [ ] Add `list_subscription_line_items_by_type(subscription_id, SubscriptionType)` if not already present (needed to find VMs, IP ranges, etc. from a subscription)
+- [ ] Verify build + tests pass
+
+### Increment 12: Worker — generalised `check_subscriptions` loop
+
+- [ ] Add `WorkJob::CheckSubscriptions` variant to `lnvps_api_common/src/work/mod.rs`
+- [ ] Add `check_subscriptions()` to `Worker`: loads all active subscriptions, groups by type, drives lifecycle actions
+- [ ] Add `handle_subscription_state(sub: &Subscription)` to `Worker`:
+  - Expiring soon (within 1 day): attempt NWC auto-renewal via `renew_subscription(sub.id)` if `sub.auto_renewal_enabled` and user has NWC; otherwise send "expiring soon" notification
+  - Expired (expires < now): call `deactivate_subscription` for non-VM subscriptions; for VM subscriptions delegate to existing `handle_vm_state` (stop the VM)
+  - Grace period exceeded (expires + delete_after < now): for non-VM subscriptions send deletion/cancellation notification; for VM subscriptions delegate to existing deletion path
+- [ ] Add `get_last_check_subscriptions` / `set_last_check_subscriptions` KV helpers (rate-limit key: `"worker-last-check-subscriptions"`)
+- [ ] Schedule `WorkJob::CheckSubscriptions` at the same 30-second interval in `bin/api.rs`
+- [ ] Verify build + tests pass
+
+### Increment 13: VM lifecycle — drive from subscription, not vm.expires
+
+- [ ] `handle_vm_state` currently reads `vm.expires` for stop/delete decisions. Change it to load `vm.subscription_id → subscription.expires` and use that as the authoritative expiry timestamp. `vm.expires` stays for hypervisor last-known-state but stops being the policy source.
+- [ ] Remove the `vm.auto_renewal_enabled` NWC path from `handle_vm_state`; NWC auto-renewal is now driven by `handle_subscription_state` via `sub.auto_renewal_enabled`.
+- [ ] `auto_renew_via_nwc` is currently called with `vm.id`; change signature to accept `subscription_id` so it works for any product type.
+- [ ] Update `check_vms` to skip expired/lifecycle decisions (delegate to `check_subscriptions`); it retains only the hypervisor-state sync (spawning missing VMs, updating run-state cache).
+- [ ] Verify build + tests pass
+
+### Increment 14: IP range deactivation on expiry
+
+- [ ] When `deactivate_subscription` is called for a subscription with one or more `IpRange` line items, set `ip_range_subscription.is_active = false` and `ended_at = NOW()` for each linked row.
+- [ ] Add worker notification: "Your IP range subscription has expired and your allocation has been deactivated."
+- [ ] Add worker notification for expiring-soon (same 1-day window as VMs).
+- [ ] Verify build + tests pass
+
+### Increment 15: Unit tests for generalised lifecycle
+
+- [ ] Test `check_subscriptions`: expiring-soon triggers NWC attempt then notification
+- [ ] Test `check_subscriptions`: expired non-VM subscription triggers `deactivate_subscription`
+- [ ] Test `check_subscriptions`: expired VM subscription still stops the hypervisor VM
+- [ ] Test `deactivate_subscription`: flips `is_active = false` and sets `ended_at` on linked IP range rows
+- [ ] Test grace-period deletion notification path
+- [ ] Verify all existing 214+ unit tests still pass
+
+---
+
+## Phase 3: Generic Payment Completion Pipeline
+
+Currently `NodeInvoiceHandler` and `RevolutPaymentHandler` each independently duplicate the same post-payment sequence (mark paid → fetch VM before/after → log history → dispatch WorkJob). Neither handler can complete a non-VM payment (both call `get_vm_by_subscription` unconditionally, which returns `RowNotFound` for IP range subscriptions). Stripe is a stub. Admin handlers duplicate the pattern a third and fourth time without dispatching work jobs.
+
+This phase extracts a single `on_payment_complete` pipeline that is product-agnostic and payment-method-agnostic.
+
+### Context
+
+- `subscription_payment_paid()` in the DB layer is already product-agnostic — it extends `subscription.expires` and optionally `vm.expires` for VM subscriptions. No changes needed there.
+- The VM-specific post-payment actions (logging, `CheckVm` dispatch) need to be moved into a product handler abstraction.
+- IP range subscriptions have no post-payment actions today; this phase adds CIDR allocation + `ip_range_subscription.is_active` flip.
+- Cancel-competing-upgrades logic is also duplicated per payment method and must be centralised.
+
+### Increment 16: `PaymentCompletionHandler` trait + VM implementation
+
+- [ ] Define trait `PaymentCompletionHandler` in `lnvps_api_common` (or `lnvps_api/src/payments/mod.rs`):
+  ```rust
+  #[async_trait]
+  pub trait PaymentCompletionHandler: Send + Sync {
+      /// Called after subscription_payment_paid() succeeds.
+      /// `payment` is already marked paid in the DB.
+      async fn on_payment_complete(&self, payment: &SubscriptionPayment) -> Result<()>;
+  }
+  ```
+- [ ] Implement `VmPaymentCompletionHandler`:
+  - Fetch VM (via `get_vm_by_subscription`) — returns early (no-op) if no VM linked
+  - Fetch VM state before/after payment for history logging
+  - Call `vm_history_logger.log_vm_payment_received` + `log_vm_renewed`
+  - Branch on `payment_type`: dispatch `WorkJob::ProcessVmUpgrade` (Upgrade) or `WorkJob::CheckVm` (Renewal)
+- [ ] Implement `IpRangePaymentCompletionHandler`:
+  - On first payment (`!is_setup` before the call): allocate CIDR block, insert `ip_range_subscription` row with `is_active = true`
+  - On renewal: flip existing `ip_range_subscription.is_active = true`, clear `ended_at`
+  - Send user notification: "Your IP range subscription is now active"
+  - Dispatch `WorkJob::CheckSubscriptions` to pick up new state
+- [ ] Implement a `CompositePaymentCompletionHandler` (or a dispatcher fn) that selects the right handler by inspecting `subscription_line_item.subscription_type`
+- [ ] Verify build + tests pass
+
+### Increment 17: Centralised `complete_payment` function
+
+- [ ] Extract shared `complete_payment(db, payment, completion_handler, cancel_fn) -> Result<()>` free function in `payments/mod.rs`:
+  1. Call `db.subscription_payment_paid(payment)` (atomic DB mark-paid + expiry extension)
+  2. Call `completion_handler.on_payment_complete(payment)`
+  3. Call `cancel_fn(payment)` to cancel competing upgrade payments for the same subscription (method-specific: cancel Lightning invoice vs. Revolut order vs. no-op)
+- [ ] Refactor `NodeInvoiceHandler::mark_payment_paid` to call `complete_payment` — remove all duplicated VM logic
+- [ ] Refactor `RevolutPaymentHandler::try_complete_payment` to call `complete_payment` — remove all duplicated VM logic; also remove the `get_vm_by_subscription` call (it moves into `VmPaymentCompletionHandler`)
+- [ ] Refactor `admin_complete_vm_payment` to call `complete_payment`
+- [ ] Refactor `admin_complete_subscription_payment` to call `complete_payment` (this also adds the missing WorkJob dispatch to the admin subscription path)
+- [ ] Verify build + all existing tests pass
+
+### Increment 18: Stripe handler implementation
+
+- [ ] Implement `StripePaymentHandler::listen()` using Stripe webhook events (`payment_intent.succeeded`)
+- [ ] Implement `StripePaymentHandler`'s payment lookup by `external_id` → `get_subscription_payment_by_ext_id`
+- [ ] Implement cancel-competing-upgrades using Stripe API (cancel PaymentIntent)
+- [ ] Wire into `complete_payment` with the same `CompositePaymentCompletionHandler`
+- [ ] Remove the `bail!("not yet implemented")` for `PaymentMethod::Stripe` in `renew_subscription`
+- [ ] Verify build + tests pass
+
+### Increment 19: Unit tests for generic payment pipeline
+
+- [ ] Test `complete_payment` with VM renewal: DB marked paid, VM history logged, `CheckVm` dispatched
+- [ ] Test `complete_payment` with VM upgrade: `ProcessVmUpgrade` dispatched, competing upgrades cancelled
+- [ ] Test `complete_payment` with IP range renewal: `ip_range_subscription.is_active` flipped, notification sent
+- [ ] Test `complete_payment` with IP range first payment: CIDR allocated, `ip_range_subscription` row inserted
+- [ ] Test `admin_complete_subscription_payment` now dispatches a WorkJob (regression: it previously did not)
+- [ ] Verify all existing 214+ unit tests still pass
+
 ## Notes
 
 - Test database backup: `~/Downloads/lnvps_lnvps-20250316020007.sql.gz`
 - `VmCostPlanIntervalType` has ~50 references — rename via type alias for incremental migration
 - Custom VMs always use 1 Month interval; standard VMs copy from cost plan
 - All line items on a subscription share the same interval (interval lives on subscription, not line item)
+- Phase 2 key invariant: `vm.expires` stays on the `vm` table for hypervisor decisions; `subscription.expires` is the billing/policy source of truth that drives it
+- Phase 3 key invariant: payment methods know nothing about products; product handlers know nothing about payment methods; `complete_payment` is the only join point
