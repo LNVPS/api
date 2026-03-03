@@ -1,4 +1,4 @@
-use crate::payments::{complete_payment, make_completion_handler};
+use crate::payments::complete_payment;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use isocountry::CountryCode;
@@ -200,14 +200,12 @@ impl RevolutPaymentHandler {
             }
         }
 
-        let handler =
-            make_completion_handler(&payment, self.db.clone(), self.tx.clone(), "revolut").await?;
-
         let db = self.db.clone();
         let api = self.api.clone();
+        let tx = self.tx.clone();
         let payment_id = payment.id.clone();
 
-        complete_payment(&self.db, &payment, &handler, |paid_payment| {
+        complete_payment(&self.db, &payment, tx, "revolut", |paid_payment| {
             let db = db.clone();
             let api = api.clone();
             async move {

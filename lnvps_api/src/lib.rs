@@ -1,5 +1,6 @@
 pub mod api;
 pub mod data_migration;
+pub mod subscription;
 pub mod dns;
 pub mod host;
 pub mod json_api;

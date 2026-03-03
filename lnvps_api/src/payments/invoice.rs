@@ -1,4 +1,4 @@
-use crate::payments::{complete_payment, make_completion_handler};
+use crate::payments::complete_payment;
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
@@ -37,14 +37,12 @@ impl NodeInvoiceHandler {
     }
 
     async fn complete(&self, payment: &SubscriptionPayment) -> Result<()> {
-        let handler =
-            make_completion_handler(payment, self.db.clone(), self.tx.clone(), "lightning").await?;
-
         let db = self.db.clone();
         let node = self.node.clone();
+        let tx = self.tx.clone();
         let payment_id = payment.id.clone();
 
-        complete_payment(&self.db, payment, &handler, |paid_payment| {
+        complete_payment(&self.db, payment, tx, "lightning", |paid_payment| {
             let db = db.clone();
             let node = node.clone();
             async move {

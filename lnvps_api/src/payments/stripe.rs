@@ -1,4 +1,4 @@
-use crate::payments::{complete_payment, make_completion_handler};
+use crate::payments::complete_payment;
 use anyhow::{Context, Result};
 use lnvps_api_common::WorkCommander;
 use lnvps_db::{LNVpsDb, PaymentMethod, PaymentMethodConfig, ProviderConfig, SubscriptionPaymentType};
@@ -48,14 +48,12 @@ impl StripePaymentHandler {
             .get_subscription_payment_by_ext_id(ext_id)
             .await?;
 
-        let handler =
-            make_completion_handler(&payment, self.db.clone(), self.tx.clone(), "stripe").await?;
-
         let db = self.db.clone();
         let api = self.api.clone();
+        let tx = self.tx.clone();
         let payment_id = payment.id.clone();
 
-        complete_payment(&self.db, &payment, &handler, |paid_payment| {
+        complete_payment(&self.db, &payment, tx, "stripe", |paid_payment| {
             let db = db.clone();
             let api = api.clone();
             async move {

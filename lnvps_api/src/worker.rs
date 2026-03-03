@@ -16,6 +16,7 @@ use lnvps_api_common::{
     WorkFeedback, WorkJob, WorkJobMessage, op_fatal,
     retry::{OpError, Pipeline, RetryPolicy},
 };
+use crate::subscription::line_item_handler;
 use lnvps_db::{CpuArch, CpuFeature, CpuMfg, LNVpsDb, Vm, VmHost, VmIpAssignment, VmOsImage};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
@@ -219,64 +220,57 @@ impl Worker {
         Ok(())
     }
 
-    /// Handle subscription lifecycle state:
-    /// 1. Expiring soon: attempt NWC auto-renewal; if not possible, notify user
-    /// 2. Expired: deactivate subscription (non-VM products); VM products handled by check_vms
-    /// 3. Grace period exceeded: notify user of deletion
+    /// Handle subscription lifecycle state by dispatching to per-line-item handlers.
+    /// 1. Expiring soon: attempt NWC auto-renewal; notify user; call on_expiring_soon per line item
+    /// 2. Expired: call on_expired per line item
+    /// 3. Grace period exceeded: notify user; call on_grace_period_exceeded per line item
     async fn handle_subscription_state(
         &self,
         sub: &lnvps_db::Subscription,
         last_check: DateTime<Utc>,
     ) -> Result<()> {
-        use lnvps_db::SubscriptionType;
-
         const BEFORE_EXPIRE_NOTIFICATION_DAYS: u64 = 1;
         let Some(expires) = sub.expires else {
-            // Subscription has never been paid — no lifecycle action needed
             return Ok(());
         };
 
-        let expiry_window = Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
+        let line_items = self.db.list_subscription_line_items(sub.id).await?;
 
         // --- Expiring soon ---
+        let expiry_window = Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
         if expires < expiry_window && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS)) {
-            let user = self.db.get_user(sub.user_id).await?;
             let mut renewal_attempted = false;
             let mut renewal_successful = false;
             let mut nwc_error = String::new();
 
             #[cfg(feature = "nostr-nwc")]
             if sub.auto_renewal_enabled {
-                if let Some(ref nwc_connection) = user.nwc_connection_string {
+                if let Some(ref nwc_connection) = self.db.get_user(sub.user_id).await?.nwc_connection_string {
                     let nwc_string: String = nwc_connection.clone().into();
                     if !nwc_string.is_empty() {
-                        info!(
-                            "Attempting auto-renewal for subscription {} via NWC",
-                            sub.id
-                        );
+                        info!("Attempting auto-renewal for subscription {} via NWC", sub.id);
                         renewal_attempted = true;
-                        // Look up the VM linked to this subscription (if any)
-                        let vm_id_result = self.db.get_vm_by_subscription(sub.id).await;
-                        let nwc_result = match vm_id_result {
-                            Ok(vm) => self.provisioner.auto_renew_via_nwc(vm.id, &nwc_string).await,
-                            Err(_) => Err(anyhow::anyhow!("No VM linked to subscription {}", sub.id)),
-                        };
+                        let nwc_result = self.db.get_vm_by_subscription(sub.id).await
+                            .map_err(|_| anyhow::anyhow!("No VM linked to subscription {}", sub.id))
+                            .and_then(|vm| Ok(vm.id));
                         match nwc_result {
-                            Ok(_) => {
-                                renewal_successful = true;
-                                info!("Successfully auto-renewed subscription {} via NWC", sub.id);
-                                self.queue_notification(
-                                    sub.user_id,
-                                    format!(
-                                        "Your subscription '{}' has been automatically renewed via Nostr Wallet Connect.",
-                                        sub.name
-                                    ),
-                                    Some(format!("[Sub{}] Auto-Renewed", sub.id)),
-                                )
-                                .await;
-                            }
+                            Ok(vm_id) => match self.provisioner.auto_renew_via_nwc(vm_id, &nwc_string).await {
+                                Ok(_) => {
+                                    renewal_successful = true;
+                                    info!("Successfully auto-renewed subscription {} via NWC", sub.id);
+                                    self.queue_notification(
+                                        sub.user_id,
+                                        format!("Your subscription '{}' has been automatically renewed via Nostr Wallet Connect.", sub.name),
+                                        Some(format!("[Sub{}] Auto-Renewed", sub.id)),
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
+                                    nwc_error = e.to_string();
+                                }
+                            },
                             Err(e) => {
-                                warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
+                                warn!("NWC renewal: {}", e);
                                 nwc_error = e.to_string();
                             }
                         }
@@ -300,58 +294,47 @@ impl Worker {
                     sub.user_id,
                     message,
                     Some(format!("[Sub{}] Expiring Soon", sub.id)),
-                )
-                .await;
+                ).await;
             }
-        }
 
-        // --- Expired: deactivate non-VM subscriptions ---
-        if expires < Utc::now() {
-            let line_items = self.db.list_subscription_line_items(sub.id).await?;
-            let has_vm = line_items.iter().any(|li| {
-                matches!(
-                    li.subscription_type,
-                    SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
-                )
-            });
-            // VM subscriptions are handled by check_vms / handle_vm_state
-            if !has_vm {
-                info!("Deactivating expired subscription {}", sub.id);
-                if let Err(e) = self.db.deactivate_subscription(sub.id).await {
-                    warn!("Failed to deactivate subscription {}: {}", sub.id, e);
-                } else {
-                    self.queue_notification(
-                        sub.user_id,
-                        format!(
-                            "Your subscription '{}' has expired and has been deactivated. Please renew to restore service.",
-                            sub.name
-                        ),
-                        Some(format!("[Sub{}] Expired", sub.id)),
-                    )
-                    .await;
+            for li in &line_items {
+                match line_item_handler(li, self.db.clone(), self.work_commander.clone()).await {
+                    Ok(h) => { let _ = h.on_expiring_soon(sub).await; }
+                    Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
         }
 
-        // --- Grace period exceeded: notify (non-VM) ---
+        // --- Expired ---
+        if expires < Utc::now() {
+            for li in &line_items {
+                match line_item_handler(li, self.db.clone(), self.work_commander.clone()).await {
+                    Ok(h) => {
+                        if let Err(e) = h.on_expired(sub).await {
+                            warn!("on_expired failed for line item {}: {}", li.id, e);
+                        }
+                    }
+                    Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
+                }
+            }
+        }
+
+        // --- Grace period exceeded ---
         if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
-            let line_items = self.db.list_subscription_line_items(sub.id).await?;
-            let has_vm = line_items.iter().any(|li| {
-                matches!(
-                    li.subscription_type,
-                    SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
-                )
-            });
-            if !has_vm {
-                self.queue_notification(
-                    sub.user_id,
-                    format!(
-                        "Your subscription '{}' has been cancelled after the grace period.",
-                        sub.name
-                    ),
-                    Some(format!("[Sub{}] Cancelled", sub.id)),
-                )
-                .await;
+            self.queue_notification(
+                sub.user_id,
+                format!("Your subscription '{}' has been cancelled after the grace period.", sub.name),
+                Some(format!("[Sub{}] Cancelled", sub.id)),
+            ).await;
+            for li in &line_items {
+                match line_item_handler(li, self.db.clone(), self.work_commander.clone()).await {
+                    Ok(h) => {
+                        if let Err(e) = h.on_grace_period_exceeded(sub).await {
+                            warn!("on_grace_period_exceeded failed for line item {}: {}", li.id, e);
+                        }
+                    }
+                    Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
+                }
             }
         }
 
