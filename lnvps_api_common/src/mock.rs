@@ -3139,4 +3139,119 @@ mod tests {
         assert_ne!(page0[0].id, page1[0].id);
         assert_ne!(page1[0].id, page2[0].id);
     }
+
+    // =========================================================================
+    // Subscription lifecycle DB tests (Increment 15)
+    // =========================================================================
+
+    /// list_expiring_subscriptions returns active subscriptions expiring within window.
+    #[tokio::test]
+    async fn test_list_expiring_subscriptions_returns_soon_expiring() {
+        let db = MockDb::default();
+        // Set subscription id=1 to expire 30 minutes from now (within 1-day window)
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() + chrono::Duration::minutes(30));
+        }
+
+        let result = db.list_expiring_subscriptions(86400).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
+    }
+
+    /// list_expiring_subscriptions excludes subscriptions expiring outside the window.
+    #[tokio::test]
+    async fn test_list_expiring_subscriptions_excludes_far_future() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() + chrono::Duration::days(10));
+        }
+
+        let result = db.list_expiring_subscriptions(86400).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// list_expired_subscriptions returns active subscriptions whose expiry is in the past.
+    #[tokio::test]
+    async fn test_list_expired_subscriptions_returns_past_expiry() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+
+        let result = db.list_expired_subscriptions().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
+    }
+
+    /// list_expired_subscriptions excludes subscriptions not yet expired.
+    #[tokio::test]
+    async fn test_list_expired_subscriptions_excludes_active() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        let result = db.list_expired_subscriptions().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// deactivate_subscription sets is_active=false on the subscription.
+    #[tokio::test]
+    async fn test_deactivate_subscription_flips_is_active() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+        }
+
+        db.deactivate_subscription(1).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        assert!(!subs[&1].is_active);
+    }
+
+    /// deactivate_subscription sets ended_at and is_active=false on linked ip_range_subscription rows.
+    #[tokio::test]
+    async fn test_deactivate_subscription_ends_ip_range_subscriptions() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+        }
+
+        // Insert an ip_range_subscription linked to line_item id=1 (which belongs to subscription id=1)
+        let ip_sub = IpRangeSubscription {
+            id: 0,
+            subscription_line_item_id: 1,
+            available_ip_space_id: 1,
+            created: Utc::now(),
+            cidr: "192.0.2.0/24".to_string(),
+            is_active: true,
+            started_at: Utc::now(),
+            ended_at: None,
+            metadata: None,
+        };
+        let inserted_id = db.insert_ip_range_subscription(&ip_sub).await.unwrap();
+
+        db.deactivate_subscription(1).await.unwrap();
+
+        let ip_subs = db.ip_range_subscriptions.lock().await;
+        let updated = ip_subs.get(&inserted_id).unwrap();
+        assert!(!updated.is_active);
+        assert!(updated.ended_at.is_some());
+    }
 }

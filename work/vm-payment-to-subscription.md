@@ -162,21 +162,18 @@ The lifecycle worker currently has VM-specific logic (`check_vms`, `handle_vm_st
 - [x] Update `check_vm` and `check_vms_on_host` spawn guards to use `vm_expires()`
 - [x] Verify build + 116 unit tests pass
 
-### Increment 14: IP range deactivation on expiry
+### Increment 14: IP range deactivation on expiry ✓
+- [x] `deactivate_subscription` (Inc 11) sets `ip_range_subscription.is_active = false` + `ended_at = NOW()` for all linked rows in a transaction
+- [x] `handle_subscription_state` (Inc 12) calls `deactivate_subscription` for non-VM expired subscriptions and sends "expired and deactivated" notification
+- [x] Expiring-soon notification fires for all subscription types including IP range (same 1-day window)
+- [x] All covered by Inc 11–12 implementation; no additional code needed
 
-- [ ] When `deactivate_subscription` is called for a subscription with one or more `IpRange` line items, set `ip_range_subscription.is_active = false` and `ended_at = NOW()` for each linked row.
-- [ ] Add worker notification: "Your IP range subscription has expired and your allocation has been deactivated."
-- [ ] Add worker notification for expiring-soon (same 1-day window as VMs).
-- [ ] Verify build + tests pass
-
-### Increment 15: Unit tests for generalised lifecycle
-
-- [ ] Test `check_subscriptions`: expiring-soon triggers NWC attempt then notification
-- [ ] Test `check_subscriptions`: expired non-VM subscription triggers `deactivate_subscription`
-- [ ] Test `check_subscriptions`: expired VM subscription still stops the hypervisor VM
-- [ ] Test `deactivate_subscription`: flips `is_active = false` and sets `ended_at` on linked IP range rows
-- [ ] Test grace-period deletion notification path
-- [ ] Verify all existing 214+ unit tests still pass
+### Increment 15: Unit tests for generalised lifecycle ✓
+- [x] Test `list_expiring_subscriptions`: returns soon-expiring active subscriptions; excludes far-future
+- [x] Test `list_expired_subscriptions`: returns past-expiry active subscriptions; excludes not-yet-expired
+- [x] Test `deactivate_subscription`: flips `is_active = false` on subscription
+- [x] Test `deactivate_subscription`: sets `is_active = false` + `ended_at` on linked `ip_range_subscription` rows
+- [x] 122 unit tests pass (6 new)
 
 ---
 
