@@ -353,8 +353,8 @@ pub struct AdminVmInfo {
     pub id: u64,
     /// When the VM was created
     pub created: DateTime<Utc>,
-    /// When the VM expires
-    pub expires: DateTime<Utc>,
+    /// When the VM's subscription expires (None = never paid)
+    pub expires: Option<DateTime<Utc>>,
     /// Network MAC address
     pub mac_address: String,
     /// OS Image ID for linking
@@ -552,10 +552,14 @@ impl AdminVmInfo {
             }
         };
 
+        // Load subscription for expiry + auto_renewal
+        let li = db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
         Ok(Self {
             id: vm.id,
             created: vm.created,
-            expires: vm.expires,
+            expires: sub.expires,
             mac_address: vm.mac_address.clone(),
             image_id: vm.image_id,
             image_name: format!("{} {} {}", image.distribution, image.flavour, image.version),
@@ -567,7 +571,7 @@ impl AdminVmInfo {
             ssh_key_name: ssh_key.name,
             ip_addresses,
             running_state,
-            auto_renewal_enabled: vm.auto_renewal_enabled,
+            auto_renewal_enabled: sub.auto_renewal_enabled,
             cpu,
             cpu_mfg,
             cpu_arch,
@@ -2075,9 +2079,9 @@ pub struct AdminRefundAmountInfo {
     pub currency: String,
     /// Exchange rate used for conversion (if applicable)
     pub rate: f32,
-    /// VM expiry date
-    pub expires: DateTime<Utc>,
-    /// Seconds remaining until VM expires
+    /// Subscription expiry date (None = never paid)
+    pub expires: Option<DateTime<Utc>>,
+    /// Seconds remaining until subscription expires (0 if not set)
     pub seconds_remaining: i64,
 }
 

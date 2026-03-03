@@ -216,8 +216,8 @@ pub struct ApiVmStatus {
     pub id: u64,
     /// When the VM was created
     pub created: DateTime<Utc>,
-    /// When the VM expires
-    pub expires: DateTime<Utc>,
+    /// When the VM's subscription expires (None = never paid)
+    pub expires: Option<DateTime<Utc>>,
     /// Network MAC address
     pub mac_address: String,
     /// OS Image in use
@@ -230,7 +230,7 @@ pub struct ApiVmStatus {
     pub ip_assignments: Vec<ApiVmIpAssignment>,
     /// Current running state of the VM
     pub status: VmRunningState,
-    /// Enable automatic renewal via NWC for this VM
+    /// Enable automatic renewal (from subscription)
     pub auto_renewal_enabled: bool,
 }
 
@@ -253,10 +253,22 @@ pub async fn vm_to_status(
         .collect();
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
+    // Load subscription for expiry + auto_renewal
+    let (sub_expires, sub_auto_renewal) =
+        if let Ok(li) = db.get_subscription_line_item(vm.subscription_line_item_id).await {
+            if let Ok(sub) = db.get_subscription(li.subscription_id).await {
+                (sub.expires, sub.auto_renewal_enabled)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+
     Ok(ApiVmStatus {
         id: vm.id,
         created: vm.created,
-        expires: vm.expires,
+        expires: sub_expires,
         mac_address: vm.mac_address,
         image: image.into(),
         template,
@@ -271,7 +283,7 @@ pub async fn vm_to_status(
                 ApiVmIpAssignment::from(&i, range)
             })
             .collect(),
-        auto_renewal_enabled: vm.auto_renewal_enabled,
+        auto_renewal_enabled: sub_auto_renewal,
     })
 }
 

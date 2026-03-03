@@ -563,11 +563,9 @@ mod tests {
             subscription_line_item_id: 0,
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
-            expires: chrono::Utc::now() + chrono::Duration::days(30),
             created: chrono::Utc::now(),
             ref_code: None,
             deleted: false,
-            auto_renewal_enabled: false,
             disabled: false,
         };
         let vm_id = db.insert_vm(&vm).await?;

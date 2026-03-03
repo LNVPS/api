@@ -110,11 +110,15 @@ async fn admin_create_vm_ip_assignment(
         return ApiData::err("Cannot assign IP to a deleted VM");
     }
 
-    if vm.expires == vm.created {
+    // Check subscription state
+    let li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+    let sub = this.db.get_subscription(li.subscription_id).await?;
+
+    if !sub.is_setup {
         return ApiData::err("Cannot assign IP to a new VM");
     }
 
-    if vm.expires < Utc::now() {
+    if sub.expires.map(|e| e < Utc::now()).unwrap_or(true) {
         return ApiData::err("Cannot assign IP to an expired VM");
     }
 

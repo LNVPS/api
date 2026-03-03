@@ -1177,12 +1177,10 @@ async fn create_vms(
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created,
-            expires,
             disk_id: disk.id,
             mac_address: mac_address.clone(),
             deleted: false,
             ref_code: ref_code.clone(),
-            auto_renewal_enabled: false,
             disabled: false,
         };
 
@@ -1224,12 +1222,10 @@ async fn create_vms(
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created,
-            expires,
             disk_id: disk.id,
             mac_address: mac_address.clone(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 

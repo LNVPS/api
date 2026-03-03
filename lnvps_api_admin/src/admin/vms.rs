@@ -466,12 +466,13 @@ async fn admin_extend_vm(
         return ApiData::err("Cannot extend by more than 365 days");
     }
 
-    let old_expires = vm.expires;
-    let new_expires = vm.expires + Days::new(req.days as u64);
-
-    // Update VM expiration date in database
-    vm.expires = new_expires;
-    this.db.update_vm(&vm).await?;
+    // Extend the subscription expiry (single source of truth)
+    let li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+    let mut sub = this.db.get_subscription(li.subscription_id).await?;
+    let old_expires = sub.expires.unwrap_or(Utc::now());
+    let new_expires = old_expires + Days::new(req.days as u64);
+    sub.expires = Some(new_expires);
+    this.db.update_subscription(&sub).await?;
 
     // Log the extension in VM history
     let vm_history_logger = VmHistoryLogger::new(this.db.clone());
@@ -688,12 +689,16 @@ async fn admin_calculate_vm_refund(
         .calculate_refund_amount_from_date(vm_id, payment_method, calculation_date)
         .await?;
 
+    let vm_li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+    let vm_sub = this.db.get_subscription(vm_li.subscription_id).await?;
     let refund_info = AdminRefundAmountInfo {
         amount: refund_result.amount.value(),
         currency: refund_result.amount.currency().to_string(),
         rate: refund_result.rate.rate,
-        expires: vm.expires,
-        seconds_remaining: (vm.expires - calculation_date).num_seconds(),
+        expires: vm_sub.expires,
+        seconds_remaining: vm_sub.expires
+            .map(|e| (e - calculation_date).num_seconds())
+            .unwrap_or(0),
     };
 
     ApiData::ok(refund_info)

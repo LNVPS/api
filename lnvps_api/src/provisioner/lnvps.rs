@@ -177,12 +177,10 @@ impl LNVpsProvisioner {
             subscription_line_item_id,
             ssh_key_id: ssh_key.id,
             created: now,
-            expires: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 
@@ -289,12 +287,10 @@ impl LNVpsProvisioner {
             subscription_line_item_id,
             ssh_key_id: ssh_key.id,
             created: now,
-            expires: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 

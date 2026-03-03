@@ -367,19 +367,18 @@ impl Worker {
         Ok(())
     }
 
-    /// Resolve the authoritative expiry for a VM.
-    /// Uses `subscription.expires` (via subscription_line_item) if available; falls back to `vm.expires`.
-    async fn vm_expires(&self, vm: &Vm) -> DateTime<Utc> {
+    /// Resolve the authoritative expiry for a VM from its subscription.
+    async fn vm_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
         let result = async {
             let line_item = self
                 .db
                 .get_subscription_line_item(vm.subscription_line_item_id)
                 .await?;
             let sub = self.db.get_subscription(line_item.subscription_id).await?;
-            anyhow::Ok(sub.expires.unwrap_or(vm.expires))
+            anyhow::Ok(sub.expires)
         }
         .await;
-        result.unwrap_or(vm.expires)
+        result.unwrap_or(None)
     }
 
     /// Handle VM hypervisor state:
@@ -389,7 +388,10 @@ impl Worker {
     /// Expiry notifications and NWC auto-renewal are handled by `handle_subscription_state`
     /// (driven by `check_subscriptions`), not here.
     async fn handle_vm_state(&self, vm: &Vm, state: &VmRunningState) -> Result<()> {
-        let expires = self.vm_expires(vm).await;
+        let Some(expires) = self.vm_expires(vm).await else {
+            // Subscription not yet paid — nothing to enforce
+            return Ok(());
+        };
 
         // Stop VM if expired and is running
         if expires < Utc::now() && state.state == VmRunningStates::Running {
@@ -447,7 +449,7 @@ impl Worker {
             }
             Err(e) => {
                 warn!("Failed to get VM{} state: {}", vm.id, e);
-                if self.vm_expires(vm).await > Utc::now() {
+                if self.vm_expires(vm).await.map(|e| e > Utc::now()).unwrap_or(false) {
                     self.spawn_vm_internal(vm).await?;
                 }
             }
@@ -473,7 +475,7 @@ impl Worker {
             } else {
                 // VM not found in bulk response, handle as missing
                 warn!("VM {} not found in bulk response", vm.id);
-                if self.vm_expires(vm).await > Utc::now() {
+                if self.vm_expires(vm).await.map(|e| e > Utc::now()).unwrap_or(false) {
                     self.spawn_vm_internal(vm).await?;
                 }
             }
@@ -580,7 +582,21 @@ impl Worker {
         let mut vms_to_delete = Vec::new();
 
         for vm in &db_vms {
-            let is_new_vm = vm.created == vm.expires;
+            // A VM is "new" (never paid) if its subscription has never been set up.
+            let is_new_vm = if let Ok(li) = self
+                .db
+                .get_subscription_line_item(vm.subscription_line_item_id)
+                .await
+            {
+                !self
+                    .db
+                    .get_subscription(li.subscription_id)
+                    .await
+                    .map(|s| s.is_setup)
+                    .unwrap_or(false)
+            } else {
+                true
+            };
 
             // only check spawned vms
             if !is_new_vm {
@@ -588,7 +604,7 @@ impl Worker {
             }
 
             // delete vm if not paid (in new state) after 1 hour
-            if is_new_vm && !vm.deleted && vm.expires < Utc::now().sub(TimeDelta::hours(1)) {
+            if is_new_vm && !vm.deleted && vm.created < Utc::now().sub(TimeDelta::hours(1)) {
                 vms_to_delete.push(vm);
             }
         }
@@ -899,7 +915,7 @@ impl Worker {
         // Patch firewall configuration for all VMs on this host
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
-            if !vm.deleted && vm.expires > Utc::now() {
+            if !vm.deleted && self.vm_expires(vm).await.map(|e| e > Utc::now()).unwrap_or(false) {
                 info!("Patching firewall for VM {} on host {}", vm.id, host.name);
                 match FullVmInfo::load(vm.id, self.db.clone()).await {
                     Ok(vm_config) => {
@@ -1660,13 +1676,9 @@ impl Worker {
                     bail!("Cannot start deleted VM {}", vm_id);
                 }
 
-                // Check if VM is expired
-                if vm.expires < Utc::now() {
-                    bail!(
-                        "Cannot start expired VM {} - it has expired (expires: {})",
-                        vm_id,
-                        vm.expires
-                    );
+                // Check if VM is expired via subscription
+                if self.vm_expires(&vm).await.map(|e| e < Utc::now()).unwrap_or(false) {
+                    bail!("Cannot start expired VM {}", vm_id);
                 }
 
                 // Start the VM via provisioner

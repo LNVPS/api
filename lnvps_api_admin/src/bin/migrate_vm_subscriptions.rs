@@ -223,14 +223,14 @@ async fn migrate_vm_subscription(
         name: format!("VM {} Subscription", vm_id),
         description: Some(description.clone()),
         created: Utc::now(),
-        expires: Some(vm.expires),
+        expires: None, // vm.expires column removed; set manually after migration if needed
         is_active,
         is_setup: true,
         currency,
         interval_amount,
         interval_type,
         setup_fee: 0,
-        auto_renewal_enabled: vm.auto_renewal_enabled,
+        auto_renewal_enabled: false,
         external_id: None,
     };
     let line_item = SubscriptionLineItem {

@@ -197,12 +197,10 @@ mod tests {
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created: chrono::Utc::now(),
-            expires: chrono::Utc::now(),
             disk_id: 1,
             mac_address: "bc:24:11:00:00:01".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 
@@ -244,12 +242,10 @@ mod tests {
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created: chrono::Utc::now(),
-            expires: chrono::Utc::now(),
             disk_id: 1,
             mac_address: "bc:24:11:00:00:01".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 
@@ -286,12 +282,10 @@ mod tests {
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created: chrono::Utc::now(),
-            expires: chrono::Utc::now(),
             disk_id: 1,
             mac_address: "bc:24:11:00:00:01".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 

@@ -347,12 +347,10 @@ mod tests {
                 subscription_line_item_id: 0,
                 ssh_key_id: 1,
                 created: Default::default(),
-                expires: Default::default(),
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 deleted: false,
                 ref_code: None,
-                auto_renewal_enabled: false,
                 disabled: false,
             },
             host: VmHost {

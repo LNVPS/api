@@ -15,10 +15,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lnvps_api_common::{UpgradeConfig, VmHistoryLogger, WorkCommander, WorkJob};
-use lnvps_db::{LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment,
-               SubscriptionPaymentType, SubscriptionType};
-use log::{info, warn};
+use lnvps_api_common::WorkCommander;
+use lnvps_db::{LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType};
 use std::sync::Arc;
 
 mod vm;

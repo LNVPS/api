@@ -704,11 +704,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn list_expired_vms(&self) -> DbResult<Vec<Vm>> {
-        Ok(
-            sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
-                .fetch_all(&self.db)
-                .await?,
+        // Expired VMs are those whose subscription has expired
+        Ok(sqlx::query_as(
+            "SELECT v.* FROM vm v \
+             INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             INNER JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 0 AND s.expires < NOW()",
         )
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
@@ -728,7 +732,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,created,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
@@ -737,11 +741,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
             .bind(vm.created)
-            .bind(vm.expires)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(&vm.ref_code)
-            .bind(vm.auto_renewal_enabled)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
@@ -757,17 +759,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
             .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
-            .bind(vm.expires)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
-            .bind(vm.auto_renewal_enabled)
             .bind(vm.disabled)
             .bind(vm.id)
             .execute(&self.db)
@@ -1041,12 +1041,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&vm_payment.id)
         .execute(&mut *tx)
         .await?;
-
-        sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ?")
-            .bind(vm_payment.time_value)
-            .bind(vm_payment.vm_id)
-            .execute(&mut *tx)
-            .await?;
 
         tx.commit().await?;
         Ok(())
@@ -1885,21 +1879,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
 
         if let Some(time_value) = payment.time_value {
-            // VM path: extend subscription and vm expires by explicit time_value seconds
+            // Extend subscription.expires by explicit time_value seconds
             sqlx::query(
                 "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? SECOND), is_active = 1, is_setup = 1 WHERE id = ?",
-            )
-            .bind(time_value)
-            .bind(payment.subscription_id)
-            .execute(tx.as_mut())
-            .await?;
-
-            // Also extend the vm.expires — look up the VM linked to this subscription
-            sqlx::query(
-                "UPDATE vm SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? SECOND) \
-                 WHERE subscription_line_item_id IN \
-                   (SELECT id FROM subscription_line_item WHERE subscription_id = ? AND subscription_type IN (3, 4)) \
-                 AND deleted = 0",
             )
             .bind(time_value)
             .bind(payment.subscription_id)

@@ -887,8 +887,6 @@ pub struct Vm {
     pub ssh_key_id: u64,
     /// When the VM was created
     pub created: DateTime<Utc>,
-    /// When the VM expires
-    pub expires: DateTime<Utc>,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
     /// Network MAC address
@@ -897,8 +895,6 @@ pub struct Vm {
     pub deleted: bool,
     /// Referral code (recorded during ordering)
     pub ref_code: Option<String>,
-    /// Enable automatic renewal
-    pub auto_renewal_enabled: bool,
     /// Whether the VM is disabled by admin
     pub disabled: bool,
 }

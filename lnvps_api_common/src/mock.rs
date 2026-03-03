@@ -109,12 +109,10 @@ impl MockDb {
             subscription_line_item_id: 1,
             ssh_key_id: 1,
             created: Utc::now(),
-            expires: Default::default(),
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         }
     }
@@ -665,12 +663,27 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn list_expired_vms(&self) -> DbResult<Vec<Vm>> {
-        let vms = self.vms.lock().await;
-        Ok(vms
-            .values()
-            .filter(|v| !v.deleted && v.expires >= Utc::now())
-            .cloned()
-            .collect())
+        // In the mock, cross-reference subscription expires.
+        // Collect VM ids and subscription line item ids first.
+        let vm_list: Vec<Vm> = {
+            let vms = self.vms.lock().await;
+            vms.values().filter(|v| !v.deleted).cloned().collect()
+        };
+        let mut expired = Vec::new();
+        for vm in vm_list {
+            let line_items = self.subscription_line_items.lock().await;
+            let sub_id = line_items.get(&vm.subscription_line_item_id).map(|li| li.subscription_id);
+            drop(line_items);
+            if let Some(sid) = sub_id {
+                let subs = self.subscriptions.lock().await;
+                if let Some(sub) = subs.get(&sid) {
+                    if sub.expires.map(|e| e < Utc::now()).unwrap_or(true) {
+                        expired.push(vm);
+                    }
+                }
+            }
+        }
+        Ok(expired)
     }
 
     async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
@@ -728,10 +741,8 @@ impl LNVpsDbBase for MockDb {
             v.custom_template_id = vm.custom_template_id;
             v.subscription_line_item_id = vm.subscription_line_item_id;
             v.ssh_key_id = vm.ssh_key_id;
-            v.expires = vm.expires;
             v.disk_id = vm.disk_id;
             v.mac_address = vm.mac_address.clone();
-            v.auto_renewal_enabled = vm.auto_renewal_enabled;
             v.disabled = vm.disabled;
         }
         Ok(())
@@ -974,15 +985,12 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn vm_payment_paid(&self, payment: &VmPayment) -> DbResult<()> {
-        let mut v = self.vms.lock().await;
         let mut p = self.payments.lock().await;
         if let Some(p) = p.iter_mut().find(|p| p.id == *payment.id) {
             p.is_paid = true;
             p.paid_at = Some(Utc::now());
         }
-        if let Some(v) = v.get_mut(&payment.vm_id) {
-            v.expires = v.expires.add(TimeDelta::seconds(payment.time_value as i64));
-        }
+        // vm.expires removed — expiry is managed exclusively via subscription.expires
         Ok(())
     }
 
@@ -1618,28 +1626,6 @@ impl LNVpsDbBase for MockDb {
             subscription.is_setup = true;
         }
         drop(subscriptions);
-
-        // VM path: also extend vm.expires by time_value seconds
-        if let Some(time_value) = payment.time_value {
-            // Find the VM line item for this subscription
-            let items = self.subscription_line_items.lock().await;
-            let line_item_id = items.values().find(|li| {
-                li.subscription_id == payment.subscription_id
-                    && matches!(
-                        li.subscription_type,
-                        lnvps_db::SubscriptionType::VmRenewal | lnvps_db::SubscriptionType::VmUpgrade
-                    )
-            }).map(|li| li.id);
-            drop(items);
-
-            if let Some(lid) = line_item_id {
-                let mut vms = self.vms.lock().await;
-                if let Some(vm) = vms.values_mut().find(|v| v.subscription_line_item_id == lid && !v.deleted) {
-                    let base = vm.expires.max(Utc::now());
-                    vm.expires = base.add(TimeDelta::seconds(time_value as i64));
-                }
-            }
-        }
 
         Ok(())
     }
@@ -2946,11 +2932,10 @@ mod tests {
         assert!(p.paid_at.is_some());
     }
 
-    /// VM path: time_value is set — subscription AND vm expires extended by that many seconds.
+    /// VM path: time_value is set — subscription expires extended by that many seconds.
     #[tokio::test]
     async fn test_subscription_payment_paid_vm_extends_by_time_value() {
         let db = MockDb::default();
-        // Insert the mock VM so vm.expires can be updated
         db.vms.lock().await.insert(1, MockDb::mock_vm());
 
         let time_value_secs = 30 * 24 * 3600u64; // 30 days
@@ -2976,14 +2961,6 @@ mod tests {
         assert!(sub.is_setup);
         drop(subs);
 
-        // VM expires must also be extended
-        let vms = db.vms.lock().await;
-        let vm = vms.get(&1).unwrap();
-        assert!(
-            vm.expires >= expected_min && vm.expires <= expected_max,
-            "vm expires {} not in expected range",
-            vm.expires
-        );
     }
 
     /// Regular subscription path: time_value is None — expires extended by subscription interval.

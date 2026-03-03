@@ -21,10 +21,19 @@ impl VmLineItemHandler {
         tx: Arc<dyn WorkCommander>,
     ) -> Result<Self> {
         let vm = db.get_vm(vm_id).await?;
+        // Read expiry from subscription (authoritative source)
+        let vm_expires_before = if let Ok(li) = db.get_subscription_line_item(vm.subscription_line_item_id).await {
+            db.get_subscription(li.subscription_id).await
+                .ok()
+                .and_then(|s| s.expires)
+                .unwrap_or_else(chrono::Utc::now)
+        } else {
+            chrono::Utc::now()
+        };
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         Ok(Self {
             vm_id,
-            vm_expires_before: vm.expires,
+            vm_expires_before,
             db,
             tx,
             vm_history_logger,
@@ -36,7 +45,16 @@ impl VmLineItemHandler {
 impl SubscriptionLineItemHandler for VmLineItemHandler {
     async fn on_payment(&self, payment: &SubscriptionPayment, method_label: &str) -> Result<()> {
         let vm_id = self.vm_id;
-        let vm_after = self.db.get_vm(vm_id).await?;
+        let vm = self.db.get_vm(vm_id).await?;
+        // Get new expiry from subscription (authoritative source)
+        let vm_expires_after = if let Ok(li) = self.db.get_subscription_line_item(vm.subscription_line_item_id).await {
+            self.db.get_subscription(li.subscription_id).await
+                .ok()
+                .and_then(|s| s.expires)
+                .unwrap_or_else(chrono::Utc::now)
+        } else {
+            chrono::Utc::now()
+        };
 
         let payment_metadata = serde_json::json!({
             "payment_id": hex::encode(&payment.id),
@@ -65,7 +83,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
                     vm_id,
                     None,
                     self.vm_expires_before,
-                    vm_after.expires,
+                    vm_expires_after,
                     Some(payment.amount + payment.tax + payment.processing_fee),
                     Some(&payment.currency),
                     Some(serde_json::json!({
