@@ -1325,14 +1325,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
-        Ok(sqlx::query_as("SELECT * FROM subscription")
+        Ok(sqlx::query_as("SELECT * FROM subscription ORDER BY id DESC")
             .fetch_all(&self.db)
             .await?)
     }
 
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         Ok(
-            sqlx::query_as("SELECT * FROM subscription WHERE user_id = ?")
+            sqlx::query_as("SELECT * FROM subscription WHERE user_id = ? ORDER BY id DESC")
                 .bind(user_id)
                 .fetch_all(&self.db)
                 .await?,
