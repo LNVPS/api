@@ -903,6 +903,29 @@ pub struct Vm {
     pub disabled: bool,
 }
 
+/// Raw vm_payment row with external_data as a plain String (not decrypted).
+/// Used by the data migration tool to copy rows without needing the encryption key.
+#[derive(FromRow, Clone, Debug)]
+pub struct VmPaymentRaw {
+    pub id: Vec<u8>,
+    pub vm_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    pub payment_type: PaymentType,
+    pub external_data: String,
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub rate: f32,
+    pub time_value: u64,
+    pub tax: u64,
+    pub upgrade_params: Option<String>,
+    pub processing_fee: u64,
+    pub paid_at: Option<DateTime<Utc>>,
+}
+
 /// Minimal VM projection used by the data migration tool where
 /// `subscription_line_item_id` may still be NULL for pre-migration rows.
 #[derive(FromRow, Clone, Debug)]

@@ -5,7 +5,7 @@ use crate::{
     ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmForMigration, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmForMigration, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -35,13 +35,13 @@ impl LNVpsDbMysql {
         &self.db
     }
 
-    /// List IDs of non-deleted VMs that have not yet been linked to a subscription line item.
-    /// Used by the data migration tool to avoid decoding nullable subscription_line_item_id
-    /// via the Vm struct (which requires it non-null).
+    /// List IDs of ALL VMs (including deleted) that have not yet been linked to a subscription
+    /// line item. Used by the data migration tool to avoid decoding nullable
+    /// subscription_line_item_id via the Vm struct (which requires it non-null).
     pub async fn list_vm_ids_without_subscription(&self) -> DbResult<Vec<u64>> {
         let rows = sqlx::query(
-            "SELECT id FROM vm WHERE deleted = 0 \
-             AND (subscription_line_item_id IS NULL OR subscription_line_item_id = 0)",
+            "SELECT id FROM vm \
+             WHERE subscription_line_item_id IS NULL OR subscription_line_item_id = 0",
         )
         .fetch_all(&self.db)
         .await?;
@@ -49,6 +49,40 @@ impl LNVpsDbMysql {
             .iter()
             .map(|r| r.get::<u32, _>("id") as u64)
             .collect())
+    }
+
+    /// List VM ids that have vm_payment rows not yet copied to subscription_payment.
+    /// Identifies by id: a vm_payment is considered copied if a subscription_payment
+    /// with the same binary id exists.
+    pub async fn list_vm_ids_with_uncopied_payments(&self) -> DbResult<Vec<u64>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT vp.vm_id FROM vm_payment vp \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM subscription_payment sp WHERE sp.id = vp.id \
+             )",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<u32, _>("vm_id") as u64)
+            .collect())
+    }
+
+    /// List all vm_payment rows for a VM, with external_data as raw String (no decryption).
+    /// Used by the data migration tool to copy rows without needing the encryption key.
+    pub async fn list_vm_payments_for_migration(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<VmPaymentRaw>> {
+        Ok(sqlx::query_as(
+            "SELECT id, vm_id, created, expires, amount, currency, payment_method, payment_type, \
+             external_data, external_id, is_paid, rate, time_value, tax, upgrade_params, \
+             processing_fee, paid_at FROM vm_payment WHERE vm_id = ? ORDER BY created ASC",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     /// Set subscription_line_item_id on a VM by id.
