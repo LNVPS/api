@@ -2186,4 +2186,103 @@ mod tests {
         // subscription_id checked implicitly via renew();
         Ok(())
     }
+
+    // ── provision subscription creation tests ────────────────────────────────
+
+    /// provision() creates a subscription and line item linked to the VM.
+    #[tokio::test]
+    async fn test_provision_creates_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = prov
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        assert!(
+            vm.subscription_line_item_id > 0,
+            "VM must have a subscription_line_item_id"
+        );
+
+        // Line item must exist
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::VmRenewal);
+
+        // Subscription must exist and have interval from cost_plan
+        let sub = db.get_subscription(line_item.subscription_id).await?;
+        assert_eq!(sub.user_id, user.id);
+        // Default cost_plan has interval_amount=1, interval_type=Month
+        assert_eq!(sub.interval_amount, 1);
+        assert!(
+            matches!(sub.interval_type, IntervalType::Month),
+            "expected Month interval"
+        );
+        assert!(!sub.is_active, "subscription should start inactive");
+        assert!(!sub.is_setup, "subscription should start un-setup");
+
+        Ok(())
+    }
+
+    /// provision_custom() creates a subscription with 1-Month interval.
+    #[tokio::test]
+    async fn test_provision_custom_creates_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id =
+            insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+
+        let template = lnvps_db::VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+
+        let vm = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await?;
+
+        assert!(vm.subscription_line_item_id > 0);
+
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::VmRenewal);
+
+        let sub = db.get_subscription(line_item.subscription_id).await?;
+        assert_eq!(sub.user_id, user.id);
+        // Custom VMs always use 1-Month interval
+        assert_eq!(sub.interval_amount, 1);
+        assert!(
+            matches!(sub.interval_type, IntervalType::Month),
+            "expected Month interval"
+        );
+        assert!(!sub.is_active);
+        assert!(!sub.is_setup);
+
+        Ok(())
+    }
+
+    /// provision() sets ref_code on the VM.
+    #[tokio::test]
+    async fn test_provision_sets_ref_code() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = prov
+            .provision(user.id, 1, 1, ssh_key.id, Some("TEST123".to_string()))
+            .await?;
+
+        assert_eq!(vm.ref_code, Some("TEST123".to_string()));
+        Ok(())
+    }
 }

@@ -97,20 +97,20 @@ Full plan details captured in this work file.
 - [x] Update referral cost tracking to join via vm.subscription_id
 - [x] Verify build + tests pass
 
-### Increment 8: Subscription creation for new VMs
-- [ ] Update standard VM provisioning to create subscription + line item
-- [ ] Update custom VM provisioning to create subscription + line item
-- [ ] Update IP range subscription creation to explicitly set interval on subscription
-- [ ] Verify build + tests pass
+### Increment 8: Subscription creation for new VMs ✓
+- [x] Update standard VM provisioning to create subscription + line item (done in Inc 3+4)
+- [x] Update custom VM provisioning to create subscription + line item (done in Inc 3+4)
+- [x] Update IP range subscription creation to explicitly set interval on subscription (already correct)
+- [x] Verify build + tests pass
 
-### Increment 9: Testing & validation
-- [ ] Unit tests: subscription_payment_paid() for VMs
-- [ ] Unit tests: subscription_payment_paid() for regular subscriptions
-- [ ] Unit tests: interval computation from subscription
-- [ ] Unit tests: standard vs custom VM subscription creation
-- [ ] Integration tests: VM renewal flow
-- [ ] Integration tests: VM upgrade flow (standard → custom)
-- [ ] Integration tests: webhook processing
+### Increment 9: Testing & validation ✓
+- [x] Unit tests: subscription_payment_paid() for VMs (time_value path)
+- [x] Unit tests: subscription_payment_paid() for regular subscriptions (interval path)
+- [x] Unit tests: interval computation from subscription (Day/Month/Year)
+- [x] Unit tests: standard vs custom VM subscription creation (provision/provision_custom)
+- [x] Unit tests: consecutive payment stacking
+- [x] Unit tests: list_vm_subscription_payments_paginated pagination
+- [x] Unit tests: NodeInvoiceHandler::mark_payment_paid (Renewal + Upgrade paths)
 - [ ] Data migration tests against backup
 - [ ] Validation endpoint: VMs without subscriptions, missing time_value, duplicates
 

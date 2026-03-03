@@ -2593,3 +2593,232 @@ impl LNVPSNostrDb for MockDb {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+
+    /// Build a minimal SubscriptionPayment for the default mock subscription (id=1).
+    fn make_payment(subscription_id: u64, time_value: Option<u64>) -> SubscriptionPayment {
+        SubscriptionPayment {
+            id: vec![1u8; 16],
+            subscription_id,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::hours(1),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        }
+    }
+
+    /// subscription_payment_paid marks the payment as paid and sets paid_at.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_marks_payment() {
+        let db = MockDb::default();
+        let payment = make_payment(1, Some(86400));
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let payments = db.subscription_payments.lock().await;
+        let p = payments.iter().find(|p| p.id == payment.id).unwrap();
+        assert!(p.is_paid);
+        assert!(p.paid_at.is_some());
+    }
+
+    /// VM path: time_value is set — subscription expires extended by that many seconds.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_vm_extends_by_time_value() {
+        let db = MockDb::default();
+        let time_value_secs = 30 * 24 * 3600u64; // 30 days
+        let payment = make_payment(1, Some(time_value_secs));
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        // Should be approximately now + 30 days
+        let expected_min = before + chrono::Duration::seconds(time_value_secs as i64 - 5);
+        let expected_max = before + chrono::Duration::seconds(time_value_secs as i64 + 5);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range",
+            expires
+        );
+        assert!(sub.is_active);
+        assert!(sub.is_setup);
+    }
+
+    /// Regular subscription path: time_value is None — expires extended by subscription interval.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_month() {
+        let db = MockDb::default();
+        // Default subscription has interval_amount=1, interval_type=Month
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        // Should be approximately 1 month from now
+        let expected_min = before + chrono::Duration::days(28);
+        let expected_max = before + chrono::Duration::days(32);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range for 1-month interval",
+            expires
+        );
+    }
+
+    /// Regular subscription path: year interval extends by 12 months.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_year() {
+        let db = MockDb::default();
+        // Update subscription to use 1-year interval
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 1;
+            sub.interval_type = IntervalType::Year;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        // Should be approximately 12 months from now
+        let expected_min = before + chrono::Duration::days(364);
+        let expected_max = before + chrono::Duration::days(367);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range for 1-year interval",
+            expires
+        );
+    }
+
+    /// Regular subscription path: day interval extends by N days.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_day() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 7;
+            sub.interval_type = IntervalType::Day;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        let expected_min = before + chrono::Duration::days(6);
+        let expected_max = before + chrono::Duration::days(8);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range for 7-day interval",
+            expires
+        );
+    }
+
+    /// Consecutive payments stack: second payment extends from the first expiry.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_stacks_from_previous_expiry() {
+        let db = MockDb::default();
+        let p1 = make_payment(1, Some(86400));
+        let mut p2 = make_payment(1, Some(86400));
+        p2.id = vec![2u8; 16]; // different id
+
+        db.insert_subscription_payment(&p1).await.unwrap();
+        db.insert_subscription_payment(&p2).await.unwrap();
+
+        db.subscription_payment_paid(&p1).await.unwrap();
+        let expires_after_first = {
+            let subs = db.subscriptions.lock().await;
+            subs.get(&1).unwrap().expires.unwrap()
+        };
+
+        db.subscription_payment_paid(&p2).await.unwrap();
+        let expires_after_second = {
+            let subs = db.subscriptions.lock().await;
+            subs.get(&1).unwrap().expires.unwrap()
+        };
+
+        // Second payment adds another 86400s on top of the first expiry
+        let diff = (expires_after_second - expires_after_first).num_seconds();
+        assert!(
+            (diff - 86400).abs() < 5,
+            "Second payment should add ~86400s from first expiry, but diff was {}s",
+            diff
+        );
+    }
+
+    /// list_vm_subscription_payments_paginated returns the correct window.
+    #[tokio::test]
+    async fn test_list_vm_subscription_payments_paginated() {
+        let db = MockDb::default();
+        // Insert default VM (id=1) which uses subscription_id=1
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(1, MockDb::mock_vm());
+        }
+
+        // Insert 5 payments for subscription_id=1
+        for i in 0u8..5 {
+            let mut p = make_payment(1, Some(86400));
+            p.id = vec![i; 16];
+            p.created = Utc::now() + chrono::Duration::seconds(i as i64);
+            db.insert_subscription_payment(&p).await.unwrap();
+        }
+
+        // Page 0: first 2
+        let page0 = db
+            .list_vm_subscription_payments_paginated(1, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(page0.len(), 2);
+
+        // Page 1: next 2
+        let page1 = db
+            .list_vm_subscription_payments_paginated(1, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+
+        // Page 2: last 1
+        let page2 = db
+            .list_vm_subscription_payments_paginated(1, 2, 4)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+
+        // Pages do not overlap
+        assert_ne!(page0[0].id, page1[0].id);
+        assert_ne!(page1[0].id, page2[0].id);
+    }
+}
