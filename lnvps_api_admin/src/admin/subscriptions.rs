@@ -372,8 +372,10 @@ async fn admin_list_subscription_payments(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    // Verify subscription exists
-    let _subscription = this.db.get_subscription(subscription_id).await?;
+    // Verify subscription exists and fetch company base currency
+    let subscription = this.db.get_subscription(subscription_id).await?;
+    let company = this.db.get_company(subscription.company_id).await?;
+    let base_currency = company.base_currency;
 
     let all_payments = this.db.list_subscription_payments(subscription_id).await?;
     let total = all_payments.len() as u64;
@@ -382,7 +384,7 @@ async fn admin_list_subscription_payments(
         .into_iter()
         .skip(offset as usize)
         .take(limit as usize)
-        .map(AdminSubscriptionPaymentInfo::from)
+        .map(|p| AdminSubscriptionPaymentInfo::new(p, base_currency.clone()))
         .collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
@@ -398,8 +400,8 @@ async fn admin_get_subscription_payment(
 
     let payment_id = hex::decode(&id).map_err(|_| anyhow::anyhow!("Invalid payment ID format"))?;
 
-    let payment = this.db.get_subscription_payment(&payment_id).await?;
-    ApiData::ok(AdminSubscriptionPaymentInfo::from(payment))
+    let payment = this.db.get_subscription_payment_with_company(&payment_id).await?;
+    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(payment))
 }
 
 /// Manually mark a subscription payment as paid (admin override).
@@ -430,7 +432,7 @@ async fn admin_complete_subscription_payment(
         payment.subscription_id
     );
 
-    // Re-read the payment to get updated state
-    let updated = this.db.get_subscription_payment(&payment_id).await?;
-    ApiData::ok(AdminSubscriptionPaymentInfo::from(updated))
+    // Re-read the payment to get updated state (with company info)
+    let updated = this.db.get_subscription_payment_with_company(&payment_id).await?;
+    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated))
 }

@@ -2460,6 +2460,7 @@ pub struct AdminSubscriptionPaymentInfo {
     pub expires: DateTime<Utc>,
     pub amount: u64,
     pub currency: String,
+    pub company_base_currency: String,
     pub payment_method: AdminPaymentMethod,
     pub payment_type: ApiSubscriptionPaymentType,
     pub external_id: Option<String>,
@@ -2502,8 +2503,8 @@ impl From<ApiSubscriptionPaymentType> for lnvps_db::SubscriptionPaymentType {
     }
 }
 
-impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
-    fn from(payment: lnvps_db::SubscriptionPayment) -> Self {
+impl AdminSubscriptionPaymentInfo {
+    pub fn new(payment: lnvps_db::SubscriptionPayment, company_base_currency: String) -> Self {
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
@@ -2512,6 +2513,30 @@ impl From<lnvps_db::SubscriptionPayment> for AdminSubscriptionPaymentInfo {
             expires: payment.expires,
             amount: payment.amount,
             currency: payment.currency,
+            company_base_currency,
+            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
+            external_id: payment.external_id,
+            is_paid: payment.is_paid,
+            paid_at: payment.paid_at,
+            rate: payment.rate,
+            time_value: payment.time_value,
+            metadata: payment.metadata,
+            tax: payment.tax,
+            processing_fee: payment.processing_fee,
+        }
+    }
+
+    pub fn from_with_company(payment: lnvps_db::SubscriptionPaymentWithCompany) -> Self {
+        Self {
+            id: hex::encode(&payment.id),
+            subscription_id: payment.subscription_id,
+            user_id: payment.user_id,
+            created: payment.created,
+            expires: payment.expires,
+            amount: payment.amount,
+            currency: payment.currency,
+            company_base_currency: payment.company_base_currency,
             payment_method: AdminPaymentMethod::from(payment.payment_method),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             external_id: payment.external_id,
