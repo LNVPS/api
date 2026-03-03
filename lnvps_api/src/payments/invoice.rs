@@ -301,4 +301,97 @@ mod tests {
 
         Ok(()) // expiry extension is tested thoroughly in mock tests
     }
+
+    /// Build a DB with a non-VM (IpRange) subscription and unpaid payment.
+    async fn setup_ip_range_renewal(
+    ) -> Result<(Arc<MockDb>, Arc<MockNode>, Arc<ChannelWorkCommander>, SubscriptionPayment)> {
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+
+        let pubkey: [u8; 32] = [2u8; 32];
+        let user_id = db.upsert_user(&pubkey).await?;
+
+        let (sub_id, _line_item_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "ip range test".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "ip range".to_string(),
+                    description: None,
+                    amount: 500,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let payment = SubscriptionPayment {
+            id: vec![99u8; 16],
+            subscription_id: sub_id,
+            user_id,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::hours(1),
+            amount: 500,
+            currency: "EUR".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        };
+        db.insert_subscription_payment(&payment).await?;
+
+        let tx = Arc::new(ChannelWorkCommander::new());
+        Ok((db, node, tx, payment))
+    }
+
+    /// complete for a non-VM (IpRange) renewal marks it paid and dispatches CheckSubscriptions.
+    #[tokio::test]
+    async fn test_complete_non_vm_renewal_dispatches_check_subscriptions() -> Result<()> {
+        let (db, node, tx, payment) = setup_ip_range_renewal().await?;
+
+        let handler = NodeInvoiceHandler::new(node, db.clone(), tx.clone());
+        handler.complete(&payment).await?;
+
+        // Payment should be marked paid
+        let payments = db.subscription_payments.lock().await;
+        let p = payments.iter().find(|p| p.id == payment.id).unwrap();
+        assert!(p.is_paid, "payment should be marked paid");
+        drop(payments);
+
+        // CheckSubscriptions should be dispatched (not CheckVm)
+        let jobs = tx.recv().await?;
+        assert_eq!(jobs.len(), 1, "expected exactly one work job");
+        assert!(
+            matches!(&jobs[0].job, WorkJob::CheckSubscriptions),
+            "expected CheckSubscriptions job for non-VM payment, got {:?}",
+            jobs[0].job
+        );
+
+        Ok(())
+    }
 }

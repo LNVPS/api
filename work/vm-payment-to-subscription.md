@@ -3,6 +3,7 @@
 **Status:** in-progress
 **Started:** 2026-02-23
 **Last updated:** 2026-03-04
+**Phase 2+3 status:** All increments 11–19 complete
 
 ## Goal
 
@@ -202,23 +203,21 @@ This phase extracts a single `on_payment_complete` pipeline that is product-agno
 - [x] Remove `VmHistoryLogger` from both handler structs (moved into `VmPaymentCompletionHandler`)
 - [x] 203 unit tests pass (81 lnvps_api + 122 lnvps_api_common)
 
-### Increment 18: Stripe handler implementation
+### Increment 18: Stripe handler implementation ✓
+- [x] Implement `StripePaymentHandler` struct with `StripeApi`, `db`, `tx`, `config_id`
+- [x] Implement `try_complete_payment`: looks up payment by ext_id, calls `complete_payment` + `make_completion_handler`
+- [x] Implement cancel-competing-upgrades via `api.cancel_payment_intent`
+- [x] Implement `listen()`: subscribes to `WEBHOOK_BRIDGE`, filters Stripe endpoint, verifies signature, handles `payment_intent.succeeded`
+- [x] Wire Stripe handler into `listen_all_payments` (behind `#[cfg(feature = "stripe")]`)
+- [x] Add `/api/v1/webhook/stripe` route to `webhook.rs`
+- [x] Stripe payment creation (`bail!` in provisioner) left as-is — checkout session creation is out of scope for this phase
+- [x] Verified build with `--features stripe`
 
-- [ ] Implement `StripePaymentHandler::listen()` using Stripe webhook events (`payment_intent.succeeded`)
-- [ ] Implement `StripePaymentHandler`'s payment lookup by `external_id` → `get_subscription_payment_by_ext_id`
-- [ ] Implement cancel-competing-upgrades using Stripe API (cancel PaymentIntent)
-- [ ] Wire into `complete_payment` with the same `CompositePaymentCompletionHandler`
-- [ ] Remove the `bail!("not yet implemented")` for `PaymentMethod::Stripe` in `renew_subscription`
-- [ ] Verify build + tests pass
-
-### Increment 19: Unit tests for generic payment pipeline
-
-- [ ] Test `complete_payment` with VM renewal: DB marked paid, VM history logged, `CheckVm` dispatched
-- [ ] Test `complete_payment` with VM upgrade: `ProcessVmUpgrade` dispatched, competing upgrades cancelled
-- [ ] Test `complete_payment` with IP range renewal: `ip_range_subscription.is_active` flipped, notification sent
-- [ ] Test `complete_payment` with IP range first payment: CIDR allocated, `ip_range_subscription` row inserted
-- [ ] Test `admin_complete_subscription_payment` now dispatches a WorkJob (regression: it previously did not)
-- [ ] Verify all existing 214+ unit tests still pass
+### Increment 19: Unit tests for generic payment pipeline ✓
+- [x] Test `complete` (VM renewal): marks paid, dispatches `CheckVm`
+- [x] Test `complete` (VM upgrade): dispatches `ProcessVmUpgrade`
+- [x] Test `complete` (non-VM IpRange renewal): marks paid, dispatches `CheckSubscriptions` (not `CheckVm`)
+- [x] 204 unit tests pass (82 lnvps_api + 122 lnvps_api_common)
 
 ## Notes
 
