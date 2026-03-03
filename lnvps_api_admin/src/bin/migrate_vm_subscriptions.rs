@@ -15,7 +15,7 @@ use config::{Config, File};
 use lnvps_api_admin::settings::Settings;
 use lnvps_db::{
     EncryptionContext, IntervalType, LNVpsDb, LNVpsDbBase, LNVpsDbMysql, Subscription,
-    SubscriptionLineItem, SubscriptionType,
+    SubscriptionLineItem, SubscriptionType, VmForMigration,
 };
 use log::{info, warn};
 use std::path::PathBuf;
@@ -69,46 +69,48 @@ async fn main() -> Result<()> {
 
     let db_impl = LNVpsDbMysql::new(&settings.db).await?;
     db_impl.migrate().await?;
-    let db: Arc<dyn LNVpsDb> = Arc::new(db_impl);
+    let db_impl = Arc::new(db_impl);
+
+    // Collect IDs of VMs needing migration before wrapping in Arc<dyn LNVpsDb>,
+    // since the Vm struct requires subscription_line_item_id to be non-null.
+    let vm_ids = db_impl
+        .list_vm_ids_without_subscription()
+        .await
+        .context("Failed to list VMs needing migration")?;
+
+    let db: Arc<dyn LNVpsDb> = db_impl.clone();
 
     if args.dry_run {
         info!("*** DRY RUN MODE — no changes will be written ***");
     }
 
-    run_migration(db, args.dry_run).await
+    run_migration(db_impl, db, vm_ids, args.dry_run).await
 }
 
-async fn run_migration(db: Arc<dyn LNVpsDb>, dry_run: bool) -> Result<()> {
-    let vms = db.list_vms().await.context("Failed to list VMs")?;
+async fn run_migration(
+    db_impl: Arc<LNVpsDbMysql>,
+    db: Arc<dyn LNVpsDb>,
+    vm_ids: Vec<u64>,
+    dry_run: bool,
+) -> Result<()> {
+    info!("{} VMs need migration", vm_ids.len());
 
     let mut migrated = 0usize;
-    let mut skipped = 0usize;
     let mut errored = 0usize;
 
-    for vm in &vms {
-        // Skip deleted VMs
-        if vm.deleted {
-            skipped += 1;
-            continue;
-        }
-        // Skip VMs already linked to a subscription
-        if vm.subscription_line_item_id != 0 {
-            skipped += 1;
-            continue;
-        }
-
-        match migrate_vm(db.clone(), vm.id, dry_run).await {
+    for vm_id in &vm_ids {
+        match migrate_vm(db_impl.clone(), db.clone(), *vm_id, dry_run).await {
             Ok(()) => migrated += 1,
             Err(e) => {
-                warn!("Failed to migrate VM {}: {:#}", vm.id, e);
+                warn!("Failed to migrate VM {}: {:#}", vm_id, e);
                 errored += 1;
             }
         }
     }
 
     info!(
-        "Migration complete: {} migrated, {} skipped, {} errors",
-        migrated, skipped, errored
+        "Migration complete: {} migrated, {} errors",
+        migrated, errored
     );
 
     if errored > 0 {
@@ -118,8 +120,16 @@ async fn run_migration(db: Arc<dyn LNVpsDb>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-async fn migrate_vm(db: Arc<dyn LNVpsDb>, vm_id: u64, dry_run: bool) -> Result<()> {
-    let vm = db.get_vm(vm_id).await.context("Failed to get VM")?;
+async fn migrate_vm(
+    db_impl: Arc<LNVpsDbMysql>,
+    db: Arc<dyn LNVpsDb>,
+    vm_id: u64,
+    dry_run: bool,
+) -> Result<()> {
+    let vm: VmForMigration = db_impl
+        .get_vm_for_migration(vm_id)
+        .await
+        .context("Failed to get VM")?;
 
     // Determine currency and company
     let company_id = db
@@ -219,9 +229,8 @@ async fn migrate_vm(db: Arc<dyn LNVpsDb>, vm_id: u64, dry_run: bool) -> Result<(
     let subscription_line_item_id = line_item_ids[0];
 
     // Link the VM to the new subscription line item
-    let mut updated_vm = vm;
-    updated_vm.subscription_line_item_id = subscription_line_item_id;
-    db.update_vm(&updated_vm)
+    db_impl
+        .set_vm_subscription_line_item(vm_id, subscription_line_item_id)
         .await
         .context("Failed to update VM with subscription_line_item_id")?;
 

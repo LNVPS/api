@@ -903,6 +903,19 @@ pub struct Vm {
     pub disabled: bool,
 }
 
+/// Minimal VM projection used by the data migration tool where
+/// `subscription_line_item_id` may still be NULL for pre-migration rows.
+#[derive(FromRow, Clone, Debug)]
+pub struct VmForMigration {
+    pub id: u64,
+    pub user_id: u64,
+    pub template_id: Option<u64>,
+    pub custom_template_id: Option<u64>,
+    pub expires: DateTime<Utc>,
+    pub auto_renewal_enabled: bool,
+    pub subscription_line_item_id: Option<u64>,
+}
+
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VmIpAssignment {
     /// Unique id of this assignment

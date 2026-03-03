@@ -5,7 +5,7 @@ use crate::{
     ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmForMigration, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -29,6 +29,54 @@ impl LNVpsDbMysql {
     pub async fn execute(&self, sql: &str) -> DbResult<()> {
         self.db.execute(sql).await?;
         Ok(())
+    }
+
+    pub fn pool(&self) -> &MySqlPool {
+        &self.db
+    }
+
+    /// List IDs of non-deleted VMs that have not yet been linked to a subscription line item.
+    /// Used by the data migration tool to avoid decoding nullable subscription_line_item_id
+    /// via the Vm struct (which requires it non-null).
+    pub async fn list_vm_ids_without_subscription(&self) -> DbResult<Vec<u64>> {
+        let rows = sqlx::query(
+            "SELECT id FROM vm WHERE deleted = 0 \
+             AND (subscription_line_item_id IS NULL OR subscription_line_item_id = 0)",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<u32, _>("id") as u64)
+            .collect())
+    }
+
+    /// Set subscription_line_item_id on a VM by id.
+    /// Used by the data migration tool where full Vm round-trip is not possible.
+    pub async fn set_vm_subscription_line_item(
+        &self,
+        vm_id: u64,
+        subscription_line_item_id: u64,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE vm SET subscription_line_item_id = ? WHERE id = ?")
+            .bind(subscription_line_item_id)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetch a VM row with subscription_line_item_id decoded as Option<u64>.
+    /// Used by the data migration tool where the column may still be NULL.
+    pub async fn get_vm_for_migration(&self, vm_id: u64) -> DbResult<VmForMigration> {
+        Ok(sqlx::query_as(
+            "SELECT id, user_id, template_id, custom_template_id, expires, \
+             auto_renewal_enabled, subscription_line_item_id \
+             FROM vm WHERE id = ?",
+        )
+        .bind(vm_id)
+        .fetch_one(&self.db)
+        .await?)
     }
 }
 
