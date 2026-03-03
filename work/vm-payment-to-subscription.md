@@ -190,41 +190,17 @@ This phase extracts a single `on_payment_complete` pipeline that is product-agno
 - IP range subscriptions have no post-payment actions today; this phase adds CIDR allocation + `ip_range_subscription.is_active` flip.
 - Cancel-competing-upgrades logic is also duplicated per payment method and must be centralised.
 
-### Increment 16: `PaymentCompletionHandler` trait + VM implementation
-
-- [ ] Define trait `PaymentCompletionHandler` in `lnvps_api_common` (or `lnvps_api/src/payments/mod.rs`):
-  ```rust
-  #[async_trait]
-  pub trait PaymentCompletionHandler: Send + Sync {
-      /// Called after subscription_payment_paid() succeeds.
-      /// `payment` is already marked paid in the DB.
-      async fn on_payment_complete(&self, payment: &SubscriptionPayment) -> Result<()>;
-  }
-  ```
-- [ ] Implement `VmPaymentCompletionHandler`:
-  - Fetch VM (via `get_vm_by_subscription`) — returns early (no-op) if no VM linked
-  - Fetch VM state before/after payment for history logging
-  - Call `vm_history_logger.log_vm_payment_received` + `log_vm_renewed`
-  - Branch on `payment_type`: dispatch `WorkJob::ProcessVmUpgrade` (Upgrade) or `WorkJob::CheckVm` (Renewal)
-- [ ] Implement `IpRangePaymentCompletionHandler`:
-  - On first payment (`!is_setup` before the call): allocate CIDR block, insert `ip_range_subscription` row with `is_active = true`
-  - On renewal: flip existing `ip_range_subscription.is_active = true`, clear `ended_at`
-  - Send user notification: "Your IP range subscription is now active"
-  - Dispatch `WorkJob::CheckSubscriptions` to pick up new state
-- [ ] Implement a `CompositePaymentCompletionHandler` (or a dispatcher fn) that selects the right handler by inspecting `subscription_line_item.subscription_type`
-- [ ] Verify build + tests pass
-
-### Increment 17: Centralised `complete_payment` function
-
-- [ ] Extract shared `complete_payment(db, payment, completion_handler, cancel_fn) -> Result<()>` free function in `payments/mod.rs`:
-  1. Call `db.subscription_payment_paid(payment)` (atomic DB mark-paid + expiry extension)
-  2. Call `completion_handler.on_payment_complete(payment)`
-  3. Call `cancel_fn(payment)` to cancel competing upgrade payments for the same subscription (method-specific: cancel Lightning invoice vs. Revolut order vs. no-op)
-- [ ] Refactor `NodeInvoiceHandler::mark_payment_paid` to call `complete_payment` — remove all duplicated VM logic
-- [ ] Refactor `RevolutPaymentHandler::try_complete_payment` to call `complete_payment` — remove all duplicated VM logic; also remove the `get_vm_by_subscription` call (it moves into `VmPaymentCompletionHandler`)
-- [ ] Refactor `admin_complete_vm_payment` to call `complete_payment`
-- [ ] Refactor `admin_complete_subscription_payment` to call `complete_payment` (this also adds the missing WorkJob dispatch to the admin subscription path)
-- [ ] Verify build + all existing tests pass
+### Increment 16 + 17: `PaymentCompletionHandler` trait + centralised `complete_payment` ✓
+- [x] Define `PaymentCompletionHandler` trait in `lnvps_api/src/payments/mod.rs`
+- [x] Implement `VmPaymentCompletionHandler`: fetches VM before/after, logs history, dispatches `CheckVm`/`ProcessVmUpgrade`
+- [x] Implement `NonVmPaymentCompletionHandler`: dispatches `CheckSubscriptions`
+- [x] Implement `make_completion_handler` dispatcher: selects handler by `subscription_type`
+- [x] Extract `complete_payment(db, payment, handler, cancel_fn)` free function
+- [x] Refactor `NodeInvoiceHandler`: replaces `mark_payment_paid(vm_id)` with `complete(payment)` — removes all duplicated VM logic and the `get_vm_by_subscription` call
+- [x] Refactor `RevolutPaymentHandler::try_complete_payment` — removes duplicated VM history logging, uses `complete_payment`; also removes `VmHistoryLogger` from struct
+- [x] `admin_complete_subscription_payment`: add `CheckSubscriptions` WorkJob dispatch (was missing)
+- [x] Remove `VmHistoryLogger` from both handler structs (moved into `VmPaymentCompletionHandler`)
+- [x] 203 unit tests pass (81 lnvps_api + 122 lnvps_api_common)
 
 ### Increment 18: Stripe handler implementation
 

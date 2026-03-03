@@ -8,7 +8,7 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -422,6 +422,15 @@ async fn admin_complete_subscription_payment(
         id,
         payment.subscription_id
     );
+
+    // Dispatch CheckSubscriptions so the lifecycle worker picks up the new expiry
+    if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {
+        log::error!(
+            "Payment completed but failed to dispatch CheckSubscriptions for subscription {}: {}",
+            payment.subscription_id,
+            e
+        );
+    }
 
     // Re-read the payment to get updated state (with company info)
     let updated = this.db.get_subscription_payment_with_company(&payment_id).await?;

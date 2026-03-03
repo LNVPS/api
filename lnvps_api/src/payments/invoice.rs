@@ -1,9 +1,8 @@
-use crate::payments::handle_upgrade;
+use crate::payments::{complete_payment, make_completion_handler};
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
-use lnvps_api_common::WorkJob;
-use lnvps_api_common::{VmHistoryLogger, WorkCommander};
+use lnvps_api_common::WorkCommander;
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::{InvoiceUpdate, LightningNode};
@@ -13,7 +12,6 @@ pub struct NodeInvoiceHandler {
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
     tx: Arc<dyn WorkCommander>,
-    vm_history_logger: VmHistoryLogger,
 }
 
 impl NodeInvoiceHandler {
@@ -22,118 +20,62 @@ impl NodeInvoiceHandler {
         db: Arc<dyn LNVpsDb>,
         tx: Arc<dyn WorkCommander>,
     ) -> Self {
-        let vm_history_logger = VmHistoryLogger::new(db.clone());
-        Self {
-            node,
-            tx,
-            db,
-            vm_history_logger,
-        }
+        Self { node, tx, db }
     }
 
     async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
-        let p = self.db.get_subscription_payment(id).await?;
-        let vm = self.db.get_vm_by_subscription(p.subscription_id).await?;
-        self.mark_payment_paid(&p, vm.id).await
+        let payment = self.db.get_subscription_payment(id).await?;
+        self.complete(&payment).await
     }
 
     async fn mark_paid_ext_id(&self, external_id: &str) -> Result<()> {
-        let p = self
+        let payment = self
             .db
             .get_subscription_payment_by_ext_id(external_id)
             .await?;
-        let vm = self.db.get_vm_by_subscription(p.subscription_id).await?;
-        self.mark_payment_paid(&p, vm.id).await
+        self.complete(&payment).await
     }
 
-    async fn mark_payment_paid(&self, payment: &SubscriptionPayment, vm_id: u64) -> Result<()> {
-        let vm_before = self.db.get_vm(vm_id).await?;
+    async fn complete(&self, payment: &SubscriptionPayment) -> Result<()> {
+        let handler =
+            make_completion_handler(payment, self.db.clone(), self.tx.clone(), "lightning").await?;
 
-        self.db.subscription_payment_paid(payment).await?;
+        let db = self.db.clone();
+        let node = self.node.clone();
+        let payment_id = payment.id.clone();
 
-        let vm_after = self.db.get_vm(vm_id).await?;
+        complete_payment(&self.db, payment, handler.as_ref(), |paid_payment| {
+            let db = db.clone();
+            let node = node.clone();
+            async move {
+                // Cancel other pending Lightning upgrade invoices for this subscription
+                let vm = db.get_vm_by_subscription(paid_payment.subscription_id).await?;
+                let other_upgrades = db
+                    .list_pending_vm_subscription_payments(vm.id)
+                    .await?
+                    .into_iter()
+                    .filter(|p| {
+                        p.payment_type == SubscriptionPaymentType::Upgrade
+                            && p.payment_method == PaymentMethod::Lightning
+                            && p.id != payment_id
+                    })
+                    .collect::<Vec<_>>();
 
-        let payment_metadata = serde_json::json!({
-            "payment_id": hex::encode(&payment.id),
-            "payment_method": "lightning"
-        });
-
-        if let Err(e) = self
-            .vm_history_logger
-            .log_vm_payment_received(
-                vm_id,
-                payment.amount + payment.tax + payment.processing_fee,
-                &payment.currency,
-                payment.time_value.unwrap_or(0),
-                Some(payment_metadata),
-            )
-            .await
-        {
-            warn!("Failed to log payment for VM {}: {}", vm_id, e);
-        }
-
-        let time_value = payment.time_value.unwrap_or(0);
-        if time_value > 0
-            && let Err(e) = self
-                .vm_history_logger
-                .log_vm_renewed(
-                    vm_id,
-                    None,
-                    vm_before.expires,
-                    vm_after.expires,
-                    Some(payment.amount + payment.tax + payment.processing_fee),
-                    Some(&payment.currency),
-                    Some(serde_json::json!({
-                        "time_added_seconds": time_value,
-                        "payment_id": hex::encode(&payment.id)
-                    })),
-                )
-                .await
-        {
-            warn!("Failed to log VM {} renewal: {}", vm_id, e);
-        }
-
-        info!(
-            "Subscription payment {} for VM {}, paid",
-            hex::encode(&payment.id),
-            vm_id
-        );
-
-        if payment.payment_type == SubscriptionPaymentType::Upgrade {
-            handle_upgrade(payment, vm_id, &self.tx, self.db.clone()).await?;
-
-            // cancel other pending upgrade payments for this VM
-            let other_upgrades = self
-                .db
-                .list_pending_vm_subscription_payments(vm_id)
-                .await?
-                .into_iter()
-                .filter(|p| {
-                    p.payment_type == SubscriptionPaymentType::Upgrade
-                        && p.payment_method == PaymentMethod::Lightning
-                        && p.id != payment.id
-                })
-                .collect::<Vec<_>>();
-
-            for ugp in other_upgrades {
-                let hex_id = hex::encode(&ugp.id);
-                if let Err(e) = self.node.cancel_invoice(&ugp.id).await {
-                    warn!("Failed to cancel invoice {}: {}", hex_id, e);
+                for ugp in other_upgrades {
+                    let hex_id = hex::encode(&ugp.id);
+                    if let Err(e) = node.cancel_invoice(&ugp.id).await {
+                        warn!("Failed to cancel invoice {}: {}", hex_id, e);
+                    }
+                    let mut expired = ugp;
+                    expired.expires = Utc::now();
+                    if let Err(e) = db.update_subscription_payment(&expired).await {
+                        warn!("Failed to update invoice {}: {}", hex_id, e);
+                    }
                 }
-                // mark as expired via update
-                let mut expired = ugp;
-                expired.expires = Utc::now();
-                if let Err(e) = self.db.update_subscription_payment(&expired).await {
-                    warn!("Failed to update invoice {}: {}", hex_id, e);
-                }
+                Ok(())
             }
-        } else {
-            self.tx
-                .send(WorkJob::CheckVm { vm_id })
-                .await?;
-        }
-
-        Ok(())
+        })
+        .await
     }
 
     pub async fn listen(&mut self) -> Result<()> {
@@ -291,14 +233,14 @@ mod tests {
         Ok((db, node, tx, payment, vm_id))
     }
 
-    /// mark_payment_paid for a Renewal payment marks it paid and enqueues CheckVm.
+    /// complete for a Renewal payment marks it paid and enqueues CheckVm.
     #[tokio::test]
-    async fn test_mark_payment_paid_renewal_marks_paid_and_enqueues_check_vm() -> Result<()> {
+    async fn test_complete_renewal_marks_paid_and_enqueues_check_vm() -> Result<()> {
         let (db, node, tx, payment, vm_id) =
             setup_renewal(86400, SubscriptionPaymentType::Renewal).await?;
 
         let handler = NodeInvoiceHandler::new(node, db.clone(), tx.clone());
-        handler.mark_payment_paid(&payment, vm_id).await?;
+        handler.complete(&payment).await?;
 
         // Payment should be marked paid
         let payments = db.subscription_payments.lock().await;
@@ -318,9 +260,9 @@ mod tests {
         Ok(())
     }
 
-    /// mark_payment_paid for an Upgrade payment enqueues ProcessVmUpgrade.
+    /// complete for an Upgrade payment enqueues ProcessVmUpgrade.
     #[tokio::test]
-    async fn test_mark_payment_paid_upgrade_enqueues_process_vm_upgrade() -> Result<()> {
+    async fn test_complete_upgrade_enqueues_process_vm_upgrade() -> Result<()> {
         let (db, node, tx, mut payment, vm_id) =
             setup_renewal(0, SubscriptionPaymentType::Upgrade).await?;
 
@@ -333,7 +275,7 @@ mod tests {
         db.update_subscription_payment(&payment).await?;
 
         let handler = NodeInvoiceHandler::new(node, db.clone(), tx.clone());
-        handler.mark_payment_paid(&payment, vm_id).await?;
+        handler.complete(&payment).await?;
 
         // A ProcessVmUpgrade job should have been enqueued
         let jobs = tx.recv().await?;
@@ -347,16 +289,15 @@ mod tests {
         Ok(())
     }
 
-    /// mark_payment_paid extends the subscription expiry for a renewal.
+    /// complete extends the subscription expiry for a renewal.
     #[tokio::test]
-    async fn test_mark_payment_paid_extends_subscription_expiry() -> Result<()> {
+    async fn test_complete_extends_subscription_expiry() -> Result<()> {
         let time_value = 30u64 * 24 * 3600;
-        let (db, node, tx, payment, vm_id) =
+        let (db, node, tx, payment, _vm_id) =
             setup_renewal(time_value, SubscriptionPaymentType::Renewal).await?;
 
-        let before = Utc::now();
         let handler = NodeInvoiceHandler::new(node, db, tx);
-        handler.mark_payment_paid(&payment, vm_id).await?;
+        handler.complete(&payment).await?;
 
         Ok(()) // expiry extension is tested thoroughly in mock tests
     }
