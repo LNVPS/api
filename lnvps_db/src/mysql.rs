@@ -1569,10 +1569,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>> {
         Ok(
-            sqlx::query_as("SELECT * FROM subscription_payment WHERE subscription_id = ?")
-                .bind(subscription_id)
-                .fetch_all(&self.db)
-                .await?,
+            sqlx::query_as(
+                "SELECT * FROM subscription_payment WHERE subscription_id = ? ORDER BY created DESC",
+            )
+            .bind(subscription_id)
+            .fetch_all(&self.db)
+            .await?,
         )
     }
 
@@ -1581,10 +1583,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         user_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>> {
         Ok(
-            sqlx::query_as("SELECT * FROM subscription_payment WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_all(&self.db)
-                .await?,
+            sqlx::query_as(
+                "SELECT * FROM subscription_payment WHERE user_id = ? ORDER BY created DESC",
+            )
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await?,
         )
     }
 
