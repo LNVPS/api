@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-02-23
-**Last updated:** 2026-03-02
+**Last updated:** 2026-03-03
 
 ## Goal
 
@@ -111,6 +111,9 @@ Full plan details captured in this work file.
 - [x] Unit tests: consecutive payment stacking
 - [x] Unit tests: list_vm_subscription_payments_paginated pagination
 - [x] Unit tests: NodeInvoiceHandler::mark_payment_paid (Renewal + Upgrade paths)
+- [x] Fix Bug 1 (double-conversion in renew_subscription): collect full NewPaymentInfo from get_vm_cost_for_intervals; do not pass already-converted BTC amounts through get_amount_and_rate again
+- [x] Fix Bug 2 (time_value: None): set time_value from summed NewPaymentInfo.time_value values on created SubscriptionPayment
+- [x] Add amount/time_value assertions to all 4 renew tests
 - [ ] Data migration tests against backup
 - [ ] Validation endpoint: VMs without subscriptions, missing time_value, duplicates
 

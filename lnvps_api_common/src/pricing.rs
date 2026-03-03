@@ -250,13 +250,13 @@ impl PricingEngine {
             self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
-        let expected_time_value = base_cost.time_value * intervals as u64;
-
-        // Check for existing unpaid subscription payment with matching time value
+        // Check for an existing unpaid renewal payment for this VM's subscription.
+        // We match on subscription_id + payment_method + payment_type only — matching
+        // on time_value is unreliable because time_value is computed from vm.expires,
+        // which advances after each confirmed payment.
         let payments = self.db.list_vm_subscription_payments(vm.id).await?;
         if let Some(px) = payments.into_iter().find(|p| {
             !p.is_paid
-                && p.time_value == Some(expected_time_value)
                 && p.payment_method == method
                 && p.payment_type == SubscriptionPaymentType::Renewal
         }) {
@@ -264,11 +264,12 @@ impl PricingEngine {
         }
 
         // Scale the cost by number of intervals
+        let base = vm.expires.max(Utc::now());
         if intervals == 1 {
             Ok(CostResult::New(base_cost))
         } else {
             let scaled_amount = base_cost.amount * intervals as u64;
-            let scaled_time = expected_time_value;
+            let scaled_time = base_cost.time_value * intervals as u64;
             let scaled_tax = self.get_tax_for_user(vm.user_id, scaled_amount).await?;
             let processing_fee = self
                 .calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount)
@@ -280,7 +281,7 @@ impl PricingEngine {
                 currency: base_cost.currency,
                 rate: base_cost.rate,
                 time_value: scaled_time,
-                new_expiry: vm.expires.add(TimeDelta::seconds(scaled_time as i64)),
+                new_expiry: base.add(TimeDelta::seconds(scaled_time as i64)),
             }))
         }
     }
@@ -359,8 +360,9 @@ impl PricingEngine {
         let template = self.db.get_custom_vm_template(template_id).await?;
         let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
 
-        // custom templates are always 1-month intervals
-        let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
+        // custom templates are always 1-month intervals; clamp base to now for expired VMs
+        let base = vm.expires.max(Utc::now());
+        let time_value = (base.add(Months::new(1)) - base).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
                 CurrencyAmount::from_u64(price.currency, price.total()),
@@ -383,7 +385,7 @@ impl PricingEngine {
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
-            new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
+            new_expiry: base.add(TimeDelta::seconds(time_value as i64)),
         })
     }
 
@@ -420,17 +422,15 @@ impl PricingEngine {
     }
 
     pub fn next_template_expire(vm: &Vm, cost_plan: &VmCostPlan) -> u64 {
+        // Clamp the base to now so expired VMs get a sensible time_value
+        let base = vm.expires.max(Utc::now());
         let next_expire = match cost_plan.interval_type {
-            IntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
-            IntervalType::Month => vm
-                .expires
-                .add(Months::new(cost_plan.interval_amount as u32)),
-            IntervalType::Year => vm
-                .expires
-                .add(Months::new((12 * cost_plan.interval_amount) as u32)),
+            IntervalType::Day => base.add(Days::new(cost_plan.interval_amount)),
+            IntervalType::Month => base.add(Months::new(cost_plan.interval_amount as u32)),
+            IntervalType::Year => base.add(Months::new((12 * cost_plan.interval_amount) as u32)),
         };
 
-        (next_expire - vm.expires).num_seconds() as u64
+        (next_expire - base).num_seconds() as u64
     }
 
     /// Gets the renewal cost of a standard VM
@@ -453,6 +453,7 @@ impl PricingEngine {
             .get_amount_and_rate(CurrencyAmount::from_u64(currency, cost_plan.amount), method)
             .await?;
         let time_value = Self::next_template_expire(vm, &cost_plan);
+        let base = vm.expires.max(Utc::now());
         Ok(NewPaymentInfo {
             amount: converted_amount.amount.value(),
             tax: self
@@ -469,7 +470,7 @@ impl PricingEngine {
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
-            new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
+            new_expiry: base.add(TimeDelta::seconds(time_value as i64)),
         })
     }
 

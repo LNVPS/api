@@ -1478,6 +1478,29 @@ impl LNVpsDbBase for MockDb {
             subscription.is_active = true;
             subscription.is_setup = true;
         }
+        drop(subscriptions);
+
+        // VM path: also extend vm.expires by time_value seconds
+        if let Some(time_value) = payment.time_value {
+            // Find the VM line item for this subscription
+            let items = self.subscription_line_items.lock().await;
+            let line_item_id = items.values().find(|li| {
+                li.subscription_id == payment.subscription_id
+                    && matches!(
+                        li.subscription_type,
+                        lnvps_db::SubscriptionType::VmRenewal | lnvps_db::SubscriptionType::VmUpgrade
+                    )
+            }).map(|li| li.id);
+            drop(items);
+
+            if let Some(lid) = line_item_id {
+                let mut vms = self.vms.lock().await;
+                if let Some(vm) = vms.values_mut().find(|v| v.subscription_line_item_id == lid && !v.deleted) {
+                    let base = vm.expires.max(Utc::now());
+                    vm.expires = base.add(TimeDelta::seconds(time_value as i64));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -2638,10 +2661,13 @@ mod tests {
         assert!(p.paid_at.is_some());
     }
 
-    /// VM path: time_value is set — subscription expires extended by that many seconds.
+    /// VM path: time_value is set — subscription AND vm expires extended by that many seconds.
     #[tokio::test]
     async fn test_subscription_payment_paid_vm_extends_by_time_value() {
         let db = MockDb::default();
+        // Insert the mock VM so vm.expires can be updated
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+
         let time_value_secs = 30 * 24 * 3600u64; // 30 days
         let payment = make_payment(1, Some(time_value_secs));
         db.insert_subscription_payment(&payment).await.unwrap();
@@ -2649,19 +2675,30 @@ mod tests {
         let before = Utc::now();
         db.subscription_payment_paid(&payment).await.unwrap();
 
-        let subs = db.subscriptions.lock().await;
-        let sub = subs.get(&1).unwrap();
-        let expires = sub.expires.unwrap();
-        // Should be approximately now + 30 days
         let expected_min = before + chrono::Duration::seconds(time_value_secs as i64 - 5);
         let expected_max = before + chrono::Duration::seconds(time_value_secs as i64 + 5);
+
+        // Subscription expires must be extended
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let sub_expires = sub.expires.unwrap();
         assert!(
-            expires >= expected_min && expires <= expected_max,
-            "expires {} not in expected range",
-            expires
+            sub_expires >= expected_min && sub_expires <= expected_max,
+            "subscription expires {} not in expected range",
+            sub_expires
         );
         assert!(sub.is_active);
         assert!(sub.is_setup);
+        drop(subs);
+
+        // VM expires must also be extended
+        let vms = db.vms.lock().await;
+        let vm = vms.get(&1).unwrap();
+        assert!(
+            vm.expires >= expected_min && vm.expires <= expected_max,
+            "vm expires {} not in expected range",
+            vm.expires
+        );
     }
 
     /// Regular subscription path: time_value is None — expires extended by subscription interval.

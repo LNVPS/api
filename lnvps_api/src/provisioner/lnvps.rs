@@ -396,16 +396,26 @@ impl LNVpsProvisioner {
         // Get user for tax calculation
         let user = self.db.get_user(subscription.user_id).await?;
 
-        // Calculate total cost per interval in subscription currency.
-        // VmRenewal line items always compute their current cost via the
-        // pricing engine — never use the stored amount, which may be stale
-        // (or zero for custom VMs with dynamic pricing).
-        // Non-VM line items use their stored amount directly.
-        let mut per_interval_cost: u64 = 0;
+        // Calculate total cost for the renewal.
+        //
+        // VmRenewal line items use get_vm_cost_for_intervals, which already
+        // performs the currency conversion (EUR→BTC etc.) internally and
+        // returns amounts in the payment method's currency together with the
+        // correct time_value.  We must NOT pass those already-converted amounts
+        // through get_amount_and_rate again — that would cause double conversion.
+        //
+        // Non-VM line items store their price in the subscription's base currency
+        // and are accumulated separately for a single conversion pass at the end.
+
         let mut setup_fee: u64 = 0;
 
+        // Accumulate NewPaymentInfo from all VM line items
+        let mut vm_payment_infos: Vec<NewPaymentInfo> = Vec::new();
+        // Accumulate non-VM amounts (in subscription currency) for conversion
+        let mut non_vm_interval_cost: u64 = 0;
+
         for item in &line_items {
-            let item_amount = if item.subscription_type == SubscriptionType::VmRenewal {
+            if item.subscription_type == SubscriptionType::VmRenewal {
                 let vm = self.db.get_vm_by_line_item(item.id).await?;
                 let pe = PricingEngine::new_for_vm(
                     self.db.clone(),
@@ -415,65 +425,110 @@ impl LNVpsProvisioner {
                 )
                 .await?;
                 match pe.get_vm_cost_for_intervals(vm.id, method, intervals).await? {
-                    CostResult::New(p) => p.amount,
-                    CostResult::Existing(p) => p.amount,
+                    CostResult::New(p) => vm_payment_infos.push(p),
+                    CostResult::Existing(p) => {
+                        // An identical unpaid payment already exists — return it directly
+                        return Ok(p);
+                    }
                 }
             } else {
-                item.amount * intervals as u64
-            };
-            per_interval_cost += item_amount;
+                non_vm_interval_cost += item.amount * intervals as u64;
+            }
             setup_fee += item.setup_amount;
         }
 
         // is_setup is set to true once the first (purchase) payment is confirmed.
-        // Use it directly instead of scanning payment history.
-        let (list_price_amount, payment_type) = if subscription.is_setup {
-            (per_interval_cost, SubscriptionPaymentType::Renewal)
+        let payment_type = if subscription.is_setup {
+            SubscriptionPaymentType::Renewal
         } else {
-            (per_interval_cost + setup_fee, SubscriptionPaymentType::Purchase)
+            SubscriptionPaymentType::Purchase
         };
 
-        // Parse subscription currency
+        // Parse subscription currency (needed for non-VM item conversion)
         let subscription_currency = Currency::from_str(&subscription.currency)
-            .map_err(|e| anyhow::anyhow!("Invalid currency"))?;
-        let list_price = CurrencyAmount::from_u64(subscription_currency, list_price_amount);
+            .map_err(|_| anyhow::anyhow!("Invalid currency"))?;
 
-        // Create pricing engine for currency conversion
-        let pe = PricingEngine::new(
-            self.db.clone(),
-            self.rates.clone(),
-            self.tax_rates.clone(),
-            subscription_currency,
-        );
+        // Convert non-VM amounts to the payment method currency if any exist
+        let (non_vm_converted_amount, non_vm_rate, non_vm_tax, non_vm_processing_fee): (
+            u64,
+            f32,
+            u64,
+            u64,
+        ) = if non_vm_interval_cost > 0 {
+                let pe = PricingEngine::new(
+                    self.db.clone(),
+                    self.rates.clone(),
+                    self.tax_rates.clone(),
+                    subscription_currency,
+                );
+                let mut base = non_vm_interval_cost;
+                if !subscription.is_setup {
+                    base += setup_fee;
+                }
+                let list_price = CurrencyAmount::from_u64(subscription_currency, base);
+                let converted = pe.get_amount_and_rate(list_price, method).await?;
+                let tax = pe
+                    .get_tax_for_user(user.id, converted.amount.value())
+                    .await?;
+                let processing_fee = pe
+                    .calculate_processing_fee(
+                        subscription.company_id,
+                        method,
+                        converted.amount.currency(),
+                        converted.amount.value(),
+                    )
+                    .await;
+                (
+                    converted.amount.value(),
+                    converted.rate.rate,
+                    tax,
+                    processing_fee,
+                )
+            } else {
+                (0u64, 0f32, 0u64, 0u64)
+            };
 
-        // Convert list price to payment method currency and get rate
-        let converted = pe.get_amount_and_rate(list_price, method).await?;
+        // Aggregate all line item amounts.  All VM infos are already in the
+        // payment method's currency so they can be summed directly.
+        let vm_amount: u64 = vm_payment_infos.iter().map(|p| p.amount).sum();
+        // time_value: sum of all VM intervals (non-VM items don't extend expiry)
+        let time_value: u64 = vm_payment_infos.iter().map(|p| p.time_value).sum();
+        // Use the rate from the first VM item if available, else from non-VM conversion
+        let rate = vm_payment_infos
+            .first()
+            .map(|p| p.rate.rate)
+            .unwrap_or(non_vm_rate);
+        // Tax and processing fee are already computed per-item by get_vm_cost_for_intervals;
+        // add non-VM taxes on top.
+        let tax: u64 = vm_payment_infos.iter().map(|p| p.tax).sum::<u64>() + non_vm_tax;
+        let processing_fee: u64 = vm_payment_infos
+            .iter()
+            .map(|p| p.processing_fee)
+            .sum::<u64>()
+            + non_vm_processing_fee;
 
-        // Calculate tax on the converted amount
-        let tax = pe
-            .get_tax_for_user(user.id, converted.amount.value())
-            .await?;
+        let total_amount = vm_amount + non_vm_converted_amount;
 
-        // Calculate processing fee using subscription's company_id
-        let processing_fee = pe
-            .calculate_processing_fee(
-                subscription.company_id,
-                method,
-                converted.amount.currency(),
-                converted.amount.value(),
-            )
-            .await;
+        // Payment method currency: BTC for Lightning, otherwise subscription currency
+        let payment_currency = vm_payment_infos
+            .first()
+            .map(|p| p.currency)
+            .unwrap_or(subscription_currency);
+
+        // Wrap the aggregated values so the invoice/order creation below can use them
+        let converted_amount = total_amount;
+        let converted_currency = payment_currency;
 
         // Generate payment based on method
         let subscription_payment = match method {
             PaymentMethod::Lightning => {
                 ensure!(
-                    converted.amount.currency() == Currency::BTC,
+                    converted_currency == Currency::BTC,
                     "Lightning payment must be in BTC"
                 );
                 const INVOICE_EXPIRE: u64 = 600;
                 // Round to nearest satoshi for wallet compatibility
-                let invoice_amount = round_msat_to_sat(converted.amount.value() + tax);
+                let invoice_amount = round_msat_to_sat(converted_amount + tax);
                 let desc = match payment_type {
                     SubscriptionPaymentType::Purchase => {
                         format!("Subscription purchase: {}", subscription.name)
@@ -507,15 +562,15 @@ impl LNVpsProvisioner {
                     user_id: subscription.user_id,
                     created: Utc::now(),
                     expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
-                    amount: converted.amount.value(),
-                    currency: converted.amount.currency().to_string(),
+                    amount: converted_amount,
+                    currency: converted_currency.to_string(),
                     payment_method: method,
                     payment_type,
                     external_data: invoice.pr().into(),
                     external_id: invoice.external_id,
                     is_paid: false,
-                    rate: converted.rate.rate,
-                    time_value: None,
+                    rate,
+                    time_value: if time_value > 0 { Some(time_value) } else { None },
                     metadata: None,
                     tax,
                     processing_fee,
@@ -529,7 +584,7 @@ impl LNVpsProvisioner {
                     bail!("Revolut not configured")
                 };
                 ensure!(
-                    converted.amount.currency() != Currency::BTC,
+                    converted_currency != Currency::BTC,
                     "Cannot create Revolut orders for BTC currency"
                 );
 
@@ -546,8 +601,8 @@ impl LNVpsProvisioner {
                 };
 
                 let order_amount = CurrencyAmount::from_u64(
-                    converted.amount.currency(),
-                    converted.amount.value() + tax + processing_fee,
+                    converted_currency,
+                    converted_amount + tax + processing_fee,
                 );
                 let order = rev.create_order(&desc, order_amount, None).await?;
 
@@ -558,15 +613,15 @@ impl LNVpsProvisioner {
                     user_id: subscription.user_id,
                     created: Utc::now(),
                     expires: Utc::now().add(Duration::from_secs(3600)),
-                    amount: converted.amount.value(),
-                    currency: converted.amount.currency().to_string(),
+                    amount: converted_amount,
+                    currency: converted_currency.to_string(),
                     payment_method: method,
                     payment_type,
                     external_data: order.raw_data.into(),
                     external_id: Some(order.external_id),
                     is_paid: false,
-                    rate: converted.rate.rate,
-                    time_value: None,
+                    rate,
+                    time_value: if time_value > 0 { Some(time_value) } else { None },
                     metadata: None,
                     tax,
                     processing_fee,
@@ -2020,7 +2075,23 @@ mod tests {
         let prov = make_provisioner_with_rates(db).await?;
         let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
 
-        // subscription_id checked implicitly via renew();
+        assert_eq!(payment.currency, "BTC", "payment currency should be BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(
+            payment.time_value.unwrap() > 0,
+            "time_value must be positive"
+        );
+        // With rate 69_420 EUR/BTC and custom pricing (2cpu@100 + 4GB@50 + 150 ip4 + 0 ip6 + 50GB@10*5)
+        // = (200 + 200 + 150 + 0 + 500)  = 1050 EUR cents → ~1.51M millisats at 69420 rate
+        // Sanity check: well above zero and below 10_000_000 (10k sats)
+        assert!(
+            payment.amount > 0 && payment.amount < 10_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
@@ -2084,7 +2155,20 @@ mod tests {
         }
         let prov = make_provisioner_with_rates(db).await?;
         let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
-        // subscription_id checked implicitly via renew();
+
+        assert_eq!(payment.currency, "BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(payment.time_value.unwrap() > 0);
+        // cost_plan amount=132 EUR cents at rate 69420 EUR/BTC → ~1,902 millisats
+        // Sanity: > 0 and well under 1 billion millisats
+        assert!(
+            payment.amount > 0 && payment.amount < 1_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
@@ -2100,7 +2184,18 @@ mod tests {
         }
         let prov = make_provisioner_with_rates(db).await?;
         let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
-        // subscription_id checked implicitly via renew();
+
+        assert_eq!(payment.currency, "BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(payment.time_value.unwrap() > 0);
+        assert!(
+            payment.amount > 0 && payment.amount < 1_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
@@ -2183,7 +2278,21 @@ mod tests {
             .await?;
         let prov = make_provisioner_with_rates(db).await?;
         let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
-        // subscription_id checked implicitly via renew();
+
+        assert_eq!(payment.currency, "BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(payment.time_value.unwrap() > 0);
+        // Custom pricing: cpu=2@100 + mem=4GB@50 + ip4@200 + disk=50GB@10*5 = 200+200+200+0+500
+        // = 1100 EUR cents at rate 69420 → ~1.59M millisats
+        // Sanity: > 0 and well under 1 billion millisats
+        assert!(
+            payment.amount > 0 && payment.amount < 1_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
