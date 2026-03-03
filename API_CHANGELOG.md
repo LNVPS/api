@@ -6,7 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **2026-03-03** - VM upgrade no longer leaves subscription renewal cost stale
+  - `POST /api/v1/vm/{id}/upgrade` — After payment confirmation, `SubscriptionLineItem.amount` is now updated to the new base-currency cost of the upgraded template for both standard→custom and custom→custom upgrade paths
+  - `GET /api/v1/subscriptions/{id}` and admin equivalents — `line_items[].price` now reflects the post-upgrade renewal cost immediately after an upgrade completes
+
+- **2026-03-03** - Migration tool no longer marks subscriptions active for deleted VMs
+  - `migrate_vm_subscriptions` — Subscriptions created for deleted VMs are now inserted with `is_active = false`
+
 ### Changed
+
+- **2026-03-03** - Admin subscription list now returns results in descending order
+  - `GET /api/admin/v1/subscriptions` — Results ordered by `id DESC` (newest first); applies to both the all-subscriptions list and the `?user_id=N` filtered list
+
+- **2026-03-03** - Admin VM info response now includes subscription details
+  - `GET /api/admin/v1/vms/{id}` — Response now includes a `subscription` object with the full `AdminSubscriptionInfo` (id, status, interval, currency, line items, payment count); omitted if no subscription is linked
+
+- **2026-03-03** - Admin subscription payment response now includes `company_base_currency`
+  - `GET /api/admin/v1/subscriptions/{id}/payments` — Each payment now includes `company_base_currency`
+  - `GET /api/admin/v1/subscription_payments/{id}` — Response now includes `company_base_currency`
+  - `POST /api/admin/v1/subscription_payments/{id}/complete` — Response now includes `company_base_currency`
 
 - **2026-03-03** - VM payments now use the unified `subscription_payment` table
   - All VM renewal, purchase, and upgrade payments are now stored in `subscription_payment` instead of `vm_payment`
