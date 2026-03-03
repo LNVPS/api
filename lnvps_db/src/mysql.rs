@@ -795,6 +795,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_pending_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT sp.* FROM subscription_payment sp \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ? AND sp.is_paid = 0 AND sp.expires > NOW() \
+             ORDER BY sp.created DESC",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn list_vm_subscription_payments_paginated(
         &self,
         vm_id: u64,

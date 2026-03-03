@@ -250,14 +250,13 @@ impl PricingEngine {
             self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
-        // Check for an existing unpaid renewal payment for this VM's subscription.
-        // We match on subscription_id + payment_method + payment_type only — matching
-        // on time_value is unreliable because time_value is computed from vm.expires,
-        // which advances after each confirmed payment.
-        let payments = self.db.list_vm_subscription_payments(vm.id).await?;
-        if let Some(px) = payments.into_iter().find(|p| {
-            !p.is_paid
-                && p.payment_method == method
+        // Check for an existing pending (unpaid, non-expired) renewal payment.
+        // We match on payment_method + payment_type only — matching on time_value is
+        // unreliable because time_value is computed from vm.expires, which advances
+        // after each confirmed payment.
+        let pending = self.db.list_pending_vm_subscription_payments(vm.id).await?;
+        if let Some(px) = pending.into_iter().find(|p| {
+            p.payment_method == method
                 && p.payment_type == SubscriptionPaymentType::Renewal
         }) {
             return Ok(CostResult::Existing(px));
@@ -2148,6 +2147,104 @@ mod tests {
             result.is_err(),
             "Should not find pricing when template lacks required features"
         );
+        Ok(())
+    }
+
+    /// Build a minimal PricingEngine backed by MockDb with the BTC/EUR rate set.
+    async fn make_pe(db: Arc<dyn LNVpsDb>) -> PricingEngine {
+        let rates = Arc::new(MockExchangeRate::new());
+        rates
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), MOCK_RATE)
+            .await;
+        PricingEngine::new(db, rates as Arc<dyn ExchangeRateService>, HashMap::new(), Currency::EUR)
+    }
+
+    /// get_vm_cost_for_intervals returns CostResult::Existing when a valid (non-expired)
+    /// unpaid renewal payment already exists for the VM.
+    #[tokio::test]
+    async fn test_get_vm_cost_dedup_reuses_valid_unpaid_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.users.lock().await.insert(1, User { id: 1, pubkey: vec![], ..Default::default() });
+
+        // Insert an existing unpaid renewal payment that has not yet expired
+        let existing = SubscriptionPayment {
+            id: vec![0xabu8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::minutes(10), // still valid
+            amount: 9999,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "lnbc_test".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: MOCK_RATE,
+            time_value: Some(86400),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        };
+        db.insert_subscription_payment(&existing).await?;
+
+        let db_arc: Arc<dyn LNVpsDb> = db;
+        let pe = make_pe(db_arc).await;
+        let result = pe.get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1).await?;
+
+        match result {
+            CostResult::Existing(p) => {
+                assert_eq!(p.id, existing.id, "should return the pre-existing payment");
+            }
+            CostResult::New(_) => bail!("expected Existing, got New"),
+        }
+        Ok(())
+    }
+
+    /// get_vm_cost_for_intervals returns CostResult::New when the only existing unpaid
+    /// renewal payment has an expired invoice, rather than returning the stale payment.
+    #[tokio::test]
+    async fn test_get_vm_cost_dedup_ignores_expired_unpaid_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.users.lock().await.insert(1, User { id: 1, pubkey: vec![], ..Default::default() });
+
+        // Insert an unpaid renewal payment whose invoice has already expired
+        let expired = SubscriptionPayment {
+            id: vec![0xddu8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now() - chrono::Duration::hours(1),
+            expires: Utc::now() - chrono::Duration::minutes(1), // expired
+            amount: 9999,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "lnbc_expired".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: MOCK_RATE,
+            time_value: Some(86400),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        };
+        db.insert_subscription_payment(&expired).await?;
+
+        let db_arc: Arc<dyn LNVpsDb> = db;
+        let pe = make_pe(db_arc).await;
+        let result = pe.get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1).await?;
+
+        match result {
+            CostResult::New(p) => {
+                assert_ne!(p.amount, 9999, "should compute a fresh amount, not the expired one");
+                assert!(p.time_value > 0, "fresh payment must have a time_value");
+            }
+            CostResult::Existing(_) => bail!("expected New, got Existing — expired invoice was reused"),
+        }
         Ok(())
     }
 }

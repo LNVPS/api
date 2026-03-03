@@ -239,6 +239,12 @@ pub trait LNVpsDbBase: Send + Sync {
         vm_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>>;
 
+    /// List unpaid, non-expired subscription payments for a VM
+    async fn list_pending_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
+
     /// List subscription payments for a VM with pagination
     async fn list_vm_subscription_payments_paginated(
         &self,

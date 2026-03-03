@@ -782,6 +782,18 @@ impl LNVpsDbBase for MockDb {
         Ok(result)
     }
 
+    async fn list_pending_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let all = self.list_vm_subscription_payments(vm_id).await?;
+        let now = Utc::now();
+        Ok(all
+            .into_iter()
+            .filter(|p| !p.is_paid && p.expires > now)
+            .collect())
+    }
+
     async fn list_vm_subscription_payments_paginated(
         &self,
         vm_id: u64,

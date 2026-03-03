@@ -105,12 +105,11 @@ impl NodeInvoiceHandler {
             // cancel other pending upgrade payments for this VM
             let other_upgrades = self
                 .db
-                .list_vm_subscription_payments(vm_id)
+                .list_pending_vm_subscription_payments(vm_id)
                 .await?
                 .into_iter()
                 .filter(|p| {
-                    !p.is_paid
-                        && p.payment_type == SubscriptionPaymentType::Upgrade
+                    p.payment_type == SubscriptionPaymentType::Upgrade
                         && p.payment_method == PaymentMethod::Lightning
                         && p.id != payment.id
                 })
