@@ -21,7 +21,7 @@ use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
     NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use nostr_sdk::Timestamp;

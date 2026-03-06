@@ -560,13 +560,12 @@ mod tests {
             ssh_key_id: ssh_key.id,
             template_id: Some(1),
             custom_template_id: None,
+            subscription_line_item_id: 0,
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
-            expires: chrono::Utc::now() + chrono::Duration::days(30),
             created: chrono::Utc::now(),
             ref_code: None,
             deleted: false,
-            auto_renewal_enabled: false,
             disabled: false,
         };
         let vm_id = db.insert_vm(&vm).await?;

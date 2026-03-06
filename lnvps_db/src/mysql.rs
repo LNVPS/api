@@ -1,10 +1,11 @@
 use crate::{
-    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IpRange, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IntervalType, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
+    PaymentType, Referral,
     ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentWithCompany, VmTemplate,
+    VmForMigration, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -28,6 +29,142 @@ impl LNVpsDbMysql {
     pub async fn execute(&self, sql: &str) -> DbResult<()> {
         self.db.execute(sql).await?;
         Ok(())
+    }
+
+    pub fn pool(&self) -> &MySqlPool {
+        &self.db
+    }
+
+    /// List IDs of ALL VMs (including deleted) that have not yet been linked to a subscription
+    /// line item. Used by the data migration tool to avoid decoding nullable
+    /// subscription_line_item_id via the Vm struct (which requires it non-null).
+    pub async fn list_vm_ids_without_subscription(&self) -> DbResult<Vec<u64>> {
+        let rows = sqlx::query(
+            "SELECT id FROM vm \
+             WHERE subscription_line_item_id IS NULL OR subscription_line_item_id = 0",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<u32, _>("id") as u64)
+            .collect())
+    }
+
+    /// Insert a subscription_payment row by copying a vm_payment row verbatim,
+    /// writing external_data as raw bytes (no encrypt/decrypt round-trip).
+    pub async fn insert_subscription_payment_raw(
+        &self,
+        vp: &VmPaymentRaw,
+        subscription_id: u64,
+        user_id: u64,
+        payment_type: u16,
+        time_value: Option<u64>,
+        metadata: Option<&str>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO subscription_payment \
+             (id, subscription_id, user_id, created, expires, amount, currency, \
+              payment_method, payment_type, external_data, external_id, is_paid, rate, \
+              time_value, metadata, tax, processing_fee, paid_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&vp.id)
+        .bind(subscription_id)
+        .bind(user_id)
+        .bind(vp.created)
+        .bind(vp.expires)
+        .bind(vp.amount)
+        .bind(&vp.currency)
+        .bind(vp.payment_method as u16)
+        .bind(payment_type)
+        .bind(&vp.external_data) // raw string — no encryption
+        .bind(&vp.external_id)
+        .bind(vp.is_paid)
+        .bind(vp.rate)
+        .bind(time_value)
+        .bind(metadata)
+        .bind(vp.tax)
+        .bind(vp.processing_fee)
+        .bind(vp.paid_at)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// List the binary ids of all subscription_payments for a subscription.
+    /// Used by the migration tool for idempotency checking without decrypting external_data.
+    pub async fn list_subscription_payment_ids_for_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<Vec<u8>>> {
+        let rows = sqlx::query("SELECT id FROM subscription_payment WHERE subscription_id = ?")
+            .bind(subscription_id)
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<Vec<u8>, _>("id")).collect())
+    }
+
+    /// List VM ids that have vm_payment rows not yet copied to subscription_payment.
+    /// Identifies by id: a vm_payment is considered copied if a subscription_payment
+    /// with the same binary id exists.
+    pub async fn list_vm_ids_with_uncopied_payments(&self) -> DbResult<Vec<u64>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT vp.vm_id FROM vm_payment vp \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM subscription_payment sp WHERE sp.id = vp.id \
+             )",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<u32, _>("vm_id") as u64)
+            .collect())
+    }
+
+    /// List all vm_payment rows for a VM, with external_data as raw String (no decryption).
+    /// Used by the data migration tool to copy rows without needing the encryption key.
+    pub async fn list_vm_payments_for_migration(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<VmPaymentRaw>> {
+        Ok(sqlx::query_as(
+            "SELECT id, vm_id, created, expires, amount, currency, payment_method, payment_type, \
+             external_data, external_id, is_paid, rate, time_value, tax, upgrade_params, \
+             processing_fee, paid_at FROM vm_payment WHERE vm_id = ? ORDER BY created ASC",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    /// Set subscription_line_item_id on a VM by id.
+    /// Used by the data migration tool where full Vm round-trip is not possible.
+    pub async fn set_vm_subscription_line_item(
+        &self,
+        vm_id: u64,
+        subscription_line_item_id: u64,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE vm SET subscription_line_item_id = ? WHERE id = ?")
+            .bind(subscription_line_item_id)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetch a VM row with subscription_line_item_id decoded as Option<u64>.
+    /// Used by the data migration tool where the column may still be NULL.
+    pub async fn get_vm_for_migration(&self, vm_id: u64) -> DbResult<VmForMigration> {
+        Ok(sqlx::query_as(
+            "SELECT id, user_id, template_id, custom_template_id, expires, \
+             auto_renewal_enabled, subscription_line_item_id, deleted \
+             FROM vm WHERE id = ?",
+        )
+        .bind(vm_id)
+        .fetch_one(&self.db)
+        .await?)
     }
 }
 
@@ -447,6 +584,25 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_cost_plans_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCostPlan>, u64)> {
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_cost_plan")
+                .fetch_one(&self.db)
+                .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM vm_cost_plan ORDER BY created DESC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
     async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_cost_plan(name,created,amount,currency,interval_amount,interval_type) values(?,?,?,?,?,?) returning id")
             .bind(&cost_plan.name)
@@ -548,11 +704,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn list_expired_vms(&self) -> DbResult<Vec<Vm>> {
-        Ok(
-            sqlx::query_as("select * from vm where expires > current_timestamp()  and deleted = 0")
-                .fetch_all(&self.db)
-                .await?,
+        // Expired VMs are those whose subscription has expired
+        Ok(sqlx::query_as(
+            "SELECT v.* FROM vm v \
+             INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             INNER JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 0 AND s.expires < NOW()",
         )
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
@@ -572,19 +732,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,ssh_key_id,created,expires,disk_id,mac_address,ref_code,auto_renewal_enabled) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,created,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
+            .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
             .bind(vm.created)
-            .bind(vm.expires)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(&vm.ref_code)
-            .bind(vm.auto_renewal_enabled)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
@@ -600,21 +759,105 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,ssh_key_id=?,expires=?,disk_id=?,mac_address=?,auto_renewal_enabled=?,disabled=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
             .bind(vm.custom_template_id)
+            .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
-            .bind(vm.expires)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
-            .bind(vm.auto_renewal_enabled)
             .bind(vm.disabled)
             .bind(vm.id)
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm WHERE subscription_line_item_id = ? AND deleted = 0")
+                .bind(line_item_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+        Ok(sqlx::query_as(
+            "SELECT v.* FROM vm v \
+             INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             WHERE sli.subscription_id = ? \
+               AND sli.subscription_type IN (3, 4) \
+               AND v.deleted = 0 \
+             LIMIT 1",
+        )
+        .bind(subscription_id)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM vm WHERE subscription_line_item_id = ? AND deleted = 0 LIMIT 1",
+        )
+        .bind(line_item_id)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn list_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT sp.* FROM subscription_payment sp \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ? \
+             ORDER BY sp.created DESC",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_pending_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT sp.* FROM subscription_payment sp \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ? AND sp.is_paid = 0 AND sp.expires > NOW() \
+             ORDER BY sp.created DESC",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_vm_subscription_payments_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT sp.* FROM subscription_payment sp \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ? \
+             ORDER BY sp.created DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(vm_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
@@ -799,12 +1042,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ?")
-            .bind(vm_payment.time_value)
-            .bind(vm_payment.vm_id)
-            .execute(&mut *tx)
-            .await?;
-
         tx.commit().await?;
         Ok(())
     }
@@ -824,6 +1061,57 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_custom_pricing_paginated(
+        &self,
+        region_id: Option<u64>,
+        enabled: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCustomPricing>, u64)> {
+        // Build WHERE clauses dynamically
+        let mut conditions = Vec::new();
+        if region_id.is_some() {
+            conditions.push("region_id = ?");
+        }
+        if enabled.is_some() {
+            conditions.push("enabled = ?");
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM vm_custom_pricing {}", where_clause);
+        let data_sql = format!(
+            "SELECT * FROM vm_custom_pricing {} ORDER BY id DESC LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        // Build and execute count query
+        let mut count_q = sqlx::query_scalar(&count_sql);
+        if let Some(r) = region_id {
+            count_q = count_q.bind(r);
+        }
+        if let Some(e) = enabled {
+            count_q = count_q.bind(e);
+        }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        // Build and execute data query
+        let mut data_q = sqlx::query_as(&data_sql);
+        if let Some(r) = region_id {
+            data_q = data_q.bind(r);
+        }
+        if let Some(e) = enabled {
+            data_q = data_q.bind(e);
+        }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
     }
 
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
@@ -1110,18 +1398,55 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
-        Ok(sqlx::query_as("SELECT * FROM subscription")
+        Ok(sqlx::query_as("SELECT * FROM subscription ORDER BY id DESC")
             .fetch_all(&self.db)
             .await?)
     }
 
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         Ok(
-            sqlx::query_as("SELECT * FROM subscription WHERE user_id = ?")
+            sqlx::query_as("SELECT * FROM subscription WHERE user_id = ? ORDER BY id DESC")
                 .bind(user_id)
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_subscriptions_paginated(
+        &self,
+        user_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)> {
+        let (total, rows) = if let Some(uid) = user_id {
+            let total: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM subscription WHERE user_id = ?")
+                    .bind(uid)
+                    .fetch_one(&self.db)
+                    .await?;
+            let rows = sqlx::query_as(
+                "SELECT * FROM subscription WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(uid)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+            (total, rows)
+        } else {
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription")
+                .fetch_one(&self.db)
+                .await?;
+            let rows = sqlx::query_as(
+                "SELECT * FROM subscription ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+            (total, rows)
+        };
+        Ok((rows, total as u64))
     }
 
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
@@ -1131,6 +1456,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_expiring_subscriptions(
+        &self,
+        within_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription WHERE is_active = 1 AND expires IS NOT NULL \
+             AND expires < DATE_ADD(NOW(), INTERVAL ? SECOND) AND expires > NOW()",
+        )
+        .bind(within_seconds)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription WHERE is_active = 1 AND expires IS NOT NULL \
+             AND expires < NOW()",
+        )
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+        sqlx::query("UPDATE subscription SET is_active = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE ip_range_subscription ips \
+             INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id \
+             SET ips.is_active = 0, ips.ended_at = NOW() \
+             WHERE sli.subscription_id = ? AND ips.ended_at IS NULL",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription> {
@@ -1151,7 +1517,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, is_setup, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
         .bind(subscription.company_id)
@@ -1160,7 +1526,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.created)
         .bind(subscription.expires)
         .bind(subscription.is_active)
+        .bind(subscription.is_setup)
         .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1174,12 +1543,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         subscription: &Subscription,
         mut line_items: Vec<SubscriptionLineItem>,
-    ) -> DbResult<u64> {
+    ) -> DbResult<(u64, Vec<u64>)> {
         let mut tx = self.db.begin().await?;
 
         // Insert subscription
         let res = sqlx::query(
-            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, currency, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription (user_id, company_id, name, description, created, expires, is_active, is_setup, currency, interval_amount, interval_type, setup_fee, auto_renewal_enabled, external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.user_id)
         .bind(subscription.company_id)
@@ -1188,7 +1557,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(subscription.created)
         .bind(subscription.expires)
         .bind(subscription.is_active)
+        .bind(subscription.is_setup)
         .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1196,12 +1568,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?;
 
         let subscription_id = res.last_insert_id();
+        let mut line_item_ids = Vec::with_capacity(line_items.len());
 
         // Insert all line items with the subscription_id
         for line_item in &mut line_items {
             line_item.subscription_id = subscription_id;
 
-            sqlx::query(
+            let li_res = sqlx::query(
                 "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(line_item.subscription_id)
@@ -1213,15 +1586,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&line_item.configuration)
             .execute(&mut *tx)
             .await?;
+
+            line_item_ids.push(li_res.last_insert_id());
         }
 
         tx.commit().await?;
-        Ok(subscription_id)
+        Ok((subscription_id, line_item_ids))
     }
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription SET user_id = ?, company_id = ?, name = ?, description = ?, expires = ?, is_active = ?, currency = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
+            "UPDATE subscription SET user_id = ?, company_id = ?, name = ?, description = ?, expires = ?, is_active = ?, is_setup = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_fee = ?, auto_renewal_enabled = ?, external_id = ? WHERE id = ?"
         )
         .bind(subscription.user_id)
         .bind(subscription.company_id)
@@ -1229,7 +1604,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&subscription.description)
         .bind(subscription.expires)
         .bind(subscription.is_active)
+        .bind(subscription.is_setup)
         .bind(&subscription.currency)
+        .bind(subscription.interval_amount)
+        .bind(subscription.interval_type)
         .bind(subscription.setup_fee)
         .bind(subscription.auto_renewal_enabled)
         .bind(&subscription.external_id)
@@ -1342,11 +1720,36 @@ impl LNVpsDbBase for LNVpsDbMysql {
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>> {
         Ok(
-            sqlx::query_as("SELECT * FROM subscription_payment WHERE subscription_id = ?")
-                .bind(subscription_id)
-                .fetch_all(&self.db)
-                .await?,
+            sqlx::query_as(
+                "SELECT * FROM subscription_payment WHERE subscription_id = ? ORDER BY created DESC",
+            )
+            .bind(subscription_id)
+            .fetch_all(&self.db)
+            .await?,
         )
+    }
+
+    async fn list_subscription_payments_paginated(
+        &self,
+        subscription_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SubscriptionPayment>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscription_payment WHERE subscription_id = ?",
+        )
+        .bind(subscription_id)
+        .fetch_one(&self.db)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE subscription_id = ? ORDER BY created DESC LIMIT ? OFFSET ?",
+        )
+        .bind(subscription_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn list_subscription_payments_by_user(
@@ -1354,10 +1757,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         user_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>> {
         Ok(
-            sqlx::query_as("SELECT * FROM subscription_payment WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_all(&self.db)
-                .await?,
+            sqlx::query_as(
+                "SELECT * FROM subscription_payment WHERE user_id = ? ORDER BY created DESC",
+            )
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await?,
         )
     }
 
@@ -1387,11 +1792,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         id: &Vec<u8>,
     ) -> DbResult<SubscriptionPaymentWithCompany> {
         Ok(sqlx::query_as(
-            "SELECT sp.*, c.base_currency as company_base_currency
+            "SELECT sp.*,
+             c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
+             v.id as vm_id,
+             vh.id as host_id, vh.name as host_name,
+             vhr.id as region_id, vhr.name as region_name
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
-             JOIN users u ON s.user_id = u.id
-             JOIN company c ON u.id = c.id
+             LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
+                 AND sli.subscription_type IN (3, 4)
+             LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
+             LEFT JOIN vm_host vh ON v.host_id = vh.id
+             LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
+                                     THEN vhr.company_id
+                                     ELSE s.user_id END) = c.id
              WHERE sp.id = ?",
         )
         .bind(id)
@@ -1401,7 +1816,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, paid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&payment.id)
         .bind(payment.subscription_id)
@@ -1417,6 +1832,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(payment.is_paid)
         .bind(payment.rate)
         .bind(payment.tax)
+        .bind(payment.processing_fee)
+        .bind(payment.time_value)
+        .bind(&payment.metadata)
         .bind(payment.paid_at)
         .execute(&self.db)
         .await?;
@@ -1426,7 +1844,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription_payment SET subscription_id = ?, user_id = ?, created = ?, expires = ?, amount = ?, currency = ?, payment_method = ?, payment_type = ?, external_data = ?, external_id = ?, is_paid = ?, rate = ?, tax = ? WHERE id = ?"
+            "UPDATE subscription_payment SET subscription_id = ?, user_id = ?, created = ?, expires = ?, amount = ?, currency = ?, payment_method = ?, payment_type = ?, external_data = ?, external_id = ?, is_paid = ?, rate = ?, tax = ?, processing_fee = ?, time_value = ?, metadata = ? WHERE id = ?"
         )
         .bind(payment.subscription_id)
         .bind(payment.user_id)
@@ -1441,6 +1859,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(payment.is_paid)
         .bind(payment.rate)
         .bind(payment.tax)
+        .bind(payment.processing_fee)
+        .bind(payment.time_value)
+        .bind(&payment.metadata)
         .bind(&payment.id)
         .execute(&self.db)
         .await?;
@@ -1457,14 +1878,39 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(tx.as_mut())
             .await?;
 
-        // Subscriptions are always monthly - extend by 30 days and activate
-        sqlx::query(
-            "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL 30 DAY), is_active = 1 WHERE id = ?"
-        )
-        .bind(payment.subscription_id)
-        .execute(&self.db)
-        .await?;
+        if let Some(time_value) = payment.time_value {
+            // Extend subscription.expires by explicit time_value seconds
+            sqlx::query(
+                "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? SECOND), is_active = 1, is_setup = 1 WHERE id = ?",
+            )
+            .bind(time_value)
+            .bind(payment.subscription_id)
+            .execute(tx.as_mut())
+            .await?;
+        } else {
+            // Regular subscription path: read interval from the subscription itself
+            let sub: Subscription =
+                sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
+                    .bind(payment.subscription_id)
+                    .fetch_one(tx.as_mut())
+                    .await?;
+            let interval_sql = match sub.interval_type {
+                IntervalType::Day => "DAY",
+                IntervalType::Month => "MONTH",
+                IntervalType::Year => "YEAR",
+            };
+            let sql = format!(
+                "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? {}), is_active = 1, is_setup = 1 WHERE id = ?",
+                interval_sql
+            );
+            sqlx::query(&sql)
+                .bind(sub.interval_amount)
+                .bind(payment.subscription_id)
+                .execute(tx.as_mut())
+                .await?;
+        }
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1483,6 +1929,52 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_available_ip_space_paginated(
+        &self,
+        is_available: Option<bool>,
+        is_reserved: Option<bool>,
+        registry: Option<u8>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AvailableIpSpace>, u64)> {
+        let mut conditions: Vec<&str> = Vec::new();
+        if is_available.is_some() {
+            conditions.push("is_available = ?");
+        }
+        if is_reserved.is_some() {
+            conditions.push("is_reserved = ?");
+        }
+        if registry.is_some() {
+            conditions.push("registry = ?");
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM available_ip_space {}", where_clause);
+        let data_sql = format!(
+            "SELECT * FROM available_ip_space {} ORDER BY created DESC LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        let mut count_q = sqlx::query_scalar(&count_sql);
+        if let Some(v) = is_available { count_q = count_q.bind(v); }
+        if let Some(v) = is_reserved { count_q = count_q.bind(v); }
+        if let Some(v) = registry { count_q = count_q.bind(v); }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        let mut data_q = sqlx::query_as(&data_sql);
+        if let Some(v) = is_available { data_q = data_q.bind(v); }
+        if let Some(v) = is_reserved { data_q = data_q.bind(v); }
+        if let Some(v) = registry { data_q = data_q.bind(v); }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
     }
 
     async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
@@ -1560,6 +2052,29 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_ip_space_pricing_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpSpacePricing>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ip_space_pricing WHERE available_ip_space_id = ?",
+        )
+        .bind(available_ip_space_id)
+        .fetch_one(&self.db)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM ip_space_pricing WHERE available_ip_space_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(available_ip_space_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing> {
@@ -1666,6 +2181,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_ip_range_subscriptions_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        user_id: Option<u64>,
+        is_active: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpRangeSubscription>, u64)> {
+        let mut extra = String::from("AND ips.available_ip_space_id = ?");
+        if user_id.is_some() {
+            extra.push_str(" AND s.user_id = ?");
+        }
+        if is_active.is_some() {
+            extra.push_str(" AND ips.is_active = ?");
+        }
+
+        let base = "SELECT ips.* FROM ip_range_subscription ips \
+                    INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id \
+                    INNER JOIN subscription s ON sli.subscription_id = s.id \
+                    WHERE 1=1";
+
+        let count_sql = format!("{} {}", base, extra);
+        let data_sql = format!(
+            "{} {} ORDER BY ips.id DESC LIMIT ? OFFSET ?",
+            base, extra
+        );
+
+        let mut count_q = sqlx::query_scalar(&count_sql).bind(available_ip_space_id);
+        if let Some(u) = user_id { count_q = count_q.bind(u); }
+        if let Some(a) = is_active { count_q = count_q.bind(a); }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        let mut data_q = sqlx::query_as(&data_sql).bind(available_ip_space_id);
+        if let Some(u) = user_id { data_q = data_q.bind(u); }
+        if let Some(a) = is_active { data_q = data_q.bind(a); }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
+    }
+
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
         Ok(
             sqlx::query_as("SELECT * FROM ip_range_subscription WHERE id = ?")
@@ -1744,6 +2300,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn list_payment_method_configs_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentMethodConfig>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_method_config")
+            .fetch_one(&self.db)
+            .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM payment_method_config ORDER BY company_id, payment_method, name LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn list_payment_method_configs_for_company(
@@ -1926,23 +2500,26 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as(
             "SELECT v.id as vm_id,
                     v.ref_code,
-                    vp.created,
-                    vp.amount,
-                    vp.currency,
-                    vp.rate,
+                    sp.created,
+                    sp.amount,
+                    sp.currency,
+                    sp.rate,
                     c.base_currency
              FROM vm v
              JOIN (
-                 SELECT vm_id, currency, amount, created, rate,
-                        ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) AS rn
-                 FROM vm_payment
-                 WHERE is_paid = 1
-             ) vp ON v.id = vp.vm_id AND vp.rn = 1
+                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
+                 FROM subscription_payment sp2
+                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+                     AND sli2.subscription_type IN (3, 4)
+                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+                 WHERE sp2.is_paid = 1
+             ) sp ON v.id = sp.vm_id AND sp.rn = 1
              JOIN vm_host vh ON v.host_id = vh.id
              JOIN vm_host_region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
              WHERE v.ref_code = ?
-             ORDER BY vp.created DESC",
+             ORDER BY sp.created DESC",
         )
         .bind(code)
         .fetch_all(&self.db)
@@ -1954,7 +2531,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "SELECT COUNT(*) FROM vm v
              WHERE v.ref_code = ?
                AND NOT EXISTS (
-                   SELECT 1 FROM vm_payment vp WHERE vp.vm_id = v.id AND vp.is_paid = 1
+                   SELECT 1
+                   FROM subscription_payment sp
+                   JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id
+                       AND sli.subscription_type IN (3, 4)
+                   WHERE v.subscription_line_item_id = sli.id AND sp.is_paid = 1
                )",
         )
         .bind(code)
@@ -2281,6 +2862,24 @@ impl AdminDb for LNVpsDbMysql {
             .await?;
 
         Ok(roles)
+    }
+
+    async fn list_roles_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AdminRole>, u64)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_roles")
+            .fetch_one(&self.db)
+            .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM admin_roles ORDER BY is_system_role DESC, name ASC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
     }
 
     async fn update_role(&self, role: &AdminRole) -> DbResult<()> {
@@ -3201,76 +3800,46 @@ impl AdminDb for LNVpsDbMysql {
         Ok(count as u64)
     }
 
-    async fn admin_get_payments_by_date_range(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-    ) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as(
-            "SELECT * FROM vm_payment WHERE created >= ? AND created < ? AND is_paid = true ORDER BY created",
-        )
-        .bind(start_date)
-        .bind(end_date)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
-    async fn admin_get_payments_by_date_range_and_company(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-        company_id: u64,
-    ) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as(
-            "SELECT vp.* FROM vm_payment vp
-             JOIN vm v ON vp.vm_id = v.id
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
-             WHERE vp.created >= ? AND vp.created < ? AND vp.is_paid = true AND vhr.company_id = ?
-             ORDER BY vp.created",
-        )
-        .bind(start_date)
-        .bind(end_date)
-        .bind(company_id)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> DbResult<Vec<VmPaymentWithCompany>> {
+    ) -> DbResult<Vec<SubscriptionPaymentWithCompany>> {
         let mut query = QueryBuilder::new(
-            "SELECT vp.*, 
+            "SELECT sp.*,
              c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
-             v.user_id,
+             v.id as vm_id,
              vh.id as host_id, vh.name as host_name,
              vhr.id as region_id, vhr.name as region_name
-             FROM vm_payment vp
-             JOIN vm v ON vp.vm_id = v.id
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             WHERE vp.created >= ",
+             FROM subscription_payment sp
+             JOIN subscription s ON sp.subscription_id = s.id
+             LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
+                 AND sli.subscription_type IN (3, 4)
+             LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
+             LEFT JOIN vm_host vh ON v.host_id = vh.id
+             LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
+                                     THEN vhr.company_id
+                                     ELSE s.user_id END) = c.id
+             WHERE sp.created >= ",
         );
         query.push_bind(start_date);
-        query.push(" AND vp.created < ");
+        query.push(" AND sp.created < ");
         query.push_bind(end_date);
-        query.push(" AND vp.is_paid = true AND c.id = ");
+        query.push(" AND sp.is_paid = true AND c.id = ");
         query.push_bind(company_id);
 
         if let Some(currency) = currency {
-            query.push(" AND vp.currency = ");
+            query.push(" AND sp.currency = ");
             query.push_bind(currency);
         }
 
-        query.push(" ORDER BY vp.created");
+        query.push(" ORDER BY sp.created");
 
         Ok(query
-            .build_query_as::<VmPaymentWithCompany>()
+            .build_query_as::<SubscriptionPaymentWithCompany>()
             .fetch_all(&self.db)
             .await?)
     }
@@ -3284,31 +3853,34 @@ impl AdminDb for LNVpsDbMysql {
     ) -> DbResult<Vec<ReferralCostUsage>> {
         let mut query = "SELECT v.id as vm_id,
                                 v.ref_code,
-                                vp.created,
-                                vp.amount,
-                                vp.currency,
-                                vp.rate,
+                                sp.created,
+                                sp.amount,
+                                sp.currency,
+                                sp.rate,
                                 c.base_currency
                          FROM vm v
                          JOIN (
-                             SELECT vm_id, currency, amount, created, rate,
-                                    ROW_NUMBER() OVER (PARTITION BY vm_id ORDER BY created ASC) as rn
-                             FROM vm_payment
-                             WHERE is_paid = 1
-                         ) vp ON v.id = vp.vm_id AND vp.rn = 1
+                             SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                                    ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) as rn
+                             FROM subscription_payment sp2
+                             JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+                                 AND sli2.subscription_type IN (3, 4)
+                             JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+                             WHERE sp2.is_paid = 1
+                         ) sp ON v.id = sp.vm_id AND sp.rn = 1
                          JOIN vm_host vh ON v.host_id = vh.id
                          JOIN vm_host_region vhr ON vh.region_id = vhr.id
                          JOIN company c ON vhr.company_id = c.id
-                         WHERE v.ref_code IS NOT NULL 
-                           AND vp.created >= ? 
-                           AND vp.created <= ?
+                         WHERE v.ref_code IS NOT NULL
+                           AND sp.created >= ?
+                           AND sp.created <= ?
                            AND c.id = ?".to_string();
 
         if ref_code.is_some() {
             query.push_str(" AND v.ref_code = ?");
         }
 
-        query.push_str(" ORDER BY vp.created DESC");
+        query.push_str(" ORDER BY sp.created DESC");
 
         let mut db_query = sqlx::query_as(&query)
             .bind(start_date)

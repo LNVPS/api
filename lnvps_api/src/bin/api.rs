@@ -114,9 +114,6 @@ async fn main() -> Result<(), Error> {
     let provisioner = settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
     provisioner.init().await?;
 
-    // run data migrations
-    run_data_migrations(db.clone(), provisioner.clone(), &settings).await?;
-
     let worker = Worker::new(
         db.clone(),
         provisioner.clone(),
@@ -129,7 +126,11 @@ async fn main() -> Result<(), Error> {
     let mode = args.mode.unwrap_or(vec![ExecMode::Worker, ExecMode::Api]);
 
     if mode.contains(&ExecMode::Worker) {
+        // Data migrations touch hosts, ARP tables, DNS, etc. — worker concerns only.
+        run_data_migrations(db.clone(), provisioner.clone(), &settings).await?;
+
         tasks.push(worker.spawn_job_interval(WorkJob::CheckVms, Duration::from_secs(30)));
+        tasks.push(worker.spawn_job_interval(WorkJob::CheckSubscriptions, Duration::from_secs(30)));
         tasks.push(worker.spawn_handler_loop());
 
         // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)

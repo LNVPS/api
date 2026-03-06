@@ -182,6 +182,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all VM cost plans
     async fn list_cost_plans(&self) -> DbResult<Vec<VmCostPlan>>;
 
+    /// List VM cost plans with database-level pagination. Returns (rows, total_count).
+    async fn list_cost_plans_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCostPlan>, u64)>;
+
     /// Insert a new VM cost plan
     async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64>;
 
@@ -226,6 +233,33 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
+
+    /// Get a VM by its subscription line item ID
+    async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
+
+    /// Get a VM by subscription ID — finds the VM(Renewal/Upgrade) line item for the subscription
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm>;
+    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
+
+    /// List subscription payments for a VM (via vm → line_item → subscription)
+    async fn list_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
+
+    /// List unpaid, non-expired subscription payments for a VM
+    async fn list_pending_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
+
+    /// List subscription payments for a VM with pagination
+    async fn list_vm_subscription_payments_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
 
     /// List VM ip assignments
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64>;
@@ -288,6 +322,17 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>>;
+
+    /// List all custom pricing models with optional filters and database-level pagination.
+    /// `region_id = None` returns all regions. `enabled = None` returns all.
+    /// Returns (rows, total_count).
+    async fn list_custom_pricing_paginated(
+        &self,
+        region_id: Option<u64>,
+        enabled: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCustomPricing>, u64)>;
 
     /// Get a custom pricing model
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing>;
@@ -376,15 +421,39 @@ pub trait LNVpsDbBase: Send + Sync {
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>>;
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
+
+    /// List all active subscriptions expiring within `within_seconds` seconds from now.
+    async fn list_expiring_subscriptions(
+        &self,
+        within_seconds: u64,
+    ) -> DbResult<Vec<Subscription>>;
+
+    /// List all active subscriptions that have already expired.
+    async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>>;
+
+    /// Deactivate a subscription: set `is_active = false`.
+    /// Also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows.
+    async fn deactivate_subscription(&self, id: u64) -> DbResult<()>;
+
+    /// List subscriptions with database-level pagination. `user_id = None` returns all users.
+    /// Returns (rows, total_count).
+    async fn list_subscriptions_paginated(
+        &self,
+        user_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)>;
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription>;
     async fn get_subscription_by_ext_id(&self, external_id: &str) -> DbResult<Subscription>;
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64>;
+    /// Insert a subscription with its line items.
+    /// Returns `(subscription_id, line_item_ids)`.
     async fn insert_subscription_with_line_items(
         &self,
         subscription: &Subscription,
         line_items: Vec<SubscriptionLineItem>,
-    ) -> DbResult<u64>;
+    ) -> DbResult<(u64, Vec<u64>)>;
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()>;
     async fn delete_subscription(&self, id: u64) -> DbResult<()>;
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String>;
@@ -408,6 +477,15 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>>;
+
+    /// List subscription payments with database-level pagination. Returns (rows, total_count).
+    async fn list_subscription_payments_paginated(
+        &self,
+        subscription_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SubscriptionPayment>, u64)>;
+
     async fn list_subscription_payments_by_user(
         &self,
         user_id: u64,
@@ -428,6 +506,17 @@ pub trait LNVpsDbBase: Send + Sync {
 
     // Available IP Space
     async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>>;
+
+    /// List available IP spaces with optional filters and database-level pagination.
+    /// Returns (rows, total_count).
+    async fn list_available_ip_space_paginated(
+        &self,
+        is_available: Option<bool>,
+        is_reserved: Option<bool>,
+        registry: Option<u8>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AvailableIpSpace>, u64)>;
     async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace>;
     async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace>;
     async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64>;
@@ -439,6 +528,14 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         available_ip_space_id: u64,
     ) -> DbResult<Vec<IpSpacePricing>>;
+
+    /// List pricing for an IP space with database-level pagination. Returns (rows, total_count).
+    async fn list_ip_space_pricing_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpSpacePricing>, u64)>;
     async fn get_ip_space_pricing(&self, id: u64) -> DbResult<IpSpacePricing>;
     async fn get_ip_space_pricing_by_prefix(
         &self,
@@ -462,6 +559,17 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         user_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>>;
+
+    /// List IP range subscriptions for a given space with optional filters and DB-level pagination.
+    /// Returns (rows, total_count).
+    async fn list_ip_range_subscriptions_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        user_id: Option<u64>,
+        is_active: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpRangeSubscription>, u64)>;
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription>;
     async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription>;
     async fn insert_ip_range_subscription(
@@ -480,6 +588,13 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List all payment method configurations
     async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>>;
+
+    /// List payment method configurations with database-level pagination. Returns (rows, total_count).
+    async fn list_payment_method_configs_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentMethodConfig>, u64)>;
 
     /// List payment method configurations for a company
     async fn list_payment_method_configs_for_company(
@@ -538,11 +653,11 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all payout records for a referral
     async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>>;
 
-    /// List the first paid VM payment per VM that used this referral code.
+    /// List the first paid subscription payment per VM that used this referral code.
     /// This is the basis for computing earned amounts (per currency).
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>>;
 
-    /// Count VMs that used this referral code but have never made a paid payment.
+    /// Count VMs that used this referral code but have never made a paid subscription payment.
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 }
 

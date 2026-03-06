@@ -1,10 +1,11 @@
-use crate::payments::handle_upgrade;
+use crate::payments::complete_payment;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use isocountry::CountryCode;
-use lnvps_api_common::WorkJob;
-use lnvps_api_common::{VmHistoryLogger, WorkCommander};
-use lnvps_db::{LNVpsDb, PaymentMethod, PaymentMethodConfig, PaymentType, ProviderConfig};
+use lnvps_api_common::WorkCommander;
+use lnvps_db::{
+    LNVpsDb, PaymentMethod, PaymentMethodConfig, ProviderConfig, SubscriptionPaymentType,
+};
 use log::{error, info, warn};
 use payments_rs::fiat::{
     RevolutApi, RevolutConfig, RevolutOrderState, RevolutWebhookBody, RevolutWebhookEvent,
@@ -19,7 +20,6 @@ pub struct RevolutPaymentHandler {
     tx: Arc<dyn WorkCommander>,
     public_url: String,
     config_id: u64,
-    vm_history_logger: VmHistoryLogger,
 }
 
 impl RevolutPaymentHandler {
@@ -44,14 +44,12 @@ impl RevolutPaymentHandler {
             public_key: revolut_config.public_key.clone(),
         })?;
 
-        let vm_history_logger = VmHistoryLogger::new(db.clone());
         Ok(Self {
             api,
             public_url: public_url.to_string(),
             config_id: config.id,
             db,
             tx: sender,
-            vm_history_logger,
         })
     }
 
@@ -173,12 +171,12 @@ impl RevolutPaymentHandler {
     }
 
     async fn try_complete_payment(&self, ext_id: &str) -> Result<()> {
-        let mut payment = self.db.get_vm_payment_by_ext_id(ext_id).await?;
+        let mut payment = self
+            .db
+            .get_subscription_payment_by_ext_id(ext_id)
+            .await?;
 
-        // Get VM state before payment processing
-        let vm_before = self.db.get_vm(payment.vm_id).await?;
-
-        // save payment state json into external_data
+        // Verify the Revolut order is completed and store order JSON
         let order = self.api.get_order(ext_id).await?;
         if !matches!(order.state, RevolutOrderState::Completed) {
             error!("Invalid order state {:?}", order);
@@ -186,7 +184,7 @@ impl RevolutPaymentHandler {
         }
         payment.external_data = serde_json::to_string(&order)?.into();
 
-        // check user country matches card country
+        // Update user country from card country if not already set (best-effort)
         if let Some(cc) = order
             .payments
             .and_then(|p| p.first().cloned())
@@ -194,105 +192,59 @@ impl RevolutPaymentHandler {
             .and_then(|p| p.card_country_code)
             .and_then(|c| CountryCode::for_alpha2(&c).ok())
         {
-            let vm = self.db.get_vm(payment.vm_id).await?;
-            let mut user = self.db.get_user(vm.user_id).await?;
-            if user.country_code.is_none() {
-                // update user country code to match card country
-                user.country_code = Some(cc.alpha3().to_string());
-                self.db.update_user(&user).await?;
+            if let Ok(mut user) = self.db.get_user(payment.user_id).await {
+                if user.country_code.is_none() {
+                    user.country_code = Some(cc.alpha3().to_string());
+                    let _ = self.db.update_user(&user).await;
+                }
             }
         }
 
-        self.db.vm_payment_paid(&payment).await?;
+        let db = self.db.clone();
+        let api = self.api.clone();
+        let tx = self.tx.clone();
+        let payment_id = payment.id.clone();
 
-        // Get VM state after payment processing
-        let vm_after = self.db.get_vm(payment.vm_id).await?;
+        complete_payment(&self.db, &payment, tx, "revolut", |paid_payment| {
+            let db = db.clone();
+            let api = api.clone();
+            async move {
+                // Cancel other pending Revolut upgrade orders for this subscription
+                let vm = db.get_vm_by_subscription(paid_payment.subscription_id).await?;
+                let other_upgrades = db
+                    .list_pending_vm_subscription_payments(vm.id)
+                    .await?
+                    .into_iter()
+                    .filter(|p| {
+                        p.payment_type == SubscriptionPaymentType::Upgrade
+                            && p.payment_method == PaymentMethod::Revolut
+                            && p.id != payment_id
+                    })
+                    .collect::<Vec<_>>();
 
-        // Log payment received in VM history
-        let payment_metadata = serde_json::json!({
-            "external_id": ext_id,
-            "payment_method": "revolut"
-        });
-
-        if let Err(e) = self
-            .vm_history_logger
-            .log_vm_payment_received(
-                payment.vm_id,
-                payment.amount + payment.tax + payment.processing_fee,
-                &payment.currency,
-                payment.time_value,
-                Some(payment_metadata),
-            )
-            .await
-        {
-            warn!("Failed to log payment for VM {}: {}", payment.vm_id, e);
-        }
-
-        // Log VM renewal if this extends the expiration
-        if payment.time_value > 0
-            && let Err(e) = self
-                .vm_history_logger
-                .log_vm_renewed(
-                    payment.vm_id,
-                    None,
-                    vm_before.expires,
-                    vm_after.expires,
-                    Some(payment.amount + payment.tax + payment.processing_fee),
-                    Some(&payment.currency),
-                    Some(serde_json::json!({
-                        "time_added_seconds": payment.time_value,
-                        "external_id": ext_id
-                    })),
-                )
-                .await
-        {
-            warn!("Failed to log VM {} renewal: {}", payment.vm_id, e);
-        }
-
-        // Handle upgrade payments differently - trigger upgrade processing instead of just checking VM
-        if payment.payment_type == lnvps_db::PaymentType::Upgrade {
-            handle_upgrade(&payment, &self.tx, self.db.clone()).await?;
-
-            // cancel other upgrade payments
-            let other_upgrades = self
-                .db
-                .list_vm_payment_by_method_and_type(
-                    payment.vm_id,
-                    PaymentMethod::Revolut,
-                    PaymentType::Upgrade,
-                )
-                .await?;
-            for mut ugp in other_upgrades {
-                if ugp.id == payment.id {
-                    continue;
-                }
-
-                ugp.expires = Utc::now();
-                let hex_id = hex::encode(&ugp.id);
-                if let Some(ext_id) = ugp.external_id.as_ref() {
-                    if let Err(e) = self.api.cancel_order(ext_id).await {
-                        warn!("Failed to cancel order {}: {}", hex_id, e);
+                for ugp in other_upgrades {
+                    let hex_id = hex::encode(&ugp.id);
+                    if let Some(eid) = ugp.external_id.as_ref() {
+                        if let Err(e) = api.cancel_order(eid).await {
+                            warn!("Failed to cancel order {}: {}", hex_id, e);
+                        }
+                    } else {
+                        warn!("External id does not exist on fiat payment: {}", hex_id);
                     }
-                } else {
-                    warn!("External id does not exist on fiat payment: {}", hex_id);
+                    let mut expired = ugp;
+                    expired.expires = Utc::now();
+                    if let Err(e) = db.update_subscription_payment(&expired).await {
+                        warn!("Failed to update payment {}: {}", hex_id, e);
+                    }
                 }
-                if let Err(e) = self.db.update_vm_payment(&ugp).await {
-                    warn!("Failed to update invoice {}: {}", hex_id, e);
-                }
+                Ok(())
             }
-        } else {
-            // Regular renewal payment - just check the VM
-            self.tx
-                .send(WorkJob::CheckVm {
-                    vm_id: payment.vm_id,
-                })
-                .await?;
-        }
+        })
+        .await?;
 
         info!(
-            "VM payment {} for {}, paid",
-            hex::encode(payment.id),
-            payment.vm_id
+            "Subscription payment {} paid via Revolut",
+            hex::encode(&payment.id)
         );
         Ok(())
     }

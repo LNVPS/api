@@ -28,7 +28,20 @@ impl DataMigration for Ip6InitDataMigration {
             let net = NetworkProvisioner::new(db.clone());
             let vms = db.list_vms().await?;
             for vm in vms {
-                if vm.expires < Utc::now() {
+                // Skip expired VMs — check subscription expiry
+                let sub_active = db
+                    .get_subscription_line_item(vm.subscription_line_item_id)
+                    .await
+                    .ok()
+                    .and_then(|li| Some(li.subscription_id));
+                let sub_active = if let Some(sub_id) = sub_active {
+                    db.get_subscription(sub_id).await
+                        .map(|s| s.expires.map(|e| e > Utc::now()).unwrap_or(false))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !sub_active {
                     continue;
                 }
                 // skip VM with no assigned mac

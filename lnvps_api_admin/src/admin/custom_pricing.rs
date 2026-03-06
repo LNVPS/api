@@ -124,37 +124,10 @@ async fn admin_list_custom_pricing(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    // For now, get all and filter manually - ideally this would be done in the database
-    let all_regions = if let Some(region_id) = params.region_id {
-        vec![region_id]
-    } else {
-        this.db
-            .list_host_region()
-            .await?
-            .into_iter()
-            .map(|r| r.id)
-            .collect()
-    };
-
-    let mut all_pricing = Vec::new();
-    for region in all_regions {
-        let region_pricing = this.db.list_custom_pricing(region).await?;
-        all_pricing.extend(region_pricing);
-    }
-
-    // Apply enabled filter if provided
-    if let Some(enabled_filter) = params.enabled {
-        all_pricing.retain(|p| p.enabled == enabled_filter);
-    }
-
-    let total = all_pricing.len() as u64;
-
-    // Apply pagination
-    let paginated_pricing: Vec<_> = all_pricing
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    let (paginated_pricing, total) = this
+        .db
+        .list_custom_pricing_paginated(params.region_id, params.enabled, limit, offset)
+        .await?;
 
     let mut pricing_infos = Vec::new();
     for pricing in paginated_pricing {

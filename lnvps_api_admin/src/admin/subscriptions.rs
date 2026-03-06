@@ -8,7 +8,7 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -109,19 +109,10 @@ async fn admin_list_subscriptions(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let all_subscriptions = if let Some(uid) = params.user_id {
-        this.db.list_subscriptions_by_user(uid).await?
-    } else {
-        this.db.list_subscriptions().await?
-    };
-
-    let total = all_subscriptions.len() as u64;
-
-    let subscriptions = all_subscriptions
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect::<Vec<_>>();
+    let (subscriptions, total) = this
+        .db
+        .list_subscriptions_paginated(params.user_id, limit, offset)
+        .await?;
 
     let mut subscription_infos = Vec::new();
     for subscription in subscriptions {
@@ -372,17 +363,19 @@ async fn admin_list_subscription_payments(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    // Verify subscription exists
-    let _subscription = this.db.get_subscription(subscription_id).await?;
+    // Verify subscription exists and fetch company base currency
+    let subscription = this.db.get_subscription(subscription_id).await?;
+    let company = this.db.get_company(subscription.company_id).await?;
+    let base_currency = company.base_currency;
 
-    let all_payments = this.db.list_subscription_payments(subscription_id).await?;
-    let total = all_payments.len() as u64;
+    let (page, total) = this
+        .db
+        .list_subscription_payments_paginated(subscription_id, limit, offset)
+        .await?;
 
-    let payments: Vec<AdminSubscriptionPaymentInfo> = all_payments
+    let payments: Vec<AdminSubscriptionPaymentInfo> = page
         .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .map(AdminSubscriptionPaymentInfo::from)
+        .map(|p| AdminSubscriptionPaymentInfo::new(p, base_currency.clone()))
         .collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
@@ -398,8 +391,8 @@ async fn admin_get_subscription_payment(
 
     let payment_id = hex::decode(&id).map_err(|_| anyhow::anyhow!("Invalid payment ID format"))?;
 
-    let payment = this.db.get_subscription_payment(&payment_id).await?;
-    ApiData::ok(AdminSubscriptionPaymentInfo::from(payment))
+    let payment = this.db.get_subscription_payment_with_company(&payment_id).await?;
+    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(payment))
 }
 
 /// Manually mark a subscription payment as paid (admin override).
@@ -430,7 +423,16 @@ async fn admin_complete_subscription_payment(
         payment.subscription_id
     );
 
-    // Re-read the payment to get updated state
-    let updated = this.db.get_subscription_payment(&payment_id).await?;
-    ApiData::ok(AdminSubscriptionPaymentInfo::from(updated))
+    // Dispatch CheckSubscriptions so the lifecycle worker picks up the new expiry
+    if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {
+        log::error!(
+            "Payment completed but failed to dispatch CheckSubscriptions for subscription {}: {}",
+            payment.subscription_id,
+            e
+        );
+    }
+
+    // Re-read the payment to get updated state (with company info)
+    let updated = this.db.get_subscription_payment_with_company(&payment_id).await?;
+    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated))
 }

@@ -8,7 +8,7 @@ use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
 };
-use lnvps_db::{PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
+use lnvps_db::{IntervalType, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
 use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
@@ -44,15 +44,10 @@ async fn v1_list_subscriptions(
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
 
-    let all_subscriptions = this.db.list_subscriptions_by_user(uid).await?;
-    let total = all_subscriptions.len() as u64;
+    let (page, total) = this.db.list_subscriptions_paginated(Some(uid), limit, offset).await?;
 
     let mut subscriptions = Vec::new();
-    for subscription in all_subscriptions
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-    {
+    for subscription in page {
         subscriptions
             .push(ApiSubscription::from_subscription(this.db.as_ref(), subscription).await?);
     }
@@ -98,15 +93,13 @@ pub async fn v1_list_subscription_payments(
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
 
-    let all_payments = this.db.list_subscription_payments(id).await?;
-    let total = all_payments.len() as u64;
+    let (page, total) = this
+        .db
+        .list_subscription_payments_paginated(id, limit, offset)
+        .await?;
 
-    let payments: Vec<ApiSubscriptionPayment> = all_payments
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .map(ApiSubscriptionPayment::from)
-        .collect();
+    let payments: Vec<ApiSubscriptionPayment> =
+        page.into_iter().map(ApiSubscriptionPayment::from).collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
 }
@@ -212,7 +205,7 @@ async fn v1_create_subscription(
     let company_id = derived_company_id
         .ok_or_else(|| anyhow::anyhow!("Could not determine company from line items"))?;
 
-    // Create the subscription (always monthly interval)
+    // Create the subscription (always monthly interval for IP/ASN/DNS subscriptions)
     let subscription = Subscription {
         id: 0, // Will be set by database
         user_id: uid,
@@ -222,7 +215,10 @@ async fn v1_create_subscription(
         created: Utc::now(),
         expires: None,    // Will be set after first payment
         is_active: false, // Inactive until first payment
+        is_setup: false,  // Set to true once purchase payment is confirmed
         currency,
+        interval_amount: 1,
+        interval_type: IntervalType::Month,
         setup_fee: total_setup_fee,
         auto_renewal_enabled: auto_renewal,
         external_id: None,
@@ -235,7 +231,7 @@ async fn v1_create_subscription(
             |(name, description, amount, setup_amount, subscription_type, configuration)| {
                 SubscriptionLineItem {
                     id: 0,
-                    subscription_id: 0, // Will be set below
+                    subscription_id: 0, // Will be set by insert
                     subscription_type,
                     name,
                     description,
@@ -248,7 +244,7 @@ async fn v1_create_subscription(
         .collect();
 
     // Insert subscription and line items in a single transaction
-    let subscription_id = this
+    let (subscription_id, _line_item_ids) = this
         .db
         .insert_subscription_with_line_items(&subscription, line_items)
         .await?;
@@ -292,7 +288,7 @@ async fn v1_renew_subscription(
     // Generate payment via provisioner
     let payment = this
         .provisioner
-        .renew_subscription(id, method)
+        .renew_subscription(id, method, 1)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
 

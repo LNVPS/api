@@ -33,6 +33,13 @@ pub trait AdminDb: Send + Sync {
     /// List all roles
     async fn list_roles(&self) -> DbResult<Vec<AdminRole>>;
 
+    /// List roles with database-level pagination. Returns (rows, total_count).
+    async fn list_roles_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AdminRole>, u64)>;
+
     /// Update role information
     async fn update_role(&self, role: &AdminRole) -> DbResult<()>;
 
@@ -203,29 +210,14 @@ pub trait AdminDb: Send + Sync {
     /// Count regions assigned to a company
     async fn admin_count_company_regions(&self, company_id: u64) -> DbResult<u64>;
 
-    /// Get payments within a date range (admin only)
-    async fn admin_get_payments_by_date_range(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-    ) -> DbResult<Vec<crate::VmPayment>>;
-
-    /// Get payments within a date range for a specific company (admin only)
-    async fn admin_get_payments_by_date_range_and_company(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-        company_id: u64,
-    ) -> DbResult<Vec<crate::VmPayment>>;
-
-    /// Get payments with company and currency info for time-series reporting
+    /// Get subscription payments with company and currency info for time-series reporting
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> DbResult<Vec<crate::VmPaymentWithCompany>>;
+    ) -> DbResult<Vec<crate::SubscriptionPaymentWithCompany>>;
 
     /// Get referral cost usage report within date range for a specific company
     async fn admin_get_referral_usage_by_date_range(

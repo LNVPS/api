@@ -35,15 +35,13 @@ async fn admin_list_payment_methods(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let all_configs = this.db.list_payment_method_configs().await?;
-    let total = all_configs.len() as u64;
+    let (page, total) = this
+        .db
+        .list_payment_method_configs_paginated(limit, offset)
+        .await?;
 
-    let configs: Vec<AdminPaymentMethodConfigInfo> = all_configs
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .map(AdminPaymentMethodConfigInfo::from)
-        .collect();
+    let configs: Vec<AdminPaymentMethodConfigInfo> =
+        page.into_iter().map(AdminPaymentMethodConfigInfo::from).collect();
 
     ApiPaginatedData::ok(configs, total, limit, offset)
 }

@@ -4,8 +4,9 @@ use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, LNVpsDb, PaymentMethod, PaymentType, Vm,
-    VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomTemplate, VmPayment,
+    CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
+    PaymentType, SubscriptionPayment, SubscriptionPaymentType, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomTemplate, VmPayment,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
@@ -65,15 +66,23 @@ pub struct PricingEngine {
 impl PricingEngine {
     /// Convert cost plan interval to seconds
     fn cost_plan_interval_to_seconds(
-        interval_type: VmCostPlanIntervalType,
+        interval_type: IntervalType,
         interval_amount: u64,
     ) -> i64 {
         let base_seconds = match interval_type {
-            VmCostPlanIntervalType::Day => 24 * 60 * 60, // 86,400 seconds per day
-            VmCostPlanIntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
-            VmCostPlanIntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
+            IntervalType::Day => 24 * 60 * 60, // 86,400 seconds per day
+            IntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
+            IntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
         };
         base_seconds * interval_amount as i64
+    }
+
+    /// Get the authoritative expiry for a VM from its subscription.
+    /// Returns `None` if the subscription has never been paid.
+    async fn vm_subscription_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
+        let li = self.db.get_subscription_line_item(vm.subscription_line_item_id).await.ok()?;
+        let sub = self.db.get_subscription(li.subscription_id).await.ok()?;
+        sub.expires
     }
 
     /// Calculate processing fee for a payment based on payment method and amount
@@ -213,11 +222,12 @@ impl PricingEngine {
         let new_time = (cost.time_value as f64 * scale).floor() as u64;
         ensure!(new_time > 0, "Extend time is less than 1 second");
 
+        let vm_expires = self.vm_subscription_expires(&vm).await.unwrap_or_else(Utc::now);
         Ok(CostResult::New(NewPaymentInfo {
             amount: input.value(),
             currency: cost.currency,
             time_value: new_time,
-            new_expiry: vm.expires.add(TimeDelta::seconds(new_time as i64)),
+            new_expiry: vm_expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
             tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
             processing_fee: self
@@ -249,26 +259,25 @@ impl PricingEngine {
             self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
-        let expected_time_value = base_cost.time_value * intervals as u64;
-
-        // Check for existing payment with matching time value
-        let payments = self
-            .db
-            .list_vm_payment_by_method_and_type(vm.id, method, PaymentType::Renewal)
-            .await?;
-        if let Some(px) = payments
-            .into_iter()
-            .find(|p| p.time_value == expected_time_value)
-        {
+        // Check for an existing pending (unpaid, non-expired) renewal payment.
+        // We match on payment_method + payment_type only — matching on time_value is
+        // unreliable because time_value is computed from vm.expires, which advances
+        // after each confirmed payment.
+        let pending = self.db.list_pending_vm_subscription_payments(vm.id).await?;
+        if let Some(px) = pending.into_iter().find(|p| {
+            p.payment_method == method
+                && p.payment_type == SubscriptionPaymentType::Renewal
+        }) {
             return Ok(CostResult::Existing(px));
         }
 
         // Scale the cost by number of intervals
+        let base = self.vm_subscription_expires(&vm).await.unwrap_or_else(Utc::now).max(Utc::now());
         if intervals == 1 {
             Ok(CostResult::New(base_cost))
         } else {
             let scaled_amount = base_cost.amount * intervals as u64;
-            let scaled_time = expected_time_value;
+            let scaled_time = base_cost.time_value * intervals as u64;
             let scaled_tax = self.get_tax_for_user(vm.user_id, scaled_amount).await?;
             let processing_fee = self
                 .calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount)
@@ -280,7 +289,7 @@ impl PricingEngine {
                 currency: base_cost.currency,
                 rate: base_cost.rate,
                 time_value: scaled_time,
-                new_expiry: vm.expires.add(TimeDelta::seconds(scaled_time as i64)),
+                new_expiry: base.add(TimeDelta::seconds(scaled_time as i64)),
             }))
         }
     }
@@ -359,8 +368,9 @@ impl PricingEngine {
         let template = self.db.get_custom_vm_template(template_id).await?;
         let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
 
-        // custom templates are always 1-month intervals
-        let time_value = (vm.expires.add(Months::new(1)) - vm.expires).num_seconds() as u64;
+        // custom templates are always 1-month intervals; clamp base to now for expired VMs
+        let base = self.vm_subscription_expires(vm).await.unwrap_or_else(Utc::now).max(Utc::now());
+        let time_value = (base.add(Months::new(1)) - base).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
                 CurrencyAmount::from_u64(price.currency, price.total()),
@@ -383,7 +393,7 @@ impl PricingEngine {
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
-            new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
+            new_expiry: base.add(TimeDelta::seconds(time_value as i64)),
         })
     }
 
@@ -419,18 +429,16 @@ impl PricingEngine {
         }
     }
 
-    pub fn next_template_expire(vm: &Vm, cost_plan: &VmCostPlan) -> u64 {
+    pub fn next_template_expire(base_expiry: DateTime<Utc>, cost_plan: &VmCostPlan) -> u64 {
+        // Clamp the base to now so expired VMs get a sensible time_value
+        let base = base_expiry.max(Utc::now());
         let next_expire = match cost_plan.interval_type {
-            VmCostPlanIntervalType::Day => vm.expires.add(Days::new(cost_plan.interval_amount)),
-            VmCostPlanIntervalType::Month => vm
-                .expires
-                .add(Months::new(cost_plan.interval_amount as u32)),
-            VmCostPlanIntervalType::Year => vm
-                .expires
-                .add(Months::new((12 * cost_plan.interval_amount) as u32)),
+            IntervalType::Day => base.add(Days::new(cost_plan.interval_amount)),
+            IntervalType::Month => base.add(Months::new(cost_plan.interval_amount as u32)),
+            IntervalType::Year => base.add(Months::new((12 * cost_plan.interval_amount) as u32)),
         };
 
-        (next_expire - vm.expires).num_seconds() as u64
+        (next_expire - base).num_seconds() as u64
     }
 
     /// Gets the renewal cost of a standard VM
@@ -452,7 +460,9 @@ impl PricingEngine {
         let converted_amount = self
             .get_amount_and_rate(CurrencyAmount::from_u64(currency, cost_plan.amount), method)
             .await?;
-        let time_value = Self::next_template_expire(vm, &cost_plan);
+        let vm_expires = self.vm_subscription_expires(vm).await.unwrap_or_else(Utc::now);
+        let time_value = Self::next_template_expire(vm_expires, &cost_plan);
+        let base = vm_expires.max(Utc::now());
         Ok(NewPaymentInfo {
             amount: converted_amount.amount.value(),
             tax: self
@@ -469,7 +479,7 @@ impl PricingEngine {
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
-            new_expiry: vm.expires.add(TimeDelta::seconds(time_value as i64)),
+            new_expiry: base.add(TimeDelta::seconds(time_value as i64)),
         })
     }
 
@@ -632,8 +642,10 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
 
         ensure!(!vm.deleted, "Can't calculate for deleted VM");
+        let vm_expires = self.vm_subscription_expires(&vm).await
+            .ok_or_else(|| anyhow!("VM subscription has no expiry date"))?;
         ensure!(
-            vm.expires > from_date,
+            vm_expires > from_date,
             "Can't calculate for expired VM from the specified date"
         );
 
@@ -658,7 +670,7 @@ impl PricingEngine {
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
             let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
-            let time_value = Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
+            let time_value = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
             (
                 CurrencyAmount::from_u64(price.currency, price.total()),
                 time_value,
@@ -667,7 +679,7 @@ impl PricingEngine {
             bail!("VM must have either a standard template or custom template");
         };
 
-        let seconds_remaining = (vm.expires - from_date).num_seconds();
+        let seconds_remaining = (vm_expires - from_date).num_seconds();
         let cost_per_second = current_cost.value() as f64 / current_time_value as f64;
         let prorated_amount = seconds_remaining as f64 * cost_per_second;
         let prorated_cost =
@@ -708,7 +720,9 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
 
         ensure!(!vm.deleted, "Can't upgrade deleted VM");
-        ensure!(vm.expires > Utc::now(), "Can't upgrade an expired VM");
+        let vm_expires = self.vm_subscription_expires(&vm).await
+            .ok_or_else(|| anyhow!("VM subscription has no expiry date"))?;
+        ensure!(vm_expires > Utc::now(), "Can't upgrade an expired VM");
 
         // Get remaining time info for current VM
         let remaining_info = self.get_remaining_time_info(vm_id).await?;
@@ -723,7 +737,7 @@ impl PricingEngine {
 
         // Get the time value for the custom template
         let custom_plan_seconds =
-            Self::cost_plan_interval_to_seconds(VmCostPlanIntervalType::Month, 1);
+            Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
         let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
 
         // calculate the cost based on the time until the vm expires
@@ -783,8 +797,8 @@ impl PricingEngine {
 
 #[derive(Clone)]
 pub enum CostResult {
-    /// An existing payment already exists and should be used
-    Existing(VmPayment),
+    /// An existing unpaid subscription payment already exists and should be reused
+    Existing(SubscriptionPayment),
     /// A new payment can be created with the specified amount
     New(NewPaymentInfo),
 }
@@ -1174,8 +1188,7 @@ mod tests {
         let amount_eur = plan.amount as f64 / 100.0; // Convert cents to EUR
         let mo_price = (amount_eur / MOCK_RATE as f64 * 1.0e11) as u64;
         let time_scale = 1000f64 / mo_price as f64;
-        let vm = db.get_vm(1).await?;
-        let next_expire = PricingEngine::next_template_expire(&vm, &plan);
+        let next_expire = PricingEngine::next_template_expire(Utc::now(), &plan);
         match price {
             CostResult::New(payment_info) => {
                 let expect_time = (next_expire as f64 * time_scale) as u64;
@@ -1304,7 +1317,14 @@ mod tests {
         // Setup test data
         setup_upgrade_test_data(&db).await?;
 
-        // Create a VM with a standard template
+        // Create a VM with a standard template; set subscription expiry to 15 days
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(15));
+                s.is_setup = true;
+            }
+        }
         {
             let mut vms = db.vms.lock().await;
             vms.insert(
@@ -1312,7 +1332,6 @@ mod tests {
                 Vm {
                     id: 1,
                     user_id: 1,
-                    expires: Utc::now() + chrono::Duration::days(15), // 15 days remaining
                     template_id: Some(1),
                     custom_template_id: None,
                     deleted: false,
@@ -1357,13 +1376,19 @@ mod tests {
 
         // Create an expired VM
         {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() - chrono::Duration::days(1)); // Expired
+                s.is_setup = true;
+            }
+        }
+        {
             let mut vms = db.vms.lock().await;
             vms.insert(
                 1,
                 Vm {
                     id: 1,
                     user_id: 1,
-                    expires: Utc::now() - chrono::Duration::days(1), // Expired
                     template_id: Some(1),
                     custom_template_id: None,
                     deleted: false,
@@ -1399,7 +1424,14 @@ mod tests {
 
         setup_upgrade_test_data(&db).await?;
 
-        // Create a deleted VM
+        // Create a deleted VM; set subscription expiry
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(15));
+                s.is_setup = true;
+            }
+        }
         {
             let mut vms = db.vms.lock().await;
             vms.insert(
@@ -1407,7 +1439,6 @@ mod tests {
                 Vm {
                     id: 1,
                     user_id: 1,
-                    expires: Utc::now() + chrono::Duration::days(15),
                     template_id: Some(1),
                     custom_template_id: None,
                     deleted: true, // Deleted
@@ -1444,7 +1475,14 @@ mod tests {
         setup_upgrade_test_data(&db).await?;
         add_custom_pricing(&db).await;
 
-        // Create a VM with a custom template
+        // Create a VM with a custom template; set subscription expiry to 10 days
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(10));
+                s.is_setup = true;
+            }
+        }
         {
             let mut vms = db.vms.lock().await;
             vms.insert(
@@ -1452,7 +1490,6 @@ mod tests {
                 Vm {
                     id: 1,
                     user_id: 1,
-                    expires: Utc::now() + chrono::Duration::days(10),
                     template_id: None,
                     custom_template_id: Some(1),
                     deleted: false,
@@ -1501,13 +1538,19 @@ mod tests {
         let seconds_remaining = 86400i64; // 1 day
         let expiry_time = Utc::now() + chrono::Duration::seconds(seconds_remaining);
         {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(expiry_time);
+                s.is_setup = true;
+            }
+        }
+        {
             let mut vms = db.vms.lock().await;
             vms.insert(
                 1,
                 Vm {
                     id: 1,
                     user_id: 1,
-                    expires: expiry_time,
                     template_id: Some(1),
                     custom_template_id: None,
                     deleted: false,
@@ -1666,13 +1709,19 @@ mod tests {
         let seconds_remaining = 14 * 24 * 60 * 60i64; // 14 days = 1,209,600 seconds
         let expiry_time = Utc::now() + chrono::Duration::seconds(seconds_remaining);
         {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(expiry_time);
+                s.is_setup = true;
+            }
+        }
+        {
             let mut vms = db.vms.lock().await;
             vms.insert(
                 1,
                 Vm {
                     id: 1,
                     user_id: 1,
-                    expires: expiry_time,
                     template_id: Some(1),
                     custom_template_id: None,
                     deleted: false,
@@ -1977,10 +2026,16 @@ mod tests {
                 ssh_key_id: 1,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
-                expires: Utc::now() + TimeDelta::days(30),
                 ..Default::default()
             },
         );
+        drop(vms);
+        // Set subscription expiry to 30 days
+        let mut subs = db.subscriptions.lock().await;
+        if let Some(s) = subs.get_mut(&1) {
+            s.expires = Some(Utc::now() + TimeDelta::days(30));
+            s.is_setup = true;
+        }
         vm_id
     }
 
@@ -2147,6 +2202,104 @@ mod tests {
             result.is_err(),
             "Should not find pricing when template lacks required features"
         );
+        Ok(())
+    }
+
+    /// Build a minimal PricingEngine backed by MockDb with the BTC/EUR rate set.
+    async fn make_pe(db: Arc<dyn LNVpsDb>) -> PricingEngine {
+        let rates = Arc::new(MockExchangeRate::new());
+        rates
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), MOCK_RATE)
+            .await;
+        PricingEngine::new(db, rates as Arc<dyn ExchangeRateService>, HashMap::new(), Currency::EUR)
+    }
+
+    /// get_vm_cost_for_intervals returns CostResult::Existing when a valid (non-expired)
+    /// unpaid renewal payment already exists for the VM.
+    #[tokio::test]
+    async fn test_get_vm_cost_dedup_reuses_valid_unpaid_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.users.lock().await.insert(1, User { id: 1, pubkey: vec![], ..Default::default() });
+
+        // Insert an existing unpaid renewal payment that has not yet expired
+        let existing = SubscriptionPayment {
+            id: vec![0xabu8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::minutes(10), // still valid
+            amount: 9999,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "lnbc_test".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: MOCK_RATE,
+            time_value: Some(86400),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        };
+        db.insert_subscription_payment(&existing).await?;
+
+        let db_arc: Arc<dyn LNVpsDb> = db;
+        let pe = make_pe(db_arc).await;
+        let result = pe.get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1).await?;
+
+        match result {
+            CostResult::Existing(p) => {
+                assert_eq!(p.id, existing.id, "should return the pre-existing payment");
+            }
+            CostResult::New(_) => bail!("expected Existing, got New"),
+        }
+        Ok(())
+    }
+
+    /// get_vm_cost_for_intervals returns CostResult::New when the only existing unpaid
+    /// renewal payment has an expired invoice, rather than returning the stale payment.
+    #[tokio::test]
+    async fn test_get_vm_cost_dedup_ignores_expired_unpaid_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.users.lock().await.insert(1, User { id: 1, pubkey: vec![], ..Default::default() });
+
+        // Insert an unpaid renewal payment whose invoice has already expired
+        let expired = SubscriptionPayment {
+            id: vec![0xddu8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now() - chrono::Duration::hours(1),
+            expires: Utc::now() - chrono::Duration::minutes(1), // expired
+            amount: 9999,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "lnbc_expired".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: MOCK_RATE,
+            time_value: Some(86400),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        };
+        db.insert_subscription_payment(&expired).await?;
+
+        let db_arc: Arc<dyn LNVpsDb> = db;
+        let pe = make_pe(db_arc).await;
+        let result = pe.get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1).await?;
+
+        match result {
+            CostResult::New(p) => {
+                assert_ne!(p.amount, 9999, "should compute a fresh amount, not the expired one");
+                assert!(p.time_value > 0, "fresh payment must have a time_value");
+            }
+            CostResult::Existing(_) => bail!("expected New, got Existing — expired invoice was reused"),
+        }
         Ok(())
     }
 }

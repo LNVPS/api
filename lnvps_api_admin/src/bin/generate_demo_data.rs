@@ -7,7 +7,7 @@ use lnvps_api_admin::settings::Settings;
 use lnvps_db::{
     AdminDb, Company, DiskInterface, DiskType, EncryptedString, EncryptionContext, IpRange,
     IpRangeAllocationMode, LNVpsDbBase, LNVpsDbMysql, OsDistribution, PaymentMethod, PaymentType,
-    User, UserSshKey, Vm, VmCostPlan, VmCostPlanIntervalType, VmCustomPricing, VmCustomTemplate,
+    User, UserSshKey, Vm, VmCostPlan, IntervalType, VmCustomPricing, VmCustomTemplate,
     VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use log::info;
@@ -503,13 +503,13 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
     // Amounts are in smallest currency units: cents for fiat, millisats for BTC
     // BTC: 1 BTC = 100,000,000 sats = 100,000,000,000 millisats
     // 0.0005 BTC = 50,000 sats = 50,000,000 millisats
-    let plans_data: Vec<(&str, u64, &str, i32, VmCostPlanIntervalType, DateTime<Utc>)> = vec![
+    let plans_data: Vec<(&str, u64, &str, i32, IntervalType, DateTime<Utc>)> = vec![
         (
             "Nano BTC Plan",
             50_000_000, // 0.0005 BTC in millisats (~$50)
             "BTC",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             years_ago(2),
         ),
         (
@@ -517,7 +517,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             100_000_000, // 0.001 BTC in millisats (~$100)
             "BTC",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(21),
         ),
         (
@@ -525,7 +525,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             200_000_000, // 0.002 BTC in millisats (~$200)
             "BTC",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(15),
         ),
         (
@@ -533,7 +533,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             500_000_000, // 0.005 BTC in millisats (~$500)
             "BTC",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(12),
         ),
         (
@@ -541,7 +541,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             800_000_000, // 0.008 BTC in millisats (~$800)
             "BTC",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(8),
         ),
         (
@@ -549,7 +549,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             1_200_000_000, // 0.012 BTC in millisats (~$1200)
             "BTC",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(3),
         ),
         (
@@ -557,7 +557,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             500, // $5.00 in cents
             "USD",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(20),
         ),
         (
@@ -565,7 +565,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             1000, // $10.00 in cents
             "USD",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(16),
         ),
         (
@@ -573,7 +573,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             1500, // $15.00 in cents
             "USD",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(10),
         ),
         (
@@ -581,7 +581,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             2500, // $25.00 in cents
             "USD",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(4),
         ),
         (
@@ -589,7 +589,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             450, // €4.50 in cents
             "EUR",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(9),
         ),
         (
@@ -597,7 +597,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
             1200, // €12.00 in cents
             "EUR",
             1,
-            VmCostPlanIntervalType::Month,
+            IntervalType::Month,
             months_ago(1),
         ),
     ];
@@ -1174,14 +1174,13 @@ async fn create_vms(
             image_id: os_image.id,
             template_id: Some(template.id),
             custom_template_id: None,
+            subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created,
-            expires,
             disk_id: disk.id,
             mac_address: mac_address.clone(),
             deleted: false,
             ref_code: ref_code.clone(),
-            auto_renewal_enabled: false,
             disabled: false,
         };
 
@@ -1220,14 +1219,13 @@ async fn create_vms(
             image_id: os_image.id,
             template_id: None,
             custom_template_id: Some(custom_template.id),
+            subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
             created,
-            expires,
             disk_id: disk.id,
             mac_address: mac_address.clone(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
 

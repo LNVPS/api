@@ -197,7 +197,24 @@ impl HostCapacityService {
         disk_type: Option<DiskType>,
         disk_interface: Option<DiskInterface>,
     ) -> Result<HostCapacity> {
-        let vms = self.db.list_vms_on_host(host.id).await?;
+        let all_vms = self.db.list_vms_on_host(host.id).await?;
+        // Only count VMs that have been paid for (subscription is_setup = true)
+        let mut vms = Vec::new();
+        for vm in all_vms {
+            if vm.deleted {
+                continue;
+            }
+            let is_paid = if let Ok(li) = self.db.get_subscription_line_item(vm.subscription_line_item_id).await {
+                self.db.get_subscription(li.subscription_id).await
+                    .map(|s| s.is_setup)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if is_paid {
+                vms.push(vm);
+            }
+        }
 
         // load ip ranges
         let ip_ranges = self.db.list_ip_range_in_region(host.region_id).await?;
@@ -220,7 +237,7 @@ impl HostCapacityService {
         let templates = self.db.list_vm_templates().await?;
         let custom_templates: Vec<DbResult<VmCustomTemplate>> = join_all(
             vms.iter()
-                .filter(|v| v.custom_template_id.is_some() && v.expires > Utc::now())
+                .filter(|v| v.custom_template_id.is_some())
                 .map(|v| {
                     self.db
                         .get_custom_vm_template(v.custom_template_id.unwrap())
@@ -243,7 +260,6 @@ impl HostCapacityService {
         // a mapping between vm_id and resources
         let vm_resources: HashMap<u64, VmResources> = vms
             .iter()
-            .filter(|v| v.expires > Utc::now())
             .filter_map(|v| {
                 if let Some(x) = v.template_id {
                     templates.iter().find(|t| t.id == x).map(|t| VmResources {
