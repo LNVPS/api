@@ -244,6 +244,10 @@ impl Worker {
         if expires < expiry_window
             && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS))
         {
+            // Track whether NWC auto-renewal was attempted and succeeded (so we skip the
+            // generic "expiring soon" notification below).
+            let mut auto_renewed = false;
+
             #[cfg(feature = "nostr-nwc")]
             if sub.auto_renewal_enabled {
                 let user = self.db.get_user(sub.user_id).await?;
@@ -266,6 +270,7 @@ impl Worker {
                                     format!("Your subscription has been automatically renewed via Nostr Wallet Connect.\n{}", sub_notification_descr),
                                     Some(format!("[{}] Auto-Renewed", sub_notification_subject)),
                                 ).await;
+                                auto_renewed = true;
                             }
                             Err(e) => {
                                 warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
@@ -278,12 +283,25 @@ impl Worker {
                                     Some(format!("[{}] Expiring Soon", sub_notification_subject)),
                                 )
                                     .await;
+                                auto_renewed = true;
                             }
                         }
-
-                        return Ok(());
                     }
                 }
+            }
+
+            // Send a plain expiry warning whenever NWC auto-renewal was not attempted
+            // (feature disabled, auto_renewal off, or no NWC string configured).
+            if !auto_renewed {
+                self.queue_notification(
+                    sub.user_id,
+                    format!(
+                        "Your subscription will expire soon. Please renew manually in the next {} day(s).\n{}",
+                        BEFORE_EXPIRE_NOTIFICATION_DAYS, sub_notification_descr
+                    ),
+                    Some(format!("[{}] Expiring Soon", sub_notification_subject)),
+                )
+                .await;
             }
         } else if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
             // mark subscription as not-active
