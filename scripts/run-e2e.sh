@@ -145,7 +145,7 @@ DB_NAME="lnvps_e2e_${LNVPS_E2E_RUN_ID}"
 echo "=== Run ID: ${LNVPS_E2E_RUN_ID} | Database: ${DB_NAME} ==="
 
 # Wait for MariaDB to accept connections (first-time volume init can take >30s in CI)
-DB_READY_TIMEOUT=90
+DB_READY_TIMEOUT=120
 echo "Waiting for MariaDB at ${DB_HOST}:${DB_PORT} (timeout: ${DB_READY_TIMEOUT}s)..."
 for i in $(seq 1 "$DB_READY_TIMEOUT"); do
     if mysql_exec "SELECT 1" >/dev/null 2>&1; then
@@ -193,13 +193,13 @@ cargo run -p lnvps_api -- --config "$TMP_API_CONFIG" \
     > /tmp/lnvps-e2e-api.log 2>&1 &
 echo $! > "$API_PID_FILE"
 
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
     if curl -sf "${LNVPS_API_URL:-http://localhost:8000}/" >/dev/null 2>&1; then
         echo "User API ready after ${i}s"
         break
     fi
-    if [[ "$i" -eq 60 ]]; then
-        echo "ERROR: User API failed to start within 60s" >&2
+    if [[ "$i" -eq 90 ]]; then
+        echo "ERROR: User API failed to start within 90s" >&2
         echo "--- User API log ---" >&2
         tail -30 /tmp/lnvps-e2e-api.log >&2
         exit 1
@@ -215,13 +215,13 @@ cargo run -p lnvps_api_admin --bin lnvps_api_admin -- --config "$TMP_ADMIN_CONFI
     > /tmp/lnvps-e2e-admin-api.log 2>&1 &
 echo $! > "$ADMIN_PID_FILE"
 
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
     if curl -sf "${LNVPS_ADMIN_API_URL:-http://localhost:8001}/" >/dev/null 2>&1; then
         echo "Admin API ready after ${i}s"
         break
     fi
-    if [[ "$i" -eq 60 ]]; then
-        echo "ERROR: Admin API failed to start within 60s" >&2
+    if [[ "$i" -eq 90 ]]; then
+        echo "ERROR: Admin API failed to start within 90s" >&2
         echo "--- Admin API log ---" >&2
         tail -30 /tmp/lnvps-e2e-admin-api.log >&2
         exit 1
