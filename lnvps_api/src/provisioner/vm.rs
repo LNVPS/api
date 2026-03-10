@@ -779,10 +779,10 @@ mod tests {
     use super::*;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
-    use crate::subscription::SubscriptionHandler;
+    use crate::subscription::{SubscriptionHandler, SubscriptionLineItemHandler, VmLineItemHandler};
     use lnvps_api_common::{
         ChannelWorkCommander, GB, InMemoryRateCache, MockDb, MockExchangeRate, TB, Ticker,
-        WorkCommander,
+        WorkCommander, WorkJob,
     };
     use lnvps_db::{
         AccessPolicy, DiskInterface, DiskType, IntervalType, LNVpsDbBase, NetworkAccessPolicy,
@@ -866,7 +866,7 @@ mod tests {
             node.clone(),
             rates.clone(),
             wrk.clone(),
-        );
+        )?;
         let provisioner = sub_handler.vm_provisioner();
 
         let (user, ssh_key) = add_user(&db).await?;
@@ -1049,7 +1049,7 @@ mod tests {
             node,
             rates,
             Arc::new(ChannelWorkCommander::new()),
-        ))
+        )?)
     }
 
     /// Insert a VmCustomPricing + one VmCustomPricingDisk into db and return the pricing id.
@@ -2031,5 +2031,222 @@ mod tests {
 
         assert_eq!(vm.ref_code, Some("TEST123".to_string()));
         Ok(())
+    }
+
+    // ── subscription / VM lifecycle tests ────────────────────────────────────
+
+    /// After a first payment is completed the subscription must be active and
+    /// `expires` must be set, and a `WorkJob::CheckVm` must be queued so the
+    /// worker knows to spawn the VM on the hypervisor.
+    #[tokio::test]
+    async fn test_payment_activates_subscription_and_queues_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler_with_commander(db.clone(), wrk.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        // Provision a VM (subscription starts inactive, expires=None)
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub_before = db.get_subscription(li.subscription_id).await?;
+        assert!(!sub_before.is_active, "subscription must start inactive");
+        assert!(sub_before.expires.is_none(), "expires must start as None");
+
+        // Create and complete a payment
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment).await?;
+
+        // Subscription must now be active with an expiry date
+        let sub_after = db.get_subscription(li.subscription_id).await?;
+        assert!(sub_after.is_active, "subscription must be active after payment");
+        assert!(
+            sub_after.expires.is_some(),
+            "expires must be set after payment"
+        );
+        assert!(
+            sub_after.expires.unwrap() > Utc::now(),
+            "expires must be in the future"
+        );
+        assert!(sub_after.is_setup, "is_setup must be true after first payment");
+
+        // A WorkJob::CheckVm must have been queued — recv() is non-blocking here since
+        // complete_payment already sent the job synchronously above.
+        let msgs = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wrk.recv(),
+        )
+        .await
+        .expect("timed out waiting for WorkJob::CheckVm")
+        ?;
+        let found_check_vm = msgs
+            .iter()
+            .any(|m| matches!(&m.job, WorkJob::CheckVm { vm_id } if *vm_id == vm.id));
+        assert!(
+            found_check_vm,
+            "expected WorkJob::CheckVm {{ vm_id: {} }} in queued jobs: {:?}",
+            vm.id,
+            msgs.iter().map(|m| format!("{:?}", m.job)).collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// When `on_expired` is called for a VM line item `on_expired` must succeed
+    /// and the VM must remain present in the database (it is only stopped, not
+    /// deleted).  `stop_vm` is best-effort on the hypervisor; a no-op for a VM
+    /// that hasn't been spawned yet is acceptable.
+    #[tokio::test]
+    async fn test_on_expired_stops_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
+        let handler = VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner).await?;
+
+        // on_expired must succeed (stop is best-effort; silently no-ops for unspawned VMs)
+        handler.on_expired(&sub, &li).await?;
+
+        // VM must still exist in the DB — on_expired only stops, it does NOT delete
+        assert!(
+            db.get_vm(vm_id).await.is_ok(),
+            "VM must still exist in DB after on_expired (stop only, not delete)"
+        );
+
+        Ok(())
+    }
+
+    /// When `on_grace_period_exceeded` is called the VM must be deleted from the
+    /// database (MockDb hard-deletes on `delete_vm`), so `get_vm` returns an error.
+    #[tokio::test]
+    async fn test_on_grace_period_exceeded_deletes_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+
+        // Confirm VM exists in DB before deletion
+        assert!(db.get_vm(vm_id).await.is_ok(), "VM must exist before deletion");
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
+        let handler =
+            VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner).await?;
+        handler.on_grace_period_exceeded(&sub, &li).await?;
+
+        // VM must be gone from the database after grace period exceeded
+        assert!(
+            db.get_vm(vm_id).await.is_err(),
+            "VM must be deleted from DB after grace period"
+        );
+
+        Ok(())
+    }
+
+    /// Renewing an already-expired subscription extends `expires` beyond the
+    /// previous expiry date and re-activates the subscription.
+    #[tokio::test]
+    async fn test_renew_after_expiry_extends_expires() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+
+        // First payment — activates subscription
+        let payment1 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment1).await?;
+
+        let sub_after_first = db.get_subscription(li.subscription_id).await?;
+        let first_expiry = sub_after_first
+            .expires
+            .expect("expires must be set after first payment");
+        assert!(sub_after_first.is_active);
+
+        // Manually wind the expiry into the past to simulate an expired subscription
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&li.subscription_id).unwrap();
+            sub.expires = Some(Utc::now() - chrono::Duration::days(5));
+            sub.is_active = false;
+        }
+
+        // Second payment — must re-activate and extend beyond the (now-past) expiry
+        let payment2 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment2).await?;
+
+        let sub_after_second = db.get_subscription(li.subscription_id).await?;
+        assert!(
+            sub_after_second.is_active,
+            "subscription must be re-activated after second payment"
+        );
+        let second_expiry = sub_after_second
+            .expires
+            .expect("expires must be set after second payment");
+        assert!(
+            second_expiry > Utc::now(),
+            "new expiry must be in the future"
+        );
+        assert!(
+            second_expiry > first_expiry,
+            "new expiry must be later than the first expiry"
+        );
+
+        Ok(())
+    }
+
+    /// Helper: build a SubscriptionHandler wired to a specific WorkCommander.
+    async fn make_sub_handler_with_commander(
+        db: Arc<MockDb>,
+        wrk: Arc<dyn WorkCommander>,
+    ) -> Result<SubscriptionHandler> {
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        Ok(SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            rates,
+            wrk,
+        )?)
     }
 }

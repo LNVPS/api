@@ -3,7 +3,11 @@ use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
+use crate::host::dummy_host::DummyVmHost;
 use crate::router::{ArpEntry, Router};
+
+/// Type alias so tests can refer to the in-memory VM host as `MockVmHost`.
+pub type MockVmHost = DummyVmHost;
 use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bitcoin::hashes::Hash;

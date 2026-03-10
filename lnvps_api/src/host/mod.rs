@@ -18,7 +18,7 @@ mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
 
-mod dummy_host;
+pub(crate) mod dummy_host;
 
 pub struct TerminalStream {
     pub rx: Receiver<Vec<u8>>,
