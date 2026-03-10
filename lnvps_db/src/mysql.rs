@@ -781,7 +781,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "SELECT v.* FROM vm v \
              INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
              WHERE sli.subscription_id = ? \
-               AND sli.subscription_type IN (3, 4) \
+               AND sli.subscription_type = 3 \
              LIMIT 1",
         )
         .bind(subscription_id)
@@ -840,6 +840,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(offset)
         .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn count_vm_subscription_payments(&self, vm_id: u64) -> DbResult<u64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM subscription_payment sp \
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id \
+             INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ?",
+        )
+        .bind(vm_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(row.0 as u64)
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
@@ -1789,7 +1802,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
              LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
-                 AND sli.subscription_type IN (3, 4)
+                 AND sli.subscription_type = 3
              LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
              LEFT JOIN vm_host vh ON v.host_id = vh.id
              LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
@@ -2516,7 +2529,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                         ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
                  FROM subscription_payment sp2
                  JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type IN (3, 4)
+                     AND sli2.subscription_type = 3
                  JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
                  WHERE sp2.is_paid = 1
              ) sp ON v.id = sp.vm_id AND sp.rn = 1
@@ -2539,7 +2552,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                    SELECT 1
                    FROM subscription_payment sp
                    JOIN subscription_line_item sli ON sli.subscription_id = sp.subscription_id
-                       AND sli.subscription_type IN (3, 4)
+                       AND sli.subscription_type = 3
                    WHERE v.subscription_line_item_id = sli.id AND sp.is_paid = 1
                )",
         )
@@ -3821,7 +3834,7 @@ impl AdminDb for LNVpsDbMysql {
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
              LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
-                 AND sli.subscription_type IN (3, 4)
+                 AND sli.subscription_type = 3
              LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
              LEFT JOIN vm_host vh ON v.host_id = vh.id
              LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
@@ -3869,7 +3882,7 @@ impl AdminDb for LNVpsDbMysql {
                                     ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) as rn
                              FROM subscription_payment sp2
                              JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                                 AND sli2.subscription_type IN (3, 4)
+                                 AND sli2.subscription_type = 3
                              JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
                              WHERE sp2.is_paid = 1
                          ) sp ON v.id = sp.vm_id AND sp.rn = 1
