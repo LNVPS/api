@@ -111,7 +111,10 @@ async fn admin_create_vm_ip_assignment(
     }
 
     // Check subscription state
-    let li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+    let li = this
+        .db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await?;
     let sub = this.db.get_subscription(li.subscription_id).await?;
 
     if !sub.is_setup {

@@ -1,6 +1,6 @@
 use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -73,6 +73,8 @@ pub enum VmHostKind {
     #[default]
     Proxmox = 0,
     LibVirt = 1,
+
+    Dummy = u16::MAX,
 }
 
 impl Display for VmHostKind {
@@ -80,6 +82,7 @@ impl Display for VmHostKind {
         match self {
             VmHostKind::Proxmox => write!(f, "proxmox"),
             VmHostKind::LibVirt => write!(f, "libvirt"),
+            VmHostKind::Dummy => write!(f, "dummy"),
         }
     }
 }
@@ -1568,8 +1571,7 @@ pub enum SubscriptionType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
-    VmRenewal = 3,     // VM (links to vm table via vm.subscription_line_item_id)
-    VmUpgrade = 4,     // VM upgrade (links to vm table via vm.subscription_line_item_id)
+    Vps = 3,           // VM (links to vm table via vm.subscription_line_item_id)
 }
 
 impl Display for SubscriptionType {
@@ -1578,8 +1580,7 @@ impl Display for SubscriptionType {
             SubscriptionType::IpRange => write!(f, "IP Range"),
             SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
             SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
-            SubscriptionType::VmRenewal => write!(f, "VM Renewal"),
-            SubscriptionType::VmUpgrade => write!(f, "VM Upgrade"),
+            SubscriptionType::Vps => write!(f, "VPS"),
         }
     }
 }

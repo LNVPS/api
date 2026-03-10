@@ -254,16 +254,18 @@ pub async fn vm_to_status(
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     // Load subscription for expiry + auto_renewal
-    let (sub_expires, sub_auto_renewal) =
-        if let Ok(li) = db.get_subscription_line_item(vm.subscription_line_item_id).await {
-            if let Ok(sub) = db.get_subscription(li.subscription_id).await {
-                (sub.expires, sub.auto_renewal_enabled)
-            } else {
-                (None, false)
-            }
+    let (sub_expires, sub_auto_renewal) = if let Ok(li) = db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await
+    {
+        if let Ok(sub) = db.get_subscription(li.subscription_id).await {
+            (sub.expires, sub.auto_renewal_enabled)
         } else {
             (None, false)
-        };
+        }
+    } else {
+        (None, false)
+    };
 
     Ok(ApiVmStatus {
         id: vm.id,

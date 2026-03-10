@@ -60,17 +60,25 @@ pub struct PricingEngine {
     db: Arc<dyn LNVpsDb>,
     rates: Arc<dyn ExchangeRateService>,
     tax_rates: HashMap<CountryCode, f32>,
-    base_currency: Currency,
 }
 
 impl PricingEngine {
+    pub fn new(
+        db: Arc<dyn LNVpsDb>,
+        rates: Arc<dyn ExchangeRateService>,
+        tax_rates: HashMap<CountryCode, f32>,
+    ) -> Self {
+        Self {
+            db,
+            rates,
+            tax_rates,
+        }
+    }
+
     /// Convert cost plan interval to seconds
-    fn cost_plan_interval_to_seconds(
-        interval_type: IntervalType,
-        interval_amount: u64,
-    ) -> i64 {
+    fn cost_plan_interval_to_seconds(interval_type: IntervalType, interval_amount: u64) -> i64 {
         let base_seconds = match interval_type {
-            IntervalType::Day => 24 * 60 * 60, // 86,400 seconds per day
+            IntervalType::Day => 24 * 60 * 60,        // 86,400 seconds per day
             IntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
             IntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
         };
@@ -80,7 +88,11 @@ impl PricingEngine {
     /// Get the authoritative expiry for a VM from its subscription.
     /// Returns `None` if the subscription has never been paid.
     async fn vm_subscription_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
-        let li = self.db.get_subscription_line_item(vm.subscription_line_item_id).await.ok()?;
+        let li = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await
+            .ok()?;
         let sub = self.db.get_subscription(li.subscription_id).await.ok()?;
         sub.expires
     }
@@ -170,35 +182,6 @@ impl PricingEngine {
         percentage_fee + base_fee
     }
 
-    pub fn new(
-        db: Arc<dyn LNVpsDb>,
-        rates: Arc<dyn ExchangeRateService>,
-        tax_rates: HashMap<CountryCode, f32>,
-        base_currency: Currency,
-    ) -> Self {
-        Self {
-            db,
-            rates,
-            tax_rates,
-            base_currency,
-        }
-    }
-
-    /// Create a new pricing engine for a specific VM, automatically looking up the company's base currency
-    pub async fn new_for_vm(
-        db: Arc<dyn LNVpsDb>,
-        rates: Arc<dyn ExchangeRateService>,
-        tax_rates: HashMap<CountryCode, f32>,
-        vm_id: u64,
-    ) -> Result<Self> {
-        let base_currency_str = db.get_vm_base_currency(vm_id).await?;
-        let base_currency: Currency = base_currency_str
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid base currency: {}", base_currency_str))?;
-
-        Ok(Self::new(db, rates, tax_rates, base_currency))
-    }
-
     /// Get amount of time a certain currency amount will extend a vm in seconds
     pub async fn get_cost_by_amount(
         &self,
@@ -222,7 +205,10 @@ impl PricingEngine {
         let new_time = (cost.time_value as f64 * scale).floor() as u64;
         ensure!(new_time > 0, "Extend time is less than 1 second");
 
-        let vm_expires = self.vm_subscription_expires(&vm).await.unwrap_or_else(Utc::now);
+        let vm_expires = self
+            .vm_subscription_expires(&vm)
+            .await
+            .unwrap_or_else(Utc::now);
         Ok(CostResult::New(NewPaymentInfo {
             amount: input.value(),
             currency: cost.currency,
@@ -265,14 +251,17 @@ impl PricingEngine {
         // after each confirmed payment.
         let pending = self.db.list_pending_vm_subscription_payments(vm.id).await?;
         if let Some(px) = pending.into_iter().find(|p| {
-            p.payment_method == method
-                && p.payment_type == SubscriptionPaymentType::Renewal
+            p.payment_method == method && p.payment_type == SubscriptionPaymentType::Renewal
         }) {
             return Ok(CostResult::Existing(px));
         }
 
         // Scale the cost by number of intervals
-        let base = self.vm_subscription_expires(&vm).await.unwrap_or_else(Utc::now).max(Utc::now());
+        let base = self
+            .vm_subscription_expires(&vm)
+            .await
+            .unwrap_or_else(Utc::now)
+            .max(Utc::now());
         if intervals == 1 {
             Ok(CostResult::New(base_cost))
         } else {
@@ -369,7 +358,11 @@ impl PricingEngine {
         let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
 
         // custom templates are always 1-month intervals; clamp base to now for expired VMs
-        let base = self.vm_subscription_expires(vm).await.unwrap_or_else(Utc::now).max(Utc::now());
+        let base = self
+            .vm_subscription_expires(vm)
+            .await
+            .unwrap_or_else(Utc::now)
+            .max(Utc::now());
         let time_value = (base.add(Months::new(1)) - base).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
@@ -460,7 +453,10 @@ impl PricingEngine {
         let converted_amount = self
             .get_amount_and_rate(CurrencyAmount::from_u64(currency, cost_plan.amount), method)
             .await?;
-        let vm_expires = self.vm_subscription_expires(vm).await.unwrap_or_else(Utc::now);
+        let vm_expires = self
+            .vm_subscription_expires(vm)
+            .await
+            .unwrap_or_else(Utc::now);
         let time_value = Self::next_template_expire(vm_expires, &cost_plan);
         let base = vm_expires.max(Utc::now());
         Ok(NewPaymentInfo {
@@ -642,7 +638,9 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
 
         ensure!(!vm.deleted, "Can't calculate for deleted VM");
-        let vm_expires = self.vm_subscription_expires(&vm).await
+        let vm_expires = self
+            .vm_subscription_expires(&vm)
+            .await
             .ok_or_else(|| anyhow!("VM subscription has no expiry date"))?;
         ensure!(
             vm_expires > from_date,
@@ -695,7 +693,7 @@ impl PricingEngine {
     }
 
     /// Calculate pro-rated refund amount for a VM from a specific date
-    pub async fn calculate_refund_amount_from_date(
+    pub async fn calculate_vm_refund_amount_from_date(
         &self,
         vm_id: u64,
         method: PaymentMethod,
@@ -711,7 +709,7 @@ impl PricingEngine {
     }
 
     /// Calculate both the upgrade cost and new renewal cost for a VM
-    pub async fn calculate_upgrade_cost(
+    pub async fn calculate_vm_upgrade_cost(
         &self,
         vm_id: u64,
         cfg: &UpgradeConfig,
@@ -720,7 +718,9 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
 
         ensure!(!vm.deleted, "Can't upgrade deleted VM");
-        let vm_expires = self.vm_subscription_expires(&vm).await
+        let vm_expires = self
+            .vm_subscription_expires(&vm)
+            .await
             .ok_or_else(|| anyhow!("VM subscription has no expiry date"))?;
         ensure!(vm_expires > Utc::now(), "Can't upgrade an expired VM");
 
@@ -736,8 +736,7 @@ impl PricingEngine {
         let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
-        let custom_plan_seconds =
-            Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
+        let custom_plan_seconds = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
         let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
 
         // calculate the cost based on the time until the vm expires
@@ -988,7 +987,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         // Test a range of amounts to ensure gross-up always holds
         for base in [100u64, 345, 1000, 9999, 50000] {
@@ -1057,7 +1056,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let amount = 990u64; // €9.90 in cents
         let fee = pe
@@ -1147,7 +1146,7 @@ mod tests {
 
         let taxes = HashMap::from([(CountryCode::IRL, 23.0)]);
 
-        let pe = PricingEngine::new(db.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db.clone(), rates, taxes);
         let plan = MockDb::mock_cost_plan();
 
         let price = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
@@ -1199,58 +1198,6 @@ mod tests {
             }
             _ => bail!("??"),
         }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_pricing_engine_with_different_currencies() -> Result<()> {
-        let db = MockDb::default();
-        let rates = Arc::new(MockExchangeRate::new());
-
-        // Set up rates for different currencies
-        rates.set_rate(Ticker::btc_rate("EUR")?, 95_000.0).await;
-        rates.set_rate(Ticker::btc_rate("USD")?, 100_000.0).await;
-
-        let taxes = HashMap::new();
-        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-
-        // Test EUR pricing engine
-        let pe_eur =
-            PricingEngine::new(db_arc.clone(), rates.clone(), taxes.clone(), Currency::EUR);
-
-        // Test USD pricing engine
-        let pe_usd = PricingEngine::new(db_arc.clone(), rates.clone(), taxes, Currency::USD);
-
-        // Both should work with their respective base currencies
-        // The base currency is now stored in the pricing engine itself
-        assert_eq!(pe_eur.base_currency, Currency::EUR);
-        assert_eq!(pe_usd.base_currency, Currency::USD);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_new_for_vm() -> Result<()> {
-        let db = MockDb::default();
-        let rates = Arc::new(MockExchangeRate::new());
-
-        // Set up rates
-        rates.set_rate(Ticker::btc_rate("EUR")?, 95_000.0).await;
-
-        let taxes = HashMap::new();
-
-        // Add a VM
-        {
-            let mut vms = db.vms.lock().await;
-            vms.insert(1, MockDb::mock_vm());
-        }
-
-        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-
-        // Test creating pricing engine for VM (should use EUR from default company)
-        let pe = PricingEngine::new_for_vm(db_arc.clone(), rates.clone(), taxes.clone(), 1).await?;
-        assert_eq!(pe.base_currency, Currency::EUR);
 
         Ok(())
     }
@@ -1342,7 +1289,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         // Test upgrade configuration - increase CPU from 1 to 2
         let upgrade_config = UpgradeConfig {
@@ -1352,7 +1299,7 @@ mod tests {
         };
 
         let quote = pe
-            .calculate_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
+            .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await?;
 
         // Verify that we got a valid quote
@@ -1399,7 +1346,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(2),
@@ -1409,7 +1356,7 @@ mod tests {
 
         // Should fail for expired VM
         let result = pe
-            .calculate_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
+            .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await;
         assert!(result.is_err());
 
@@ -1449,7 +1396,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(2),
@@ -1459,7 +1406,7 @@ mod tests {
 
         // Should fail for deleted VM
         let result = pe
-            .calculate_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
+            .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await;
         assert!(result.is_err());
 
@@ -1500,7 +1447,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let upgrade_config = UpgradeConfig {
             new_cpu: Some(4), // Upgrade from 2 to 4 CPUs
@@ -1509,7 +1456,7 @@ mod tests {
         };
 
         let quote = pe
-            .calculate_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
+            .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await?;
 
         // Verify that we got a valid quote for custom template upgrade
@@ -1561,7 +1508,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         // Test upgrade - increase CPU from 2 to 4 (double the CPU)
         let upgrade_config = UpgradeConfig {
@@ -1579,7 +1526,7 @@ mod tests {
         let old_cost_per_second = old_cost_info.cost_per_second();
 
         let quote = pe
-            .calculate_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
+            .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await?;
 
         // Calculate expected values based on the algorithm:
@@ -1732,7 +1679,7 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db_arc.clone(), rates, taxes, Currency::EUR);
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         // Test large upgrade - significantly increase all resources
         let upgrade_config = UpgradeConfig {
@@ -1742,7 +1689,7 @@ mod tests {
         };
 
         let quote = pe
-            .calculate_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
+            .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await?;
 
         // This should result in a significant positive upgrade cost since we're upgrading to much higher specs
@@ -1889,7 +1836,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let taxes = HashMap::new();
-        let pe = PricingEngine::new(db.clone(), rates, taxes.clone(), Currency::EUR);
+        let pe = PricingEngine::new(db.clone(), rates, taxes.clone());
 
         // Test Lightning payment (no processing fee)
         let price_lightning = pe.get_vm_cost(1, PaymentMethod::Lightning).await?;
@@ -2049,7 +1996,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2072,7 +2019,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2099,7 +2046,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2127,7 +2074,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2151,7 +2098,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2190,7 +2137,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new(), Currency::EUR);
+        let pe = PricingEngine::new(db, rates, HashMap::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2211,7 +2158,7 @@ mod tests {
         rates
             .set_rate(Ticker::btc_rate("EUR").unwrap(), MOCK_RATE)
             .await;
-        PricingEngine::new(db, rates as Arc<dyn ExchangeRateService>, HashMap::new(), Currency::EUR)
+        PricingEngine::new(db, rates as Arc<dyn ExchangeRateService>, HashMap::new())
     }
 
     /// get_vm_cost_for_intervals returns CostResult::Existing when a valid (non-expired)
@@ -2220,7 +2167,14 @@ mod tests {
     async fn test_get_vm_cost_dedup_reuses_valid_unpaid_payment() -> Result<()> {
         let db = Arc::new(MockDb::default());
         db.vms.lock().await.insert(1, MockDb::mock_vm());
-        db.users.lock().await.insert(1, User { id: 1, pubkey: vec![], ..Default::default() });
+        db.users.lock().await.insert(
+            1,
+            User {
+                id: 1,
+                pubkey: vec![],
+                ..Default::default()
+            },
+        );
 
         // Insert an existing unpaid renewal payment that has not yet expired
         let existing = SubscriptionPayment {
@@ -2247,7 +2201,9 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = db;
         let pe = make_pe(db_arc).await;
-        let result = pe.get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1).await?;
+        let result = pe
+            .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1)
+            .await?;
 
         match result {
             CostResult::Existing(p) => {
@@ -2264,7 +2220,14 @@ mod tests {
     async fn test_get_vm_cost_dedup_ignores_expired_unpaid_payment() -> Result<()> {
         let db = Arc::new(MockDb::default());
         db.vms.lock().await.insert(1, MockDb::mock_vm());
-        db.users.lock().await.insert(1, User { id: 1, pubkey: vec![], ..Default::default() });
+        db.users.lock().await.insert(
+            1,
+            User {
+                id: 1,
+                pubkey: vec![],
+                ..Default::default()
+            },
+        );
 
         // Insert an unpaid renewal payment whose invoice has already expired
         let expired = SubscriptionPayment {
@@ -2291,14 +2254,21 @@ mod tests {
 
         let db_arc: Arc<dyn LNVpsDb> = db;
         let pe = make_pe(db_arc).await;
-        let result = pe.get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1).await?;
+        let result = pe
+            .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1)
+            .await?;
 
         match result {
             CostResult::New(p) => {
-                assert_ne!(p.amount, 9999, "should compute a fresh amount, not the expired one");
+                assert_ne!(
+                    p.amount, 9999,
+                    "should compute a fresh amount, not the expired one"
+                );
                 assert!(p.time_value > 0, "fresh payment must have a time_value");
             }
-            CostResult::Existing(_) => bail!("expected New, got Existing — expired invoice was reused"),
+            CostResult::Existing(_) => {
+                bail!("expected New, got Existing — expired invoice was reused")
+            }
         }
         Ok(())
     }

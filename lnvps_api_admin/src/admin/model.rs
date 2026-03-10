@@ -21,6 +21,7 @@ use lnvps_db::{
 pub enum AdminVmHostKind {
     Proxmox,
     Libvirt,
+    Mock,
 }
 
 impl From<VmHostKind> for AdminVmHostKind {
@@ -28,6 +29,7 @@ impl From<VmHostKind> for AdminVmHostKind {
         match host_kind {
             VmHostKind::Proxmox => AdminVmHostKind::Proxmox,
             VmHostKind::LibVirt => AdminVmHostKind::Libvirt,
+            VmHostKind::Dummy => AdminVmHostKind::Mock,
         }
     }
 }
@@ -37,6 +39,7 @@ impl From<AdminVmHostKind> for VmHostKind {
         match admin_host_kind {
             AdminVmHostKind::Proxmox => VmHostKind::Proxmox,
             AdminVmHostKind::Libvirt => VmHostKind::LibVirt,
+            AdminVmHostKind::Mock => VmHostKind::Dummy,
         }
     }
 }
@@ -553,7 +556,9 @@ impl AdminVmInfo {
         };
 
         // Load subscription for expiry + auto_renewal
-        let li = db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
         let sub = db.get_subscription(li.subscription_id).await?;
 
         Ok(Self {

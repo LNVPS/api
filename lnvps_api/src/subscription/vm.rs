@@ -1,17 +1,22 @@
+use crate::provisioner::VmProvisioner;
 use crate::subscription::SubscriptionLineItemHandler;
 use anyhow::Result;
 use async_trait::async_trait;
 use lnvps_api_common::{UpgradeConfig, VmHistoryLogger, WorkCommander, WorkJob};
-use lnvps_db::{LNVpsDb, Subscription, SubscriptionPayment, SubscriptionPaymentType};
-use log::{info, warn};
+use lnvps_db::{
+    LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
+    SubscriptionType, Vm,
+};
+use log::{error, info, warn};
 use std::sync::Arc;
 
 pub struct VmLineItemHandler {
-    vm_id: u64,
+    vm: Vm,
     vm_expires_before: chrono::DateTime<chrono::Utc>,
     db: Arc<dyn LNVpsDb>,
     tx: Arc<dyn WorkCommander>,
     vm_history_logger: VmHistoryLogger,
+    provisioner: VmProvisioner,
 }
 
 impl VmLineItemHandler {
@@ -19,11 +24,15 @@ impl VmLineItemHandler {
         vm_id: u64,
         db: Arc<dyn LNVpsDb>,
         tx: Arc<dyn WorkCommander>,
+        provisioner: VmProvisioner,
     ) -> Result<Self> {
         let vm = db.get_vm(vm_id).await?;
-        // Read expiry from subscription (authoritative source)
-        let vm_expires_before = if let Ok(li) = db.get_subscription_line_item(vm.subscription_line_item_id).await {
-            db.get_subscription(li.subscription_id).await
+        let vm_expires_before = if let Ok(li) = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await
+        {
+            db.get_subscription(li.subscription_id)
+                .await
                 .ok()
                 .and_then(|s| s.expires)
                 .unwrap_or_else(chrono::Utc::now)
@@ -32,23 +41,54 @@ impl VmLineItemHandler {
         };
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         Ok(Self {
-            vm_id,
+            vm,
             vm_expires_before,
             db,
             tx,
             vm_history_logger,
+            provisioner,
         })
+    }
+
+    async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
+        if let Err(e) = self
+            .tx
+            .send(WorkJob::SendNotification {
+                user_id,
+                message,
+                title,
+            })
+            .await
+        {
+            error!("Failed to queue notification: {}", e);
+        }
+    }
+
+    async fn queue_admin_notification(&self, message: String, title: Option<String>) {
+        if let Err(e) = self
+            .tx
+            .send(WorkJob::SendAdminNotification { message, title })
+            .await
+        {
+            warn!("Failed to send admin notification: {}", e);
+        }
     }
 }
 
 #[async_trait]
 impl SubscriptionLineItemHandler for VmLineItemHandler {
-    async fn on_payment(&self, payment: &SubscriptionPayment, method_label: &str) -> Result<()> {
-        let vm_id = self.vm_id;
+    async fn on_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+        let vm_id = self.vm.id;
         let vm = self.db.get_vm(vm_id).await?;
         // Get new expiry from subscription (authoritative source)
-        let vm_expires_after = if let Ok(li) = self.db.get_subscription_line_item(vm.subscription_line_item_id).await {
-            self.db.get_subscription(li.subscription_id).await
+        let vm_expires_after = if let Ok(li) = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await
+        {
+            self.db
+                .get_subscription(li.subscription_id)
+                .await
                 .ok()
                 .and_then(|s| s.expires)
                 .unwrap_or_else(chrono::Utc::now)
@@ -58,7 +98,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
 
         let payment_metadata = serde_json::json!({
             "payment_id": hex::encode(&payment.id),
-            "payment_method": method_label
+            "payment_method": payment.payment_method.to_string()
         });
 
         if let Err(e) = self
@@ -111,7 +151,10 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
                 {
                     info!(
                         "Processing upgrade payment for VM {} with params: CPU={:?}, Memory={:?}, Disk={:?}",
-                        vm_id, upgrade_params.new_cpu, upgrade_params.new_memory, upgrade_params.new_disk
+                        vm_id,
+                        upgrade_params.new_cpu,
+                        upgrade_params.new_memory,
+                        upgrade_params.new_disk
                     );
                     self.tx
                         .send(WorkJob::ProcessVmUpgrade {
@@ -138,36 +181,63 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         Ok(())
     }
 
-    async fn on_expiring_soon(&self, sub: &Subscription) -> Result<()> {
-        // VM-specific expiry notification (without NWC — NWC is handled at subscription level
-        // in the worker before individual line item handlers are called)
-        let vm_id = self.vm_id;
-        info!("VM {} subscription {} expiring soon", vm_id, sub.id);
-        // The notification is sent at subscription level by the worker; nothing extra needed here.
+    async fn on_expired(
+        &self,
+        _sub: &Subscription,
+        line_item: &SubscriptionLineItem,
+    ) -> Result<()> {
+        // skip anything that isn't the vm line item (skip upgrade lines)
+        if line_item.subscription_type != SubscriptionType::Vps {
+            return Ok(());
+        }
+        info!("Stopping expired VM {}", self.vm.id);
+        if let Err(e) = self.provisioner.stop_vm(self.vm.id).await {
+            warn!("Failed to stop VM {}: {}", self.vm.id, e);
+        } else if let Err(e) = self
+            .vm_history_logger
+            .log_vm_expired(self.vm.id, None)
+            .await
+        {
+            warn!("Failed to log VM {} expiration: {}", self.vm.id, e);
+        }
+        self.queue_notification(
+            self.vm.user_id,
+            format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.",
+                    self.vm.id, self.provisioner.delete_after),
+            Some(format!("[VM{}] Expired", self.vm.id)),
+        ).await;
         Ok(())
     }
 
-    async fn on_expired(&self, sub: &Subscription) -> Result<()> {
-        // VM stop is handled by handle_vm_state / check_vms (hypervisor-driven).
-        // We just dispatch CheckVm so it is picked up promptly.
-        let vm_id = self.vm_id;
-        info!(
-            "VM {} subscription {} expired — dispatching CheckVm",
-            vm_id, sub.id
-        );
-        self.tx.send(WorkJob::CheckVm { vm_id }).await?;
-        Ok(())
-    }
+    async fn on_grace_period_exceeded(
+        &self,
+        sub: &Subscription,
+        line_item: &SubscriptionLineItem,
+    ) -> Result<()> {
+        // skip anything that isn't the vm line item (skip upgrade lines)
+        if line_item.subscription_type != SubscriptionType::Vps {
+            return Ok(());
+        }
+        let vm_id = self.vm.id;
+        info!("VM {} subscription {} grace period exceeded", vm_id, sub.id);
+        if self.vm.deleted {
+            return Ok(());
+        }
 
-    async fn on_grace_period_exceeded(&self, sub: &Subscription) -> Result<()> {
-        // VM deletion is handled by handle_vm_state / check_vms.
-        // Dispatch CheckVm so it is picked up promptly.
-        let vm_id = self.vm_id;
-        info!(
-            "VM {} subscription {} grace period exceeded — dispatching CheckVm",
-            vm_id, sub.id
-        );
-        self.tx.send(WorkJob::CheckVm { vm_id }).await?;
+        if let Err(e) = self.provisioner.delete_vm(vm_id).await {
+            warn!("Failed to delete expired VM {}: {}", vm_id, e);
+        } else {
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_deleted(vm_id, None, Some("expired and exceeded grace period"), None)
+                .await
+            {
+                warn!("Failed to log VM {} deletion: {}", vm_id, e);
+            }
+        }
+        let title = Some(format!("[VM{}] Deleted", self.vm.id));
+        self.queue_admin_notification(format!("VM{} was deleted", self.vm.id), title)
+            .await;
         Ok(())
     }
 }

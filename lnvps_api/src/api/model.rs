@@ -270,16 +270,12 @@ impl ApiInvoiceItem {
 impl ApiVmPayment {
     /// Convert a `SubscriptionPayment` to an `ApiVmPayment`.
     /// The `vm_id` must be provided because `SubscriptionPayment` only knows the subscription.
-    pub fn from_subscription_payment(
-        value: lnvps_db::SubscriptionPayment,
-        vm_id: u64,
-    ) -> Self {
+    pub fn from_subscription_payment(value: lnvps_db::SubscriptionPayment, vm_id: u64) -> Self {
         let upgrade_params = value
             .metadata
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_default());
-        let is_upgrade =
-            value.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade;
+        let is_upgrade = value.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade;
         let data = match &value.payment_method {
             PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
             PaymentMethod::Revolut => {
@@ -287,8 +283,7 @@ impl ApiVmPayment {
                 struct RevolutData {
                     pub token: String,
                 }
-                let data: RevolutData =
-                    serde_json::from_str(value.external_data.as_str()).unwrap();
+                let data: RevolutData = serde_json::from_str(value.external_data.as_str()).unwrap();
                 ApiPaymentData::Revolut { token: data.token }
             }
             PaymentMethod::Paypal => todo!(),
@@ -297,8 +292,7 @@ impl ApiVmPayment {
                 struct StripeData {
                     pub session_id: String,
                 }
-                let data: StripeData =
-                    serde_json::from_str(value.external_data.as_str()).unwrap();
+                let data: StripeData = serde_json::from_str(value.external_data.as_str()).unwrap();
                 ApiPaymentData::Stripe {
                     session_id: data.session_id,
                 }

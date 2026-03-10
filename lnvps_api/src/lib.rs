@@ -1,6 +1,5 @@
 pub mod api;
 pub mod data_migration;
-pub mod subscription;
 pub mod dns;
 pub mod host;
 pub mod json_api;
@@ -11,6 +10,7 @@ pub mod router;
 pub mod settings;
 #[cfg(feature = "proxmox")]
 pub mod ssh_client;
+pub mod subscription;
 pub mod worker;
 
 #[cfg(test)]

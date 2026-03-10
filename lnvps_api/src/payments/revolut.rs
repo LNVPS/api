@@ -1,11 +1,8 @@
-use crate::payments::complete_payment;
+use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result};
-use chrono::Utc;
+
 use isocountry::CountryCode;
-use lnvps_api_common::WorkCommander;
-use lnvps_db::{
-    LNVpsDb, PaymentMethod, PaymentMethodConfig, ProviderConfig, SubscriptionPaymentType,
-};
+use lnvps_db::{LNVpsDb, PaymentMethodConfig, ProviderConfig, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::fiat::{
     RevolutApi, RevolutConfig, RevolutOrderState, RevolutWebhookBody, RevolutWebhookEvent,
@@ -17,7 +14,7 @@ use std::sync::Arc;
 pub struct RevolutPaymentHandler {
     api: RevolutApi,
     db: Arc<dyn LNVpsDb>,
-    tx: Arc<dyn WorkCommander>,
+    subscription_handler: SubscriptionHandler,
     public_url: String,
     config_id: u64,
 }
@@ -27,7 +24,7 @@ impl RevolutPaymentHandler {
         config: &PaymentMethodConfig,
         public_url: &str,
         db: Arc<dyn LNVpsDb>,
-        sender: Arc<dyn WorkCommander>,
+        subscription_handler: SubscriptionHandler,
     ) -> Result<Self> {
         let provider_config = config
             .get_provider_config()
@@ -49,7 +46,7 @@ impl RevolutPaymentHandler {
             public_url: public_url.to_string(),
             config_id: config.id,
             db,
-            tx: sender,
+            subscription_handler,
         })
     }
 
@@ -171,10 +168,7 @@ impl RevolutPaymentHandler {
     }
 
     async fn try_complete_payment(&self, ext_id: &str) -> Result<()> {
-        let mut payment = self
-            .db
-            .get_subscription_payment_by_ext_id(ext_id)
-            .await?;
+        let mut payment = self.db.get_subscription_payment_by_ext_id(ext_id).await?;
 
         // Verify the Revolut order is completed and store order JSON
         let order = self.api.get_order(ext_id).await?;
@@ -200,52 +194,19 @@ impl RevolutPaymentHandler {
             }
         }
 
-        let db = self.db.clone();
-        let api = self.api.clone();
-        let tx = self.tx.clone();
-        let payment_id = payment.id.clone();
-
-        complete_payment(&self.db, &payment, tx, "revolut", |paid_payment| {
-            let db = db.clone();
-            let api = api.clone();
-            async move {
-                // Cancel other pending Revolut upgrade orders for this subscription
-                let vm = db.get_vm_by_subscription(paid_payment.subscription_id).await?;
-                let other_upgrades = db
-                    .list_pending_vm_subscription_payments(vm.id)
-                    .await?
-                    .into_iter()
-                    .filter(|p| {
-                        p.payment_type == SubscriptionPaymentType::Upgrade
-                            && p.payment_method == PaymentMethod::Revolut
-                            && p.id != payment_id
-                    })
-                    .collect::<Vec<_>>();
-
-                for ugp in other_upgrades {
-                    let hex_id = hex::encode(&ugp.id);
-                    if let Some(eid) = ugp.external_id.as_ref() {
-                        if let Err(e) = api.cancel_order(eid).await {
-                            warn!("Failed to cancel order {}: {}", hex_id, e);
-                        }
-                    } else {
-                        warn!("External id does not exist on fiat payment: {}", hex_id);
-                    }
-                    let mut expired = ugp;
-                    expired.expires = Utc::now();
-                    if let Err(e) = db.update_subscription_payment(&expired).await {
-                        warn!("Failed to update payment {}: {}", hex_id, e);
-                    }
+        let result = self.subscription_handler.complete_payment(&payment).await?;
+        for p in result.expired_competing_upgrades {
+            if let Some(eid) = p.external_id.as_ref() {
+                if let Err(e) = self.api.cancel_order(eid).await {
+                    warn!("Failed to cancel order {}: {}", hex::encode(p.id), e);
                 }
-                Ok(())
+            } else {
+                warn!(
+                    "External id does not exist on fiat payment: {}",
+                    hex::encode(p.id)
+                );
             }
-        })
-        .await?;
-
-        info!(
-            "Subscription payment {} paid via Revolut",
-            hex::encode(&payment.id)
-        );
+        }
         Ok(())
     }
 }

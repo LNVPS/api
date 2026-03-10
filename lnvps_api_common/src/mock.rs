@@ -4,19 +4,17 @@ use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
-    DiskType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
-    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
-    ReferralCostUsage, ReferralPayout, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    IntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    DiskType, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing,
+    LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
+    Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost,
+    VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
 #[cfg(feature = "admin")]
-use lnvps_db::{
-    AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats,
-};
+use lnvps_db::{AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
@@ -160,7 +158,7 @@ impl Default for MockDb {
             1,
             VmHost {
                 id: 1,
-                kind: VmHostKind::Proxmox,
+                kind: VmHostKind::Dummy,
                 region_id: 1,
                 name: "mock-host".to_string(),
                 ip: "https://localhost".to_string(),
@@ -285,7 +283,7 @@ impl Default for MockDb {
                     SubscriptionLineItem {
                         id: 1,
                         subscription_id: 1,
-                        subscription_type: lnvps_db::SubscriptionType::VmRenewal,
+                        subscription_type: lnvps_db::SubscriptionType::Vps,
                         name: "mock vm renewal".to_string(),
                         description: None,
                         amount: 1000,
@@ -585,7 +583,11 @@ impl LNVpsDbBase for MockDb {
         let mut all: Vec<_> = cost_plans.values().cloned().collect();
         all.sort_by(|a, b| b.id.cmp(&a.id));
         let total = all.len() as u64;
-        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
         Ok((page, total))
     }
 
@@ -672,7 +674,9 @@ impl LNVpsDbBase for MockDb {
         let mut expired = Vec::new();
         for vm in vm_list {
             let line_items = self.subscription_line_items.lock().await;
-            let sub_id = line_items.get(&vm.subscription_line_item_id).map(|li| li.subscription_id);
+            let sub_id = line_items
+                .get(&vm.subscription_line_item_id)
+                .map(|li| li.subscription_id);
             drop(line_items);
             if let Some(sid) = sub_id {
                 let subs = self.subscriptions.lock().await;
@@ -756,10 +760,6 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("VM not found for line item {}", line_item_id).into())
     }
 
-    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
-        self.get_vm_by_line_item(line_item_id).await
-    }
-
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
         use lnvps_db::SubscriptionType;
         let items = self.subscription_line_items.lock().await;
@@ -767,10 +767,7 @@ impl LNVpsDbBase for MockDb {
             .values()
             .find(|li| {
                 li.subscription_id == subscription_id
-                    && matches!(
-                        li.subscription_type,
-                        SubscriptionType::VmRenewal | SubscriptionType::VmUpgrade
-                    )
+                    && matches!(li.subscription_type, SubscriptionType::Vps)
             })
             .map(|li| li.id)
             .ok_or_else(|| {
@@ -1023,7 +1020,11 @@ impl LNVpsDbBase for MockDb {
             .collect();
         all.sort_by(|a, b| b.id.cmp(&a.id));
         let total = all.len() as u64;
-        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
         Ok((page, total))
     }
 
@@ -1277,7 +1278,11 @@ impl LNVpsDbBase for MockDb {
             .collect();
         all.sort_by(|a, b| b.id.cmp(&a.id));
         let total = all.len() as u64;
-        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
         Ok((page, total))
     }
 
@@ -1312,9 +1317,16 @@ impl LNVpsDbBase for MockDb {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions
             .values()
-            .filter(|s| {
-                s.is_active && s.expires.map(|e| e < Utc::now()).unwrap_or(false)
-            })
+            .filter(|s| s.is_active && s.expires.map(|e| e < Utc::now()).unwrap_or(false))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_lifecycle_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| s.is_active && s.expires.is_some())
             .cloned()
             .collect())
     }
@@ -1494,7 +1506,11 @@ impl LNVpsDbBase for MockDb {
             .collect();
         all.sort_by(|a, b| b.created.cmp(&a.created));
         let total = all.len() as u64;
-        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
         Ok((page, total))
     }
 
@@ -1800,7 +1816,11 @@ impl LNVpsDbBase for MockDb {
                         .find(|li| li.id == li_id)
                         .map(|li| li.subscription_id);
                     if let Some(sid) = sub_id {
-                        if !subscriptions.get(&sid).map(|s| s.user_id == uid).unwrap_or(false) {
+                        if !subscriptions
+                            .get(&sid)
+                            .map(|s| s.user_id == uid)
+                            .unwrap_or(false)
+                        {
                             return false;
                         }
                     } else {
@@ -1813,7 +1833,11 @@ impl LNVpsDbBase for MockDb {
             .collect();
         all.sort_by(|a, b| b.id.cmp(&a.id));
         let total = all.len() as u64;
-        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
         Ok((page, total))
     }
 
@@ -1876,7 +1900,11 @@ impl LNVpsDbBase for MockDb {
         let mut all: Vec<_> = configs.values().cloned().collect();
         all.sort_by(|a, b| a.company_id.cmp(&b.company_id).then(a.id.cmp(&b.id)));
         let total = all.len() as u64;
-        let page = all.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
         Ok((page, total))
     }
 
@@ -2069,8 +2097,12 @@ impl LNVpsDbBase for MockDb {
                 let sid = line_items
                     .get(&v.subscription_line_item_id)
                     .map(|sli| sli.subscription_id);
-                !sid.map(|s| sub_payments.iter().any(|p| p.subscription_id == s && p.is_paid))
-                    .unwrap_or(false)
+                !sid.map(|s| {
+                    sub_payments
+                        .iter()
+                        .any(|p| p.subscription_id == s && p.is_paid)
+                })
+                .unwrap_or(false)
             })
             .count() as u64)
     }
@@ -2527,7 +2559,14 @@ impl lnvps_db::AdminDb for MockDb {
                                 Some(region.company_id),
                             )
                         } else {
-                            (Some(vm.id), Some(host.id), Some(host.name.clone()), None, None, None)
+                            (
+                                Some(vm.id),
+                                Some(host.id),
+                                Some(host.name.clone()),
+                                None,
+                                None,
+                                None,
+                            )
                         }
                     } else {
                         (Some(vm.id), None, None, None, None, None)
@@ -2960,7 +2999,6 @@ mod tests {
         assert!(sub.is_active);
         assert!(sub.is_setup);
         drop(subs);
-
     }
 
     /// Regular subscription path: time_value is None — expires extended by subscription interval.

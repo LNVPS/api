@@ -8,7 +8,9 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
+};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -391,7 +393,10 @@ async fn admin_get_subscription_payment(
 
     let payment_id = hex::decode(&id).map_err(|_| anyhow::anyhow!("Invalid payment ID format"))?;
 
-    let payment = this.db.get_subscription_payment_with_company(&payment_id).await?;
+    let payment = this
+        .db
+        .get_subscription_payment_with_company(&payment_id)
+        .await?;
     ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(payment))
 }
 
@@ -433,6 +438,9 @@ async fn admin_complete_subscription_payment(
     }
 
     // Re-read the payment to get updated state (with company info)
-    let updated = this.db.get_subscription_payment_with_company(&payment_id).await?;
+    let updated = this
+        .db
+        .get_subscription_payment_with_company(&payment_id)
+        .await?;
     ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated))
 }

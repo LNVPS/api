@@ -204,8 +204,14 @@ impl HostCapacityService {
             if vm.deleted {
                 continue;
             }
-            let is_paid = if let Ok(li) = self.db.get_subscription_line_item(vm.subscription_line_item_id).await {
-                self.db.get_subscription(li.subscription_id).await
+            let is_paid = if let Ok(li) = self
+                .db
+                .get_subscription_line_item(vm.subscription_line_item_id)
+                .await
+            {
+                self.db
+                    .get_subscription(li.subscription_id)
+                    .await
                     .map(|s| s.is_setup)
                     .unwrap_or(false)
             } else {

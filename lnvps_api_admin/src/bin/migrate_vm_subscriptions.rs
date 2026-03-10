@@ -15,7 +15,6 @@
 ///   - upgrade_params JSON string → metadata serde_json::Value
 ///
 /// Both phases are idempotent. Use --dry-run to preview without writing.
-
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
@@ -191,7 +190,10 @@ async fn migrate_vm_subscription(
             let desc = format!("Custom VM {}", vm_id);
             (1u64, IntervalType::Month, 0u64, desc)
         } else {
-            bail!("VM {} has neither template_id nor custom_template_id", vm_id);
+            bail!(
+                "VM {} has neither template_id nor custom_template_id",
+                vm_id
+            );
         };
 
     let time_value = interval_to_seconds(interval_type, interval_amount);
@@ -236,7 +238,7 @@ async fn migrate_vm_subscription(
     let line_item = SubscriptionLineItem {
         id: 0,
         subscription_id: 0,
-        subscription_type: SubscriptionType::VmRenewal,
+        subscription_type: SubscriptionType::Vps,
         name: description,
         description: None,
         amount: line_item_amount,

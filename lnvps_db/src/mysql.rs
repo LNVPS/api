@@ -1,11 +1,11 @@
 use crate::{
     AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IntervalType, IpRange,
     IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
-    PaymentType, Referral,
-    ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmForMigration, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
+    PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
+    Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmForMigration,
+    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmPaymentRaw, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -45,10 +45,7 @@ impl LNVpsDbMysql {
         )
         .fetch_all(&self.db)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| r.get::<u32, _>("id") as u64)
-            .collect())
+        Ok(rows.iter().map(|r| r.get::<u32, _>("id") as u64).collect())
     }
 
     /// Insert a subscription_payment row by copying a vm_payment row verbatim,
@@ -125,10 +122,7 @@ impl LNVpsDbMysql {
 
     /// List all vm_payment rows for a VM, with external_data as raw String (no decryption).
     /// Used by the data migration tool to copy rows without needing the encryption key.
-    pub async fn list_vm_payments_for_migration(
-        &self,
-        vm_id: u64,
-    ) -> DbResult<Vec<VmPaymentRaw>> {
+    pub async fn list_vm_payments_for_migration(&self, vm_id: u64) -> DbResult<Vec<VmPaymentRaw>> {
         Ok(sqlx::query_as(
             "SELECT id, vm_id, created, expires, amount, currency, payment_method, payment_type, \
              external_data, external_id, is_paid, rate, time_value, tax, upgrade_params, \
@@ -589,17 +583,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         limit: u64,
         offset: u64,
     ) -> DbResult<(Vec<VmCostPlan>, u64)> {
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM vm_cost_plan")
-                .fetch_one(&self.db)
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_cost_plan")
+            .fetch_one(&self.db)
+            .await?;
+        let rows =
+            sqlx::query_as("SELECT * FROM vm_cost_plan ORDER BY created DESC LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.db)
                 .await?;
-        let rows = sqlx::query_as(
-            "SELECT * FROM vm_cost_plan ORDER BY created DESC LIMIT ? OFFSET ?",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db)
-        .await?;
         Ok((rows, total as u64))
     }
 
@@ -790,19 +782,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
              INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
              WHERE sli.subscription_id = ? \
                AND sli.subscription_type IN (3, 4) \
-               AND v.deleted = 0 \
              LIMIT 1",
         )
         .bind(subscription_id)
-        .fetch_one(&self.db)
-        .await?)
-    }
-
-    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
-        Ok(sqlx::query_as(
-            "SELECT * FROM vm WHERE subscription_line_item_id = ? AND deleted = 0 LIMIT 1",
-        )
-        .bind(line_item_id)
         .fetch_one(&self.db)
         .await?)
     }
@@ -1398,9 +1380,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     // Subscriptions
     async fn list_subscriptions(&self) -> DbResult<Vec<Subscription>> {
-        Ok(sqlx::query_as("SELECT * FROM subscription ORDER BY id DESC")
-            .fetch_all(&self.db)
-            .await?)
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription ORDER BY id DESC")
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
@@ -1437,13 +1421,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription")
                 .fetch_one(&self.db)
                 .await?;
-            let rows = sqlx::query_as(
-                "SELECT * FROM subscription ORDER BY id DESC LIMIT ? OFFSET ?",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.db)
-            .await?;
+            let rows =
+                sqlx::query_as("SELECT * FROM subscription ORDER BY id DESC LIMIT ? OFFSET ?")
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.db)
+                    .await?;
             (total, rows)
         };
         Ok((rows, total as u64))
@@ -1478,6 +1461,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
         .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn list_lifecycle_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        Ok(
+            sqlx::query_as(
+                "SELECT * FROM subscription WHERE is_active = 1 AND expires IS NOT NULL",
+            )
+            .fetch_all(&self.db)
+            .await?,
+        )
     }
 
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
@@ -1719,14 +1712,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>> {
-        Ok(
-            sqlx::query_as(
-                "SELECT * FROM subscription_payment WHERE subscription_id = ? ORDER BY created DESC",
-            )
-            .bind(subscription_id)
-            .fetch_all(&self.db)
-            .await?,
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE subscription_id = ? ORDER BY created DESC",
         )
+        .bind(subscription_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn list_subscription_payments_paginated(
@@ -1756,14 +1747,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         user_id: u64,
     ) -> DbResult<Vec<SubscriptionPayment>> {
-        Ok(
-            sqlx::query_as(
-                "SELECT * FROM subscription_payment WHERE user_id = ? ORDER BY created DESC",
-            )
-            .bind(user_id)
-            .fetch_all(&self.db)
-            .await?,
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE user_id = ? ORDER BY created DESC",
         )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn get_subscription_payment(&self, id: &Vec<u8>) -> DbResult<SubscriptionPayment> {
@@ -1889,11 +1878,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
         } else {
             // Regular subscription path: read interval from the subscription itself
-            let sub: Subscription =
-                sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
-                    .bind(payment.subscription_id)
-                    .fetch_one(tx.as_mut())
-                    .await?;
+            let sub: Subscription = sqlx::query_as("SELECT * FROM subscription WHERE id = ?")
+                .bind(payment.subscription_id)
+                .fetch_one(tx.as_mut())
+                .await?;
             let interval_sql = match sub.interval_type {
                 IntervalType::Day => "DAY",
                 IntervalType::Month => "MONTH",
@@ -1962,15 +1950,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
         );
 
         let mut count_q = sqlx::query_scalar(&count_sql);
-        if let Some(v) = is_available { count_q = count_q.bind(v); }
-        if let Some(v) = is_reserved { count_q = count_q.bind(v); }
-        if let Some(v) = registry { count_q = count_q.bind(v); }
+        if let Some(v) = is_available {
+            count_q = count_q.bind(v);
+        }
+        if let Some(v) = is_reserved {
+            count_q = count_q.bind(v);
+        }
+        if let Some(v) = registry {
+            count_q = count_q.bind(v);
+        }
         let total: i64 = count_q.fetch_one(&self.db).await?;
 
         let mut data_q = sqlx::query_as(&data_sql);
-        if let Some(v) = is_available { data_q = data_q.bind(v); }
-        if let Some(v) = is_reserved { data_q = data_q.bind(v); }
-        if let Some(v) = registry { data_q = data_q.bind(v); }
+        if let Some(v) = is_available {
+            data_q = data_q.bind(v);
+        }
+        if let Some(v) = is_reserved {
+            data_q = data_q.bind(v);
+        }
+        if let Some(v) = registry {
+            data_q = data_q.bind(v);
+        }
         data_q = data_q.bind(limit).bind(offset);
         let rows = data_q.fetch_all(&self.db).await?;
 
@@ -2203,19 +2203,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
                     WHERE 1=1";
 
         let count_sql = format!("{} {}", base, extra);
-        let data_sql = format!(
-            "{} {} ORDER BY ips.id DESC LIMIT ? OFFSET ?",
-            base, extra
-        );
+        let data_sql = format!("{} {} ORDER BY ips.id DESC LIMIT ? OFFSET ?", base, extra);
 
         let mut count_q = sqlx::query_scalar(&count_sql).bind(available_ip_space_id);
-        if let Some(u) = user_id { count_q = count_q.bind(u); }
-        if let Some(a) = is_active { count_q = count_q.bind(a); }
+        if let Some(u) = user_id {
+            count_q = count_q.bind(u);
+        }
+        if let Some(a) = is_active {
+            count_q = count_q.bind(a);
+        }
         let total: i64 = count_q.fetch_one(&self.db).await?;
 
         let mut data_q = sqlx::query_as(&data_sql).bind(available_ip_space_id);
-        if let Some(u) = user_id { data_q = data_q.bind(u); }
-        if let Some(a) = is_active { data_q = data_q.bind(a); }
+        if let Some(u) = user_id {
+            data_q = data_q.bind(u);
+        }
+        if let Some(a) = is_active {
+            data_q = data_q.bind(a);
+        }
         data_q = data_q.bind(limit).bind(offset);
         let rows = data_q.fetch_all(&self.db).await?;
 

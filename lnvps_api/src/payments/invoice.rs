@@ -1,9 +1,7 @@
-use crate::payments::complete_payment;
+use crate::subscription::SubscriptionHandler;
 use anyhow::Result;
-use chrono::Utc;
 use futures::StreamExt;
-use lnvps_api_common::WorkCommander;
-use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
+use lnvps_db::{LNVpsDb, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::{InvoiceUpdate, LightningNode};
 use std::sync::Arc;
@@ -11,16 +9,20 @@ use std::sync::Arc;
 pub struct NodeInvoiceHandler {
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
-    tx: Arc<dyn WorkCommander>,
+    sub_handler: SubscriptionHandler,
 }
 
 impl NodeInvoiceHandler {
     pub fn new(
         node: Arc<dyn LightningNode>,
         db: Arc<dyn LNVpsDb>,
-        tx: Arc<dyn WorkCommander>,
+        sub_handler: SubscriptionHandler,
     ) -> Self {
-        Self { node, tx, db }
+        Self {
+            node,
+            sub_handler,
+            db,
+        }
     }
 
     async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
@@ -37,43 +39,14 @@ impl NodeInvoiceHandler {
     }
 
     async fn complete(&self, payment: &SubscriptionPayment) -> Result<()> {
-        let db = self.db.clone();
-        let node = self.node.clone();
-        let tx = self.tx.clone();
-        let payment_id = payment.id.clone();
-
-        complete_payment(&self.db, payment, tx, "lightning", |paid_payment| {
-            let db = db.clone();
-            let node = node.clone();
-            async move {
-                // Cancel other pending Lightning upgrade invoices for this subscription
-                let vm = db.get_vm_by_subscription(paid_payment.subscription_id).await?;
-                let other_upgrades = db
-                    .list_pending_vm_subscription_payments(vm.id)
-                    .await?
-                    .into_iter()
-                    .filter(|p| {
-                        p.payment_type == SubscriptionPaymentType::Upgrade
-                            && p.payment_method == PaymentMethod::Lightning
-                            && p.id != payment_id
-                    })
-                    .collect::<Vec<_>>();
-
-                for ugp in other_upgrades {
-                    let hex_id = hex::encode(&ugp.id);
-                    if let Err(e) = node.cancel_invoice(&ugp.id).await {
-                        warn!("Failed to cancel invoice {}: {}", hex_id, e);
-                    }
-                    let mut expired = ugp;
-                    expired.expires = Utc::now();
-                    if let Err(e) = db.update_subscription_payment(&expired).await {
-                        warn!("Failed to update invoice {}: {}", hex_id, e);
-                    }
-                }
-                Ok(())
+        let result = self.sub_handler.complete_payment(&payment).await?;
+        for p in result.expired_competing_upgrades {
+            let hex_id = hex::encode(&p.id);
+            if let Err(e) = self.node.cancel_invoice(&p.id).await {
+                warn!("Failed to cancel invoice {}: {}", hex_id, e);
             }
-        })
-        .await
+        }
+        Ok(())
     }
 
     pub async fn listen(&mut self) -> Result<()> {
@@ -123,9 +96,12 @@ impl NodeInvoiceHandler {
 mod tests {
     use super::*;
     use crate::mocks::MockNode;
+    use crate::provisioner::VmProvisioner;
+    use crate::settings::mock_settings;
+    use crate::subscription::SubscriptionHandler;
     use anyhow::Result;
     use chrono::Utc;
-    use lnvps_api_common::{ChannelWorkCommander, MockDb, WorkJob};
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, WorkJob};
     use lnvps_db::{
         IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionPayment,
         SubscriptionPaymentType, SubscriptionType, Vm,
@@ -136,8 +112,13 @@ mod tests {
     async fn setup_renewal(
         time_value: u64,
         payment_type: SubscriptionPaymentType,
-    ) -> Result<(Arc<MockDb>, Arc<MockNode>, Arc<ChannelWorkCommander>, SubscriptionPayment, u64)>
-    {
+    ) -> Result<(
+        Arc<MockDb>,
+        Arc<MockNode>,
+        SubscriptionHandler,
+        SubscriptionPayment,
+        u64,
+    )> {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
 
@@ -177,7 +158,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::VmRenewal,
+                    subscription_type: SubscriptionType::Vps,
                     name: "vm renewal".to_string(),
                     description: None,
                     amount: 1000,
@@ -227,17 +208,24 @@ mod tests {
         };
         db.insert_subscription_payment(&payment).await?;
 
-        let tx = Arc::new(ChannelWorkCommander::new());
-        Ok((db, node, tx, payment, vm_id))
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node.clone(),
+            Arc::new(MockExchangeRate::default()),
+            Arc::new(ChannelWorkCommander::new()),
+        );
+
+        Ok((db, node, sub, payment, vm_id))
     }
 
     /// complete for a Renewal payment marks it paid and enqueues CheckVm.
     #[tokio::test]
     async fn test_complete_renewal_marks_paid_and_enqueues_check_vm() -> Result<()> {
-        let (db, node, tx, payment, vm_id) =
+        let (db, node, sub, payment, vm_id) =
             setup_renewal(86400, SubscriptionPaymentType::Renewal).await?;
 
-        let handler = NodeInvoiceHandler::new(node, db.clone(), tx.clone());
+        let handler = NodeInvoiceHandler::new(node, db.clone(), sub.clone());
         handler.complete(&payment).await?;
 
         // Payment should be marked paid
@@ -247,7 +235,7 @@ mod tests {
         drop(payments);
 
         // A CheckVm job should have been enqueued
-        let jobs = tx.recv().await?;
+        let jobs = sub.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         assert!(
             matches!(&jobs[0].job, WorkJob::CheckVm { vm_id: id } if *id == vm_id),
@@ -261,7 +249,7 @@ mod tests {
     /// complete for an Upgrade payment enqueues ProcessVmUpgrade.
     #[tokio::test]
     async fn test_complete_upgrade_enqueues_process_vm_upgrade() -> Result<()> {
-        let (db, node, tx, mut payment, vm_id) =
+        let (db, node, sub, mut payment, vm_id) =
             setup_renewal(0, SubscriptionPaymentType::Upgrade).await?;
 
         // Add upgrade metadata
@@ -272,11 +260,11 @@ mod tests {
         }));
         db.update_subscription_payment(&payment).await?;
 
-        let handler = NodeInvoiceHandler::new(node, db.clone(), tx.clone());
+        let handler = NodeInvoiceHandler::new(node, db.clone(), sub.clone());
         handler.complete(&payment).await?;
 
         // A ProcessVmUpgrade job should have been enqueued
-        let jobs = tx.recv().await?;
+        let jobs = sub.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         assert!(
             matches!(&jobs[0].job, WorkJob::ProcessVmUpgrade { vm_id: id, .. } if *id == vm_id),
@@ -301,8 +289,12 @@ mod tests {
     }
 
     /// Build a DB with a non-VM (IpRange) subscription and unpaid payment.
-    async fn setup_ip_range_renewal(
-    ) -> Result<(Arc<MockDb>, Arc<MockNode>, Arc<ChannelWorkCommander>, SubscriptionPayment)> {
+    async fn setup_ip_range_renewal() -> Result<(
+        Arc<MockDb>,
+        Arc<MockNode>,
+        SubscriptionHandler,
+        SubscriptionPayment,
+    )> {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
 
@@ -362,17 +354,23 @@ mod tests {
             paid_at: None,
         };
         db.insert_subscription_payment(&payment).await?;
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node.clone(),
+            Arc::new(MockExchangeRate::default()),
+            Arc::new(ChannelWorkCommander::new()),
+        );
 
-        let tx = Arc::new(ChannelWorkCommander::new());
-        Ok((db, node, tx, payment))
+        Ok((db, node, sub, payment))
     }
 
     /// complete for a non-VM (IpRange) renewal marks it paid and dispatches CheckSubscriptions.
     #[tokio::test]
     async fn test_complete_non_vm_renewal_dispatches_check_subscriptions() -> Result<()> {
-        let (db, node, tx, payment) = setup_ip_range_renewal().await?;
+        let (db, node, sub, payment) = setup_ip_range_renewal().await?;
 
-        let handler = NodeInvoiceHandler::new(node, db.clone(), tx.clone());
+        let handler = NodeInvoiceHandler::new(node, db.clone(), sub.clone());
         handler.complete(&payment).await?;
 
         // Payment should be marked paid
@@ -382,7 +380,7 @@ mod tests {
         drop(payments);
 
         // CheckSubscriptions should be dispatched (not CheckVm)
-        let jobs = tx.recv().await?;
+        let jobs = sub.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1, "expected exactly one work job");
         assert!(
             matches!(&jobs[0].job, WorkJob::CheckSubscriptions),

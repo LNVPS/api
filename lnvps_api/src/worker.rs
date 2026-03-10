@@ -1,7 +1,8 @@
 use crate::host::{FullVmInfo, get_host_client};
-use crate::provisioner::LNVpsProvisioner;
+use crate::provisioner::VmProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::ssh_client::SshClient;
+use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Days, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
@@ -12,18 +13,22 @@ use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
-    WorkFeedback, WorkJob, WorkJobMessage, op_fatal,
+    UpgradeConfig, VmHistoryLogger, VmRunningState, VmStateCache, WorkCommander, WorkFeedback,
+    WorkJob, WorkJobMessage, op_fatal,
     retry::{OpError, Pipeline, RetryPolicy},
 };
-use crate::subscription::line_item_handler;
-use lnvps_db::{CpuArch, CpuFeature, CpuMfg, LNVpsDb, Vm, VmHost, VmIpAssignment, VmOsImage};
+use lnvps_db::{
+    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, Subscription, SubscriptionLineItem,
+    SubscriptionType, Vm, VmHost, VmIpAssignment, VmOsImage,
+};
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
+use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -93,7 +98,7 @@ struct HostInfoOutput {
 pub struct Worker {
     settings: WorkerSettings,
     db: Arc<dyn LNVpsDb>,
-    provisioner: Arc<LNVpsProvisioner>,
+    subscription_handler: SubscriptionHandler,
     nostr: Option<Client>,
     vm_history_logger: VmHistoryLogger,
     vm_state_cache: VmStateCache,
@@ -129,19 +134,14 @@ impl Worker {
 
     pub async fn new(
         db: Arc<dyn LNVpsDb>,
-        provisioner: Arc<LNVpsProvisioner>,
+        work_commander: Arc<dyn WorkCommander>,
+        subscription_handler: SubscriptionHandler,
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
         nostr: Option<Client>,
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         let settings = settings.into();
-
-        let work_commander: Arc<dyn WorkCommander> = if let Some(redis_config) = &settings.redis {
-            Arc::new(RedisWorkCommander::new(&redis_config.url, "workers", "api-worker").await?)
-        } else {
-            Arc::new(ChannelWorkCommander::new())
-        };
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
             Arc::new(RedisKeyValueStore::new(&c.url).await?)
@@ -157,9 +157,10 @@ impl Worker {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
+
         Ok(Self {
             db,
-            provisioner,
+            subscription_handler,
             vm_state_cache,
             nostr,
             kv,
@@ -226,7 +227,7 @@ impl Worker {
     /// 3. Grace period exceeded: notify user; call on_grace_period_exceeded per line item
     async fn handle_subscription_state(
         &self,
-        sub: &lnvps_db::Subscription,
+        sub: &Subscription,
         last_check: DateTime<Utc>,
     ) -> Result<()> {
         const BEFORE_EXPIRE_NOTIFICATION_DAYS: u64 = 1;
@@ -235,82 +236,94 @@ impl Worker {
         };
 
         let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        let sub_notification_subject = self.sub_notification_subject(sub, &line_items).await;
+        let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
         // --- Expiring soon ---
         let expiry_window = Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
-        if expires < expiry_window && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS)) {
-            let mut renewal_attempted = false;
-            let mut renewal_successful = false;
-            let mut nwc_error = String::new();
-
+        if expires < expiry_window
+            && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS))
+        {
             #[cfg(feature = "nostr-nwc")]
             if sub.auto_renewal_enabled {
-                if let Some(ref nwc_connection) = self.db.get_user(sub.user_id).await?.nwc_connection_string {
+                let user = self.db.get_user(sub.user_id).await?;
+                if let Some(ref nwc_connection) = user.nwc_connection_string {
                     let nwc_string: String = nwc_connection.clone().into();
                     if !nwc_string.is_empty() {
-                        info!("Attempting auto-renewal for subscription {} via NWC", sub.id);
-                        renewal_attempted = true;
-                        let nwc_result = self.db.get_vm_by_subscription(sub.id).await
-                            .map_err(|_| anyhow::anyhow!("No VM linked to subscription {}", sub.id))
-                            .and_then(|vm| Ok(vm.id));
-                        match nwc_result {
-                            Ok(vm_id) => match self.provisioner.auto_renew_via_nwc(vm_id, &nwc_string).await {
-                                Ok(_) => {
-                                    renewal_successful = true;
-                                    info!("Successfully auto-renewed subscription {} via NWC", sub.id);
-                                    self.queue_notification(
-                                        sub.user_id,
-                                        format!("Your subscription '{}' has been automatically renewed via Nostr Wallet Connect.", sub.name),
-                                        Some(format!("[Sub{}] Auto-Renewed", sub.id)),
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
-                                    nwc_error = e.to_string();
-                                }
-                            },
+                        info!(
+                            "Attempting auto-renewal for subscription {} via NWC",
+                            sub.id
+                        );
+                        match self
+                            .subscription_handler
+                            .auto_renew_via_nwc(sub.id, &nwc_string)
+                            .await
+                        {
+                            Ok(_) => {
+                                info!("Successfully auto-renewed subscription {} via NWC", sub.id);
+                                self.queue_notification(
+                                    sub.user_id,
+                                    format!("Your subscription has been automatically renewed via Nostr Wallet Connect.\n{}", sub_notification_descr),
+                                    Some(format!("[{}] Auto-Renewed", sub_notification_subject)),
+                                ).await;
+                            }
                             Err(e) => {
-                                warn!("NWC renewal: {}", e);
-                                nwc_error = e.to_string();
+                                warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
+                                self.queue_notification(
+                                    sub.user_id,
+                                    format!(
+                                        "Your subscription will expire soon.\nAutomatic renewal failed: '{}'\nPlease renew manually in the next {} day(s).\n{}",
+                                        e, BEFORE_EXPIRE_NOTIFICATION_DAYS, sub_notification_descr
+                                    ),
+                                    Some(format!("[{}] Expiring Soon", sub_notification_subject)),
+                                )
+                                    .await;
                             }
                         }
+
+                        return Ok(());
                     }
                 }
             }
+        } else if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
+            // mark subscription as not-active
+            let mut sub = sub.clone();
+            sub.is_active = false;
+            self.db.update_subscription(&sub).await?;
 
-            if !renewal_attempted || !renewal_successful {
-                let message = if renewal_attempted {
-                    format!(
-                        "Your subscription '{}' will expire soon.\nAutomatic renewal failed: '{}'\nPlease renew manually in the next {} day(s).",
-                        sub.name, nwc_error, BEFORE_EXPIRE_NOTIFICATION_DAYS
-                    )
-                } else {
-                    format!(
-                        "Your subscription '{}' will expire soon. Please renew in the next {} day(s).",
-                        sub.name, BEFORE_EXPIRE_NOTIFICATION_DAYS
-                    )
-                };
-                self.queue_notification(
-                    sub.user_id,
-                    message,
-                    Some(format!("[Sub{}] Expiring Soon", sub.id)),
-                ).await;
-            }
-
+            self.queue_notification(
+                sub.user_id,
+                format!(
+                    "Your subscription has been cancelled.\n{}",
+                    sub_notification_descr
+                ),
+                Some(format!("[{}] Cancelled", sub_notification_subject)),
+            )
+            .await;
             for li in &line_items {
-                match line_item_handler(li, self.db.clone(), self.work_commander.clone()).await {
-                    Ok(h) => { let _ = h.on_expiring_soon(sub).await; }
+                match self.subscription_handler.make_line_item_handler(li).await {
+                    Ok(h) => {
+                        if let Err(e) = h.on_grace_period_exceeded(&sub, li).await {
+                            warn!(
+                                "on_grace_period_exceeded failed for line item {}: {}",
+                                li.id, e
+                            );
+                        }
+                    }
                     Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
-        }
-
-        // --- Expired ---
-        if expires < Utc::now() {
+        } else if expires < Utc::now() {
+            self.queue_notification(
+                sub.user_id,
+                format!("Your subscription has expired.\n{}", sub_notification_descr),
+                Some(format!("[{}] Expired", sub_notification_subject)),
+            )
+            .await;
             for li in &line_items {
-                match line_item_handler(li, self.db.clone(), self.work_commander.clone()).await {
+                match self.subscription_handler.make_line_item_handler(li).await {
                     Ok(h) => {
-                        if let Err(e) = h.on_expired(sub).await {
+                        if let Err(e) = h.on_expired(sub, li).await {
                             warn!("on_expired failed for line item {}: {}", li.id, e);
                         }
                     }
@@ -319,26 +332,70 @@ impl Worker {
             }
         }
 
-        // --- Grace period exceeded ---
-        if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
-            self.queue_notification(
-                sub.user_id,
-                format!("Your subscription '{}' has been cancelled after the grace period.", sub.name),
-                Some(format!("[Sub{}] Cancelled", sub.id)),
-            ).await;
-            for li in &line_items {
-                match line_item_handler(li, self.db.clone(), self.work_commander.clone()).await {
-                    Ok(h) => {
-                        if let Err(e) = h.on_grace_period_exceeded(sub).await {
-                            warn!("on_grace_period_exceeded failed for line item {}: {}", li.id, e);
-                        }
-                    }
-                    Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
-                }
+        Ok(())
+    }
+
+    /// Get the subscription notification subject line
+    async fn sub_notification_subject(
+        &self,
+        sub: &Subscription,
+        line_items: &Vec<SubscriptionLineItem>,
+    ) -> String {
+        if line_items
+            .iter()
+            .all(|l| l.subscription_type == SubscriptionType::Vps)
+        {
+            if let Ok(vm) = self.db.get_vm_by_subscription(sub.id).await {
+                return format!("VM{}", vm.id);
             }
         }
+        format!("Sub #{}", sub.id)
+    }
 
-        Ok(())
+    /// Get the subscription notification message body, describe the line items / services
+    fn sub_notification_message(
+        sub: &Subscription,
+        line_items: &Vec<SubscriptionLineItem>,
+    ) -> String {
+        let mut msg = format!("Subscription: {}\n\nLine Items:\n", sub.name);
+
+        for li in line_items {
+            let formatted_amount = if let Ok(cur) = Currency::from_str(&sub.currency) {
+                CurrencyAmount::from_u64(cur, li.amount).to_string()
+            } else {
+                li.amount.to_string()
+            };
+
+            let formatted_setup_amount = if let Ok(cur) = Currency::from_str(&sub.currency) {
+                CurrencyAmount::from_u64(cur, li.setup_amount).to_string()
+            } else {
+                li.amount.to_string()
+            };
+
+            let interval_type_str = match sub.interval_type {
+                IntervalType::Day => "day",
+                IntervalType::Month => "month",
+                IntervalType::Year => "year",
+            };
+
+            msg.push_str(&format!(
+                "- {}: {}/{}{}\n",
+                li.name,
+                formatted_amount,
+                interval_type_str,
+                if li.setup_amount > 0 {
+                    format!(" ({} setup fee)", formatted_setup_amount)
+                } else {
+                    "".to_string()
+                }
+            ));
+        }
+
+        if let Some(ref desc) = sub.description {
+            msg.push_str(&format!("\nDescription: {}\n", desc));
+        }
+
+        msg
     }
 
     /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
@@ -353,11 +410,8 @@ impl Worker {
             return Ok(());
         }
 
-        let subscriptions = self.db.list_subscriptions().await?;
+        let subscriptions = self.db.list_lifecycle_subscriptions().await?;
         for sub in &subscriptions {
-            if !sub.is_active {
-                continue;
-            }
             if let Err(e) = self.handle_subscription_state(sub, last_check).await {
                 error!("Failed to handle subscription {} state: {}", sub.id, e);
             }
@@ -369,74 +423,21 @@ impl Worker {
 
     /// Resolve the authoritative expiry for a VM from its subscription.
     async fn vm_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
-        let result = async {
-            let line_item = self
-                .db
-                .get_subscription_line_item(vm.subscription_line_item_id)
-                .await?;
-            let sub = self.db.get_subscription(line_item.subscription_id).await?;
-            anyhow::Ok(sub.expires)
-        }
-        .await;
-        result.unwrap_or(None)
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await
+            .ok()?;
+        let sub = self
+            .db
+            .get_subscription(line_item.subscription_id)
+            .await
+            .ok()?;
+        sub.expires
     }
 
-    /// Handle VM hypervisor state:
-    /// - Stop VM if subscription has expired and it is still running
-    /// - Delete VM if subscription expiry has exceeded the grace period
-    ///
-    /// Expiry notifications and NWC auto-renewal are handled by `handle_subscription_state`
-    /// (driven by `check_subscriptions`), not here.
-    async fn handle_vm_state(&self, vm: &Vm, state: &VmRunningState) -> Result<()> {
-        let Some(expires) = self.vm_expires(vm).await else {
-            // Subscription not yet paid — nothing to enforce
-            return Ok(());
-        };
-
-        // Stop VM if expired and is running
-        if expires < Utc::now() && state.state == VmRunningStates::Running {
-            info!("Stopping expired VM {}", vm.id);
-            if let Err(e) = self.provisioner.stop_vm(vm.id).await {
-                warn!("Failed to stop VM {}: {}", vm.id, e);
-            } else if let Err(e) = self.vm_history_logger.log_vm_expired(vm.id, None).await {
-                warn!("Failed to log VM {} expiration: {}", vm.id, e);
-            }
-            self.queue_notification(
-                vm.user_id,
-                format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.", vm.id, self.settings.delete_after),
-                Some(format!("[VM{}] Expired", vm.id)),
-            ).await;
-        }
-
-        // Delete VM if expired > self.settings.delete_after days
-        if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() && !vm.deleted {
-            info!("Deleting expired VM {}", vm.id);
-            self.provisioner.delete_vm(vm.id).await?;
-
-            // Log VM deletion
-            if let Err(e) = self
-                .vm_history_logger
-                .log_vm_deleted(vm.id, None, Some("expired and exceeded grace period"), None)
-                .await
-            {
-                warn!("Failed to log VM {} deletion: {}", vm.id, e);
-            }
-
-            let title = Some(format!("[VM{}] Deleted", vm.id));
-            self.queue_notification(
-                vm.user_id,
-                format!("Your VM #{} has been deleted!", vm.id),
-                title.clone(),
-            )
-            .await;
-            self.queue_admin_notification(format!("VM{} is ready for deletion", vm.id), title)
-                .await;
-        }
-
-        Ok(())
-    }
-
-    /// Check a VM's status
+    /// Check VM state from hypervisor and update cache
+    /// Lifecycle enforcement (stop/delete) is handled by subscription lifecycle handlers.
     async fn check_vm(&self, vm: &Vm) -> Result<()> {
         debug!("Checking VM: {}", vm.id);
         let host = self.db.get_host(vm.host_id).await?;
@@ -444,12 +445,16 @@ impl Worker {
 
         match client.get_vm_state(vm).await {
             Ok(s) => {
-                self.handle_vm_state(vm, &s).await?;
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
             Err(e) => {
                 warn!("Failed to get VM{} state: {}", vm.id, e);
-                if self.vm_expires(vm).await.map(|e| e > Utc::now()).unwrap_or(false) {
+                if self
+                    .vm_expires(vm)
+                    .await
+                    .map(|e| e > Utc::now())
+                    .unwrap_or(false)
+                {
                     self.spawn_vm_internal(vm).await?;
                 }
             }
@@ -464,18 +469,19 @@ impl Worker {
         let client = get_host_client(&host, &self.settings.provisioner_config)?;
 
         let states = client.get_all_vm_states().await?;
-        // Create a map of VM states by VM ID for quick lookup
         let state_map: HashMap<u64, VmRunningState> = states.into_iter().collect();
 
         for vm in vms {
             if let Some(state) = state_map.get(&vm.id) {
-                // Use the bulk-fetched state
-                self.handle_vm_state(vm, state).await?;
                 self.vm_state_cache.set_state(vm.id, state.clone()).await?;
             } else {
-                // VM not found in bulk response, handle as missing
                 warn!("VM {} not found in bulk response", vm.id);
-                if self.vm_expires(vm).await.map(|e| e > Utc::now()).unwrap_or(false) {
+                if self
+                    .vm_expires(vm)
+                    .await
+                    .map(|e| e > Utc::now())
+                    .unwrap_or(false)
+                {
                     self.spawn_vm_internal(vm).await?;
                 }
             }
@@ -485,7 +491,8 @@ impl Worker {
 
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
-        let pipeline = self.provisioner.spawn_vm_pipeline(vm.id).await?;
+        let provisioner = self.subscription_handler.vm_provisioner();
+        let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
         pipeline.execute().await?;
 
         // Log VM created
@@ -576,6 +583,7 @@ impl Worker {
 
         // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
+        let provisioner = self.subscription_handler.vm_provisioner();
 
         // Group VMs by host for bulk checking
         let mut vms_by_host: HashMap<u64, Vec<&Vm>> = HashMap::new();
@@ -612,7 +620,7 @@ impl Worker {
         // Process deletions first
         for vm in vms_to_delete {
             info!("Deleting unpaid VM {}", vm.id);
-            if let Err(e) = self.provisioner.delete_vm(vm.id).await {
+            if let Err(e) = provisioner.delete_vm(vm.id).await {
                 error!("Failed to delete unpaid VM {}: {}", vm.id, e);
                 self.queue_admin_notification(
                     format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
@@ -626,7 +634,6 @@ impl Worker {
         for (host_id, vms) in vms_by_host {
             if let Err(e) = self.check_vms_on_host(host_id, &vms).await {
                 error!("Failed to check VMs on host {}: {}", host_id, e);
-                // Fall back to individual checking for this host
                 for vm in vms {
                     if let Err(e) = self.check_vm(vm).await {
                         error!("Failed to check VM {}: {}", vm.id, e);
@@ -915,7 +922,13 @@ impl Worker {
         // Patch firewall configuration for all VMs on this host
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
-            if !vm.deleted && self.vm_expires(vm).await.map(|e| e > Utc::now()).unwrap_or(false) {
+            if !vm.deleted
+                && self
+                    .vm_expires(vm)
+                    .await
+                    .map(|e| e > Utc::now())
+                    .unwrap_or(false)
+            {
                 info!("Patching firewall for VM {} on host {}", vm.id, host.name);
                 match FullVmInfo::load(vm.id, self.db.clone()).await {
                     Ok(vm_config) => {
@@ -1622,7 +1635,8 @@ impl Worker {
                 }
 
                 // Delete the VM via provisioner
-                self.provisioner.delete_vm(*vm_id).await?;
+                let provisioner = self.subscription_handler.vm_provisioner();
+                provisioner.delete_vm(*vm_id).await?;
 
                 // Log VM deletion
                 let metadata = if let Some(admin_id) = admin_user_id {
@@ -1677,12 +1691,18 @@ impl Worker {
                 }
 
                 // Check if VM is expired via subscription
-                if self.vm_expires(&vm).await.map(|e| e < Utc::now()).unwrap_or(false) {
+                if self
+                    .vm_expires(&vm)
+                    .await
+                    .map(|e| e < Utc::now())
+                    .unwrap_or(false)
+                {
                     bail!("Cannot start expired VM {}", vm_id);
                 }
 
                 // Start the VM via provisioner
-                self.provisioner.start_vm(*vm_id).await?;
+                let provisioner = self.subscription_handler.vm_provisioner();
+                provisioner.start_vm(*vm_id).await?;
 
                 // Log VM start
                 let metadata = if let Some(admin_id) = admin_user_id {
@@ -1732,7 +1752,8 @@ impl Worker {
                 }
 
                 // Stop the VM via provisioner
-                self.provisioner.stop_vm(*vm_id).await?;
+                let provisioner = self.subscription_handler.vm_provisioner();
+                provisioner.stop_vm(*vm_id).await?;
 
                 // Log VM stop
                 let metadata = if let Some(admin_id) = admin_user_id {
@@ -1835,9 +1856,8 @@ impl Worker {
                 reason,
             } => {
                 info!("Admin {} creating VM for user {}", admin_user_id, user_id);
-
-                let vm = self
-                    .provisioner
+                let provisioner = self.subscription_handler.vm_provisioner();
+                let vm = provisioner
                     .provision(
                         *user_id,
                         *template_id,
@@ -1979,7 +1999,7 @@ impl Worker {
             vm_id: u64,
             cfg: UpgradeConfig,
             db: Arc<dyn LNVpsDb>,
-            provisioner: Arc<LNVpsProvisioner>,
+            provisioner: VmProvisioner,
             settings: WorkerSettings,
             vm_history_logger: VmHistoryLogger,
         }
@@ -1988,7 +2008,7 @@ impl Worker {
             vm_id,
             cfg: cfg.clone(),
             db: self.db.clone(),
-            provisioner: self.provisioner.clone(),
+            provisioner: self.subscription_handler.vm_provisioner(),
             settings: self.settings.clone(),
             vm_history_logger: self.vm_history_logger.clone(),
         };
@@ -2265,7 +2285,8 @@ impl Worker {
             dns_reverse_ref: None,
         };
 
-        self.provisioner
+        self.subscription_handler
+            .vm_provisioner()
             .network
             .save_ip_assignment(&mut assignment)
             .await?;
@@ -2320,7 +2341,8 @@ impl Worker {
         let mut assignment = self.db.get_vm_ip_assignment(assignment_id).await?;
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
-        self.provisioner
+        self.subscription_handler
+            .vm_provisioner()
             .network
             .delete_ip_assignment(&mut assignment, &range)
             .await?;
@@ -2375,7 +2397,8 @@ impl Worker {
         let mut assignment = self.db.get_vm_ip_assignment(assignment_id).await?;
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
-        self.provisioner
+        self.subscription_handler
+            .vm_provisioner()
             .network
             .update_ip_assignment_policy(&mut assignment, &range)
             .await?;

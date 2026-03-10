@@ -467,7 +467,10 @@ async fn admin_extend_vm(
     }
 
     // Extend the subscription expiry (single source of truth)
-    let li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+    let li = this
+        .db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await?;
     let mut sub = this.db.get_subscription(li.subscription_id).await?;
     let old_expires = sub.expires.unwrap_or(Utc::now());
     let new_expires = old_expires + Days::new(req.days as u64);
@@ -617,10 +620,7 @@ async fn admin_get_vm_payment(
     let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
 
     // Get subscription payment
-    let payment = this
-        .db
-        .get_subscription_payment(&payment_id_bytes)
-        .await?;
+    let payment = this.db.get_subscription_payment(&payment_id_bytes).await?;
 
     // Verify the payment's subscription belongs to this VM
     let payment_vm = this
@@ -681,22 +681,25 @@ async fn admin_calculate_vm_refund(
     // Create pricing engine instance with real exchange rates
     let tax_rates = std::collections::HashMap::new();
 
-    let pricing_engine =
-        PricingEngine::new_for_vm(this.db.clone(), this.exchange.clone(), tax_rates, vm_id).await?;
+    let pricing_engine = PricingEngine::new(this.db.clone(), this.exchange.clone(), tax_rates);
 
     // Calculate the refund amount from the specified date
     let refund_result = pricing_engine
-        .calculate_refund_amount_from_date(vm_id, payment_method, calculation_date)
+        .calculate_vm_refund_amount_from_date(vm_id, payment_method, calculation_date)
         .await?;
 
-    let vm_li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+    let vm_li = this
+        .db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await?;
     let vm_sub = this.db.get_subscription(vm_li.subscription_id).await?;
     let refund_info = AdminRefundAmountInfo {
         amount: refund_result.amount.value(),
         currency: refund_result.amount.currency().to_string(),
         rate: refund_result.rate.rate,
         expires: vm_sub.expires,
-        seconds_remaining: vm_sub.expires
+        seconds_remaining: vm_sub
+            .expires
             .map(|e| (e - calculation_date).num_seconds())
             .unwrap_or(0),
     };
@@ -830,10 +833,7 @@ async fn admin_complete_vm_payment(
     let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
 
     // Get subscription payment and verify it belongs to this VM
-    let payment = this
-        .db
-        .get_subscription_payment(&payment_id_bytes)
-        .await?;
+    let payment = this.db.get_subscription_payment(&payment_id_bytes).await?;
     let payment_vm = this
         .db
         .get_vm_by_subscription(payment.subscription_id)
@@ -874,10 +874,7 @@ async fn admin_complete_vm_payment(
     }
 
     // Re-read the payment to get updated paid_at / is_paid
-    let updated = this
-        .db
-        .get_subscription_payment(&payment_id_bytes)
-        .await?;
+    let updated = this.db.get_subscription_payment(&payment_id_bytes).await?;
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
     ApiData::ok(AdminVmPaymentInfo::from_subscription_payment(
         &updated,

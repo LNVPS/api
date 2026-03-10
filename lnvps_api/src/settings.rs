@@ -1,10 +1,7 @@
 use crate::dns::DnsServer;
-use crate::exchange::ExchangeRateService;
-use crate::provisioner::LNVpsProvisioner;
 use anyhow::Result;
 use isocountry::CountryCode;
 use lnvps_api_common::RedisConfig;
-use lnvps_db::LNVpsDb;
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::LightningNode;
 use serde::{Deserialize, Serialize};
@@ -106,6 +103,9 @@ pub struct DnsServerConfig {
 pub enum DnsServerApi {
     #[serde(rename_all = "kebab-case")]
     Cloudflare { token: String },
+
+    #[cfg(test)]
+    Mock,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -211,29 +211,16 @@ pub struct EncryptionConfig {
 }
 
 impl Settings {
-    pub fn get_provisioner(
-        &self,
-        db: Arc<dyn LNVpsDb>,
-        node: Arc<dyn LightningNode>,
-        exchange: Arc<dyn ExchangeRateService>,
-    ) -> Arc<LNVpsProvisioner> {
-        Arc::new(LNVpsProvisioner::new(
-            self.clone(),
-            db,
-            node,
-            exchange,
-            self.get_dns().expect("DNS server config"),
-        ))
-    }
-
-    pub fn get_dns(&self) -> Result<Option<Arc<dyn DnsServer>>> {
+    pub fn get_dns(&self) -> Option<Arc<dyn DnsServer>> {
         match &self.dns {
-            None => Ok(None),
+            None => None,
             Some(c) => match &c.api {
                 #[cfg(feature = "cloudflare")]
                 DnsServerApi::Cloudflare { token } => {
-                    Ok(Some(Arc::new(crate::dns::Cloudflare::new(token))))
+                    Some(Arc::new(crate::dns::Cloudflare::new(token)))
                 }
+                #[cfg(test)]
+                DnsServerApi::Mock => Some(Arc::new(crate::mocks::MockDnsServer::new())),
             },
         }
     }
@@ -304,9 +291,7 @@ pub fn mock_settings() -> Settings {
         smtp: None,
         dns: Some(DnsServerConfig {
             forward_zone_id: "mock-forward-zone-id".to_string(),
-            api: DnsServerApi::Cloudflare {
-                token: "abc".to_string(),
-            },
+            api: DnsServerApi::Mock,
         }),
         nostr: None,
         revolut: None,

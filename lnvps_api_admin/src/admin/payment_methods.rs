@@ -40,8 +40,10 @@ async fn admin_list_payment_methods(
         .list_payment_method_configs_paginated(limit, offset)
         .await?;
 
-    let configs: Vec<AdminPaymentMethodConfigInfo> =
-        page.into_iter().map(AdminPaymentMethodConfigInfo::from).collect();
+    let configs: Vec<AdminPaymentMethodConfigInfo> = page
+        .into_iter()
+        .map(AdminPaymentMethodConfigInfo::from)
+        .collect();
 
     ApiPaginatedData::ok(configs, total, limit, offset)
 }

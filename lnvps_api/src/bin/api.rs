@@ -6,7 +6,7 @@ use lnvps_api::dvm::start_dvms;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
 use lnvps_api::worker::Worker;
-use lnvps_api_common::VmHistoryLogger;
+use lnvps_api_common::{ChannelWorkCommander, RedisWorkCommander, VmHistoryLogger, WorkCommander};
 use lnvps_api_common::{VmStateCache, WorkJob, make_exchange_service};
 use std::fmt::{Display, Formatter};
 
@@ -16,6 +16,7 @@ use nostr_sdk::{Client, Keys};
 
 use axum::Router;
 use lnvps_api::api::*;
+use lnvps_api::subscription::SubscriptionHandler;
 use payments_rs::lightning::setup_crypto_provider;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -110,24 +111,37 @@ async fn main() -> Result<(), Error> {
     } else {
         VmStateCache::new()
     };
-    let vm_history = Arc::new(VmHistoryLogger::new(db.clone()));
-    let provisioner = settings.get_provisioner(db.clone(), node.clone(), exchange.clone());
-    provisioner.init().await?;
+    let vm_history = VmHistoryLogger::new(db.clone());
+
+    let work_commander: Arc<dyn WorkCommander> = if let Some(redis_config) = &settings.redis {
+        Arc::new(RedisWorkCommander::new(&redis_config.url, "workers", "api-worker").await?)
+    } else {
+        Arc::new(ChannelWorkCommander::new())
+    };
+
+    let sub_handler = SubscriptionHandler::new(
+        settings.clone(),
+        db.clone(),
+        node.clone(),
+        exchange.clone(),
+        work_commander.clone(),
+    );
+    sub_handler.vm_provisioner().init().await?;
 
     let worker = Worker::new(
         db.clone(),
-        provisioner.clone(),
+        work_commander.clone(),
+        sub_handler.clone(),
         &settings,
         status.clone(),
         nostr_client.clone(),
     )
     .await?;
-
     let mode = args.mode.unwrap_or(vec![ExecMode::Worker, ExecMode::Api]);
 
     if mode.contains(&ExecMode::Worker) {
         // Data migrations touch hosts, ARP tables, DNS, etc. — worker concerns only.
-        run_data_migrations(db.clone(), provisioner.clone(), &settings).await?;
+        run_data_migrations(db.clone(), sub_handler.vm_provisioner(), &settings).await?;
 
         tasks.push(worker.spawn_job_interval(WorkJob::CheckVms, Duration::from_secs(30)));
         tasks.push(worker.spawn_job_interval(WorkJob::CheckSubscriptions, Duration::from_secs(30)));
@@ -140,11 +154,14 @@ async fn main() -> Result<(), Error> {
                 worker.spawn_job_interval(WorkJob::CheckNostrDomains, Duration::from_secs(600)),
             );
         }
+
+        // check vms now to get current state
+        worker.send(WorkJob::CheckVms).await?;
     }
 
     // setup payment handlers
     tasks.extend(
-        listen_all_payments(&settings, node.clone(), db.clone(), worker.commander()).await?,
+        listen_all_payments(&settings, node.clone(), db.clone(), sub_handler.clone()).await?,
     );
 
     // refresh rates every 1min
@@ -166,7 +183,7 @@ async fn main() -> Result<(), Error> {
     #[cfg(feature = "nostr-dvm")]
     {
         let nostr_client = nostr_client.unwrap();
-        tasks.push(start_dvms(nostr_client.clone(), provisioner.clone()));
+        tasks.push(start_dvms(nostr_client.clone(), sub_handler.clone()));
     }
 
     // request for host info to be patched
@@ -224,7 +241,7 @@ async fn main() -> Result<(), Error> {
                     .with_state(RouterState {
                         db,
                         state: status,
-                        provisioner,
+                        sub_handler,
                         history: vm_history,
                         settings,
                         rates: exchange,

@@ -7,8 +7,8 @@ use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use isocountry::CountryCode;
-use lnurl::Tag;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
+use lnurl::{LnUrlResponse, Tag};
 use log::{error, info};
 use nostr_sdk::{ToBech32, Url};
 use payments_rs::currency::CurrencyAmount;
@@ -364,14 +364,21 @@ async fn v1_patch_vm(
         let mut ips = this.db.list_vm_ip_assignments(vm.id).await?;
         for ip in ips.iter_mut() {
             ip.dns_reverse = Some(ptr.to_string());
-            this.provisioner.network.update_reverse_ip_dns(ip).await?;
+            this.sub_handler
+                .vm_provisioner()
+                .network
+                .update_reverse_ip_dns(ip)
+                .await?;
             this.db.update_vm_ip_assignment(ip).await?;
         }
     }
 
     // Handle auto-renewal setting change — stored on the subscription, not the VM
     if let Some(auto_renewal) = data.auto_renewal_enabled {
-        let li = this.db.get_subscription_line_item(vm.subscription_line_item_id).await?;
+        let li = this
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
         let mut sub = this.db.get_subscription(li.subscription_id).await?;
         sub.auto_renewal_enabled = auto_renewal;
         this.db.update_subscription(&sub).await?;
@@ -528,7 +535,8 @@ async fn v1_create_custom_vm_order(
     let template = req.spec.clone().into();
 
     let rsp = this
-        .provisioner
+        .sub_handler
+        .vm_provisioner()
         .provision_custom(uid, template, req.image_id, req.ssh_key_id, req.ref_code)
         .await?;
 
@@ -611,7 +619,8 @@ async fn v1_create_vm_order(
     }
 
     let rsp = this
-        .provisioner
+        .sub_handler
+        .vm_provisioner()
         .provision(
             uid,
             req.template_id,
@@ -637,19 +646,26 @@ async fn v1_renew_vm(
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
 ) -> ApiResult<ApiVmPayment> {
-    let (uid, _) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let user = this.db.get_user(uid).await?;
     let intervals = q.intervals.unwrap_or(1);
+    let vm_line = this
+        .db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await?;
 
     // handle "nwc" payments automatically
     let payment = if q.method.as_deref() == Some("nwc") && user.nwc_connection_string.is_some() {
-        this.provisioner
-            .auto_renew_via_nwc(id, user.nwc_connection_string.unwrap().as_str())
+        this.sub_handler
+            .auto_renew_via_nwc(
+                vm_line.subscription_id,
+                user.nwc_connection_string.unwrap().as_str(),
+            )
             .await?
     } else {
-        this.provisioner
-            .renew_intervals(
-                id,
+        this.sub_handler
+            .renew_subscription(
+                vm_line.subscription_id,
                 q.method
                     .and_then(|m| PaymentMethod::from_str(&m).ok())
                     .unwrap_or(PaymentMethod::Lightning),
@@ -666,24 +682,46 @@ async fn v1_renew_vm_lnurlp(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<AmountQuery>,
-) -> Result<Json<LnURLPayInvoice>, &'static str> {
-    let vm = this.db.get_vm(id).await.map_err(|_e| "VM not found")?;
+) -> Result<Json<LnURLPayInvoice>, Json<lnurl::Response>> {
+    let vm = this.db.get_vm(id).await.map_err(|_| {
+        Json(lnurl::Response::Error {
+            reason: "VM not found".to_string(),
+        })
+    })?;
     if vm.deleted {
-        return Err("VM not found");
+        return Err(lnurl::Response::Error {
+            reason: "VM not found".to_string(),
+        }
+        .into());
     }
     if q.amount < 1000 {
-        return Err("Amount must be greater than 1000");
+        return Err(lnurl::Response::Error {
+            reason: "Amount must be greater than 1000".to_string(),
+        }
+        .into());
     }
-
+    let vm_line = this
+        .db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await
+        .map_err(|_| {
+            Json(lnurl::Response::Error {
+                reason: "VM not found".to_string(),
+            })
+        })?;
     let rsp = this
-        .provisioner
+        .sub_handler
         .renew_amount(
-            id,
+            vm_line.subscription_id,
             CurrencyAmount::millisats(q.amount),
             PaymentMethod::Lightning,
         )
         .await
-        .map_err(|_| "Error generating invoice")?;
+        .map_err(|_| {
+            Json(lnurl::Response::Error {
+                reason: "Error generating invoice".to_string(),
+            })
+        })?;
 
     // external_data is pr for lightning payment method
     Ok(Json(LnURLPayInvoice::new(rsp.external_data.into())))
@@ -707,7 +745,7 @@ async fn v1_lnurlp(
             .map_err(|_| "Could not get callback url")?
             .to_string(),
         max_sendable: 1_000_000_000,
-        min_sendable: 1_000, // TODO: calc min by using 1s extend time
+        min_sendable: 100_000, // TODO: calc min by using 1s extend time
         tag: Tag::PayRequest,
         metadata: serde_json::to_string(&meta).map_err(|_e| "Failed to serialize metadata")?,
         comment_allowed: None,
@@ -1032,7 +1070,10 @@ async fn v1_get_payment(
     };
 
     let payment = this.db.get_subscription_payment(&id).await?;
-    let vm = this.db.get_vm_by_subscription(payment.subscription_id).await?;
+    let vm = this
+        .db
+        .get_vm_by_subscription(payment.subscription_id)
+        .await?;
     if vm.user_id != uid {
         return ApiData::err("VM does not belong to you");
     }
@@ -1260,8 +1301,9 @@ async fn v1_vm_upgrade_quote(
 
     // Calculate the upgrade cost and new renewal cost
     match this
-        .provisioner
-        .calculate_upgrade_cost(
+        .sub_handler
+        .pricing_engine()
+        .calculate_vm_upgrade_cost(
             id,
             &cfg,
             q.method
@@ -1303,8 +1345,8 @@ async fn v1_vm_upgrade(
 
     // Create upgrade payment
     let payment = this
-        .provisioner
-        .create_upgrade_payment(
+        .sub_handler
+        .create_vm_upgrade_payment(
             id,
             &cfg,
             q.method

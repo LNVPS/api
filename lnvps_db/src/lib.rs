@@ -239,13 +239,10 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Get a VM by subscription ID — finds the VM(Renewal/Upgrade) line item for the subscription
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm>;
-    async fn get_vm_by_subscription_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
 
     /// List subscription payments for a VM (via vm → line_item → subscription)
-    async fn list_vm_subscription_payments(
-        &self,
-        vm_id: u64,
-    ) -> DbResult<Vec<SubscriptionPayment>>;
+    async fn list_vm_subscription_payments(&self, vm_id: u64)
+    -> DbResult<Vec<SubscriptionPayment>>;
 
     /// List unpaid, non-expired subscription payments for a VM
     async fn list_pending_vm_subscription_payments(
@@ -423,13 +420,15 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn list_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
 
     /// List all active subscriptions expiring within `within_seconds` seconds from now.
-    async fn list_expiring_subscriptions(
-        &self,
-        within_seconds: u64,
-    ) -> DbResult<Vec<Subscription>>;
+    async fn list_expiring_subscriptions(&self, within_seconds: u64)
+    -> DbResult<Vec<Subscription>>;
 
     /// List all active subscriptions that have already expired.
     async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>>;
+
+    /// List subscriptions that need lifecycle management (active with expires set).
+    /// This filters out: inactive subscriptions, subscriptions never paid (expires IS NULL).
+    async fn list_lifecycle_subscriptions(&self) -> DbResult<Vec<Subscription>>;
 
     /// Deactivate a subscription: set `is_active = false`.
     /// Also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows.

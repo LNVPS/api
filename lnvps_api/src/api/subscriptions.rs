@@ -44,7 +44,10 @@ async fn v1_list_subscriptions(
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
 
-    let (page, total) = this.db.list_subscriptions_paginated(Some(uid), limit, offset).await?;
+    let (page, total) = this
+        .db
+        .list_subscriptions_paginated(Some(uid), limit, offset)
+        .await?;
 
     let mut subscriptions = Vec::new();
     for subscription in page {
@@ -287,7 +290,7 @@ async fn v1_renew_subscription(
 
     // Generate payment via provisioner
     let payment = this
-        .provisioner
+        .sub_handler
         .renew_subscription(id, method, 1)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;

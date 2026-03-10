@@ -18,6 +18,8 @@ mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
 
+mod dummy_host;
+
 pub struct TerminalStream {
     pub rx: Receiver<Vec<u8>>,
     pub tx: Sender<Vec<u8>>,
@@ -93,9 +95,6 @@ pub async fn get_vm_host_client(
 }
 
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
-    #[cfg(test)]
-    return Ok(Arc::new(crate::mocks::MockVmHost::new()));
-
     Ok(match host.kind.clone() {
         #[cfg(feature = "proxmox")]
         VmHostKind::Proxmox if cfg.proxmox.is_some() => {
@@ -114,6 +113,7 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
             let cfg = cfg.libvirt.clone().unwrap();
             Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg.qemu)?)
         }
+        VmHostKind::Dummy => Arc::new(dummy_host::DummyVmHost::new()),
         _ => bail!("Unknown host config: {}", host.kind),
     })
 }
