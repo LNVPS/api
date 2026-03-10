@@ -228,7 +228,7 @@ mod tests {
             node.clone(),
             exch.clone(),
             Arc::new(ChannelWorkCommander::new()),
-        );
+        )?;
         let keys = Keys::generate();
         let empty_client = Client::new(keys.clone());
         empty_client.add_relay("wss://nos.lol").await?;

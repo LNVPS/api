@@ -91,15 +91,15 @@ impl SubscriptionHandler {
         node: Arc<dyn LightningNode>,
         rates: Arc<dyn ExchangeRateService>,
         tx: Arc<dyn WorkCommander>,
-    ) -> Self {
-        Self {
-            revolut: settings.get_revolut().expect("revolut config"),
+    ) -> Result<Self> {
+        Ok(Self {
+            revolut: settings.get_revolut()?,
             pe: PricingEngine::new(db.clone(), rates, settings.tax_rate.clone()),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             db,
             tx,
             node,
-        }
+        })
     }
 
     pub fn work_commander(&self) -> Arc<dyn WorkCommander> {
@@ -181,11 +181,28 @@ impl SubscriptionHandler {
         );
 
         if payment.payment_type == SubscriptionPaymentType::Upgrade {
-            // Cancel other pending Lightning upgrade invoices for this subscription
-            let vm = self
+            // Cancel other pending Lightning upgrade invoices for this subscription.
+            // If we can't find the VM the payment is still committed as paid — log a
+            // warning and return an empty result rather than propagating an error that
+            // would mislead callers into thinking the payment was not completed.
+            let vm = match self
                 .db
                 .get_vm_by_subscription(payment.subscription_id)
-                .await?;
+                .await
+            {
+                Ok(vm) => vm,
+                Err(e) => {
+                    warn!(
+                        "Payment {} marked paid but get_vm_by_subscription failed (sub {}): {}",
+                        hex::encode(&payment.id),
+                        payment.subscription_id,
+                        e
+                    );
+                    return Ok(CompletePaymentResult {
+                        expired_competing_upgrades: Vec::new(),
+                    });
+                }
+            };
             let other_upgrades = self
                 .db
                 .list_pending_vm_subscription_payments(vm.id)

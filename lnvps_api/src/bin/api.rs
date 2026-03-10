@@ -125,7 +125,7 @@ async fn main() -> Result<(), Error> {
         node.clone(),
         exchange.clone(),
         work_commander.clone(),
-    );
+    )?;
     sub_handler.vm_provisioner().init().await?;
 
     let worker = Worker::new(

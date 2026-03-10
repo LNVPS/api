@@ -214,7 +214,7 @@ mod tests {
             node.clone(),
             Arc::new(MockExchangeRate::default()),
             Arc::new(ChannelWorkCommander::new()),
-        );
+        )?;
 
         Ok((db, node, sub, payment, vm_id))
     }
@@ -360,7 +360,7 @@ mod tests {
             node.clone(),
             Arc::new(MockExchangeRate::default()),
             Arc::new(ChannelWorkCommander::new()),
-        );
+        )?;
 
         Ok((db, node, sub, payment))
     }
