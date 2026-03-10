@@ -1,5 +1,6 @@
 use crate::dvm::{DVMHandler, DVMJobRequest, build_status_for_job};
-use crate::provisioner::LNVpsProvisioner;
+use crate::provisioner::VmProvisioner;
+use crate::subscription::SubscriptionHandler;
 use anyhow::Context;
 use lnvps_db::{
     DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
@@ -10,17 +11,16 @@ use ssh_key::PublicKey;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 
 pub struct LnvpsDvm {
     client: Client,
-    provisioner: Arc<LNVpsProvisioner>,
+    sub_handler: SubscriptionHandler,
 }
 
 impl LnvpsDvm {
-    pub fn new(provisioner: Arc<LNVpsProvisioner>, client: Client) -> LnvpsDvm {
+    pub fn new(sub_handler: SubscriptionHandler, client: Client) -> LnvpsDvm {
         Self {
-            provisioner,
+            sub_handler,
             client,
         }
     }
@@ -31,7 +31,7 @@ impl DVMHandler for LnvpsDvm {
         &mut self,
         request: DVMJobRequest,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        let provisioner = self.provisioner.clone();
+        let sub_handler = self.sub_handler.clone();
         let client = self.client.clone();
         Box::pin(async move {
             let default_disk = "ssd".to_string();
@@ -62,7 +62,7 @@ impl DVMHandler for LnvpsDvm {
                 .context("missing os_version parameter")?;
             let region = request.params.get("region");
 
-            let db = provisioner.get_db();
+            let db = sub_handler.db();
             let host_region = if let Some(r) = region {
                 db.get_host_region_by_name(r).await?
             } else {
@@ -130,10 +130,16 @@ impl DVMHandler for LnvpsDvm {
                 .find(|i| i.distribution == image && i.version == *os_version)
                 .context("no os image found")?;
 
-            let vm = provisioner
+            let vm = sub_handler
+                .vm_provisioner()
                 .provision_custom(uid, template, image.id, ssh_key_id, None)
                 .await?;
-            let invoice = provisioner.renew(vm.id, PaymentMethod::Lightning).await?;
+            let line_item = db
+                .get_subscription_line_item(vm.subscription_line_item_id)
+                .await?;
+            let invoice = sub_handler
+                .renew_subscription(line_item.subscription_id, PaymentMethod::Lightning, 1)
+                .await?;
 
             let mut payment = build_status_for_job(
                 &request,
@@ -159,9 +165,12 @@ mod tests {
     use crate::dvm::parse_job_request;
     use crate::mocks::MockNode;
     use crate::settings::mock_settings;
-    use lnvps_api_common::{ExchangeRateService, MockDb, MockExchangeRate, Ticker};
+    use lnvps_api_common::{
+        ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate, Ticker,
+    };
     use lnvps_db::{VmCustomPricing, VmCustomPricingDisk};
     use nostr_sdk::{EventBuilder, Keys, Kind};
+    use std::sync::Arc;
 
     #[tokio::test]
     #[ignore]
@@ -213,13 +222,13 @@ mod tests {
         }
 
         let settings = mock_settings();
-        let provisioner = Arc::new(LNVpsProvisioner::new(
+        let provisioner = SubscriptionHandler::new(
             settings,
             db.clone(),
             node.clone(),
             exch.clone(),
-            None,
-        ));
+            Arc::new(ChannelWorkCommander::new()),
+        )?;
         let keys = Keys::generate();
         let empty_client = Client::new(keys.clone());
         empty_client.add_relay("wss://nos.lol").await?;

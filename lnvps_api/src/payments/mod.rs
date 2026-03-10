@@ -1,10 +1,11 @@
 use crate::payments::invoice::NodeInvoiceHandler;
 use crate::settings::Settings;
+use crate::subscription::SubscriptionHandler;
 use anyhow::Result;
-use lnvps_api_common::{UpgradeConfig, WorkCommander, WorkJob};
-use lnvps_db::{LNVpsDb, PaymentMethod, VmPayment};
+use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::LightningNode;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -16,14 +17,18 @@ mod revolut;
 #[cfg(feature = "stripe")]
 mod stripe;
 
+// =========================================================================
+// listen_all_payments
+// =========================================================================
+
 pub async fn listen_all_payments(
     settings: &Settings,
     node: Arc<dyn LightningNode>,
     db: Arc<dyn LNVpsDb>,
-    sender: Arc<dyn WorkCommander>,
+    sub_handler: SubscriptionHandler,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut ret = Vec::new();
-    let mut handler = NodeInvoiceHandler::new(node.clone(), db.clone(), sender.clone());
+    let mut handler = NodeInvoiceHandler::new(node.clone(), db.clone(), sub_handler.clone());
     ret.push(tokio::spawn(async move {
         loop {
             if let Err(e) = handler.listen().await {
@@ -54,7 +59,7 @@ pub async fn listen_all_payments(
                 &config,
                 &settings.public_url,
                 db.clone(),
-                sender.clone(),
+                sub_handler.clone(),
             ) {
                 Ok(mut handler) => {
                     ret.push(tokio::spawn(async move {
@@ -76,40 +81,42 @@ pub async fn listen_all_payments(
         }
     }
 
-    Ok(ret)
-}
+    #[cfg(feature = "stripe")]
+    {
+        use crate::payments::stripe::StripePaymentHandler;
 
-pub(crate) async fn handle_upgrade(
-    payment: &VmPayment,
-    tx: &Arc<dyn WorkCommander>,
-    _db: Arc<dyn LNVpsDb>,
-) -> Result<()> {
-    // Parse upgrade parameters from the dedicated upgrade_params field
-    if let Some(upgrade_params_json) = &payment.upgrade_params {
-        if let Ok(upgrade_params) = serde_json::from_str::<UpgradeConfig>(upgrade_params_json) {
+        let stripe_configs = db
+            .list_payment_method_configs()
+            .await?
+            .into_iter()
+            .filter(|c| c.payment_method == PaymentMethod::Stripe && c.enabled)
+            .collect::<Vec<_>>();
+
+        for config in stripe_configs {
             info!(
-                "Processing upgrade payment for VM {} with params: CPU={:?}, Memory={:?}, Disk={:?}",
-                payment.vm_id,
-                upgrade_params.new_cpu,
-                upgrade_params.new_memory,
-                upgrade_params.new_disk
+                "Starting Stripe payment handler for config: {}",
+                config.name
             );
-            tx.send(WorkJob::ProcessVmUpgrade {
-                vm_id: payment.vm_id,
-                config: upgrade_params,
-            })
-            .await?;
-        } else {
-            warn!(
-                "Upgrade payment {} has invalid upgrade parameters JSON",
-                hex::encode(&payment.id)
-            );
+            match StripePaymentHandler::new(&config, db.clone(), sub_handler.clone()) {
+                Ok(mut handler) => {
+                    ret.push(tokio::spawn(async move {
+                        loop {
+                            if let Err(e) = handler.listen().await {
+                                error!("stripe-error: {}", e);
+                            }
+                            sleep(Duration::from_secs(30)).await;
+                        }
+                    }));
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create Stripe payment handler for '{}': {}",
+                        config.name, e
+                    );
+                }
+            }
         }
-    } else {
-        warn!(
-            "Upgrade payment {} missing upgrade_params field",
-            hex::encode(&payment.id)
-        );
     }
-    Ok(())
+
+    Ok(ret)
 }

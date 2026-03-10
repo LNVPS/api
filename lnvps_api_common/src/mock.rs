@@ -1,22 +1,20 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow};
-use chrono::{TimeDelta, Utc};
+use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
-    DiskType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
-    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
-    ReferralCostUsage, ReferralPayout, Router, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    DiskType, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing,
+    LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
+    Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost,
+    VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
 #[cfg(feature = "admin")]
-use lnvps_db::{
-    AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats, VmPaymentWithCompany,
-};
+use lnvps_db::{AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats};
 use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
@@ -46,6 +44,7 @@ pub struct MockDb {
     pub subscriptions: Arc<Mutex<HashMap<u64, Subscription>>>,
     pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
+    pub ip_range_subscriptions: Arc<Mutex<HashMap<u64, IpRangeSubscription>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -66,7 +65,7 @@ impl MockDb {
             amount: 132,                 // 132 cents = €1.32 (in smallest currency units)
             currency: "EUR".to_string(), // This can be overridden based on company config
             interval_amount: 1,
-            interval_type: VmCostPlanIntervalType::Month,
+            interval_type: IntervalType::Month,
         }
     }
 
@@ -105,14 +104,12 @@ impl MockDb {
             image_id: 1,
             template_id: Some(template.id),
             custom_template_id: None,
+            subscription_line_item_id: 1,
             ssh_key_id: 1,
-            created: Utc::now(),
-            expires: Default::default(),
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         }
     }
@@ -160,7 +157,7 @@ impl Default for MockDb {
             1,
             VmHost {
                 id: 1,
-                kind: VmHostKind::Proxmox,
+                kind: VmHostKind::Dummy,
                 region_id: 1,
                 name: "mock-host".to_string(),
                 ip: "https://localhost".to_string(),
@@ -254,9 +251,49 @@ impl Default for MockDb {
                 companies
             })),
             vm_history: Arc::new(Default::default()),
-            subscriptions: Arc::new(Default::default()),
-            subscription_line_items: Arc::new(Default::default()),
+            subscriptions: Arc::new(Mutex::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    1u64,
+                    Subscription {
+                        id: 1,
+                        user_id: 1,
+                        company_id: 1,
+                        name: "mock subscription".to_string(),
+                        description: None,
+                        created: Utc::now(),
+                        expires: None,
+                        is_active: false,
+                        is_setup: false,
+                        currency: "BTC".to_string(),
+                        interval_amount: 1,
+                        interval_type: IntervalType::Month,
+                        setup_fee: 0,
+                        auto_renewal_enabled: false,
+                        external_id: None,
+                    },
+                );
+                m
+            })),
+            subscription_line_items: Arc::new(Mutex::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    1u64,
+                    SubscriptionLineItem {
+                        id: 1,
+                        subscription_id: 1,
+                        subscription_type: lnvps_db::SubscriptionType::Vps,
+                        name: "mock vm renewal".to_string(),
+                        description: None,
+                        amount: 1000,
+                        setup_amount: 0,
+                        configuration: None,
+                    },
+                );
+                m
+            })),
             subscription_payments: Arc::new(Default::default()),
+            ip_range_subscriptions: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
@@ -536,6 +573,23 @@ impl LNVpsDbBase for MockDb {
         Ok(cost_plans.values().cloned().collect())
     }
 
+    async fn list_cost_plans_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCostPlan>, u64)> {
+        let cost_plans = self.cost_plans.lock().await;
+        let mut all: Vec<_> = cost_plans.values().cloned().collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
     async fn insert_cost_plan(&self, cost_plan: &VmCostPlan) -> DbResult<u64> {
         let mut cost_plans = self.cost_plans.lock().await;
         let max = *cost_plans.keys().max().unwrap_or(&0);
@@ -610,12 +664,29 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn list_expired_vms(&self) -> DbResult<Vec<Vm>> {
-        let vms = self.vms.lock().await;
-        Ok(vms
-            .values()
-            .filter(|v| !v.deleted && v.expires >= Utc::now())
-            .cloned()
-            .collect())
+        // In the mock, cross-reference subscription expires.
+        // Collect VM ids and subscription line item ids first.
+        let vm_list: Vec<Vm> = {
+            let vms = self.vms.lock().await;
+            vms.values().filter(|v| !v.deleted).cloned().collect()
+        };
+        let mut expired = Vec::new();
+        for vm in vm_list {
+            let line_items = self.subscription_line_items.lock().await;
+            let sub_id = line_items
+                .get(&vm.subscription_line_item_id)
+                .map(|li| li.subscription_id);
+            drop(line_items);
+            if let Some(sid) = sub_id {
+                let subs = self.subscriptions.lock().await;
+                if let Some(sub) = subs.get(&sid) {
+                    if sub.expires.map(|e| e < Utc::now()).unwrap_or(true) {
+                        expired.push(vm);
+                    }
+                }
+            }
+        }
+        Ok(expired)
     }
 
     async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
@@ -671,14 +742,101 @@ impl LNVpsDbBase for MockDb {
             v.image_id = vm.image_id;
             v.template_id = vm.template_id;
             v.custom_template_id = vm.custom_template_id;
+            v.subscription_line_item_id = vm.subscription_line_item_id;
             v.ssh_key_id = vm.ssh_key_id;
-            v.expires = vm.expires;
             v.disk_id = vm.disk_id;
             v.mac_address = vm.mac_address.clone();
-            v.auto_renewal_enabled = vm.auto_renewal_enabled;
             v.disabled = vm.disabled;
         }
         Ok(())
+    }
+
+    async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
+        let vms = self.vms.lock().await;
+        vms.values()
+            .find(|v| v.subscription_line_item_id == line_item_id && !v.deleted)
+            .cloned()
+            .ok_or_else(|| anyhow!("VM not found for line item {}", line_item_id).into())
+    }
+
+    async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
+        use lnvps_db::SubscriptionType;
+        let items = self.subscription_line_items.lock().await;
+        let line_item_id = items
+            .values()
+            .find(|li| {
+                li.subscription_id == subscription_id
+                    && matches!(li.subscription_type, SubscriptionType::Vps)
+            })
+            .map(|li| li.id)
+            .ok_or_else(|| {
+                DbError::Other(anyhow!(
+                    "No VM line item for subscription {}",
+                    subscription_id
+                ))
+            })?;
+        drop(items);
+        self.get_vm_by_line_item(line_item_id).await
+    }
+
+    async fn list_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let vms = self.vms.lock().await;
+        let vm = vms
+            .get(&vm_id)
+            .ok_or_else(|| DbError::Other(anyhow!("VM not found")))?;
+        let line_item_id = vm.subscription_line_item_id;
+        drop(vms);
+
+        // resolve subscription_id via line_item
+        let items = self.subscription_line_items.lock().await;
+        let subscription_id = items
+            .get(&line_item_id)
+            .ok_or_else(|| DbError::Other(anyhow!("Line item {} not found", line_item_id)))?
+            .subscription_id;
+        drop(items);
+
+        let payments = self.subscription_payments.lock().await;
+        let mut result: Vec<_> = payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .cloned()
+            .collect();
+        result.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(result)
+    }
+
+    async fn list_pending_vm_subscription_payments(
+        &self,
+        vm_id: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let all = self.list_vm_subscription_payments(vm_id).await?;
+        let now = Utc::now();
+        Ok(all
+            .into_iter()
+            .filter(|p| !p.is_paid && p.expires > now)
+            .collect())
+    }
+
+    async fn list_vm_subscription_payments_paginated(
+        &self,
+        vm_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let all = self.list_vm_subscription_payments(vm_id).await?;
+        Ok(all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
+    async fn count_vm_subscription_payments(&self, vm_id: u64) -> DbResult<u64> {
+        let all = self.list_vm_subscription_payments(vm_id).await?;
+        Ok(all.len() as u64)
     }
 
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
@@ -828,15 +986,12 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn vm_payment_paid(&self, payment: &VmPayment) -> DbResult<()> {
-        let mut v = self.vms.lock().await;
         let mut p = self.payments.lock().await;
         if let Some(p) = p.iter_mut().find(|p| p.id == *payment.id) {
             p.is_paid = true;
             p.paid_at = Some(Utc::now());
         }
-        if let Some(v) = v.get_mut(&payment.vm_id) {
-            v.expires = v.expires.add(TimeDelta::seconds(payment.time_value as i64));
-        }
+        // vm.expires removed — expiry is managed exclusively via subscription.expires
         Ok(())
     }
 
@@ -851,6 +1006,30 @@ impl LNVpsDbBase for MockDb {
     async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().cloned().collect())
+    }
+
+    async fn list_custom_pricing_paginated(
+        &self,
+        region_id: Option<u64>,
+        enabled: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmCustomPricing>, u64)> {
+        let p = self.custom_pricing.lock().await;
+        let mut all: Vec<_> = p
+            .values()
+            .filter(|v| region_id.map_or(true, |r| v.region_id == r))
+            .filter(|v| enabled.map_or(true, |e| v.enabled == e))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
     }
 
     async fn get_custom_pricing(&self, id: u64) -> DbResult<VmCustomPricing> {
@@ -1089,6 +1268,28 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_subscriptions_paginated(
+        &self,
+        user_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)> {
+        let subscriptions = self.subscriptions.lock().await;
+        let mut all: Vec<_> = subscriptions
+            .values()
+            .filter(|s| user_id.map_or(true, |u| s.user_id == u))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>> {
         let subscriptions = self.subscriptions.lock().await;
         Ok(subscriptions
@@ -1096,6 +1297,65 @@ impl LNVpsDbBase for MockDb {
             .filter(|s| s.is_active && s.user_id == user_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_expiring_subscriptions(
+        &self,
+        within_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        let deadline = Utc::now() + chrono::Duration::seconds(within_seconds as i64);
+        Ok(subscriptions
+            .values()
+            .filter(|s| {
+                s.is_active
+                    && s.expires
+                        .map(|e| e > Utc::now() && e < deadline)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_expired_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| s.is_active && s.expires.map(|e| e < Utc::now()).unwrap_or(false))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_lifecycle_subscriptions(&self) -> DbResult<Vec<Subscription>> {
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| s.is_active && s.expires.is_some())
+            .cloned()
+            .collect())
+    }
+
+    async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
+        let mut subscriptions = self.subscriptions.lock().await;
+        if let Some(sub) = subscriptions.get_mut(&id) {
+            sub.is_active = false;
+        }
+        drop(subscriptions);
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| li.subscription_id == id)
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        for ips in ip_subs.values_mut() {
+            if line_item_ids.contains(&ips.subscription_line_item_id) && ips.ended_at.is_none() {
+                ips.is_active = false;
+                ips.ended_at = Some(Utc::now());
+            }
+        }
+        Ok(())
     }
 
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription> {
@@ -1116,15 +1376,30 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn insert_subscription(&self, subscription: &Subscription) -> DbResult<u64> {
-        Ok(0)
+        let mut subscriptions = self.subscriptions.lock().await;
+        let id = subscriptions.keys().max().copied().unwrap_or(0) + 1;
+        let mut s = subscription.clone();
+        s.id = id;
+        subscriptions.insert(id, s);
+        Ok(id)
     }
 
     async fn insert_subscription_with_line_items(
         &self,
-        _subscription: &Subscription,
-        _line_items: Vec<SubscriptionLineItem>,
-    ) -> DbResult<u64> {
-        Ok(0)
+        subscription: &Subscription,
+        line_items: Vec<SubscriptionLineItem>,
+    ) -> DbResult<(u64, Vec<u64>)> {
+        let subscription_id = self.insert_subscription(subscription).await?;
+        let mut items = self.subscription_line_items.lock().await;
+        let mut line_item_ids = Vec::with_capacity(line_items.len());
+        for mut item in line_items {
+            let item_id = items.keys().max().copied().unwrap_or(0) + 1;
+            item.id = item_id;
+            item.subscription_id = subscription_id;
+            items.insert(item_id, item);
+            line_item_ids.push(item_id);
+        }
+        Ok((subscription_id, line_item_ids))
     }
 
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()> {
@@ -1176,6 +1451,20 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("Subscription line item not found: {}", id))?)
     }
 
+    async fn get_subscription_by_line_item_id(&self, line_item_id: u64) -> DbResult<Subscription> {
+        let line_items = self.subscription_line_items.lock().await;
+        let sub_id = match line_items.get(&line_item_id) {
+            Some(li) => li.subscription_id,
+            None => return Err(DbError::Other(anyhow::anyhow!("subscription not found for line item {}", line_item_id))),
+        };
+        drop(line_items);
+        let subscriptions = self.subscriptions.lock().await;
+        subscriptions
+            .get(&sub_id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow::anyhow!("subscription {} not found", sub_id)))
+    }
+
     async fn insert_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,
@@ -1219,6 +1508,28 @@ impl LNVpsDbBase for MockDb {
             .filter(|p| p.subscription_id == subscription_id)
             .cloned()
             .collect())
+    }
+
+    async fn list_subscription_payments_paginated(
+        &self,
+        subscription_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SubscriptionPayment>, u64)> {
+        let payments = self.subscription_payments.lock().await;
+        let mut all: Vec<_> = payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.created.cmp(&a.created));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
     }
 
     async fn list_subscription_payments_by_user(
@@ -1265,7 +1576,7 @@ impl LNVpsDbBase for MockDb {
             .cloned()
             .context("Subscription payment not found")?;
 
-        // For mock, we'll just use EUR as the base currency
+        // For mock, use placeholder company/host/region data
         Ok(SubscriptionPaymentWithCompany {
             id: payment.id,
             subscription_id: payment.subscription_id,
@@ -1280,10 +1591,19 @@ impl LNVpsDbBase for MockDb {
             external_id: payment.external_id,
             is_paid: payment.is_paid,
             rate: payment.rate,
+            time_value: payment.time_value,
+            metadata: payment.metadata,
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             paid_at: payment.paid_at,
+            company_id: 0,
+            company_name: String::new(),
             company_base_currency: "EUR".to_string(),
+            vm_id: None,
+            host_id: None,
+            host_name: None,
+            region_id: None,
+            region_name: None,
         })
     }
 
@@ -1313,17 +1633,33 @@ impl LNVpsDbBase for MockDb {
         }
         drop(payments);
 
-        // Extend subscription expiration by 30 days (subscriptions are always monthly)
         let mut subscriptions = self.subscriptions.lock().await;
         if let Some(subscription) = subscriptions.get_mut(&payment.subscription_id) {
-            if let Some(expires) = subscription.expires {
-                subscription.expires = Some(expires.add(TimeDelta::days(30)));
+            let base = subscription
+                .expires
+                .unwrap_or_else(Utc::now)
+                .max(Utc::now());
+
+            let new_expires = if let Some(time_value) = payment.time_value {
+                // VM path: extend by explicit time_value seconds
+                base.add(TimeDelta::seconds(time_value as i64))
             } else {
-                // If no expiration yet, set it from now
-                subscription.expires = Some(Utc::now().add(TimeDelta::days(30)));
-            }
+                // Regular subscription path: use interval from subscription
+                match subscription.interval_type {
+                    IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
+                    IntervalType::Month => {
+                        base.add(Months::new(subscription.interval_amount as u32))
+                    }
+                    IntervalType::Year => {
+                        base.add(Months::new((12 * subscription.interval_amount) as u32))
+                    }
+                }
+            };
+            subscription.expires = Some(new_expires);
             subscription.is_active = true;
+            subscription.is_setup = true;
         }
+        drop(subscriptions);
 
         Ok(())
     }
@@ -1338,6 +1674,17 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>> {
+        todo!()
+    }
+
+    async fn list_available_ip_space_paginated(
+        &self,
+        _is_available: Option<bool>,
+        _is_reserved: Option<bool>,
+        _registry: Option<u8>,
+        _limit: u64,
+        _offset: u64,
+    ) -> DbResult<(Vec<AvailableIpSpace>, u64)> {
         todo!()
     }
 
@@ -1365,6 +1712,15 @@ impl LNVpsDbBase for MockDb {
         &self,
         available_ip_space_id: u64,
     ) -> DbResult<Vec<IpSpacePricing>> {
+        todo!()
+    }
+
+    async fn list_ip_space_pricing_by_space_paginated(
+        &self,
+        _available_ip_space_id: u64,
+        _limit: u64,
+        _offset: u64,
+    ) -> DbResult<(Vec<IpSpacePricing>, u64)> {
         todo!()
     }
 
@@ -1396,53 +1752,178 @@ impl LNVpsDbBase for MockDb {
         &self,
         subscription_line_item_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
-        todo!()
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| s.subscription_line_item_id == subscription_line_item_id)
+            .cloned()
+            .collect())
     }
 
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
         subscription_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
-        todo!()
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| li.subscription_id == subscription_id)
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| line_item_ids.contains(&s.subscription_line_item_id))
+            .cloned()
+            .collect())
     }
 
     async fn list_ip_range_subscriptions_by_user(
         &self,
         user_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>> {
-        todo!()
+        let subscriptions = self.subscriptions.lock().await;
+        let sub_ids: Vec<u64> = subscriptions
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .map(|s| s.id)
+            .collect();
+        drop(subscriptions);
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| sub_ids.contains(&li.subscription_id))
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| line_item_ids.contains(&s.subscription_line_item_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn list_ip_range_subscriptions_by_space_paginated(
+        &self,
+        available_ip_space_id: u64,
+        user_id: Option<u64>,
+        is_active: Option<bool>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpRangeSubscription>, u64)> {
+        let subscriptions = self.subscriptions.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        let mut all: Vec<IpRangeSubscription> = ip_subs
+            .values()
+            .filter(|s| {
+                if s.available_ip_space_id != available_ip_space_id {
+                    return false;
+                }
+                if let Some(active) = is_active {
+                    if s.is_active != active {
+                        return false;
+                    }
+                }
+                if let Some(uid) = user_id {
+                    let li_id = s.subscription_line_item_id;
+                    let sub_id = line_items
+                        .values()
+                        .find(|li| li.id == li_id)
+                        .map(|li| li.subscription_id);
+                    if let Some(sid) = sub_id {
+                        if !subscriptions
+                            .get(&sid)
+                            .map(|s| s.user_id == uid)
+                            .unwrap_or(false)
+                        {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
     }
 
     async fn get_ip_range_subscription(&self, id: u64) -> DbResult<IpRangeSubscription> {
-        todo!()
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IpRangeSubscription not found: {}", id).into())
     }
 
     async fn get_ip_range_subscription_by_cidr(&self, cidr: &str) -> DbResult<IpRangeSubscription> {
-        todo!()
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs
+            .values()
+            .find(|s| s.cidr == cidr)
+            .cloned()
+            .ok_or_else(|| anyhow!("IpRangeSubscription not found for cidr: {}", cidr).into())
     }
 
     async fn insert_ip_range_subscription(
         &self,
         subscription: &IpRangeSubscription,
     ) -> DbResult<u64> {
-        todo!()
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        let id = ip_subs.len() as u64 + 1;
+        let mut new = subscription.clone();
+        new.id = id;
+        ip_subs.insert(id, new);
+        Ok(id)
     }
 
     async fn update_ip_range_subscription(
         &self,
         subscription: &IpRangeSubscription,
     ) -> DbResult<()> {
-        todo!()
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs.insert(subscription.id, subscription.clone());
+        Ok(())
     }
 
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
-        todo!()
+        let mut ip_subs = self.ip_range_subscriptions.lock().await;
+        ip_subs.remove(&id);
+        Ok(())
     }
 
     // Payment Method Config
     async fn list_payment_method_configs(&self) -> DbResult<Vec<PaymentMethodConfig>> {
         let configs = self.payment_method_configs.lock().await;
         Ok(configs.values().cloned().collect())
+    }
+
+    async fn list_payment_method_configs_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentMethodConfig>, u64)> {
+        let configs = self.payment_method_configs.lock().await;
+        let mut all: Vec<_> = configs.values().cloned().collect();
+        all.sort_by(|a, b| a.company_id.cmp(&b.company_id).then(a.id.cmp(&b.id)));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
     }
 
     async fn list_payment_method_configs_for_company(
@@ -1593,24 +2074,30 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
         let vms = self.vms.lock().await;
-        let payments = self.payments.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let sub_payments = self.subscription_payments.lock().await;
         let mut result = Vec::new();
         for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
-            let mut vm_payments: Vec<&VmPayment> = payments
-                .iter()
-                .filter(|p| p.vm_id == vm.id && p.is_paid)
-                .collect();
-            vm_payments.sort_by_key(|p| p.created);
-            if let Some(first) = vm_payments.first() {
-                result.push(ReferralCostUsage {
-                    vm_id: vm.id,
-                    ref_code: code.to_string(),
-                    created: first.created,
-                    amount: first.amount,
-                    currency: first.currency.clone(),
-                    rate: first.rate,
-                    base_currency: "EUR".to_string(),
-                });
+            let subscription_id = line_items
+                .get(&vm.subscription_line_item_id)
+                .map(|sli| sli.subscription_id);
+            if let Some(sid) = subscription_id {
+                let mut vm_payments: Vec<&SubscriptionPayment> = sub_payments
+                    .iter()
+                    .filter(|p| p.subscription_id == sid && p.is_paid)
+                    .collect();
+                vm_payments.sort_by_key(|p| p.created);
+                if let Some(first) = vm_payments.first() {
+                    result.push(ReferralCostUsage {
+                        vm_id: vm.id,
+                        ref_code: code.to_string(),
+                        created: first.created,
+                        amount: first.amount,
+                        currency: first.currency.clone(),
+                        rate: first.rate,
+                        base_currency: "EUR".to_string(),
+                    });
+                }
             }
         }
         result.sort_by(|a, b| b.created.cmp(&a.created));
@@ -1619,11 +2106,22 @@ impl LNVpsDbBase for MockDb {
 
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
         let vms = self.vms.lock().await;
-        let payments = self.payments.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let sub_payments = self.subscription_payments.lock().await;
         Ok(vms
             .values()
             .filter(|v| v.ref_code.as_deref() == Some(code))
-            .filter(|v| !payments.iter().any(|p| p.vm_id == v.id && p.is_paid))
+            .filter(|v| {
+                let sid = line_items
+                    .get(&v.subscription_line_item_id)
+                    .map(|sli| sli.subscription_id);
+                !sid.map(|s| {
+                    sub_payments
+                        .iter()
+                        .any(|p| p.subscription_id == s && p.is_paid)
+                })
+                .unwrap_or(false)
+            })
             .count() as u64)
     }
 }
@@ -1723,6 +2221,19 @@ impl lnvps_db::AdminDb for MockDb {
 
     async fn list_roles(&self) -> DbResult<Vec<AdminRole>> {
         Ok(vec![])
+    }
+
+    async fn list_roles_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AdminRole>, u64)> {
+        let page: Vec<AdminRole> = vec![]
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, 0))
     }
 
     async fn update_role(&self, _role: &AdminRole) -> DbResult<()> {
@@ -2018,120 +2529,108 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_count_company_regions(&self, _company_id: u64) -> DbResult<u64> {
         Ok(0)
     }
-    async fn admin_get_payments_by_date_range(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-    ) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .filter(|p| p.is_paid && p.created >= start_date && p.created < end_date)
-            .cloned()
-            .collect())
-    }
-    async fn admin_get_payments_by_date_range_and_company(
-        &self,
-        start_date: chrono::DateTime<chrono::Utc>,
-        end_date: chrono::DateTime<chrono::Utc>,
-        company_id: u64,
-    ) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        let vms = self.vms.lock().await;
-        let hosts = self.hosts.lock().await;
-        let regions = self.regions.lock().await;
-
-        Ok(p.iter()
-            .filter(|payment| {
-                if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
-                    return false;
-                }
-
-                // Follow VM -> Host -> Region -> Company chain
-                if let Some(vm) = vms.get(&payment.vm_id) {
-                    if let Some(host) = hosts.get(&vm.host_id) {
-                        if let Some(region) = regions.get(&host.region_id) {
-                            return region.company_id == company_id;
-                        }
-                    }
-                }
-                false
-            })
-            .cloned()
-            .collect())
-    }
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
         end_date: chrono::DateTime<chrono::Utc>,
         company_id: u64,
         currency: Option<&str>,
-    ) -> DbResult<Vec<VmPaymentWithCompany>> {
-        let p = self.payments.lock().await;
+    ) -> DbResult<Vec<SubscriptionPaymentWithCompany>> {
+        let sub_payments = self.subscription_payments.lock().await;
         let vms = self.vms.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let companies = self.companies.lock().await;
 
         let mut result = Vec::new();
 
-        for payment in p.iter() {
+        for payment in sub_payments.iter() {
             if !payment.is_paid || payment.created < start_date || payment.created >= end_date {
                 continue;
             }
 
-            // Filter by currency if specified
             if let Some(filter_currency) = currency {
                 if payment.currency != filter_currency {
                     continue;
                 }
             }
 
-            // Follow VM -> Host -> Region -> Company chain
-            if let Some(vm) = vms.get(&payment.vm_id) {
-                if let Some(host) = hosts.get(&vm.host_id) {
-                    if let Some(region) = regions.get(&host.region_id) {
-                        let region_company_id = region.company_id;
-                        // Filter by company (always required)
-                        if region_company_id != company_id {
-                            continue;
-                        }
+            // Find VM via subscription → line_item (VmRenewal/VmUpgrade) → vm
+            let vm = vms.values().find(|v| {
+                line_items
+                    .get(&v.subscription_line_item_id)
+                    .map(|sli| sli.subscription_id == payment.subscription_id)
+                    .unwrap_or(false)
+            });
 
-                        if let Some(company) = companies.get(&region_company_id) {
-                            result.push(VmPaymentWithCompany {
-                                id: payment.id.clone(),
-                                vm_id: payment.vm_id,
-                                created: payment.created,
-                                expires: payment.expires,
-                                amount: payment.amount,
-                                currency: payment.currency.clone(),
-                                payment_method: payment.payment_method,
-                                payment_type: payment.payment_type,
-                                external_data: payment.external_data.clone(),
-                                external_id: payment.external_id.clone(),
-                                is_paid: payment.is_paid,
-                                rate: payment.rate,
-                                time_value: payment.time_value,
-                                tax: payment.tax,
-                                processing_fee: payment.processing_fee,
-                                upgrade_params: payment.upgrade_params.clone(),
-                                company_id: region_company_id,
-                                company_name: company.name.clone(),
-                                company_base_currency: company.base_currency.clone(),
-                                user_id: vm.user_id,
-                                host_id: host.id,
-                                host_name: host.name.clone(),
-                                region_id: region.id,
-                                region_name: region.name.clone(),
-                            });
+            let (vm_id, host_id, host_name, region_id, region_name, region_company_id) =
+                if let Some(vm) = vm {
+                    if let Some(host) = hosts.get(&vm.host_id) {
+                        if let Some(region) = regions.get(&host.region_id) {
+                            (
+                                Some(vm.id),
+                                Some(host.id),
+                                Some(host.name.clone()),
+                                Some(region.id),
+                                Some(region.name.clone()),
+                                Some(region.company_id),
+                            )
+                        } else {
+                            (
+                                Some(vm.id),
+                                Some(host.id),
+                                Some(host.name.clone()),
+                                None,
+                                None,
+                                None,
+                            )
                         }
+                    } else {
+                        (Some(vm.id), None, None, None, None, None)
                     }
-                }
+                } else {
+                    (None, None, None, None, None, None)
+                };
+
+            // Resolve company
+            let cid = region_company_id.unwrap_or(0);
+            if cid != company_id {
+                continue;
+            }
+            if let Some(company) = companies.get(&cid) {
+                result.push(SubscriptionPaymentWithCompany {
+                    id: payment.id.clone(),
+                    subscription_id: payment.subscription_id,
+                    user_id: payment.user_id,
+                    created: payment.created,
+                    expires: payment.expires,
+                    amount: payment.amount,
+                    currency: payment.currency.clone(),
+                    payment_method: payment.payment_method,
+                    payment_type: payment.payment_type,
+                    external_data: payment.external_data.clone(),
+                    external_id: payment.external_id.clone(),
+                    is_paid: payment.is_paid,
+                    rate: payment.rate,
+                    time_value: payment.time_value,
+                    metadata: payment.metadata.clone(),
+                    tax: payment.tax,
+                    processing_fee: payment.processing_fee,
+                    paid_at: payment.paid_at,
+                    company_id: cid,
+                    company_name: company.name.clone(),
+                    company_base_currency: company.base_currency.clone(),
+                    vm_id,
+                    host_id,
+                    host_name,
+                    region_id,
+                    region_name,
+                });
             }
         }
 
-        // Sort by created timestamp
         result.sort_by(|a, b| a.created.cmp(&b.created));
-
         Ok(result)
     }
     async fn admin_get_referral_usage_by_date_range(
@@ -2443,5 +2942,353 @@ impl LNVPSNostrDb for MockDb {
 
     async fn disable_domain(&self, _domain_id: u64) -> DbResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+
+    /// Build a minimal SubscriptionPayment for the default mock subscription (id=1).
+    fn make_payment(subscription_id: u64, time_value: Option<u64>) -> SubscriptionPayment {
+        SubscriptionPayment {
+            id: vec![1u8; 16],
+            subscription_id,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::hours(1),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        }
+    }
+
+    /// subscription_payment_paid marks the payment as paid and sets paid_at.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_marks_payment() {
+        let db = MockDb::default();
+        let payment = make_payment(1, Some(86400));
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let payments = db.subscription_payments.lock().await;
+        let p = payments.iter().find(|p| p.id == payment.id).unwrap();
+        assert!(p.is_paid);
+        assert!(p.paid_at.is_some());
+    }
+
+    /// VM path: time_value is set — subscription expires extended by that many seconds.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_vm_extends_by_time_value() {
+        let db = MockDb::default();
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+
+        let time_value_secs = 30 * 24 * 3600u64; // 30 days
+        let payment = make_payment(1, Some(time_value_secs));
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let expected_min = before + chrono::Duration::seconds(time_value_secs as i64 - 5);
+        let expected_max = before + chrono::Duration::seconds(time_value_secs as i64 + 5);
+
+        // Subscription expires must be extended
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let sub_expires = sub.expires.unwrap();
+        assert!(
+            sub_expires >= expected_min && sub_expires <= expected_max,
+            "subscription expires {} not in expected range",
+            sub_expires
+        );
+        assert!(sub.is_active);
+        assert!(sub.is_setup);
+        drop(subs);
+    }
+
+    /// Regular subscription path: time_value is None — expires extended by subscription interval.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_month() {
+        let db = MockDb::default();
+        // Default subscription has interval_amount=1, interval_type=Month
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        // Should be approximately 1 month from now
+        let expected_min = before + chrono::Duration::days(28);
+        let expected_max = before + chrono::Duration::days(32);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range for 1-month interval",
+            expires
+        );
+    }
+
+    /// Regular subscription path: year interval extends by 12 months.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_year() {
+        let db = MockDb::default();
+        // Update subscription to use 1-year interval
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 1;
+            sub.interval_type = IntervalType::Year;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        // Should be approximately 12 months from now
+        let expected_min = before + chrono::Duration::days(364);
+        let expected_max = before + chrono::Duration::days(367);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range for 1-year interval",
+            expires
+        );
+    }
+
+    /// Regular subscription path: day interval extends by N days.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_day() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 7;
+            sub.interval_type = IntervalType::Day;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let sub = subs.get(&1).unwrap();
+        let expires = sub.expires.unwrap();
+        let expected_min = before + chrono::Duration::days(6);
+        let expected_max = before + chrono::Duration::days(8);
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires {} not in expected range for 7-day interval",
+            expires
+        );
+    }
+
+    /// Consecutive payments stack: second payment extends from the first expiry.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_stacks_from_previous_expiry() {
+        let db = MockDb::default();
+        let p1 = make_payment(1, Some(86400));
+        let mut p2 = make_payment(1, Some(86400));
+        p2.id = vec![2u8; 16]; // different id
+
+        db.insert_subscription_payment(&p1).await.unwrap();
+        db.insert_subscription_payment(&p2).await.unwrap();
+
+        db.subscription_payment_paid(&p1).await.unwrap();
+        let expires_after_first = {
+            let subs = db.subscriptions.lock().await;
+            subs.get(&1).unwrap().expires.unwrap()
+        };
+
+        db.subscription_payment_paid(&p2).await.unwrap();
+        let expires_after_second = {
+            let subs = db.subscriptions.lock().await;
+            subs.get(&1).unwrap().expires.unwrap()
+        };
+
+        // Second payment adds another 86400s on top of the first expiry
+        let diff = (expires_after_second - expires_after_first).num_seconds();
+        assert!(
+            (diff - 86400).abs() < 5,
+            "Second payment should add ~86400s from first expiry, but diff was {}s",
+            diff
+        );
+    }
+
+    /// list_vm_subscription_payments_paginated returns the correct window.
+    #[tokio::test]
+    async fn test_list_vm_subscription_payments_paginated() {
+        let db = MockDb::default();
+        // Insert default VM (id=1) which uses subscription_id=1
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(1, MockDb::mock_vm());
+        }
+
+        // Insert 5 payments for subscription_id=1
+        for i in 0u8..5 {
+            let mut p = make_payment(1, Some(86400));
+            p.id = vec![i; 16];
+            p.created = Utc::now() + chrono::Duration::seconds(i as i64);
+            db.insert_subscription_payment(&p).await.unwrap();
+        }
+
+        // Page 0: first 2
+        let page0 = db
+            .list_vm_subscription_payments_paginated(1, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(page0.len(), 2);
+
+        // Page 1: next 2
+        let page1 = db
+            .list_vm_subscription_payments_paginated(1, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+
+        // Page 2: last 1
+        let page2 = db
+            .list_vm_subscription_payments_paginated(1, 2, 4)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+
+        // Pages do not overlap
+        assert_ne!(page0[0].id, page1[0].id);
+        assert_ne!(page1[0].id, page2[0].id);
+    }
+
+    // =========================================================================
+    // Subscription lifecycle DB tests (Increment 15)
+    // =========================================================================
+
+    /// list_expiring_subscriptions returns active subscriptions expiring within window.
+    #[tokio::test]
+    async fn test_list_expiring_subscriptions_returns_soon_expiring() {
+        let db = MockDb::default();
+        // Set subscription id=1 to expire 30 minutes from now (within 1-day window)
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() + chrono::Duration::minutes(30));
+        }
+
+        let result = db.list_expiring_subscriptions(86400).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
+    }
+
+    /// list_expiring_subscriptions excludes subscriptions expiring outside the window.
+    #[tokio::test]
+    async fn test_list_expiring_subscriptions_excludes_far_future() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() + chrono::Duration::days(10));
+        }
+
+        let result = db.list_expiring_subscriptions(86400).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// list_expired_subscriptions returns active subscriptions whose expiry is in the past.
+    #[tokio::test]
+    async fn test_list_expired_subscriptions_returns_past_expiry() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+
+        let result = db.list_expired_subscriptions().await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
+    }
+
+    /// list_expired_subscriptions excludes subscriptions not yet expired.
+    #[tokio::test]
+    async fn test_list_expired_subscriptions_excludes_active() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+            sub.expires = Some(Utc::now() + chrono::Duration::hours(1));
+        }
+
+        let result = db.list_expired_subscriptions().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// deactivate_subscription sets is_active=false on the subscription.
+    #[tokio::test]
+    async fn test_deactivate_subscription_flips_is_active() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+        }
+
+        db.deactivate_subscription(1).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        assert!(!subs[&1].is_active);
+    }
+
+    /// deactivate_subscription sets ended_at and is_active=false on linked ip_range_subscription rows.
+    #[tokio::test]
+    async fn test_deactivate_subscription_ends_ip_range_subscriptions() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.is_active = true;
+        }
+
+        // Insert an ip_range_subscription linked to line_item id=1 (which belongs to subscription id=1)
+        let ip_sub = IpRangeSubscription {
+            id: 0,
+            subscription_line_item_id: 1,
+            available_ip_space_id: 1,
+            created: Utc::now(),
+            cidr: "192.0.2.0/24".to_string(),
+            is_active: true,
+            started_at: Utc::now(),
+            ended_at: None,
+            metadata: None,
+        };
+        let inserted_id = db.insert_ip_range_subscription(&ip_sub).await.unwrap();
+
+        db.deactivate_subscription(1).await.unwrap();
+
+        let ip_subs = db.ip_range_subscriptions.lock().await;
+        let updated = ip_subs.get(&inserted_id).unwrap();
+        assert!(!updated.is_active);
+        assert!(updated.ended_at.is_some());
     }
 }

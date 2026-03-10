@@ -5,6 +5,20 @@ on:
     branches:
       - master
   pull_request:
+  workflow_dispatch:
+    inputs:
+      docker:
+        description: 'Docker image to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - lnvps-api
+          - lnvps-api-admin
+          - lnvps-operator
+          - lnvps-nostr
+          - lnvps-host-info
 
 env:
   REGISTRY: registry.v0l.io
@@ -14,6 +28,10 @@ jobs:
   # Build host-info as a multi-arch image first
   build-host-info:
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.docker == 'lnvps-host-info' || github.event.inputs.docker == 'all'))
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,6 +66,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: build-host-info
+    if: >
+      always() && (
+        github.event_name == 'push' ||
+        github.event_name == 'pull_request' ||
+        github.event_name == 'workflow_dispatch'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +105,10 @@ jobs:
           password: ${{ secrets.REGISTRY_TOKEN }}
 
       - name: Build and push ${{ matrix.name }}
+        if: >
+          github.event_name == 'push' ||
+          github.event_name == 'pull_request' ||
+          (github.event_name == 'workflow_dispatch' && (github.event.inputs.docker == matrix.name || github.event.inputs.docker == 'all'))
         uses: docker/build-push-action@v5
         with:
           context: .

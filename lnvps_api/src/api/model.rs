@@ -252,6 +252,78 @@ impl ApiInvoiceItem {
             payment.time_value,
         )
     }
+
+    /// Creates a formatted invoice item from a SubscriptionPayment
+    pub fn from_subscription_payment(
+        payment: &lnvps_db::SubscriptionPayment,
+    ) -> Result<Self, anyhow::Error> {
+        Self::from_payment_data(
+            payment.amount,
+            payment.tax,
+            payment.processing_fee,
+            &payment.currency,
+            payment.time_value.unwrap_or(0),
+        )
+    }
+}
+
+impl ApiVmPayment {
+    /// Convert a `SubscriptionPayment` to an `ApiVmPayment`.
+    /// The `vm_id` must be provided because `SubscriptionPayment` only knows the subscription.
+    pub fn from_subscription_payment(
+        value: lnvps_db::SubscriptionPayment,
+        vm_id: u64,
+    ) -> anyhow::Result<Self> {
+        let upgrade_params = value
+            .metadata
+            .as_ref()
+            .map(|m| serde_json::to_string(m).unwrap_or_default());
+        let is_upgrade = value.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade;
+        let data = match &value.payment_method {
+            PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
+            PaymentMethod::Revolut => {
+                #[derive(Deserialize)]
+                struct RevolutData {
+                    pub token: String,
+                }
+                let data: RevolutData =
+                    serde_json::from_str(value.external_data.as_str()).map_err(|e| {
+                        anyhow::anyhow!("Failed to parse Revolut payment data: {}", e)
+                    })?;
+                ApiPaymentData::Revolut { token: data.token }
+            }
+            PaymentMethod::Paypal => todo!(),
+            PaymentMethod::Stripe => {
+                #[derive(Deserialize)]
+                struct StripeData {
+                    pub session_id: String,
+                }
+                let data: StripeData =
+                    serde_json::from_str(value.external_data.as_str()).map_err(|e| {
+                        anyhow::anyhow!("Failed to parse Stripe payment data: {}", e)
+                    })?;
+                ApiPaymentData::Stripe {
+                    session_id: data.session_id,
+                }
+            }
+        };
+        Ok(Self {
+            id: hex::encode(&value.id),
+            vm_id,
+            created: value.created,
+            expires: value.expires,
+            amount: value.amount,
+            tax: value.tax,
+            processing_fee: value.processing_fee,
+            currency: value.currency,
+            is_paid: value.is_paid,
+            paid_at: value.paid_at,
+            time: value.time_value.unwrap_or(0),
+            is_upgrade,
+            upgrade_params,
+            data,
+        })
+    }
 }
 
 impl From<lnvps_db::VmPayment> for ApiVmPayment {
@@ -621,6 +693,7 @@ pub struct ApiSubscriptionPayment {
 pub enum ApiSubscriptionPaymentType {
     Purchase,
     Renewal,
+    Upgrade,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -628,6 +701,7 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
         match payment_type {
             lnvps_db::SubscriptionPaymentType::Purchase => ApiSubscriptionPaymentType::Purchase,
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
+            lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
         }
     }
 }

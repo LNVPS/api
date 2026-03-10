@@ -11,6 +11,10 @@ path = "src/bin/admin_api.rs"
 name = "generate_demo_data"
 path = "src/bin/generate_demo_data.rs"
 
+[[bin]]
+name = "migrate_vm_subscriptions"
+path = "src/bin/migrate_vm_subscriptions.rs"
+
 [features]
 default = ["lnvps_db/admin"]
 demo = ["dep:rand"]

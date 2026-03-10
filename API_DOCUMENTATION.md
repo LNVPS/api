@@ -65,7 +65,7 @@ interface AccountInfo {
 interface VmStatus {
   id: number;
   created: string; // ISO 8601 datetime
-  expires: string; // ISO 8601 datetime
+  expires?: string; // ISO 8601 datetime — null/omitted for VMs not yet paid
   mac_address: string;
   image: VmOsImage;
   template: VmTemplate;
@@ -225,7 +225,7 @@ interface PaymentType {
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc';
+  name: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   metadata: Record<string, string>;
   currencies: ('BTC' | 'EUR' | 'USD')[];
   processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
@@ -264,11 +264,12 @@ interface SubscriptionPayment {
   created: string; // ISO 8601 datetime
   expires: string; // ISO 8601 datetime
   amount: Price; // Total payment amount
-  payment_method: 'lightning' | 'revolut' | 'paypal' | 'stripe';
-  payment_type: 'Purchase' | 'Renewal';
+  payment_method: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  payment_type: 'Purchase' | 'Renewal' | 'Upgrade';
   is_paid: boolean;
   paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
   tax: Price; // Tax amount
+  processing_fee: Price; // Processing fee in the payment currency
 }
 ```
 
@@ -483,6 +484,12 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **Auth**: Required
 - **Response**: `null`
 
+#### VM Serial Console (WebSocket)
+- **WebSocket** `/api/v1/vm/{id}/console`
+- **Auth**: Query parameter `?auth=<base64_nip98_event>` (same base64-encoded NIP-98 event as the `Authorization` header)
+- **Protocol**: WebSocket upgrade — bidirectional relay between the client and the VM's serial console
+- **Description**: Opens a WebSocket connection to the VM's serial terminal. Raw bytes in either direction are forwarded to/from the VM's serial port on the host. The connection is closed when either side disconnects or an error occurs.
+
 ### Templates and Images
 
 #### List VM Templates
@@ -529,9 +536,15 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **Response**: `VmPayment`
 
 #### Get Payment History
-- **GET** `/api/v1/vm/{id}/payments`
+- **GET** `/api/v1/vm/{id}/payments?limit={limit}&offset={offset}`
 - **Auth**: Required
-- **Response**: `VmPayment[]`
+- **Query Params**:
+  - `limit`: Optional (default: 50, max: 100)
+  - `offset`: Optional (default: 0)
+- **Response**: Paginated list of VM payments
+```typescript
+// Returns: PaginatedResponse<VmPayment>
+```
 
 #### Get Payment Invoice (PDF)
 - **GET** `/api/v1/payment/{payment_id}/invoice?auth={base64_auth}`
@@ -621,7 +634,7 @@ const result: ApiResponse<Subscription> = await response.json();
 - **GET** `/api/v1/subscriptions/{id}/renew?method={payment_method}`
 - **Auth**: Required
 - **Query Params**:
-  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal' | 'stripe'). Defaults to 'lightning'
+  - `method`: Optional payment method (`'lightning'` | `'revolut'` | `'paypal'` | `'stripe'`). Defaults to `'lightning'`
 - **Response**: `SubscriptionPayment`
 - **Description**: Generates a payment invoice to renew/extend the subscription. For the first payment, the amount includes setup fees plus the monthly recurring cost. For subsequent renewals, only the monthly recurring cost is charged. After payment is confirmed, resources (IP ranges, etc.) are allocated and the subscription is activated.
 
@@ -963,10 +976,7 @@ interface IpSpacePricing {
   other_setup_fee: Price[]; // Setup fees converted to alternative currencies
 }
 
-interface Price {
-  currency: 'usd' | 'eur' | 'btc' | 'gbp' | 'cad' | 'chf' | 'aud' | 'jpy';
-  amount: number; // In decimal format (e.g., 10.00 for $10, 0.00011 for BTC)
-}
+// Note: uses the same Price type as the rest of the API (smallest currency units, uppercase currency codes)
 
 interface IpRangeSubscription {
   id: number;

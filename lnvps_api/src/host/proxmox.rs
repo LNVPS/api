@@ -379,7 +379,10 @@ impl ProxmoxClient {
             .map_err(OpError::Transient)?;
 
         if existing.trim() != snippet_content.trim() {
-            let parent = snippet_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/tmp");
+            let parent = snippet_path
+                .rsplit_once('/')
+                .map(|(p, _)| p)
+                .unwrap_or("/tmp");
             ssh.execute(&format!("mkdir -p '{parent}'"))
                 .await
                 .map_err(OpError::Transient)?;
@@ -819,11 +822,7 @@ impl ProxmoxClient {
         }
     }
 
-    fn make_config(
-        &self,
-        value: &FullVmInfo,
-        vendor_snippet: Option<&str>,
-    ) -> Result<VmConfig> {
+    fn make_config(&self, value: &FullVmInfo, vendor_snippet: Option<&str>) -> Result<VmConfig> {
         let ip_config = value
             .ips
             .iter()
@@ -2595,14 +2594,7 @@ mod tests {
             arch: "x86_64".to_string(),
             firewall_config: None,
         };
-        let p = ProxmoxClient::new(
-            "http://localhost:8006".parse()?,
-            "",
-            "",
-            None,
-            q_cfg,
-            None,
-        );
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         // With vendor snippet
         let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"))?;

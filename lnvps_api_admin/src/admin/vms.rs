@@ -12,7 +12,7 @@ use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
     UpgradeConfig, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
 };
-use lnvps_db::{AdminAction, AdminResource, PaymentType};
+use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
 use serde::Deserialize;
 
@@ -466,12 +466,15 @@ async fn admin_extend_vm(
         return ApiData::err("Cannot extend by more than 365 days");
     }
 
-    let old_expires = vm.expires;
-    let new_expires = vm.expires + Days::new(req.days as u64);
-
-    // Update VM expiration date in database
-    vm.expires = new_expires;
-    this.db.update_vm(&vm).await?;
+    // Extend the subscription expiry (single source of truth, use shortcut function)
+    let mut sub = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
+    let old_expires = sub.expires.unwrap_or(Utc::now());
+    let new_expires = old_expires + Days::new(req.days as u64);
+    sub.expires = Some(new_expires);
+    this.db.update_subscription(&sub).await?;
 
     // Log the extension in VM history
     let vm_history_logger = VmHistoryLogger::new(this.db.clone());
@@ -499,6 +502,16 @@ async fn admin_extend_vm(
         "Admin {} extended VM {} by {} days until {}",
         auth.user_id, id, req.days, new_expires
     );
+
+    // Trigger SpawnVm so the worker provisions the VM if it has never been
+    // spawned (mac == ff:ff:ff:ff:ff:ff) or syncs its state if it already has.
+    if let Err(e) = this
+        .work_commander
+        .send(WorkJob::SpawnVm { vm_id: id })
+        .await
+    {
+        error!("Failed to queue SpawnVm job for VM {}: {}", id, e);
+    }
 
     ApiData::ok(())
 }
@@ -577,27 +590,23 @@ async fn admin_list_vm_payments(
     auth.require_permission(AdminResource::Payments, AdminAction::View)?;
 
     // Verify VM exists
-    let _vm = this.db.get_vm(vm_id).await?;
+    let vm = this.db.get_vm(vm_id).await?;
 
-    let limit = page.limit.unwrap_or(50).min(100); // Max 100 items per page
+    let limit = page.limit.unwrap_or(50).min(100);
     let offset = page.offset.unwrap_or(0);
 
-    // Get VM payments with pagination
     let payments = this
         .db
-        .list_vm_payment_paginated(vm_id, limit, offset)
+        .list_vm_subscription_payments_paginated(vm.id, limit, offset)
         .await?;
 
-    // For total count, we'll get all payments and count them
-    // This is not ideal for large datasets, but works for now
-    let all_payments = this.db.list_vm_payment(vm_id).await?;
-    let total = all_payments.len() as u64;
+    let total = this.db.count_vm_subscription_payments(vm.id).await?;
 
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
 
     let admin_payments: Vec<AdminVmPaymentInfo> = payments
         .iter()
-        .map(|p| AdminVmPaymentInfo::from_vm_payment(p, base_currency.clone()))
+        .map(|p| AdminVmPaymentInfo::from_subscription_payment(p, vm_id, base_currency.clone()))
         .collect();
 
     ApiPaginatedData::ok(admin_payments, total, limit, offset)
@@ -613,21 +622,26 @@ async fn admin_get_vm_payment(
     auth.require_permission(AdminResource::Payments, AdminAction::View)?;
 
     // Verify VM exists
-    let _vm = this.db.get_vm(vm_id).await?;
+    let vm = this.db.get_vm(vm_id).await?;
 
     // Decode payment ID from hex
     let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
 
-    // Get payment
-    let payment = this.db.get_vm_payment(&payment_id_bytes).await?;
+    // Get subscription payment
+    let payment = this.db.get_subscription_payment(&payment_id_bytes).await?;
 
-    // Verify payment belongs to this VM
-    if payment.vm_id != vm_id {
+    // Verify the payment's subscription belongs to this VM
+    let payment_vm = this
+        .db
+        .get_vm_by_subscription(payment.subscription_id)
+        .await?;
+    if payment_vm.id != vm.id {
         return ApiData::err("Payment does not belong to this VM");
     }
 
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
-    let admin_payment_info = AdminVmPaymentInfo::from_vm_payment(&payment, base_currency);
+    let admin_payment_info =
+        AdminVmPaymentInfo::from_subscription_payment(&payment, vm_id, base_currency);
 
     ApiData::ok(admin_payment_info)
 }
@@ -675,20 +689,26 @@ async fn admin_calculate_vm_refund(
     // Create pricing engine instance with real exchange rates
     let tax_rates = std::collections::HashMap::new();
 
-    let pricing_engine =
-        PricingEngine::new_for_vm(this.db.clone(), this.exchange.clone(), tax_rates, vm_id).await?;
+    let pricing_engine = PricingEngine::new(this.db.clone(), this.exchange.clone(), tax_rates);
 
     // Calculate the refund amount from the specified date
     let refund_result = pricing_engine
-        .calculate_refund_amount_from_date(vm_id, payment_method, calculation_date)
+        .calculate_vm_refund_amount_from_date(vm_id, payment_method, calculation_date)
         .await?;
 
+    let vm_sub = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
     let refund_info = AdminRefundAmountInfo {
         amount: refund_result.amount.value(),
         currency: refund_result.amount.currency().to_string(),
         rate: refund_result.rate.rate,
-        expires: vm.expires,
-        seconds_remaining: (vm.expires - calculation_date).num_seconds(),
+        expires: vm_sub.expires,
+        seconds_remaining: vm_sub
+            .expires
+            .map(|e| (e - calculation_date).num_seconds())
+            .unwrap_or(0),
     };
 
     ApiData::ok(refund_info)
@@ -802,7 +822,7 @@ async fn admin_create_vm(
 
 /// Manually mark a VM payment as paid (admin override).
 ///
-/// This calls `vm_payment_paid` which atomically sets `is_paid=true`,
+/// This calls `subscription_payment_paid` which atomically sets `is_paid=true`,
 /// records `paid_at`, and extends the VM expiry by the payment's `time_value`.
 /// After that it dispatches a `CheckVm` work job (or `ProcessVmUpgrade`
 /// for upgrade payments) exactly like the normal payment-provider flow.
@@ -814,14 +834,18 @@ async fn admin_complete_vm_payment(
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
 
     // Verify VM exists
-    let _vm = this.db.get_vm(vm_id).await?;
+    let vm = this.db.get_vm(vm_id).await?;
 
     // Decode payment ID from hex
     let payment_id_bytes = hex::decode(&payment_id).map_err(|_| "Invalid payment ID format")?;
 
-    // Get payment and verify it belongs to this VM
-    let payment = this.db.get_vm_payment(&payment_id_bytes).await?;
-    if payment.vm_id != vm_id {
+    // Get subscription payment and verify it belongs to this VM
+    let payment = this.db.get_subscription_payment(&payment_id_bytes).await?;
+    let payment_vm = this
+        .db
+        .get_vm_by_subscription(payment.subscription_id)
+        .await?;
+    if payment_vm.id != vm.id {
         return ApiData::err("Payment does not belong to this VM");
     }
 
@@ -829,8 +853,8 @@ async fn admin_complete_vm_payment(
         return ApiData::err("Payment is already completed");
     }
 
-    // Mark as paid (atomically sets is_paid, paid_at, extends VM expiry)
-    this.db.vm_payment_paid(&payment).await?;
+    // Mark as paid (atomically sets is_paid, paid_at, extends VM expiry via time_value)
+    this.db.subscription_payment_paid(&payment).await?;
 
     info!(
         "Admin {} manually completed VM payment {} for VM {}",
@@ -838,12 +862,12 @@ async fn admin_complete_vm_payment(
     );
 
     // Dispatch the appropriate work job
-    let job = if payment.payment_type == PaymentType::Upgrade {
-        // Parse upgrade config from the payment's upgrade_params field
+    let job = if payment.payment_type == SubscriptionPaymentType::Upgrade {
+        // Parse upgrade config from the payment's metadata field
         let config = payment
-            .upgrade_params
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<UpgradeConfig>(json).ok())
+            .metadata
+            .as_ref()
+            .and_then(|json| serde_json::from_value::<UpgradeConfig>(json.clone()).ok())
             .unwrap_or_else(|| UpgradeConfig::new(None, None, None));
         WorkJob::ProcessVmUpgrade { vm_id, config }
     } else {
@@ -857,7 +881,11 @@ async fn admin_complete_vm_payment(
     }
 
     // Re-read the payment to get updated paid_at / is_paid
-    let updated = this.db.get_vm_payment(&payment_id_bytes).await?;
+    let updated = this.db.get_subscription_payment(&payment_id_bytes).await?;
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
-    ApiData::ok(AdminVmPaymentInfo::from_vm_payment(&updated, base_currency))
+    ApiData::ok(AdminVmPaymentInfo::from_subscription_payment(
+        &updated,
+        vm_id,
+        base_currency,
+    ))
 }

@@ -19,7 +19,7 @@ Admin API request/response format reference for LLM consumption.
 **RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
-**SubscriptionPaymentType**: `"purchase"`, `"renewal"`
+**SubscriptionPaymentType**: `"purchase"`, `"renewal"`, `"upgrade"`
 **SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`
 **InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
 **CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
@@ -176,6 +176,34 @@ GET /api/admin/v1/vms/{id}
 Required Permission: `virtual_machines::view`
 
 Returns detailed VM information with complete host and region data. The VM must have valid host and region associations.
+
+The response includes a `subscription` field (type: `AdminSubscriptionInfo`) when the VM is linked to a subscription. This object contains:
+- `id` — subscription ID
+- `is_active` — whether the subscription is currently active
+- `interval_amount` / `interval_type` — billing interval
+- `currency` — billing currency
+- `payment_count` — total number of payments made
+- `line_items` — array of `AdminSubscriptionLineItemInfo` objects
+
+Example (abbreviated):
+```json
+{
+  "data": {
+    "id": 42,
+    "subscription": {
+      "id": 7,
+      "is_active": true,
+      "interval_amount": 1,
+      "interval_type": "month",
+      "currency": "USD",
+      "payment_count": 3,
+      "line_items": [{ "id": 12, "amount": 999, "setup_amount": 0 }]
+    }
+  }
+}
+```
+
+`subscription` is `null`/omitted if no subscription is linked to the VM.
 
 #### Create VM for User
 
@@ -2837,7 +2865,8 @@ The RBAC system uses the following permission format: `resource::action`
   "id": number,
   // VM ID
   "created": "string (ISO 8601)",
-  "expires": "string (ISO 8601)",
+  "expires": "string (ISO 8601) | null",
+  // null for VMs not yet paid
   "mac_address": "string",
   "image_id": number,
   // OS image ID for linking
@@ -2917,7 +2946,31 @@ The RBAC system uses the following permission format: `resource::action`
   "region_id": number,
   "region_name": "string",
   "deleted": boolean,
-  "ref_code": "string | null"
+  "ref_code": "string | null",
+  "subscription": {
+    // Full AdminSubscriptionInfo — present when the VM has a linked subscription
+    "id": number,
+    "name": "string",
+    "is_active": boolean,
+    "auto_renewal_enabled": boolean,
+    "interval_amount": number,
+    "interval_type": "day" | "month" | "year",
+    "currency": "string",
+    "payment_count": number,
+    "line_items": [
+      {
+        "id": number,
+        "name": "string",
+        "description": "string | null",
+        "amount": number,
+        // recurring cost in cents/millisats
+        "setup_amount": number
+        // one-time setup fee in cents/millisats
+      }
+    ]
+  }
+  | null
+  // null/omitted when no subscription is linked
 }
 ```
 
@@ -3199,6 +3252,8 @@ The RBAC system uses the following permission format: `resource::action`
   // Total amount in cents/millisats
   "currency": "string",
   // "USD", "EUR", "BTC", etc.
+  "company_base_currency": "string",
+  // Base currency of the company that owns the subscription (e.g., "EUR")
   "payment_method": "lightning"
   |
   "revolut"
@@ -3208,17 +3263,25 @@ The RBAC system uses the following permission format: `resource::action`
   "stripe",
   "payment_type": "purchase"
   |
-  "renewal",
+  "renewal"
+  |
+  "upgrade",
   // SubscriptionPaymentType enum
   "external_id": "string | null",
   // External payment processor ID
   "is_paid": boolean,
   "paid_at": "string (ISO 8601) | null",
   // When payment was completed (null if unpaid)
-  "rate": number
+  "rate": number,
+  // Exchange rate to company_base_currency
+  "time_value": number
   |
   null,
-  // Exchange rate if applicable
+  // Seconds added to expiry when this payment is completed (omitted if not applicable)
+  "metadata": object
+  |
+  null,
+  // Service-specific JSON metadata (omitted if none)
   "tax": number,
   // Tax amount in cents/millisats
   "processing_fee": number
