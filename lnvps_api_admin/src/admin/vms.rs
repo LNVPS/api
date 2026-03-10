@@ -591,8 +591,7 @@ async fn admin_list_vm_payments(
         .list_vm_subscription_payments_paginated(vm.id, limit, offset)
         .await?;
 
-    let all_payments = this.db.list_vm_subscription_payments(vm.id).await?;
-    let total = all_payments.len() as u64;
+    let total = this.db.count_vm_subscription_payments(vm.id).await?;
 
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
 

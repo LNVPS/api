@@ -258,6 +258,9 @@ pub trait LNVpsDbBase: Send + Sync {
         offset: u64,
     ) -> DbResult<Vec<SubscriptionPayment>>;
 
+    /// Count total subscription payments for a VM (for pagination metadata)
+    async fn count_vm_subscription_payments(&self, vm_id: u64) -> DbResult<u64>;
+
     /// List VM ip assignments
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64>;
 

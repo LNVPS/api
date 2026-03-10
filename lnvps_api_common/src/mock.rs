@@ -835,6 +835,11 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn count_vm_subscription_payments(&self, vm_id: u64) -> DbResult<u64> {
+        let all = self.list_vm_subscription_payments(vm_id).await?;
+        Ok(all.len() as u64)
+    }
+
     async fn insert_vm_ip_assignment(&self, ip_assignment: &VmIpAssignment) -> DbResult<u64> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         let max = *ip_assignments.keys().max().unwrap_or(&0);
