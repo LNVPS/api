@@ -340,7 +340,7 @@ impl ProxmoxClient {
         };
 
         let snippet_filename = "lnvps-vendor.yaml";
-        let snippet_content = "#cloud-config\nssh_deletekeys: false\nssh_genkeytypes: []\n";
+        let snippet_content = "#cloud-config\nssh_deletekeys: false\n";
 
         // Snippet storage path depends on the storage type; for the default
         // `local` storage this is `/var/lib/vz/snippets/`.  For other directory-
@@ -934,7 +934,7 @@ impl ProxmoxClient {
             None => op_fatal!("scsi0 not found in VM config"),
         };
 
-        // Strip any pre-existing throttle params so we get the bare volume ref
+        // Strip any pre-existing throttle/ssd params so we get the bare volume ref
         let volume_part = scsi0_base
             .split(',')
             .next()
@@ -942,6 +942,11 @@ impl ProxmoxClient {
             .to_string();
 
         let mut parts = vec![volume_part];
+        // Re-apply SSD params if the disk type is SSD
+        if matches!(req.disk.kind, DiskType::SSD) {
+            parts.push("discard=on".to_string());
+            parts.push("ssd=1".to_string());
+        }
         if let Some(v) = limits.disk_mbps_read {
             parts.push(format!("mbps_rd={}", v));
         }
@@ -2660,6 +2665,98 @@ mod tests {
             .expect("wait_for_vm_stopped should succeed once status is stopped");
 
         // wiremock verifies the expected call counts on drop
+        Ok(())
+    }
+
+    /// Regression test: `apply_disk_limits` must preserve `discard=on,ssd=1` for SSD disks.
+    ///
+    /// Before the fix, `apply_disk_limits` stripped all existing disk params (including
+    /// `discard=on,ssd=1`) when applying I/O throttle limits, taking only the bare volume
+    /// path and adding back only the throttle params.
+    #[tokio::test]
+    async fn test_apply_disk_limits_preserves_ssd_params() -> Result<()> {
+        let server = MockServer::start().await;
+
+        // The existing scsi0 config as Proxmox would return it
+        let config_body = serde_json::json!({
+            "data": {
+                "digest": "abc123",
+                "scsi0": "local-zfs:vm-1-disk-0,discard=on,size=100G,ssd=1"
+            }
+        });
+
+        // GET /config — returns existing VM config
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&config_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // POST /config — accept the update; return a task ID
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
+
+        // Build a FullVmInfo with SSD disk and disk throttle limits
+        let mut info = mock_full_vm();
+        info.template.as_mut().unwrap().disk_mbps_read = Some(200);
+        info.template.as_mut().unwrap().disk_mbps_write = Some(100);
+
+        client
+            .apply_disk_limits(&info)
+            .await
+            .expect("apply_disk_limits should succeed");
+
+        // Inspect the POST request body to verify ssd params are present
+        let received = server.received_requests().await.unwrap();
+        let post_req = received
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("expected a POST to /config");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&post_req.body).expect("POST body should be JSON");
+        let scsi0 = body["scsi0"].as_str().expect("scsi0 field must be present");
+
+        assert!(
+            scsi0.contains("discard=on"),
+            "expected discard=on in scsi0, got: {}",
+            scsi0
+        );
+        assert!(
+            scsi0.contains("ssd=1"),
+            "expected ssd=1 in scsi0, got: {}",
+            scsi0
+        );
+        assert!(
+            scsi0.contains("mbps_rd=200"),
+            "expected mbps_rd=200 in scsi0, got: {}",
+            scsi0
+        );
+        assert!(
+            scsi0.contains("mbps_wr=100"),
+            "expected mbps_wr=100 in scsi0, got: {}",
+            scsi0
+        );
+
         Ok(())
     }
 }
