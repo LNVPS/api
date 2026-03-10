@@ -1,15 +1,103 @@
+use std::sync::OnceLock;
+
 use nostr::Keys;
 use sqlx::Row;
 use sqlx::mysql::MySqlPool;
 
-/// Default database URL for local development (matches docker-compose).
-fn db_url() -> String {
-    std::env::var("LNVPS_DB_URL")
-        .unwrap_or_else(|_| "mysql://root:root@localhost:3376/lnvps".to_string())
+// ---------------------------------------------------------------------------
+// Per-run database isolation
+// ---------------------------------------------------------------------------
+
+/// Return the unique run ID for this test process.
+///
+/// Reads `LNVPS_E2E_RUN_ID` from the environment. If not set, generates a
+/// timestamp-based ID once per process and caches it.
+pub fn run_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("LNVPS_E2E_RUN_ID").unwrap_or_else(|_| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .to_string()
+        })
+    })
 }
 
-/// Connect to the database.
+/// Name of the per-run test database: `lnvps_e2e_{run_id}`.
+pub fn test_db_name() -> String {
+    format!("lnvps_e2e_{}", run_id())
+}
+
+/// Base URL for the database server without any database name.
+/// Reads `LNVPS_DB_BASE_URL` (e.g. `mysql://root:root@localhost:3376`).
+/// Falls back to stripping the path from `LNVPS_DB_URL` or using the
+/// docker-compose default.
+fn root_db_url() -> String {
+    if let Ok(v) = std::env::var("LNVPS_DB_BASE_URL") {
+        return v;
+    }
+    // Derive from LNVPS_DB_URL by dropping everything from the last '/'
+    let full = std::env::var("LNVPS_DB_URL")
+        .unwrap_or_else(|_| "mysql://root:root@localhost:3376/lnvps".to_string());
+    // Strip the database name component (last '/...' segment)
+    if let Some(idx) = full.rfind('/') {
+        full[..idx].to_string()
+    } else {
+        full
+    }
+}
+
+/// Full connection URL for the per-run test database.
+fn db_url() -> String {
+    format!("{}/{}", root_db_url(), test_db_name())
+}
+
+/// Create the per-run test database if it does not already exist.
+pub async fn create_test_database() -> anyhow::Result<()> {
+    // Connect to a neutral system database to issue CREATE DATABASE
+    let root_url = format!("{}/mysql", root_db_url());
+    let pool = MySqlPool::connect(&root_url).await?;
+    let db_name = test_db_name();
+    sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{db_name}`"))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    eprintln!("[e2e] Created test database: {db_name}");
+    Ok(())
+}
+
+/// Drop the per-run test database.
+pub async fn drop_test_database() -> anyhow::Result<()> {
+    let root_url = format!("{}/mysql", root_db_url());
+    let pool = MySqlPool::connect(&root_url).await?;
+    let db_name = test_db_name();
+    sqlx::query(&format!("DROP DATABASE IF EXISTS `{db_name}`"))
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    eprintln!("[e2e] Dropped test database: {db_name}");
+    Ok(())
+}
+
+/// Ensure the test database has been created exactly once per process.
+/// Returns the database name.
+pub async fn ensure_test_database() -> anyhow::Result<String> {
+    static CREATED: OnceLock<String> = OnceLock::new();
+    if let Some(name) = CREATED.get() {
+        return Ok(name.clone());
+    }
+    create_test_database().await?;
+    let name = test_db_name();
+    // Ignore error if another thread beat us to it
+    let _ = CREATED.set(name.clone());
+    Ok(name)
+}
+
+/// Connect to the per-run test database (creating it first if necessary).
 pub async fn connect() -> anyhow::Result<MySqlPool> {
+    ensure_test_database().await?;
     let pool = MySqlPool::connect(&db_url()).await?;
     Ok(pool)
 }

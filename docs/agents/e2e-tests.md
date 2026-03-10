@@ -6,35 +6,55 @@ The `lnvps_e2e` crate contains end-to-end integration tests that run against liv
 
 **These tests are NOT run during Docker image builds.** They run in a dedicated CI workflow (`e2e.yml`) on pull requests, and can also be run locally.
 
-## Prerequisites
+## Running
 
-Before running E2E tests, ensure:
+### Using the script (recommended)
 
-1. **MySQL/MariaDB** is running on port 3376 (via `docker compose up -d`)
-2. **User API** (`lnvps_api`) is running on port 8000
-3. **Admin API** (`lnvps_api_admin`) is running on port 8001
-4. Database migrations have been applied (automatic on server startup)
+`scripts/run-e2e.sh` handles everything: starts docker infrastructure, waits for LND, creates the per-run database, patches the API configs, builds and starts both API servers, runs the tests, and tears everything down on exit.
+
+```bash
+# Full run (start docker, build, run all tests, stop docker)
+./scripts/run-e2e.sh
+
+# Skip rebuild if binaries are already up to date
+./scripts/run-e2e.sh --no-build
+
+# Run only the lifecycle test
+./scripts/run-e2e.sh --filter lifecycle
+
+# Leave API servers and docker running after the run (for debugging)
+./scripts/run-e2e.sh --no-cleanup
+```
+
+### Script options
+
+| Flag | Description |
+|---|---|
+| `--no-build` | Skip `cargo build` step |
+| `--no-cleanup` | Leave API servers and DB running after the run |
+| `--filter FILTER` | Pass a test-name filter to `cargo test` (e.g. `lifecycle`) |
+| `--run-id ID` | Override the run ID (default: current timestamp) |
+
+### Unit tests only (no API servers needed)
+
+```bash
+# Docker still required for the DB connection in unit tests
+docker compose up -d
+cargo test --workspace --exclude lnvps_e2e -- --test-threads=1
+```
 
 Do NOT set `LNVPS_DEV_SETUP=1` — the lifecycle test creates and cleans up all its own infrastructure. The `dev_setup.sql` script inserts data that can conflict.
 
-## Running
+## Per-run Database Isolation
 
-```bash
-# Run all E2E tests (always use --test-threads=1)
-cargo test -p lnvps_e2e -- --test-threads=1
+Each test process creates its own temporary database named `lnvps_e2e_{run_id}` and drops it at the end of the lifecycle test. This prevents test runs from polluting the main `lnvps` database.
 
-# Run with output visible
-cargo test -p lnvps_e2e -- --test-threads=1 --nocapture
+- In CI the run ID is `${{ github.run_id }}_${{ github.run_attempt }}` (set as `LNVPS_E2E_RUN_ID`).
+- Locally, if `LNVPS_E2E_RUN_ID` is not set, the current Unix timestamp in milliseconds is used.
+- The database is created automatically the first time any test calls `db::connect()`.
+- The lifecycle test drops the database at the end of its cleanup section.
 
-# Run a specific test module
-cargo test -p lnvps_e2e lifecycle -- --test-threads=1 --nocapture
-cargo test -p lnvps_e2e rbac -- --test-threads=1
-cargo test -p lnvps_e2e admin_api -- --test-threads=1
-cargo test -p lnvps_e2e user_api -- --test-threads=1
-
-# Run against a remote server (override defaults)
-LNVPS_API_URL=https://api-uat.lnvps.net cargo test -p lnvps_e2e user_api -- --test-threads=1
-```
+The API servers must be configured to connect to the same per-run database. In CI this is done by the workflow step that patches the API config files before starting the servers.
 
 ## Environment Variables
 
@@ -42,7 +62,9 @@ LNVPS_API_URL=https://api-uat.lnvps.net cargo test -p lnvps_e2e user_api -- --te
 |---|---|---|
 | `LNVPS_API_URL` | `http://localhost:8000` | User API base URL |
 | `LNVPS_ADMIN_API_URL` | `http://localhost:8001` | Admin API base URL |
-| `LNVPS_DB_URL` | `mysql://root:root@localhost:3376/lnvps` | Direct DB connection for bootstrap/cleanup |
+| `LNVPS_DB_BASE_URL` | *(derived from `LNVPS_DB_URL`)* | DB server URL without database name, e.g. `mysql://root:root@localhost:3376`. Used to create/drop the per-run database. |
+| `LNVPS_DB_URL` | `mysql://root:root@localhost:3376/lnvps` | Full DB URL — only used to derive `LNVPS_DB_BASE_URL` when the latter is not set. |
+| `LNVPS_E2E_RUN_ID` | *(current timestamp ms)* | Unique ID for this test run; determines the per-run DB name `lnvps_e2e_{run_id}`. |
 | `NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for user identity |
 | `ADMIN_NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for admin identity |
 
@@ -165,21 +187,24 @@ pub async fn hard_delete_my_resource(pool: &MySqlPool, id: u64) -> anyhow::Resul
 
 ## CI Workflow
 
-The `.github/workflows/e2e.yml` workflow runs E2E tests on every pull request. It:
+The `.github/workflows/e2e.yml` workflow runs E2E tests on every pull request. It installs dependencies, then delegates entirely to `scripts/run-e2e.sh` with `LNVPS_E2E_RUN_ID` set to `${{ github.run_id }}_${{ github.run_attempt }}`. The script:
 
 1. Starts infrastructure via `docker-compose.e2e.yaml` (MariaDB, Redis, bitcoind regtest, LND)
 2. Waits for LND to be ready and copies TLS cert + macaroon to the host
 3. Mines 101 blocks so LND has spendable funds
-4. Builds and starts both API servers using configs from `.github/e2e/`
-5. Runs `cargo test -p lnvps_e2e -- --test-threads=1`
-6. Tears down all containers on completion
+4. Creates the per-run database `lnvps_e2e_{run_id}`
+5. Writes temporary API configs pointing at the per-run database
+6. Builds and starts both API servers
+7. Runs `cargo test -p lnvps_e2e -- --test-threads=1`
+8. Tears down API servers and docker containers on exit
 
 ### CI files
 
 | File | Purpose |
 |---|---|
-| `.github/workflows/e2e.yml` | GitHub Actions workflow |
+| `.github/workflows/e2e.yml` | GitHub Actions workflow (thin wrapper around the script) |
+| `scripts/run-e2e.sh` | Full runner script used by CI and local development |
 | `docker-compose.e2e.yaml` | Compose file with DB, Redis, bitcoind, LND |
-| `.github/e2e/api-config.yaml` | User API config pointing to CI LND |
-| `.github/e2e/admin-config.yaml` | Admin API config |
+| `.github/e2e/api-config.yaml` | User API config template (DB URL replaced at runtime) |
+| `.github/e2e/admin-config.yaml` | Admin API config template (DB URL replaced at runtime) |
 | `.github/e2e/wait-for-lnd.sh` | Script to wait for LND readiness and mine initial blocks |

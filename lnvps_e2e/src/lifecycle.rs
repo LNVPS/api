@@ -754,6 +754,11 @@ mod tests {
 
         pool.close().await;
 
+        // Drop the per-run test database so it does not accumulate across runs.
+        // The API servers must be stopped before this point (CI tears them down
+        // in the Cleanup step after tests finish, so this is safe here).
+        crate::db::drop_test_database().await.unwrap();
+
         eprintln!("=== Full lifecycle test passed ===");
     }
 }
