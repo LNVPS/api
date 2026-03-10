@@ -145,7 +145,7 @@ DB_NAME="lnvps_e2e_${LNVPS_E2E_RUN_ID}"
 echo "=== Run ID: ${LNVPS_E2E_RUN_ID} | Database: ${DB_NAME} ==="
 
 # Wait for MariaDB to accept connections (first-time volume init can take >30s in CI)
-DB_READY_TIMEOUT=120
+DB_READY_TIMEOUT=600
 echo "Waiting for MariaDB at ${DB_HOST}:${DB_PORT} (timeout: ${DB_READY_TIMEOUT}s)..."
 for i in $(seq 1 "$DB_READY_TIMEOUT"); do
     if mysql_exec "SELECT 1" >/dev/null 2>&1; then
