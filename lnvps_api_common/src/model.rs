@@ -214,7 +214,7 @@ impl ApiVmTemplate {
 pub struct ApiVmStatus {
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
-    /// When the VM was created
+    /// When the subscription was created (i.e. when the VM was ordered)
     pub created: DateTime<Utc>,
     /// When the VM's subscription expires (None = never paid)
     pub expires: Option<DateTime<Utc>>,
@@ -253,23 +253,16 @@ pub async fn vm_to_status(
         .collect();
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
-    // Load subscription for expiry + auto_renewal
-    let (sub_expires, sub_auto_renewal) = if let Ok(li) = db
-        .get_subscription_line_item(vm.subscription_line_item_id)
-        .await
-    {
-        if let Ok(sub) = db.get_subscription(li.subscription_id).await {
-            (sub.expires, sub.auto_renewal_enabled)
-        } else {
-            (None, false)
-        }
-    } else {
-        (None, false)
-    };
+    // Load subscription for created + expiry + auto_renewal
+    let (sub_created, sub_expires, sub_auto_renewal) =
+        match db.get_subscription_by_line_item_id(vm.subscription_line_item_id).await {
+            Ok(sub) => (sub.created, sub.expires, sub.auto_renewal_enabled),
+            Err(_) => (Utc::now(), None, false),
+        };
 
     Ok(ApiVmStatus {
         id: vm.id,
-        created: vm.created,
+        created: sub_created,
         expires: sub_expires,
         mac_address: vm.mac_address,
         image: image.into(),

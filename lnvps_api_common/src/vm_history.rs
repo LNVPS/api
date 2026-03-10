@@ -33,7 +33,6 @@ impl VmHistoryLogger {
             "template_id": vm.template_id,
             "custom_template_id": vm.custom_template_id,
             "ssh_key_id": vm.ssh_key_id,
-            "created": vm.created,
             "disk_id": vm.disk_id,
             "mac_address": vm.mac_address,
             "ref_code": vm.ref_code
@@ -467,7 +466,6 @@ mod tests {
             custom_template_id: None,
             subscription_line_item_id: 0,
             ssh_key_id: 0,
-            created: chrono::Utc::now(),
             disk_id: 0,
             mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
             deleted: false,
@@ -644,7 +642,6 @@ mod tests {
     #[tokio::test]
     async fn test_log_vm_configuration_changed() {
         let logger = make_logger();
-        let now = chrono::Utc::now();
         let old_vm = lnvps_db::Vm {
             id: 18,
             host_id: 1,
@@ -654,7 +651,6 @@ mod tests {
             custom_template_id: None,
             subscription_line_item_id: 0,
             ssh_key_id: 1,
-            created: now,
             disk_id: 1,
             mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
             deleted: false,

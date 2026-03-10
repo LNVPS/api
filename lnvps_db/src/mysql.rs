@@ -27,7 +27,8 @@ impl LNVpsDbMysql {
     }
 
     pub async fn execute(&self, sql: &str) -> DbResult<()> {
-        self.db.execute(sql).await?;
+        let mut conn = self.db.acquire().await?;
+        conn.execute(sql).await?;
         Ok(())
     }
 
@@ -724,7 +725,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,created,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
@@ -732,7 +733,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.custom_template_id)
             .bind(vm.subscription_line_item_id)
             .bind(vm.ssh_key_id)
-            .bind(vm.created)
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(&vm.ref_code)
@@ -1668,6 +1668,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(&self.db)
                 .await?,
         )
+    }
+
+    async fn get_subscription_by_line_item_id(&self, line_item_id: u64) -> DbResult<Subscription> {
+        Ok(sqlx::query_as(
+            "SELECT s.* FROM subscription s
+             INNER JOIN subscription_line_item sli ON sli.subscription_id = s.id
+             WHERE sli.id = ?"
+        )
+        .bind(line_item_id)
+        .fetch_one(&self.db)
+        .await?)
     }
 
     async fn insert_subscription_line_item(

@@ -204,19 +204,12 @@ impl HostCapacityService {
             if vm.deleted {
                 continue;
             }
-            let is_paid = if let Ok(li) = self
+            let is_paid = self
                 .db
-                .get_subscription_line_item(vm.subscription_line_item_id)
+                .get_subscription_by_line_item_id(vm.subscription_line_item_id)
                 .await
-            {
-                self.db
-                    .get_subscription(li.subscription_id)
-                    .await
-                    .map(|s| s.is_setup)
-                    .unwrap_or(false)
-            } else {
-                false
-            };
+                .map(|s| s.is_setup)
+                .unwrap_or(false);
             if is_paid {
                 vms.push(vm);
             }

@@ -354,7 +354,7 @@ pub struct AdminVmInfo {
     // Core VM information (moved from ApiVmStatus)
     /// Unique VM ID (Same in proxmox)
     pub id: u64,
-    /// When the VM was created
+    /// When the subscription was created (i.e. when the VM was ordered)
     pub created: DateTime<Utc>,
     /// When the VM's subscription expires (None = never paid)
     pub expires: Option<DateTime<Utc>>,
@@ -536,34 +536,20 @@ impl AdminVmInfo {
         }
 
         // Fetch subscription via the VM's subscription line item
-        let subscription = {
-            let line_item = db
-                .get_subscription_line_item(vm.subscription_line_item_id)
-                .await
-                .ok();
-            if let Some(line_item) = line_item {
-                let sub = db.get_subscription(line_item.subscription_id).await.ok();
-                if let Some(sub) = sub {
-                    AdminSubscriptionInfo::from_subscription(db, &sub)
-                        .await
-                        .ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let subscription = match db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+        {
+            Ok(sub) => AdminSubscriptionInfo::from_subscription(db, &sub).await.ok(),
+            Err(_) => None,
         };
 
-        // Load subscription for expiry + auto_renewal
-        let li = db
-            .get_subscription_line_item(vm.subscription_line_item_id)
-            .await?;
-        let sub = db.get_subscription(li.subscription_id).await?;
+        // Load subscription for expiry + auto_renewal (use shortcut function)
+        let sub = db.get_subscription_by_line_item_id(vm.subscription_line_item_id).await?;
 
         Ok(Self {
             id: vm.id,
-            created: vm.created,
+            created: sub.created,
             expires: sub.expires,
             mac_address: vm.mac_address.clone(),
             image_id: vm.image_id,
@@ -2836,17 +2822,9 @@ impl AdminIpRangeSubscriptionInfo {
     ) -> anyhow::Result<Self> {
         let mut info = Self::from(sub.clone());
 
-        // Get line item details
-        if let Ok(line_item) = db
-            .get_subscription_line_item(sub.subscription_line_item_id)
-            .await
-        {
-            info.subscription_id = Some(line_item.subscription_id);
-
-            // Get subscription details for user_id
-            if let Ok(subscription) = db.get_subscription(line_item.subscription_id).await {
-                info.user_id = Some(subscription.user_id);
-            }
+        // Get subscription details for user_id (use shortcut function)
+        if let Ok(subscription) = db.get_subscription_by_line_item_id(sub.subscription_line_item_id).await {
+            info.user_id = Some(subscription.user_id);
         }
 
         // Get parent IP space CIDR

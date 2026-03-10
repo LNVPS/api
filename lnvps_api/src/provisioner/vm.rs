@@ -146,13 +146,12 @@ impl VmProvisioner {
             setup_amount: 0,
             configuration: None,
         };
-        let (_subscription_id, line_item_ids) = self
+        let (subscription_id, line_item_ids) = self
             .db
             .insert_subscription_with_line_items(&subscription, vec![line_item])
             .await?;
         let subscription_line_item_id = line_item_ids[0];
 
-        let now = Utc::now();
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -162,7 +161,6 @@ impl VmProvisioner {
             custom_template_id: None,
             subscription_line_item_id,
             ssh_key_id: ssh_key.id,
-            created: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
@@ -172,6 +170,16 @@ impl VmProvisioner {
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
+
+        // Update subscription and line item names now that the VM ID is known
+        let mut sub = self.db.get_subscription(subscription_id).await?;
+        sub.name = format!("VM{} subscription", new_vm.id);
+        self.db.update_subscription(&sub).await?;
+
+        let mut li = self.db.get_subscription_line_item(subscription_line_item_id).await?;
+        li.name = format!("VM{} - {}", new_vm.id, template.name);
+        self.db.update_subscription_line_item(&li).await?;
+
         Ok(new_vm)
     }
 
@@ -256,13 +264,12 @@ impl VmProvisioner {
             setup_amount: 0,
             configuration: None,
         };
-        let (_subscription_id, line_item_ids) = self
+        let (subscription_id, line_item_ids) = self
             .db
             .insert_subscription_with_line_items(&subscription, vec![line_item])
             .await?;
         let subscription_line_item_id = line_item_ids[0];
 
-        let now = Utc::now();
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -272,7 +279,6 @@ impl VmProvisioner {
             custom_template_id: Some(template_id),
             subscription_line_item_id,
             ssh_key_id: ssh_key.id,
-            created: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
@@ -282,6 +288,16 @@ impl VmProvisioner {
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
+
+        // Update subscription and line item names now that the VM ID is known
+        let mut sub = self.db.get_subscription(subscription_id).await?;
+        sub.name = format!("VM{} subscription", new_vm.id);
+        self.db.update_subscription(&sub).await?;
+
+        let mut li = self.db.get_subscription_line_item(subscription_line_item_id).await?;
+        li.name = format!("VM{} - {}", new_vm.id, pricing.name);
+        self.db.update_subscription_line_item(&li).await?;
+
         Ok(new_vm)
     }
 
@@ -2035,9 +2051,9 @@ mod tests {
 
     // ── subscription / VM lifecycle tests ────────────────────────────────────
 
-    /// After a first payment is completed the subscription must be active and
-    /// `expires` must be set, and a `WorkJob::CheckVm` must be queued so the
-    /// worker knows to spawn the VM on the hypervisor.
+    /// After any non-upgrade payment is completed, `WorkJob::SpawnVm` must be
+    /// queued regardless of payment type. The MAC-address guard inside the
+    /// worker makes it safe to queue SpawnVm for both first and renewal payments.
     #[tokio::test]
     async fn test_payment_activates_subscription_and_queues_vm() -> Result<()> {
         let db = Arc::new(MockDb::default());
@@ -2077,22 +2093,74 @@ mod tests {
         );
         assert!(sub_after.is_setup, "is_setup must be true after first payment");
 
-        // A WorkJob::CheckVm must have been queued — recv() is non-blocking here since
-        // complete_payment already sent the job synchronously above.
+        // WorkJob::SpawnVm must be queued for every non-upgrade payment.
+        // recv() is non-blocking here since complete_payment already sent the job
+        // synchronously above.
         let msgs = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             wrk.recv(),
         )
         .await
-        .expect("timed out waiting for WorkJob::CheckVm")
+        .expect("timed out waiting for WorkJob::SpawnVm")
         ?;
-        let found_check_vm = msgs
+        let found_spawn_vm = msgs
             .iter()
-            .any(|m| matches!(&m.job, WorkJob::CheckVm { vm_id } if *vm_id == vm.id));
+            .any(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id));
         assert!(
-            found_check_vm,
-            "expected WorkJob::CheckVm {{ vm_id: {} }} in queued jobs: {:?}",
+            found_spawn_vm,
+            "expected WorkJob::SpawnVm {{ vm_id: {} }} in queued jobs: {:?}",
             vm.id,
+            msgs.iter().map(|m| format!("{:?}", m.job)).collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// Two payments created before either is confirmed (both appear as Purchase
+    /// type) must both queue `WorkJob::SpawnVm`. The MAC-address guard in the
+    /// worker makes the second job a no-op once the VM is already provisioned.
+    #[tokio::test]
+    async fn test_double_payment_both_queue_spawn_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler_with_commander(db.clone(), wrk.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+
+        // Create two payments before either is confirmed.
+        let p1 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        let p2 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        // Confirm both.
+        sub_handler.complete_payment(&p1).await?;
+        sub_handler.complete_payment(&p2).await?;
+
+        // Drain the queue — both payments must have queued SpawnVm.
+        let msgs = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wrk.recv(),
+        )
+        .await
+        .expect("timed out waiting for SpawnVm jobs")?;
+
+        let spawn_count = msgs
+            .iter()
+            .filter(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id))
+            .count();
+        assert_eq!(
+            spawn_count, 2,
+            "expected 2 SpawnVm jobs, got {:?}",
             msgs.iter().map(|m| format!("{:?}", m.job)).collect::<Vec<_>>()
         );
 

@@ -466,12 +466,11 @@ async fn admin_extend_vm(
         return ApiData::err("Cannot extend by more than 365 days");
     }
 
-    // Extend the subscription expiry (single source of truth)
-    let li = this
+    // Extend the subscription expiry (single source of truth, use shortcut function)
+    let mut sub = this
         .db
-        .get_subscription_line_item(vm.subscription_line_item_id)
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
         .await?;
-    let mut sub = this.db.get_subscription(li.subscription_id).await?;
     let old_expires = sub.expires.unwrap_or(Utc::now());
     let new_expires = old_expires + Days::new(req.days as u64);
     sub.expires = Some(new_expires);
@@ -503,6 +502,16 @@ async fn admin_extend_vm(
         "Admin {} extended VM {} by {} days until {}",
         auth.user_id, id, req.days, new_expires
     );
+
+    // Trigger SpawnVm so the worker provisions the VM if it has never been
+    // spawned (mac == ff:ff:ff:ff:ff:ff) or syncs its state if it already has.
+    if let Err(e) = this
+        .work_commander
+        .send(WorkJob::SpawnVm { vm_id: id })
+        .await
+    {
+        error!("Failed to queue SpawnVm job for VM {}: {}", id, e);
+    }
 
     ApiData::ok(())
 }
@@ -687,11 +696,10 @@ async fn admin_calculate_vm_refund(
         .calculate_vm_refund_amount_from_date(vm_id, payment_method, calculation_date)
         .await?;
 
-    let vm_li = this
+    let vm_sub = this
         .db
-        .get_subscription_line_item(vm.subscription_line_item_id)
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
         .await?;
-    let vm_sub = this.db.get_subscription(vm_li.subscription_id).await?;
     let refund_info = AdminRefundAmountInfo {
         amount: refund_result.amount.value(),
         currency: refund_result.amount.currency().to_string(),

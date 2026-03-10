@@ -171,8 +171,23 @@ pub async fn remove_all_roles(pool: &MySqlPool, user_id: u64) -> anyhow::Result<
 
 /// Hard-delete a VM and all its dependent rows from the database.
 /// Used by E2E cleanup when the worker cannot reach a fake host.
+///
+/// Also removes the subscription and its payments that back this VM,
+/// because all new VMs link to a `subscription_line_item` and expiry is
+/// tracked in `subscription.expires` (not in `vm` directly).
 pub async fn hard_delete_vm(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<()> {
-    // Delete in dependency order
+    // Resolve subscription_id via the line-item link before deleting the VM row.
+    let sub_id: Option<u64> = sqlx::query_scalar(
+        "SELECT sli.subscription_id \
+         FROM vm v \
+         INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+         WHERE v.id = ?",
+    )
+    .bind(vm_id)
+    .fetch_optional(pool)
+    .await?;
+
+    // Delete legacy vm_payment rows (pre-subscription-migration VMs only).
     sqlx::query("DELETE FROM vm_payment WHERE vm_id = ?")
         .bind(vm_id)
         .execute(pool)
@@ -187,6 +202,36 @@ pub async fn hard_delete_vm(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<()> 
         .await?;
     sqlx::query("DELETE FROM vm WHERE id = ?")
         .bind(vm_id)
+        .execute(pool)
+        .await?;
+
+    // Delete subscription rows that were linked to this VM (if any).
+    if let Some(sid) = sub_id {
+        hard_delete_subscription(pool, sid).await?;
+    }
+
+    Ok(())
+}
+
+/// Hard-delete a subscription and all its payments and line items.
+///
+/// Use this when the admin API soft-deletes subscriptions or when the
+/// lifecycle test needs to clean up a subscription that was created via
+/// the admin API or the subscription endpoints directly.
+pub async fn hard_delete_subscription(pool: &MySqlPool, sub_id: u64) -> anyhow::Result<()> {
+    // Payments reference the subscription; delete them first.
+    sqlx::query("DELETE FROM subscription_payment WHERE subscription_id = ?")
+        .bind(sub_id)
+        .execute(pool)
+        .await?;
+    // Line items cascade-delete from the subscription in production (ON DELETE
+    // CASCADE), but we delete explicitly here to be safe across all DB configs.
+    sqlx::query("DELETE FROM subscription_line_item WHERE subscription_id = ?")
+        .bind(sub_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM subscription WHERE id = ?")
+        .bind(sub_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -273,6 +318,42 @@ pub async fn hard_delete_company(pool: &MySqlPool, company_id: u64) -> anyhow::R
         .bind(company_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Backdate `subscription.created` by the given number of hours so that `check_vms`
+/// considers the VM eligible for unpaid-VM cleanup (threshold: 1 hour).
+pub async fn backdate_vm_created(pool: &MySqlPool, vm_id: u64, hours: u32) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE subscription s \
+         INNER JOIN subscription_line_item sli ON sli.subscription_id = s.id \
+         INNER JOIN vm v ON v.subscription_line_item_id = sli.id \
+         SET s.created = DATE_SUB(NOW(), INTERVAL ? HOUR) \
+         WHERE v.id = ?",
+    )
+    .bind(hours)
+    .bind(vm_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set `subscription.expires` to a given number of seconds in the past so that
+/// `check_subscriptions` considers it expired (or within the grace period).
+///
+/// Pass `seconds_ago = 0` to set it to exactly `NOW()` (boundary).
+pub async fn expire_subscription(
+    pool: &MySqlPool,
+    sub_id: u64,
+    seconds_ago: u64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE subscription SET expires = DATE_SUB(NOW(), INTERVAL ? SECOND) WHERE id = ?",
+    )
+    .bind(seconds_ago)
+    .bind(sub_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

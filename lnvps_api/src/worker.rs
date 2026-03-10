@@ -375,7 +375,31 @@ impl Worker {
         sub: &Subscription,
         line_items: &Vec<SubscriptionLineItem>,
     ) -> String {
-        let mut msg = format!("Subscription: {}\n\nLine Items:\n", sub.name);
+        let interval_str = match sub.interval_type {
+            IntervalType::Day => {
+                if sub.interval_amount == 1 {
+                    "per day".to_string()
+                } else {
+                    format!("every {} days", sub.interval_amount)
+                }
+            }
+            IntervalType::Month => {
+                if sub.interval_amount == 1 {
+                    "per month".to_string()
+                } else {
+                    format!("every {} months", sub.interval_amount)
+                }
+            }
+            IntervalType::Year => {
+                if sub.interval_amount == 1 {
+                    "per year".to_string()
+                } else {
+                    format!("every {} years", sub.interval_amount)
+                }
+            }
+        };
+
+        let mut msg = format!("Subscription: {}\n\nServices:\n", sub.name);
 
         for li in line_items {
             let formatted_amount = if let Ok(cur) = Currency::from_str(&sub.currency) {
@@ -390,27 +414,21 @@ impl Worker {
                 li.amount.to_string()
             };
 
-            let interval_type_str = match sub.interval_type {
-                IntervalType::Day => "day",
-                IntervalType::Month => "month",
-                IntervalType::Year => "year",
-            };
-
             msg.push_str(&format!(
-                "- {}: {}/{}{}\n",
-                li.name,
-                formatted_amount,
-                interval_type_str,
-                if li.setup_amount > 0 {
-                    format!(" ({} setup fee)", formatted_setup_amount)
-                } else {
-                    "".to_string()
-                }
+                "- {} — {} {}",
+                li.name, formatted_amount, interval_str
             ));
+            if li.setup_amount > 0 {
+                msg.push_str(&format!(" + {} setup fee", formatted_setup_amount));
+            }
+            msg.push('\n');
+            if let Some(ref desc) = li.description {
+                msg.push_str(&format!("  {}\n", desc));
+            }
         }
 
         if let Some(ref desc) = sub.description {
-            msg.push_str(&format!("\nDescription: {}\n", desc));
+            msg.push_str(&format!("\nNote: {}\n", desc));
         }
 
         msg
@@ -441,17 +459,11 @@ impl Worker {
 
     /// Resolve the authoritative expiry for a VM from its subscription.
     async fn vm_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
-        let line_item = self
-            .db
-            .get_subscription_line_item(vm.subscription_line_item_id)
+        self.db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await
-            .ok()?;
-        let sub = self
-            .db
-            .get_subscription(line_item.subscription_id)
-            .await
-            .ok()?;
-        sub.expires
+            .ok()?
+            .expires
     }
 
     /// Check VM state from hypervisor and update cache
@@ -467,11 +479,12 @@ impl Worker {
             }
             Err(e) => {
                 warn!("Failed to get VM{} state: {}", vm.id, e);
-                if self
-                    .vm_expires(vm)
-                    .await
-                    .map(|e| e > Utc::now())
-                    .unwrap_or(false)
+                if !vm.deleted
+                    && self
+                        .vm_expires(vm)
+                        .await
+                        .map(|e| e > Utc::now())
+                        .unwrap_or(false)
                 {
                     self.spawn_vm_internal(vm).await?;
                 }
@@ -527,31 +540,40 @@ impl Worker {
         let user = self.db.get_user(vm.user_id).await?;
         let resources = FullVmInfo::vm_resources(vm.id, self.db.clone()).await?;
 
-        let msg = format!(
-            "VM #{} been created!\n\nOS: {}\nCPU: {}\nRAM: {}GB\nDisk: {}GB\n{}\n\nNPUB: {}",
+        let ip_lines = vm_ips
+            .iter()
+            .map(|i| {
+                if let Some(fwd) = &i.dns_forward {
+                    format!("IP: {} ({})", i.ip, fwd)
+                } else {
+                    format!("IP: {}", i.ip)
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+        let user_msg = format!(
+            "Your VM #{} has been created!\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}\n\nNPUB: {}",
             vm.id,
             image,
             resources.cpu,
             resources.memory / crate::GB,
             resources.disk_size / crate::GB,
-            vm_ips
-                .iter()
-                .map(|i| if let Some(fwd) = &i.dns_forward {
-                    format!("IP: {} ({})", i.ip, fwd)
-                } else {
-                    format!("IP: {}", i.ip)
-                })
-                .collect::<Vec<String>>()
-                .join("\n"),
+            ip_lines,
             PublicKey::from_slice(&user.pubkey)?.to_bech32()?
         );
-        self.queue_notification(
-            vm.user_id,
-            format!("Your {}", &msg),
-            Some(format!("[VM{}] Created", vm.id)),
-        )
-        .await;
-        self.queue_admin_notification(msg, Some(format!("[VM{}] Created", vm.id)))
+        let admin_msg = format!(
+            "VM #{} has been created.\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}\n\nUser NPUB: {}",
+            vm.id,
+            image,
+            resources.cpu,
+            resources.memory / crate::GB,
+            resources.disk_size / crate::GB,
+            ip_lines,
+            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
+        );
+        self.queue_notification(vm.user_id, user_msg, Some(format!("[VM{}] Created", vm.id)))
+            .await;
+        self.queue_admin_notification(admin_msg, Some(format!("[VM{}] Created", vm.id)))
             .await;
         Ok(())
     }
@@ -609,28 +631,27 @@ impl Worker {
 
         for vm in &db_vms {
             // A VM is "new" (never paid) if its subscription has never been set up.
-            let is_new_vm = if let Ok(li) = self
+            let Some(sub) = self
                 .db
-                .get_subscription_line_item(vm.subscription_line_item_id)
+                .get_subscription_by_line_item_id(vm.subscription_line_item_id)
                 .await
-            {
-                !self
-                    .db
-                    .get_subscription(li.subscription_id)
-                    .await
-                    .map(|s| s.is_setup)
-                    .unwrap_or(false)
-            } else {
-                true
+                .ok()
+            else {
+                warn!("Skipping VM{}, no subscription found (corrupted?)", vm.id);
+                continue;
             };
 
-            // only check spawned vms
-            if !is_new_vm {
+            // Only check spawned VMs — paid VMs need status checking on hosts.
+            if sub.is_setup {
                 vms_by_host.entry(vm.host_id).or_default().push(vm);
             }
 
-            // delete vm if not paid (in new state) after 1 hour
-            if is_new_vm && !vm.deleted && vm.created < Utc::now().sub(TimeDelta::hours(1)) {
+            // Delete VM if unpaid (never set up) after 1 hour grace period.
+            // Use subscription created time as primary; fall back to vm.created
+            // if the subscription lookup failed.
+            let vm_old_enough_to_delete = Utc::now() - sub.created > TimeDelta::hours(1);
+
+            if !vm.deleted && vm_old_enough_to_delete && !sub.is_setup {
                 vms_to_delete.push(vm);
             }
         }
@@ -652,16 +673,6 @@ impl Worker {
         for (host_id, vms) in vms_by_host {
             if let Err(e) = self.check_vms_on_host(host_id, &vms).await {
                 error!("Failed to check VMs on host {}: {}", host_id, e);
-                for vm in vms {
-                    if let Err(e) = self.check_vm(vm).await {
-                        error!("Failed to check VM {}: {}", vm.id, e);
-                        self.queue_admin_notification(
-                            format!("Failed to check VM {}:\n{}", vm.id, e),
-                            Some(format!("VM {} Check Failed", vm.id)),
-                        )
-                        .await
-                    }
-                }
             }
         }
 
@@ -1596,6 +1607,17 @@ impl Worker {
                 let vm = self.db.get_vm(*vm_id).await?;
                 self.check_vm(&vm).await?;
             }
+            WorkJob::SpawnVm { vm_id } => {
+                let vm = self.db.get_vm(*vm_id).await?;
+                if vm.mac_address == "ff:ff:ff:ff:ff:ff" {
+                    // VM has never been provisioned on the host — spawn it now.
+                    self.spawn_vm_internal(&vm).await?;
+                } else {
+                    // VM already exists (a prior SpawnVm succeeded).
+                    // Just sync its state into the cache.
+                    self.check_vm(&vm).await?;
+                }
+            }
             WorkJob::SendNotification {
                 user_id,
                 message,
@@ -2221,11 +2243,22 @@ impl Worker {
             .execute()
             .await?;
 
+        let upgraded_vm = self.db.get_vm(vm_id).await?;
+        let new_resources = FullVmInfo::vm_resources(vm_id, self.db.clone()).await;
+        let specs_line = match new_resources {
+            Ok(r) => format!(
+                "\n\nNew specifications:\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB",
+                r.cpu,
+                r.memory / crate::GB,
+                r.disk_size / crate::GB
+            ),
+            Err(_) => String::new(),
+        };
         self.queue_notification(
-            self.db.get_vm(vm_id).await?.user_id,
+            upgraded_vm.user_id,
             format!(
-                "Your VM #{} has been successfully upgraded. The new specifications are now active.",
-                vm_id
+                "Your VM #{} has been successfully upgraded. The new specifications are now active.{}",
+                vm_id, specs_line
             ),
             Some(format!("[VM{}] Upgrade Complete", vm_id)),
         ).await;

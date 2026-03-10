@@ -88,13 +88,11 @@ impl PricingEngine {
     /// Get the authoritative expiry for a VM from its subscription.
     /// Returns `None` if the subscription has never been paid.
     async fn vm_subscription_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
-        let li = self
-            .db
-            .get_subscription_line_item(vm.subscription_line_item_id)
+        self.db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await
-            .ok()?;
-        let sub = self.db.get_subscription(li.subscription_id).await.ok()?;
-        sub.expires
+            .ok()?
+            .expires
     }
 
     /// Calculate processing fee for a payment based on payment method and amount

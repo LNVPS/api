@@ -86,7 +86,7 @@ async fn main() -> Result<(), Error> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
     #[cfg(debug_assertions)]
-    if std::env::var("LNVPS_DEV_SETUP").is_ok() {
+    if std::env::var("LNVPS_NO_DEV_SETUP").is_err() {
         let setup_script = include_str!("../../dev_setup.sql");
         db.execute(setup_script).await?;
         info!("Executed dev_setup.sql");

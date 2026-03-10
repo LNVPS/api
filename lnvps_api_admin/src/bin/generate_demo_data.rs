@@ -1176,7 +1176,6 @@ async fn create_vms(
             custom_template_id: None,
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
-            created,
             disk_id: disk.id,
             mac_address: mac_address.clone(),
             deleted: false,
@@ -1221,7 +1220,6 @@ async fn create_vms(
             custom_template_id: Some(custom_template.id),
             subscription_line_item_id: 0,
             ssh_key_id: ssh_key.id,
-            created,
             disk_id: disk.id,
             mac_address: mac_address.clone(),
             deleted: false,
@@ -1295,12 +1293,18 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             _ => 1.0,                                                  // USD base rate
         };
 
+        let sub_created = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .map(|s| s.created)
+            .unwrap_or_else(|_| Utc::now());
+
         let payment_id_bytes = hex::decode(&payment_id)?;
         let payment = VmPayment {
             id: payment_id_bytes,
             vm_id: vm.id,
-            created: vm.created,
-            expires: vm.created + Duration::hours(1),
+            created: sub_created,
+            expires: sub_created + Duration::hours(1),
             amount,
             external_data: EncryptedString::new(external_data),
             time_value: 7776000,
@@ -1313,7 +1317,7 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             tax: 0,
             processing_fee: 0,
             upgrade_params: None,
-            paid_at: Some(vm.created), // Demo data: assume paid immediately
+            paid_at: Some(sub_created), // Demo data: assume paid immediately
         };
 
         db.insert_vm_payment(&payment).await?;

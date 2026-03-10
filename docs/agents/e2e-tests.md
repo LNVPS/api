@@ -43,7 +43,7 @@ docker compose up -d
 cargo test --workspace --exclude lnvps_e2e -- --test-threads=1
 ```
 
-Do NOT set `LNVPS_DEV_SETUP=1` — the lifecycle test creates and cleans up all its own infrastructure. The `dev_setup.sql` script inserts data that can conflict.
+The `run-e2e.sh` script sets `LNVPS_NO_DEV_SETUP=1` when starting the API servers so that `dev_setup.sql` is not executed. The lifecycle test creates and cleans up all its own infrastructure; the dev setup data would conflict with it.
 
 ## Per-run Database Isolation
 
@@ -65,6 +65,7 @@ The API servers must be configured to connect to the same per-run database. In C
 | `LNVPS_DB_BASE_URL` | *(derived from `LNVPS_DB_URL`)* | DB server URL without database name, e.g. `mysql://root:root@localhost:3376`. Used to create/drop the per-run database. |
 | `LNVPS_DB_URL` | `mysql://root:root@localhost:3376/lnvps` | Full DB URL — only used to derive `LNVPS_DB_BASE_URL` when the latter is not set. |
 | `LNVPS_E2E_RUN_ID` | *(current timestamp ms)* | Unique ID for this test run; determines the per-run DB name `lnvps_e2e_{run_id}`. |
+| `LNVPS_NO_DEV_SETUP` | *(unset)* | Set to any value to suppress `dev_setup.sql` on startup (debug builds only). Always set by `run-e2e.sh`. |
 | `NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for user identity |
 | `ADMIN_NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for admin identity |
 

@@ -106,7 +106,6 @@ impl MockDb {
             custom_template_id: None,
             subscription_line_item_id: 1,
             ssh_key_id: 1,
-            created: Utc::now(),
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
@@ -1450,6 +1449,20 @@ impl LNVpsDbBase for MockDb {
             .get(&id)
             .cloned()
             .ok_or_else(|| anyhow!("Subscription line item not found: {}", id))?)
+    }
+
+    async fn get_subscription_by_line_item_id(&self, line_item_id: u64) -> DbResult<Subscription> {
+        let line_items = self.subscription_line_items.lock().await;
+        let sub_id = match line_items.get(&line_item_id) {
+            Some(li) => li.subscription_id,
+            None => return Err(DbError::Other(anyhow::anyhow!("subscription not found for line item {}", line_item_id))),
+        };
+        drop(line_items);
+        let subscriptions = self.subscriptions.lock().await;
+        subscriptions
+            .get(&sub_id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow::anyhow!("subscription {} not found", sub_id)))
     }
 
     async fn insert_subscription_line_item(

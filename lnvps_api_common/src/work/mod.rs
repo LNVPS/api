@@ -35,6 +35,11 @@ pub enum WorkJob {
     ///
     /// This job starts a vm if stopped and also creates the vm if it doesn't exist yet
     CheckVm { vm_id: u64 },
+    /// Unconditionally provision and spawn a VM onto the host.
+    ///
+    /// Used after a first (Purchase) payment is confirmed so the VM is created
+    /// immediately without relying on `get_vm_state` to detect its absence.
+    SpawnVm { vm_id: u64 },
     /// Send a notification to the users chosen contact preferences
     SendNotification {
         user_id: u64,
@@ -161,6 +166,7 @@ impl fmt::Display for WorkJob {
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
+            WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
         }
     }
 }

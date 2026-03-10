@@ -189,7 +189,7 @@ fi
 # 6. Start user API
 # ---------------------------------------------------------------------------
 echo "=== Starting user API ==="
-cargo run -p lnvps_api -- --config "$TMP_API_CONFIG" \
+LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api -- --config "$TMP_API_CONFIG" \
     > /tmp/lnvps-e2e-api.log 2>&1 &
 echo $! > "$API_PID_FILE"
 
@@ -211,7 +211,7 @@ done
 # 7. Start admin API
 # ---------------------------------------------------------------------------
 echo "=== Starting admin API ==="
-cargo run -p lnvps_api_admin --bin lnvps_api_admin -- --config "$TMP_ADMIN_CONFIG" \
+LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api_admin --bin lnvps_api_admin -- --config "$TMP_ADMIN_CONFIG" \
     > /tmp/lnvps-e2e-admin-api.log 2>&1 &
 echo $! > "$ADMIN_PID_FILE"
 

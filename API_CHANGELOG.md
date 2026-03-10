@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **2026-03-10** - WebSocket console endpoint for VM serial terminal access (User API)
+  - `ANY /api/v1/vm/{id}/console` (WebSocket upgrade) — Bidirectional relay between the client and the VM's serial console via the host provisioner. Authentication is passed via query parameter `?auth=<base64_nip98_event>`.
+
+- **2026-03-10** - Stripe payment handler fully implemented
+  - `POST /api/v1/vm` / `POST /api/v1/vm/custom-template` — Stripe is now a fully functional payment method (`method=stripe`)
+  - `GET /api/v1/vm/{id}/renew?method=stripe` — VM renewals can now be paid via Stripe
+  - `GET /api/v1/subscriptions/{id}/renew?method=stripe` — Subscription renewals support Stripe
+  - `POST /api/v1/vm/{id}/upgrade?method=stripe` — VM upgrades support Stripe
+
+- **2026-03-10** - `LNURL` added as a payment method variant
+  - `GET /api/v1/payment/methods` — Response may now include `{ "name": "lnurl", ... }` when Lightning is enabled
+
+- **2026-03-10** - `Upgrade` added as a `SubscriptionPayment.payment_type` variant
+  - `GET /api/v1/subscriptions/{id}/payments` — Payments created for VM upgrades now carry `payment_type: "Upgrade"`
+  - Previously only `Purchase` and `Renewal` were possible
+
+- **2026-03-10** - `processing_fee` field added to `SubscriptionPayment` user API response
+  - `GET /api/v1/subscriptions/{id}/payments` — Each payment now includes `processing_fee: { currency, amount }`
+
+### Changed
+
+- **2026-03-10** - `VmStatus.expires` is now nullable
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — The `expires` field is now `string | null` (was always a string). It will be `null` for newly created VMs that have not yet been paid.
+
+- **2026-03-10** - `GET /api/v1/vm/{id}/payments` now uses database-level pagination
+  - The endpoint now accepts `?limit=N&offset=N` query parameters and returns a paginated response (`data`, `total`, `limit`, `offset`). Previously the list was unbounded.
+
+### Fixed
+
+- **2026-03-10** - VM subscription lookup query used incorrect type filter
+  - Internal fix: the query that finds a VM's linked subscription was incorrectly using `IN (3, 4)` instead of `= 3`, which could return incorrect results.
+
+- **2026-03-10** - `ApiVmPayment::from_subscription_payment` now propagates JSON parse errors
+  - Previously, a malformed `metadata` JSON field in a `subscription_payment` row would be silently ignored, potentially returning incorrect upgrade parameter data. Errors are now surfaced to the API caller.
+
+- **2026-03-10** - Expiry notification always sent when NWC auto-renewal is inactive
+  - Workers now always send the expiry notification email/NIP-17 DM even when NWC is configured but `auto_renewal_enabled` is false for the subscription.
+
+### Removed
+
+- **2026-03-10** - Clarification: `POST /api/admin/v1/vms/{id}/renew` does **not** exist
+  - The 2026-03-03 changelog entry incorrectly stated that multi-interval renewal was added to an admin renew endpoint. No such endpoint exists in the admin API. Multi-interval renewal is only available via the user-facing `GET /api/v1/vm/{id}/renew?intervals=N`.
+
 ### Fixed
 
 - **2026-03-03** - VM upgrade no longer leaves subscription renewal cost stale

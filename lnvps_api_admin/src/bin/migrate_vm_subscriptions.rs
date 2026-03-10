@@ -283,11 +283,7 @@ async fn migrate_vm_payments(
         .filter(|&id| id != 0)
         .with_context(|| format!("VM {} has no subscription_line_item_id", vm_id))?;
 
-    let line_item = db
-        .get_subscription_line_item(subscription_line_item_id)
-        .await
-        .context("Failed to get subscription line item")?;
-    let subscription_id = line_item.subscription_id;
+    let subscription_id = db.get_subscription_by_line_item_id(subscription_line_item_id).await?.id;
 
     // Load all vm_payment rows for this VM (raw — external_data not decrypted)
     let vm_payments: Vec<VmPaymentRaw> = db_impl

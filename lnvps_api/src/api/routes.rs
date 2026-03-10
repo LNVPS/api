@@ -375,11 +375,10 @@ async fn v1_patch_vm(
 
     // Handle auto-renewal setting change — stored on the subscription, not the VM
     if let Some(auto_renewal) = data.auto_renewal_enabled {
-        let li = this
+        let mut sub = this
             .db
-            .get_subscription_line_item(vm.subscription_line_item_id)
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await?;
-        let mut sub = this.db.get_subscription(li.subscription_id).await?;
         sub.auto_renewal_enabled = auto_renewal;
         this.db.update_subscription(&sub).await?;
     }

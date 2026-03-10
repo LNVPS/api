@@ -27,18 +27,12 @@ impl VmLineItemHandler {
         provisioner: VmProvisioner,
     ) -> Result<Self> {
         let vm = db.get_vm(vm_id).await?;
-        let vm_expires_before = if let Ok(li) = db
-            .get_subscription_line_item(vm.subscription_line_item_id)
+        let vm_expires_before = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await
-        {
-            db.get_subscription(li.subscription_id)
-                .await
-                .ok()
-                .and_then(|s| s.expires)
-                .unwrap_or_else(chrono::Utc::now)
-        } else {
-            chrono::Utc::now()
-        };
+            .ok()
+            .and_then(|s| s.expires)
+            .unwrap_or_else(chrono::Utc::now);
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         Ok(Self {
             vm,
@@ -81,20 +75,13 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         let vm_id = self.vm.id;
         let vm = self.db.get_vm(vm_id).await?;
         // Get new expiry from subscription (authoritative source)
-        let vm_expires_after = if let Ok(li) = self
+        let vm_expires_after = self
             .db
-            .get_subscription_line_item(vm.subscription_line_item_id)
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await
-        {
-            self.db
-                .get_subscription(li.subscription_id)
-                .await
-                .ok()
-                .and_then(|s| s.expires)
-                .unwrap_or_else(chrono::Utc::now)
-        } else {
-            chrono::Utc::now()
-        };
+            .ok()
+            .and_then(|s| s.expires)
+            .unwrap_or_else(chrono::Utc::now);
 
         let payment_metadata = serde_json::json!({
             "payment_id": hex::encode(&payment.id),
@@ -175,7 +162,12 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
                 );
             }
         } else {
-            self.tx.send(WorkJob::CheckVm { vm_id }).await?;
+            // Always queue SpawnVm for non-upgrade payments. The worker checks
+            // whether the VM has ever been provisioned (via mac_address) and
+            // falls back to CheckVm if it already exists on the host. This is
+            // safe against multiple concurrent payments of any type: the
+            // mac_address guard makes SpawnVm idempotent.
+            self.tx.send(WorkJob::SpawnVm { vm_id }).await?;
         }
 
         Ok(())
@@ -202,8 +194,10 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         }
         self.queue_notification(
             self.vm.user_id,
-            format!("Your VM #{} has expired and is now stopped, please renew in the next {} days or your VM will be deleted.",
-                    self.vm.id, self.provisioner.delete_after),
+            format!(
+                "Your VM #{} has expired and has been stopped.\n\nPlease renew your subscription within {} day(s) to restore access. If not renewed, the VM and all its data will be permanently deleted.",
+                self.vm.id, self.provisioner.delete_after
+            ),
             Some(format!("[VM{}] Expired", self.vm.id)),
         ).await;
         Ok(())
@@ -236,8 +230,14 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             }
         }
         let title = Some(format!("[VM{}] Deleted", self.vm.id));
-        self.queue_admin_notification(format!("VM{} was deleted", self.vm.id), title)
-            .await;
+        self.queue_admin_notification(
+            format!(
+                "VM #{} has been permanently deleted after exceeding the grace period without renewal.\nUser ID: {}",
+                self.vm.id, self.vm.user_id
+            ),
+            title,
+        )
+        .await;
         Ok(())
     }
 }

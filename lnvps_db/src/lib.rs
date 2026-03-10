@@ -466,6 +466,10 @@ pub trait LNVpsDbBase: Send + Sync {
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionLineItem>>;
     async fn get_subscription_line_item(&self, id: u64) -> DbResult<SubscriptionLineItem>;
+    
+    /// Get subscription directly from line item ID (avoids doing two lookups)
+    async fn get_subscription_by_line_item_id(&self, line_item_id: u64) -> DbResult<Subscription>;
+    
     async fn insert_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,

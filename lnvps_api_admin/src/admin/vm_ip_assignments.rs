@@ -110,12 +110,11 @@ async fn admin_create_vm_ip_assignment(
         return ApiData::err("Cannot assign IP to a deleted VM");
     }
 
-    // Check subscription state
-    let li = this
+    // Check subscription state (use shortcut function)
+    let sub = this
         .db
-        .get_subscription_line_item(vm.subscription_line_item_id)
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
         .await?;
-    let sub = this.db.get_subscription(li.subscription_id).await?;
 
     if !sub.is_setup {
         return ApiData::err("Cannot assign IP to a new VM");

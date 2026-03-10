@@ -2614,6 +2614,7 @@ dependencies = [
  "chrono",
  "hex",
  "nostr 0.44.2",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,6 +1,6 @@
 use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -888,8 +888,6 @@ pub struct Vm {
     pub subscription_line_item_id: u64,
     /// Users ssh-key assigned to this VM
     pub ssh_key_id: u64,
-    /// When the VM was created
-    pub created: DateTime<Utc>,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
     /// Network MAC address
