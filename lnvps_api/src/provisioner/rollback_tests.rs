@@ -551,7 +551,6 @@ mod tests {
             subscription_line_item_id: 0,
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
-            created: chrono::Utc::now(),
             ref_code: None,
             deleted: false,
             disabled: false,

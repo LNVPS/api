@@ -350,6 +350,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires live network access to zap.stream"]
     async fn test_validate_lightning_address_accepts_valid() {
         let result = validate_lightning_address("kieran@zap.stream").await;
         assert!(result.is_ok());

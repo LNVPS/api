@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-03-10** - `"creating"` VM state for cleaner first-provision UX (closes #119)
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now transitions to `"creating"` immediately after the first payment is confirmed and before the VM is provisioned on the host. The state is replaced by a real host state (`"running"`, `"stopped"`, etc.) once provisioning completes.
+  - `GET /api/admin/v1/vms`, `GET /api/admin/v1/vms/{id}` — Same `"creating"` state visible in the admin API.
+  - This gives frontends a meaningful status to display instead of a stale `"stopped"` state during initial provisioning.
+
 - **2026-03-10** - WebSocket console endpoint for VM serial terminal access (User API)
   - `ANY /api/v1/vm/{id}/console` (WebSocket upgrade) — Bidirectional relay between the client and the VM's serial console via the host provisioner. Authentication is passed via query parameter `?auth=<base64_nip98_event>`.
 
@@ -28,6 +33,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `GET /api/v1/subscriptions/{id}/payments` — Each payment now includes `processing_fee: { currency, amount }`
 
 ### Changed
+
+- **2026-03-10** - `VmRunningStates` enum simplified — `"starting"` and `"deleting"` removed
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now has four possible values: `"unknown"` (default before first poll), `"running"`, `"stopped"`, `"creating"`. The former `"starting"` and `"deleting"` variants are no longer emitted.
+  - `GET /api/admin/v1/vms`, `GET /api/admin/v1/vms/{id}` — Same change applies to `running_state.state`.
+  - `"unknown"` is now the default value when no state has been cached yet, replacing the previous implicit `"stopped"` default.
 
 - **2026-03-10** - `VmStatus.expires` is now nullable
   - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — The `expires` field is now `string | null` (was always a string). It will be `null` for newly created VMs that have not yet been paid.

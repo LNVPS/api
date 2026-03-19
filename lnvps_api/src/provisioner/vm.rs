@@ -10,7 +10,7 @@ use isocountry::CountryCode;
 use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
-    PricingEngine, UpgradeConfig, UpgradeCostQuote, round_msat_to_sat,
+    PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, round_msat_to_sat,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
@@ -882,6 +882,7 @@ mod tests {
             node.clone(),
             rates.clone(),
             wrk.clone(),
+            VmStateCache::new(),
         )?;
         let provisioner = sub_handler.vm_provisioner();
 
@@ -1065,6 +1066,7 @@ mod tests {
             node,
             rates,
             Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
         )?)
     }
 
@@ -2147,21 +2149,27 @@ mod tests {
         sub_handler.complete_payment(&p2).await?;
 
         // Drain the queue — both payments must have queued SpawnVm.
-        let msgs = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            wrk.recv(),
-        )
-        .await
-        .expect("timed out waiting for SpawnVm jobs")?;
+        // ChannelWorkCommander::recv() returns one message at a time, so drain
+        // in a loop until no more messages arrive within a short timeout.
+        let mut all_msgs = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), wrk.recv()).await {
+                Ok(Ok(msgs)) if !msgs.is_empty() => all_msgs.extend(msgs),
+                _ => break,
+            }
+        }
 
-        let spawn_count = msgs
+        let spawn_count = all_msgs
             .iter()
             .filter(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id))
             .count();
         assert_eq!(
             spawn_count, 2,
             "expected 2 SpawnVm jobs, got {:?}",
-            msgs.iter().map(|m| format!("{:?}", m.job)).collect::<Vec<_>>()
+            all_msgs
+                .iter()
+                .map(|m| format!("{:?}", m.job))
+                .collect::<Vec<_>>()
         );
 
         Ok(())
@@ -2189,7 +2197,7 @@ mod tests {
             .await?;
         let sub = db.get_subscription(li.subscription_id).await?;
 
-        let handler = VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner).await?;
+        let handler = VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner, VmStateCache::new()).await?;
 
         // on_expired must succeed (stop is best-effort; silently no-ops for unspawned VMs)
         handler.on_expired(&sub, &li).await?;
@@ -2227,7 +2235,7 @@ mod tests {
         let sub = db.get_subscription(li.subscription_id).await?;
 
         let handler =
-            VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner).await?;
+            VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner, VmStateCache::new()).await?;
         handler.on_grace_period_exceeded(&sub, &li).await?;
 
         // VM must be gone from the database after grace period exceeded
@@ -2315,6 +2323,7 @@ mod tests {
             node,
             rates,
             wrk,
+            VmStateCache::new(),
         )?)
     }
 }

@@ -2,6 +2,7 @@ use crate::dvm::{DVMHandler, DVMJobRequest, build_status_for_job};
 use crate::provisioner::VmProvisioner;
 use crate::subscription::SubscriptionHandler;
 use anyhow::Context;
+use lnvps_api_common::VmStateCache;
 use lnvps_db::{
     DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
 };
@@ -228,6 +229,7 @@ mod tests {
             node.clone(),
             exch.clone(),
             Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
         )?;
         let keys = Keys::generate();
         let empty_client = Client::new(keys.clone());

@@ -1,9 +1,9 @@
-use crate::host::{FullVmInfo, get_host_client};
+use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::provisioner::VmProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
 use crate::ssh_client::SshClient;
 use crate::subscription::SubscriptionHandler;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Datelike, Days, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
 use lettre::AsyncTransport;
@@ -19,7 +19,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, Subscription, SubscriptionLineItem,
-    SubscriptionType, Vm, VmHost, VmIpAssignment, VmOsImage,
+    SubscriptionType, Vm, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
@@ -457,23 +457,8 @@ impl Worker {
         Ok(())
     }
 
-    /// Resolve the authoritative expiry for a VM from its subscription.
-    async fn vm_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
-        self.db
-            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-            .await
-            .ok()?
-            .expires
-    }
-
-    /// Check VM state from hypervisor and update cache
-    /// Lifecycle enforcement (stop/delete) is handled by subscription lifecycle handlers.
-    async fn check_vm(&self, vm: &Vm) -> Result<()> {
-        debug!("Checking VM: {}", vm.id);
-        let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
-
-        match client.get_vm_state(vm).await {
+    async fn handle_vm_state(&self, state: Result<VmRunningState>, vm: &Vm) -> Result<()> {
+        match state {
             Ok(s) => {
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
@@ -493,6 +478,32 @@ impl Worker {
         Ok(())
     }
 
+    /// Resolve the authoritative expiry for a VM from its subscription.
+    async fn vm_expires(&self, vm: &Vm) -> Option<DateTime<Utc>> {
+        self.db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .ok()?
+            .expires
+    }
+
+    /// Check VM state from hypervisor and update cache
+    /// Lifecycle enforcement (stop/delete) is handled by subscription lifecycle handlers.
+    async fn check_vm(&self, vm: &Vm) -> Result<()> {
+        debug!("Checking VM: {}", vm.id);
+        let host = self.db.get_host(vm.host_id).await?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        self.handle_vm_state(
+            client
+                .get_vm_state(vm)
+                .await
+                .map_err(|e| anyhow!("VM state error {e}")),
+            &vm,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Check multiple VMs on a single host using bulk API
     async fn check_vms_on_host(&self, host_id: u64, vms: &[&Vm]) -> Result<()> {
         debug!("Checking {} VMs on host {}", vms.len(), host_id);
@@ -503,19 +514,14 @@ impl Worker {
         let state_map: HashMap<u64, VmRunningState> = states.into_iter().collect();
 
         for vm in vms {
-            if let Some(state) = state_map.get(&vm.id) {
-                self.vm_state_cache.set_state(vm.id, state.clone()).await?;
-            } else {
-                warn!("VM {} not found in bulk response", vm.id);
-                if self
-                    .vm_expires(vm)
-                    .await
-                    .map(|e| e > Utc::now())
-                    .unwrap_or(false)
-                {
-                    self.spawn_vm_internal(vm).await?;
-                }
-            }
+            self.handle_vm_state(
+                state_map
+                    .get(&vm.id)
+                    .map(|s| s.clone())
+                    .context("VM not found in bulk response"),
+                &vm,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -630,6 +636,10 @@ impl Worker {
         let mut vms_to_delete = Vec::new();
 
         for vm in &db_vms {
+            if vm.deleted {
+                continue;
+            }
+
             // A VM is "new" (never paid) if its subscription has never been set up.
             let Some(sub) = self
                 .db
@@ -641,18 +651,11 @@ impl Worker {
                 continue;
             };
 
-            // Only check spawned VMs — paid VMs need status checking on hosts.
-            if sub.is_setup {
-                vms_by_host.entry(vm.host_id).or_default().push(vm);
-            }
-
-            // Delete VM if unpaid (never set up) after 1 hour grace period.
-            // Use subscription created time as primary; fall back to vm.created
-            // if the subscription lookup failed.
             let vm_old_enough_to_delete = Utc::now() - sub.created > TimeDelta::hours(1);
-
-            if !vm.deleted && vm_old_enough_to_delete && !sub.is_setup {
+            if vm_old_enough_to_delete && !sub.is_setup {
                 vms_to_delete.push(vm);
+            } else if sub.is_setup {
+                vms_by_host.entry(vm.host_id).or_default().push(vm);
             }
         }
 
@@ -901,6 +904,9 @@ impl Worker {
     }
 
     async fn patch_host(&self, host: &mut VmHost) -> Result<()> {
+        if host.kind == VmHostKind::Dummy {
+            return Ok(());
+        }
         let client = match get_host_client(host, &self.settings.provisioner_config) {
             Ok(h) => h,
             Err(e) => bail!("Failed to get host client: {} {}", host.name, e),

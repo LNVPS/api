@@ -113,7 +113,13 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
             let cfg = cfg.libvirt.clone().unwrap();
             Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg.qemu)?)
         }
-        VmHostKind::Dummy => Arc::new(dummy_host::DummyVmHost::new()),
+        VmHostKind::Dummy => {
+            if cfg!(test) {
+                Arc::new(dummy_host::DummyVmHost::new())
+            } else {
+                Arc::new(dummy_host::DummyVmHost::new_persistent())
+            }
+        },
         _ => bail!("Unknown host config: {}", host.kind),
     })
 }
@@ -346,7 +352,6 @@ mod tests {
                 custom_template_id: None,
                 subscription_line_item_id: 0,
                 ssh_key_id: 1,
-                created: Default::default(),
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 deleted: false,

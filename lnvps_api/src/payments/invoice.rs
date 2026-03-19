@@ -1,6 +1,7 @@
 use crate::subscription::SubscriptionHandler;
 use anyhow::Result;
 use futures::StreamExt;
+use lnvps_api_common::VmStateCache;
 use lnvps_db::{LNVpsDb, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::{InvoiceUpdate, LightningNode};
@@ -214,6 +215,7 @@ mod tests {
             node.clone(),
             Arc::new(MockExchangeRate::default()),
             Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
         )?;
 
         Ok((db, node, sub, payment, vm_id))
@@ -238,8 +240,8 @@ mod tests {
         let jobs = sub.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         assert!(
-            matches!(&jobs[0].job, WorkJob::CheckVm { vm_id: id } if *id == vm_id),
-            "expected CheckVm job, got {:?}",
+            matches!(&jobs[0].job, WorkJob::SpawnVm { vm_id: id } if *id == vm_id),
+            "expected SpawnVm job, got {:?}",
             jobs[0].job
         );
 
@@ -360,6 +362,7 @@ mod tests {
             node.clone(),
             Arc::new(MockExchangeRate::default()),
             Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
         )?;
 
         Ok((db, node, sub, payment))

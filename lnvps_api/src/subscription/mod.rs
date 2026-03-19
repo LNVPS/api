@@ -40,6 +40,7 @@ use crate::provisioner::VmProvisioner;
 use crate::settings::Settings;
 pub use ip_range::IpRangeLineItemHandler;
 pub use vm::VmLineItemHandler;
+use lnvps_api_common::VmStateCache;
 
 // =========================================================================
 // Trait
@@ -82,6 +83,7 @@ pub struct SubscriptionHandler {
 
     pe: PricingEngine,
     vm_provisioner: VmProvisioner,
+    vm_state_cache: VmStateCache,
 }
 
 impl SubscriptionHandler {
@@ -91,6 +93,7 @@ impl SubscriptionHandler {
         node: Arc<dyn LightningNode>,
         rates: Arc<dyn ExchangeRateService>,
         tx: Arc<dyn WorkCommander>,
+        vm_state_cache: VmStateCache,
     ) -> Result<Self> {
         Ok(Self {
             revolut: settings.get_revolut()?,
@@ -99,6 +102,7 @@ impl SubscriptionHandler {
             db,
             tx,
             node,
+            vm_state_cache,
         })
     }
 
@@ -131,6 +135,7 @@ impl SubscriptionHandler {
                         self.db.clone(),
                         self.tx.clone(),
                         self.vm_provisioner.clone(),
+                        self.vm_state_cache.clone(),
                     )
                     .await?,
                 ))

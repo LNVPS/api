@@ -125,6 +125,7 @@ async fn main() -> Result<(), Error> {
         node.clone(),
         exchange.clone(),
         work_commander.clone(),
+        status.clone(),
     )?;
     sub_handler.vm_provisioner().init().await?;
 

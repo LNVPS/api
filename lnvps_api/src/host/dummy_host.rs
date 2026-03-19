@@ -7,12 +7,13 @@ use chrono::Utc;
 use lnvps_api_common::retry::OpResult;
 use lnvps_api_common::{GB, PB, TB, VmRunningState, VmRunningStates, op_fatal};
 use lnvps_db::{Vm, VmOsImage};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
 
 /// Per-VM state tracked by the mock host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct MockVm {
     state: VmRunningStates,
     /// Monotonically increasing uptime counter (seconds). Reset to 0 on stop.
@@ -30,18 +31,6 @@ struct MockVm {
 }
 
 impl MockVm {
-    fn new_stopped() -> Self {
-        Self {
-            state: VmRunningStates::Stopped,
-            uptime_secs: 0,
-            net_in: 0,
-            net_out: 0,
-            disk_read: 0,
-            disk_write: 0,
-            last_tick: now_secs(),
-        }
-    }
-
     /// Advance the simulated counters based on elapsed wall-clock time.
     /// Only accumulates when the VM is Running.
     fn tick(&mut self) {
@@ -100,11 +89,18 @@ fn now_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// A mock `VmHostClient` that simulates VM lifecycle without contacting any
-/// real hypervisor.  All instances share the same in-process VM map so the
-/// worker's `CheckVm` / `CheckVms` jobs see the state set by API handlers.
+/// real hypervisor.
+///
+/// Two construction modes:
+/// - [`DummyVmHost::new()`] — fresh independent in-memory map; used by tests.
+/// - [`DummyVmHost::new_persistent()`] — process-wide shared map backed by a
+///   JSON file in `/tmp`; used by the real API service so state survives
+///   restarts.
 #[derive(Debug, Clone)]
 pub struct DummyVmHost {
     vms: Arc<Mutex<HashMap<u64, MockVm>>>,
+    /// When `true`, mutations are flushed to [`STATE_FILE`].
+    persist: bool,
 }
 
 impl Default for DummyVmHost {
@@ -113,12 +109,47 @@ impl Default for DummyVmHost {
     }
 }
 
+/// Path used to persist dummy-host VM state across restarts.
+const STATE_FILE: &str = "/tmp/lnvps_dummy_vms.json";
+
 impl DummyVmHost {
+    /// Create a fresh, isolated in-memory host.  State is never written to
+    /// disk.  Use this in tests.
     pub fn new() -> Self {
-        static LAZY_VMS: LazyLock<Arc<Mutex<HashMap<u64, MockVm>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        Self {
+            vms: Arc::new(Mutex::new(HashMap::new())),
+            persist: false,
+        }
+    }
+
+    /// Create (or reuse) the process-wide persistent host.  State is loaded
+    /// from [`STATE_FILE`] on first call and flushed after every mutation.
+    /// Use this in the real API service.
+    pub fn new_persistent() -> Self {
+        static LAZY_VMS: LazyLock<Arc<Mutex<HashMap<u64, MockVm>>>> = LazyLock::new(|| {
+            let map = DummyVmHost::load_from_file().unwrap_or_default();
+            Arc::new(Mutex::new(map))
+        });
         Self {
             vms: LAZY_VMS.clone(),
+            persist: true,
+        }
+    }
+
+    /// Load the VM map from the JSON state file, if it exists.
+    fn load_from_file() -> Option<HashMap<u64, MockVm>> {
+        let data = std::fs::read_to_string(STATE_FILE).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Flush the current VM map to disk.  No-op when `persist` is false.
+    async fn save(&self) {
+        if !self.persist {
+            return;
+        }
+        let vms = self.vms.lock().await;
+        if let Ok(json) = serde_json::to_string(&*vms) {
+            let _ = std::fs::write(STATE_FILE, json);
         }
     }
 }
@@ -150,50 +181,74 @@ impl VmHostClient for DummyVmHost {
         ))
     }
 
-    /// Register the VM under its DB id and leave it Stopped.
-    ///
-    /// The spawn pipeline ends here; the worker will subsequently dispatch a
-    /// `CheckVm` job which calls `get_vm_state`, finds it Stopped, and caches
-    /// that state.  An explicit `start_vm` call is required to transition it to
-    /// Running.
+    /// Register the VM under its DB id in the `Creating` state, then
+    /// transition it to `Stopped` after a real async delay of 10–60 seconds,
+    /// simulating provisioning time on a real hypervisor.
     async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        vms.insert(cfg.vm.id, MockVm::new_stopped());
+        let vm_id = cfg.vm.id;
+
+        // when using dummy host in real dev env, add a small delete in create_vm
+        #[cfg(not(test))]
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        {
+            let mut vms = self.vms.lock().await;
+            vms.insert(
+                vm_id,
+                MockVm {
+                    state: VmRunningStates::Stopped,
+                    ..MockVm::default()
+                },
+            );
+        }
+        self.save().await;
+
         Ok(())
     }
 
     async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        vms.remove(&vm.id);
+        {
+            let mut vms = self.vms.lock().await;
+            vms.remove(&vm.id);
+        }
+        self.save().await;
         Ok(())
     }
 
     async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        if let Some(m) = vms.get_mut(&vm.id) {
-            m.tick();
-            m.state = VmRunningStates::Running;
+        {
+            let mut vms = self.vms.lock().await;
+            if let Some(m) = vms.get_mut(&vm.id) {
+                m.tick();
+                m.state = VmRunningStates::Running;
+            }
         }
+        self.save().await;
         Ok(())
     }
 
     async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        if let Some(m) = vms.get_mut(&vm.id) {
-            m.tick();
-            m.state = VmRunningStates::Stopped;
-            m.uptime_secs = 0;
+        {
+            let mut vms = self.vms.lock().await;
+            if let Some(m) = vms.get_mut(&vm.id) {
+                m.tick();
+                m.state = VmRunningStates::Stopped;
+                m.uptime_secs = 0;
+            }
         }
+        self.save().await;
         Ok(())
     }
 
     async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        if let Some(m) = vms.get_mut(&vm.id) {
-            m.tick();
-            m.uptime_secs = 0;
-            m.state = VmRunningStates::Running;
+        {
+            let mut vms = self.vms.lock().await;
+            if let Some(m) = vms.get_mut(&vm.id) {
+                m.tick();
+                m.uptime_secs = 0;
+                m.state = VmRunningStates::Running;
+            }
         }
+        self.save().await;
         Ok(())
     }
 

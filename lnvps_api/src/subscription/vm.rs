@@ -2,7 +2,10 @@ use crate::provisioner::VmProvisioner;
 use crate::subscription::SubscriptionLineItemHandler;
 use anyhow::Result;
 use async_trait::async_trait;
-use lnvps_api_common::{UpgradeConfig, VmHistoryLogger, WorkCommander, WorkJob};
+use lnvps_api_common::{
+    UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
+    WorkJob,
+};
 use lnvps_db::{
     LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
     SubscriptionType, Vm,
@@ -17,6 +20,7 @@ pub struct VmLineItemHandler {
     tx: Arc<dyn WorkCommander>,
     vm_history_logger: VmHistoryLogger,
     provisioner: VmProvisioner,
+    vm_state_cache: VmStateCache,
 }
 
 impl VmLineItemHandler {
@@ -25,6 +29,7 @@ impl VmLineItemHandler {
         db: Arc<dyn LNVpsDb>,
         tx: Arc<dyn WorkCommander>,
         provisioner: VmProvisioner,
+        vm_state_cache: VmStateCache,
     ) -> Result<Self> {
         let vm = db.get_vm(vm_id).await?;
         let vm_expires_before = db
@@ -41,6 +46,7 @@ impl VmLineItemHandler {
             tx,
             vm_history_logger,
             provisioner,
+            vm_state_cache,
         })
     }
 
@@ -162,6 +168,25 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
                 );
             }
         } else {
+            // For the very first payment on a VM (mac_address == ff:ff:ff:ff:ff:ff),
+            // immediately set the cache state to Creating so the UI can show a
+            // meaningful "creating" status while the provisioner runs.
+            let vm = self.db.get_vm(vm_id).await?;
+            if vm.mac_address == "ff:ff:ff:ff:ff:ff" {
+                if let Err(e) = self
+                    .vm_state_cache
+                    .set_state(
+                        vm_id,
+                        VmRunningState {
+                            state: VmRunningStates::Creating,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    warn!("Failed to set Creating state for VM {}: {}", vm_id, e);
+                }
+            }
             // Always queue SpawnVm for non-upgrade payments. The worker checks
             // whether the VM has ever been provisioned (via mac_address) and
             // falls back to CheckVm if it already exists on the host. This is

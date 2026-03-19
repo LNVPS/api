@@ -14,7 +14,7 @@ This document provides comprehensive API specifications for generating TypeScrip
 
 **DiskType**: `"hdd"`, `"ssd"`
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
-**VmState**: `"running"`, `"stopped"`, `"pending"`, `"error"`, `"unknown"`
+**VmState**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
 **CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
 **OsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
 `"redhatenterprise"`
@@ -71,11 +71,28 @@ interface VmStatus {
   template: VmTemplate;
   ssh_key: UserSshKey;
   ip_assignments: VmIpAssignment[];
-  status: VmState;
+  status: VmRunningState; // Full running state with metrics; check status.state for the current lifecycle state
   auto_renewal_enabled: boolean; // Whether automatic renewal via NWC is enabled for this VM
 }
 
-type VmState = 'running' | 'stopped' | 'pending' | 'error' | 'unknown';
+interface VmRunningState {
+  timestamp: number;  // Unix timestamp when state was collected
+  state: VmRunningStateKind;
+  cpu_usage: number;  // CPU usage percentage (0.0–100.0)
+  mem_usage: number;  // Memory usage percentage (0.0–100.0)
+  uptime: number;     // Uptime in seconds
+  net_in: number;     // Network bytes received
+  net_out: number;    // Network bytes transmitted
+  disk_write: number; // Disk bytes written
+  disk_read: number;  // Disk bytes read
+}
+
+// state field values:
+// "unknown"  — State not yet known (default before first poll)
+// "running"  — VM is running normally
+// "stopped"  — VM is shut down
+// "creating" — First payment received; VM is being provisioned on the host for the first time
+type VmRunningStateKind = 'unknown' | 'running' | 'stopped' | 'creating';
 ```
 
 ### VM Template

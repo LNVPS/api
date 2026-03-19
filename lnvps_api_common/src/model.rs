@@ -282,26 +282,6 @@ pub async fn vm_to_status(
     })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum VmState {
-    Pending,
-    Running,
-    #[default]
-    Stopped,
-    Failed,
-}
-
-impl From<crate::status::VmRunningStates> for VmState {
-    fn from(running_state: crate::status::VmRunningStates) -> Self {
-        match running_state {
-            crate::status::VmRunningStates::Running => VmState::Running,
-            crate::status::VmRunningStates::Stopped => VmState::Stopped,
-            crate::status::VmRunningStates::Starting => VmState::Pending,
-            crate::status::VmRunningStates::Deleting => VmState::Failed,
-        }
-    }
-}
 
 #[derive(Serialize)]
 pub struct ApiVmIpAssignment {
