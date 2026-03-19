@@ -18,6 +18,8 @@ mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
 
+pub(crate) mod dummy_host;
+
 pub struct TerminalStream {
     pub rx: Receiver<Vec<u8>>,
     pub tx: Sender<Vec<u8>>,
@@ -93,9 +95,6 @@ pub async fn get_vm_host_client(
 }
 
 pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
-    #[cfg(test)]
-    return Ok(Arc::new(crate::mocks::MockVmHost::new()));
-
     Ok(match host.kind.clone() {
         #[cfg(feature = "proxmox")]
         VmHostKind::Proxmox if cfg.proxmox.is_some() => {
@@ -114,6 +113,13 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
             let cfg = cfg.libvirt.clone().unwrap();
             Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg.qemu)?)
         }
+        VmHostKind::Dummy => {
+            if cfg!(test) {
+                Arc::new(dummy_host::DummyVmHost::new())
+            } else {
+                Arc::new(dummy_host::DummyVmHost::new_persistent())
+            }
+        },
         _ => bail!("Unknown host config: {}", host.kind),
     })
 }
@@ -344,14 +350,12 @@ mod tests {
                 image_id: 1,
                 template_id: Some(template.id),
                 custom_template_id: None,
+                subscription_line_item_id: 0,
                 ssh_key_id: 1,
-                created: Default::default(),
-                expires: Default::default(),
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 deleted: false,
                 ref_code: None,
-                auto_renewal_enabled: false,
                 disabled: false,
             },
             host: VmHost {

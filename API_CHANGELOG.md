@@ -4,6 +4,114 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **2026-03-10** - `"creating"` VM state for cleaner first-provision UX (closes #119)
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now transitions to `"creating"` immediately after the first payment is confirmed and before the VM is provisioned on the host. The state is replaced by a real host state (`"running"`, `"stopped"`, etc.) once provisioning completes.
+  - `GET /api/admin/v1/vms`, `GET /api/admin/v1/vms/{id}` — Same `"creating"` state visible in the admin API.
+  - This gives frontends a meaningful status to display instead of a stale `"stopped"` state during initial provisioning.
+
+- **2026-03-10** - WebSocket console endpoint for VM serial terminal access (User API)
+  - `ANY /api/v1/vm/{id}/console` (WebSocket upgrade) — Bidirectional relay between the client and the VM's serial console via the host provisioner. Authentication is passed via query parameter `?auth=<base64_nip98_event>`.
+
+- **2026-03-10** - Stripe payment handler fully implemented
+  - `POST /api/v1/vm` / `POST /api/v1/vm/custom-template` — Stripe is now a fully functional payment method (`method=stripe`)
+  - `GET /api/v1/vm/{id}/renew?method=stripe` — VM renewals can now be paid via Stripe
+  - `GET /api/v1/subscriptions/{id}/renew?method=stripe` — Subscription renewals support Stripe
+  - `POST /api/v1/vm/{id}/upgrade?method=stripe` — VM upgrades support Stripe
+
+- **2026-03-10** - `LNURL` added as a payment method variant
+  - `GET /api/v1/payment/methods` — Response may now include `{ "name": "lnurl", ... }` when Lightning is enabled
+
+- **2026-03-10** - `Upgrade` added as a `SubscriptionPayment.payment_type` variant
+  - `GET /api/v1/subscriptions/{id}/payments` — Payments created for VM upgrades now carry `payment_type: "Upgrade"`
+  - Previously only `Purchase` and `Renewal` were possible
+
+- **2026-03-10** - `processing_fee` field added to `SubscriptionPayment` user API response
+  - `GET /api/v1/subscriptions/{id}/payments` — Each payment now includes `processing_fee: { currency, amount }`
+
+### Changed
+
+- **2026-03-10** - `VmRunningStates` enum simplified — `"starting"` and `"deleting"` removed
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now has four possible values: `"unknown"` (default before first poll), `"running"`, `"stopped"`, `"creating"`. The former `"starting"` and `"deleting"` variants are no longer emitted.
+  - `GET /api/admin/v1/vms`, `GET /api/admin/v1/vms/{id}` — Same change applies to `running_state.state`.
+  - `"unknown"` is now the default value when no state has been cached yet, replacing the previous implicit `"stopped"` default.
+
+- **2026-03-10** - `VmStatus.expires` is now nullable
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — The `expires` field is now `string | null` (was always a string). It will be `null` for newly created VMs that have not yet been paid.
+
+- **2026-03-10** - `GET /api/v1/vm/{id}/payments` now uses database-level pagination
+  - The endpoint now accepts `?limit=N&offset=N` query parameters and returns a paginated response (`data`, `total`, `limit`, `offset`). Previously the list was unbounded.
+
+### Fixed
+
+- **2026-03-10** - VM subscription lookup query used incorrect type filter
+  - Internal fix: the query that finds a VM's linked subscription was incorrectly using `IN (3, 4)` instead of `= 3`, which could return incorrect results.
+
+- **2026-03-10** - `ApiVmPayment::from_subscription_payment` now propagates JSON parse errors
+  - Previously, a malformed `metadata` JSON field in a `subscription_payment` row would be silently ignored, potentially returning incorrect upgrade parameter data. Errors are now surfaced to the API caller.
+
+- **2026-03-10** - Expiry notification always sent when NWC auto-renewal is inactive
+  - Workers now always send the expiry notification email/NIP-17 DM even when NWC is configured but `auto_renewal_enabled` is false for the subscription.
+
+### Removed
+
+- **2026-03-10** - Clarification: `POST /api/admin/v1/vms/{id}/renew` does **not** exist
+  - The 2026-03-03 changelog entry incorrectly stated that multi-interval renewal was added to an admin renew endpoint. No such endpoint exists in the admin API. Multi-interval renewal is only available via the user-facing `GET /api/v1/vm/{id}/renew?intervals=N`.
+
+### Fixed
+
+- **2026-03-03** - VM upgrade no longer leaves subscription renewal cost stale
+  - `POST /api/v1/vm/{id}/upgrade` — After payment confirmation, `SubscriptionLineItem.amount` is now updated to the new base-currency cost of the upgraded template for both standard→custom and custom→custom upgrade paths
+  - `GET /api/v1/subscriptions/{id}` and admin equivalents — `line_items[].price` now reflects the post-upgrade renewal cost immediately after an upgrade completes
+
+- **2026-03-03** - Migration tool no longer marks subscriptions active for deleted VMs
+  - `migrate_vm_subscriptions` — Subscriptions created for deleted VMs are now inserted with `is_active = false`
+
+### Changed
+
+- **2026-03-03** - Admin subscription list now returns results in descending order
+  - `GET /api/admin/v1/subscriptions` — Results ordered by `id DESC` (newest first); applies to both the all-subscriptions list and the `?user_id=N` filtered list
+
+- **2026-03-03** - Admin VM info response now includes subscription details
+  - `GET /api/admin/v1/vms/{id}` — Response now includes a `subscription` object with the full `AdminSubscriptionInfo` (id, status, interval, currency, line items, payment count); omitted if no subscription is linked
+
+- **2026-03-03** - Admin subscription payment response now includes `company_base_currency`
+  - `GET /api/admin/v1/subscriptions/{id}/payments` — Each payment now includes `company_base_currency`
+  - `GET /api/admin/v1/subscription_payments/{id}` — Response now includes `company_base_currency`
+  - `POST /api/admin/v1/subscription_payments/{id}/complete` — Response now includes `company_base_currency`
+
+- **2026-03-03** - VM payments now use the unified `subscription_payment` table
+  - All VM renewal, purchase, and upgrade payments are now stored in `subscription_payment` instead of `vm_payment`
+  - `GET /api/v1/vm/{id}/payments` — Response format unchanged; now backed by `subscription_payment`; supports pagination via `?limit=N&offset=N` query params
+  - `GET /api/v1/vm/{id}/payments/{payment_id}` — Now looks up by `subscription_payment.id`
+  - `GET /api/v1/vm/{id}/payments/{payment_id}/invoice` — Now backed by `subscription_payment`
+  - `POST /api/v1/vm/{id}/renew` — Returns payment from `subscription_payment`
+  - `POST /api/v1/vm/{id}/upgrade` — Returns payment from `subscription_payment`; upgrade parameters stored in `metadata` JSON field
+  - `GET /api/admin/v1/vms/{id}/payments` — Now backed by `subscription_payment`; uses real DB-level pagination
+  - `GET /api/admin/v1/vms/{id}/payments/{payment_id}` — Now looks up by `subscription_payment.id`
+  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Now completes a `subscription_payment`
+  - `GET /api/admin/v1/reports/time-series` — Revenue data now sourced from `subscription_payment`
+  - `GET /api/admin/v1/reports/referral-usage/time-series` — Referral data now sourced from `subscription_payment`
+  - **Requires data migration**: Run `migrate_vm_subscriptions` binary to backfill existing VMs with subscriptions before upgrading
+  - **Schema migrations**: `20260302151134_vm_subscription_link.sql` and `20260302154256_vm_subscription_not_null.sql`
+
+- **2026-03-03** - Every VM is now linked to a `subscription` and `subscription_line_item`
+  - `vm` table has a new `subscription_line_item_id` column (NOT NULL) linking it to the subscriptions system
+  - New VMs provisioned via `POST /api/v1/vm` or `POST /api/v1/vm/custom` automatically get a subscription created
+  - The subscription interval is copied from the cost plan (standard VMs) or defaults to 1 month (custom VMs)
+
+- **2026-03-03** - `IntervalType` enum renamed from `VmCostPlanIntervalType`
+  - Affects admin responses that include cost plan or subscription interval information
+
+### Added
+
+- **2026-03-03** - Multi-interval VM renewal support
+  - `POST /api/v1/vm/{id}/renew` — Accepts optional `intervals` query parameter to pre-pay multiple billing periods at once
+  - `POST /api/admin/v1/vms/{id}/renew` — Same `intervals` support in admin renewal endpoint
+
 ## [v0.2.0] - 2026-02-22
 
 ### Changed

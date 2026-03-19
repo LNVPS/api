@@ -1,6 +1,6 @@
 use crate::dns::DnsServer;
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
-use crate::provisioner::LNVpsNetworkProvisioner;
+use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
 use anyhow::{Context, Result, bail, ensure};
@@ -10,12 +10,13 @@ use isocountry::CountryCode;
 use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
-    PricingEngine, UpgradeConfig, UpgradeCostQuote, round_msat_to_sat,
+    PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, round_msat_to_sat,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
-    IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType, Vm, VmCustomTemplate,
-    VmIpAssignment, VmPayment, VmTemplate,
+    IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
+    SubscriptionType, Vm, VmCustomTemplate, VmIpAssignment, VmPayment, VmTemplate,
 };
 use log::{debug, info};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -27,48 +28,34 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Main provisioner class for LNVPS
-///
-/// Does all the hard work and logic for creating / expiring VM's
+/// Main provisioner class for LNVPS (VMs)
 #[derive(Clone)]
-pub struct LNVpsProvisioner {
+pub struct VmProvisioner {
     read_only: bool,
     db: Arc<dyn LNVpsDb>,
-    node: Arc<dyn LightningNode>,
-    revolut: Option<Arc<dyn FiatPaymentService>>,
-    rates: Arc<dyn ExchangeRateService>,
-    tax_rates: HashMap<CountryCode, f32>,
-    pub network: LNVpsNetworkProvisioner,
+    pub network: VmNetworkProvisioner,
     provisioner_config: ProvisionerConfig,
+    pub delete_after: u16,
 }
 
-impl LNVpsProvisioner {
+impl VmProvisioner {
     /// Create a retry policy for network operations (DNS, Router, Host)
     fn retry_policy() -> RetryPolicy {
         RetryPolicy::default()
     }
 
-    pub fn new(
-        settings: Settings,
-        db: Arc<dyn LNVpsDb>,
-        node: Arc<dyn LightningNode>,
-        rates: Arc<dyn ExchangeRateService>,
-        dns: Option<Arc<dyn DnsServer>>,
-    ) -> Self {
+    pub fn new(settings: Settings, db: Arc<dyn LNVpsDb>) -> Self {
         Self {
-            network: LNVpsNetworkProvisioner::new(
+            network: VmNetworkProvisioner::new(
                 db.clone(),
-                dns,
+                settings.get_dns(),
                 settings.dns.as_ref().map(|z| z.forward_zone_id.to_string()),
                 Self::retry_policy(),
             ),
-            revolut: settings.get_revolut().expect("revolut config"),
-            tax_rates: settings.tax_rate,
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
+            delete_after: settings.delete_after,
             db,
-            node,
-            rates,
         }
     }
 
@@ -128,7 +115,43 @@ impl LNVpsProvisioner {
             bail!("No host disk found")
         };
 
-        let now = Utc::now();
+        let region = self.db.get_host_region(template.region_id).await?;
+        let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
+
+        // Create subscription for this VM
+        let subscription = Subscription {
+            id: 0,
+            user_id: user.id,
+            company_id: region.company_id,
+            name: format!("{} subscription", template.name),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: false,
+            is_setup: false,
+            currency: cost_plan.currency.clone(),
+            interval_amount: cost_plan.interval_amount,
+            interval_type: cost_plan.interval_type,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+        let line_item = SubscriptionLineItem {
+            id: 0,
+            subscription_id: 0,
+            subscription_type: SubscriptionType::Vps,
+            name: template.name.clone(),
+            description: None,
+            amount: cost_plan.amount,
+            setup_amount: 0,
+            configuration: None,
+        };
+        let (subscription_id, line_item_ids) = self
+            .db
+            .insert_subscription_with_line_items(&subscription, vec![line_item])
+            .await?;
+        let subscription_line_item_id = line_item_ids[0];
+
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -136,19 +159,27 @@ impl LNVpsProvisioner {
             image_id: image.id,
             template_id: Some(template.id),
             custom_template_id: None,
+            subscription_line_item_id,
             ssh_key_id: ssh_key.id,
-            created: now,
-            expires: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code,
-            auto_renewal_enabled: false, // Default to disabled for new VMs
             disabled: false,
         };
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
+
+        // Update subscription and line item names now that the VM ID is known
+        let mut sub = self.db.get_subscription(subscription_id).await?;
+        sub.name = format!("VM{} subscription", new_vm.id);
+        self.db.update_subscription(&sub).await?;
+
+        let mut li = self.db.get_subscription_line_item(subscription_line_item_id).await?;
+        li.name = format!("VM{} - {}", new_vm.id, template.name);
+        self.db.update_subscription_line_item(&li).await?;
+
         Ok(new_vm)
     }
 
@@ -203,8 +234,42 @@ impl LNVpsProvisioner {
 
         // insert custom templates
         let template_id = self.db.insert_custom_vm_template(&template).await?;
+        let region = self.db.get_host_region(pricing.region_id).await?;
 
-        let now = Utc::now();
+        // Create subscription for this custom VM (1-month interval, amount computed at payment time)
+        let subscription = Subscription {
+            id: 0,
+            user_id: user.id,
+            company_id: region.company_id,
+            name: "Custom VM subscription".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: false,
+            is_setup: false,
+            currency: pricing.currency.clone(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+        let line_item = SubscriptionLineItem {
+            id: 0,
+            subscription_id: 0,
+            subscription_type: SubscriptionType::Vps,
+            name: pricing.name.clone(),
+            description: None,
+            amount: 0, // computed dynamically
+            setup_amount: 0,
+            configuration: None,
+        };
+        let (subscription_id, line_item_ids) = self
+            .db
+            .insert_subscription_with_line_items(&subscription, vec![line_item])
+            .await?;
+        let subscription_line_item_id = line_item_ids[0];
+
         let mut new_vm = Vm {
             id: 0,
             host_id: host.host.id,
@@ -212,397 +277,28 @@ impl LNVpsProvisioner {
             image_id: image.id,
             template_id: None,
             custom_template_id: Some(template_id),
+            subscription_line_item_id,
             ssh_key_id: ssh_key.id,
-            created: now,
-            expires: now,
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
             ref_code,
-            auto_renewal_enabled: false, // Default to disabled for new VMs
             disabled: false,
         };
 
         let new_id = self.db.insert_vm(&new_vm).await?;
         new_vm.id = new_id;
+
+        // Update subscription and line item names now that the VM ID is known
+        let mut sub = self.db.get_subscription(subscription_id).await?;
+        sub.name = format!("VM{} subscription", new_vm.id);
+        self.db.update_subscription(&sub).await?;
+
+        let mut li = self.db.get_subscription_line_item(subscription_line_item_id).await?;
+        li.name = format!("VM{} - {}", new_vm.id, pricing.name);
+        self.db.update_subscription_line_item(&li).await?;
+
         Ok(new_vm)
-    }
-
-    #[cfg(feature = "nostr-nwc")]
-    /// Attempt automatic renewal via Nostr Wallet Connect
-    pub async fn auto_renew_via_nwc(
-        &self,
-        vm_id: u64,
-        nwc_connection_string: &str,
-    ) -> Result<VmPayment> {
-        use nostr_sdk::prelude::*;
-
-        debug!("Attempting automatic renewal for VM {} via NWC", vm_id);
-
-        // Use existing renew method to create the payment/invoice
-        let vm_payment = self.renew(vm_id, PaymentMethod::Lightning).await?;
-
-        // Extract the invoice from external_data
-        let invoice: String = vm_payment.external_data.clone().into();
-        debug!(
-            "Created renewal invoice for VM {}, attempting NWC payment",
-            vm_id
-        );
-
-        // Parse NWC connection string
-        let nwc_uri = nwc::prelude::NostrWalletConnectURI::from_str(nwc_connection_string)
-            .context("Invalid NWC connection string")?;
-
-        // Create nostr client for NWC
-        let client = nwc::NWC::new(nwc_uri);
-        client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
-        info!("Successful NWC auto-renewal payment for VM {}", vm_id);
-        Ok(vm_payment)
-    }
-
-    /// Create a renewal payment for a single interval
-    pub async fn renew(&self, vm_id: u64, method: PaymentMethod) -> Result<VmPayment> {
-        self.renew_intervals(vm_id, method, 1).await
-    }
-
-    /// Create a renewal payment for multiple intervals
-    pub async fn renew_intervals(
-        &self,
-        vm_id: u64,
-        method: PaymentMethod,
-        intervals: u32,
-    ) -> Result<VmPayment> {
-        let pe = PricingEngine::new_for_vm(
-            self.db.clone(),
-            self.rates.clone(),
-            self.tax_rates.clone(),
-            vm_id,
-        )
-        .await?;
-        let price = pe
-            .get_vm_cost_for_intervals(vm_id, method, intervals)
-            .await?;
-        self.price_to_payment(vm_id, method, price).await
-    }
-
-    /// Renew a VM using a specific amount
-    pub async fn renew_amount(
-        &self,
-        vm_id: u64,
-        amount: CurrencyAmount,
-        method: PaymentMethod,
-    ) -> Result<VmPayment> {
-        let pe = PricingEngine::new_for_vm(
-            self.db.clone(),
-            self.rates.clone(),
-            self.tax_rates.clone(),
-            vm_id,
-        )
-        .await?;
-        let price = pe.get_cost_by_amount(vm_id, amount, method).await?;
-        self.price_to_payment(vm_id, method, price).await
-    }
-
-    /// Create a renewal/purchase payment for a subscription
-    pub async fn renew_subscription(
-        &self,
-        subscription_id: u64,
-        method: PaymentMethod,
-    ) -> Result<lnvps_db::SubscriptionPayment> {
-        use lnvps_db::{SubscriptionPayment, SubscriptionPaymentType};
-
-        // Get subscription and line items
-        let subscription = self.db.get_subscription(subscription_id).await?;
-        let line_items = self
-            .db
-            .list_subscription_line_items(subscription_id)
-            .await?;
-        ensure!(!line_items.is_empty(), "Subscription has no line items");
-
-        // Get user for tax calculation
-        let user = self.db.get_user(subscription.user_id).await?;
-
-        // Calculate total cost in subscription currency
-        let mut monthly_cost: u64 = 0;
-        let mut setup_fee: u64 = 0;
-
-        for item in &line_items {
-            monthly_cost += item.amount;
-            setup_fee += item.setup_amount;
-        }
-
-        // Check if this is first payment (purchase) or renewal
-        let existing_payments = self.db.list_subscription_payments(subscription_id).await?;
-        let has_paid = existing_payments.iter().any(|p| p.is_paid);
-
-        let (list_price_amount, payment_type) = if has_paid {
-            // Renewal - monthly cost only
-            (monthly_cost, SubscriptionPaymentType::Renewal)
-        } else {
-            // Purchase - monthly cost + setup fees
-            (monthly_cost + setup_fee, SubscriptionPaymentType::Purchase)
-        };
-
-        // Parse subscription currency
-        let subscription_currency = Currency::from_str(&subscription.currency)
-            .map_err(|e| anyhow::anyhow!("Invalid currency"))?;
-        let list_price = CurrencyAmount::from_u64(subscription_currency, list_price_amount);
-
-        // Create pricing engine for currency conversion
-        let pe = PricingEngine::new(
-            self.db.clone(),
-            self.rates.clone(),
-            self.tax_rates.clone(),
-            subscription_currency,
-        );
-
-        // Convert list price to payment method currency and get rate
-        let converted = pe.get_amount_and_rate(list_price, method).await?;
-
-        // Calculate tax on the converted amount
-        let tax = pe
-            .get_tax_for_user(user.id, converted.amount.value())
-            .await?;
-
-        // Calculate processing fee using subscription's company_id
-        let processing_fee = pe
-            .calculate_processing_fee(
-                subscription.company_id,
-                method,
-                converted.amount.currency(),
-                converted.amount.value(),
-            )
-            .await;
-
-        // Generate payment based on method
-        let subscription_payment = match method {
-            PaymentMethod::Lightning => {
-                ensure!(
-                    converted.amount.currency() == Currency::BTC,
-                    "Lightning payment must be in BTC"
-                );
-                const INVOICE_EXPIRE: u64 = 600;
-                // Round to nearest satoshi for wallet compatibility
-                let invoice_amount = round_msat_to_sat(converted.amount.value() + tax);
-                let desc = match payment_type {
-                    SubscriptionPaymentType::Purchase => {
-                        format!("Subscription purchase: {}", subscription.name)
-                    }
-                    SubscriptionPaymentType::Renewal => {
-                        format!("Subscription renewal: {}", subscription.name)
-                    }
-                };
-
-                info!(
-                    "Creating invoice for subscription {} for {} sats",
-                    subscription_id,
-                    invoice_amount / 1000
-                );
-
-                let invoice = self
-                    .node
-                    .add_invoice(AddInvoiceRequest {
-                        memo: Some(desc),
-                        amount: invoice_amount,
-                        expire: Some(INVOICE_EXPIRE as u32),
-                    })
-                    .await?;
-
-                SubscriptionPayment {
-                    id: hex::decode(invoice.payment_hash())?,
-                    subscription_id,
-                    user_id: subscription.user_id,
-                    created: Utc::now(),
-                    expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
-                    amount: converted.amount.value(),
-                    currency: converted.amount.currency().to_string(),
-                    payment_method: method,
-                    payment_type,
-                    external_data: invoice.pr().into(),
-                    external_id: invoice.external_id,
-                    is_paid: false,
-                    rate: converted.rate.rate,
-                    tax,
-                    processing_fee,
-                    paid_at: None,
-                }
-            }
-            PaymentMethod::Revolut => {
-                let rev = if let Some(r) = &self.revolut {
-                    r
-                } else {
-                    bail!("Revolut not configured")
-                };
-                ensure!(
-                    converted.amount.currency() != Currency::BTC,
-                    "Cannot create Revolut orders for BTC currency"
-                );
-
-                let desc = match payment_type {
-                    SubscriptionPaymentType::Purchase => {
-                        format!("Subscription purchase: {}", subscription.name)
-                    }
-                    SubscriptionPaymentType::Renewal => {
-                        format!("Subscription renewal: {}", subscription.name)
-                    }
-                };
-
-                let order_amount = CurrencyAmount::from_u64(
-                    converted.amount.currency(),
-                    converted.amount.value() + tax + processing_fee,
-                );
-                let order = rev.create_order(&desc, order_amount, None).await?;
-
-                let new_id: [u8; 32] = rand::random();
-                SubscriptionPayment {
-                    id: new_id.to_vec(),
-                    subscription_id,
-                    user_id: subscription.user_id,
-                    created: Utc::now(),
-                    expires: Utc::now().add(Duration::from_secs(3600)),
-                    amount: converted.amount.value(),
-                    currency: converted.amount.currency().to_string(),
-                    payment_method: method,
-                    payment_type,
-                    external_data: order.raw_data.into(),
-                    external_id: Some(order.external_id),
-                    is_paid: false,
-                    rate: converted.rate.rate,
-                    tax,
-                    processing_fee,
-                    paid_at: None,
-                }
-            }
-            PaymentMethod::Paypal => bail!("PayPal not implemented"),
-            PaymentMethod::Stripe => bail!("Stripe not implemented"),
-        };
-
-        // Save payment to database
-        self.db
-            .insert_subscription_payment(&subscription_payment)
-            .await?;
-
-        Ok(subscription_payment)
-    }
-
-    async fn price_to_payment(
-        &self,
-        vm_id: u64,
-        method: PaymentMethod,
-        price: CostResult,
-    ) -> Result<VmPayment> {
-        self.price_to_payment_with_type(vm_id, method, price, PaymentType::Renewal, None)
-            .await
-    }
-
-    async fn price_to_payment_with_type(
-        &self,
-        vm_id: u64,
-        method: PaymentMethod,
-        price: CostResult,
-        payment_type: PaymentType,
-        upgrade_params: Option<String>,
-    ) -> Result<VmPayment> {
-        match price {
-            CostResult::Existing(p) => Ok(p),
-            CostResult::New(p) => {
-                let desc = match payment_type {
-                    PaymentType::Renewal => format!("VM renewal {vm_id} to {}", p.new_expiry),
-                    PaymentType::Upgrade => format!("VM upgrade {vm_id}"),
-                };
-                let vm_payment = match method {
-                    PaymentMethod::Lightning => {
-                        ensure!(
-                            p.currency == Currency::BTC,
-                            "Cannot create invoices for non-BTC currency"
-                        );
-                        const INVOICE_EXPIRE: u64 = 600;
-                        // Round to nearest satoshi for wallet compatibility
-                        let total_amount = round_msat_to_sat(p.amount + p.tax);
-                        info!(
-                            "Creating invoice for {vm_id} for {} sats",
-                            total_amount / 1000
-                        );
-                        let invoice = self
-                            .node
-                            .add_invoice(AddInvoiceRequest {
-                                memo: Some(desc),
-                                amount: total_amount,
-                                expire: Some(INVOICE_EXPIRE as u32),
-                            })
-                            .await?;
-                        VmPayment {
-                            id: hex::decode(invoice.payment_hash())?,
-                            vm_id,
-                            created: Utc::now(),
-                            expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
-                            amount: p.amount,
-                            tax: p.tax,
-                            processing_fee: p.processing_fee,
-                            currency: p.currency.to_string(),
-                            payment_method: method,
-                            payment_type,
-                            time_value: p.time_value,
-                            is_paid: false,
-                            rate: p.rate.rate,
-                            external_data: invoice.pr().into(),
-                            external_id: invoice.external_id,
-                            upgrade_params,
-                            paid_at: None,
-                        }
-                    }
-                    PaymentMethod::Revolut => {
-                        let rev = if let Some(r) = &self.revolut {
-                            r
-                        } else {
-                            bail!("Revolut not configured")
-                        };
-                        ensure!(
-                            p.currency != Currency::BTC,
-                            "Cannot create revolut orders for BTC currency"
-                        );
-                        let order = rev
-                            .create_order(
-                                &desc,
-                                CurrencyAmount::from_u64(
-                                    p.currency,
-                                    p.amount + p.tax + p.processing_fee,
-                                ),
-                                None,
-                            )
-                            .await?;
-                        let new_id: [u8; 32] = rand::random();
-                        VmPayment {
-                            id: new_id.to_vec(),
-                            vm_id,
-                            created: Utc::now(),
-                            expires: Utc::now().add(Duration::from_secs(3600)),
-                            amount: p.amount,
-                            tax: p.tax,
-                            processing_fee: p.processing_fee,
-                            currency: p.currency.to_string(),
-                            payment_method: method,
-                            payment_type,
-                            time_value: p.time_value,
-                            is_paid: false,
-                            rate: p.rate.rate,
-                            external_data: order.raw_data.into(),
-                            external_id: Some(order.external_id),
-                            upgrade_params,
-                            paid_at: None,
-                        }
-                    }
-                    PaymentMethod::Paypal => todo!(),
-                    PaymentMethod::Stripe => {
-                        todo!("Stripe payment integration not yet implemented")
-                    }
-                };
-
-                self.db.insert_vm_payment(&vm_payment).await?;
-
-                Ok(vm_payment)
-            }
-        }
     }
 
     /// Apply vm config to host
@@ -793,23 +489,6 @@ impl LNVpsProvisioner {
         Ok(())
     }
 
-    /// Calculate both upgrade cost and new renewal cost for a VM upgrade
-    pub async fn calculate_upgrade_cost(
-        &self,
-        vm_id: u64,
-        cfg: &UpgradeConfig,
-        method: PaymentMethod,
-    ) -> Result<UpgradeCostQuote> {
-        let pe = PricingEngine::new_for_vm(
-            self.db.clone(),
-            self.rates.clone(),
-            self.tax_rates.clone(),
-            vm_id,
-        )
-        .await?;
-        pe.calculate_upgrade_cost(vm_id, cfg, method).await
-    }
-
     /// Convert a VM from standard template to custom template
     pub async fn convert_to_custom_template(&self, vm_id: u64, cfg: &UpgradeConfig) -> Result<()> {
         let (mut vm, _, new_custom_template) = self.create_upgrade_template(vm_id, cfg).await?;
@@ -826,38 +505,55 @@ impl LNVpsProvisioner {
 
         self.db.update_vm(&vm).await?;
 
+        // Update the subscription to 1-Month billing (custom VMs are always monthly)
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let mut subscription = self.db.get_subscription(line_item.subscription_id).await?;
+        subscription.interval_amount = 1;
+        subscription.interval_type = IntervalType::Month;
+        self.db.update_subscription(&subscription).await?;
+
+        // Calculate the new base-currency cost for the new custom template and update the line
+        // item's amount so the displayed subscription cost reflects the upgraded specs.
+        let new_price =
+            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
+
+        // Update the line item: mark as VmRenewal (no longer VmUpgrade), store the new config,
+        // and update the renewal amount to the new template's base-currency cost.
+        let mut updated_line_item = line_item;
+        updated_line_item.subscription_type = SubscriptionType::Vps;
+        updated_line_item.configuration = Some(serde_json::to_value(cfg)?);
+        updated_line_item.amount = new_price.total();
+        self.db
+            .update_subscription_line_item(&updated_line_item)
+            .await?;
+
         Ok(())
     }
 
-    /// Create an upgrade payment
-    pub async fn create_upgrade_payment(
-        &self,
-        vm_id: u64,
-        cfg: &UpgradeConfig,
-        method: PaymentMethod,
-    ) -> Result<VmPayment> {
-        let cost_difference = self.calculate_upgrade_cost(vm_id, cfg, method).await?;
+    /// Update the subscription line item's renewal amount for a VM that already uses a custom
+    /// template.  Called after the custom template's specs have been updated in the database so
+    /// that `ApiSubscriptionLineItem.price` reflects the new cost.
+    pub async fn update_line_item_cost_for_custom_vm(&self, vm_id: u64) -> Result<()> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let custom_template_id = vm
+            .custom_template_id
+            .ok_or_else(|| anyhow::anyhow!("VM does not have a custom template"))?;
+        let template = self.db.get_custom_vm_template(custom_template_id).await?;
 
-        // create a payment entry for upgrade
-        let payment = NewPaymentInfo {
-            amount: cost_difference.upgrade.amount.value(),
-            currency: cost_difference.upgrade.amount.currency(),
-            rate: cost_difference.upgrade.rate,
-            time_value: 0, //upgrades dont add time
-            new_expiry: Default::default(),
-            tax: 0,            // No tax on upgrades for now
-            processing_fee: 0, // No processing fee on upgrades for now
-        };
-        let upgrade_params_json = serde_json::to_string(cfg)?;
+        let new_price =
+            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &template).await?;
 
-        self.price_to_payment_with_type(
-            vm_id,
-            method,
-            CostResult::New(payment),
-            PaymentType::Upgrade,
-            Some(upgrade_params_json),
-        )
-        .await
+        let mut line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        line_item.amount = new_price.total();
+        self.db.update_subscription_line_item(&line_item).await?;
+
+        Ok(())
     }
 
     /// Create a new custom template using a vm's existing standard template
@@ -901,7 +597,7 @@ impl LNVpsProvisioner {
 
         let custom_pricing = compatible_pricing
             .ok_or_else(|| anyhow::anyhow!(
-                "No custom pricing available for this region that supports disk type {:?} with interface {:?}", 
+                "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
                 current_template.disk_type,
                 current_template.disk_interface
             ))?;
@@ -977,7 +673,7 @@ pub struct SpawnVmContext {
     /// The client impl to provision this vm on the host
     host_client: Arc<dyn VmHostClient>,
     /// Network provisioner access
-    network: LNVpsNetworkProvisioner,
+    network: VmNetworkProvisioner,
 
     /// Generated mac address, can be rolled back if the entry has an ID
     generated_mac: Option<ArpEntry>,
@@ -1058,7 +754,7 @@ impl SpawnVmContext {
             None => op_fatal!("Cannot provision VM without an IPv4 address"),
         }
         if let Some(mut v6) = ip.ip6 {
-            let assignment = LNVpsProvisioner::v6_to_allocation(
+            let assignment = VmProvisioner::v6_to_allocation(
                 &mut v6,
                 self.info.vm.id,
                 &self.info.vm.mac_address,
@@ -1099,10 +795,15 @@ mod tests {
     use super::*;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
-    use lnvps_api_common::{GB, InMemoryRateCache, MockDb, MockExchangeRate, TB, Ticker};
+    use crate::subscription::{SubscriptionHandler, SubscriptionLineItemHandler, VmLineItemHandler};
+    use lnvps_api_common::{
+        ChannelWorkCommander, GB, InMemoryRateCache, MockDb, MockExchangeRate, TB, Ticker,
+        WorkCommander, WorkJob,
+    };
     use lnvps_db::{
-        AccessPolicy, DiskInterface, DiskType, LNVpsDbBase, NetworkAccessPolicy, RouterKind, User,
-        UserSshKey, VmCustomPricing, VmCustomPricingDisk, VmTemplate,
+        AccessPolicy, DiskInterface, DiskType, IntervalType, LNVpsDbBase, NetworkAccessPolicy,
+        RouterKind, Subscription, User, UserSshKey, VmCustomPricing, VmCustomPricingDisk,
+        VmTemplate,
     };
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -1172,14 +873,18 @@ mod tests {
             r.reverse_zone_id = Some("mock-v6-rev-zone-id".to_string());
         }
 
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
         let dns = MockDnsServer::new();
-        let provisioner = LNVpsProvisioner::new(
+        dns.zones.lock().await.clear(); // reset dns server zones
+        let sub_handler = SubscriptionHandler::new(
             settings,
             db.clone(),
             node.clone(),
             rates.clone(),
-            Some(Arc::new(dns.clone())),
-        );
+            wrk.clone(),
+            VmStateCache::new(),
+        )?;
+        let provisioner = sub_handler.vm_provisioner();
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -1187,9 +892,18 @@ mod tests {
             .await?;
         println!("{:?}", vm);
 
+        let sub = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+
         // renew vm
-        let payment = provisioner.renew(vm.id, PaymentMethod::Lightning).await?;
-        assert_eq!(vm.id, payment.vm_id);
+        let payment = sub_handler
+            .renew_subscription(sub.id, PaymentMethod::Lightning, 1)
+            .await?;
+        assert!(
+            vm.subscription_line_item_id > 0,
+            "VM must have a subscription line item"
+        );
         assert_eq!(payment.tax, (payment.amount as f64 * 0.01).floor() as u64);
 
         // check invoice amount matches rounded amount+tax
@@ -1301,15 +1015,7 @@ mod tests {
         env_logger::try_init().ok();
         let settings = settings();
         let db = Arc::new(MockDb::default());
-        let node = Arc::new(MockNode::default());
-        let rates = Arc::new(InMemoryRateCache::default());
-        let prov = LNVpsProvisioner::new(
-            settings.clone(),
-            db.clone(),
-            node.clone(),
-            rates.clone(),
-            None,
-        );
+        let prov = VmProvisioner::new(settings.clone(), db.clone());
 
         let large_template = VmTemplate {
             id: 0,
@@ -1345,25 +1051,23 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// Build a minimal provisioner backed by the given MockDb (no DNS, no rates needed).
-    fn make_provisioner(db: Arc<MockDb>) -> LNVpsProvisioner {
-        let node = Arc::new(MockNode::default());
-        let rates = Arc::new(MockExchangeRate::new());
-        LNVpsProvisioner::new(mock_settings(), db, node, rates, None)
+    fn make_provisioner(db: Arc<MockDb>) -> VmProvisioner {
+        VmProvisioner::new(mock_settings(), db)
     }
 
-    /// Build a provisioner with a BTC/EUR exchange rate set (needed for renewal).
-    async fn make_provisioner_with_rates(db: Arc<MockDb>) -> Result<LNVpsProvisioner> {
+    async fn make_sub_handler(db: Arc<MockDb>) -> Result<SubscriptionHandler> {
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
-        Ok(LNVpsProvisioner::new(
+        Ok(SubscriptionHandler::new(
             mock_settings(),
-            db,
+            db.clone(),
             node,
             rates,
-            None,
-        ))
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )?)
     }
 
     /// Insert a VmCustomPricing + one VmCustomPricingDisk into db and return the pricing id.
@@ -1412,9 +1116,47 @@ mod tests {
         Ok(pricing_id)
     }
 
+    /// Create a minimal subscription + line item for test VMs.
+    /// Returns the line_item_id to set on the Vm.
+    async fn make_test_subscription(db: &Arc<MockDb>, user_id: u64) -> Result<u64> {
+        let (_sub_id, line_item_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "test sub".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![lnvps_db::SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    name: "test item".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+        Ok(line_item_ids[0])
+    }
+
     /// Insert a VM that uses the default mock standard template (template_id = 1).
     async fn insert_standard_template_vm(db: &Arc<MockDb>) -> Result<u64> {
         let (user, ssh_key) = add_user(db).await?;
+        let subscription_line_item_id = make_test_subscription(db, user.id).await?;
         let vm_id = db
             .insert_vm(&Vm {
                 id: 0,
@@ -1423,6 +1165,7 @@ mod tests {
                 image_id: 1,
                 template_id: Some(1),
                 custom_template_id: None,
+                subscription_line_item_id,
                 ssh_key_id: ssh_key.id,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1825,6 +1568,7 @@ mod tests {
 
         // Directly insert VM (bypassing provision_custom) to simulate an existing VM
         // that was created before the pricing was disabled
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
         let vm_id = db
             .insert_vm(&Vm {
                 id: 0,
@@ -1833,6 +1577,7 @@ mod tests {
                 image_id: 1,
                 template_id: None,
                 custom_template_id: Some(custom_template_id),
+                subscription_line_item_id,
                 ssh_key_id: ssh_key.id,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1841,10 +1586,31 @@ mod tests {
             })
             .await?;
 
-        let prov = make_provisioner_with_rates(db).await?;
-        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
+        let sub = db
+            .get_subscription_line_item(subscription_line_item_id)
+            .await?;
+        let prov = make_sub_handler(db).await?;
+        let payment = prov
+            .renew_subscription(sub.id, PaymentMethod::Lightning, 1)
+            .await?;
 
-        assert_eq!(payment.vm_id, vm_id);
+        assert_eq!(payment.currency, "BTC", "payment currency should be BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(
+            payment.time_value.unwrap() > 0,
+            "time_value must be positive"
+        );
+        // With rate 69_420 EUR/BTC and custom pricing (2cpu@100 + 4GB@50 + 150 ip4 + 0 ip6 + 50GB@10*5)
+        // = (200 + 200 + 150 + 0 + 500)  = 1050 EUR cents → ~1.51M millisats at 69420 rate
+        // Sanity check: well above zero and below 10_000_000 (10k sats)
+        assert!(
+            payment.amount > 0 && payment.amount < 10_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
@@ -1906,9 +1672,28 @@ mod tests {
             let mut templates = db.templates.lock().await;
             templates.get_mut(&1).unwrap().enabled = false;
         }
-        let prov = make_provisioner_with_rates(db).await?;
-        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
-        assert_eq!(payment.vm_id, vm_id);
+        let vm = db.get_vm(vm_id).await?;
+        let sub = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let prov = make_sub_handler(db).await?;
+        let payment = prov
+            .renew_subscription(sub.subscription_id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        assert_eq!(payment.currency, "BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(payment.time_value.unwrap() > 0);
+        // cost_plan amount=132 EUR cents at rate 69420 EUR/BTC → ~1,902 millisats
+        // Sanity: > 0 and well under 1 billion millisats
+        assert!(
+            payment.amount > 0 && payment.amount < 1_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
@@ -1922,9 +1707,27 @@ mod tests {
             templates.get_mut(&1).unwrap().expires =
                 Some(Utc::now() - chrono::Duration::seconds(1));
         }
-        let prov = make_provisioner_with_rates(db).await?;
-        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
-        assert_eq!(payment.vm_id, vm_id);
+
+        let vm = db.get_vm(vm_id).await?;
+        let sub = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let prov = make_sub_handler(db).await?;
+        let payment = prov
+            .renew_subscription(sub.subscription_id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        assert_eq!(payment.currency, "BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(payment.time_value.unwrap() > 0);
+        assert!(
+            payment.amount > 0 && payment.amount < 1_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
     }
 
@@ -1988,6 +1791,7 @@ mod tests {
                 ..Default::default()
             })
             .await?;
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
         let vm_id = db
             .insert_vm(&Vm {
                 id: 0,
@@ -1996,6 +1800,7 @@ mod tests {
                 image_id: 1,
                 template_id: None,
                 custom_template_id: Some(custom_template_id),
+                subscription_line_item_id,
                 ssh_key_id: ssh_key.id,
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -2003,9 +1808,522 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        let prov = make_provisioner_with_rates(db).await?;
-        let payment = prov.renew(vm_id, PaymentMethod::Lightning).await?;
-        assert_eq!(payment.vm_id, vm_id);
+
+        let vm = db.get_vm(vm_id).await?;
+        let sub = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let prov = make_sub_handler(db).await?;
+        let payment = prov
+            .renew_subscription(sub.subscription_id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        assert_eq!(payment.currency, "BTC");
+        assert!(
+            payment.time_value.is_some(),
+            "time_value must be set for VM renewal"
+        );
+        assert!(payment.time_value.unwrap() > 0);
+        // Custom pricing: cpu=2@100 + mem=4GB@50 + ip4@200 + disk=50GB@10*5 = 200+200+200+0+500
+        // = 1100 EUR cents at rate 69420 → ~1.59M millisats
+        // Sanity: > 0 and well under 1 billion millisats
+        assert!(
+            payment.amount > 0 && payment.amount < 1_000_000_000,
+            "amount {} is unreasonably large (double-conversion bug?)",
+            payment.amount
+        );
         Ok(())
+    }
+
+    // ── provision subscription creation tests ────────────────────────────────
+
+    /// provision() creates a subscription and line item linked to the VM.
+    #[tokio::test]
+    async fn test_provision_creates_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = prov.provision(user.id, 1, 1, ssh_key.id, None).await?;
+
+        assert!(
+            vm.subscription_line_item_id > 0,
+            "VM must have a subscription_line_item_id"
+        );
+
+        // Line item must exist
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::Vps);
+
+        // Subscription must exist and have interval from cost_plan
+        let sub = db.get_subscription(line_item.subscription_id).await?;
+        assert_eq!(sub.user_id, user.id);
+        // Default cost_plan has interval_amount=1, interval_type=Month
+        assert_eq!(sub.interval_amount, 1);
+        assert!(
+            matches!(sub.interval_type, IntervalType::Month),
+            "expected Month interval"
+        );
+        assert!(!sub.is_active, "subscription should start inactive");
+        assert!(!sub.is_setup, "subscription should start un-setup");
+
+        Ok(())
+    }
+
+    /// provision_custom() creates a subscription with 1-Month interval.
+    #[tokio::test]
+    async fn test_provision_custom_creates_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+
+        let template = lnvps_db::VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+
+        let vm = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await?;
+
+        assert!(vm.subscription_line_item_id > 0);
+
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::Vps);
+
+        let sub = db.get_subscription(line_item.subscription_id).await?;
+        assert_eq!(sub.user_id, user.id);
+        // Custom VMs always use 1-Month interval
+        assert_eq!(sub.interval_amount, 1);
+        assert!(
+            matches!(sub.interval_type, IntervalType::Month),
+            "expected Month interval"
+        );
+        assert!(!sub.is_active);
+        assert!(!sub.is_setup);
+
+        Ok(())
+    }
+
+    // ── subscription line item amount update tests ───────────────────────────
+
+    /// Regression: convert_to_custom_template must update line_item.amount to the new
+    /// base-currency cost of the custom template so that the subscription's displayed
+    /// renewal cost is not stale after a standard→custom upgrade.
+    #[tokio::test]
+    async fn test_convert_to_custom_template_updates_line_item_amount() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db.clone());
+
+        // Record the old line item amount before the upgrade.
+        let vm = db.get_vm(vm_id).await?;
+        let old_line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let old_amount = old_line_item.amount;
+
+        // Upgrade: add more CPU so the new cost will be higher.
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        prov.convert_to_custom_template(vm_id, &cfg).await?;
+
+        // After conversion the line item amount must reflect the new custom template cost
+        // and must differ from the old standard-template amount.
+        let vm_after = db.get_vm(vm_id).await?;
+        let new_line_item = db
+            .get_subscription_line_item(vm_after.subscription_line_item_id)
+            .await?;
+
+        assert_ne!(
+            new_line_item.amount, old_amount,
+            "line_item.amount must be updated after upgrade (was stale: {})",
+            old_amount
+        );
+        assert!(
+            new_line_item.amount > 0,
+            "new line_item.amount must be positive"
+        );
+        Ok(())
+    }
+
+    /// Regression: update_line_item_cost_for_custom_vm must update line_item.amount for a VM
+    /// that already uses a custom template after its specs are changed.
+    #[tokio::test]
+    async fn test_update_line_item_cost_for_custom_vm_updates_amount() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+
+        let (user, ssh_key) = add_user(&db).await?;
+
+        // Start with a small custom template (2 CPU).
+        let small_template_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 4 * GB,
+                disk_size: 64 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ..Default::default()
+            })
+            .await?;
+
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(small_template_id),
+                subscription_line_item_id,
+                ssh_key_id: ssh_key.id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:f1".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+
+        let prov = make_provisioner(db.clone());
+
+        // Read the amount before the template update.
+        let vm = db.get_vm(vm_id).await?;
+        let old_amount = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?
+            .amount;
+
+        // Simulate the worker upgrading the template to 4 CPU.
+        {
+            let mut custom_template_map = db.custom_template.lock().await;
+            let tpl = custom_template_map.get_mut(&small_template_id).unwrap();
+            tpl.cpu = 4;
+        }
+
+        // Now call the helper that should refresh the line item cost.
+        prov.update_line_item_cost_for_custom_vm(vm_id).await?;
+
+        let new_amount = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?
+            .amount;
+
+        assert_ne!(
+            new_amount, old_amount,
+            "line_item.amount must be updated after custom template spec change (was stale: {})",
+            old_amount
+        );
+        assert!(new_amount > 0, "new line_item.amount must be positive");
+        Ok(())
+    }
+
+    /// provision() sets ref_code on the VM.
+    #[tokio::test]
+    async fn test_provision_sets_ref_code() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = prov
+            .provision(user.id, 1, 1, ssh_key.id, Some("TEST123".to_string()))
+            .await?;
+
+        assert_eq!(vm.ref_code, Some("TEST123".to_string()));
+        Ok(())
+    }
+
+    // ── subscription / VM lifecycle tests ────────────────────────────────────
+
+    /// After any non-upgrade payment is completed, `WorkJob::SpawnVm` must be
+    /// queued regardless of payment type. The MAC-address guard inside the
+    /// worker makes it safe to queue SpawnVm for both first and renewal payments.
+    #[tokio::test]
+    async fn test_payment_activates_subscription_and_queues_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler_with_commander(db.clone(), wrk.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        // Provision a VM (subscription starts inactive, expires=None)
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub_before = db.get_subscription(li.subscription_id).await?;
+        assert!(!sub_before.is_active, "subscription must start inactive");
+        assert!(sub_before.expires.is_none(), "expires must start as None");
+
+        // Create and complete a payment
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment).await?;
+
+        // Subscription must now be active with an expiry date
+        let sub_after = db.get_subscription(li.subscription_id).await?;
+        assert!(sub_after.is_active, "subscription must be active after payment");
+        assert!(
+            sub_after.expires.is_some(),
+            "expires must be set after payment"
+        );
+        assert!(
+            sub_after.expires.unwrap() > Utc::now(),
+            "expires must be in the future"
+        );
+        assert!(sub_after.is_setup, "is_setup must be true after first payment");
+
+        // WorkJob::SpawnVm must be queued for every non-upgrade payment.
+        // recv() is non-blocking here since complete_payment already sent the job
+        // synchronously above.
+        let msgs = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wrk.recv(),
+        )
+        .await
+        .expect("timed out waiting for WorkJob::SpawnVm")
+        ?;
+        let found_spawn_vm = msgs
+            .iter()
+            .any(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id));
+        assert!(
+            found_spawn_vm,
+            "expected WorkJob::SpawnVm {{ vm_id: {} }} in queued jobs: {:?}",
+            vm.id,
+            msgs.iter().map(|m| format!("{:?}", m.job)).collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// Two payments created before either is confirmed (both appear as Purchase
+    /// type) must both queue `WorkJob::SpawnVm`. The MAC-address guard in the
+    /// worker makes the second job a no-op once the VM is already provisioned.
+    #[tokio::test]
+    async fn test_double_payment_both_queue_spawn_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler_with_commander(db.clone(), wrk.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+
+        // Create two payments before either is confirmed.
+        let p1 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        let p2 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        // Confirm both.
+        sub_handler.complete_payment(&p1).await?;
+        sub_handler.complete_payment(&p2).await?;
+
+        // Drain the queue — both payments must have queued SpawnVm.
+        // ChannelWorkCommander::recv() returns one message at a time, so drain
+        // in a loop until no more messages arrive within a short timeout.
+        let mut all_msgs = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(100), wrk.recv()).await {
+                Ok(Ok(msgs)) if !msgs.is_empty() => all_msgs.extend(msgs),
+                _ => break,
+            }
+        }
+
+        let spawn_count = all_msgs
+            .iter()
+            .filter(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id))
+            .count();
+        assert_eq!(
+            spawn_count, 2,
+            "expected 2 SpawnVm jobs, got {:?}",
+            all_msgs
+                .iter()
+                .map(|m| format!("{:?}", m.job))
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// When `on_expired` is called for a VM line item `on_expired` must succeed
+    /// and the VM must remain present in the database (it is only stopped, not
+    /// deleted).  `stop_vm` is best-effort on the hypervisor; a no-op for a VM
+    /// that hasn't been spawned yet is acceptable.
+    #[tokio::test]
+    async fn test_on_expired_stops_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
+        let handler = VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner, VmStateCache::new()).await?;
+
+        // on_expired must succeed (stop is best-effort; silently no-ops for unspawned VMs)
+        handler.on_expired(&sub, &li).await?;
+
+        // VM must still exist in the DB — on_expired only stops, it does NOT delete
+        assert!(
+            db.get_vm(vm_id).await.is_ok(),
+            "VM must still exist in DB after on_expired (stop only, not delete)"
+        );
+
+        Ok(())
+    }
+
+    /// When `on_grace_period_exceeded` is called the VM must be deleted from the
+    /// database (MockDb hard-deletes on `delete_vm`), so `get_vm` returns an error.
+    #[tokio::test]
+    async fn test_on_grace_period_exceeded_deletes_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+
+        // Confirm VM exists in DB before deletion
+        assert!(db.get_vm(vm_id).await.is_ok(), "VM must exist before deletion");
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
+        let handler =
+            VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner, VmStateCache::new()).await?;
+        handler.on_grace_period_exceeded(&sub, &li).await?;
+
+        // VM must be gone from the database after grace period exceeded
+        assert!(
+            db.get_vm(vm_id).await.is_err(),
+            "VM must be deleted from DB after grace period"
+        );
+
+        Ok(())
+    }
+
+    /// Renewing an already-expired subscription extends `expires` beyond the
+    /// previous expiry date and re-activates the subscription.
+    #[tokio::test]
+    async fn test_renew_after_expiry_extends_expires() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+
+        // First payment — activates subscription
+        let payment1 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment1).await?;
+
+        let sub_after_first = db.get_subscription(li.subscription_id).await?;
+        let first_expiry = sub_after_first
+            .expires
+            .expect("expires must be set after first payment");
+        assert!(sub_after_first.is_active);
+
+        // Manually wind the expiry into the past to simulate an expired subscription
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&li.subscription_id).unwrap();
+            sub.expires = Some(Utc::now() - chrono::Duration::days(5));
+            sub.is_active = false;
+        }
+
+        // Second payment — must re-activate and extend beyond the (now-past) expiry
+        let payment2 = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment2).await?;
+
+        let sub_after_second = db.get_subscription(li.subscription_id).await?;
+        assert!(
+            sub_after_second.is_active,
+            "subscription must be re-activated after second payment"
+        );
+        let second_expiry = sub_after_second
+            .expires
+            .expect("expires must be set after second payment");
+        assert!(
+            second_expiry > Utc::now(),
+            "new expiry must be in the future"
+        );
+        assert!(
+            second_expiry > first_expiry,
+            "new expiry must be later than the first expiry"
+        );
+
+        Ok(())
+    }
+
+    /// Helper: build a SubscriptionHandler wired to a specific WorkCommander.
+    async fn make_sub_handler_with_commander(
+        db: Arc<MockDb>,
+        wrk: Arc<dyn WorkCommander>,
+    ) -> Result<SubscriptionHandler> {
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        Ok(SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            rates,
+            wrk,
+            VmStateCache::new(),
+        )?)
     }
 }

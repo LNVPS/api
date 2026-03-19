@@ -60,35 +60,16 @@ async fn admin_list_ip_space(
     let limit = params.limit.unwrap_or(50).min(100); // Max 100 items per page
     let offset = params.offset.unwrap_or(0);
 
-    // Get all IP spaces (we'll filter in memory for now)
-    let all_spaces = this.db.list_available_ip_space().await?;
-
-    // Filter based on query params
-    let filtered_spaces: Vec<_> = all_spaces
-        .into_iter()
-        .filter(|space| {
-            if let Some(is_available) = params.is_available {
-                if space.is_available != is_available {
-                    return false;
-                }
-            }
-            if let Some(registry) = params.registry {
-                if (space.registry as u8) != registry {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-
-    let total = filtered_spaces.len() as u64;
-
-    // Paginate
-    let paginated_spaces: Vec<_> = filtered_spaces
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    let (paginated_spaces, total) = this
+        .db
+        .list_available_ip_space_paginated(
+            params.is_available,
+            None,
+            params.registry,
+            limit,
+            offset,
+        )
+        .await?;
 
     // Convert to API format with enriched data
     let mut ip_spaces = Vec::new();
@@ -331,15 +312,10 @@ async fn admin_list_ip_space_pricing(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    let all_pricing = this.db.list_ip_space_pricing_by_space(id).await?;
-    let total = all_pricing.len() as u64;
-
-    // Paginate
-    let paginated_pricing: Vec<_> = all_pricing
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    let (paginated_pricing, total) = this
+        .db
+        .list_ip_space_pricing_by_space_paginated(id, limit, offset)
+        .await?;
 
     // Convert to API format
     let pricing_infos: Vec<_> = paginated_pricing
@@ -542,40 +518,16 @@ async fn admin_list_ip_space_subscriptions(
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
-    // Get all subscriptions for this IP space
-    // We need to get all subscriptions and filter by available_ip_space_id
-    let all_subscriptions = if let Some(user_id) = params.user_id {
-        this.db.list_ip_range_subscriptions_by_user(user_id).await?
-    } else {
-        // Get all subscriptions (use user_id 0 as sentinel for all)
-        // This is a limitation - we may need to add a new DB method for this
-        this.db.list_ip_range_subscriptions_by_user(0).await?
-    };
-
-    // Filter by space_id and optionally by is_active
-    let filtered_subs: Vec<_> = all_subscriptions
-        .into_iter()
-        .filter(|sub| {
-            if sub.available_ip_space_id != id {
-                return false;
-            }
-            if let Some(is_active) = params.is_active {
-                if sub.is_active != is_active {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-
-    let total = filtered_subs.len() as u64;
-
-    // Paginate
-    let paginated_subs: Vec<_> = filtered_subs
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    let (paginated_subs, total) = this
+        .db
+        .list_ip_range_subscriptions_by_space_paginated(
+            id,
+            params.user_id,
+            params.is_active,
+            limit,
+            offset,
+        )
+        .await?;
 
     // Convert to API format with enriched data
     let mut sub_infos = Vec::new();

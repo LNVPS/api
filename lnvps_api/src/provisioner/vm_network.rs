@@ -11,9 +11,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use try_procedure::{OpError, RetryPolicy, retry_async};
 
-/// Network assignment tool for [super::LNVpsProvisioner]
+/// Network assignment tool for [super::VmProvisioner]
 #[derive(Clone)]
-pub struct LNVpsNetworkProvisioner {
+pub struct VmNetworkProvisioner {
     db: Arc<dyn LNVpsDb>,
     /// DNS server to add entries to
     dns: Option<Arc<dyn DnsServer>>,
@@ -23,7 +23,7 @@ pub struct LNVpsNetworkProvisioner {
     retry_policy: RetryPolicy,
 }
 
-impl LNVpsNetworkProvisioner {
+impl VmNetworkProvisioner {
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         dns: Option<Arc<dyn DnsServer>>,

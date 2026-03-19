@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tower_http::cors::CorsLayer;
 
 mod routes;
@@ -36,10 +36,17 @@ async fn main() -> Result<()> {
         Some(i) => i.parse()?,
         None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8000),
     };
-    let listener = TcpListener::bind(ip).await?;
+    let listener = bind_address(ip).await?;
     info!("Listening on {}", ip);
     let router = routes::routes(db);
     axum::serve(listener, router.layer(CorsLayer::permissive())).await?;
 
     Ok(())
+}
+
+async fn bind_address(address: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    socket.listen(1024)
 }

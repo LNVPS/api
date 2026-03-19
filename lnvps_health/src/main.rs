@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::time::interval;
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
                 .with_state(metrics_clone);
 
             info!("Starting metrics server on {}", metrics_bind);
-            match TcpListener::bind(metrics_bind).await {
+            match bind_address(metrics_bind).await {
                 Ok(listener) => {
                     if let Err(e) = axum::serve(listener, app).await {
                         error!("Metrics server error: {}", e);
@@ -362,4 +362,11 @@ fn record_check_metric(metrics: &HealthMetrics, check_id: &str, result: &checks:
         }
         _ => {}
     }
+}
+
+async fn bind_address(address: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    socket.listen(1024)
 }

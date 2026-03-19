@@ -1,6 +1,6 @@
 use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
@@ -73,6 +73,8 @@ pub enum VmHostKind {
     #[default]
     Proxmox = 0,
     LibVirt = 1,
+
+    Dummy = u16::MAX,
 }
 
 impl Display for VmHostKind {
@@ -80,6 +82,7 @@ impl Display for VmHostKind {
         match self {
             VmHostKind::Proxmox => write!(f, "proxmox"),
             VmHostKind::LibVirt => write!(f, "libvirt"),
+            VmHostKind::Dummy => write!(f, "dummy"),
         }
     }
 }
@@ -730,7 +733,7 @@ pub enum NetworkAccessPolicy {
 
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize)]
 #[repr(u16)]
-pub enum VmCostPlanIntervalType {
+pub enum IntervalType {
     Day = 0,
     Month = 1,
     Year = 2,
@@ -745,7 +748,7 @@ pub struct VmCostPlan {
     pub amount: u64,
     pub currency: String,
     pub interval_amount: u64,
-    pub interval_type: VmCostPlanIntervalType,
+    pub interval_type: IntervalType,
 }
 
 /// Offers.
@@ -881,12 +884,10 @@ pub struct Vm {
     pub template_id: Option<u64>,
     /// Custom pricing specification used for this vm [VmCustomTemplate]
     pub custom_template_id: Option<u64>,
+    /// The subscription line item managing billing for this VM (mirrors ip_range_subscription pattern)
+    pub subscription_line_item_id: u64,
     /// Users ssh-key assigned to this VM
     pub ssh_key_id: u64,
-    /// When the VM was created
-    pub created: DateTime<Utc>,
-    /// When the VM expires
-    pub expires: DateTime<Utc>,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
     /// Network MAC address
@@ -895,10 +896,45 @@ pub struct Vm {
     pub deleted: bool,
     /// Referral code (recorded during ordering)
     pub ref_code: Option<String>,
-    /// Enable automatic renewal
-    pub auto_renewal_enabled: bool,
     /// Whether the VM is disabled by admin
     pub disabled: bool,
+}
+
+/// Raw vm_payment row with external_data as a plain String (not decrypted).
+/// Used by the data migration tool to copy rows without needing the encryption key.
+#[derive(FromRow, Clone, Debug)]
+pub struct VmPaymentRaw {
+    pub id: Vec<u8>,
+    pub vm_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    pub payment_type: PaymentType,
+    pub external_data: String,
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub rate: f32,
+    pub time_value: u64,
+    pub tax: u64,
+    pub upgrade_params: Option<String>,
+    pub processing_fee: u64,
+    pub paid_at: Option<DateTime<Utc>>,
+}
+
+/// Minimal VM projection used by the data migration tool where
+/// `subscription_line_item_id` may still be NULL for pre-migration rows.
+#[derive(FromRow, Clone, Debug)]
+pub struct VmForMigration {
+    pub id: u64,
+    pub user_id: u64,
+    pub template_id: Option<u64>,
+    pub custom_template_id: Option<u64>,
+    pub expires: DateTime<Utc>,
+    pub auto_renewal_enabled: bool,
+    pub subscription_line_item_id: Option<u64>,
+    pub deleted: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -1488,6 +1524,8 @@ pub enum SubscriptionPaymentType {
     Purchase = 0,
     /// Recurring renewal payment
     Renewal = 1,
+    /// VM upgrade payment
+    Upgrade = 2,
 }
 
 impl Display for SubscriptionPaymentType {
@@ -1495,11 +1533,12 @@ impl Display for SubscriptionPaymentType {
         match self {
             SubscriptionPaymentType::Purchase => write!(f, "Purchase"),
             SubscriptionPaymentType::Renewal => write!(f, "Renewal"),
+            SubscriptionPaymentType::Upgrade => write!(f, "Upgrade"),
         }
     }
 }
 
-/// Subscription for a recurring service (always monthly billing)
+/// Subscription for a recurring service
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct Subscription {
     pub id: u64,
@@ -1510,7 +1549,14 @@ pub struct Subscription {
     pub created: DateTime<Utc>,
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
+    /// Whether the initial setup (purchase) payment has been confirmed.
+    /// Used to determine if setup fees apply on the next renewal invoice.
+    pub is_setup: bool,
     pub currency: String,
+    /// Number of intervals per billing cycle (e.g. 1 for "every 1 month")
+    pub interval_amount: u64,
+    /// Interval unit (Day, Month, Year)
+    pub interval_type: IntervalType,
     pub setup_fee: u64,
     pub auto_renewal_enabled: bool,
     pub external_id: Option<String>,
@@ -1523,6 +1569,7 @@ pub enum SubscriptionType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
+    Vps = 3,           // VM (links to vm table via vm.subscription_line_item_id)
 }
 
 impl Display for SubscriptionType {
@@ -1531,6 +1578,7 @@ impl Display for SubscriptionType {
             SubscriptionType::IpRange => write!(f, "IP Range"),
             SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
             SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
+            SubscriptionType::Vps => write!(f, "VPS"),
         }
     }
 }
@@ -1540,6 +1588,7 @@ impl Display for SubscriptionType {
 pub struct SubscriptionLineItem {
     pub id: u64,
     pub subscription_id: u64,
+    /// Discriminant indicating which product table owns this line item
     pub subscription_type: SubscriptionType,
     pub name: String,
     pub description: Option<String>,
@@ -1564,13 +1613,17 @@ pub struct SubscriptionPayment {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
+    /// Number of seconds this payment adds to subscription expiry
+    pub time_value: Option<u64>,
+    /// JSON metadata (e.g. upgrade parameters)
+    pub metadata: Option<serde_json::Value>,
     pub tax: u64,
     pub processing_fee: u64,
     /// Timestamp when the payment was completed
     pub paid_at: Option<DateTime<Utc>>,
 }
 
-/// Subscription payment with company info (for admin views)
+/// Subscription payment with company info (for admin views and time-series reporting)
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct SubscriptionPaymentWithCompany {
     pub id: Vec<u8>,
@@ -1586,11 +1639,26 @@ pub struct SubscriptionPaymentWithCompany {
     pub external_id: Option<String>,
     pub is_paid: bool,
     pub rate: f32,
+    /// Number of seconds this payment adds to subscription expiry
+    pub time_value: Option<u64>,
+    /// JSON metadata (e.g. upgrade parameters)
+    pub metadata: Option<serde_json::Value>,
     pub tax: u64,
     pub processing_fee: u64,
     /// Timestamp when the payment was completed
     pub paid_at: Option<DateTime<Utc>>,
+    // Company information
+    pub company_id: u64,
+    pub company_name: String,
     pub company_base_currency: String,
+    // VM information (NULL for non-VM subscriptions)
+    pub vm_id: Option<u64>,
+    // Host information
+    pub host_id: Option<u64>,
+    pub host_name: Option<String>,
+    // Region information
+    pub region_id: Option<u64>,
+    pub region_name: Option<String>,
 }
 
 /// Internet Registry - Regional Internet Registry

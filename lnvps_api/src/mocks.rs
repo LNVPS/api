@@ -3,7 +3,11 @@ use crate::dns::{BasicRecord, DnsServer, RecordType};
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
+use crate::host::dummy_host::DummyVmHost;
 use crate::router::{ArpEntry, Router};
+
+/// Type alias so tests can refer to the in-memory VM host as `MockVmHost`.
+pub type MockVmHost = DummyVmHost;
 use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bitcoin::hashes::Hash;
@@ -21,8 +25,8 @@ use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
     NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
-    VmCostPlanIntervalType, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory,
-    VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
+    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 use nostr_sdk::Timestamp;
 use payments_rs::lightning::{
@@ -229,183 +233,6 @@ impl LightningNode for MockNode {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MockVmHost {
-    vms: Arc<Mutex<HashMap<u64, MockVm>>>,
-}
-
-#[derive(Debug, Clone)]
-struct MockVm {
-    pub state: VmRunningStates,
-}
-
-impl Default for MockVmHost {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MockVmHost {
-    pub fn new() -> Self {
-        static LAZY_VMS: LazyLock<Arc<Mutex<HashMap<u64, MockVm>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-        Self {
-            vms: LAZY_VMS.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl VmHostClient for MockVmHost {
-    async fn get_info(&self) -> OpResult<VmHostInfo> {
-        todo!()
-    }
-
-    async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
-        Ok(())
-    }
-
-    async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
-        Ok(format!(
-            "ff:ff:ff:{}:{}:{}",
-            hex::encode([rand::random::<u8>()]),
-            hex::encode([rand::random::<u8>()]),
-            hex::encode([rand::random::<u8>()]),
-        ))
-    }
-
-    async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        if let Some(mut vm) = vms.get_mut(&vm.id) {
-            vm.state = VmRunningStates::Running;
-        }
-        Ok(())
-    }
-
-    async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        if let Some(mut vm) = vms.get_mut(&vm.id) {
-            vm.state = VmRunningStates::Stopped;
-        }
-        Ok(())
-    }
-
-    async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        if let Some(mut vm) = vms.get_mut(&vm.id) {
-            vm.state = VmRunningStates::Running;
-        }
-        Ok(())
-    }
-
-    async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        let max_id = *vms.keys().max().unwrap_or(&0);
-        vms.insert(
-            max_id + 1,
-            MockVm {
-                state: VmRunningStates::Stopped,
-            },
-        );
-        Ok(())
-    }
-
-    async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
-        let mut vms = self.vms.lock().await;
-        vms.remove(&vm.id);
-        Ok(())
-    }
-
-    async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
-        Ok(())
-    }
-
-    async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
-        Ok(())
-    }
-
-    async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
-        // Mock implementation - just return Ok for testing
-        Ok(())
-    }
-
-    async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
-        let vms = self.vms.lock().await;
-        if let Some(vm) = vms.get(&vm.id) {
-            Ok(VmRunningState {
-                timestamp: Utc::now().timestamp() as u64,
-                state: vm.state.clone(),
-                cpu_usage: 69.0,
-                mem_usage: 69.0,
-                uptime: 100,
-                net_in: 69,
-                net_out: 69,
-                disk_write: 69,
-                disk_read: 69,
-            })
-        } else {
-            op_fatal!("No vm with id {}", vm.id)
-        }
-    }
-
-    async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
-        let vms = self.vms.lock().await;
-        let states = vms
-            .iter()
-            .map(|(vm_id, vm)| {
-                (
-                    *vm_id,
-                    VmRunningState {
-                        timestamp: Utc::now().timestamp() as u64,
-                        state: vm.state.clone(),
-                        cpu_usage: 69.0,
-                        mem_usage: 69.0,
-                        uptime: 100,
-                        net_in: 69,
-                        net_out: 69,
-                        disk_write: 69,
-                        disk_read: 69,
-                    },
-                )
-            })
-            .collect();
-        Ok(states)
-    }
-
-    async fn configure_vm(&self, vm: &FullVmInfo) -> OpResult<()> {
-        Ok(())
-    }
-
-    async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
-        todo!()
-    }
-
-    async fn get_time_series_data(
-        &self,
-        vm: &Vm,
-        series: TimeSeries,
-    ) -> OpResult<Vec<TimeSeriesData>> {
-        Ok(vec![])
-    }
-
-    async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
-        use tokio::sync::mpsc::channel;
-        let (client_tx, client_rx) = channel::<Vec<u8>>(256);
-        let (server_tx, mut server_rx) = channel::<Vec<u8>>(256);
-        tokio::spawn(async move {
-            while let Some(buf) = server_rx.recv().await {
-                if client_tx.send(buf).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(TerminalStream {
-            rx: client_rx,
-            tx: server_tx,
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct MockDnsServer {
     pub zones: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>,
@@ -425,11 +252,18 @@ impl Default for MockDnsServer {
 
 impl MockDnsServer {
     pub fn new() -> Self {
+        static LAZY_ZONES: LazyLock<Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
         Self {
-            zones: Arc::new(Mutex::new(HashMap::new())),
+            zones: LAZY_ZONES.clone(),
         }
     }
+
+    pub async fn reset() {
+        Self::new().zones.lock().await.clear();
+    }
 }
+
 #[async_trait]
 impl DnsServer for MockDnsServer {
     async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {

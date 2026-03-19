@@ -11,7 +11,7 @@
 #[cfg(test)]
 mod tests {
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
-    use crate::provisioner::LNVpsProvisioner;
+    use crate::provisioner::VmProvisioner;
     use crate::router::Router;
     use crate::settings::mock_settings;
     use anyhow::Result;
@@ -97,8 +97,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -156,8 +155,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -229,13 +227,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner = LNVpsProvisioner::new(
-            settings,
-            db.clone(),
-            node.clone(),
-            rates.clone(),
-            Some(Arc::new(dns.clone())),
-        );
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -316,8 +308,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -368,16 +359,15 @@ mod tests {
         clear_mock_state().await;
         let settings = mock_settings();
         let db = Arc::new(MockDb::default());
-        let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        MockDnsServer::reset().await;
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -417,8 +407,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -467,8 +456,7 @@ mod tests {
         setup_db_with_static_arp(&db).await?;
 
         let _dns = MockDnsServer::new();
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -533,7 +521,7 @@ mod tests {
     #[tokio::test]
     async fn test_rollback_unpersisted_arp_dns_on_save_vm_failure() -> Result<()> {
         clear_mock_state().await;
-        use crate::provisioner::LNVpsNetworkProvisioner;
+        use crate::provisioner::VmNetworkProvisioner;
         use try_procedure::RetryPolicy;
 
         let db = Arc::new(MockDb::default());
@@ -541,7 +529,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let network = LNVpsNetworkProvisioner::new(
+        let network = VmNetworkProvisioner::new(
             db.clone(),
             Some(dns.clone()),
             Some("mock-forward-zone-id".to_string()),
@@ -560,13 +548,11 @@ mod tests {
             ssh_key_id: ssh_key.id,
             template_id: Some(1),
             custom_template_id: None,
+            subscription_line_item_id: 0,
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
-            expires: chrono::Utc::now() + chrono::Duration::days(30),
-            created: chrono::Utc::now(),
             ref_code: None,
             deleted: false,
-            auto_renewal_enabled: false,
             disabled: false,
         };
         let vm_id = db.insert_vm(&vm).await?;
@@ -646,8 +632,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
@@ -696,8 +681,7 @@ mod tests {
 
         setup_db_with_static_arp(&db).await?;
 
-        let provisioner =
-            LNVpsProvisioner::new(settings, db.clone(), node.clone(), rates.clone(), Some(dns));
+        let provisioner = VmProvisioner::new(settings, db.clone());
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
