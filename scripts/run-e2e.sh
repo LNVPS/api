@@ -101,12 +101,16 @@ cleanup() {
     echo ""
     echo "=== Cleanup ==="
     if [[ -f "$API_PID_FILE" ]]; then
-        kill "$(cat "$API_PID_FILE")" 2>/dev/null || true
+        api_pid=$(cat "$API_PID_FILE")
+        kill "$api_pid" 2>/dev/null || true
+        wait "$api_pid" 2>/dev/null || true
         rm -f "$API_PID_FILE"
         echo "Stopped user API"
     fi
     if [[ -f "$ADMIN_PID_FILE" ]]; then
-        kill "$(cat "$ADMIN_PID_FILE")" 2>/dev/null || true
+        admin_pid=$(cat "$ADMIN_PID_FILE")
+        kill "$admin_pid" 2>/dev/null || true
+        wait "$admin_pid" 2>/dev/null || true
         rm -f "$ADMIN_PID_FILE"
         echo "Stopped admin API"
     fi
