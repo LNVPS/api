@@ -799,11 +799,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ?")
-            .bind(vm_payment.time_value)
-            .bind(vm_payment.vm_id)
-            .execute(&mut *tx)
-            .await?;
+        let rows_affected =
+            sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ? and deleted = 0")
+                .bind(vm_payment.time_value)
+                .bind(vm_payment.vm_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+
+        if rows_affected == 0 {
+            tx.rollback().await?;
+            return Err(DbError::Source(
+                anyhow!("VM {} is deleted, cannot apply payment", vm_payment.vm_id)
+                    .into_boxed_dyn_error(),
+            ));
+        }
 
         tx.commit().await?;
         Ok(())

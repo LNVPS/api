@@ -2445,12 +2445,10 @@ mod tests {
         let worker = setup_worker(db.clone()).await?;
         worker.check_vms().await?;
 
-        // VM should have been deleted (removed from MockDb)
+        // VM should be soft-deleted
         let vms = db.vms.lock().await;
-        assert!(
-            !vms.contains_key(&vm_id),
-            "Unpaid VM older than 1 hour should be deleted"
-        );
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(false);
+        assert!(deleted, "Unpaid VM older than 1 hour should be deleted");
         Ok(())
     }
 
@@ -2465,10 +2463,11 @@ mod tests {
         let worker = setup_worker(db.clone()).await?;
         worker.check_vms().await?;
 
-        // VM should still be present
+        // VM should still be present and not deleted
         let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(true);
         assert!(
-            vms.contains_key(&vm_id),
+            !deleted,
             "Unpaid VM younger than 1 hour should not be deleted"
         );
         Ok(())

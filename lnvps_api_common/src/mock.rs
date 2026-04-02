@@ -661,7 +661,9 @@ impl LNVpsDbBase for MockDb {
 
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
-        vms.remove(&vm_id);
+        if let Some(vm) = vms.get_mut(&vm_id) {
+            vm.deleted = true;
+        }
         Ok(())
     }
 
@@ -834,8 +836,17 @@ impl LNVpsDbBase for MockDb {
             p.is_paid = true;
             p.paid_at = Some(Utc::now());
         }
-        if let Some(v) = v.get_mut(&payment.vm_id) {
-            v.expires = v.expires.add(TimeDelta::seconds(payment.time_value as i64));
+        match v.get_mut(&payment.vm_id) {
+            Some(vm) if !vm.deleted => {
+                vm.expires = vm.expires.add(TimeDelta::seconds(payment.time_value as i64));
+            }
+            Some(_) => {
+                return Err(DbError::Other(anyhow!(
+                    "VM {} is deleted, cannot apply payment",
+                    payment.vm_id
+                )));
+            }
+            None => {}
         }
         Ok(())
     }

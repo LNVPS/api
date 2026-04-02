@@ -496,12 +496,11 @@ mod tests {
         provisioner.delete_vm(vm_id).await?;
 
         // Verify complete cleanup:
-        // Note: MockDb hard-deletes VMs, so we can't verify VM.deleted flag
-        // In production, the VM would be soft-deleted (deleted = true)
+        // VM should be soft-deleted (deleted = true), matching production MySQL behavior
 
-        // 1. VM should no longer be accessible (MockDb hard-delete)
-        let vm_get_result = db.get_vm(vm_id).await;
-        assert!(vm_get_result.is_err(), "VM should be deleted from MockDb");
+        // 1. VM should be soft-deleted
+        let vm_after = db.get_vm(vm_id).await?;
+        assert!(vm_after.deleted, "VM should be deleted from MockDb");
 
         // 2. IPs should be soft-deleted with refs cleared
         let ips_after = db.list_vm_ip_assignments(vm_id).await?;
@@ -667,9 +666,9 @@ mod tests {
         let result = provisioner.delete_vm(vm_id).await;
         assert!(result.is_ok(), "Delete should succeed");
 
-        // Verify VM is deleted (MockDb hard-deletes)
-        let vm_get_result = db.get_vm(vm_id).await;
-        assert!(vm_get_result.is_err(), "VM should be deleted from MockDb");
+        // Verify VM is soft-deleted (matching production MySQL behavior)
+        let vm_after = db.get_vm(vm_id).await?;
+        assert!(vm_after.deleted, "VM should be deleted from MockDb");
 
         // Verify IP assignments are marked as deleted
         let ips_after = db.list_vm_ip_assignments(vm_id).await?;

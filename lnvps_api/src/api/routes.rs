@@ -1308,6 +1308,9 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
     if uid != vm.user_id {
         return Err(ApiError::new("VM does not belong to you"));
     }
+    if vm.deleted {
+        return Err(ApiError::new("VM not found"));
+    }
     Ok((uid, vm))
 }
 
