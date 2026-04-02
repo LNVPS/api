@@ -487,14 +487,35 @@ impl Worker {
 
         // Process deletions first
         for vm in vms_to_delete {
-            info!("Deleting unpaid VM {}", vm.id);
-            if let Err(e) = self.provisioner.delete_vm(vm.id).await {
-                error!("Failed to delete unpaid VM {}: {}", vm.id, e);
-                self.queue_admin_notification(
-                    format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
-                    Some(format!("VM {} Deletion Failed", vm.id)),
-                )
-                .await
+            // Re-read the VM from the database to guard against a race condition where a
+            // payment was confirmed between the initial list_vms() snapshot and now.
+            // Only proceed with deletion if the VM is still in the unpaid (new) state.
+            match self.db.get_vm(vm.id).await {
+                Ok(current_vm) if current_vm.created == current_vm.expires => {
+                    info!("Deleting unpaid VM {}", vm.id);
+                    if let Err(e) = self.provisioner.delete_vm(vm.id).await {
+                        error!("Failed to delete unpaid VM {}: {}", vm.id, e);
+                        self.queue_admin_notification(
+                            format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
+                            Some(format!("VM {} Deletion Failed", vm.id)),
+                        )
+                        .await
+                    }
+                }
+                Ok(_) => {
+                    info!(
+                        "VM {} was paid since last check, skipping deletion",
+                        vm.id
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to re-read VM {} before deletion: {}", vm.id, e);
+                    self.queue_admin_notification(
+                        format!("Failed to re-read VM {} before deletion:\n{}", vm.id, e),
+                        Some(format!("VM {} Pre-Deletion Read Failed", vm.id)),
+                    )
+                    .await
+                }
             }
         }
 
@@ -2347,6 +2368,109 @@ impl Worker {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mocks::{MockDnsServer, MockNode};
+    use crate::settings::mock_settings;
+    use crate::provisioner::LNVpsProvisioner;
+    use lnvps_api_common::{MockDb, MockExchangeRate};
+    use lnvps_db::{LNVpsDbBase, UserSshKey, Vm};
+
+    async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
+        let settings = mock_settings();
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        let dns = MockDnsServer::new();
+        let provisioner = Arc::new(LNVpsProvisioner::new(
+            settings.clone(),
+            db.clone(),
+            node,
+            rates,
+            Some(Arc::new(dns)),
+        ));
+        let cache = VmStateCache::new();
+        Worker::new(db, provisioner, &settings, cache, None).await
+    }
+
+    async fn add_vm_with_state(
+        db: &Arc<MockDb>,
+        created: DateTime<Utc>,
+        expires: DateTime<Utc>,
+    ) -> Result<Vm> {
+        let pubkey: [u8; 32] = rand::random();
+        let user_id = db.upsert_user(&pubkey).await?;
+        let ssh_key_id = db
+            .insert_user_ssh_key(&UserSshKey {
+                id: 0,
+                name: "test".to_string(),
+                user_id,
+                created: Utc::now(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await?;
+        let vm = Vm {
+            id: 0,
+            host_id: 1,
+            user_id,
+            image_id: 1,
+            template_id: Some(1),
+            custom_template_id: None,
+            ssh_key_id,
+            created,
+            expires,
+            disk_id: 1,
+            mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            deleted: false,
+            ref_code: None,
+            auto_renewal_enabled: false,
+            disabled: false,
+        };
+        let vm_id = db.insert_vm(&vm).await?;
+        Ok(db.get_vm(vm_id).await?)
+    }
+
+    /// An unpaid VM (created == expires) that is older than 1 hour must be deleted by check_vms.
+    #[tokio::test]
+    async fn test_check_vms_deletes_unpaid_vm_after_one_hour() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let vm = add_vm_with_state(&db, old, old).await?;
+        let vm_id = vm.id;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        // VM should have been deleted (removed from MockDb)
+        let vms = db.vms.lock().await;
+        assert!(
+            !vms.contains_key(&vm_id),
+            "Unpaid VM older than 1 hour should be deleted"
+        );
+        Ok(())
+    }
+
+    /// An unpaid VM that was created less than 1 hour ago must NOT be deleted by check_vms.
+    #[tokio::test]
+    async fn test_check_vms_skips_unpaid_vm_within_one_hour() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let recent = Utc::now().sub(TimeDelta::minutes(30));
+        let vm = add_vm_with_state(&db, recent, recent).await?;
+        let vm_id = vm.id;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        // VM should still be present
+        let vms = db.vms.lock().await;
+        assert!(
+            vms.contains_key(&vm_id),
+            "Unpaid VM younger than 1 hour should not be deleted"
+        );
         Ok(())
     }
 }
