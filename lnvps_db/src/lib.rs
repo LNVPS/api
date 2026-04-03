@@ -286,6 +286,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Return the most recently settled invoice
     async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>>;
 
+    /// Count active (unpaid, non-expired) payments for a VM
+    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64>;
+
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>>;
 

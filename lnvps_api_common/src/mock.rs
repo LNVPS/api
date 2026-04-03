@@ -852,6 +852,13 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
+    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64> {
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .filter(|p| p.vm_id == vm_id && !p.is_paid && p.expires > Utc::now())
+            .count() as u64)
+    }
+
     async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().cloned().collect())
