@@ -799,11 +799,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("update vm set expires = TIMESTAMPADD(SECOND, ?, expires) where id = ?")
-            .bind(vm_payment.time_value)
-            .bind(vm_payment.vm_id)
-            .execute(&mut *tx)
-            .await?;
+        // Un-delete the VM if it was deleted (e.g. auto-cleaned up before payment arrived)
+        // and extend its expiry. This handles payment methods with longer timeouts.
+        sqlx::query(
+            "update vm set expires = TIMESTAMPADD(SECOND, ?, expires), deleted = 0 where id = ?",
+        )
+        .bind(vm_payment.time_value)
+        .bind(vm_payment.vm_id)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())
