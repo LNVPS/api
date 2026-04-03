@@ -492,35 +492,18 @@ impl Worker {
             // Only proceed with deletion if the VM is still in the unpaid (new) state.
             match self.db.get_vm(vm.id).await {
                 Ok(current_vm) if current_vm.created == current_vm.expires => {
-                    // Skip deletion if the VM has any pending (unpaid, non-expired) payments.
-                    match self.db.list_vm_payment(vm.id).await {
-                        Ok(payments) => {
-                            if payments
-                                .iter()
-                                .any(|p| !p.is_paid && p.expires > Utc::now())
-                            {
-                                info!(
-                                    "VM {} has pending unpaid payments, skipping deletion",
-                                    vm.id
-                                );
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to check payments for VM {} before deletion: {}",
-                                vm.id, e
-                            );
-                            self.queue_admin_notification(
-                                format!(
-                                    "Failed to check payments for VM {} before deletion:\n{}",
-                                    vm.id, e
-                                ),
-                                Some(format!("VM {} Payment Check Failed", vm.id)),
-                            )
-                            .await;
-                            continue;
-                        }
+                    if self
+                        .db
+                        .count_active_vm_payments(vm.id)
+                        .await
+                        .unwrap_or(0)
+                        > 0
+                    {
+                        info!(
+                            "VM {} has pending unpaid payments, skipping deletion",
+                            vm.id
+                        );
+                        continue;
                     }
                     info!("Deleting unpaid VM {}", vm.id);
                     if let Err(e) = self.provisioner.delete_vm(vm.id).await {

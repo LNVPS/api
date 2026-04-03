@@ -821,6 +821,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64> {
+        let (count,): (i64,) =
+            sqlx::query_as("select count(*) from vm_payment where vm_id = ? and is_paid = false and expires > NOW()")
+                .bind(vm_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok(count as u64)
+    }
+
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>> {
         Ok(
             sqlx::query_as("select * from vm_custom_pricing where region_id = ?")
