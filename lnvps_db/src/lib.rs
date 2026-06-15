@@ -26,6 +26,17 @@ pub use model::*;
 pub use mysql::*;
 use try_procedure::OpError;
 
+/// Compute the email hash used for lookups: SHA-256 of lowercased, trimmed email.
+pub fn email_hash(email: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(email.trim().to_lowercase().as_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("sqlx: {0}")]

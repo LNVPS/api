@@ -20,6 +20,8 @@ pub struct User {
     pub created: DateTime<Utc>,
     /// Users email address for notifications (encrypted)
     pub email: EncryptedString,
+    /// SHA-256 hash of lowercased+trimmed email for lookups (32 bytes)
+    pub email_hash: Option<Vec<u8>>,
     /// Whether the email address has been verified
     pub email_verified: bool,
     /// Token used for email address verification (empty string means no pending verification)
