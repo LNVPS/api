@@ -63,10 +63,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_user(&self, user: &User) -> DbResult<()> {
+        let hash = if user.email.is_empty() {
+            None
+        } else {
+            Some(crate::email_hash(user.email.as_str()).to_vec())
+        };
         sqlx::query(
-            "update users set email=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
+            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
         )
             .bind(&user.email)
+            .bind(hash)
             .bind(user.email_verified)
             .bind(&user.email_verify_token)
             .bind(user.contact_nip17)
@@ -2468,6 +2474,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.pubkey,
                 u.created,
                 u.email,
+                u.email_hash,
                 u.email_verified,
                 u.email_verify_token,
                 u.contact_nip17,
@@ -2527,6 +2534,55 @@ impl AdminDb for LNVpsDbMysql {
         let total = count_query_builder.fetch_one(&self.db).await? as u64;
 
         Ok((users, total))
+    }
+
+    async fn admin_find_user_by_email_hash(&self, hash: &[u8; 32]) -> DbResult<Option<crate::AdminUserInfo>> {
+        let user = sqlx::query_as::<_, crate::AdminUserInfo>(
+            r#"
+            SELECT 
+                u.id,
+                u.pubkey,
+                u.created,
+                u.email,
+                u.email_hash,
+                u.email_verified,
+                u.email_verify_token,
+                u.contact_nip17,
+                u.contact_email,
+                u.country_code,
+                u.billing_name,
+                u.billing_address_1,
+                u.billing_address_2,
+                u.billing_city,
+                u.billing_state,
+                u.billing_postcode,
+                u.billing_tax_id,
+                u.nwc_connection_string,
+                COALESCE(vm_stats.vm_count, 0) as vm_count,
+                CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
+            FROM users u
+            LEFT JOIN (
+                SELECT 
+                    user_id, 
+                    COUNT(*) as vm_count
+                FROM vm 
+                WHERE deleted = 0 
+                GROUP BY user_id
+            ) vm_stats ON u.id = vm_stats.user_id
+            LEFT JOIN (
+                SELECT DISTINCT user_id
+                FROM admin_role_assignments
+                WHERE expires_at IS NULL OR expires_at > NOW()
+            ) admin_roles ON u.id = admin_roles.user_id
+            WHERE u.email_hash = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(hash.as_slice())
+        .fetch_optional(&self.db)
+        .await?;
+
+        Ok(user)
     }
 
     async fn admin_list_regions(

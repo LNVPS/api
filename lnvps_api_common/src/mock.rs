@@ -299,6 +299,7 @@ impl LNVpsDbBase for MockDb {
         let mut users = self.users.lock().await;
         if let Some(u) = users.get_mut(&user.id) {
             u.email = user.email.clone();
+            u.email_hash = user.email_hash.clone();
             u.email_verified = user.email_verified;
             u.email_verify_token = user.email_verify_token.clone();
             u.contact_email = user.contact_email;
@@ -839,7 +840,9 @@ impl LNVpsDbBase for MockDb {
         if let Some(vm) = v.get_mut(&payment.vm_id) {
             // Un-delete the VM if it was deleted (e.g. auto-cleaned up before payment arrived)
             vm.deleted = false;
-            vm.expires = vm.expires.add(TimeDelta::seconds(payment.time_value as i64));
+            vm.expires = vm
+                .expires
+                .add(TimeDelta::seconds(payment.time_value as i64));
         }
         Ok(())
     }
@@ -1793,6 +1796,10 @@ impl lnvps_db::AdminDb for MockDb {
             })
             .collect();
         Ok((paginated_users, total))
+    }
+
+    async fn admin_find_user_by_email_hash(&self, _hash: &[u8; 32]) -> DbResult<Option<AdminUserInfo>> {
+        Ok(None)
     }
 
     async fn admin_list_regions(
