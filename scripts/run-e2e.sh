@@ -68,22 +68,33 @@ DB_USER=$(echo "$DB_BASE" | sed -E 's|mysql://([^:]+):.*|\1|')
 DB_PASS=$(echo "$DB_BASE" | sed -E 's|mysql://[^:]+:([^@]+)@.*|\1|')
 
 # ---------------------------------------------------------------------------
-# mysql_exec SQL — run a SQL statement via local client or docker exec fallback
+# mysql_exec SQL — run a SQL statement against the e2e MariaDB.
+#
+# Prefers running inside the DB container via `docker compose exec` because that
+# is deterministic in CI: it does not depend on a host mysql/mariadb client being
+# installed, nor on the published port being reachable from the runner host
+# (which was the cause of repeated "MariaDB did not become ready" CI failures).
+# Falls back to a host client only if compose exec is unavailable.
 # ---------------------------------------------------------------------------
 mysql_exec() {
     local sql="$1"
-    if command -v mysql >/dev/null 2>&1; then
-        mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p${DB_PASS}" \
-            -e "$sql" 2>/dev/null
-    elif command -v mariadb >/dev/null 2>&1; then
+    # Preferred: execute inside the db service container.
+    if docker compose -f "$COMPOSE_FILE" exec -T db \
+        mariadb -u "$DB_USER" "-p${DB_PASS}" -e "$sql" 2>/dev/null; then
+        return 0
+    fi
+    # Fallbacks: host clients (used for local dev where the client is installed).
+    if command -v mariadb >/dev/null 2>&1; then
         mariadb -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p${DB_PASS}" \
             -e "$sql" 2>/dev/null
+    elif command -v mysql >/dev/null 2>&1; then
+        mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p${DB_PASS}" \
+            -e "$sql" 2>/dev/null
     else
-        # Fall back to docker exec into a running MariaDB/MySQL container
+        # Last resort: docker exec by published-port lookup.
         local container
         container=$(docker ps --filter "publish=${DB_PORT}" --format "{{.Names}}" | head -1)
         if [[ -z "$container" ]]; then
-            echo "ERROR: no mysql/mariadb client found and no container listening on port ${DB_PORT}" >&2
             return 1
         fi
         docker exec "$container" mariadb -u "$DB_USER" "-p${DB_PASS}" -e "$sql" 2>/dev/null
@@ -129,7 +140,12 @@ fi
 # 1. Start docker infrastructure
 # ---------------------------------------------------------------------------
 echo "=== Starting infrastructure ($COMPOSE_FILE) ==="
-docker compose -f "$COMPOSE_FILE" up -d
+# --wait blocks until services with a healthcheck (db, bitcoind) report healthy,
+# so the DB is reachable before we probe it. Falls back to plain up -d on older
+# docker that doesn't support --wait.
+if ! docker compose -f "$COMPOSE_FILE" up -d --wait 2>/dev/null; then
+    docker compose -f "$COMPOSE_FILE" up -d
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Wait for LND (if present in compose file) and copy credentials
@@ -148,9 +164,9 @@ fi
 DB_NAME="lnvps_e2e_${LNVPS_E2E_RUN_ID}"
 echo "=== Run ID: ${LNVPS_E2E_RUN_ID} | Database: ${DB_NAME} ==="
 
-# Wait for MariaDB to accept connections (first-time volume init can take >30s in CI)
-DB_READY_TIMEOUT=600
-echo "Waiting for MariaDB at ${DB_HOST}:${DB_PORT} (timeout: ${DB_READY_TIMEOUT}s)..."
+# Wait for MariaDB to accept connections (first-time volume init can take a while in CI)
+DB_READY_TIMEOUT=300
+echo "Waiting for MariaDB (timeout: ${DB_READY_TIMEOUT}s)..."
 for i in $(seq 1 "$DB_READY_TIMEOUT"); do
     if mysql_exec "SELECT 1" >/dev/null 2>&1; then
         echo "MariaDB ready after ${i}s"
@@ -158,6 +174,13 @@ for i in $(seq 1 "$DB_READY_TIMEOUT"); do
     fi
     if [[ "$i" -eq "$DB_READY_TIMEOUT" ]]; then
         echo "ERROR: MariaDB did not become ready within ${DB_READY_TIMEOUT}s" >&2
+        echo "--- docker compose ps ---" >&2
+        docker compose -f "$COMPOSE_FILE" ps >&2 || true
+        echo "--- db container logs (tail) ---" >&2
+        docker compose -f "$COMPOSE_FILE" logs --tail=40 db >&2 || true
+        echo "--- last mysql_exec attempt (stderr) ---" >&2
+        docker compose -f "$COMPOSE_FILE" exec -T db \
+            mariadb -u "$DB_USER" "-p${DB_PASS}" -e "SELECT 1" >&2 || true
         exit 1
     fi
     sleep 1
