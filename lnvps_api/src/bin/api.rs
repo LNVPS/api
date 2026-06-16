@@ -91,7 +91,15 @@ async fn main() -> Result<(), Error> {
         db.execute(setup_script).await?;
         info!("Executed dev_setup.sql");
     }
-    let db: Arc<dyn LNVpsDb> = Arc::new(db);
+    // Backfill VMs/payments into the subscription system. Must run AFTER schema
+    // migrations and BEFORE the Arc<dyn LNVpsDb> is used anywhere (the worker data
+    // migrations and all VM reads decode the non-nullable subscription_line_item_id,
+    // which is NULL for pre-migration rows until this backfill links them).
+    // Idempotent — a no-op once every VM is linked and every payment copied.
+    let db = Arc::new(db);
+    lnvps_api::data_migration::vm_subscription_backfill::run_vm_subscription_backfill(db.clone())
+        .await?;
+    let db: Arc<dyn LNVpsDb> = db;
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
         for r in &c.relays {

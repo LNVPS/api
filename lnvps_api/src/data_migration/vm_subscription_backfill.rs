@@ -1,48 +1,26 @@
-/// Data migration tool: migrate VMs to the subscription payment system.
-///
-/// Phase 1 — Subscription backfill:
-///   For every VM (including deleted) that does not yet have a subscription_line_item_id:
-///   - Standard VMs (template_id set): create a subscription from the cost plan interval/amount.
-///   - Custom VMs (custom_template_id set): create a subscription with 1-Month interval.
-///   - VMs with neither: skip with a warning.
-///
-/// Phase 2 — Payment backfill:
-///   For every vm_payment that has not yet been copied to subscription_payment:
-///   - Look up the VM's subscription_line_item_id (set in Phase 1).
-///   - Insert a matching subscription_payment row preserving all fields.
-///   - PaymentType::Renewal → SubscriptionPaymentType::Renewal
-///   - PaymentType::Upgrade → SubscriptionPaymentType::Upgrade
-///   - upgrade_params JSON string → metadata serde_json::Value
-///
-/// Both phases are idempotent. Use --dry-run to preview without writing.
+//! Startup backfill: migrate VMs and vm_payment records into the subscription system.
+//!
+//! This runs unconditionally at app startup, immediately after schema migrations and
+//! BEFORE `run_data_migrations` (which calls `list_vms()` and would fail to decode the
+//! non-nullable `vm.subscription_line_item_id` if any VM were still unlinked).
+//!
+//! Phase 1 — Subscription backfill: for every VM (including deleted) without a
+//!   `subscription_line_item_id`, create a subscription + line item and link the VM.
+//!   The VM's existing `expires` and `auto_renewal_enabled` are copied onto the
+//!   subscription so billing/renewal enforcement continues seamlessly.
+//!
+//! Phase 2 — Payment backfill: copy every `vm_payment` row that has not yet been
+//!   copied into `subscription_payment`, preserving all fields.
+//!
+//! Both phases are idempotent: VMs already linked and payments already copied are skipped.
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::Parser;
-use config::{Config, File};
-use lnvps_api_admin::settings::Settings;
 use lnvps_db::{
-    EncryptionContext, IntervalType, LNVpsDb, LNVpsDbBase, LNVpsDbMysql, Subscription,
-    SubscriptionLineItem, SubscriptionPaymentType, SubscriptionType, VmForMigration, VmPaymentRaw,
+    IntervalType, LNVpsDb, LNVpsDbMysql, Subscription, SubscriptionLineItem,
+    SubscriptionPaymentType, SubscriptionType, VmForMigration, VmPaymentRaw,
 };
 use log::{info, warn};
-use std::path::PathBuf;
 use std::sync::Arc;
-
-#[derive(Parser)]
-#[clap(
-    about = "Migrate VMs and vm_payment records to the subscription payment system",
-    version,
-    author
-)]
-struct Args {
-    /// Path to the config file
-    #[clap(short, long)]
-    config: Option<PathBuf>,
-
-    /// Preview changes without writing to the database
-    #[clap(long)]
-    dry_run: bool,
-}
 
 /// Compute interval-to-seconds matching PricingEngine::cost_plan_interval_to_seconds.
 fn interval_to_seconds(interval_type: IntervalType, interval_amount: u64) -> i64 {
@@ -54,46 +32,27 @@ fn interval_to_seconds(interval_type: IntervalType, interval_amount: u64) -> i64
     base * interval_amount as i64
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-
-    let args = Args::parse();
-    let settings: Settings = Config::builder()
-        .add_source(File::from(
-            args.config.unwrap_or(PathBuf::from("config.yaml")),
-        ))
-        .build()?
-        .try_deserialize()?;
-
-    if let Some(ref encryption_config) = settings.encryption {
-        EncryptionContext::init_from_file(
-            &encryption_config.key_file,
-            encryption_config.auto_generate,
-        )?;
-        info!("Database encryption initialized");
-    }
-
-    let db_impl = LNVpsDbMysql::new(&settings.db).await?;
-    db_impl.migrate().await?;
-    let db_impl = Arc::new(db_impl);
+/// Run the VM → subscription backfill. Safe to call on every startup (idempotent).
+pub async fn run_vm_subscription_backfill(db_impl: Arc<LNVpsDbMysql>) -> Result<()> {
     let db: Arc<dyn LNVpsDb> = db_impl.clone();
-
-    if args.dry_run {
-        info!("*** DRY RUN MODE — no changes will be written ***");
-    }
 
     // Phase 1: create subscriptions for all VMs (including deleted)
     let vm_ids = db_impl
         .list_vm_ids_without_subscription()
         .await
         .context("Failed to list VMs needing subscription")?;
-    info!("Phase 1: {} VMs need a subscription", vm_ids.len());
+
+    if !vm_ids.is_empty() {
+        info!(
+            "VM subscription backfill — Phase 1: {} VMs need a subscription",
+            vm_ids.len()
+        );
+    }
 
     let mut sub_migrated = 0usize;
     let mut sub_errored = 0usize;
     for vm_id in &vm_ids {
-        match migrate_vm_subscription(db_impl.clone(), db.clone(), *vm_id, args.dry_run).await {
+        match migrate_vm_subscription(db_impl.clone(), db.clone(), *vm_id).await {
             Ok(()) => sub_migrated += 1,
             Err(e) => {
                 warn!("Phase 1: Failed to migrate VM {}: {:#}", vm_id, e);
@@ -101,43 +60,47 @@ async fn main() -> Result<()> {
             }
         }
     }
-    info!(
-        "Phase 1 complete: {} subscriptions created, {} errors",
-        sub_migrated, sub_errored
-    );
+    if !vm_ids.is_empty() {
+        info!(
+            "VM subscription backfill — Phase 1 complete: {} subscriptions created, {} errors",
+            sub_migrated, sub_errored
+        );
+    }
 
     // Phase 2: backfill vm_payment → subscription_payment
     let payment_vm_ids = db_impl
         .list_vm_ids_with_uncopied_payments()
         .await
         .context("Failed to list VMs with uncopied payments")?;
-    info!(
-        "Phase 2: {} VMs have vm_payment records to backfill",
-        payment_vm_ids.len()
-    );
+
+    if !payment_vm_ids.is_empty() {
+        info!(
+            "VM subscription backfill — Phase 2: {} VMs have vm_payment records to backfill",
+            payment_vm_ids.len()
+        );
+    }
 
     let mut pay_migrated = 0usize;
     let mut pay_errored = 0usize;
     for vm_id in &payment_vm_ids {
-        match migrate_vm_payments(db_impl.clone(), db.clone(), *vm_id, args.dry_run).await {
+        match migrate_vm_payments(db_impl.clone(), db.clone(), *vm_id).await {
             Ok(n) => pay_migrated += n,
             Err(e) => {
-                warn!(
-                    "Phase 2: Failed to migrate payments for VM {}: {:#}",
-                    vm_id, e
-                );
+                warn!("Phase 2: Failed to migrate payments for VM {}: {:#}", vm_id, e);
                 pay_errored += 1;
             }
         }
     }
-    info!(
-        "Phase 2 complete: {} payments backfilled, {} VM errors",
-        pay_migrated, pay_errored
-    );
+    if !payment_vm_ids.is_empty() {
+        info!(
+            "VM subscription backfill — Phase 2 complete: {} payments backfilled, {} VM errors",
+            pay_migrated, pay_errored
+        );
+    }
 
     if sub_errored > 0 || pay_errored > 0 {
         bail!(
-            "{} subscription errors, {} payment VM errors (see warnings above)",
+            "VM subscription backfill incomplete: {} subscription errors, {} payment VM errors (see warnings above)",
             sub_errored,
             pay_errored
         );
@@ -152,7 +115,6 @@ async fn migrate_vm_subscription(
     db_impl: Arc<LNVpsDbMysql>,
     db: Arc<dyn LNVpsDb>,
     vm_id: u64,
-    dry_run: bool,
 ) -> Result<()> {
     let vm: VmForMigration = db_impl
         .get_vm_for_migration(vm_id)
@@ -190,16 +152,12 @@ async fn migrate_vm_subscription(
             let desc = format!("Custom VM {}", vm_id);
             (1u64, IntervalType::Month, 0u64, desc)
         } else {
-            bail!(
-                "VM {} has neither template_id nor custom_template_id",
-                vm_id
-            );
+            bail!("VM {} has neither template_id nor custom_template_id", vm_id);
         };
 
     let time_value = interval_to_seconds(interval_type, interval_amount);
     info!(
-        "{} VM {} → subscription ({} {}, time_value={}s, amount={})",
-        if dry_run { "[DRY RUN]" } else { "Phase 1:" },
+        "Phase 1: VM {} → subscription ({} {}, time_value={}s, amount={})",
         vm_id,
         interval_amount,
         match interval_type {
@@ -211,10 +169,6 @@ async fn migrate_vm_subscription(
         line_item_amount,
     );
 
-    if dry_run {
-        return Ok(());
-    }
-
     // Deleted VMs should have inactive subscriptions — they are no longer running.
     let is_active = !vm.deleted;
 
@@ -225,14 +179,18 @@ async fn migrate_vm_subscription(
         name: format!("VM {} Subscription", vm_id),
         description: Some(description.clone()),
         created: Utc::now(),
-        expires: None, // vm.expires column removed; set manually after migration if needed
+        // Preserve the VM's existing billing expiry so renewal/suspension/auto-renewal
+        // enforcement continues seamlessly. The legacy vm.expires column is the source
+        // of truth pre-migration and is dropped only at finalization.
+        expires: Some(vm.expires),
         is_active,
         is_setup: true,
         currency,
         interval_amount,
         interval_type,
         setup_fee: 0,
-        auto_renewal_enabled: false,
+        // Preserve the VM's auto-renewal preference so NWC auto-renewal keeps working.
+        auto_renewal_enabled: vm.auto_renewal_enabled,
         external_id: None,
     };
     let line_item = SubscriptionLineItem {
@@ -257,10 +215,6 @@ async fn migrate_vm_subscription(
         .await
         .context("Failed to link VM to subscription")?;
 
-    info!(
-        "Phase 1: VM {} → subscription line item {}",
-        vm_id, subscription_line_item_id
-    );
     Ok(())
 }
 
@@ -270,7 +224,6 @@ async fn migrate_vm_payments(
     db_impl: Arc<LNVpsDbMysql>,
     db: Arc<dyn LNVpsDb>,
     vm_id: u64,
-    dry_run: bool,
 ) -> Result<usize> {
     // Get the subscription_line_item_id (must exist after Phase 1)
     let vm: VmForMigration = db_impl
@@ -316,7 +269,7 @@ async fn migrate_vm_payments(
         };
 
         // Parse upgrade_params string → serde_json::Value for metadata
-        let metadata = vp
+        let metadata: Option<serde_json::Value> = vp
             .upgrade_params
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
@@ -329,41 +282,24 @@ async fn migrate_vm_payments(
         };
 
         let payment_type_u16 = payment_type as u16;
-        let metadata_str: Option<String> =
-            metadata.as_ref().map(|v: &serde_json::Value| v.to_string());
+        let metadata_str: Option<String> = metadata.as_ref().map(|v| v.to_string());
 
-        if dry_run {
-            info!(
-                "[DRY RUN] VM {} payment {} → subscription_payment (paid={}, amount={} {})",
-                vm_id,
-                hex::encode(&vp.id),
-                vp.is_paid,
-                vp.amount,
-                vp.currency
-            );
-        } else {
-            db_impl
-                .insert_subscription_payment_raw(
-                    vp,
-                    subscription_id,
-                    vm.user_id,
-                    payment_type_u16,
-                    time_value,
-                    metadata_str.as_deref(),
+        db_impl
+            .insert_subscription_payment_raw(
+                vp,
+                subscription_id,
+                vm.user_id,
+                payment_type_u16,
+                time_value,
+                metadata_str.as_deref(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to insert subscription_payment for vm_payment {}",
+                    hex::encode(&vp.id)
                 )
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to insert subscription_payment for vm_payment {}",
-                        hex::encode(&vp.id)
-                    )
-                })?;
-            info!(
-                "Phase 2: VM {} payment {} → subscription_payment",
-                vm_id,
-                hex::encode(&vp.id)
-            );
-        }
+            })?;
         copied += 1;
     }
 

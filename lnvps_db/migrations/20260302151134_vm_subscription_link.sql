@@ -24,6 +24,16 @@ ALTER TABLE vm
         FOREIGN KEY (subscription_line_item_id) REFERENCES subscription_line_item (id);
 CREATE INDEX idx_vm_subscription_line_item ON vm (subscription_line_item_id);
 
+-- Relax the legacy vm.expires / vm.auto_renewal_enabled columns so that new VM inserts
+-- (which no longer set these columns) succeed, while the existing data is preserved for
+-- the migrate_vm_subscriptions backfill. These columns are dropped only at finalization,
+-- AFTER the data migration has run and been verified in production (see
+-- docs/agents/migrations.md). Dropping them before the backfill runs would discard every
+-- VM's billing expiry and auto-renewal preference.
+ALTER TABLE vm
+    MODIFY COLUMN expires TIMESTAMP NULL DEFAULT NULL,
+    MODIFY COLUMN auto_renewal_enabled BIT(1) NOT NULL DEFAULT 0;
+
 -- Add VmRenewal(3) and VmUpgrade(4) to the subscription_type enum stored in
 -- subscription_line_item.subscription_type. No DDL change needed — the column
 -- is SMALLINT UNSIGNED, so the new values are valid immediately.

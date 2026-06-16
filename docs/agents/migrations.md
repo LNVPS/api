@@ -42,22 +42,35 @@ from the legacy `vm_payment` table to the unified `subscription_payment` table.
   `subscription_payment`. All new columns have safe defaults so existing rows are unaffected.
   `vm.subscription_line_item_id` is added **nullable** so the data migration can backfill existing
   rows; the DB-level `NOT NULL` constraint is deferred to finalization (see below). The Rust `Vm`
-  model already types the field as non-nullable (`u64`), and all provisioning paths set it.
-- `20260304000000_drop_vm_expires.sql` — Removes `vm.expires` and `vm.auto_renewal_enabled`.
-  Expiry is now read exclusively from `subscription.expires`, and auto-renewal is managed via
-  `subscription.auto_renewal_enabled`.
+  model already types the field as non-nullable (`u64`), and all provisioning paths set it. This
+  migration also **relaxes** the legacy `vm.expires` (now nullable) and `vm.auto_renewal_enabled`
+  (now `DEFAULT 0`) columns so new VM inserts — which no longer write those columns — succeed
+  while the legacy data is preserved for the backfill.
 
-**Data migration** (must be run manually):
+**Ordering invariant (critical):** the legacy `vm.expires`, `vm.auto_renewal_enabled`, and
+`vm.created` columns must NOT be dropped until *after* the startup backfill has run and been
+verified in production. The backfill reads `vm.expires` and `vm.auto_renewal_enabled` to populate
+`subscription.expires` / `subscription.auto_renewal_enabled`. Dropping these columns first (as an
+earlier revision of this branch did via `20260304000000_drop_vm_expires.sql` /
+`20260310000000_drop_vm_created.sql`) makes the backfill fail for every VM and discards all billing
+expiry. Those drops have been moved into the finalization step below.
 
-```bash
-cargo run --bin migrate_vm_subscriptions -- --database-url <URL>
-# Dry-run first:
-cargo run --bin migrate_vm_subscriptions -- --database-url <URL> --dry-run
-```
+**Data migration** (runs automatically at startup):
 
-The binary iterates all VMs that do not yet have a `subscription_line_item_id` set, creates a
-`subscription` + `subscription_line_item` (type `VmRenewal`) for each, and links the VM. It is
-idempotent — VMs that already have a subscription are skipped.
+The backfill runs unconditionally during app startup, immediately after schema migrations and
+*before* `run_data_migrations` (see `lnvps_api/src/data_migration/vm_subscription_backfill.rs`,
+called from `bin/api.rs`). This ordering is mandatory: `run_data_migrations` and every VM read
+decode the non-nullable `vm.subscription_line_item_id`, which is `NULL` for pre-migration rows
+until the backfill links them — so the app would be broken for all existing VMs in any window where
+it served traffic before the backfill completed. Running it inside startup eliminates that window.
+
+The backfill iterates all VMs that do not yet have a `subscription_line_item_id` set, creates a
+`subscription` + `subscription_line_item` (type `Vps`) for each, and links the VM. It copies the
+VM's `expires` into `subscription.expires` and `auto_renewal_enabled` into
+`subscription.auto_renewal_enabled` so billing/renewal enforcement continues seamlessly. Phase 2
+copies every `vm_payment` into `subscription_payment`. It is idempotent — VMs already linked and
+payments already copied are skipped — so it is safe to run on every boot. If any VM or payment
+fails, startup aborts so the issue is surfaced before the app serves traffic.
 
 **Finalization** (after production verification — do not run until confirmed):
 
@@ -67,6 +80,11 @@ subscription path:
 ```sql
 -- Enforce the link at the DB level (Rust already treats it as non-nullable)
 ALTER TABLE vm MODIFY subscription_line_item_id INTEGER UNSIGNED NOT NULL;
+
+-- Drop the legacy expiry/auto-renewal/created columns now that subscription.expires
+-- and subscription.auto_renewal_enabled are authoritative and backfilled.
+ALTER TABLE vm DROP COLUMN expires, DROP COLUMN auto_renewal_enabled;
+ALTER TABLE vm DROP COLUMN created;
 
 -- Drop the legacy payment table
 DROP TABLE vm_payment;

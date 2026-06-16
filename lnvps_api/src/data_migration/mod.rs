@@ -21,6 +21,7 @@ mod encryption_migration;
 mod ip6_init;
 mod payment_method_config;
 mod ssh_key_migration;
+pub mod vm_subscription_backfill;
 
 /// Basic data migration to run at startup
 pub trait DataMigration: Send + Sync {

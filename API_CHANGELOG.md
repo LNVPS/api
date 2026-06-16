@@ -66,7 +66,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `GET /api/v1/subscriptions/{id}` and admin equivalents — `line_items[].price` now reflects the post-upgrade renewal cost immediately after an upgrade completes
 
 - **2026-03-03** - Migration tool no longer marks subscriptions active for deleted VMs
-  - `migrate_vm_subscriptions` — Subscriptions created for deleted VMs are now inserted with `is_active = false`
+  - VM subscription backfill — Subscriptions created for deleted VMs are now inserted with `is_active = false`
 
 ### Changed
 
@@ -93,8 +93,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Now completes a `subscription_payment`
   - `GET /api/admin/v1/reports/time-series` — Revenue data now sourced from `subscription_payment`
   - `GET /api/admin/v1/reports/referral-usage/time-series` — Referral data now sourced from `subscription_payment`
-  - **Requires data migration**: Run `migrate_vm_subscriptions` binary to backfill existing VMs with subscriptions before upgrading
-  - **Schema migrations**: `20260302151134_vm_subscription_link.sql` and `20260302154256_vm_subscription_not_null.sql`
+  - **Automatic data migration**: existing VMs and `vm_payment` rows are backfilled into the subscription system automatically at app startup (no manual step). The backfill runs after schema migrations and before any VM reads, and is idempotent.
+  - **Schema migrations**: `20260302151134_vm_subscription_link.sql` (the DB-level `NOT NULL` on `vm.subscription_line_item_id` and the drop of legacy `vm.expires`/`created`/`auto_renewal_enabled` are deferred to finalization, run manually after production verification)
 
 - **2026-03-03** - Every VM is now linked to a `subscription` and `subscription_line_item`
   - `vm` table has a new `subscription_line_item_id` column (NOT NULL) linking it to the subscriptions system
