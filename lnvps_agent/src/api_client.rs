@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::{Client, Method};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::nip98::Nip98Signer;
 use crate::settings::Settings;
@@ -26,11 +27,63 @@ impl ApiClient {
         })
     }
 
-    /// Generate a fresh NIP-98 auth header value for the given URL path and method.
+    /// Generate a fresh NIP-98 auth header value for the given admin API path and method.
     fn auth_header(&self, path: &str, method: &str) -> Result<String> {
         let full_url = format!("{}{}", self.admin_api_url, path);
         let token = self.signer.sign_auth_token(&full_url, method)?;
         Ok(format!("Nostr {}", token))
+    }
+
+    /// Issue an authenticated admin API request and deserialize the JSON body.
+    ///
+    /// `sign_path` is the path used to compute the NIP-98 signature (no query
+    /// string), while `request_path` is the actual path requested (may carry a
+    /// query string). `label` is used for error context.
+    async fn admin_request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        sign_path: &str,
+        request_path: &str,
+        body: Option<serde_json::Value>,
+        label: &str,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.admin_api_url, request_path);
+        let auth = self.auth_header(sign_path, method.as_str())?;
+        let mut req = self
+            .client
+            .request(method, &url)
+            .header("Authorization", auth);
+        if let Some(body) = body {
+            req = req.header("Content-Type", "application/json").json(&body);
+        }
+        req.send()
+            .await
+            .with_context(|| format!("{label} request failed"))?
+            .json()
+            .await
+            .with_context(|| format!("{label} parse failed"))
+    }
+
+    /// Authenticated admin GET returning a list (empty when absent).
+    async fn admin_get_list(
+        &self,
+        sign_path: &str,
+        request_path: &str,
+        label: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
+            .admin_request(Method::GET, sign_path, request_path, None, label)
+            .await?;
+        Ok(rsp.data.unwrap_or_default())
+    }
+
+    /// Authenticated admin GET returning a single object (errors when absent).
+    async fn admin_get_one(&self, path: &str, label: &str) -> Result<serde_json::Value> {
+        let rsp: AdminResponseWrapper<serde_json::Value> = self
+            .admin_request(Method::GET, path, path, None, label)
+            .await?;
+        rsp.data
+            .with_context(|| format!("No data in {label} response"))
     }
 
     // ── Admin API calls ──────────────────────────────────────────────
@@ -42,108 +95,46 @@ impl ApiClient {
         include_deleted: Option<bool>,
     ) -> Result<Vec<serde_json::Value>> {
         let path = "/api/admin/v1/vms";
-        let mut url = format!("{}{}", self.admin_api_url, path);
         let mut params = Vec::new();
         if let Some(uid) = user_id {
-            params.push(("user_id", uid.to_string()));
+            params.push(format!("user_id={uid}"));
         }
         if let Some(d) = include_deleted {
-            params.push(("include_deleted", d.to_string()));
+            params.push(format!("include_deleted={d}"));
         }
-        if !params.is_empty() {
-            let qs: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            url.push('?');
-            url.push_str(&qs.join("&"));
-        }
-
-        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(path, "GET")?)
-            .send()
+        let request_path = if params.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{}", params.join("&"))
+        };
+        self.admin_get_list(path, &request_path, "admin_list_vms")
             .await
-            .context("admin_list_vms request failed")?
-            .json()
-            .await
-            .context("admin_list_vms parse failed")?;
-
-        Ok(rsp.data.unwrap_or_default())
     }
 
     /// Get a specific VM by id
     pub async fn admin_get_vm(&self, vm_id: u64) -> Result<serde_json::Value> {
         let path = format!("/api/admin/v1/vms/{}", vm_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<serde_json::Value> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(&path, "GET")?)
-            .send()
-            .await
-            .context("admin_get_vm request failed")?
-            .json()
-            .await
-            .context("admin_get_vm parse failed")?;
-
-        rsp.data.context("No VM data in response")
+        self.admin_get_one(&path, "admin_get_vm").await
     }
 
     /// List a VM's payment history
     pub async fn admin_list_vm_payments(&self, vm_id: u64) -> Result<Vec<serde_json::Value>> {
         let path = format!("/api/admin/v1/vms/{}/payments", vm_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(&path, "GET")?)
-            .send()
+        self.admin_get_list(&path, &path, "admin_list_vm_payments")
             .await
-            .context("admin_list_vm_payments request failed")?
-            .json()
-            .await
-            .context("admin_list_vm_payments parse failed")?;
-
-        Ok(rsp.data.unwrap_or_default())
     }
 
     /// Get a user's info by id
     pub async fn admin_get_user(&self, user_id: u64) -> Result<serde_json::Value> {
         let path = format!("/api/admin/v1/users/{}", user_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<serde_json::Value> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(&path, "GET")?)
-            .send()
-            .await
-            .context("admin_get_user request failed")?
-            .json()
-            .await
-            .context("admin_get_user parse failed")?;
-
-        rsp.data.context("No user data in response")
+        self.admin_get_one(&path, "admin_get_user").await
     }
 
     /// List a VM's history
     pub async fn admin_list_vm_history(&self, vm_id: u64) -> Result<Vec<serde_json::Value>> {
         let path = format!("/api/admin/v1/vms/{}/history", vm_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(&path, "GET")?)
-            .send()
+        self.admin_get_list(&path, &path, "admin_list_vm_history")
             .await
-            .context("admin_list_vm_history request failed")?
-            .json()
-            .await
-            .context("admin_list_vm_history parse failed")?;
-
-        Ok(rsp.data.unwrap_or_default())
     }
 
     /// List all users, paginating through all results (100 per page).
@@ -153,19 +144,16 @@ impl ApiClient {
         let limit: u64 = 100;
 
         loop {
-            let path = format!("/api/admin/v1/users?limit={}&offset={}", limit, offset);
-            let url = format!("{}{}", self.admin_api_url, path);
-
+            let request_path = format!("/api/admin/v1/users?limit={}&offset={}", limit, offset);
             let rsp: AdminPaginatedResponse<Vec<serde_json::Value>> = self
-                .client
-                .get(&url)
-                .header("Authorization", self.auth_header("/api/admin/v1/users", "GET")?)
-                .send()
-                .await
-                .context("admin_list_users request failed")?
-                .json()
-                .await
-                .context("admin_list_users parse failed")?;
+                .admin_request(
+                    Method::GET,
+                    "/api/admin/v1/users",
+                    &request_path,
+                    None,
+                    "admin_list_users",
+                )
+                .await?;
 
             let page = rsp.data.unwrap_or_default();
             let total = rsp.total.unwrap_or(0);
@@ -186,19 +174,16 @@ impl ApiClient {
         &self,
         pubkey: &str,
     ) -> Result<Option<serde_json::Value>> {
-        let path = format!("/api/admin/v1/users?search={}", pubkey);
-        let url = format!("{}{}", self.admin_api_url, path);
-
+        let request_path = format!("/api/admin/v1/users?search={}", pubkey);
         let rsp: AdminPaginatedResponse<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header("/api/admin/v1/users", "GET")?)
-            .send()
-            .await
-            .context("admin_find_user_by_pubkey request failed")?
-            .json()
-            .await
-            .context("admin_find_user_by_pubkey parse failed")?;
+            .admin_request(
+                Method::GET,
+                "/api/admin/v1/users",
+                &request_path,
+                None,
+                "admin_find_user_by_pubkey",
+            )
+            .await?;
 
         let users = rsp.data.unwrap_or_default();
         // search returns prefix matches, so filter for exact pubkey
@@ -211,23 +196,17 @@ impl ApiClient {
     }
 
     /// Lookup a user by email address via the indexed email_hash column.
-    pub async fn admin_find_user_by_email(
-        &self,
-        email: &str,
-    ) -> Result<Option<serde_json::Value>> {
-        let path = format!("/api/admin/v1/users/by-email?email={}", email);
-        let url = format!("{}{}", self.admin_api_url, path);
-
+    pub async fn admin_find_user_by_email(&self, email: &str) -> Result<Option<serde_json::Value>> {
+        let request_path = format!("/api/admin/v1/users/by-email?email={}", email);
         let rsp: serde_json::Value = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header("/api/admin/v1/users/by-email", "GET")?)
-            .send()
-            .await
-            .context("admin_find_user_by_email request failed")?
-            .json()
-            .await
-            .context("admin_find_user_by_email parse failed")?;
+            .admin_request(
+                Method::GET,
+                "/api/admin/v1/users/by-email",
+                &request_path,
+                None,
+                "admin_find_user_by_email",
+            )
+            .await?;
 
         if rsp.get("error").is_some() || rsp.get("data").and_then(|v| v.as_object()).is_none() {
             return Ok(None);
@@ -239,161 +218,97 @@ impl ApiClient {
     /// Refund a VM payment
     pub async fn admin_refund_vm(&self, vm_id: u64) -> Result<serde_json::Value> {
         let path = format!("/api/admin/v1/vms/{}/refund", vm_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
         let rsp: AdminResponseWrapper<serde_json::Value> = self
-            .client
-            .post(&url)
-            .header("Authorization", self.auth_header(&path, "POST")?)
-            .header("Content-Type", "application/json")
-            .body("{}")
-            .send()
-            .await
-            .context("admin_refund_vm request failed")?
-            .json()
-            .await
-            .context("admin_refund_vm parse failed")?;
-
+            .admin_request(
+                Method::POST,
+                &path,
+                &path,
+                Some(serde_json::json!({})),
+                "admin_refund_vm",
+            )
+            .await?;
         rsp.data.context("No refund data in response")
     }
 
     /// Extend a VM
     pub async fn admin_extend_vm(&self, vm_id: u64, days: u64) -> Result<serde_json::Value> {
         let path = format!("/api/admin/v1/vms/{}/extend", vm_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let body = serde_json::json!({"days": days});
-
         let rsp: AdminResponseWrapper<serde_json::Value> = self
-            .client
-            .put(&url)
-            .header("Authorization", self.auth_header(&path, "PUT")?)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("admin_extend_vm request failed")?
-            .json()
-            .await
-            .context("admin_extend_vm parse failed")?;
-
+            .admin_request(
+                Method::PUT,
+                &path,
+                &path,
+                Some(serde_json::json!({ "days": days })),
+                "admin_extend_vm",
+            )
+            .await?;
         rsp.data.context("No extend data in response")
     }
 
     /// Delete a VM
     pub async fn admin_delete_vm(&self, vm_id: u64) -> Result<serde_json::Value> {
         let path = format!("/api/admin/v1/vms/{}", vm_id);
-        let url = format!("{}{}", self.admin_api_url, path);
-
         let rsp: AdminResponseWrapper<serde_json::Value> = self
-            .client
-            .delete(&url)
-            .header("Authorization", self.auth_header(&path, "DELETE")?)
-            .send()
-            .await
-            .context("admin_delete_vm request failed")?
-            .json()
-            .await
-            .context("admin_delete_vm parse failed")?;
-
+            .admin_request(Method::DELETE, &path, &path, None, "admin_delete_vm")
+            .await?;
         rsp.data.context("No delete data in response")
     }
 
     /// Get the regions
     pub async fn admin_list_regions(&self) -> Result<Vec<serde_json::Value>> {
         let path = "/api/admin/v1/regions";
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(path, "GET")?)
-            .send()
-            .await
-            .context("admin_list_regions request failed")?
-            .json()
-            .await
-            .context("admin_list_regions parse failed")?;
-
-        Ok(rsp.data.unwrap_or_default())
+        self.admin_get_list(path, path, "admin_list_regions").await
     }
 
     /// List all VM templates (name, specs, pricing, region)
     pub async fn admin_list_templates(&self) -> Result<Vec<serde_json::Value>> {
         let path = "/api/admin/v1/vm_templates";
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(path, "GET")?)
-            .send()
+        self.admin_get_list(path, path, "admin_list_templates")
             .await
-            .context("admin_list_templates request failed")?
-            .json()
-            .await
-            .context("admin_list_templates parse failed")?;
-
-        Ok(rsp.data.unwrap_or_default())
     }
 
     /// List all OS images available for provisioning
     pub async fn admin_list_os_images(&self) -> Result<Vec<serde_json::Value>> {
         let path = "/api/admin/v1/vm_os_images";
-        let url = format!("{}{}", self.admin_api_url, path);
-
-        let rsp: AdminResponseWrapper<Vec<serde_json::Value>> = self
-            .client
-            .get(&url)
-            .header("Authorization", self.auth_header(path, "GET")?)
-            .send()
+        self.admin_get_list(path, path, "admin_list_os_images")
             .await
-            .context("admin_list_os_images request failed")?
-            .json()
-            .await
-            .context("admin_list_os_images parse failed")?;
-
-        Ok(rsp.data.unwrap_or_default())
     }
 
     // ── User API calls (for user-scoped lookups) ───────────────────
 
-    /// List user's VMs (user API, not admin)
-    /// Note: requires the user's Nip98 auth token, which comes from the support channel
-    pub async fn user_list_vms(&self, auth_token: &str) -> Result<Vec<serde_json::Value>> {
-        let path = "/api/v1/vm";
+    /// Issue a user API GET authenticated with a caller-supplied NIP-98 token.
+    async fn user_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        auth_token: &str,
+        label: &str,
+    ) -> Result<T> {
         let url = format!("{}{}", self.user_api_url, path);
-
-        let rsp: ApiResponseWrapper<Vec<serde_json::Value>> = self
-            .client
+        self.client
             .get(&url)
             .header("Authorization", format!("Nostr {}", auth_token))
             .send()
             .await
-            .context("user_list_vms request failed")?
+            .with_context(|| format!("{label} request failed"))?
             .json()
             .await
-            .context("user_list_vms parse failed")?;
+            .with_context(|| format!("{label} parse failed"))
+    }
 
+    /// List user's VMs (user API, not admin)
+    /// Note: requires the user's Nip98 auth token, which comes from the support channel
+    pub async fn user_list_vms(&self, auth_token: &str) -> Result<Vec<serde_json::Value>> {
+        let rsp: ApiResponseWrapper<Vec<serde_json::Value>> = self
+            .user_get("/api/v1/vm", auth_token, "user_list_vms")
+            .await?;
         Ok(rsp.data.unwrap_or_default())
     }
 
     /// Get user's account info
     pub async fn user_get_account(&self, auth_token: &str) -> Result<serde_json::Value> {
-        let path = "/api/v1/account";
-        let url = format!("{}{}", self.user_api_url, path);
-
         let rsp: ApiResponseWrapper<serde_json::Value> = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Nostr {}", auth_token))
-            .send()
-            .await
-            .context("user_get_account request failed")?
-            .json()
-            .await
-            .context("user_get_account parse failed")?;
-
+            .user_get("/api/v1/account", auth_token, "user_get_account")
+            .await?;
         rsp.data.context("No account data")
     }
 }

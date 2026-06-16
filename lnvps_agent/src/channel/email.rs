@@ -103,10 +103,7 @@ impl EmailSupportChannel {
             .build();
 
         log::info!("Sending email to {} (subject: {})...", to, subject);
-        mailer
-            .send(email)
-            .await
-            .context("SMTP send failed")?;
+        mailer.send(email).await.context("SMTP send failed")?;
 
         log::info!("SMTP send successful");
 
@@ -150,15 +147,9 @@ impl SupportChannel for EmailSupportChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("Support request");
 
-        let in_reply_to = ctx
-            .get("message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let in_reply_to = ctx.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
 
-        let references = ctx
-            .get("references")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let references = ctx.get("references").and_then(|v| v.as_str()).unwrap_or("");
 
         let re_subject = if original_subject.starts_with("Re: ") {
             original_subject.to_string()
@@ -166,8 +157,14 @@ impl SupportChannel for EmailSupportChannel {
             format!("Re: {}", original_subject)
         };
 
-        self.send_smtp_reply(from_email, &re_subject, &reply.response, in_reply_to, references)
-            .await
+        self.send_smtp_reply(
+            from_email,
+            &re_subject,
+            &reply.response,
+            in_reply_to,
+            references,
+        )
+        .await
     }
 }
 
@@ -207,7 +204,7 @@ async fn idle_session(
     tx: &mpsc::Sender<IncomingSupportRequest>,
     seen: &mut HashSet<String>,
 ) -> Result<()> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let t = Duration::from_secs(30);
     let (host, _port) = parse_host_port(&config.imap_server, 993)?;
@@ -228,10 +225,13 @@ async fn idle_session(
         .context("TLS handshake failed")?;
 
     let client = async_imap::Client::new(tls_stream);
-    let mut session = timeout(t, client.login(&config.imap_username, &config.imap_password))
-        .await
-        .context("IMAP login timed out")?
-        .map_err(|(e, _)| anyhow::anyhow!("IMAP login failed: {}", e))?;
+    let mut session = timeout(
+        t,
+        client.login(&config.imap_username, &config.imap_password),
+    )
+    .await
+    .context("IMAP login timed out")?
+    .map_err(|(e, _)| anyhow::anyhow!("IMAP login failed: {}", e))?;
     log::info!("IMAP logged in as {}", config.imap_username);
 
     let mailbox = config.imap_mailbox.as_deref().unwrap_or("INBOX");
@@ -255,8 +255,7 @@ async fn idle_session(
 
         // Wait for new data (IDLE auto-reconnects every 29 min per RFC 2177)
         let (wait_fut, _stop) = handle.wait();
-        let idle_result = timeout(Duration::from_secs(29 * 60), wait_fut)
-            .await;
+        let idle_result = timeout(Duration::from_secs(29 * 60), wait_fut).await;
 
         // Exit IDLE and get the session back
         session = timeout(t, handle.done())
@@ -288,7 +287,7 @@ async fn fetch_and_process(
     tx: &mpsc::Sender<IncomingSupportRequest>,
     seen: &mut HashSet<String>,
 ) -> Result<()> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let t = Duration::from_secs(15);
 
@@ -306,14 +305,14 @@ async fn fetch_and_process(
 
     log::info!("Found {} unseen messages", unseen.len());
     let fetch_range = unseen.join(",");
-    let messages: Vec<async_imap::types::Fetch> = timeout(t, session
-        .fetch(&fetch_range, "(FLAGS UID RFC822)"))
-        .await
-        .context("IMAP fetch timed out")?
-        .context("IMAP fetch failed")?
-        .try_collect()
-        .await
-        .context("Failed to collect fetch results")?;
+    let messages: Vec<async_imap::types::Fetch> =
+        timeout(t, session.fetch(&fetch_range, "(FLAGS UID RFC822)"))
+            .await
+            .context("IMAP fetch timed out")?
+            .context("IMAP fetch failed")?
+            .try_collect()
+            .await
+            .context("Failed to collect fetch results")?;
 
     for fetch in &messages {
         let Some(uid) = fetch.uid else { continue };
@@ -330,8 +329,7 @@ async fn fetch_and_process(
         seen.insert(uid_str.clone());
 
         // Extract threading headers
-        let from_email = extract_header(&raw, "from")
-            .and_then(|v| extract_email_addr(&v));
+        let from_email = extract_header(&raw, "from").and_then(|v| extract_email_addr(&v));
         let subject = extract_header(&raw, "subject").unwrap_or_default();
         let message_id = extract_header(&raw, "message-id").unwrap_or_default();
         let in_reply_to = extract_header(&raw, "in-reply-to").unwrap_or_default();
@@ -345,9 +343,16 @@ async fn fetch_and_process(
 
         // Resolve the user via the admin API
         let pubkey = match api.admin_find_user_by_email(from_email).await {
-            Ok(Some(u)) => u.get("pubkey").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            Ok(Some(u)) => u
+                .get("pubkey")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             Ok(None) => {
-                log::info!("No LNVPS user for {} (UID {}) — general question", from_email, uid);
+                log::info!(
+                    "No LNVPS user for {} (UID {}) — general question",
+                    from_email,
+                    uid
+                );
                 None
             }
             Err(e) => {
@@ -371,7 +376,12 @@ async fn fetch_and_process(
             body_text
         };
 
-        log::info!("Email {} -> {} (UID {})", from_email, pubkey.as_deref().unwrap_or("general"), uid);
+        log::info!(
+            "Email {} -> {} (UID {})",
+            from_email,
+            pubkey.as_deref().unwrap_or("general"),
+            uid
+        );
 
         let reply_references = build_reply_references(&references, &message_id);
 
@@ -516,14 +526,21 @@ mod tests {
 
     #[test]
     fn extract_header_finds_subject() {
-        let raw = "From: user@example.com\nSubject: My VM is down\nMessage-ID: <abc@ex.com>\n\nBody";
-        assert_eq!(extract_header(raw, "subject"), Some("My VM is down".to_string()));
+        let raw =
+            "From: user@example.com\nSubject: My VM is down\nMessage-ID: <abc@ex.com>\n\nBody";
+        assert_eq!(
+            extract_header(raw, "subject"),
+            Some("My VM is down".to_string())
+        );
     }
 
     #[test]
     fn extract_header_case_insensitive() {
         let raw = "message-id: <test@ex.com>\n\nBody";
-        assert_eq!(extract_header(raw, "Message-ID"), Some("<test@ex.com>".to_string()));
+        assert_eq!(
+            extract_header(raw, "Message-ID"),
+            Some("<test@ex.com>".to_string())
+        );
     }
 
     #[test]

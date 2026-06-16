@@ -37,11 +37,14 @@ async fn main() -> Result<()> {
             "Starting kind1 Nostr support channel: relays={:?}, mentions={:?}",
             kind1_cfg.relays, kind1_cfg.mention_pubkeys
         );
-        let channel = Box::new(lnvps_agent::channel::kind1::Kind1SupportChannel::new(
-            kind1_cfg.clone(),
-            &settings.nsec,
-            api_client.clone(),
-        ).await?);
+        let channel = Box::new(
+            lnvps_agent::channel::kind1::Kind1SupportChannel::new(
+                kind1_cfg.clone(),
+                &settings.nsec,
+                api_client.clone(),
+            )
+            .await?,
+        );
         agent.run_loop(channel).await;
     } else if let Some(ref email_cfg) = settings.email {
         info!(

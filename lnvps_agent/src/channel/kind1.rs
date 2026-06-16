@@ -38,13 +38,9 @@ impl Kind1SupportChannel {
             None => vec![bot_pubkey],
         };
 
-        let opts = ClientOptions::new()
-            .automatic_authentication(false);
+        let opts = ClientOptions::new().automatic_authentication(false);
 
-        let client = Client::builder()
-            .signer(keys)
-            .opts(opts)
-            .build();
+        let client = Client::builder().signer(keys).opts(opts).build();
 
         // Connect to relays
         for relay in &config.relays {
@@ -231,8 +227,8 @@ impl SupportChannel for Kind1SupportChannel {
         let builder = EventBuilder::text_note_reply(
             &reply.response,
             &original_event,
-            None::<&Event>,     // root = same as reply_to (top-level reply)
-            None::<RelayUrl>,   // no specific relay URL
+            None::<&Event>,   // root = same as reply_to (top-level reply)
+            None::<RelayUrl>, // no specific relay URL
         );
 
         let output = self
