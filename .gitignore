@@ -2,6 +2,7 @@
 .idea/
 *.config.yaml
 **/*.log
+/log.txt
 *.key
 
 # Agent secrets and runtime data

@@ -144,8 +144,8 @@ impl SubscriptionHandler {
                 self.db.clone(),
                 self.tx.clone(),
             ))),
-            _ => {
-                unimplemented!()
+            other => {
+                bail!("No line item handler implemented for subscription type {other:?}")
             }
         }
     }
@@ -629,9 +629,9 @@ impl SubscriptionHandler {
                             paid_at: None,
                         }
                     }
-                    PaymentMethod::Paypal => todo!(),
+                    PaymentMethod::Paypal => bail!("PayPal not implemented"),
                     PaymentMethod::Stripe => {
-                        todo!("Stripe payment integration not yet implemented")
+                        bail!("Stripe payment creation not yet implemented")
                     }
                 };
 

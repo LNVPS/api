@@ -16,11 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **2026-03-10** - WebSocket console endpoint for VM serial terminal access (User API)
   - `ANY /api/v1/vm/{id}/console` (WebSocket upgrade) — Bidirectional relay between the client and the VM's serial console via the host provisioner. Authentication is passed via query parameter `?auth=<base64_nip98_event>`.
 
-- **2026-03-10** - Stripe payment handler fully implemented
-  - `POST /api/v1/vm` / `POST /api/v1/vm/custom-template` — Stripe is now a fully functional payment method (`method=stripe`)
-  - `GET /api/v1/vm/{id}/renew?method=stripe` — VM renewals can now be paid via Stripe
-  - `GET /api/v1/subscriptions/{id}/renew?method=stripe` — Subscription renewals support Stripe
-  - `POST /api/v1/vm/{id}/upgrade?method=stripe` — VM upgrades support Stripe
+- **2026-03-10** - Stripe payment **completion** handling implemented
+  - `POST /api/v1/webhook/stripe` — Incoming Stripe `payment_intent.succeeded` webhooks are now verified and processed, marking the matching subscription payment paid and running the standard completion pipeline.
+  - Note: Stripe payment **creation** (checkout/intent creation for `method=stripe` on VM purchase, renewal, upgrade, and subscription renewal) is **not yet implemented** — those endpoints return an error for `method=stripe`. Only completion of externally-created Stripe payments is wired up.
 
 - **2026-03-10** - `LNURL` added as a payment method variant
   - `GET /api/v1/payment/methods` — Response may now include `{ "name": "lnurl", ... }` when Lightning is enabled

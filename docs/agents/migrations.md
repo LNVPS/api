@@ -40,10 +40,14 @@ from the legacy `vm_payment` table to the unified `subscription_payment` table.
 - `20260302151134_vm_subscription_link.sql` — Adds `subscription_line_item_id` to `vm`; adds
   `interval_amount`/`interval_type` back to `subscription`; adds `time_value`/`metadata` to
   `subscription_payment`. All new columns have safe defaults so existing rows are unaffected.
-- `20260302154256_vm_subscription_not_null.sql` — Makes `vm.subscription_line_item_id` NOT NULL
-  after the data migration has been run.
+  `vm.subscription_line_item_id` is added **nullable** so the data migration can backfill existing
+  rows; the DB-level `NOT NULL` constraint is deferred to finalization (see below). The Rust `Vm`
+  model already types the field as non-nullable (`u64`), and all provisioning paths set it.
+- `20260304000000_drop_vm_expires.sql` — Removes `vm.expires` and `vm.auto_renewal_enabled`.
+  Expiry is now read exclusively from `subscription.expires`, and auto-renewal is managed via
+  `subscription.auto_renewal_enabled`.
 
-**Data migration** (must be run manually before the NOT NULL migration):
+**Data migration** (must be run manually):
 
 ```bash
 cargo run --bin migrate_vm_subscriptions -- --database-url <URL>
@@ -58,8 +62,12 @@ idempotent — VMs that already have a subscription are skipped.
 **Finalization** (after production verification — do not run until confirmed):
 
 Once the data migration has been verified in production and all new VMs are going through the
-subscription path, `vm_payment` can be dropped:
+subscription path:
 
 ```sql
+-- Enforce the link at the DB level (Rust already treats it as non-nullable)
+ALTER TABLE vm MODIFY subscription_line_item_id INTEGER UNSIGNED NOT NULL;
+
+-- Drop the legacy payment table
 DROP TABLE vm_payment;
 ```

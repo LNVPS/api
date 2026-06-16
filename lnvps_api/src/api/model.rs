@@ -290,7 +290,7 @@ impl ApiVmPayment {
                     .map_err(|e| anyhow::anyhow!("Failed to parse Revolut payment data: {}", e))?;
                 ApiPaymentData::Revolut { token: data.token }
             }
-            PaymentMethod::Paypal => todo!(),
+            PaymentMethod::Paypal => anyhow::bail!("PayPal payments are not supported"),
             PaymentMethod::Stripe => {
                 #[derive(Deserialize)]
                 struct StripeData {
