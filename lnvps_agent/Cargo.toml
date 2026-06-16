@@ -1,0 +1,36 @@
+[package]
+name = "lnvps_agent"
+version.workspace = true
+edition.workspace = true
+description = "AI support agent for LNVPS — processes support requests using an async-openai agent with API-calling tools"
+
+[[bin]]
+name = "lnvps_agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["signal", "time"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+config = { workspace = true }
+async-trait.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+futures = { workspace = true }
+
+async-openai = "0.28"
+chrono = { version = "0.4", features = ["serde"] }
+nostr = { version = "0.44", default-features = false, features = ["std"] }
+nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", default-features = false }
+base64 = "0.22"
+
+# Email support channel (IMAP poll + SMTP reply)
+lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "smtp-transport", "builder"] }
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
