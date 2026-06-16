@@ -3,3 +3,7 @@
 *.config.yaml
 **/*.log
 *.key
+
+# Agent secrets and runtime data
+lnvps_agent/settings.yaml
+lnvps_agent/conversation_history/
