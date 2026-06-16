@@ -64,6 +64,9 @@ jobs:
           - name: lnvps-nostr
             file: lnvps_nostr/Dockerfile
             image: registry.v0l.io/lnvps-nostr:latest
+          - name: lnvps-agent
+            file: lnvps_agent/Dockerfile
+            image: registry.v0l.io/lnvps-agent:latest
 
     steps:
       - name: Checkout code
