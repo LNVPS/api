@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
             lnvps_agent::channel::kind1::Kind1SupportChannel::new(
                 kind1_cfg.clone(),
                 &settings.nsec,
-                api_client.clone(),
             )
             .await?,
         );
@@ -53,7 +52,6 @@ async fn main() -> Result<()> {
         );
         let channel = Box::new(lnvps_agent::channel::email::EmailSupportChannel::new(
             email_cfg.clone(),
-            api_client.clone(),
         ));
         agent.run_loop(channel).await;
     } else {

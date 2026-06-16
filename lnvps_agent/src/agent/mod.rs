@@ -14,8 +14,9 @@ use async_openai::types::{
 };
 
 use crate::api_client::ApiClient;
-use crate::channel::{IncomingSupportRequest, Requester};
+use crate::channel::IncomingSupportRequest;
 use crate::conversation::{ChatMessage, ConversationStore, SenderConversation, StoredToolCall};
+use crate::identity::Requester;
 use crate::settings::Settings;
 
 pub use executor::{LnvpsToolExecutor, PublicToolExecutor, ToolExecutor};
@@ -341,14 +342,14 @@ impl SupportAgent {
         req: &IncomingSupportRequest,
         channel_prompt: &str,
     ) -> Result<String> {
-        let key = &req.conversation_key;
-        let (response, new_messages) = match &req.requester {
-            Requester::Anonymous => {
-                self.process_general(key, &req.message, channel_prompt)
+        let key = req.sender.conversation_key();
+        let (response, new_messages) = match self.api.resolve(&req.sender).await? {
+            Requester::Customer { user_id, account } => {
+                self.process_known_user(key, user_id, &account, &req.message, channel_prompt)
                     .await?
             }
-            Requester::Customer { user_id, account } => {
-                self.process_known_user(key, *user_id, account, &req.message, channel_prompt)
+            Requester::Anonymous => {
+                self.process_general(key, &req.message, channel_prompt)
                     .await?
             }
         };
@@ -423,14 +424,9 @@ impl SupportAgent {
         let channel_prompt = channel.channel_prompt().to_string();
 
         while let Some(req) = channel.next_request().await {
-            let who = match &req.requester {
-                Requester::Customer { user_id, .. } => format!("customer #{user_id}"),
-                Requester::Anonymous => "(general)".to_string(),
-            };
             log::info!(
-                "Processing request from {} (key={}): {}",
-                who,
-                req.conversation_key,
+                "Processing request from {}: {}",
+                req.sender.conversation_key(),
                 &req.message[..req.message.len().min(100)]
             );
 

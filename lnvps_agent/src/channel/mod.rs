@@ -4,33 +4,14 @@ pub mod kind1;
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Who sent a support request, as resolved by the channel against the LNVPS API.
-///
-/// The channel does this lookup once (to route the reply and gate access), so
-/// the agent never has to resolve the user again.
-#[derive(Clone, Debug)]
-pub enum Requester {
-    /// A known LNVPS customer.
-    Customer {
-        /// Resolved LNVPS user id — tools are scoped to this user.
-        user_id: u64,
-        /// The full account record returned by the resolution lookup
-        /// (admin `AdminUserInfo` JSON). Reused as prompt context so the
-        /// agent does not have to fetch the account a second time.
-        account: serde_json::Value,
-    },
-    /// Not a known customer — general public question.
-    Anonymous,
-}
+use crate::identity::SenderIdentity;
 
 /// An incoming support request from a customer.
 #[derive(Clone, Debug)]
 pub struct IncomingSupportRequest {
-    /// Stable per-sender key used for conversation storage.
-    /// For email this is the From address; for Nostr it's the author pubkey hex.
-    pub conversation_key: String,
-    /// The resolved sender identity.
-    pub requester: Requester,
+    /// How the channel identifies the sender. The agent resolves this to a
+    /// customer account (or treats them as general public).
+    pub sender: SenderIdentity,
     /// The customer's message.
     pub message: String,
     /// Opaque channel-specific token — the channel stashes whatever it needs

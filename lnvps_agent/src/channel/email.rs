@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -12,8 +11,8 @@ use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
-use crate::api_client::ApiClient;
-use crate::channel::{IncomingSupportRequest, Requester, SupportChannel, SupportReply};
+use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
+use crate::identity::SenderIdentity;
 use crate::settings::EmailConfig;
 
 /// Email support channel that uses IMAP IDLE for push-based email notifications.
@@ -22,8 +21,8 @@ use crate::settings::EmailConfig;
 /// to receive instant notifications when new messages arrive. Falls back to
 /// reconnecting on errors.
 ///
-/// Users are identified by their `From` email address, which is looked up
-/// against the LNVPS admin API to resolve to a pubkey.
+/// Senders are identified by their `From` email address; resolving that to a
+/// customer account is left to the agent.
 pub struct EmailSupportChannel {
     config: EmailConfig,
     /// Receive end of the channel fed by the IDLE loop.
@@ -31,16 +30,15 @@ pub struct EmailSupportChannel {
 }
 
 impl EmailSupportChannel {
-    pub fn new(config: EmailConfig, api: Arc<ApiClient>) -> Self {
+    pub fn new(config: EmailConfig) -> Self {
         let (tx, rx) = mpsc::channel::<IncomingSupportRequest>(256);
 
         let cfg = config.clone();
-        let api_clone = api.clone();
 
         // Spawn a background task that maintains a persistent IMAP connection
         // and uses IDLE to wait for new messages.
         tokio::spawn(async move {
-            run_idle_loop(cfg, api_clone, tx).await;
+            run_idle_loop(cfg, tx).await;
         });
 
         Self {
@@ -176,15 +174,11 @@ impl SupportChannel for EmailSupportChannel {
 /// then enters IDLE. When IDLE signals new mail, fetches and processes
 /// the new messages, then re-enters IDLE. On any error, reconnects
 /// after a short delay.
-async fn run_idle_loop(
-    config: EmailConfig,
-    api: Arc<ApiClient>,
-    tx: mpsc::Sender<IncomingSupportRequest>,
-) {
+async fn run_idle_loop(config: EmailConfig, tx: mpsc::Sender<IncomingSupportRequest>) {
     let mut seen = HashSet::<String>::new();
 
     loop {
-        match idle_session(&config, &api, &tx, &mut seen).await {
+        match idle_session(&config, &tx, &mut seen).await {
             Ok(()) => {
                 // idle_session returned normally — reconnect
                 log::info!("IMAP IDLE session ended, reconnecting...");
@@ -200,7 +194,6 @@ async fn run_idle_loop(
 /// Run a single IMAP session: connect, login, select, process unseen, IDLE loop.
 async fn idle_session(
     config: &EmailConfig,
-    api: &Arc<ApiClient>,
     tx: &mpsc::Sender<IncomingSupportRequest>,
     seen: &mut HashSet<String>,
 ) -> Result<()> {
@@ -242,7 +235,7 @@ async fn idle_session(
     log::info!("IMAP selected '{}', fetching unseen...", mailbox);
 
     // Process any existing unseen messages
-    fetch_and_process(&mut session, api, tx, seen).await?;
+    fetch_and_process(&mut session, tx, seen).await?;
 
     // IDLE loop: wait for new mail, then fetch
     loop {
@@ -266,7 +259,7 @@ async fn idle_session(
         match idle_result {
             Ok(Ok(_resp)) => {
                 log::debug!("IDLE returned new data, fetching...");
-                fetch_and_process(&mut session, api, tx, seen).await?;
+                fetch_and_process(&mut session, tx, seen).await?;
             }
             Ok(Err(e)) => {
                 // IDLE error — reconnect
@@ -283,7 +276,6 @@ async fn idle_session(
 /// Search for unseen messages, process them, and send to the channel.
 async fn fetch_and_process(
     session: &mut async_imap::Session<tokio_native_tls::TlsStream<TcpStream>>,
-    api: &Arc<ApiClient>,
     tx: &mpsc::Sender<IncomingSupportRequest>,
     seen: &mut HashSet<String>,
 ) -> Result<()> {
@@ -341,36 +333,6 @@ async fn fetch_and_process(
             continue;
         };
 
-        // Resolve the user via the admin API once.
-        let requester = match api.admin_find_user_by_email(from_email).await {
-            Ok(Some(user)) => match user.get("id").and_then(|v| v.as_u64()) {
-                Some(user_id) => Requester::Customer {
-                    user_id,
-                    account: user,
-                },
-                None => {
-                    log::warn!(
-                        "User for {} (UID {}) has no id field — general",
-                        from_email,
-                        uid
-                    );
-                    Requester::Anonymous
-                }
-            },
-            Ok(None) => {
-                log::info!(
-                    "No LNVPS user for {} (UID {}) — general question",
-                    from_email,
-                    uid
-                );
-                Requester::Anonymous
-            }
-            Err(e) => {
-                log::error!("API error looking up {}: {} — general", from_email, e);
-                Requester::Anonymous
-            }
-        };
-
         // Extract body text
         let body_text = raw
             .find("\r\n\r\n")
@@ -386,17 +348,12 @@ async fn fetch_and_process(
             body_text
         };
 
-        let who = match &requester {
-            Requester::Customer { user_id, .. } => format!("customer #{user_id}"),
-            Requester::Anonymous => "general".to_string(),
-        };
-        log::info!("Email {} -> {} (UID {})", from_email, who, uid);
+        log::info!("Email from {} (UID {})", from_email, uid);
 
         let reply_references = build_reply_references(&references, &message_id);
 
         let req = IncomingSupportRequest {
-            requester,
-            conversation_key: from_email.clone(),
+            sender: SenderIdentity::Email(from_email.clone()),
             message: message.trim().to_string(),
             channel_context: Some(
                 serde_json::json!({

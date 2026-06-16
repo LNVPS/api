@@ -3,6 +3,7 @@ use reqwest::{Client, Method};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::identity::{Requester, SenderIdentity};
 use crate::nip98::Nip98Signer;
 use crate::settings::Settings;
 
@@ -84,6 +85,36 @@ impl ApiClient {
             .await?;
         rsp.data
             .with_context(|| format!("No data in {label} response"))
+    }
+
+    // ── Customer resolution ──────────────────────────────────────────
+
+    /// Resolve a sender identity to a [`Requester`].
+    ///
+    /// This is the single place sender resolution happens: it selects the
+    /// correct lookup endpoint for the identity type and classifies the result
+    /// as a known customer or general public. Channels never do this.
+    pub async fn resolve(&self, sender: &SenderIdentity) -> Result<Requester> {
+        let user = match sender {
+            SenderIdentity::Email(email) => self.admin_find_user_by_email(email).await?,
+            SenderIdentity::Pubkey(pubkey) => self.admin_find_user_by_pubkey(pubkey).await?,
+        };
+
+        let key = sender.conversation_key();
+        let Some(user) = user else {
+            log::info!("{} is not an LNVPS customer — general", key);
+            return Ok(Requester::Anonymous);
+        };
+        match user.get("id").and_then(|v| v.as_u64()) {
+            Some(user_id) => Ok(Requester::Customer {
+                user_id,
+                account: user,
+            }),
+            None => {
+                log::warn!("Resolved user for {} has no id field — general", key);
+                Ok(Requester::Anonymous)
+            }
+        }
     }
 
     // ── Admin API calls ──────────────────────────────────────────────

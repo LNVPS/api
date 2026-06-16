@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use tokio::sync::mpsc;
 
-use crate::api_client::ApiClient;
-use crate::channel::{IncomingSupportRequest, Requester, SupportChannel, SupportReply};
+use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
+use crate::identity::SenderIdentity;
 use crate::settings::Kind1Config;
 
 /// Kind 1 Nostr support channel.
@@ -22,7 +22,7 @@ pub struct Kind1SupportChannel {
 }
 
 impl Kind1SupportChannel {
-    pub async fn new(config: Kind1Config, nsec: &str, api: Arc<ApiClient>) -> Result<Self> {
+    pub async fn new(config: Kind1Config, nsec: &str) -> Result<Self> {
         let keys = Keys::parse(nsec).context("Invalid nsec key for kind1 channel")?;
         let bot_pubkey = keys.public_key();
 
@@ -71,7 +71,6 @@ impl Kind1SupportChannel {
         let (tx, rx) = mpsc::channel::<IncomingSupportRequest>(256);
         let handler_bot = bot_pubkey;
         let handler_mentions = mention_pubkeys.clone();
-        let handler_api = api.clone();
 
         tokio::spawn(async move {
             let seen = Arc::new(std::sync::Mutex::new(HashSet::<EventId>::new()));
@@ -80,7 +79,6 @@ impl Kind1SupportChannel {
                 .handle_notifications(|notification| {
                     let tx = tx.clone();
                     let handler_mentions = handler_mentions.clone();
-                    let handler_api = handler_api.clone();
                     let seen = seen.clone();
 
                     async move {
@@ -119,40 +117,6 @@ impl Kind1SupportChannel {
                                 }
 
                                 let author_hex = event.pubkey.to_string();
-                                let short = &author_hex[..16.min(author_hex.len())];
-
-                                // Resolve the author against the LNVPS API once.
-                                let requester = match handler_api
-                                    .admin_find_user_by_pubkey(&author_hex)
-                                    .await
-                                {
-                                    Ok(Some(user)) => {
-                                        match user.get("id").and_then(|v| v.as_u64()) {
-                                            Some(user_id) => Requester::Customer {
-                                                user_id,
-                                                account: user,
-                                            },
-                                            None => {
-                                                log::warn!(
-                                                    "Kind1 user {} has no id field — general",
-                                                    short
-                                                );
-                                                Requester::Anonymous
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => {
-                                        log::info!(
-                                            "Kind1 mention from {} is not an LNVPS user — general",
-                                            short
-                                        );
-                                        Requester::Anonymous
-                                    }
-                                    Err(e) => {
-                                        log::error!("API error looking up {}: {}", short, e);
-                                        Requester::Anonymous
-                                    }
-                                };
 
                                 log::info!(
                                     "Kind1 mention from {} (event {}): {}",
@@ -162,8 +126,7 @@ impl Kind1SupportChannel {
                                 );
 
                                 let req = IncomingSupportRequest {
-                                    requester,
-                                    conversation_key: author_hex,
+                                    sender: SenderIdentity::Pubkey(author_hex),
                                     message: event.content.clone(),
                                     channel_context: Some(
                                         serde_json::json!({
