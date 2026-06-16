@@ -7,7 +7,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::api_client::ApiClient;
-use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
+use crate::channel::{IncomingSupportRequest, Requester, SupportChannel, SupportReply};
 use crate::settings::Kind1Config;
 
 /// Kind 1 Nostr support channel.
@@ -119,27 +119,38 @@ impl Kind1SupportChannel {
                                 }
 
                                 let author_hex = event.pubkey.to_string();
+                                let short = &author_hex[..16.min(author_hex.len())];
 
-                                // Look up whether the author is an LNVPS customer
-                                let pubkey = match handler_api
+                                // Resolve the author against the LNVPS API once.
+                                let requester = match handler_api
                                     .admin_find_user_by_pubkey(&author_hex)
                                     .await
                                 {
-                                    Ok(Some(_)) => Some(author_hex.clone()),
+                                    Ok(Some(user)) => {
+                                        match user.get("id").and_then(|v| v.as_u64()) {
+                                            Some(user_id) => Requester::Customer {
+                                                user_id,
+                                                pubkey: Some(author_hex.clone()),
+                                            },
+                                            None => {
+                                                log::warn!(
+                                                    "Kind1 user {} has no id field — general",
+                                                    short
+                                                );
+                                                Requester::Anonymous
+                                            }
+                                        }
+                                    }
                                     Ok(None) => {
                                         log::info!(
                                             "Kind1 mention from {} is not an LNVPS user — general",
-                                            &author_hex[..16.min(author_hex.len())]
+                                            short
                                         );
-                                        None
+                                        Requester::Anonymous
                                     }
                                     Err(e) => {
-                                        log::error!(
-                                            "API error looking up {}: {}",
-                                            &author_hex[..16.min(author_hex.len())],
-                                            e
-                                        );
-                                        None
+                                        log::error!("API error looking up {}: {}", short, e);
+                                        Requester::Anonymous
                                     }
                                 };
 
@@ -151,8 +162,8 @@ impl Kind1SupportChannel {
                                 );
 
                                 let req = IncomingSupportRequest {
-                                    pubkey,
-                                    sender_id: author_hex,
+                                    requester,
+                                    conversation_key: author_hex,
                                     message: event.content.clone(),
                                     channel_context: Some(
                                         serde_json::json!({

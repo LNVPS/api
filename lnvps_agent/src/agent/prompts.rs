@@ -24,9 +24,11 @@ Be friendly, professional, and concise."#
 }
 
 /// System prompt for a known customer. `account` is rendered as pretty JSON
-/// so the model has the user's current account context.
-pub fn user_system_message(user_pubkey: &str, account: &serde_json::Value) -> String {
+/// so the model has the user's current account context. `user_pubkey` is shown
+/// for context when the account has one.
+pub fn user_system_message(user_pubkey: Option<&str>, account: &serde_json::Value) -> String {
     let account_pretty = serde_json::to_string_pretty(account).unwrap_or_default();
+    let user_pubkey = user_pubkey.unwrap_or("(none on file)");
     format!(
         r#"You are the LNVPS support agent. You help customers with their VPS hosting
 accounts, virtual machines, payments, and billing.
@@ -121,9 +123,13 @@ mod tests {
     #[test]
     fn user_system_message_includes_context() {
         let account = serde_json::json!({"id": 42, "email": "x@y.z"});
-        let msg = user_system_message("abc123", &account);
+        let msg = user_system_message(Some("abc123"), &account);
         assert!(msg.contains("abc123"));
         assert!(msg.contains("\"id\": 42"));
+
+        // No pubkey on file still renders.
+        let msg = user_system_message(None, &account);
+        assert!(msg.contains("(none on file)"));
     }
 
     #[test]

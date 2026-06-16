@@ -4,19 +4,37 @@ pub mod kind1;
 use anyhow::Result;
 use async_trait::async_trait;
 
+/// Who sent a support request, as resolved by the channel against the LNVPS API.
+///
+/// The channel does this lookup once (to route the reply and gate access), so
+/// the agent never has to resolve the user again.
+#[derive(Clone, Debug)]
+pub enum Requester {
+    /// A known LNVPS customer.
+    Customer {
+        /// Resolved LNVPS user id — tools are scoped to this user.
+        user_id: u64,
+        /// The customer's nostr pubkey hex, if their account has one.
+        /// Used only for prompt context; not all customers have a pubkey.
+        pubkey: Option<String>,
+    },
+    /// Not a known customer — general public question.
+    Anonymous,
+}
+
 /// An incoming support request from a customer.
 #[derive(Clone, Debug)]
 pub struct IncomingSupportRequest {
-    /// The customer's nostr pubkey in hex format (64 chars).
-    /// `None` for general questions from unknown senders.
-    pub pubkey: Option<String>,
-    /// Stable identifier for this sender across requests.
-    /// For email channels this is the From email address.
-    pub sender_id: String,
+    /// Stable per-sender key used for conversation storage.
+    /// For email this is the From address; for Nostr it's the author pubkey hex.
+    pub conversation_key: String,
+    /// The resolved sender identity.
+    pub requester: Requester,
     /// The customer's message.
     pub message: String,
-    /// Opaque channel-specific identifier — the channel implementation
-    /// can stash whatever it needs here to route the reply later.
+    /// Opaque channel-specific token — the channel stashes whatever it needs
+    /// here to route the reply later (e.g. email threading headers, nostr event).
+    /// The agent treats this as a pass-through and never inspects it.
     pub channel_context: Option<String>,
 }
 

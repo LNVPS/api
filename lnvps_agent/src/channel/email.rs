@@ -13,7 +13,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::api_client::ApiClient;
-use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
+use crate::channel::{IncomingSupportRequest, Requester, SupportChannel, SupportReply};
 use crate::settings::EmailConfig;
 
 /// Email support channel that uses IMAP IDLE for push-based email notifications.
@@ -341,23 +341,36 @@ async fn fetch_and_process(
             continue;
         };
 
-        // Resolve the user via the admin API
-        let pubkey = match api.admin_find_user_by_email(from_email).await {
-            Ok(Some(u)) => u
-                .get("pubkey")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+        // Resolve the user via the admin API once.
+        let requester = match api.admin_find_user_by_email(from_email).await {
+            Ok(Some(user)) => match user.get("id").and_then(|v| v.as_u64()) {
+                Some(user_id) => Requester::Customer {
+                    user_id,
+                    pubkey: user
+                        .get("pubkey")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                },
+                None => {
+                    log::warn!(
+                        "User for {} (UID {}) has no id field — general",
+                        from_email,
+                        uid
+                    );
+                    Requester::Anonymous
+                }
+            },
             Ok(None) => {
                 log::info!(
                     "No LNVPS user for {} (UID {}) — general question",
                     from_email,
                     uid
                 );
-                None
+                Requester::Anonymous
             }
             Err(e) => {
                 log::error!("API error looking up {}: {} — general", from_email, e);
-                None
+                Requester::Anonymous
             }
         };
 
@@ -376,18 +389,17 @@ async fn fetch_and_process(
             body_text
         };
 
-        log::info!(
-            "Email {} -> {} (UID {})",
-            from_email,
-            pubkey.as_deref().unwrap_or("general"),
-            uid
-        );
+        let who = match &requester {
+            Requester::Customer { user_id, .. } => format!("customer #{user_id}"),
+            Requester::Anonymous => "general".to_string(),
+        };
+        log::info!("Email {} -> {} (UID {})", from_email, who, uid);
 
         let reply_references = build_reply_references(&references, &message_id);
 
         let req = IncomingSupportRequest {
-            pubkey,
-            sender_id: from_email.clone(),
+            requester,
+            conversation_key: from_email.clone(),
             message: message.trim().to_string(),
             channel_context: Some(
                 serde_json::json!({

@@ -14,6 +14,7 @@ use async_openai::types::{
 };
 
 use crate::api_client::ApiClient;
+use crate::channel::{IncomingSupportRequest, Requester};
 use crate::conversation::{ChatMessage, ConversationStore, SenderConversation, StoredToolCall};
 use crate::settings::Settings;
 
@@ -337,23 +338,28 @@ impl SupportAgent {
 
     pub async fn process_request(
         &self,
-        sender_id: &str,
-        user_pubkey: Option<&str>,
-        user_message: &str,
+        req: &IncomingSupportRequest,
         channel_prompt: &str,
     ) -> Result<String> {
-        let (response, new_messages) = match user_pubkey {
-            None => {
-                self.process_general(sender_id, user_message, channel_prompt)
+        let key = &req.conversation_key;
+        let (response, new_messages) = match &req.requester {
+            Requester::Anonymous => {
+                self.process_general(key, &req.message, channel_prompt)
                     .await?
             }
-            Some(pubkey) => {
-                self.process_known_user(sender_id, pubkey, user_message, channel_prompt)
-                    .await?
+            Requester::Customer { user_id, pubkey } => {
+                self.process_known_user(
+                    key,
+                    *user_id,
+                    pubkey.as_deref(),
+                    &req.message,
+                    channel_prompt,
+                )
+                .await?
             }
         };
 
-        self.record_turn(sender_id, new_messages).await;
+        self.record_turn(key, new_messages).await;
         Ok(response)
     }
 
@@ -385,22 +391,16 @@ impl SupportAgent {
         .await
     }
 
-    /// Handle a request from a known customer (resolved via their pubkey).
+    /// Handle a request from a known customer. The channel already resolved the
+    /// `user_id`, so we only fetch the account context for the prompt.
     async fn process_known_user(
         &self,
         sender_id: &str,
-        pubkey: &str,
+        user_id: u64,
+        pubkey: Option<&str>,
         user_message: &str,
         channel_prompt: &str,
     ) -> Result<(String, Vec<ChatMessage>)> {
-        let user = self
-            .api
-            .admin_find_user_by_pubkey(pubkey)
-            .await?
-            .ok_or_else(|| anyhow!("No user found with pubkey: {}", pubkey))?;
-        let user_id = user["id"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("User record missing 'id' field"))?;
         let account = self.api.admin_get_user(user_id).await?;
 
         let system = prompts::with_channel_prompt(
@@ -432,24 +432,19 @@ impl SupportAgent {
         let channel_prompt = channel.channel_prompt().to_string();
 
         while let Some(req) = channel.next_request().await {
-            let pubkey_display = req.pubkey.as_deref().unwrap_or("(general)");
+            let who = match &req.requester {
+                Requester::Customer { user_id, .. } => format!("customer #{user_id}"),
+                Requester::Anonymous => "(general)".to_string(),
+            };
             log::info!(
-                "Processing request from {} (sender={}): {}",
-                pubkey_display,
-                req.sender_id,
+                "Processing request from {} (key={}): {}",
+                who,
+                req.conversation_key,
                 &req.message[..req.message.len().min(100)]
             );
 
             let reply_ctx = req.channel_context.clone();
-            let response = match self
-                .process_request(
-                    &req.sender_id,
-                    req.pubkey.as_deref(),
-                    &req.message,
-                    &channel_prompt,
-                )
-                .await
-            {
+            let response = match self.process_request(&req, &channel_prompt).await {
                 Ok(text) => text,
                 Err(e) => {
                     log::error!("Agent error: {}", e);
