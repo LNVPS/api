@@ -119,7 +119,7 @@ pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn
             } else {
                 Arc::new(dummy_host::DummyVmHost::new_persistent())
             }
-        },
+        }
         _ => bail!("Unknown host config: {}", host.kind),
     })
 }

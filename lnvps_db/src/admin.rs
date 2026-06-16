@@ -75,6 +75,13 @@ pub trait AdminDb: Send + Sync {
         search_pubkey: Option<&str>,
     ) -> DbResult<(Vec<crate::AdminUserInfo>, u64)>;
 
+    /// Find a user by their email hash (SHA-256 of lowercased+trimmed email).
+    /// Returns None if no match found.
+    async fn admin_find_user_by_email_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> DbResult<Option<crate::AdminUserInfo>>;
+
     // Region management methods
     /// List all regions with pagination
     async fn admin_list_regions(

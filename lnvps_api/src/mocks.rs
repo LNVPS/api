@@ -1,9 +1,9 @@
 #![allow(unused)]
 use crate::dns::{BasicRecord, DnsServer, RecordType};
+use crate::host::dummy_host::DummyVmHost;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
-use crate::host::dummy_host::DummyVmHost;
 use crate::router::{ArpEntry, Router};
 
 /// Type alias so tests can refer to the in-memory VM host as `MockVmHost`.

@@ -254,11 +254,13 @@ pub async fn vm_to_status(
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     // Load subscription for created + expiry + auto_renewal
-    let (sub_created, sub_expires, sub_auto_renewal) =
-        match db.get_subscription_by_line_item_id(vm.subscription_line_item_id).await {
-            Ok(sub) => (sub.created, sub.expires, sub.auto_renewal_enabled),
-            Err(_) => (Utc::now(), None, false),
-        };
+    let (sub_created, sub_expires, sub_auto_renewal) = match db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await
+    {
+        Ok(sub) => (sub.created, sub.expires, sub.auto_renewal_enabled),
+        Err(_) => (Utc::now(), None, false),
+    };
 
     Ok(ApiVmStatus {
         id: vm.id,
@@ -281,7 +283,6 @@ pub async fn vm_to_status(
         auto_renewal_enabled: sub_auto_renewal,
     })
 }
-
 
 #[derive(Serialize)]
 pub struct ApiVmIpAssignment {

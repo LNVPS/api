@@ -540,12 +540,16 @@ impl AdminVmInfo {
             .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await
         {
-            Ok(sub) => AdminSubscriptionInfo::from_subscription(db, &sub).await.ok(),
+            Ok(sub) => AdminSubscriptionInfo::from_subscription(db, &sub)
+                .await
+                .ok(),
             Err(_) => None,
         };
 
         // Load subscription for expiry + auto_renewal (use shortcut function)
-        let sub = db.get_subscription_by_line_item_id(vm.subscription_line_item_id).await?;
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
 
         Ok(Self {
             id: vm.id,
@@ -2823,7 +2827,10 @@ impl AdminIpRangeSubscriptionInfo {
         let mut info = Self::from(sub.clone());
 
         // Get subscription details for user_id (use shortcut function)
-        if let Ok(subscription) = db.get_subscription_by_line_item_id(sub.subscription_line_item_id).await {
+        if let Ok(subscription) = db
+            .get_subscription_by_line_item_id(sub.subscription_line_item_id)
+            .await
+        {
             info.user_id = Some(subscription.user_id);
         }
 

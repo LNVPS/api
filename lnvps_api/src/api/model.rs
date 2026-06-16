@@ -286,10 +286,8 @@ impl ApiVmPayment {
                 struct RevolutData {
                     pub token: String,
                 }
-                let data: RevolutData =
-                    serde_json::from_str(value.external_data.as_str()).map_err(|e| {
-                        anyhow::anyhow!("Failed to parse Revolut payment data: {}", e)
-                    })?;
+                let data: RevolutData = serde_json::from_str(value.external_data.as_str())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Revolut payment data: {}", e))?;
                 ApiPaymentData::Revolut { token: data.token }
             }
             PaymentMethod::Paypal => todo!(),
@@ -298,10 +296,8 @@ impl ApiVmPayment {
                 struct StripeData {
                     pub session_id: String,
                 }
-                let data: StripeData =
-                    serde_json::from_str(value.external_data.as_str()).map_err(|e| {
-                        anyhow::anyhow!("Failed to parse Stripe payment data: {}", e)
-                    })?;
+                let data: StripeData = serde_json::from_str(value.external_data.as_str())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse Stripe payment data: {}", e))?;
                 ApiPaymentData::Stripe {
                     session_id: data.session_id,
                 }

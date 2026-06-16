@@ -1083,6 +1083,7 @@ async fn create_users(db: &LNVpsDbMysql) -> Result<Vec<User>> {
             billing_postcode: None,
             billing_tax_id: None,
             nwc_connection_string: None,
+            email_hash: None,
         };
 
         let pubkey_array: [u8; 32] = pubkey_bytes.as_slice().try_into()?;

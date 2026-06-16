@@ -10,8 +10,7 @@ use redis::streams::{StreamAddOptions, StreamTrimStrategy, StreamTrimmingMode};
 /// Redis URL used by the E2E test environment.
 /// Reads `LNVPS_REDIS_URL`, falling back to the docker-compose.e2e.yaml default.
 pub fn redis_url() -> String {
-    std::env::var("LNVPS_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6399".to_string())
+    std::env::var("LNVPS_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6399".to_string())
 }
 
 /// Publish a `WorkJob` to the worker stream.

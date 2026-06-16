@@ -661,6 +661,49 @@ impl Worker {
 
         // Process deletions first
         for vm in vms_to_delete {
+            // Re-read the subscription to guard against a race condition where a
+            // payment was confirmed between the initial list_vms() snapshot and now.
+            // Only proceed with deletion if the subscription is still not set up.
+            let current_sub = match self
+                .db
+                .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(
+                        "Failed to re-read subscription for VM {} before deletion: {}",
+                        vm.id, e
+                    );
+                    self.queue_admin_notification(
+                        format!(
+                            "Failed to re-read subscription for VM {} before deletion:\n{}",
+                            vm.id, e
+                        ),
+                        Some(format!("VM {} Pre-Deletion Read Failed", vm.id)),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            if current_sub.is_setup {
+                info!("VM {} was paid since last check, skipping deletion", vm.id);
+                continue;
+            }
+            // Skip deletion if there are still pending (unexpired) payments outstanding.
+            if self
+                .db
+                .list_pending_vm_subscription_payments(vm.id)
+                .await
+                .map(|p| !p.is_empty())
+                .unwrap_or(false)
+            {
+                info!(
+                    "VM {} has pending unpaid payments, skipping deletion",
+                    vm.id
+                );
+                continue;
+            }
             info!("Deleting unpaid VM {}", vm.id);
             if let Err(e) = provisioner.delete_vm(vm.id).await {
                 error!("Failed to delete unpaid VM {}: {}", vm.id, e);
@@ -2556,6 +2599,237 @@ impl Worker {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mocks::MockNode;
+    use crate::settings::mock_settings;
+    use crate::subscription::SubscriptionHandler;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
+    use lnvps_db::{
+        LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType,
+        UserSshKey, Vm,
+    };
+
+    async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
+        let settings = mock_settings();
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        let work_commander = Arc::new(ChannelWorkCommander::new());
+        let cache = VmStateCache::new();
+        let sub_handler = SubscriptionHandler::new(
+            settings.clone(),
+            db.clone(),
+            node,
+            rates,
+            work_commander.clone(),
+            cache.clone(),
+        )?;
+        Worker::new(db, work_commander, sub_handler, &settings, cache, None).await
+    }
+
+    /// Create a VM linked to a subscription with the given created timestamp and is_setup state.
+    /// Returns (vm_id, subscription_id).
+    async fn add_vm_with_subscription(
+        db: &Arc<MockDb>,
+        sub_created: DateTime<Utc>,
+        is_setup: bool,
+    ) -> Result<(u64, u64)> {
+        let pubkey: [u8; 32] = rand::random();
+        let user_id = db.upsert_user(&pubkey).await?;
+        let ssh_key_id = db
+            .insert_user_ssh_key(&UserSshKey {
+                id: 0,
+                name: "test".to_string(),
+                user_id,
+                created: Utc::now(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await?;
+
+        let (subscription_id, line_item_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "test sub".to_string(),
+                    description: None,
+                    created: sub_created,
+                    expires: if is_setup {
+                        Some(sub_created.add(TimeDelta::days(30)))
+                    } else {
+                        None
+                    },
+                    is_active: is_setup,
+                    is_setup,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::Vps,
+                    name: "test item".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let vm = Vm {
+            id: 0,
+            host_id: 1,
+            user_id,
+            image_id: 1,
+            template_id: Some(1),
+            custom_template_id: None,
+            ssh_key_id,
+            subscription_line_item_id: line_item_ids[0],
+            disk_id: 1,
+            mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            deleted: false,
+            ..Default::default()
+        };
+        let vm_id = db.insert_vm(&vm).await?;
+        Ok((vm_id, subscription_id))
+    }
+
+    fn make_subscription_payment(
+        subscription_id: u64,
+        user_id: u64,
+        created: DateTime<Utc>,
+        expires: DateTime<Utc>,
+        id: u8,
+    ) -> SubscriptionPayment {
+        SubscriptionPayment {
+            id: vec![id; 32],
+            subscription_id,
+            user_id,
+            created,
+            expires,
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Lightning,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: lnvps_db::EncryptedString::from("test"),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2592000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        }
+    }
+
+    /// An unpaid VM (subscription not set up) older than 1 hour must be deleted by check_vms.
+    #[tokio::test]
+    async fn test_check_vms_deletes_unpaid_vm_after_one_hour() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, _) = add_vm_with_subscription(&db, old, false).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        // VM should be soft-deleted
+        let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(false);
+        assert!(deleted, "Unpaid VM older than 1 hour should be deleted");
+        Ok(())
+    }
+
+    /// An unpaid VM whose subscription was created less than 1 hour ago must NOT be deleted.
+    #[tokio::test]
+    async fn test_check_vms_skips_unpaid_vm_within_one_hour() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let recent = Utc::now().sub(TimeDelta::minutes(30));
+        let (vm_id, _) = add_vm_with_subscription(&db, recent, false).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        // VM should still be present and not deleted
+        let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(true);
+        assert!(
+            !deleted,
+            "Unpaid VM younger than 1 hour should not be deleted"
+        );
+        Ok(())
+    }
+
+    /// An unpaid VM (older than 1 hour) with a non-expired pending payment must NOT be deleted.
+    #[tokio::test]
+    async fn test_check_vms_skips_unpaid_vm_with_pending_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+
+        // Add a pending (unpaid, not-yet-expired) payment for this subscription.
+        db.insert_subscription_payment(&make_subscription_payment(
+            subscription_id,
+            user_id,
+            Utc::now(),
+            Utc::now().add(TimeDelta::minutes(10)),
+            1,
+        ))
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        // VM must NOT be deleted because there is a pending payment.
+        let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(true);
+        assert!(
+            !deleted,
+            "Unpaid VM with a non-expired pending payment should not be deleted"
+        );
+        Ok(())
+    }
+
+    /// An unpaid VM (older than 1 hour) whose only payment is already expired must still be deleted.
+    #[tokio::test]
+    async fn test_check_vms_deletes_unpaid_vm_with_only_expired_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+
+        // Add a payment whose invoice has already expired.
+        db.insert_subscription_payment(&make_subscription_payment(
+            subscription_id,
+            user_id,
+            old,
+            old.add(TimeDelta::minutes(10)),
+            2,
+        ))
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        // VM should be soft-deleted because the only payment is expired.
+        let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(false);
+        assert!(
+            deleted,
+            "Unpaid VM with only an expired payment should still be deleted"
+        );
         Ok(())
     }
 }

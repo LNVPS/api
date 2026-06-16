@@ -367,14 +367,21 @@ mod tests {
         // 12b. Subscription state immediately after VM creation
         //      The admin VM response includes the full subscription object.
         // ----------------------------------------------------------------
-        let vm_admin_initial =
-            json_ok(admin.get_auth(&format!("/api/admin/v1/vms/{vm_id}")).await.unwrap()).await;
+        let vm_admin_initial = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{vm_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
         let sub_obj = &vm_admin_initial["data"]["subscription"];
         assert!(
             sub_obj.is_object(),
             "Admin VM response should include a subscription object"
         );
-        let sub_id = sub_obj["id"].as_u64().expect("subscription.id should be a u64");
+        let sub_id = sub_obj["id"]
+            .as_u64()
+            .expect("subscription.id should be a u64");
         // After VM creation but before first payment: is_setup=false, expires=null
         assert!(
             !sub_obj["is_setup"].as_bool().unwrap_or(true),
@@ -387,9 +394,12 @@ mod tests {
         eprintln!("Subscription {sub_id} created (is_setup=false, expires=null) ✓");
 
         // User can see their subscription via the subscription endpoint
-        let user_sub =
-            json_ok(user.get_auth(&format!("/api/v1/subscriptions/{sub_id}")).await.unwrap())
-                .await;
+        let user_sub = json_ok(
+            user.get_auth(&format!("/api/v1/subscriptions/{sub_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(
             user_sub["data"]["id"].as_u64().unwrap(),
             sub_id,
@@ -428,9 +438,7 @@ mod tests {
         // Also confirm not paid via the admin subscription-payments endpoint
         let sp = json_ok(
             admin
-                .get_auth(&format!(
-                    "/api/admin/v1/subscription_payments/{payment_id}"
-                ))
+                .get_auth(&format!("/api/admin/v1/subscription_payments/{payment_id}"))
                 .await
                 .unwrap(),
         )
@@ -447,8 +455,12 @@ mod tests {
         // 14. Pay invoice via lnd-payer → lnd channel
         // ----------------------------------------------------------------
         let bolt11 = crate::lightning::extract_bolt11(&renew_data).unwrap();
-        pay_and_wait(&admin, &format!("/api/admin/v1/vms/{vm_id}/payments/{payment_id}"), &bolt11)
-            .await;
+        pay_and_wait(
+            &admin,
+            &format!("/api/admin/v1/vms/{vm_id}/payments/{payment_id}"),
+            &bolt11,
+        )
+        .await;
         eprintln!("Payment {payment_id} settled via Lightning ✓");
 
         // VM expiry should have moved forward
@@ -461,8 +473,13 @@ mod tests {
         // 14b. Verify subscription state after first payment
         //      is_setup should now be true; expires should be set.
         // ----------------------------------------------------------------
-        let vm_admin_paid =
-            json_ok(admin.get_auth(&format!("/api/admin/v1/vms/{vm_id}")).await.unwrap()).await;
+        let vm_admin_paid = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{vm_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
         let sub_after_pay = &vm_admin_paid["data"]["subscription"];
         assert!(
             sub_after_pay["is_setup"].as_bool().unwrap_or(false),
@@ -529,8 +546,7 @@ mod tests {
             .await
             .unwrap();
         if resp.status() == StatusCode::OK {
-            let sub_renew =
-                serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
+            let sub_renew = serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
             let sub_payment_id = sub_renew["data"]["id"].as_str().unwrap().to_string();
             eprintln!("Created subscription-path payment {sub_payment_id}");
 
@@ -559,8 +575,7 @@ mod tests {
 
             // VM expiry should have advanced beyond the previous value
             let vm_after_second_pay =
-                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap())
-                    .await;
+                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
             let new_expires = vm_after_second_pay["data"]["expires"].as_str().unwrap();
             assert_ne!(
                 new_expires, expires_str,
@@ -1187,15 +1202,18 @@ mod tests {
             pool.close().await;
             return;
         }
-        let vm_data: serde_json::Value =
-            serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let vm_data: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         let unpaid_vm_id = vm_data["data"]["id"].as_u64().unwrap();
         eprintln!("[cleanup] Created unpaid VM {unpaid_vm_id}");
 
         // Verify the VM is visible and its subscription is NOT set up.
-        let vm_admin =
-            json_ok(admin.get_auth(&format!("/api/admin/v1/vms/{unpaid_vm_id}")).await.unwrap())
-                .await;
+        let vm_admin = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{unpaid_vm_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(
             !vm_admin["data"]["deleted"].as_bool().unwrap_or(true),
             "Unpaid VM should not be deleted yet"
@@ -1258,8 +1276,7 @@ mod tests {
         eprintln!("[cleanup] Unpaid VM {unpaid_vm_id} deleted by worker ✓");
 
         // After deletion the user should no longer see the VM.
-        let list_after =
-            json_ok(user.get_auth("/api/v1/vm").await.unwrap()).await;
+        let list_after = json_ok(user.get_auth("/api/v1/vm").await.unwrap()).await;
         assert!(
             !list_after["data"]
                 .as_array()
@@ -1322,7 +1339,9 @@ mod tests {
                     &cleanup_bolt11,
                 )
                 .await;
-                eprintln!("[cleanup] Payment {pay_id} settled via Lightning; VM {paid_vm_id} now active");
+                eprintln!(
+                    "[cleanup] Payment {pay_id} settled via Lightning; VM {paid_vm_id} now active"
+                );
 
                 // Confirm subscription is active and has an expiry.
                 let vm2_admin = json_ok(
@@ -1371,9 +1390,9 @@ mod tests {
                             .get_auth(&format!("/api/admin/v1/vms/{paid_vm_id}/history"))
                             .await
                             .unwrap();
-                        if let Ok(h) = serde_json::from_str::<serde_json::Value>(
-                            &hr.text().await.unwrap(),
-                        ) {
+                        if let Ok(h) =
+                            serde_json::from_str::<serde_json::Value>(&hr.text().await.unwrap())
+                        {
                             if h["data"].as_array().map_or(false, |arr| {
                                 arr.iter().any(|e| {
                                     e["action_type"]
@@ -1389,9 +1408,9 @@ mod tests {
                             .get_auth(&format!("/api/admin/v1/subscriptions/{sub2_id}"))
                             .await
                             .unwrap();
-                        if let Ok(s) = serde_json::from_str::<serde_json::Value>(
-                            &sr.text().await.unwrap(),
-                        ) {
+                        if let Ok(s) =
+                            serde_json::from_str::<serde_json::Value>(&sr.text().await.unwrap())
+                        {
                             return !s["data"]["is_active"].as_bool().unwrap_or(true);
                         }
                         false
@@ -1404,9 +1423,7 @@ mod tests {
                     "Expired subscription {sub2_id} should have triggered stop/deactivation \
                      within 30 s (check vm history for Expired entry or subscription is_active=false)"
                 );
-                eprintln!(
-                    "[cleanup] Subscription expiry handled by worker for VM {paid_vm_id} ✓"
-                );
+                eprintln!("[cleanup] Subscription expiry handled by worker for VM {paid_vm_id} ✓");
 
                 // Clean up the paid VM (hard-delete bypasses the worker).
                 let pool = crate::db::connect().await.unwrap();
@@ -1427,7 +1444,9 @@ mod tests {
         let pool = crate::db::connect().await.unwrap();
         // The unpaid VM was deleted by the worker (deleted=true), but we still
         // need to remove its subscription rows — hard_delete_vm handles both.
-        crate::db::hard_delete_vm(&pool, unpaid_vm_id).await.unwrap();
+        crate::db::hard_delete_vm(&pool, unpaid_vm_id)
+            .await
+            .unwrap();
         eprintln!("[cleanup] Hard-deleted unpaid VM row {unpaid_vm_id}");
 
         cleanup_infra(
@@ -1465,16 +1484,30 @@ mod tests {
         ssh_key_id: Option<u64>,
     ) {
         if let Some(cp) = custom_pricing_id {
-            crate::db::hard_delete_custom_pricing(pool, cp).await.unwrap();
+            crate::db::hard_delete_custom_pricing(pool, cp)
+                .await
+                .unwrap();
         }
         let _ = ssh_key_id; // SSH keys are owned by the user row, not a separate cleanup needed
-        crate::db::hard_delete_vm_template(pool, template_id).await.unwrap();
-        crate::db::hard_delete_ip_range(pool, ip_range_id).await.unwrap();
+        crate::db::hard_delete_vm_template(pool, template_id)
+            .await
+            .unwrap();
+        crate::db::hard_delete_ip_range(pool, ip_range_id)
+            .await
+            .unwrap();
         crate::db::hard_delete_host(pool, host_id).await.unwrap();
-        crate::db::hard_delete_os_image(pool, image_id).await.unwrap();
-        crate::db::hard_delete_cost_plan(pool, cost_plan_id).await.unwrap();
-        crate::db::hard_delete_region(pool, region_id).await.unwrap();
-        crate::db::hard_delete_company(pool, company_id).await.unwrap();
+        crate::db::hard_delete_os_image(pool, image_id)
+            .await
+            .unwrap();
+        crate::db::hard_delete_cost_plan(pool, cost_plan_id)
+            .await
+            .unwrap();
+        crate::db::hard_delete_region(pool, region_id)
+            .await
+            .unwrap();
+        crate::db::hard_delete_company(pool, company_id)
+            .await
+            .unwrap();
         eprintln!("[cleanup] Infrastructure hard-deleted ✓");
     }
 
@@ -1487,8 +1520,7 @@ mod tests {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
         loop {
             if f().await {
                 return true;
@@ -1511,11 +1543,7 @@ mod tests {
     // admin complete endpoint so the suite can still pass in minimal
     // environments.
     // ----------------------------------------------------------------
-    async fn pay_and_wait(
-        admin: &crate::client::TestClient,
-        status_path: &str,
-        bolt11: &str,
-    ) {
+    async fn pay_and_wait(admin: &crate::client::TestClient, status_path: &str, bolt11: &str) {
         match crate::lightning::pay_invoice(bolt11).await {
             Ok(()) => {
                 eprintln!("Lightning payment submitted, polling {status_path} ...");
@@ -1535,7 +1563,10 @@ mod tests {
                     }
                 })
                 .await;
-                assert!(paid, "Payment at {status_path} was not marked paid within 30 s after Lightning settlement");
+                assert!(
+                    paid,
+                    "Payment at {status_path} was not marked paid within 30 s after Lightning settlement"
+                );
             }
             Err(e) => {
                 // lnd-payer unavailable — fall back to admin complete so the

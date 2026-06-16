@@ -63,7 +63,7 @@ pub fn routes() -> Router<RouterState> {
         .route("/api/v1/vm", post(v1_create_vm_order))
         .route("/api/v1/vm/{id}/renew", get(v1_renew_vm))
         .route("/api/v1/vm/{id}/renew-lnurlp", get(v1_renew_vm_lnurlp))
-        .route("/.well-known/lnurlp/<id>", get(v1_lnurlp))
+        .route("/.well-known/lnurlp/{id}", get(v1_lnurlp))
         .route("/api/v1/vm/{id}/start", patch(v1_start_vm))
         .route("/api/v1/vm/{id}/stop", patch(v1_stop_vm))
         .route("/api/v1/vm/{id}/restart", patch(v1_restart_vm))
@@ -1364,6 +1364,9 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
     let vm = this.db.get_vm(id).await?;
     if uid != vm.user_id {
         return Err(ApiError::new("VM does not belong to you"));
+    }
+    if vm.deleted {
+        return Err(ApiError::new("VM not found"));
     }
     Ok((uid, vm))
 }

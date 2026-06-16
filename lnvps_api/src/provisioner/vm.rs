@@ -176,7 +176,10 @@ impl VmProvisioner {
         sub.name = format!("VM{} subscription", new_vm.id);
         self.db.update_subscription(&sub).await?;
 
-        let mut li = self.db.get_subscription_line_item(subscription_line_item_id).await?;
+        let mut li = self
+            .db
+            .get_subscription_line_item(subscription_line_item_id)
+            .await?;
         li.name = format!("VM{} - {}", new_vm.id, template.name);
         self.db.update_subscription_line_item(&li).await?;
 
@@ -294,7 +297,10 @@ impl VmProvisioner {
         sub.name = format!("VM{} subscription", new_vm.id);
         self.db.update_subscription(&sub).await?;
 
-        let mut li = self.db.get_subscription_line_item(subscription_line_item_id).await?;
+        let mut li = self
+            .db
+            .get_subscription_line_item(subscription_line_item_id)
+            .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         self.db.update_subscription_line_item(&li).await?;
 
@@ -795,7 +801,9 @@ mod tests {
     use super::*;
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::settings::mock_settings;
-    use crate::subscription::{SubscriptionHandler, SubscriptionLineItemHandler, VmLineItemHandler};
+    use crate::subscription::{
+        SubscriptionHandler, SubscriptionLineItemHandler, VmLineItemHandler,
+    };
     use lnvps_api_common::{
         ChannelWorkCommander, GB, InMemoryRateCache, MockDb, MockExchangeRate, TB, Ticker,
         WorkCommander, WorkJob,
@@ -2084,7 +2092,10 @@ mod tests {
 
         // Subscription must now be active with an expiry date
         let sub_after = db.get_subscription(li.subscription_id).await?;
-        assert!(sub_after.is_active, "subscription must be active after payment");
+        assert!(
+            sub_after.is_active,
+            "subscription must be active after payment"
+        );
         assert!(
             sub_after.expires.is_some(),
             "expires must be set after payment"
@@ -2093,18 +2104,17 @@ mod tests {
             sub_after.expires.unwrap() > Utc::now(),
             "expires must be in the future"
         );
-        assert!(sub_after.is_setup, "is_setup must be true after first payment");
+        assert!(
+            sub_after.is_setup,
+            "is_setup must be true after first payment"
+        );
 
         // WorkJob::SpawnVm must be queued for every non-upgrade payment.
         // recv() is non-blocking here since complete_payment already sent the job
         // synchronously above.
-        let msgs = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            wrk.recv(),
-        )
-        .await
-        .expect("timed out waiting for WorkJob::SpawnVm")
-        ?;
+        let msgs = tokio::time::timeout(std::time::Duration::from_millis(100), wrk.recv())
+            .await
+            .expect("timed out waiting for WorkJob::SpawnVm")?;
         let found_spawn_vm = msgs
             .iter()
             .any(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id));
@@ -2112,7 +2122,9 @@ mod tests {
             found_spawn_vm,
             "expected WorkJob::SpawnVm {{ vm_id: {} }} in queued jobs: {:?}",
             vm.id,
-            msgs.iter().map(|m| format!("{:?}", m.job)).collect::<Vec<_>>()
+            msgs.iter()
+                .map(|m| format!("{:?}", m.job))
+                .collect::<Vec<_>>()
         );
 
         Ok(())
@@ -2164,7 +2176,8 @@ mod tests {
             .filter(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id))
             .count();
         assert_eq!(
-            spawn_count, 2,
+            spawn_count,
+            2,
             "expected 2 SpawnVm jobs, got {:?}",
             all_msgs
                 .iter()
@@ -2197,7 +2210,14 @@ mod tests {
             .await?;
         let sub = db.get_subscription(li.subscription_id).await?;
 
-        let handler = VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner, VmStateCache::new()).await?;
+        let handler = VmLineItemHandler::new(
+            vm_id,
+            db.clone(),
+            wrk.clone(),
+            provisioner,
+            VmStateCache::new(),
+        )
+        .await?;
 
         // on_expired must succeed (stop is best-effort; silently no-ops for unspawned VMs)
         handler.on_expired(&sub, &li).await?;
@@ -2211,8 +2231,8 @@ mod tests {
         Ok(())
     }
 
-    /// When `on_grace_period_exceeded` is called the VM must be deleted from the
-    /// database (MockDb hard-deletes on `delete_vm`), so `get_vm` returns an error.
+    /// When `on_grace_period_exceeded` is called the VM must be deleted
+    /// (MockDb soft-deletes on `delete_vm`, setting `deleted = true`).
     #[tokio::test]
     async fn test_on_grace_period_exceeded_deletes_vm() -> Result<()> {
         let db = Arc::new(MockDb::default());
@@ -2227,21 +2247,30 @@ mod tests {
         let vm_id = vm.id;
 
         // Confirm VM exists in DB before deletion
-        assert!(db.get_vm(vm_id).await.is_ok(), "VM must exist before deletion");
+        assert!(
+            db.get_vm(vm_id).await.is_ok(),
+            "VM must exist before deletion"
+        );
 
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
         let sub = db.get_subscription(li.subscription_id).await?;
 
-        let handler =
-            VmLineItemHandler::new(vm_id, db.clone(), wrk.clone(), provisioner, VmStateCache::new()).await?;
+        let handler = VmLineItemHandler::new(
+            vm_id,
+            db.clone(),
+            wrk.clone(),
+            provisioner,
+            VmStateCache::new(),
+        )
+        .await?;
         handler.on_grace_period_exceeded(&sub, &li).await?;
 
-        // VM must be gone from the database after grace period exceeded
+        // VM must be soft-deleted after grace period exceeded
         assert!(
-            db.get_vm(vm_id).await.is_err(),
-            "VM must be deleted from DB after grace period"
+            db.get_vm(vm_id).await?.deleted,
+            "VM must be marked deleted after grace period"
         );
 
         Ok(())

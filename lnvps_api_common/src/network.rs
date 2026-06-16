@@ -148,12 +148,14 @@ impl NetworkProvisioner {
         // mark some IPS as always used
         // Namely:
         //  .0 & .255 of /24 (first and last)
-        //  gateway ip of the range
+        //  gateway ip of the range (only if it falls within the CIDR)
         if !range.use_full_range && range_cidr.is_ipv4() {
             ips.insert(range_cidr.iter().next().unwrap());
             ips.insert(range_cidr.iter().last().unwrap());
         }
-        ips.insert(gateway.ip());
+        if range_cidr.contains(gateway.ip()) {
+            ips.insert(gateway.ip());
+        }
 
         // Early exit if the range is already full
         if let NetworkSize::V4(size) = range_cidr.size() {
@@ -776,6 +778,60 @@ mod tests {
         };
         let available = NetworkProvisioner::count_available_ips(&range, 15);
         assert_eq!(available, Some(free_ips.len() as u64));
+    }
+
+    /// Regression test: pick_ip_from_range must succeed when the gateway is outside
+    /// the CIDR range. Previously the gateway was unconditionally added to the
+    /// `ips` HashSet, inflating the count and triggering the early-exit
+    /// `ips.len() >= size` check even though a free IP existed.
+    #[tokio::test]
+    async fn test_pick_ip_gateway_outside_range_not_full() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+
+        // /28 = 16 IPs (.224-.239), gateway outside range, use_full_range = true
+        let range = IpRange {
+            id: 106,
+            cidr: "15.235.3.224/28".to_string(),
+            gateway: "148.113.164.254".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::Sequential,
+            use_full_range: true,
+            ..Default::default()
+        };
+        db.ip_range.lock().await.insert(106, range);
+
+        // Assign 15 of 16 IPs — leave .237 free
+        let mut assignments = db.ip_assignments.lock().await;
+        for i in 0..16u8 {
+            let ip_last = 224 + i;
+            if ip_last == 237 {
+                continue; // leave this one free
+            }
+            let id = (i + 1) as u64;
+            assignments.insert(
+                id,
+                VmIpAssignment {
+                    id,
+                    vm_id: id,
+                    ip_range_id: 106,
+                    ip: format!("15.235.3.{}", ip_last),
+                    ..Default::default()
+                },
+            );
+        }
+        drop(assignments);
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db);
+
+        // This previously failed with "No IPs available in range 15.235.3.224/28"
+        let available = mgr
+            .pick_ip_from_range_id(106)
+            .await
+            .expect("Should find free IP .237");
+        assert_eq!(available.ip.ip().to_string(), "15.235.3.237");
     }
 
     #[tokio::test]

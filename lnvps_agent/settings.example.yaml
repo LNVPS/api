@@ -1,0 +1,54 @@
+# LNVPS Support Agent Configuration
+
+listen: 0.0.0.0:8080
+
+# Base URLs for the LNVPS APIs
+admin-api-url: https://admin.lnvps.io
+user-api-url: https://api.lnvps.io
+
+# Nsec key for signing NIP-98 auth events and Nostr channel operations (bech32 nsec1...)
+nsec: nsec1...
+
+# OpenAI-compatible API configuration (works with Ollama, LM Studio, etc.)
+openai:
+  # For Ollama: http://localhost:11434/v1
+  # For OpenAI: https://api.openai.com/v1
+  base-url: http://localhost:11434/v1
+  # API key — not needed for Ollama, required for OpenAI
+  # api-key: sk-...
+  # Model to use (e.g., llama3.2, qwen2.5, gpt-4o)
+  model: llama3.2
+  # Max completion tokens
+  max-tokens: 2048
+
+# Optional: custom system prompt override
+# system-prompt: |
+#   You are the LNVPS support agent...
+
+# Email support channel (optional)
+# Uses IMAP IDLE for push-based email notifications
+# email:
+#   imap-server: imap.gmail.com:993
+#   imap-username: support@lnvps.io
+#   imap-password: your-app-password
+#   imap-mailbox: INBOX
+#   smtp-server: smtp.gmail.com:587
+#   smtp-username: support@lnvps.io
+#   smtp-password: your-app-password
+#   smtp-from: support@lnvps.io
+#   smtp-from-name: LNVPS Support
+
+# Kind 1 Nostr channel (optional)
+# Replies to mentions on nostr kind 1 events in real-time
+# kind1:
+#   relays:
+#     - wss://nos.lol
+#     - wss://relay.damus.io
+#     - wss://relay.primal.net
+#   # Optional: specific pubkey(s) whose mentions trigger replies
+#   # Defaults to the bot's own pubkey (derived from the shared nsec above)
+#   # mention-pubkeys:
+#   #   - "hex_pubkey_here"
+
+# Path to conversation history storage directory
+# conversation-history-path: ./conversation_history

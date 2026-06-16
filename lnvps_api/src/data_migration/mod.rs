@@ -1,5 +1,6 @@
 use crate::data_migration::arp_ref_fixer::ArpRefFixerDataMigration;
 use crate::data_migration::dns::DnsDataMigration;
+use crate::data_migration::email_hash_backfill::EmailHashBackfillMigration;
 use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::data_migration::payment_method_config::PaymentMethodConfigMigration;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 
 mod arp_ref_fixer;
 mod dns;
+mod email_hash_backfill;
 mod encryption_migration;
 mod ip6_init;
 mod payment_method_config;
@@ -54,6 +56,9 @@ pub async fn run_data_migrations(
 
     // Migrate SSH key from proxmox config to database
     migrations.push(Box::new(SshKeyMigration::new(db.clone(), settings.clone())));
+
+    // Backfill email_hash for users missing it (must run after encryption migration)
+    migrations.push(Box::new(EmailHashBackfillMigration::new(db.clone())));
 
     info!("Running {} data migrations", migrations.len());
     for migration in migrations {

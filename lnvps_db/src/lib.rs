@@ -26,6 +26,17 @@ pub use model::*;
 pub use mysql::*;
 use try_procedure::OpError;
 
+/// Compute the email hash used for lookups: SHA-256 of lowercased, trimmed email.
+pub fn email_hash(email: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(email.trim().to_lowercase().as_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("sqlx: {0}")]
@@ -320,6 +331,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Return the most recently settled invoice
     async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>>;
 
+    /// Count active (unpaid, non-expired) payments for a VM
+    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64>;
+
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>>;
 
@@ -466,10 +480,10 @@ pub trait LNVpsDbBase: Send + Sync {
         subscription_id: u64,
     ) -> DbResult<Vec<SubscriptionLineItem>>;
     async fn get_subscription_line_item(&self, id: u64) -> DbResult<SubscriptionLineItem>;
-    
+
     /// Get subscription directly from line item ID (avoids doing two lookups)
     async fn get_subscription_by_line_item_id(&self, line_item_id: u64) -> DbResult<Subscription>;
-    
+
     async fn insert_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,

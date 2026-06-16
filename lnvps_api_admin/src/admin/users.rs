@@ -6,12 +6,16 @@ use axum::routing::get;
 use axum::{Json, Router};
 use isocountry::CountryCode;
 use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
-use lnvps_db::{AdminAction, AdminResource};
+use lnvps_db::{AdminAction, AdminResource, email_hash};
 use serde::Deserialize;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
         .route("/api/admin/v1/users", get(admin_list_users))
+        .route(
+            "/api/admin/v1/users/by-email",
+            get(admin_find_user_by_email),
+        )
         .route(
             "/api/admin/v1/users/{id}",
             get(admin_get_user).patch(admin_update_user),
@@ -75,6 +79,28 @@ async fn admin_list_users(
         limit,
         offset,
     )
+}
+
+#[derive(Deserialize)]
+struct FindByEmailQuery {
+    email: String,
+}
+
+/// Find a single user by their email address using the indexed email_hash column.
+async fn admin_find_user_by_email(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(query): Query<FindByEmailQuery>,
+) -> ApiResult<AdminUserInfo> {
+    auth.require_permission(AdminResource::Users, AdminAction::View)?;
+
+    let hash = email_hash(&query.email);
+    let user = this.db.admin_find_user_by_email_hash(&hash).await?;
+
+    match user {
+        Some(u) => ApiData::ok(u.into()),
+        None => ApiData::err("User not found"),
+    }
 }
 
 /// Update user account information

@@ -336,6 +336,7 @@ impl LNVpsDbBase for MockDb {
         let mut users = self.users.lock().await;
         if let Some(u) = users.get_mut(&user.id) {
             u.email = user.email.clone();
+            u.email_hash = user.email_hash.clone();
             u.email_verified = user.email_verified;
             u.email_verify_token = user.email_verify_token.clone();
             u.contact_email = user.contact_email;
@@ -732,7 +733,9 @@ impl LNVpsDbBase for MockDb {
 
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
-        vms.remove(&vm_id);
+        if let Some(vm) = vms.get_mut(&vm_id) {
+            vm.deleted = true;
+        }
         Ok(())
     }
 
@@ -1001,6 +1004,13 @@ impl LNVpsDbBase for MockDb {
             .filter(|p| p.is_paid)
             .max_by(|a, b| a.created.cmp(&b.created))
             .cloned())
+    }
+
+    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64> {
+        let p = self.payments.lock().await;
+        Ok(p.iter()
+            .filter(|p| p.vm_id == vm_id && !p.is_paid && p.expires > Utc::now())
+            .count() as u64)
     }
 
     async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
@@ -1455,7 +1465,12 @@ impl LNVpsDbBase for MockDb {
         let line_items = self.subscription_line_items.lock().await;
         let sub_id = match line_items.get(&line_item_id) {
             Some(li) => li.subscription_id,
-            None => return Err(DbError::Other(anyhow::anyhow!("subscription not found for line item {}", line_item_id))),
+            None => {
+                return Err(DbError::Other(anyhow::anyhow!(
+                    "subscription not found for line item {}",
+                    line_item_id
+                )));
+            }
         };
         drop(line_items);
         let subscriptions = self.subscriptions.lock().await;
@@ -1660,6 +1675,23 @@ impl LNVpsDbBase for MockDb {
             subscription.is_setup = true;
         }
         drop(subscriptions);
+
+        // Un-delete any VM linked to this subscription (e.g. auto-cleaned up before
+        // payment arrived).
+        let line_items = self.subscription_line_items.lock().await;
+        let line_item_ids: Vec<u64> = line_items
+            .values()
+            .filter(|li| li.subscription_id == payment.subscription_id)
+            .map(|li| li.id)
+            .collect();
+        drop(line_items);
+        let mut vms = self.vms.lock().await;
+        for vm in vms.values_mut() {
+            if line_item_ids.contains(&vm.subscription_line_item_id) {
+                vm.deleted = false;
+            }
+        }
+        drop(vms);
 
         Ok(())
     }
@@ -2293,6 +2325,13 @@ impl lnvps_db::AdminDb for MockDb {
             })
             .collect();
         Ok((paginated_users, total))
+    }
+
+    async fn admin_find_user_by_email_hash(
+        &self,
+        _hash: &[u8; 32],
+    ) -> DbResult<Option<AdminUserInfo>> {
+        Ok(None)
     }
 
     async fn admin_list_regions(

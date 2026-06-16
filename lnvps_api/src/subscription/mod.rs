@@ -39,8 +39,8 @@ mod vm;
 use crate::provisioner::VmProvisioner;
 use crate::settings::Settings;
 pub use ip_range::IpRangeLineItemHandler;
-pub use vm::VmLineItemHandler;
 use lnvps_api_common::VmStateCache;
+pub use vm::VmLineItemHandler;
 
 // =========================================================================
 // Trait
