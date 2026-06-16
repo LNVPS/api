@@ -23,12 +23,16 @@ Be friendly, professional, and concise."#
         .to_string()
 }
 
-/// System prompt for a known customer. `account` is rendered as pretty JSON
-/// so the model has the user's current account context. `user_pubkey` is shown
-/// for context when the account has one.
-pub fn user_system_message(user_pubkey: Option<&str>, account: &serde_json::Value) -> String {
+/// System prompt for a known customer. `account` is the resolved account record
+/// (admin `AdminUserInfo` JSON); it is rendered as pretty JSON so the model has
+/// the user's current account context, and the pubkey is surfaced from it.
+pub fn user_system_message(account: &serde_json::Value) -> String {
+    let user_pubkey = account
+        .get("pubkey")
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("(none on file)");
     let account_pretty = serde_json::to_string_pretty(account).unwrap_or_default();
-    let user_pubkey = user_pubkey.unwrap_or("(none on file)");
     format!(
         r#"You are the LNVPS support agent. You help customers with their VPS hosting
 accounts, virtual machines, payments, and billing.
@@ -122,13 +126,13 @@ mod tests {
 
     #[test]
     fn user_system_message_includes_context() {
-        let account = serde_json::json!({"id": 42, "email": "x@y.z"});
-        let msg = user_system_message(Some("abc123"), &account);
+        let account = serde_json::json!({"id": 42, "email": "x@y.z", "pubkey": "abc123"});
+        let msg = user_system_message(&account);
         assert!(msg.contains("abc123"));
         assert!(msg.contains("\"id\": 42"));
 
         // No pubkey on file still renders.
-        let msg = user_system_message(None, &account);
+        let msg = user_system_message(&serde_json::json!({"id": 1, "pubkey": ""}));
         assert!(msg.contains("(none on file)"));
     }
 

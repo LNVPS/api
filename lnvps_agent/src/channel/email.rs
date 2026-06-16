@@ -346,10 +346,7 @@ async fn fetch_and_process(
             Ok(Some(user)) => match user.get("id").and_then(|v| v.as_u64()) {
                 Some(user_id) => Requester::Customer {
                     user_id,
-                    pubkey: user
-                        .get("pubkey")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
+                    account: user,
                 },
                 None => {
                     log::warn!(

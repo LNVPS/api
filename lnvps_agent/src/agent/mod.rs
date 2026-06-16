@@ -347,15 +347,9 @@ impl SupportAgent {
                 self.process_general(key, &req.message, channel_prompt)
                     .await?
             }
-            Requester::Customer { user_id, pubkey } => {
-                self.process_known_user(
-                    key,
-                    *user_id,
-                    pubkey.as_deref(),
-                    &req.message,
-                    channel_prompt,
-                )
-                .await?
+            Requester::Customer { user_id, account } => {
+                self.process_known_user(key, *user_id, account, &req.message, channel_prompt)
+                    .await?
             }
         };
 
@@ -392,21 +386,18 @@ impl SupportAgent {
     }
 
     /// Handle a request from a known customer. The channel already resolved the
-    /// `user_id`, so we only fetch the account context for the prompt.
+    /// user and returned their full account record, so no further lookup is
+    /// needed here.
     async fn process_known_user(
         &self,
         sender_id: &str,
         user_id: u64,
-        pubkey: Option<&str>,
+        account: &serde_json::Value,
         user_message: &str,
         channel_prompt: &str,
     ) -> Result<(String, Vec<ChatMessage>)> {
-        let account = self.api.admin_get_user(user_id).await?;
-
-        let system = prompts::with_channel_prompt(
-            prompts::user_system_message(pubkey, &account),
-            channel_prompt,
-        );
+        let system =
+            prompts::with_channel_prompt(prompts::user_system_message(account), channel_prompt);
         let base = self.base_messages(sender_id, system).await;
         let tools = tool_specs(super::tools::support_tools());
         let executor = Arc::new(LnvpsToolExecutor::new(self.api.clone(), user_id));

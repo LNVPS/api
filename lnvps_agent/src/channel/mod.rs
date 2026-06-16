@@ -14,9 +14,10 @@ pub enum Requester {
     Customer {
         /// Resolved LNVPS user id — tools are scoped to this user.
         user_id: u64,
-        /// The customer's nostr pubkey hex, if their account has one.
-        /// Used only for prompt context; not all customers have a pubkey.
-        pubkey: Option<String>,
+        /// The full account record returned by the resolution lookup
+        /// (admin `AdminUserInfo` JSON). Reused as prompt context so the
+        /// agent does not have to fetch the account a second time.
+        account: serde_json::Value,
     },
     /// Not a known customer — general public question.
     Anonymous,

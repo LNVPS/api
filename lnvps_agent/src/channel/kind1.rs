@@ -130,7 +130,7 @@ impl Kind1SupportChannel {
                                         match user.get("id").and_then(|v| v.as_u64()) {
                                             Some(user_id) => Requester::Customer {
                                                 user_id,
-                                                pubkey: Some(author_hex.clone()),
+                                                account: user,
                                             },
                                             None => {
                                                 log::warn!(
