@@ -463,6 +463,17 @@ mod tests {
         .await;
         eprintln!("Payment {payment_id} settled via Lightning ✓");
 
+        // Capture the pre-upgrade renewal amount for later comparison
+        let pre_upg_payment = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{vm_id}/payments/{payment_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let pre_upgrade_amount = pre_upg_payment["data"]["amount"].as_u64().unwrap();
+        eprintln!("Pre-upgrade renewal amount: {pre_upgrade_amount}");
+
         // VM expiry should have moved forward
         let vm_after_pay =
             json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
@@ -683,11 +694,12 @@ mod tests {
             .unwrap();
         if resp.status() == StatusCode::OK {
             let quote = serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
+            let new_renewal_cost = quote["data"]["new_renewal_cost"]["amount"].as_u64().unwrap();
             eprintln!(
-                "Upgrade quote: cost_diff={}, new_renewal={}",
+                "Upgrade quote: cost_diff={}, new_renewal={new_renewal_cost}",
                 quote["data"]["cost_difference"]["amount"],
-                quote["data"]["new_renewal_cost"]["amount"]
             );
+            assert!(new_renewal_cost > 0, "New renewal cost should be positive");
 
             // ----------------------------------------------------------
             // 15. Execute upgrade → creates an upgrade payment
@@ -711,14 +723,148 @@ mod tests {
                 .await;
                 eprintln!("Upgrade payment {upg_payment_id} settled via Lightning ✓");
 
-                // Give the worker a moment then verify template CPU changed
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let vm_upgraded =
-                    json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
-                let new_cpu = vm_upgraded["data"]["template"]["cpu"].as_u64().unwrap_or(0);
-                eprintln!("VM {vm_id} CPU after upgrade: {new_cpu}");
-                // new_cpu should be 2 (the upgrade target), but the worker
-                // may not have processed yet — log for manual inspection
+                // Poll for the upgrade to take effect — the worker processes
+                // ProcessVmUpgrade (stop → resize → reconfigure → start) and
+                // converts the VM from standard template to custom template.
+                let cpu_upgraded = poll_until(30, 500, || {
+                    let user = user_client();
+                    async move {
+                        let r = user
+                            .get_auth(&format!("/api/v1/vm/{vm_id}"))
+                            .await
+                            .unwrap();
+                        let body: serde_json::Value =
+                            serde_json::from_str(&r.text().await.unwrap()).unwrap();
+                        body["data"]["template"]["cpu"].as_u64().unwrap_or(0) == 2
+                    }
+                })
+                .await;
+                assert!(
+                    cpu_upgraded,
+                    "VM {vm_id} CPU should have been upgraded to 2 within 30 s"
+                );
+                eprintln!("VM {vm_id} CPU upgraded to 2 ✓");
+
+                // ------------------------------------------------------
+                // 15b. Verify subscription state after upgrade
+                // ------------------------------------------------------
+                let vm_admin_upgraded = json_ok(
+                    admin
+                        .get_auth(&format!("/api/admin/v1/vms/{vm_id}"))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let vm_upgraded_data = &vm_admin_upgraded["data"];
+                let sub_after_upgrade = &vm_upgraded_data["subscription"];
+
+                // Custom VMs are always billed monthly
+                assert!(
+                    sub_after_upgrade["is_active"].as_bool().unwrap_or(false),
+                    "Subscription should still be active after upgrade"
+                );
+                assert!(
+                    sub_after_upgrade["is_setup"].as_bool().unwrap_or(false),
+                    "Subscription should still be set-up after upgrade"
+                );
+                let interval_type =
+                    sub_after_upgrade["interval_type"].as_str().unwrap_or("");
+                assert_eq!(
+                    interval_type, "month",
+                    "Subscription interval_type should be 'month' after upgrade, got '{interval_type}'"
+                );
+
+                // VM should now use a custom template (no longer standard)
+                assert!(
+                    vm_upgraded_data["template_id"].is_null(),
+                    "VM template_id should be null after standard→custom upgrade"
+                );
+                assert!(
+                    vm_upgraded_data["custom_template_id"].as_u64().is_some(),
+                    "VM should have a custom_template_id after upgrade"
+                );
+
+                eprintln!("Subscription {sub_id} post-upgrade state verified ✓");
+
+                // ------------------------------------------------------
+                // 15c. Renew the upgraded VM — verifies the new rate
+                //      is applied and the subscription expiry extends.
+                // ------------------------------------------------------
+                let expires_before_renew =
+                    vm_upgraded_data["expires"].as_str().unwrap().to_string();
+                let resp = user
+                    .get_auth(&format!("/api/v1/vm/{vm_id}/renew"))
+                    .await
+                    .unwrap();
+                if resp.status() == StatusCode::OK {
+                    let post_upg_renew =
+                        serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
+                    let post_upg_payment_id =
+                        post_upg_renew["data"]["id"].as_str().unwrap().to_string();
+                    eprintln!("Created post-upgrade renewal payment {post_upg_payment_id}");
+
+                    let post_upg_bolt11 =
+                        crate::lightning::extract_bolt11(&post_upg_renew).unwrap();
+                    pay_and_wait(
+                        &admin,
+                        &format!("/api/admin/v1/vms/{vm_id}/payments/{post_upg_payment_id}"),
+                        &post_upg_bolt11,
+                    )
+                    .await;
+                    eprintln!("Post-upgrade renewal {post_upg_payment_id} settled ✓");
+
+                    // Fetch the completed payment to check its amount
+                    let post_upg_paid = json_ok(
+                        admin
+                            .get_auth(&format!(
+                                "/api/admin/v1/vms/{vm_id}/payments/{post_upg_payment_id}"
+                            ))
+                            .await
+                            .unwrap(),
+                    )
+                    .await;
+                    let post_upgrade_amount =
+                        post_upg_paid["data"]["amount"].as_u64().unwrap();
+
+                    // The upgraded VM (CPU 1→2) should cost more than before
+                    assert!(
+                        post_upgrade_amount > pre_upgrade_amount,
+                        "Post-upgrade renewal amount ({post_upgrade_amount}) should exceed pre-upgrade amount ({pre_upgrade_amount})"
+                    );
+                    // The renewal amount should match the quoted new_renewal_cost
+                    assert_eq!(
+                        post_upgrade_amount, new_renewal_cost,
+                        "Post-upgrade renewal amount ({post_upgrade_amount}) should match the quoted new renewal cost ({new_renewal_cost})"
+                    );
+                    eprintln!(
+                        "Post-upgrade renewal amount {post_upgrade_amount} > pre-upgrade {pre_upgrade_amount}, matches quote ✓"
+                    );
+
+                    // Expiry should have advanced
+                    let vm_after_post_upg_renew = json_ok(
+                        user.get_auth(&format!("/api/v1/vm/{vm_id}"))
+                            .await
+                            .unwrap(),
+                    )
+                    .await;
+                    let expires_after_renew =
+                        vm_after_post_upg_renew["data"]["expires"]
+                            .as_str()
+                            .unwrap()
+                            .to_string();
+                    assert_ne!(
+                        expires_after_renew, expires_before_renew,
+                        "VM expiry should have advanced after post-upgrade renewal"
+                    );
+                    eprintln!(
+                        "VM {vm_id} expiry advanced from {expires_before_renew} → {expires_after_renew} after post-upgrade renewal ✓"
+                    );
+                } else {
+                    eprintln!(
+                        "Post-upgrade renew returned {} — skipping renewal-after-upgrade check",
+                        resp.status()
+                    );
+                }
             } else {
                 eprintln!("Upgrade execution returned {}", resp.status());
             }
