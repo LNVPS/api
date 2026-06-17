@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
     let api_client = Arc::new(ApiClient::new(&settings)?);
     let agent = SupportAgent::new(api_client.clone(), settings.clone(), store);
 
+    let mut handles = Vec::new();
+
     if let Some(ref kind1_cfg) = settings.kind1 {
         info!(
             "Starting kind1 Nostr support channel: relays={:?}, mentions={:?}",
@@ -46,8 +48,13 @@ async fn main() -> Result<()> {
             )
             .await?,
         );
-        agent.run_loop(channel).await;
-    } else if let Some(ref email_cfg) = settings.email {
+        let agent = agent.clone();
+        handles.push(tokio::spawn(async move {
+            agent.run_loop(channel).await;
+        }));
+    }
+
+    if let Some(ref email_cfg) = settings.email {
         info!(
             "Starting email support channel: {} / {}",
             email_cfg.imap_server, email_cfg.imap_username
@@ -55,9 +62,21 @@ async fn main() -> Result<()> {
         let channel = Box::new(lnvps_agent::channel::email::EmailSupportChannel::new(
             email_cfg.clone(),
         ));
-        agent.run_loop(channel).await;
-    } else {
+        let agent = agent.clone();
+        handles.push(tokio::spawn(async move {
+            agent.run_loop(channel).await;
+        }));
+    }
+
+    if handles.is_empty() {
         info!("No support channel configured — exiting.");
+        return Ok(());
+    }
+
+    for handle in handles {
+        if let Err(e) = handle.await {
+            return Err(anyhow::anyhow!("Channel panicked: {}", e));
+        }
     }
 
     Ok(())

@@ -104,6 +104,7 @@ fn tool_specs(functions: Vec<async_openai::types::FunctionObject>) -> Vec<ChatCo
 }
 
 /// The AI support agent that handles a support conversation.
+#[derive(Clone)]
 pub struct SupportAgent {
     api: Arc<ApiClient>,
     settings: Settings,
