@@ -14,6 +14,10 @@ async fn main() -> Result<()> {
         env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
     );
 
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+
     let settings = Settings::load()?;
     info!("LNVPS support agent starting...");
     info!("Admin API URL: {}", settings.admin_api_url);
