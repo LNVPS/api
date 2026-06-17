@@ -331,7 +331,13 @@ impl Worker {
                     Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
-        } else if expires < Utc::now() {
+        } else if expires < Utc::now() && expires >= last_check {
+            // Edge-triggered: only fire on the first check after expiry crosses. The
+            // subscription stays `is_active = 1` (and thus keeps being returned by
+            // `list_lifecycle_subscriptions`) throughout the grace period until it is either
+            // renewed or the grace branch above deactivates it. Without the `expires >=
+            // last_check` guard this branch re-ran every CheckSubscriptions cycle (~30s),
+            // re-stopping the VM and re-sending the "expired" notification on a loop.
             self.queue_notification(
                 sub.user_id,
                 format!("Your subscription has expired.\n{}", sub_notification_descr),
@@ -2616,7 +2622,12 @@ mod tests {
     };
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
-        let settings = mock_settings();
+        setup_worker_with_delete_after(db, 0).await
+    }
+
+    async fn setup_worker_with_delete_after(db: Arc<MockDb>, delete_after: u16) -> Result<Worker> {
+        let mut settings = mock_settings();
+        settings.delete_after = delete_after;
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
         let work_commander = Arc::new(ChannelWorkCommander::new());
@@ -2829,6 +2840,74 @@ mod tests {
         assert!(
             deleted,
             "Unpaid VM with only an expired payment should still be deleted"
+        );
+        Ok(())
+    }
+
+    /// Drain all currently-queued work jobs without blocking, returning the count of
+    /// `SendNotification` jobs whose title contains `needle`.
+    async fn count_notifications(worker: &Worker, needle: &str) -> usize {
+        let mut count = 0;
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                worker.work_commander.recv(),
+            )
+            .await
+            {
+                Ok(Ok(jobs)) => {
+                    for j in jobs {
+                        if let WorkJob::SendNotification { title: Some(t), .. } = &j.job {
+                            if t.contains(needle) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                _ => break, // timed out (channel drained) or error
+            }
+        }
+        count
+    }
+
+    /// Regression: an expired subscription within its grace period must only fire the
+    /// "Expired" notification (and `on_expired`) ONCE, on the check where expiry is first
+    /// detected — not on every CheckSubscriptions cycle. Previously the expired branch had
+    /// no edge-trigger guard and re-ran every ~30s, re-stopping the VM and spamming
+    /// notifications in an endless loop.
+    #[tokio::test]
+    async fn test_expired_subscription_notifies_once_within_grace_period() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Subscription created 40 days ago, so its 30-day expiry is ~10 days in the past
+        // but well within a 30-day grace period.
+        let created = Utc::now().sub(TimeDelta::days(40));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let sub = db.get_subscription(subscription_id).await?;
+        assert!(sub.expires.unwrap() < Utc::now(), "sub must be expired");
+
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        // First check: last_check is just before "now", so expiry (10 days ago) is NOT in
+        // (last_check, now]. To exercise the first-detection edge we use a last_check from
+        // before the expiry, then a later last_check for the subsequent cycle.
+        let before_expiry = sub.expires.unwrap().sub(TimeDelta::days(1));
+        worker
+            .handle_subscription_state(&sub, before_expiry)
+            .await?;
+        let first = count_notifications(&worker, "Expired").await;
+        assert!(
+            first >= 1,
+            "expired notification must fire when expiry is first detected (got {first})"
+        );
+
+        // Second check on a later cycle: last_check is now after the expiry, so the guard
+        // (expires >= last_check) must suppress the repeat.
+        let after_expiry = sub.expires.unwrap().add(TimeDelta::minutes(1));
+        worker.handle_subscription_state(&sub, after_expiry).await?;
+        let second = count_notifications(&worker, "Expired").await;
+        assert_eq!(
+            second, 0,
+            "expired notification must NOT repeat on subsequent cycles within grace"
         );
         Ok(())
     }

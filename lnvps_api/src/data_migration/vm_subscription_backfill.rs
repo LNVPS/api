@@ -618,7 +618,10 @@ mod tests {
         let mut vm = vm_with_expires(created, created, false);
         vm.expires = None;
         let sub = build_subscription_for_vm(&vm, 1, "EUR".to_string(), 1, IntervalType::Month, "x");
-        assert_eq!(sub.expires, None, "NULL legacy expires => no subscription expiry");
+        assert_eq!(
+            sub.expires, None,
+            "NULL legacy expires => no subscription expiry"
+        );
         assert!(!sub.is_setup, "NULL-expires VM must not be is_setup");
         assert!(!sub.is_active);
     }
