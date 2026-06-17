@@ -49,6 +49,19 @@ impl LNVpsDbMysql {
         Ok(rows.iter().map(|r| r.get::<u32, _>("id") as u64).collect())
     }
 
+    /// List ids of all VMs that already have a subscription linked. Used by the one-time
+    /// repair pass that corrects fields written incorrectly by earlier backfill revisions
+    /// (subscription.created/currency/is_setup and the custom-VM line-item amount).
+    pub async fn list_vm_ids_with_subscription(&self) -> DbResult<Vec<u64>> {
+        let rows = sqlx::query(
+            "SELECT id FROM vm \
+             WHERE subscription_line_item_id IS NOT NULL AND subscription_line_item_id != 0",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<u32, _>("id") as u64).collect())
+    }
+
     /// Insert a subscription_payment row by copying a vm_payment row verbatim,
     /// writing external_data as raw bytes (no encrypt/decrypt round-trip).
     pub async fn insert_subscription_payment_raw(
@@ -153,7 +166,7 @@ impl LNVpsDbMysql {
     /// Used by the data migration tool where the column may still be NULL.
     pub async fn get_vm_for_migration(&self, vm_id: u64) -> DbResult<VmForMigration> {
         Ok(sqlx::query_as(
-            "SELECT id, user_id, template_id, custom_template_id, expires, \
+            "SELECT id, user_id, template_id, custom_template_id, created, expires, \
              auto_renewal_enabled, subscription_line_item_id, deleted \
              FROM vm WHERE id = ?",
         )

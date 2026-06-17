@@ -733,7 +733,7 @@ pub enum NetworkAccessPolicy {
     StaticArp = 0,
 }
 
-#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum IntervalType {
     Day = 0,
@@ -933,6 +933,7 @@ pub struct VmForMigration {
     pub user_id: u64,
     pub template_id: Option<u64>,
     pub custom_template_id: Option<u64>,
+    pub created: DateTime<Utc>,
     pub expires: DateTime<Utc>,
     pub auto_renewal_enabled: bool,
     pub subscription_line_item_id: Option<u64>,
