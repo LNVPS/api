@@ -1,10 +1,13 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::TryStreamExt;
+use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
 
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
@@ -208,11 +211,16 @@ async fn idle_session(
         .context("TCP connect timed out")?
         .context("TCP connect failed")?;
 
-    let tls_connector = native_tls::TlsConnector::builder()
-        .build()
-        .context("Failed to build TLS connector")?;
-    let tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
-    let tls_stream = timeout(t, tls_connector.connect(&host, tcp))
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let server_name = ServerName::try_from(host.as_str())
+        .context("Invalid server name for TLS")?
+        .to_owned();
+    let tls_stream = timeout(t, connector.connect(server_name, tcp))
         .await
         .context("TLS handshake timed out")?
         .context("TLS handshake failed")?;
@@ -275,7 +283,7 @@ async fn idle_session(
 
 /// Search for unseen messages, process them, and send to the channel.
 async fn fetch_and_process(
-    session: &mut async_imap::Session<tokio_native_tls::TlsStream<TcpStream>>,
+    session: &mut async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>,
     tx: &mpsc::Sender<IncomingSupportRequest>,
     seen: &mut HashSet<String>,
 ) -> Result<()> {
@@ -297,13 +305,16 @@ async fn fetch_and_process(
 
     log::info!("Found {} unseen messages", unseen.len());
     let fetch_range = unseen.join(",");
+    let fetch_stream = timeout(t, session.fetch(&fetch_range, "(FLAGS UID RFC822)"))
+        .await
+        .context("IMAP fetch timed out")?
+        .context("IMAP fetch failed")?;
+
+    let t_collect = Duration::from_secs(30);
     let messages: Vec<async_imap::types::Fetch> =
-        timeout(t, session.fetch(&fetch_range, "(FLAGS UID RFC822)"))
+        timeout(t_collect, fetch_stream.try_collect::<Vec<_>>())
             .await
-            .context("IMAP fetch timed out")?
-            .context("IMAP fetch failed")?
-            .try_collect()
-            .await
+            .context("IMAP fetch collect timed out")?
             .context("Failed to collect fetch results")?;
 
     for fetch in &messages {
@@ -537,5 +548,24 @@ mod tests {
         let (host, port) = parse_host_port("smtp.example.com", 587).unwrap();
         assert_eq!(host, "smtp.example.com");
         assert_eq!(port, 587);
+    }
+
+    /// Regression test: the original `fetch_and_process` called `.try_collect()`
+    /// *outside* any timeout. If the IMAP server sends a slow or partial response,
+    /// the stream would block forever, locking the entire email channel.
+    ///
+    /// This test verifies that wrapping a stream's `try_collect()` in
+    /// `tokio::time::timeout` correctly unblocks after the timeout elapses,
+    /// preventing the app from hanging.
+    #[tokio::test]
+    async fn try_collect_timeout_prevents_indefinite_blocking() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Simulate a stream that blocks forever (like a stalled IMAP connection)
+        let never = futures::stream::pending::<Result<i32, anyhow::Error>>();
+
+        let result = timeout(Duration::from_millis(10), never.try_collect::<Vec<_>>()).await;
+        assert!(result.is_err(), "timeout should have elapsed");
     }
 }

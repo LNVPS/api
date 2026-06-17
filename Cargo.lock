@@ -2710,7 +2710,6 @@ dependencies = [
  "futures",
  "lettre",
  "log 0.4.29",
- "native-tls",
  "nostr 0.44.2",
  "nostr-sdk",
  "reqwest 0.13.2",
@@ -2719,7 +2718,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-native-tls",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
