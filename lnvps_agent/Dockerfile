@@ -20,5 +20,4 @@ RUN apt update && \
     apt install -y ca-certificates libssl3 && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/build .
-ENV LNVPS_AGENT_CONFIG=/etc/lnvps-agent/settings.yaml
 ENTRYPOINT ["./bin/lnvps_agent"]

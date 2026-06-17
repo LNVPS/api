@@ -315,8 +315,7 @@ mss-checks:
 ### `lnvps_agent` config
 
 AI support agent. Watches an email inbox (IMAP IDLE) and/or Nostr kind-1 mentions, and answers
-support requests using an OpenAI-compatible LLM with tools that call the LNVPS APIs. Config path is
-passed via the `LNVPS_AGENT_CONFIG` environment variable; all keys can also be overridden with
+support requests using an OpenAI-compatible LLM with tools that call the LNVPS APIs. Config is loaded from a `settings.yaml` file in the working directory; all keys can also be overridden with
 `LNVPS_AGENT__*` environment variables.
 
 ```yaml

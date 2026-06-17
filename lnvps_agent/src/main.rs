@@ -14,9 +14,7 @@ async fn main() -> Result<()> {
         env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
     );
 
-    let config_path = std::env::var("LNVPS_AGENT_CONFIG").ok().map(PathBuf::from);
-
-    let settings = Settings::load(config_path)?;
+    let settings = Settings::load()?;
     info!("LNVPS support agent starting...");
     info!("Admin API URL: {}", settings.admin_api_url);
     info!("OpenAI URL: {}", settings.openai.base_url);

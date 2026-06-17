@@ -92,39 +92,18 @@ pub struct OpenAiConfig {
 }
 
 impl Settings {
-    pub fn load(path: Option<PathBuf>) -> Result<Self> {
-        let builder = Config::builder();
-
-        // Default configuration
-        let builder = builder
+    pub fn load() -> Result<Self> {
+        let builder = Config::builder()
             .set_default("listen", "0.0.0.0:8080")?
-            .set_default("openai.max_tokens", 2048u32)?;
-
-        #[cfg(debug_assertions)]
-        let builder = {
-            let default_path = std::env::current_dir()?.join("settings.yaml");
-            if default_path.exists() {
-                builder.add_source(config::File::from(default_path).required(false))
-            } else {
-                builder
-            }
-        };
-
-        // Load from explicit path
-        let builder = if let Some(p) = path {
-            builder.add_source(config::File::from(p).required(true))
-        } else {
-            builder
-        };
-
-        let config = builder
+            .set_default("openai.max_tokens", 2048u32)?
+            .add_source(config::File::with_name("settings").required(false))
             .add_source(
                 config::Environment::with_prefix("LNVPS_AGENT")
                     .separator("__")
                     .try_parsing(true),
-            )
-            .build()?;
+            );
 
+        let config = builder.build()?;
         let settings: Settings = config.try_deserialize()?;
         settings.validate()?;
         Ok(settings)
