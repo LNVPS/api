@@ -5,7 +5,7 @@ use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::data_migration::payment_method_config::PaymentMethodConfigMigration;
 use crate::data_migration::ssh_key_migration::SshKeyMigration;
-use crate::provisioner::LNVpsProvisioner;
+use crate::provisioner::VmProvisioner;
 use crate::settings::Settings;
 use anyhow::Result;
 use lnvps_db::LNVpsDb;
@@ -21,6 +21,7 @@ mod encryption_migration;
 mod ip6_init;
 mod payment_method_config;
 mod ssh_key_migration;
+pub mod vm_subscription_backfill;
 
 /// Basic data migration to run at startup
 pub trait DataMigration: Send + Sync {
@@ -29,7 +30,7 @@ pub trait DataMigration: Send + Sync {
 
 pub async fn run_data_migrations(
     db: Arc<dyn LNVpsDb>,
-    lnvps: Arc<LNVpsProvisioner>,
+    lnvps: VmProvisioner,
     settings: &Settings,
 ) -> Result<()> {
     let mut migrations: Vec<Box<dyn DataMigration>> = vec![];

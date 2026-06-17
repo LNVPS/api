@@ -46,11 +46,10 @@ async fn admin_list_roles(
     let limit = page.limit.unwrap_or(50).min(100);
     let offset = page.offset.unwrap_or(0);
 
-    let roles = this.db.list_roles().await?;
-    let total = roles.len() as u64;
+    let (roles, total) = this.db.list_roles_paginated(limit, offset).await?;
 
     let mut role_infos = Vec::new();
-    for role in roles.into_iter().skip(offset as usize).take(limit as usize) {
+    for role in roles {
         let mut role_info: AdminRoleInfo = role.clone().into();
 
         // Get role permissions

@@ -1,5 +1,5 @@
-mod lnvps;
-mod lnvps_network;
+mod vm;
+mod vm_network;
 
 #[cfg(test)]
 mod retry_tests;
@@ -10,6 +10,6 @@ mod integration_retry_tests;
 #[cfg(test)]
 mod rollback_tests;
 
-pub use lnvps::*;
 pub use lnvps_api_common::{HostCapacityService, NetworkProvisioner, PricingEngine};
-pub use lnvps_network::*;
+pub use vm::*;
+pub use vm_network::*;

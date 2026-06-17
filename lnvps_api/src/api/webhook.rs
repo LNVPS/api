@@ -18,6 +18,11 @@ pub fn router() -> Router<RouterState> {
         router = router.route("/api/v1/webhook/revolut", any(send_webhook));
     }
 
+    #[cfg(feature = "stripe")]
+    {
+        router = router.route("/api/v1/webhook/stripe", any(send_webhook));
+    }
+
     router
 }
 

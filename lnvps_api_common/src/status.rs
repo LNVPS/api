@@ -12,11 +12,12 @@ use tokio::sync::RwLock;
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum VmRunningStates {
-    Running,
     #[default]
+    Unknown,
+    Running,
     Stopped,
-    Starting,
-    Deleting,
+    /// Payment received; VM is being provisioned on the host for the first time.
+    Creating,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

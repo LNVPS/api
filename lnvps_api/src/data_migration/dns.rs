@@ -15,7 +15,7 @@ pub struct DnsDataMigration {
 
 impl DnsDataMigration {
     pub fn new(db: Arc<dyn LNVpsDb>, settings: &Settings) -> Option<Self> {
-        let dns = settings.get_dns().ok().flatten()?;
+        let dns = settings.get_dns()?;
         Some(Self {
             db,
             dns,

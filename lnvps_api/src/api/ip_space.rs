@@ -23,23 +23,16 @@ async fn v1_list_ip_space(
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
 
-    // Get all available IP spaces
-    let all_spaces = this.db.list_available_ip_space().await?;
-
-    // Filter to only show available ones (not reserved)
-    let available_spaces: Vec<_> = all_spaces
-        .into_iter()
-        .filter(|space| space.is_available && !space.is_reserved)
-        .collect();
-
-    let total = available_spaces.len() as u64;
-
-    // Paginate
-    let paginated_spaces: Vec<_> = available_spaces
-        .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .collect();
+    let (paginated_spaces, total) = this
+        .db
+        .list_available_ip_space_paginated(
+            Some(true),  // is_available = true
+            Some(false), // is_reserved = false
+            None,
+            limit,
+            offset,
+        )
+        .await?;
 
     // Convert to API format with pricing
     let mut ip_spaces = Vec::new();

@@ -17,8 +17,17 @@ cargo check
 
 **IMPORTANT:** Always use `--test-threads=1` to avoid flaky tests. Tests use shared static state (`LazyLock`) in mocks and must run sequentially.
 
+**IMPORTANT:** Before running any tests, always ensure Docker is running:
 ```bash
-# Run all tests
+docker compose up -d
+```
+The `lnvps_e2e` crate connects to MariaDB (port 3376) and the API servers. Without Docker the e2e tests all fail with connection errors.
+
+```bash
+# Run all unit tests (no API servers required)
+cargo test --workspace --exclude lnvps_e2e -- --test-threads=1
+
+# Run ALL tests including e2e (requires API servers on ports 8000 and 8001)
 cargo test -- --test-threads=1
 
 # Run a single test by name (substring match)

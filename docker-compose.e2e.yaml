@@ -1,6 +1,7 @@
 volumes:
   e2e-db:
   e2e-lnd:
+  e2e-lnd-payer:
   e2e-bitcoind:
   e2e-nostr-relay:
 
@@ -11,7 +12,7 @@ services:
       MARIADB_ROOT_PASSWORD: root
       MARIADB_DATABASE: lnvps
     ports:
-      - "3376:3306"
+      - "3377:3306"
     volumes:
       - "e2e-db:/var/lib/mysql"
     healthcheck:
@@ -23,7 +24,7 @@ services:
   redis:
     image: redis:latest
     ports:
-      - "6398:6379"
+      - "6399:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -84,6 +85,41 @@ services:
       - "10009:10009"
     volumes:
       - "e2e-lnd:/root/.lnd"
+    healthcheck:
+      test: ["CMD", "lncli", "--network=regtest", "getinfo"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  lnd-payer:
+    image: lightninglabs/lnd:v0.18.5-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      LND_ENVIRONMENT: regtest
+    command:
+      - lnd
+      - --noseedbackup
+      - --norest
+      - --debuglevel=info
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=polaruser
+      - --bitcoind.rpcpass=polarpass
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --rpclisten=0.0.0.0:10009
+      - --listen=0.0.0.0:9735
+      - --tlsextradomain=lnd-payer
+      - --tlsextraip=0.0.0.0
+    ports:
+      - "10010:10009"
+    volumes:
+      - "e2e-lnd-payer:/root/.lnd"
     healthcheck:
       test: ["CMD", "lncli", "--network=regtest", "getinfo"]
       interval: 5s

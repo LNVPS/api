@@ -1,132 +1,107 @@
--- Default company
-insert
-ignore into company(id,name,email,base_currency)
-values(1,"Dev Company","dev@example.com","EUR");
+-- Default company (aligns with the row inserted by the require_company_id migration)
+insert ignore into company(id,name,email,base_currency)
+values(1,"Default Company","admin@example.com","EUR");
 
-insert
-ignore into vm_host_region(id,name,enabled,company_id) values(1,"uat",1,1);
-insert
-ignore into vm_host(id,kind,region_id,name,ip,cpu,memory,enabled,api_token)
-values(1, 0, 1, "lab", "https://10.100.1.5:8006", 4, 4096*1024, 1, "root@pam!tester=c82f8a57-f876-4ca4-8610-c086d8d9d51c");
-insert
-ignore into vm_host_disk(id,host_id,name,size,kind,interface,enabled)
-values(1,1,"local-zfs",1000*1000*1000*1000, 0, 0, 1);
-insert
-ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
-values(1, 0,"Server","24.04",1,"https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img","2024-04-25");
-insert
-ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
-values(2, 0,"Server","22.04",1,"https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img","2022-04-21");
-insert
-ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
-values(3, 0,"Server","20.04",1,"https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img","2020-04-23");
-insert
-ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
-values(4, 1,"Server","12",1,"https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.raw","2023-06-10");
-insert
-ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
-values(5, 1,"Server","11",1,"https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw","2021-08-14");
-insert
-ignore into ip_range(id,cidr,enabled,region_id,gateway)
-values(1,"10.100.1.128/25",1,1,"10.100.1.1/24");
-insert
-ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
-values(1,"tiny_monthly",2,"EUR",1,1);
-insert
-ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
-values(2,"small_monthly",4,"EUR",1,1);
-insert
-ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
-values(3,"medium_monthly",8,"EUR",1,1);
-insert
-ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
-values(4,"large_monthly",17,"EUR",1,1);
-insert
-ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
-values(5,"xlarge_monthly",30,"EUR",1,1);
-insert
-ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
-values(6,"xxlarge_monthly",45,"EUR",1,1);
-insert
-ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
-values(1,"Tiny",1,1,1024*1024*1024*1,1024*1024*1024*40,1,2,1,1);
-insert
-ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
-values(2,"Small",1,2,1024*1024*1024*2,1024*1024*1024*80,1,2,2,1);
-insert
-ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
-values(3,"Medium",1,4,1024*1024*1024*4,1024*1024*1024*160,1,2,3,1);
-insert
-ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
-values(4,"Large",1,8,1024*1024*1024*8,1024*1024*1024*400,1,2,4,1);
-insert
-ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
-values(5,"X-Large",1,12,1024*1024*1024*16,1024*1024*1024*800,1,2,5,1);
-insert
-ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
-values(6,"XX-Large",1,20,1024*1024*1024*24,1024*1024*1024*1000,1,2,6,1);
+-- Region
+insert ignore into vm_host_region(id,name,enabled,company_id)
+values(1,"Mock",1,1);
 
--- Available IP Space for sale
-insert
-ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+-- Dummy (mock) host — kind=65535 (VmHostKind::Dummy), all credential fields ignored at runtime
+insert ignore into vm_host(id,kind,region_id,name,ip,cpu,memory,enabled,api_token)
+values(1,65535,1,"mock-host","https://localhost",4,4*1024*1024*1024,1,"");
+
+-- SSD/PCIe disk on the mock host (kind=1 SSD, interface=2 PCIe)
+insert ignore into vm_host_disk(id,host_id,name,size,kind,interface,enabled)
+values(1,1,"mock-disk",10*1000*1000*1000*1000,1,2,1);
+
+-- OS images
+insert ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
+values(1,0,"Server","24.04",1,"https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img","2024-04-25");
+insert ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
+values(2,0,"Server","22.04",1,"https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img","2022-04-21");
+insert ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
+values(3,1,"Server","12",1,"https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.raw","2023-06-10");
+insert ignore into vm_os_image(id,distribution,flavour,version,enabled,url,release_date)
+values(4,1,"Server","11",1,"https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw","2021-08-14");
+
+-- IPv4 loopback range (allocation_mode=0 Random, use_full_range=0)
+insert ignore into ip_range(id,cidr,enabled,region_id,gateway,allocation_mode,use_full_range)
+values(1,"127.0.0.0/8",1,1,"127.0.0.1/8",0,0);
+
+-- IPv6 link-local range (allocation_mode=0 Random, use_full_range=0)
+insert ignore into ip_range(id,cidr,enabled,region_id,gateway,allocation_mode,use_full_range)
+values(2,"fe80::/64",1,1,"fe80::1",0,0);
+
+-- Cost plans (amounts in cents: €2.00, €4.00, €8.00, €17.00, €30.00, €45.00)
+insert ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
+values(1,"tiny_monthly",200,"EUR",1,1);
+insert ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
+values(2,"small_monthly",400,"EUR",1,1);
+insert ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
+values(3,"medium_monthly",800,"EUR",1,1);
+insert ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
+values(4,"large_monthly",1700,"EUR",1,1);
+insert ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
+values(5,"xlarge_monthly",3000,"EUR",1,1);
+insert ignore into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type)
+values(6,"xxlarge_monthly",4500,"EUR",1,1);
+
+-- VM templates (disk_type=1 SSD, disk_interface=2 PCIe)
+insert ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
+values(1,"Tiny",  1, 1,1*1024*1024*1024, 40*1024*1024*1024,1,2,1,1);
+insert ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
+values(2,"Small", 1, 2,2*1024*1024*1024, 80*1024*1024*1024,1,2,2,1);
+insert ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
+values(3,"Medium",1, 4,4*1024*1024*1024,160*1024*1024*1024,1,2,3,1);
+insert ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
+values(4,"Large", 1, 8,8*1024*1024*1024,400*1024*1024*1024,1,2,4,1);
+insert ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
+values(5,"X-Large", 1,12,16*1024*1024*1024,800*1024*1024*1024,1,2,5,1);
+insert ignore into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id)
+values(6,"XX-Large",1,20,24*1024*1024*1024,1000*1024*1024*1024,1,2,6,1);
+
+-- Available IP space for sale (documentation ranges, safe for dev)
+insert ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
 values(1,1,"192.0.2.0/24",32,24,0,"ARIN-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
-
-insert
-ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+insert ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
 values(2,1,"198.51.100.0/22",26,22,0,"ARIN-2024-002",1,0,'{"upstream":"ExampleISP","asn":65000}');
-
-insert
-ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
+insert ignore into available_ip_space(id,company_id,cidr,min_prefix_size,max_prefix_size,registry,external_id,is_available,is_reserved,metadata)
 values(3,1,"2001:db8::/29",48,32,1,"RIPE-2024-001",1,0,'{"upstream":"ExampleISP","asn":65000}');
 
--- IP Space Pricing
--- Pricing for 192.0.2.0/24
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(1,1,32,500,"USD",1000); -- /32 single IP: $5/mo, $10 setup
+-- Custom pricing (per-resource billing, amounts in cents per unit per month)
+-- cpu_cost: €0.14/core, memory_cost: €0.01/GB, ip4_cost: €0.05/IPv4, ip6_cost: €0.02/IPv6
+insert ignore into vm_custom_pricing(id,name,enabled,region_id,currency,cpu_cost,memory_cost,ip4_cost,ip6_cost,cpu_mfg,cpu_arch,cpu_features,min_cpu,max_cpu,min_memory,max_memory,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit)
+values(1,"mock-flex",1,1,"EUR",14,1,5,2,0,0,"",1,32,1073741824,68719476736,NULL,NULL,NULL,NULL,NULL,NULL);
 
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(2,1,24,15000,"USD",5000); -- /24 (256 IPs): $150/mo, $50 setup
+-- Custom pricing disk (kind=1 SSD, interface=2 PCIe, cost=€0.01/GB/mo = 1 cent, limits 5GB–2TB)
+insert ignore into vm_custom_pricing_disk(id,pricing_id,kind,interface,cost,min_disk_size,max_disk_size)
+values(1,1,1,2,1,5368709120,2199023255552);
 
--- Pricing for 198.51.100.0/22
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(3,2,26,4000,"USD",2000); -- /26 (64 IPs): $40/mo, $20 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(4,2,25,7500,"USD",3000); -- /25 (128 IPs): $75/mo, $30 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(5,2,24,14000,"USD",5000); -- /24 (256 IPs): $140/mo, $50 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(6,2,23,26000,"USD",8000); -- /23 (512 IPs): $260/mo, $80 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(7,2,22,50000,"USD",15000); -- /22 (1024 IPs): $500/mo, $150 setup
-
--- Pricing for IPv6 2001:db8::/29
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(8,3,48,2000,"USD",5000); -- /48 (for end sites): $20/mo, $50 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(9,3,44,5000,"USD",10000); -- /44: $50/mo, $100 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(10,3,40,12000,"USD",20000); -- /40: $120/mo, $200 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(11,3,36,25000,"USD",35000); -- /36: $250/mo, $350 setup
-
-insert
-ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
-values(12,3,32,50000,"USD",50000); -- /32 (large ISP): $500/mo, $500 setup
+-- IP space pricing (amounts in cents)
+-- 192.0.2.0/24
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(1,1,32,500,"EUR",1000);    -- /32 single IP: €5/mo, €10 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(2,1,24,15000,"EUR",5000);  -- /24 (256 IPs): €150/mo, €50 setup
+-- 198.51.100.0/22
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(3,2,26,4000,"EUR",2000);   -- /26 (64 IPs): €40/mo, €20 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(4,2,25,7500,"EUR",3000);   -- /25 (128 IPs): €75/mo, €30 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(5,2,24,14000,"EUR",5000);  -- /24 (256 IPs): €140/mo, €50 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(6,2,23,26000,"EUR",8000);  -- /23 (512 IPs): €260/mo, €80 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(7,2,22,50000,"EUR",15000); -- /22 (1024 IPs): €500/mo, €150 setup
+-- 2001:db8::/29 (IPv6)
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(8,3,48,2000,"EUR",5000);   -- /48: €20/mo, €50 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(9,3,44,5000,"EUR",10000);  -- /44: €50/mo, €100 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(10,3,40,12000,"EUR",20000); -- /40: €120/mo, €200 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(11,3,36,25000,"EUR",35000); -- /36: €250/mo, €350 setup
+insert ignore into ip_space_pricing(id,available_ip_space_id,prefix_size,price_per_month,currency,setup_fee)
+values(12,3,32,50000,"EUR",50000); -- /32 (large ISP): €500/mo, €500 setup

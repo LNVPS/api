@@ -6,7 +6,7 @@ Admin API request/response format reference for LLM consumption.
 
 **DiskType**: `"hdd"`, `"ssd"`
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
-**VmRunningStates**: `"running"`, `"stopped"`, `"starting"`, `"deleting"`
+**VmRunningStates**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
 **AdminVmHistoryActionType**: `"created"`, `"started"`, `"stopped"`, `"restarted"`, `"deleted"`, `"expired"`,
 `"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`
 **AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`, `"stripe"`
@@ -19,7 +19,7 @@ Admin API request/response format reference for LLM consumption.
 **RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
-**SubscriptionPaymentType**: `"purchase"`, `"renewal"`
+**SubscriptionPaymentType**: `"purchase"`, `"renewal"`, `"upgrade"`
 **SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`
 **InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
 **CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
@@ -176,6 +176,34 @@ GET /api/admin/v1/vms/{id}
 Required Permission: `virtual_machines::view`
 
 Returns detailed VM information with complete host and region data. The VM must have valid host and region associations.
+
+The response includes a `subscription` field (type: `AdminSubscriptionInfo`) when the VM is linked to a subscription. This object contains:
+- `id` — subscription ID
+- `is_active` — whether the subscription is currently active
+- `interval_amount` / `interval_type` — billing interval
+- `currency` — billing currency
+- `payment_count` — total number of payments made
+- `line_items` — array of `AdminSubscriptionLineItemInfo` objects
+
+Example (abbreviated):
+```json
+{
+  "data": {
+    "id": 42,
+    "subscription": {
+      "id": 7,
+      "is_active": true,
+      "interval_amount": 1,
+      "interval_type": "month",
+      "currency": "USD",
+      "payment_count": 3,
+      "line_items": [{ "id": 12, "amount": 999, "setup_amount": 0 }]
+    }
+  }
+}
+```
+
+`subscription` is `null`/omitted if no subscription is linked to the VM.
 
 #### Create VM for User
 
@@ -2826,7 +2854,11 @@ The RBAC system uses the following permission format: `resource::action`
   "billing_tax_id": "string | null",
   "vm_count": number,
   "last_login": "string (ISO 8601) | null",
-  "is_admin": boolean
+  "is_admin": boolean,
+  "email_verified": boolean,
+  // Whether the user's email address has been verified
+  "has_nwc": boolean
+  // Whether the user has a Nostr Wallet Connect connection string configured
 }
 ```
 
@@ -2837,7 +2869,8 @@ The RBAC system uses the following permission format: `resource::action`
   "id": number,
   // VM ID
   "created": "string (ISO 8601)",
-  "expires": "string (ISO 8601)",
+  "expires": "string (ISO 8601) | null",
+  // null for VMs not yet paid
   "mac_address": "string",
   "image_id": number,
   // OS image ID for linking
@@ -2873,7 +2906,7 @@ The RBAC system uses the following permission format: `resource::action`
     "timestamp": number,
     // Unix timestamp of when state was collected
     "state": "running",
-    // VmRunningStates enum: "running", "stopped", "starting", "deleting"
+    // VmRunningStates enum: "unknown", "running", "stopped", "creating"
     "cpu_usage": number,
     // Current CPU usage percentage (0.0-100.0)
     "mem_usage": number,
@@ -2917,7 +2950,33 @@ The RBAC system uses the following permission format: `resource::action`
   "region_id": number,
   "region_name": "string",
   "deleted": boolean,
-  "ref_code": "string | null"
+  "disabled": boolean,
+  // Whether the VM has been administratively disabled
+  "ref_code": "string | null",
+  "subscription": {
+    // Full AdminSubscriptionInfo — present when the VM has a linked subscription
+    "id": number,
+    "name": "string",
+    "is_active": boolean,
+    "auto_renewal_enabled": boolean,
+    "interval_amount": number,
+    "interval_type": "day" | "month" | "year",
+    "currency": "string",
+    "payment_count": number,
+    "line_items": [
+      {
+        "id": number,
+        "name": "string",
+        "description": "string | null",
+        "amount": number,
+        // recurring cost in cents/millisats
+        "setup_amount": number
+        // one-time setup fee in cents/millisats
+      }
+    ]
+  }
+  | null
+  // null/omitted when no subscription is linked
 }
 ```
 
@@ -2956,8 +3015,7 @@ The RBAC system uses the following permission format: `resource::action`
   },
   "assigned_by": "number | null",
   "assigned_at": "string (ISO 8601)",
-  "expires_at": "string (ISO 8601) | null",
-  "is_active": boolean
+  "expires_at": "string (ISO 8601) | null"
 }
 ```
 
@@ -2988,6 +3046,8 @@ The RBAC system uses the following permission format: `resource::action`
   "load_memory": number,
   "load_disk": number,
   "vlan_id": "number | null",
+  "mtu": "number | null",
+  // MTU setting for network configuration (null if not set)
   "disks": [
     {
       "id": number,
@@ -3030,7 +3090,8 @@ The RBAC system uses the following permission format: `resource::action`
   "id": number,
   "name": "string",
   "enabled": boolean,
-  "company_id": "number | null",
+  "company_id": number,
+  // Company that owns this region
   "host_count": number,
   "total_vms": number,
   // Count of active (non-deleted) VMs only
@@ -3132,6 +3193,8 @@ The RBAC system uses the following permission format: `resource::action`
   "created": "string (ISO 8601)",
   "expires": "string (ISO 8601) | null",
   "is_active": boolean,
+  "is_setup": boolean,
+  // Whether the subscription has been fully set up (resources allocated)
   "currency": "string",
   // "USD", "EUR", "BTC", "GBP", "CAD", "CHF", "AUD", "JPY"
   "interval_amount": number,
@@ -3199,6 +3262,8 @@ The RBAC system uses the following permission format: `resource::action`
   // Total amount in cents/millisats
   "currency": "string",
   // "USD", "EUR", "BTC", etc.
+  "company_base_currency": "string",
+  // Base currency of the company that owns the subscription (e.g., "EUR")
   "payment_method": "lightning"
   |
   "revolut"
@@ -3208,17 +3273,25 @@ The RBAC system uses the following permission format: `resource::action`
   "stripe",
   "payment_type": "purchase"
   |
-  "renewal",
+  "renewal"
+  |
+  "upgrade",
   // SubscriptionPaymentType enum
   "external_id": "string | null",
   // External payment processor ID
   "is_paid": boolean,
   "paid_at": "string (ISO 8601) | null",
   // When payment was completed (null if unpaid)
-  "rate": number
+  "rate": number,
+  // Exchange rate to company_base_currency
+  "time_value": number
   |
   null,
-  // Exchange rate if applicable
+  // Seconds added to expiry when this payment is completed (omitted if not applicable)
+  "metadata": object
+  |
+  null,
+  // Service-specific JSON metadata (omitted if none)
   "tax": number,
   // Tax amount in cents/millisats
   "processing_fee": number
@@ -3239,8 +3312,12 @@ The RBAC system uses the following permission format: `resource::action`
   "release_date": "string (ISO 8601)",
   "url": "string",
   "default_username": "string | null",
-  "active_vm_count": number
+  "active_vm_count": number,
   // Number of active (non-deleted) VMs using this image
+  "sha2": "string | null",
+  // SHA-256 checksum of the image file (omitted if not set)
+  "sha2_url": "string | null"
+  // URL to a file containing the SHA-256 checksum (omitted if not set)
 }
 ```
 
@@ -3484,7 +3561,25 @@ The RBAC system uses the following permission format: `resource::action`
 }
 ```
 
+### AdminRouterInfo
+
+Embedded summary returned when a router is referenced inside another object (e.g. inside `AdminAccessPolicyDetail`).
+
+```json
+{
+  "id": number,
+  "name": "string",
+  "enabled": boolean,
+  "kind": "mikrotik",
+  // RouterKind enum: "mikrotik" or "ovh_additional_ip"
+  "url": "string"
+  // Router API URL
+}
+```
+
 ### AdminRouterDetail
+
+Full detail returned by `GET /api/admin/v1/routers/{id}`.
 
 ```json
 {
@@ -3909,6 +4004,8 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 ```json
 {
   "id": number,
+  "company_id": number,
+  // Company that owns this IP space block
   "cidr": "string",
   // e.g., "192.168.0.0/22"
   "min_prefix_size": number,
@@ -4356,6 +4453,82 @@ Instead, the config contains boolean indicators showing whether these values are
   // Supported currency codes (e.g., ["EUR", "USD"]). Empty array means use defaults.
   "created": "string (ISO 8601)",
   "modified": "string (ISO 8601)"
+}
+```
+
+### SanitizedProviderConfig
+
+The `config` field of `AdminPaymentMethodConfigInfo` is a tagged union — the `"type"` field identifies the variant. All secret/token values are replaced with boolean `has_*` indicators.
+
+**LND (`"type": "lnd"`)**
+
+```json
+{
+  "type": "lnd",
+  "url": "string",
+  // LND gRPC endpoint URL
+  "cert_path": "string",
+  // Path to the TLS certificate file on the server
+  "macaroon_path": "string"
+  // Path to the macaroon file on the server
+}
+```
+
+**Revolut (`"type": "revolut"`)**
+
+```json
+{
+  "type": "revolut",
+  "url": "string",
+  // Revolut API base URL
+  "api_version": "string",
+  // API version string (e.g. "2024-09-01")
+  "public_key": "string",
+  // Revolut public key used for webhook verification
+  "has_token": boolean,
+  // Whether the API token is configured
+  "has_webhook_secret": boolean
+  // Whether the webhook secret is configured
+}
+```
+
+**Stripe (`"type": "stripe"`)**
+
+```json
+{
+  "type": "stripe",
+  "publishable_key": "string",
+  // Stripe publishable key (safe to expose)
+  "has_secret_key": boolean,
+  // Whether the secret key is configured
+  "has_webhook_secret": boolean
+  // Whether the webhook signing secret is configured
+}
+```
+
+**PayPal (`"type": "paypal"`)**
+
+```json
+{
+  "type": "paypal",
+  "client_id": "string",
+  // PayPal OAuth client ID (safe to expose)
+  "mode": "string",
+  // "sandbox" or "live"
+  "has_client_secret": boolean
+  // Whether the client secret is configured
+}
+```
+
+**Bitvora (`"type": "bitvora"`)**
+
+```json
+{
+  "type": "bitvora",
+  "has_token": boolean,
+  // Whether the API token is configured
+  "has_webhook_secret": boolean
+  // Whether the webhook secret is configured
 }
 ```
 

@@ -64,7 +64,10 @@ impl DataMigration for EmailHashBackfillMigration {
 
                 updated += 1;
                 if updated % 100 == 0 {
-                    info!("Email hash backfill progress: {} updated, {} skipped", updated, skipped);
+                    info!(
+                        "Email hash backfill progress: {} updated, {} skipped",
+                        updated, skipped
+                    );
                 }
             }
 

@@ -10,6 +10,23 @@ mod routes;
 mod subscriptions;
 mod webhook;
 
+use crate::settings::Settings;
+use crate::subscription::SubscriptionHandler;
+pub use contact::router as contacts_router;
+pub use docs::router as docs_router;
+pub use ip_space::router as ip_space_router;
+pub use legal::router as legal_router;
+use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander};
+use lnvps_db::LNVpsDb;
+#[cfg(feature = "nostr-domain")]
+pub use nostr_domain::router as nostr_domain_router;
+pub use referral::router as referral_router;
+pub use routes::routes as main_router;
+use serde::Deserialize;
+use std::sync::Arc;
+pub use subscriptions::router as subscriptions_router;
+pub use webhook::router as webhook_router;
+
 #[derive(Deserialize)]
 pub(crate) struct PaymentMethodQuery {
     pub method: Option<String>,
@@ -32,26 +49,9 @@ pub(crate) struct AuthQuery {
 pub struct RouterState {
     pub db: Arc<dyn LNVpsDb>,
     pub state: VmStateCache,
-    pub provisioner: Arc<LNVpsProvisioner>,
-    pub history: Arc<VmHistoryLogger>,
+    pub sub_handler: SubscriptionHandler,
+    pub history: VmHistoryLogger,
     pub settings: Settings,
     pub rates: Arc<dyn ExchangeRateService>,
     pub work_sender: Arc<dyn WorkCommander>,
 }
-
-use crate::provisioner::LNVpsProvisioner;
-use crate::settings::Settings;
-pub use contact::router as contacts_router;
-pub use docs::router as docs_router;
-pub use ip_space::router as ip_space_router;
-pub use legal::router as legal_router;
-use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander};
-use lnvps_db::LNVpsDb;
-#[cfg(feature = "nostr-domain")]
-pub use nostr_domain::router as nostr_domain_router;
-pub use referral::router as referral_router;
-pub use routes::routes as main_router;
-use serde::Deserialize;
-use std::sync::Arc;
-pub use subscriptions::router as subscriptions_router;
-pub use webhook::router as webhook_router;

@@ -152,7 +152,7 @@ async fn admin_create_vm_template(
         let cost_plan_interval_amount = req.cost_plan_interval_amount.unwrap_or(1);
         let cost_plan_interval_type = req
             .cost_plan_interval_type
-            .unwrap_or(lnvps_api_common::ApiVmCostPlanIntervalType::Month);
+            .unwrap_or(lnvps_api_common::ApiIntervalType::Month);
 
         if cost_plan_interval_amount == 0 {
             return Err(anyhow::anyhow!("Cost plan interval amount cannot be zero").into());

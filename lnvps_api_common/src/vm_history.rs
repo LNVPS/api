@@ -33,8 +33,6 @@ impl VmHistoryLogger {
             "template_id": vm.template_id,
             "custom_template_id": vm.custom_template_id,
             "ssh_key_id": vm.ssh_key_id,
-            "created": vm.created,
-            "expires": vm.expires,
             "disk_id": vm.disk_id,
             "mac_address": vm.mac_address,
             "ref_code": vm.ref_code
@@ -353,7 +351,6 @@ impl VmHistoryLogger {
             "template_id": old_vm.template_id,
             "custom_template_id": old_vm.custom_template_id,
             "ssh_key_id": old_vm.ssh_key_id,
-            "expires": old_vm.expires,
             "disk_id": old_vm.disk_id,
             "mac_address": old_vm.mac_address
         });
@@ -364,7 +361,6 @@ impl VmHistoryLogger {
             "template_id": new_vm.template_id,
             "custom_template_id": new_vm.custom_template_id,
             "ssh_key_id": new_vm.ssh_key_id,
-            "expires": new_vm.expires,
             "disk_id": new_vm.disk_id,
             "mac_address": new_vm.mac_address
         });
@@ -468,14 +464,12 @@ mod tests {
             image_id: 0,
             template_id: None,
             custom_template_id: None,
+            subscription_line_item_id: 0,
             ssh_key_id: 0,
-            created: chrono::Utc::now(),
-            expires: chrono::Utc::now(),
             disk_id: 0,
             mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
         logger.log_vm_created(&vm, Some(1), None).await.unwrap();
@@ -648,7 +642,6 @@ mod tests {
     #[tokio::test]
     async fn test_log_vm_configuration_changed() {
         let logger = make_logger();
-        let now = chrono::Utc::now();
         let old_vm = lnvps_db::Vm {
             id: 18,
             host_id: 1,
@@ -656,14 +649,12 @@ mod tests {
             image_id: 1,
             template_id: Some(1),
             custom_template_id: None,
+            subscription_line_item_id: 0,
             ssh_key_id: 1,
-            created: now,
-            expires: now,
             disk_id: 1,
             mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
             deleted: false,
             ref_code: None,
-            auto_renewal_enabled: false,
             disabled: false,
         };
         let mut new_vm = old_vm.clone();

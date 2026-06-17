@@ -150,7 +150,7 @@ async fn admin_time_series_report(
     for payment in payments {
         time_series_payments.push(TimeSeriesPayment {
             id: hex::encode(&payment.id),
-            vm_id: payment.vm_id,
+            vm_id: payment.vm_id.unwrap_or(0),
             created: payment.created.to_rfc3339(),
             expires: payment.expires.to_rfc3339(),
             amount: payment.amount,
@@ -159,16 +159,16 @@ async fn admin_time_series_report(
             external_id: payment.external_id,
             is_paid: payment.is_paid,
             rate: payment.rate,
-            time_value: payment.time_value,
+            time_value: payment.time_value.unwrap_or(0),
             tax: payment.tax,
             company_id: payment.company_id,
             company_name: payment.company_name.clone(),
             company_base_currency: payment.company_base_currency.clone(),
             user_id: payment.user_id,
-            host_id: payment.host_id,
-            host_name: payment.host_name.clone(),
-            region_id: payment.region_id,
-            region_name: payment.region_name.clone(),
+            host_id: payment.host_id.unwrap_or(0),
+            host_name: payment.host_name.clone().unwrap_or_default(),
+            region_id: payment.region_id.unwrap_or(0),
+            region_name: payment.region_name.clone().unwrap_or_default(),
         });
     }
 

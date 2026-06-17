@@ -16,6 +16,8 @@ mod admin_api;
 pub mod client;
 pub mod db;
 mod lifecycle;
+pub mod lightning;
 pub mod nip98;
 mod rbac;
 mod user_api;
+pub mod worker;
