@@ -660,3 +660,133 @@ pub struct ApiCustomTemplateDiskParam {
     pub disk_type: ApiDiskType,
     pub disk_interface: ApiDiskInterface,
 }
+
+/// Service-specific configuration stored on a subscription line item.
+///
+/// Each variant references the resource this line item represents.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ApiSubscriptionLineItemConfiguration {
+    /// A VPS (virtual private server).
+    #[serde(rename = "vps")]
+    Vps {
+        vm_id: u64,
+    },
+    /// An IP range allocation.
+    #[serde(rename = "ip_range")]
+    IpRange {
+        ip_space_pricing_id: u64,
+    },
+}
+
+impl ApiSubscriptionLineItemConfiguration {
+    /// Try to parse from a raw JSON value stored in the database.
+    ///
+    /// First attempts tagged deserialization (new data with `type` field),
+    /// then falls back to auto-detection for legacy untagged JSON.
+    pub fn from_raw_value(value: &serde_json::Value) -> Option<Self> {
+        // Try tagged format first
+        serde_json::from_value(value.clone()).ok().or_else(|| {
+            // Legacy untagged fallback: detect by known field names
+            let obj = value.as_object()?;
+            if obj.contains_key("ip_space_pricing_id") {
+                Some(Self::IpRange {
+                    ip_space_pricing_id: obj.get("ip_space_pricing_id")?.as_u64()?,
+                })
+            } else if obj.contains_key("vm_id") {
+                Some(Self::Vps {
+                    vm_id: obj.get("vm_id")?.as_u64()?,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Convert back to a database-compatible JSON value (always includes the `type` tag).
+    pub fn to_raw_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vps_roundtrip() {
+        let cfg = ApiSubscriptionLineItemConfiguration::Vps { vm_id: 42 };
+        let raw = cfg.to_raw_value();
+        let parsed = ApiSubscriptionLineItemConfiguration::from_raw_value(&raw).unwrap();
+        match parsed {
+            ApiSubscriptionLineItemConfiguration::Vps { vm_id } => assert_eq!(vm_id, 42),
+            _ => panic!("expected Vps"),
+        }
+    }
+
+    #[test]
+    fn test_ip_range_roundtrip() {
+        let cfg = ApiSubscriptionLineItemConfiguration::IpRange {
+            ip_space_pricing_id: 7,
+        };
+        let raw = cfg.to_raw_value();
+        let parsed = ApiSubscriptionLineItemConfiguration::from_raw_value(&raw).unwrap();
+        match parsed {
+            ApiSubscriptionLineItemConfiguration::IpRange {
+                ip_space_pricing_id,
+            } => assert_eq!(ip_space_pricing_id, 7),
+            _ => panic!("expected IpRange"),
+        }
+    }
+
+    #[test]
+    fn test_from_legacy_untagged_ip_range() {
+        let raw = serde_json::json!({
+            "ip_space_pricing_id": 5,
+            "available_ip_space_id": 2,
+            "prefix_size": 24
+        });
+        let cfg = ApiSubscriptionLineItemConfiguration::from_raw_value(&raw).unwrap();
+        match cfg {
+            ApiSubscriptionLineItemConfiguration::IpRange {
+                ip_space_pricing_id,
+            } => assert_eq!(ip_space_pricing_id, 5),
+            _ => panic!("expected IpRange"),
+        }
+    }
+
+    #[test]
+    fn test_from_legacy_untagged_vps() {
+        let raw = serde_json::json!({
+            "vm_id": 99,
+            "cpu": 2,
+            "memory": 4096
+        });
+        let cfg = ApiSubscriptionLineItemConfiguration::from_raw_value(&raw).unwrap();
+        match cfg {
+            ApiSubscriptionLineItemConfiguration::Vps { vm_id } => assert_eq!(vm_id, 99),
+            _ => panic!("expected Vps"),
+        }
+    }
+
+    #[test]
+    fn test_from_raw_value_none() {
+        let raw = serde_json::json!({"foo": 1});
+        let cfg = ApiSubscriptionLineItemConfiguration::from_raw_value(&raw);
+        assert!(cfg.is_none());
+    }
+
+    #[test]
+    fn test_from_raw_value_null() {
+        let cfg = ApiSubscriptionLineItemConfiguration::from_raw_value(&serde_json::Value::Null);
+        assert!(cfg.is_none());
+    }
+
+    #[test]
+    fn test_serialization_includes_type_tag() {
+        let cfg = ApiSubscriptionLineItemConfiguration::Vps { vm_id: 1 };
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(s.contains(r#""type":"vps""#));
+        assert!(s.contains(r#""vm_id":1"#));
+    }
+}

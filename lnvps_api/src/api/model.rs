@@ -646,7 +646,7 @@ pub struct ApiSubscriptionLineItem {
     pub description: Option<String>,
     pub price: ApiPrice,
     pub setup_fee: ApiPrice,
-    pub configuration: Option<serde_json::Value>,
+    pub configuration: Option<ApiSubscriptionLineItemConfiguration>,
 }
 
 impl ApiSubscriptionLineItem {
@@ -657,6 +657,11 @@ impl ApiSubscriptionLineItem {
         let price = CurrencyAmount::from_u64(api_currency.into(), line_item.amount);
         let setup_fee = CurrencyAmount::from_u64(api_currency.into(), line_item.setup_amount);
 
+        let configuration = line_item
+            .configuration
+            .as_ref()
+            .and_then(|v| ApiSubscriptionLineItemConfiguration::from_raw_value(v));
+
         Self {
             id: line_item.id,
             subscription_id: line_item.subscription_id,
@@ -664,7 +669,7 @@ impl ApiSubscriptionLineItem {
             description: line_item.description,
             price: price.into(),
             setup_fee: setup_fee.into(),
-            configuration: line_item.configuration,
+            configuration,
         }
     }
 }

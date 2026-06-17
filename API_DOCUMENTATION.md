@@ -272,7 +272,13 @@ interface SubscriptionLineItem {
   description?: string;
   price: Price; // Recurring cost per billing cycle
   setup_fee: Price; // One-time setup fee
-  configuration?: any; // Service-specific configuration (JSON)
+  configuration?: SubscriptionLineItemConfiguration; // Service-specific configuration (tagged union)
+}
+
+// Tagged union discriminated by the "type" field.
+type SubscriptionLineItemConfiguration =
+  | { type: "vps"; vm_id: number }
+  | { type: "ip_range"; ip_space_pricing_id: number };
 }
 
 interface SubscriptionPayment {
