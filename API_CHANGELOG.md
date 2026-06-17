@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-06-17
+
+### Added
+
+- **2026-06-15** - `GET /api/admin/v1/users/by-email` — find a user by email address
+  - Looks up a user via an indexed SHA-256 hash of the (lowercased, trimmed) email and returns the full `AdminUserInfo`, or a `"User not found"` error if no match.
+  - Query parameter: `email` (required). Requires the `users::view` permission.
+  - Backed by a new `email_hash` column on the users table, backfilled for existing users at startup.
+
+- **2026-04-03** - LNURL-pay endpoints for VM renewal restored
+  - `GET /.well-known/lnurlp/{id}` — LNURL PayResponse for a VM. These endpoints were lost during the Rocket→Axum migration and are now working again (the path-parameter syntax was corrected for Axum).
+  - `GET /api/v1/vm/{id}/renew-lnurlp?amount={millisats}` — returns an invoice to extend the VM via LNURL pay.
+
+### Changed
+
+- **2026-04-03** - Unpaid VMs with a non-expired pending payment are no longer auto-deleted
+  - The worker cleanup loop now skips deletion of unpaid VMs that still have a pending (non-expired) payment, giving slower payment methods (e.g. Revolut) time to settle before the VM is removed.
+
+### Fixed
+
+- **2026-06-16** - VM→subscription backfill now runs reliably at startup
+  - The backfill is executed during app startup, after schema migrations and before any VM read, and preserves each VM's existing expiry and auto-renewal preference. The legacy `vm.expires` / `vm.created` columns are no longer dropped before the backfill runs, which previously caused the backfill to fail for every VM and break all VM reads. (No external API surface change — listed for operator awareness.)
+
+- **2026-04-26** - Region capacity no longer reports IP ranges as full incorrectly
+  - `GET /api/v1/vm/templates` and region availability — the gateway IP is now only counted as a used address when it actually falls within the allocation CIDR. Previously a gateway outside the range inflated the used-IP count and could falsely report a region/range as full while free IPs remained.
+
+- **2026-04-02** - Payments for already-deleted VMs are handled gracefully
+  - `POST /api/v1/vm/{id}/renew` and payment confirmation — a payment that arrives for a VM auto-deleted before the (slow) payment settled now un-deletes the VM and applies the payment instead of erroring; the VM is then re-provisioned by the next check. Renewal/invoice creation for VMs that remain deleted is rejected with `"VM not found"`.
+  - A race where a VM paid between the cleanup snapshot and the deletion step could be deleted is fixed by re-reading VM state immediately before deletion.
+
 ### Added
 
 - **2026-03-10** - `"creating"` VM state for cleaner first-provision UX (closes #119)
