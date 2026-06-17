@@ -21,6 +21,9 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
   - NIP-05 identity server (`lnvps_nostr`)
   - NIP-47 Nostr Wallet Connect for auto-renewal
   - NIP-90 Data Vending Machine (DVM) for provisioning via Nostr
+- **AI support agent** (`lnvps_agent`)
+  - Handles customer support requests with an OpenAI-compatible LLM and API-calling tools
+  - Email channel (IMAP IDLE inbox watching + SMTP replies) and Nostr kind-1 mention channel
 - **Security**
   - XDP eBPF SYN-flood rate limiter (`lnvps_ebpf` + `lnvps_fw_service`)
   - Database field-level AES-GCM encryption for sensitive columns
@@ -47,8 +50,11 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
 | `lnvps_api_common` | — | Shared types, pricing engine, exchange rates, Redis queue, NIP-98 auth |
 | `lnvps_db` | — | Database abstraction (MySQL/SQLx), migrations, field-level encryption |
 | `lnvps_nostr` | `lnvps_nostr` | Standalone NIP-05 identity server (`/.well-known/nostr.json`) |
+| `lnvps_agent` | `lnvps_agent` | AI support agent — answers support requests via email (IMAP/SMTP) and Nostr kind-1 mentions using an OpenAI-compatible LLM with API-calling tools |
 | `lnvps_operator` | `lnvps_operator` | Kubernetes operator — reconciles Nostr domain Ingress objects |
 | `lnvps_health` | `lnvps_health` | Network health monitor — TCP MSS/PMTU checks, DNS, Prometheus metrics |
+| `lnvps_host_util` | — | Host-side helper utilities packaged for isolated Docker builds |
+| `lnvps_e2e` | — | End-to-end integration test suite (spins up API + worker against a real DB/LND) |
 | `lnvps_ebpf` | — | XDP eBPF SYN-flood rate limiter (kernel program) |
 | `lnvps_fw_service` | `lnvps_fw_service` | Userspace loader for the eBPF firewall |
 
@@ -58,6 +64,7 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
 cargo build --release -p lnvps_api
 cargo build --release -p lnvps_api_admin
 cargo build --release -p lnvps_nostr
+cargo build --release -p lnvps_agent
 cargo build --release -p lnvps_operator
 cargo build --release -p lnvps_health
 ```
@@ -301,4 +308,45 @@ mss-checks:
 ```bash
 ./lnvps_health --config config.yaml         # run continuously
 ./lnvps_health --config config.yaml --once  # run once and exit
+```
+
+---
+
+### `lnvps_agent` config
+
+AI support agent. Watches an email inbox (IMAP IDLE) and/or Nostr kind-1 mentions, and answers
+support requests using an OpenAI-compatible LLM with tools that call the LNVPS APIs. Config path is
+passed via the `LNVPS_AGENT_CONFIG` environment variable; all keys can also be overridden with
+`LNVPS_AGENT__*` environment variables.
+
+```yaml
+listen: "0.0.0.0:8080"                       # agent HTTP server (default)
+admin-api-url: "https://api.example.com"     # LNVPS admin API base URL (required)
+user-api-url: "https://api.example.com"      # LNVPS user API base URL (required)
+nsec: "nsec1234xxx"                           # signs NIP-98 auth events / Nostr ops (required)
+system-prompt: "You are LNVPS support..."    # optional system prompt override
+conversation-history-path: "/var/lib/lnvps-agent"  # optional history store dir
+
+openai:                                       # OpenAI-compatible LLM (required)
+  base-url: "http://localhost:11434/v1"      # e.g. Ollama, or https://api.openai.com/v1
+  api-key: "sk-..."                          # optional (not needed for Ollama)
+  model: "gpt-4o"
+  max-tokens: 2048
+
+email:                                        # email channel (optional)
+  imap-server: "imap.gmail.com:993"
+  imap-username: "support@example.com"
+  imap-password: "app-password"
+  imap-mailbox: "INBOX"                       # optional
+  smtp-server: "smtp.gmail.com:587"
+  smtp-username: "support@example.com"
+  smtp-password: "app-password"
+  smtp-from: "support@example.com"
+  smtp-from-name: "LNVPS Support"            # optional
+
+kind1:                                        # Nostr kind-1 mention channel (optional)
+  relays:
+    - "wss://relay.damus.io"
+  mention-pubkeys: []                          # hex pubkeys to watch; defaults to the bot's own
+  poll-interval-secs: 30
 ```
