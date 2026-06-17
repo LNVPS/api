@@ -760,6 +760,21 @@ interface ReferralState extends Referral {
   - `amount`: Amount in millisatoshis (minimum 1000)
 - **Response**: Lightning Network invoice
 
+### Legal Documents
+
+#### Generate Unsigned Sponsoring LIR Agreement
+- **GET** `/api/v1/legal/sponsoring-lir-agreement?data={base64url_json}`
+- **Auth**: None
+- **Query Params**:
+  - `data`: base64url-encoded JSON of the agreement data
+- **Response**: Rendered HTML agreement document
+- **Notes**: Rejects data that includes a cryptographic proof (use the signed endpoint for that)
+
+#### Generate Signed Sponsoring LIR Agreement from Subscription
+- **GET** `/api/v1/legal/sponsoring-lir-agreement/from-subscription/{subscription_id}`
+- **Auth**: NIP-98
+- **Response**: `SignedAgreementUrlResponse` — a cryptographically signed LIR agreement for one of the caller's own subscriptions. Provider/end-user details are populated from company and user billing data. Returns an error if the subscription does not belong to the caller.
+
 ## Error Handling
 
 All endpoints return errors in the following format:

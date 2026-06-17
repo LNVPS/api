@@ -19,8 +19,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `GET /.well-known/lnurlp/{id}` — LNURL PayResponse for a VM. These endpoints were lost during the Rocket→Axum migration and are now working again (the path-parameter syntax was corrected for Axum).
   - `GET /api/v1/vm/{id}/renew-lnurlp?amount={millisats}` — returns an invoice to extend the VM via LNURL pay.
 
+- **2026-02-25** - Resource limits on custom pricing plans, propagated to custom templates
+  - `POST /api/admin/v1/custom_pricing` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
+  - `PATCH /api/admin/v1/custom_pricing/{id}` — Accepts the same limit fields; send `null` to remove a limit
+  - `GET /api/admin/v1/custom_pricing` / `GET /api/admin/v1/custom_pricing/{id}` — Response now includes limit fields (omitted when uncapped)
+  - Limits are copied from the pricing plan into each `VmCustomTemplate` at VM provisioning time (new VMs and template upgrades)
+  - `None` / omitted = uncapped
+- **2026-02-25** - Template resource limits for fair-use and SLA enforcement (closes #26)
+  - `POST /api/admin/v1/vm_templates` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
+  - `PATCH /api/admin/v1/vm_templates/{id}` — Accepts the same limit fields; send `null` to remove a limit
+  - `GET /api/admin/v1/vm_templates` / `GET /api/admin/v1/vm_templates/{id}` — Response now includes limit fields (omitted when uncapped)
+  - Limits are applied at VM create time and on any VM configure/upgrade:
+    - **Disk IO**: `mbps_rd`/`mbps_wr`/`iops_rd`/`iops_wr` on the primary disk via Proxmox API
+    - **Network bandwidth**: `rate=N` on `net0` interface
+    - **CPU limit**: `cpulimit` VM config option (fraction of allocated cores)
+  - `None` / omitted = uncapped (preserves existing behaviour for all current VMs)
+- **2026-02-24** - Cloud image checksum verification and on-demand download (closes #69)
+  - `POST /api/admin/v1/vm_os_images/{id}/download` — Enqueue an immediate download/re-check of an OS image on all hosts (requires `vm_os_image::update`)
+  - `PATCH /api/admin/v1/vm_os_images/{id}` — Now correctly applies `sha2` and `sha2_url` updates
+  - Worker: `DownloadOsImages` job fetches `sha2_url`, compares checksum via SSH, and re-downloads stale images; checksum is also passed to Proxmox `download-url` API for in-flight verification
+- **2026-02-24** - Added `company_base_currency` field to `AdminVmPaymentInfo`
+  - `GET /api/admin/v1/vms/{id}/payments` — Response now includes `company_base_currency`
+  - `GET /api/admin/v1/vms/{id}/payments/{payment_id}` — Response now includes `company_base_currency`
+  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Response now includes `company_base_currency`
+- **2026-02-23** - Sponsoring LIR Agreement generation (User API)
+  - `GET /api/v1/legal/sponsoring-lir-agreement?data={base64url_json}` — Renders an unsigned LIR agreement HTML document from base64url-encoded JSON agreement data. Rejects data that carries a cryptographic proof.
+  - `GET /api/v1/legal/sponsoring-lir-agreement/from-subscription/{subscription_id}` (NIP-98 auth) — Generates a cryptographically signed LIR agreement for one of the caller's own subscriptions, populating provider/end-user details from company and billing data. Returns a `SignedAgreementUrlResponse`.
+- **2026-02-23** - Admin endpoints to manually complete payments
+  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Mark a VM payment as paid, extend VM expiry, and dispatch provisioning (requires `payments::update`)
+  - `POST /api/admin/v1/subscription_payments/{id}/complete` — Mark a subscription payment as paid, extend subscription by 30 days, and activate it (requires `subscription_payments::update`)
+
 ### Changed
 
+- **2026-02-25** - Email verification is now required before creating a VM (closes #92)
+  - `POST /api/v1/vm` — Returns `400` with error message if the user's email is not verified
+  - `POST /api/v1/vm/custom-template` — Same gate applied
 - **2026-04-03** - Unpaid VMs with a non-expired pending payment are no longer auto-deleted
   - The worker cleanup loop now skips deletion of unpaid VMs that still have a pending (non-expired) payment, giving slower payment methods (e.g. Revolut) time to settle before the VM is removed.
 
@@ -35,6 +68,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **2026-04-02** - Payments for already-deleted VMs are handled gracefully
   - `POST /api/v1/vm/{id}/renew` and payment confirmation — a payment that arrives for a VM auto-deleted before the (slow) payment settled now un-deletes the VM and applies the payment instead of erroring; the VM is then re-provisioned by the next check. Renewal/invoice creation for VMs that remain deleted is rejected with `"VM not found"`.
   - A race where a VM paid between the cleanup snapshot and the deletion step could be deleted is fixed by re-reading VM state immediately before deletion.
+
+- **2026-02-23** - Fixed inability to unset `cpu_mfg`, `cpu_arch`, `cpu_features` fields via PATCH endpoints
+  - `PATCH /api/admin/v1/vm_templates/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - `PATCH /api/admin/v1/custom_pricing/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - `PATCH /api/admin/v1/hosts/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - Previously, sending `null` for these fields was treated the same as omitting them (no change)
 
 ### Added
 
@@ -141,46 +180,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `POST /api/admin/v1/vms/{id}/renew` — Same `intervals` support in admin renewal endpoint
 
 ## [v0.2.0] - 2026-02-22
-
-### Changed
-- **2026-02-25** - Email verification is now required before creating a VM (closes #92)
-  - `POST /api/v1/vm` — Returns `400` with error message if the user's email is not verified
-  - `POST /api/v1/vm/custom-template` — Same gate applied
-
-### Added
-- **2026-02-25** - Resource limits on custom pricing plans, propagated to custom templates
-  - `POST /api/admin/v1/custom_pricing` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
-  - `PATCH /api/admin/v1/custom_pricing/{id}` — Accepts the same limit fields; send `null` to remove a limit
-  - `GET /api/admin/v1/custom_pricing` / `GET /api/admin/v1/custom_pricing/{id}` — Response now includes limit fields (omitted when uncapped)
-  - Limits are copied from the pricing plan into each `VmCustomTemplate` at VM provisioning time (new VMs and template upgrades)
-  - `None` / omitted = uncapped
-- **2026-02-25** - Template resource limits for fair-use and SLA enforcement (closes #26)
-  - `POST /api/admin/v1/vm_templates` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
-  - `PATCH /api/admin/v1/vm_templates/{id}` — Accepts the same limit fields; send `null` to remove a limit
-  - `GET /api/admin/v1/vm_templates` / `GET /api/admin/v1/vm_templates/{id}` — Response now includes limit fields (omitted when uncapped)
-  - Limits are applied at VM create time and on any VM configure/upgrade:
-    - **Disk IO**: `mbps_rd`/`mbps_wr`/`iops_rd`/`iops_wr` on the primary disk via Proxmox API
-    - **Network bandwidth**: `rate=N` on `net0` interface
-    - **CPU limit**: `cpulimit` VM config option (fraction of allocated cores)
-  - `None` / omitted = uncapped (preserves existing behaviour for all current VMs)
-- **2026-02-24** - Cloud image checksum verification and on-demand download (closes #69)
-  - `POST /api/admin/v1/vm_os_images/{id}/download` — Enqueue an immediate download/re-check of an OS image on all hosts (requires `vm_os_image::update`)
-  - `PATCH /api/admin/v1/vm_os_images/{id}` — Now correctly applies `sha2` and `sha2_url` updates
-  - Worker: `DownloadOsImages` job fetches `sha2_url`, compares checksum via SSH, and re-downloads stale images; checksum is also passed to Proxmox `download-url` API for in-flight verification
-- **2026-02-24** - Added `company_base_currency` field to `AdminVmPaymentInfo`
-  - `GET /api/admin/v1/vms/{id}/payments` — Response now includes `company_base_currency`
-  - `GET /api/admin/v1/vms/{id}/payments/{payment_id}` — Response now includes `company_base_currency`
-  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Response now includes `company_base_currency`
-- **2026-02-23** - Admin endpoints to manually complete payments
-  - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Mark a VM payment as paid, extend VM expiry, and dispatch provisioning (requires `payments::update`)
-  - `POST /api/admin/v1/subscription_payments/{id}/complete` — Mark a subscription payment as paid, extend subscription by 30 days, and activate it (requires `subscription_payments::update`)
-
-### Fixed
-- **2026-02-23** - Fixed inability to unset `cpu_mfg`, `cpu_arch`, `cpu_features` fields via PATCH endpoints
-  - `PATCH /api/admin/v1/vm_templates/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
-  - `PATCH /api/admin/v1/custom_pricing/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
-  - `PATCH /api/admin/v1/hosts/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
-  - Previously, sending `null` for these fields was treated the same as omitting them (no change)
 
 ### Changed
 - **2026-02-22** - Reduced unpaid VM deletion time from 24 hours to 1 hour
