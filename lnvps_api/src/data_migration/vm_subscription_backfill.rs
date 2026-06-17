@@ -14,7 +14,7 @@
 //!
 //! Both phases are idempotent: VMs already linked and payments already copied are skipped.
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use lnvps_api_common::PricingEngine;
 use lnvps_db::{
     IntervalType, LNVpsDb, LNVpsDbMysql, Subscription, SubscriptionLineItem,
     SubscriptionPaymentType, SubscriptionType, VmForMigration, VmPaymentRaw,
@@ -32,9 +32,91 @@ fn interval_to_seconds(interval_type: IntervalType, interval_amount: u64) -> i64
     base * interval_amount as i64
 }
 
+/// Billing details resolved for a VM from its template or custom pricing.
+struct VmBilling {
+    currency: String,
+    interval_amount: u64,
+    interval_type: IntervalType,
+    line_item_amount: u64,
+    description: String,
+}
+
+/// Resolve a VM's billing details (currency, interval, recurring amount, description) so they
+/// match what the live provisioning paths set, ensuring the admin UI shows the correct cost:
+///   - standard template: subscription.currency = cost_plan.currency, amount = cost_plan.amount
+///   - custom template:   subscription.currency = pricing.currency,   amount = computed cost
+///
+/// Shared by the initial backfill and the one-time repair pass so both produce identical values.
+async fn resolve_vm_billing(db: &Arc<dyn LNVpsDb>, vm: &VmForMigration) -> Result<VmBilling> {
+    if let Some(template_id) = vm.template_id {
+        let template = db
+            .get_vm_template(template_id)
+            .await
+            .context("Failed to get VM template")?;
+        let cost_plan = db
+            .get_cost_plan(template.cost_plan_id)
+            .await
+            .context("Failed to get cost plan")?;
+        Ok(VmBilling {
+            currency: cost_plan.currency,
+            interval_amount: cost_plan.interval_amount,
+            interval_type: cost_plan.interval_type,
+            line_item_amount: cost_plan.amount,
+            description: format!("{} (VM {})", template.name, vm.id),
+        })
+    } else if let Some(custom_template_id) = vm.custom_template_id {
+        // Custom VMs are always billed monthly; the amount is computed from the custom
+        // pricing (CPU/memory/disk/IPs) just like update_line_item_cost_for_custom_vm.
+        let custom_template = db
+            .get_custom_vm_template(custom_template_id)
+            .await
+            .context("Failed to get custom VM template")?;
+        let price = PricingEngine::get_custom_vm_cost_amount(db, vm.id, &custom_template)
+            .await
+            .context("Failed to compute custom VM cost")?;
+        Ok(VmBilling {
+            currency: price.currency.to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            line_item_amount: price.total(),
+            description: format!("Custom VM {}", vm.id),
+        })
+    } else {
+        bail!(
+            "VM {} has neither template_id nor custom_template_id",
+            vm.id
+        );
+    }
+}
+
 /// Run the VM → subscription backfill. Safe to call on every startup (idempotent).
 pub async fn run_vm_subscription_backfill(db_impl: Arc<LNVpsDbMysql>) -> Result<()> {
     let db: Arc<dyn LNVpsDb> = db_impl.clone();
+
+    // Phase 0: repair subscriptions written by earlier (buggy) backfill revisions.
+    // Idempotent — performs no writes once every already-migrated row is correct.
+    let linked_vm_ids = db_impl
+        .list_vm_ids_with_subscription()
+        .await
+        .context("Failed to list VMs with subscription for repair")?;
+    let mut repaired = 0usize;
+    let mut repair_errored = 0usize;
+    for vm_id in &linked_vm_ids {
+        match repair_migrated_vm_subscription(db_impl.clone(), db.clone(), *vm_id).await {
+            Ok(true) => repaired += 1,
+            Ok(false) => {}
+            Err(e) => {
+                warn!("Phase 0: Failed to repair VM {}: {:#}", vm_id, e);
+                repair_errored += 1;
+            }
+        }
+    }
+    if repaired > 0 || repair_errored > 0 {
+        info!(
+            "VM subscription backfill — Phase 0 complete: {} subscriptions repaired, {} errors",
+            repaired, repair_errored
+        );
+    }
 
     // Phase 1: create subscriptions for all VMs (including deleted)
     let vm_ids = db_impl
@@ -86,7 +168,10 @@ pub async fn run_vm_subscription_backfill(db_impl: Arc<LNVpsDbMysql>) -> Result<
         match migrate_vm_payments(db_impl.clone(), db.clone(), *vm_id).await {
             Ok(n) => pay_migrated += n,
             Err(e) => {
-                warn!("Phase 2: Failed to migrate payments for VM {}: {:#}", vm_id, e);
+                warn!(
+                    "Phase 2: Failed to migrate payments for VM {}: {:#}",
+                    vm_id, e
+                );
                 pay_errored += 1;
             }
         }
@@ -98,9 +183,10 @@ pub async fn run_vm_subscription_backfill(db_impl: Arc<LNVpsDbMysql>) -> Result<
         );
     }
 
-    if sub_errored > 0 || pay_errored > 0 {
+    if repair_errored > 0 || sub_errored > 0 || pay_errored > 0 {
         bail!(
-            "VM subscription backfill incomplete: {} subscription errors, {} payment VM errors (see warnings above)",
+            "VM subscription backfill incomplete: {} repair errors, {} subscription errors, {} payment VM errors (see warnings above)",
+            repair_errored,
             sub_errored,
             pay_errored
         );
@@ -125,35 +211,15 @@ async fn migrate_vm_subscription(
         .get_vm_company_id(vm_id)
         .await
         .context("Failed to get company id for VM")?;
-    let company = db
-        .get_company(company_id)
-        .await
-        .context("Failed to get company")?;
-    let currency = company.base_currency.clone();
 
-    let (interval_amount, interval_type, line_item_amount, description) =
-        if let Some(template_id) = vm.template_id {
-            let template = db
-                .get_vm_template(template_id)
-                .await
-                .context("Failed to get VM template")?;
-            let cost_plan = db
-                .get_cost_plan(template.cost_plan_id)
-                .await
-                .context("Failed to get cost plan")?;
-            let desc = format!("{} (VM {})", template.name, vm_id);
-            (
-                cost_plan.interval_amount,
-                cost_plan.interval_type,
-                cost_plan.amount,
-                desc,
-            )
-        } else if vm.custom_template_id.is_some() {
-            let desc = format!("Custom VM {}", vm_id);
-            (1u64, IntervalType::Month, 0u64, desc)
-        } else {
-            bail!("VM {} has neither template_id nor custom_template_id", vm_id);
-        };
+    let billing = resolve_vm_billing(&db, &vm).await?;
+    let VmBilling {
+        currency,
+        interval_amount,
+        interval_type,
+        line_item_amount,
+        description,
+    } = billing;
 
     let time_value = interval_to_seconds(interval_type, interval_amount);
     info!(
@@ -170,29 +236,14 @@ async fn migrate_vm_subscription(
     );
 
     // Deleted VMs should have inactive subscriptions — they are no longer running.
-    let is_active = !vm.deleted;
-
-    let subscription = Subscription {
-        id: 0,
-        user_id: vm.user_id,
+    let subscription = build_subscription_for_vm(
+        &vm,
         company_id,
-        name: format!("VM {} Subscription", vm_id),
-        description: Some(description.clone()),
-        created: Utc::now(),
-        // Preserve the VM's existing billing expiry so renewal/suspension/auto-renewal
-        // enforcement continues seamlessly. The legacy vm.expires column is the source
-        // of truth pre-migration and is dropped only at finalization.
-        expires: Some(vm.expires),
-        is_active,
-        is_setup: true,
         currency,
         interval_amount,
         interval_type,
-        setup_fee: 0,
-        // Preserve the VM's auto-renewal preference so NWC auto-renewal keeps working.
-        auto_renewal_enabled: vm.auto_renewal_enabled,
-        external_id: None,
-    };
+        &description,
+    );
     let line_item = SubscriptionLineItem {
         id: 0,
         subscription_id: 0,
@@ -216,6 +267,149 @@ async fn migrate_vm_subscription(
         .context("Failed to link VM to subscription")?;
 
     Ok(())
+}
+
+/// Build the `Subscription` row for a VM during backfill.
+///
+/// Pure mapping (no DB access) so it can be unit-tested. The key invariants:
+/// - `created` is copied from the VM's original creation date (NOT `Utc::now()`), because the
+///   subscription is now the source of truth for the VM's "created" timestamp in the API.
+/// - `expires` and `auto_renewal_enabled` are copied from the VM so billing/renewal continue.
+/// - `is_setup` mirrors the legacy "has this VM ever been paid" signal: pre-migration, a
+///   never-paid VM had `expires == created` and `check_vms` deleted it after 1h. The new
+///   `check_vms` uses `subscription.is_setup` for that decision, so we must NOT blindly set
+///   `is_setup = true` — a VM that was still unpaid at migration time would then look paid and
+///   never be cleaned up. `expires > created` means at least one payment advanced the expiry.
+/// - Deleted VMs get an inactive subscription — they are no longer running.
+fn build_subscription_for_vm(
+    vm: &VmForMigration,
+    company_id: u64,
+    currency: String,
+    interval_amount: u64,
+    interval_type: IntervalType,
+    description: &str,
+) -> Subscription {
+    // A pre-migration VM was "set up" (paid at least once) iff its expiry was advanced past
+    // its creation time. Never-paid VMs had expires == created and must stay !is_setup so the
+    // worker's unpaid-VM cleanup continues to apply to them after migration.
+    let is_setup = vm.expires > vm.created;
+    Subscription {
+        id: 0,
+        user_id: vm.user_id,
+        company_id,
+        name: format!("VM {} Subscription", vm.id),
+        description: Some(description.to_string()),
+        // Preserve the VM's original creation date so the subscription (now the source of
+        // truth for the VM's "created" timestamp in the API) reflects when the VM was
+        // actually ordered, not when the migration ran.
+        created: vm.created,
+        // Preserve the VM's existing billing expiry so renewal/suspension/auto-renewal
+        // enforcement continues seamlessly. The legacy vm.expires column is the source of
+        // truth pre-migration and is dropped only at finalization.
+        expires: Some(vm.expires),
+        // An unpaid VM (never set up) must not be marked active.
+        is_active: !vm.deleted && is_setup,
+        is_setup,
+        currency,
+        interval_amount,
+        interval_type,
+        setup_fee: 0,
+        // Preserve the VM's auto-renewal preference so NWC auto-renewal keeps working.
+        auto_renewal_enabled: vm.auto_renewal_enabled,
+        external_id: None,
+    }
+}
+
+// ─── Phase 0: repair already-migrated subscriptions ──────────────────────────
+
+/// Repair subscriptions created by earlier (buggy) backfill revisions.
+///
+/// Earlier revisions wrote several fields incorrectly for already-linked VMs:
+///   - `subscription.created` was stamped with the migration time instead of `vm.created`
+///   - custom-VM line items got `amount = 0` (showing $0 in the admin UI)
+///   - `subscription.currency` used the company base currency instead of the cost-plan /
+///     pricing currency
+///   - `is_setup`/`is_active` were forced true even for never-paid VMs
+///
+/// This pass re-derives the correct values and updates the subscription + line item only when
+/// they actually differ. It is idempotent: once every row is correct it performs no writes.
+async fn repair_migrated_vm_subscription(
+    db_impl: Arc<LNVpsDbMysql>,
+    db: Arc<dyn LNVpsDb>,
+    vm_id: u64,
+) -> Result<bool> {
+    let vm: VmForMigration = db_impl
+        .get_vm_for_migration(vm_id)
+        .await
+        .context("Failed to get VM")?;
+
+    let line_item_id = match vm.subscription_line_item_id.filter(|&id| id != 0) {
+        Some(id) => id,
+        None => return Ok(false), // not migrated yet; Phase 1 will handle it
+    };
+
+    let mut subscription = db
+        .get_subscription_by_line_item_id(line_item_id)
+        .await
+        .context("Failed to get subscription for VM")?;
+    let mut line_item = db
+        .get_subscription_line_item(line_item_id)
+        .await
+        .context("Failed to get subscription line item")?;
+
+    let billing = resolve_vm_billing(&db, &vm).await?;
+    let is_setup = vm.expires > vm.created;
+    let want_created = vm.created;
+    let want_active = !vm.deleted && is_setup;
+
+    let mut changed = false;
+    if subscription.created != want_created {
+        subscription.created = want_created;
+        changed = true;
+    }
+    if subscription.currency != billing.currency {
+        subscription.currency = billing.currency.clone();
+        changed = true;
+    }
+    if subscription.interval_amount != billing.interval_amount {
+        subscription.interval_amount = billing.interval_amount;
+        changed = true;
+    }
+    if subscription.interval_type != billing.interval_type {
+        subscription.interval_type = billing.interval_type;
+        changed = true;
+    }
+    if subscription.is_setup != is_setup {
+        subscription.is_setup = is_setup;
+        changed = true;
+    }
+    if subscription.is_active != want_active {
+        subscription.is_active = want_active;
+        changed = true;
+    }
+
+    if changed {
+        db.update_subscription(&subscription)
+            .await
+            .context("Failed to update subscription during repair")?;
+    }
+
+    if line_item.amount != billing.line_item_amount {
+        line_item.amount = billing.line_item_amount;
+        db.update_subscription_line_item(&line_item)
+            .await
+            .context("Failed to update line item during repair")?;
+        changed = true;
+    }
+
+    if changed {
+        info!(
+            "Phase 0: repaired VM {} subscription (created={}, currency={}, amount={}, is_setup={})",
+            vm_id, want_created, billing.currency, billing.line_item_amount, is_setup
+        );
+    }
+
+    Ok(changed)
 }
 
 // ─── Phase 2: payment backfill ───────────────────────────────────────────────
@@ -304,4 +498,105 @@ async fn migrate_vm_payments(
     }
 
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn vm_for_migration(created: chrono::DateTime<Utc>, deleted: bool) -> VmForMigration {
+        // Paid VM: expiry advanced well past creation.
+        vm_with_expires(
+            created,
+            Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+            deleted,
+        )
+    }
+
+    fn vm_with_expires(
+        created: chrono::DateTime<Utc>,
+        expires: chrono::DateTime<Utc>,
+        deleted: bool,
+    ) -> VmForMigration {
+        VmForMigration {
+            id: 42,
+            user_id: 7,
+            template_id: Some(1),
+            custom_template_id: None,
+            created,
+            expires,
+            auto_renewal_enabled: true,
+            subscription_line_item_id: None,
+            deleted,
+        }
+    }
+
+    /// Regression: the backfill must preserve the VM's original creation date on the
+    /// subscription, not stamp it with the migration time (was `Utc::now()`).
+    #[test]
+    fn build_subscription_preserves_vm_created() {
+        let vm_created = Utc.with_ymd_and_hms(2025, 1, 15, 12, 30, 0).unwrap();
+        let vm = vm_for_migration(vm_created, false);
+
+        let sub = build_subscription_for_vm(
+            &vm,
+            3,
+            "EUR".to_string(),
+            1,
+            IntervalType::Month,
+            "Test (VM 42)",
+        );
+
+        assert_eq!(
+            sub.created, vm_created,
+            "subscription.created must equal vm.created"
+        );
+        assert_ne!(sub.created, Utc::now());
+        // Other preserved fields
+        assert_eq!(sub.expires, Some(vm.expires));
+        assert_eq!(sub.auto_renewal_enabled, vm.auto_renewal_enabled);
+        assert_eq!(sub.user_id, vm.user_id);
+        assert_eq!(sub.company_id, 3);
+        assert_eq!(sub.currency, "EUR");
+        assert!(
+            sub.is_active,
+            "non-deleted VM must have an active subscription"
+        );
+        assert!(sub.is_setup);
+    }
+
+    /// Deleted VMs must map to inactive subscriptions.
+    #[test]
+    fn build_subscription_deleted_vm_is_inactive() {
+        let vm = vm_for_migration(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(), true);
+        let sub = build_subscription_for_vm(&vm, 1, "USD".to_string(), 1, IntervalType::Month, "x");
+        assert!(
+            !sub.is_active,
+            "deleted VM must have an inactive subscription"
+        );
+    }
+
+    /// Regression: a VM that was still unpaid at migration time (legacy `expires == created`)
+    /// must NOT be marked `is_setup`/`is_active`, otherwise the worker's unpaid-VM cleanup
+    /// (which now keys off `subscription.is_setup`) would never delete it.
+    #[test]
+    fn build_subscription_unpaid_vm_is_not_setup() {
+        let t = Utc.with_ymd_and_hms(2026, 6, 17, 10, 0, 0).unwrap();
+        let vm = vm_with_expires(t, t, false); // expires == created => never paid
+        let sub = build_subscription_for_vm(&vm, 1, "EUR".to_string(), 1, IntervalType::Month, "x");
+        assert!(!sub.is_setup, "never-paid VM must not be is_setup");
+        assert!(!sub.is_active, "never-paid VM must not be active");
+    }
+
+    /// A paid VM (expiry advanced past creation) must be `is_setup` and active.
+    #[test]
+    fn build_subscription_paid_vm_is_setup() {
+        let created = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let expires = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
+        let vm = vm_with_expires(created, expires, false);
+        let sub = build_subscription_for_vm(&vm, 1, "EUR".to_string(), 1, IntervalType::Month, "x");
+        assert!(sub.is_setup, "paid VM must be is_setup");
+        assert!(sub.is_active, "paid non-deleted VM must be active");
+    }
 }

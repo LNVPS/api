@@ -61,6 +61,20 @@ Query Parameters:
 
 Required Permission: `users::view`
 
+#### Find User by Email
+
+```
+GET /api/admin/v1/users/by-email?email={email}
+```
+
+Query Parameters:
+
+- `email`: string (required) - the user's email address (case-insensitive; matched via an indexed SHA-256 hash)
+
+Required Permission: `users::view`
+
+Returns the matching `AdminUserInfo`, or a `"User not found"` error if no user has that email.
+
 #### Get User Details
 
 ```
