@@ -2714,6 +2714,7 @@ dependencies = [
  "nostr 0.44.2",
  "nostr-sdk",
  "reqwest 0.13.2",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
