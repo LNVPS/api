@@ -291,8 +291,10 @@ fn build_subscription_for_vm(
 ) -> Subscription {
     // A pre-migration VM was "set up" (paid at least once) iff its expiry was advanced past
     // its creation time. Never-paid VMs had expires == created and must stay !is_setup so the
-    // worker's unpaid-VM cleanup continues to apply to them after migration.
-    let is_setup = vm.expires > vm.created;
+    // worker's unpaid-VM cleanup continues to apply to them after migration. A NULL expires
+    // means the VM was created by the new (post-migration) path and has no legacy expiry to
+    // copy — treat it as not-yet-set-up with no subscription expiry.
+    let is_setup = vm.expires.map(|e| e > vm.created).unwrap_or(false);
     Subscription {
         id: 0,
         user_id: vm.user_id,
@@ -306,7 +308,7 @@ fn build_subscription_for_vm(
         // Preserve the VM's existing billing expiry so renewal/suspension/auto-renewal
         // enforcement continues seamlessly. The legacy vm.expires column is the source of
         // truth pre-migration and is dropped only at finalization.
-        expires: Some(vm.expires),
+        expires: vm.expires,
         // An unpaid VM (never set up) must not be marked active.
         is_active: !vm.deleted && is_setup,
         is_setup,
@@ -348,6 +350,14 @@ async fn repair_migrated_vm_subscription(
         None => return Ok(false), // not migrated yet; Phase 1 will handle it
     };
 
+    // A NULL legacy expires means this VM was provisioned by the new (post-migration) path,
+    // so its subscription was created correctly and there is no legacy data to back-derive
+    // created/is_setup from. The buggy revisions this pass repairs only ever ran against
+    // pre-migration VMs (which always have a non-NULL legacy expires), so skip these.
+    let Some(legacy_expires) = vm.expires else {
+        return Ok(false);
+    };
+
     let mut subscription = db
         .get_subscription_by_line_item_id(line_item_id)
         .await
@@ -358,7 +368,7 @@ async fn repair_migrated_vm_subscription(
         .context("Failed to get subscription line item")?;
 
     let billing = resolve_vm_billing(&db, &vm).await?;
-    let is_setup = vm.expires > vm.created;
+    let is_setup = legacy_expires > vm.created;
     let want_created = vm.created;
     let want_active = !vm.deleted && is_setup;
 
@@ -525,7 +535,7 @@ mod tests {
             template_id: Some(1),
             custom_template_id: None,
             created,
-            expires,
+            expires: Some(expires),
             auto_renewal_enabled: true,
             subscription_line_item_id: None,
             deleted,
@@ -554,7 +564,7 @@ mod tests {
         );
         assert_ne!(sub.created, Utc::now());
         // Other preserved fields
-        assert_eq!(sub.expires, Some(vm.expires));
+        assert_eq!(sub.expires, vm.expires);
         assert_eq!(sub.auto_renewal_enabled, vm.auto_renewal_enabled);
         assert_eq!(sub.user_id, vm.user_id);
         assert_eq!(sub.company_id, 3);
@@ -598,5 +608,18 @@ mod tests {
         let sub = build_subscription_for_vm(&vm, 1, "EUR".to_string(), 1, IntervalType::Month, "x");
         assert!(sub.is_setup, "paid VM must be is_setup");
         assert!(sub.is_active, "paid non-deleted VM must be active");
+    }
+
+    /// Regression: a VM with a NULL legacy expires (provisioned by the new path) must not
+    /// panic/error and must produce a not-setup subscription with no expiry.
+    #[test]
+    fn build_subscription_null_expires_is_not_setup() {
+        let created = Utc.with_ymd_and_hms(2026, 6, 17, 10, 0, 0).unwrap();
+        let mut vm = vm_with_expires(created, created, false);
+        vm.expires = None;
+        let sub = build_subscription_for_vm(&vm, 1, "EUR".to_string(), 1, IntervalType::Month, "x");
+        assert_eq!(sub.expires, None, "NULL legacy expires => no subscription expiry");
+        assert!(!sub.is_setup, "NULL-expires VM must not be is_setup");
+        assert!(!sub.is_active);
     }
 }
