@@ -934,7 +934,9 @@ pub struct VmForMigration {
     pub template_id: Option<u64>,
     pub custom_template_id: Option<u64>,
     pub created: DateTime<Utc>,
-    pub expires: DateTime<Utc>,
+    /// Legacy expiry column. Nullable since the new provisioning path no longer writes it
+    /// (expiry now lives on the subscription). `None` => managed by the new subscription path.
+    pub expires: Option<DateTime<Utc>>,
     pub auto_renewal_enabled: bool,
     pub subscription_line_item_id: Option<u64>,
     pub deleted: bool,
