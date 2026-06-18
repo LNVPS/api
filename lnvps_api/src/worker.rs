@@ -1174,7 +1174,7 @@ impl Worker {
         };
 
         // Create a resolver using system configuration
-        let resolver = TokioResolver::builder_tokio()?.build();
+        let resolver = TokioResolver::builder_tokio()?.build()?;
 
         // Resolve both domain and expected hostname to IP addresses
         // lookup_ip automatically follows DNS records to get final IPs

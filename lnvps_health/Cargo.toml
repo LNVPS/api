@@ -21,7 +21,7 @@ config.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 async-trait.workspace = true
 
 # Prometheus metrics

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use hickory_resolver::Resolver;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -82,8 +82,8 @@ impl DnsCheck {
         }
     }
 
-    fn create_resolver(&self, server_ip: IpAddr) -> Result<Resolver<TokioConnectionProvider>> {
-        let name_servers = NameServerConfigGroup::from_ips_clear(&[server_ip], 53, true);
+    fn create_resolver(&self, server_ip: IpAddr) -> Result<Resolver<TokioRuntimeProvider>> {
+        let name_servers = vec![NameServerConfig::udp_and_tcp(server_ip)];
         let resolver_config = ResolverConfig::from_parts(None, vec![], name_servers);
 
         let mut opts = ResolverOpts::default();
@@ -91,9 +91,9 @@ impl DnsCheck {
         opts.attempts = 2;
 
         let mut builder =
-            Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default());
+            Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default());
         *builder.options_mut() = opts;
-        Ok(builder.build())
+        Ok(builder.build()?)
     }
 }
 

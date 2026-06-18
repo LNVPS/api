@@ -67,7 +67,7 @@ lettre = { version = "0.11", features = ["tokio1-native-tls"] }
 lnurl-rs = { version = "0.9", default-features = false }
 mustache = "0.9"
 isocountry = "0.3"
-hickory-resolver = "0.25"
+hickory-resolver = "0.26"
 humantime = "2.2"
 
 # nostr (for signing agreements)
