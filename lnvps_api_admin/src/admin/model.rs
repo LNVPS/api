@@ -2266,6 +2266,8 @@ pub struct AdminCreateVmRequest {
 pub struct AdminSubscriptionInfo {
     pub id: u64,
     pub user_id: u64,
+    /// Hex-encoded Nostr pubkey of the owning user
+    pub user_pubkey: String,
     pub name: String,
     pub description: Option<String>,
     pub created: DateTime<Utc>,
@@ -2335,6 +2337,8 @@ impl From<lnvps_db::Subscription> for AdminSubscriptionInfo {
         Self {
             id: subscription.id,
             user_id: subscription.user_id,
+            // Populated by `from_subscription` which has DB access to resolve the pubkey
+            user_pubkey: String::new(),
             name: subscription.name,
             description: subscription.description,
             created: subscription.created,

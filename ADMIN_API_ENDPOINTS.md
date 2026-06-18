@@ -193,6 +193,7 @@ Returns detailed VM information with complete host and region data. The VM must 
 
 The response includes a `subscription` field (type: `AdminSubscriptionInfo`) when the VM is linked to a subscription. This object contains:
 - `id` — subscription ID
+- `user_id` / `user_pubkey` — owning user's ID and hex-encoded Nostr pubkey
 - `is_active` — whether the subscription is currently active
 - `interval_amount` / `interval_type` — billing interval
 - `currency` — billing currency
@@ -523,10 +524,15 @@ Query Parameters:
 - `limit`: number (optional) - max 100, default 50
 - `offset`: number (optional) - default 0
 - `user_id`: number (optional) - filter by user ID
+- `search`: string (optional) - case-insensitive substring match against subscription name and description
+- `status`: string (optional) - filter by active state; one of `active` or `inactive`. Omit for all
+- `auto_renewal`: boolean (optional) - filter by auto-renewal flag. Omit for all
+
+All filters are optional and combine with AND. Filtering is applied before pagination, so `total` reflects the filtered count.
 
 Required Permission: `subscriptions::view`
 
-Returns paginated list of subscriptions with embedded line items and payment count.
+Returns paginated list of subscriptions with embedded line items and payment count. Each `AdminSubscriptionInfo` includes a `user_pubkey` field (hex-encoded Nostr pubkey of the owning user) alongside `user_id`.
 
 #### Get Subscription Details
 

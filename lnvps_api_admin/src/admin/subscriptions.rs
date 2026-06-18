@@ -58,18 +58,45 @@ pub fn router() -> Router<RouterState> {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct SubscriptionQuery {
-    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
-    limit: Option<u64>,
-    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
-    offset: Option<u64>,
+    #[serde(flatten)]
+    page: PageQuery,
     #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
     user_id: Option<u64>,
+    /// Case-insensitive substring match against name and description
+    search: Option<String>,
+    /// Filter by active state; omit for all
+    status: Option<SubscriptionStatus>,
+    /// Filter by auto-renewal flag; omit for all
+    auto_renewal: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SubscriptionStatus {
+    Active,
+    Inactive,
 }
 
 impl AdminSubscriptionInfo {
     pub async fn from_subscription(
         db: &Arc<dyn LNVpsDb>,
         subscription: &lnvps_db::Subscription,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Resolve the owner's pubkey so the admin UI can render the Nostr profile
+        let user_pubkey = db
+            .get_user(subscription.user_id)
+            .await
+            .map(|u| hex::encode(&u.pubkey))
+            .unwrap_or_default();
+        Self::from_subscription_with_pubkey(db, subscription, user_pubkey).await
+    }
+
+    /// Build an `AdminSubscriptionInfo` with the owner's pubkey supplied by the caller.
+    /// Lets the list endpoint bulk-load users once instead of one query per row.
+    pub async fn from_subscription_with_pubkey(
+        db: &Arc<dyn LNVpsDb>,
+        subscription: &lnvps_db::Subscription,
+        user_pubkey: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Fetch line items
         let line_items = db
@@ -90,6 +117,7 @@ impl AdminSubscriptionInfo {
         let payment_count = payments.len() as u64;
 
         let mut info = AdminSubscriptionInfo::from(subscription.clone());
+        info.user_pubkey = user_pubkey;
         info.line_items = line_item_infos;
         info.payment_count = payment_count;
         Ok(info)
@@ -108,17 +136,52 @@ async fn admin_list_subscriptions(
 ) -> ApiPaginatedResult<AdminSubscriptionInfo> {
     auth.require_permission(AdminResource::Subscriptions, AdminAction::View)?;
 
-    let limit = params.limit.unwrap_or(50).min(100);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.page.limit.unwrap_or(50).min(100);
+    let offset = params.page.offset.unwrap_or(0);
+
+    let is_active = params.status.map(|s| matches!(s, SubscriptionStatus::Active));
 
     let (subscriptions, total) = this
         .db
-        .list_subscriptions_paginated(params.user_id, limit, offset)
+        .admin_list_subscriptions_filtered(
+            limit,
+            offset,
+            params.user_id,
+            params.search.as_deref(),
+            is_active,
+            params.auto_renewal,
+        )
         .await?;
+
+    // Bulk-load the owners for this page in a single query instead of one per row,
+    // then index their pubkeys by user_id.
+    let user_ids: Vec<u64> = subscriptions
+        .iter()
+        .map(|s| s.user_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let pubkeys: std::collections::HashMap<u64, String> = this
+        .db
+        .list_users_by_ids(&user_ids)
+        .await?
+        .into_iter()
+        .map(|u| (u.id, hex::encode(&u.pubkey)))
+        .collect();
 
     let mut subscription_infos = Vec::new();
     for subscription in subscriptions {
-        match AdminSubscriptionInfo::from_subscription(&this.db, &subscription).await {
+        let user_pubkey = pubkeys
+            .get(&subscription.user_id)
+            .cloned()
+            .unwrap_or_default();
+        match AdminSubscriptionInfo::from_subscription_with_pubkey(
+            &this.db,
+            &subscription,
+            user_pubkey,
+        )
+        .await
+        {
             Ok(info) => subscription_infos.push(info),
             Err(_) => continue,
         }

@@ -6,9 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [v0.3.0] - 2026-06-17
+## [v0.3.0] - 2026-06-18
 
 ### Added
+
+- **2026-06-18** - `GET /api/admin/v1/subscriptions` — new optional filter query parameters
+  - `search` (string) — case-insensitive substring match against subscription name and description
+  - `status` (`active` | `inactive`) — filter by the `is_active` flag; omit for all
+  - `auto_renewal` (boolean) — filter by the `auto_renewal_enabled` flag; omit for all
+  - All filters are optional and combine with AND (and with the existing `user_id`). Filtering is applied before pagination, so `total` reflects the filtered count. Response shape is otherwise unchanged.
+
+- **2026-06-18** - `AdminSubscriptionInfo` now includes a `user_pubkey` field
+  - Hex-encoded Nostr pubkey of the owning user, returned alongside the existing `user_id` by every endpoint that emits an `AdminSubscriptionInfo`: `GET /api/admin/v1/subscriptions`, `GET /api/admin/v1/subscriptions/{id}`, `POST /api/admin/v1/subscriptions`, `PATCH /api/admin/v1/subscriptions/{id}`, and the embedded `subscription` object on `GET /api/admin/v1/vms/{id}`.
 
 - **2026-06-15** - `GET /api/admin/v1/users/by-email` — find a user by email address
   - Looks up a user via an indexed SHA-256 hash of the (lowercased, trimmed) email and returns the full `AdminUserInfo`, or a `"User not found"` error if no match.
@@ -18,6 +27,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **2026-04-03** - LNURL-pay endpoints for VM renewal restored
   - `GET /.well-known/lnurlp/{id}` — LNURL PayResponse for a VM. These endpoints were lost during the Rocket→Axum migration and are now working again (the path-parameter syntax was corrected for Axum).
   - `GET /api/v1/vm/{id}/renew-lnurlp?amount={millisats}` — returns an invoice to extend the VM via LNURL pay.
+
+- **2026-03-10** - `"creating"` VM state for cleaner first-provision UX (closes #119)
+  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now transitions to `"creating"` immediately after the first payment is confirmed and before the VM is provisioned on the host. The state is replaced by a real host state (`"running"`, `"stopped"`, etc.) once provisioning completes.
+  - `GET /api/admin/v1/vms`, `GET /api/admin/v1/vms/{id}` — Same `"creating"` state visible in the admin API.
+  - This gives frontends a meaningful status to display instead of a stale `"stopped"` state during initial provisioning.
+
+- **2026-03-10** - WebSocket console endpoint for VM serial terminal access (User API)
+  - `ANY /api/v1/vm/{id}/console` (WebSocket upgrade) — Bidirectional relay between the client and the VM's serial console via the host provisioner. Authentication is passed via query parameter `?auth=<base64_nip98_event>`.
+
+- **2026-03-10** - Stripe payment **completion** handling implemented
+  - `POST /api/v1/webhook/stripe` — Incoming Stripe `payment_intent.succeeded` webhooks are now verified and processed, marking the matching subscription payment paid and running the standard completion pipeline.
+  - Note: Stripe payment **creation** (checkout/intent creation for `method=stripe` on VM purchase, renewal, upgrade, and subscription renewal) is **not yet implemented** — those endpoints return an error for `method=stripe`. Only completion of externally-created Stripe payments is wired up.
+
+- **2026-03-10** - `LNURL` added as a payment method variant
+  - `GET /api/v1/payment/methods` — Response may now include `{ "name": "lnurl", ... }` when Lightning is enabled
+
+- **2026-03-10** - `Upgrade` added as a `SubscriptionPayment.payment_type` variant
+  - `GET /api/v1/subscriptions/{id}/payments` — Payments created for VM upgrades now carry `payment_type: "Upgrade"`
+  - Previously only `Purchase` and `Renewal` were possible
+
+- **2026-03-10** - `processing_fee` field added to `SubscriptionPayment` user API response
+  - `GET /api/v1/subscriptions/{id}/payments` — Each payment now includes `processing_fee: { currency, amount }`
+
+- **2026-03-03** - Multi-interval VM renewal support
+  - `POST /api/v1/vm/{id}/renew` — Accepts optional `intervals` query parameter to pre-pay multiple billing periods at once
+  - `POST /api/admin/v1/vms/{id}/renew` — Same `intervals` support in admin renewal endpoint
 
 - **2026-02-25** - Resource limits on custom pricing plans, propagated to custom templates
   - `POST /api/admin/v1/custom_pricing` — Accepts new optional fields: `disk_iops_read`, `disk_iops_write`, `disk_mbps_read`, `disk_mbps_write`, `network_mbps`, `cpu_limit`
@@ -51,55 +86,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- **2026-02-25** - Email verification is now required before creating a VM (closes #92)
-  - `POST /api/v1/vm` — Returns `400` with error message if the user's email is not verified
-  - `POST /api/v1/vm/custom-template` — Same gate applied
 - **2026-04-03** - Unpaid VMs with a non-expired pending payment are no longer auto-deleted
   - The worker cleanup loop now skips deletion of unpaid VMs that still have a pending (non-expired) payment, giving slower payment methods (e.g. Revolut) time to settle before the VM is removed.
-
-### Fixed
-
-- **2026-06-16** - VM→subscription backfill now runs reliably at startup
-  - The backfill is executed during app startup, after schema migrations and before any VM read, and preserves each VM's existing expiry and auto-renewal preference. The legacy `vm.expires` / `vm.created` columns are no longer dropped before the backfill runs, which previously caused the backfill to fail for every VM and break all VM reads. (No external API surface change — listed for operator awareness.)
-
-- **2026-04-26** - Region capacity no longer reports IP ranges as full incorrectly
-  - `GET /api/v1/vm/templates` and region availability — the gateway IP is now only counted as a used address when it actually falls within the allocation CIDR. Previously a gateway outside the range inflated the used-IP count and could falsely report a region/range as full while free IPs remained.
-
-- **2026-04-02** - Payments for already-deleted VMs are handled gracefully
-  - `POST /api/v1/vm/{id}/renew` and payment confirmation — a payment that arrives for a VM auto-deleted before the (slow) payment settled now un-deletes the VM and applies the payment instead of erroring; the VM is then re-provisioned by the next check. Renewal/invoice creation for VMs that remain deleted is rejected with `"VM not found"`.
-  - A race where a VM paid between the cleanup snapshot and the deletion step could be deleted is fixed by re-reading VM state immediately before deletion.
-
-- **2026-02-23** - Fixed inability to unset `cpu_mfg`, `cpu_arch`, `cpu_features` fields via PATCH endpoints
-  - `PATCH /api/admin/v1/vm_templates/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
-  - `PATCH /api/admin/v1/custom_pricing/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
-  - `PATCH /api/admin/v1/hosts/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
-  - Previously, sending `null` for these fields was treated the same as omitting them (no change)
-
-### Added
-
-- **2026-03-10** - `"creating"` VM state for cleaner first-provision UX (closes #119)
-  - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now transitions to `"creating"` immediately after the first payment is confirmed and before the VM is provisioned on the host. The state is replaced by a real host state (`"running"`, `"stopped"`, etc.) once provisioning completes.
-  - `GET /api/admin/v1/vms`, `GET /api/admin/v1/vms/{id}` — Same `"creating"` state visible in the admin API.
-  - This gives frontends a meaningful status to display instead of a stale `"stopped"` state during initial provisioning.
-
-- **2026-03-10** - WebSocket console endpoint for VM serial terminal access (User API)
-  - `ANY /api/v1/vm/{id}/console` (WebSocket upgrade) — Bidirectional relay between the client and the VM's serial console via the host provisioner. Authentication is passed via query parameter `?auth=<base64_nip98_event>`.
-
-- **2026-03-10** - Stripe payment **completion** handling implemented
-  - `POST /api/v1/webhook/stripe` — Incoming Stripe `payment_intent.succeeded` webhooks are now verified and processed, marking the matching subscription payment paid and running the standard completion pipeline.
-  - Note: Stripe payment **creation** (checkout/intent creation for `method=stripe` on VM purchase, renewal, upgrade, and subscription renewal) is **not yet implemented** — those endpoints return an error for `method=stripe`. Only completion of externally-created Stripe payments is wired up.
-
-- **2026-03-10** - `LNURL` added as a payment method variant
-  - `GET /api/v1/payment/methods` — Response may now include `{ "name": "lnurl", ... }` when Lightning is enabled
-
-- **2026-03-10** - `Upgrade` added as a `SubscriptionPayment.payment_type` variant
-  - `GET /api/v1/subscriptions/{id}/payments` — Payments created for VM upgrades now carry `payment_type: "Upgrade"`
-  - Previously only `Purchase` and `Renewal` were possible
-
-- **2026-03-10** - `processing_fee` field added to `SubscriptionPayment` user API response
-  - `GET /api/v1/subscriptions/{id}/payments` — Each payment now includes `processing_fee: { currency, amount }`
-
-### Changed
 
 - **2026-03-10** - `VmRunningStates` enum simplified — `"starting"` and `"deleting"` removed
   - `GET /api/v1/vm`, `GET /api/v1/vm/{id}` — `status.state` now has four possible values: `"unknown"` (default before first poll), `"running"`, `"stopped"`, `"creating"`. The former `"starting"` and `"deleting"` variants are no longer emitted.
@@ -111,33 +99,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **2026-03-10** - `GET /api/v1/vm/{id}/payments` now uses database-level pagination
   - The endpoint now accepts `?limit=N&offset=N` query parameters and returns a paginated response (`data`, `total`, `limit`, `offset`). Previously the list was unbounded.
-
-### Fixed
-
-- **2026-03-10** - VM subscription lookup query used incorrect type filter
-  - Internal fix: the query that finds a VM's linked subscription was incorrectly using `IN (3, 4)` instead of `= 3`, which could return incorrect results.
-
-- **2026-03-10** - `ApiVmPayment::from_subscription_payment` now propagates JSON parse errors
-  - Previously, a malformed `metadata` JSON field in a `subscription_payment` row would be silently ignored, potentially returning incorrect upgrade parameter data. Errors are now surfaced to the API caller.
-
-- **2026-03-10** - Expiry notification always sent when NWC auto-renewal is inactive
-  - Workers now always send the expiry notification email/NIP-17 DM even when NWC is configured but `auto_renewal_enabled` is false for the subscription.
-
-### Removed
-
-- **2026-03-10** - Clarification: `POST /api/admin/v1/vms/{id}/renew` does **not** exist
-  - The 2026-03-03 changelog entry incorrectly stated that multi-interval renewal was added to an admin renew endpoint. No such endpoint exists in the admin API. Multi-interval renewal is only available via the user-facing `GET /api/v1/vm/{id}/renew?intervals=N`.
-
-### Fixed
-
-- **2026-03-03** - VM upgrade no longer leaves subscription renewal cost stale
-  - `POST /api/v1/vm/{id}/upgrade` — After payment confirmation, `SubscriptionLineItem.amount` is now updated to the new base-currency cost of the upgraded template for both standard→custom and custom→custom upgrade paths
-  - `GET /api/v1/subscriptions/{id}` and admin equivalents — `line_items[].price` now reflects the post-upgrade renewal cost immediately after an upgrade completes
-
-- **2026-03-03** - Migration tool no longer marks subscriptions active for deleted VMs
-  - VM subscription backfill — Subscriptions created for deleted VMs are now inserted with `is_active = false`
-
-### Changed
 
 - **2026-03-03** - Admin subscription list now returns results in descending order
   - `GET /api/admin/v1/subscriptions` — Results ordered by `id DESC` (newest first); applies to both the all-subscriptions list and the `?user_id=N` filtered list
@@ -173,11 +134,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **2026-03-03** - `IntervalType` enum renamed from `VmCostPlanIntervalType`
   - Affects admin responses that include cost plan or subscription interval information
 
-### Added
+- **2026-02-25** - Email verification is now required before creating a VM (closes #92)
+  - `POST /api/v1/vm` — Returns `400` with error message if the user's email is not verified
+  - `POST /api/v1/vm/custom-template` — Same gate applied
 
-- **2026-03-03** - Multi-interval VM renewal support
-  - `POST /api/v1/vm/{id}/renew` — Accepts optional `intervals` query parameter to pre-pay multiple billing periods at once
-  - `POST /api/admin/v1/vms/{id}/renew` — Same `intervals` support in admin renewal endpoint
+### Removed
+
+- **2026-03-10** - Clarification: `POST /api/admin/v1/vms/{id}/renew` does **not** exist
+  - The 2026-03-03 changelog entry incorrectly stated that multi-interval renewal was added to an admin renew endpoint. No such endpoint exists in the admin API. Multi-interval renewal is only available via the user-facing `GET /api/v1/vm/{id}/renew?intervals=N`.
+
+### Fixed
+
+- **2026-06-16** - VM→subscription backfill now runs reliably at startup
+  - The backfill is executed during app startup, after schema migrations and before any VM read, and preserves each VM's existing expiry and auto-renewal preference. The legacy `vm.expires` / `vm.created` columns are no longer dropped before the backfill runs, which previously caused the backfill to fail for every VM and break all VM reads. (No external API surface change — listed for operator awareness.)
+
+- **2026-04-26** - Region capacity no longer reports IP ranges as full incorrectly
+  - `GET /api/v1/vm/templates` and region availability — the gateway IP is now only counted as a used address when it actually falls within the allocation CIDR. Previously a gateway outside the range inflated the used-IP count and could falsely report a region/range as full while free IPs remained.
+
+- **2026-04-02** - Payments for already-deleted VMs are handled gracefully
+  - `POST /api/v1/vm/{id}/renew` and payment confirmation — a payment that arrives for a VM auto-deleted before the (slow) payment settled now un-deletes the VM and applies the payment instead of erroring; the VM is then re-provisioned by the next check. Renewal/invoice creation for VMs that remain deleted is rejected with `"VM not found"`.
+  - A race where a VM paid between the cleanup snapshot and the deletion step could be deleted is fixed by re-reading VM state immediately before deletion.
+
+- **2026-03-10** - VM subscription lookup query used incorrect type filter
+  - Internal fix: the query that finds a VM's linked subscription was incorrectly using `IN (3, 4)` instead of `= 3`, which could return incorrect results.
+
+- **2026-03-10** - `ApiVmPayment::from_subscription_payment` now propagates JSON parse errors
+  - Previously, a malformed `metadata` JSON field in a `subscription_payment` row would be silently ignored, potentially returning incorrect upgrade parameter data. Errors are now surfaced to the API caller.
+
+- **2026-03-10** - Expiry notification always sent when NWC auto-renewal is inactive
+  - Workers now always send the expiry notification email/NIP-17 DM even when NWC is configured but `auto_renewal_enabled` is false for the subscription.
+
+- **2026-03-03** - VM upgrade no longer leaves subscription renewal cost stale
+  - `POST /api/v1/vm/{id}/upgrade` — After payment confirmation, `SubscriptionLineItem.amount` is now updated to the new base-currency cost of the upgraded template for both standard→custom and custom→custom upgrade paths
+  - `GET /api/v1/subscriptions/{id}` and admin equivalents — `line_items[].price` now reflects the post-upgrade renewal cost immediately after an upgrade completes
+
+- **2026-03-03** - Migration tool no longer marks subscriptions active for deleted VMs
+  - VM subscription backfill — Subscriptions created for deleted VMs are now inserted with `is_active = false`
+
+- **2026-02-23** - Fixed inability to unset `cpu_mfg`, `cpu_arch`, `cpu_features` fields via PATCH endpoints
+  - `PATCH /api/admin/v1/vm_templates/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - `PATCH /api/admin/v1/custom_pricing/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - `PATCH /api/admin/v1/hosts/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
+  - Previously, sending `null` for these fields was treated the same as omitting them (no change)
 
 ## [v0.2.0] - 2026-02-22
 

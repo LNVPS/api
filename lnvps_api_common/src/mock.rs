@@ -365,6 +365,11 @@ impl LNVpsDbBase for MockDb {
         Ok(users.values().cloned().collect())
     }
 
+    async fn list_users_by_ids(&self, ids: &[u64]) -> DbResult<Vec<User>> {
+        let users = self.users.lock().await;
+        Ok(ids.iter().filter_map(|id| users.get(id).cloned()).collect())
+    }
+
     async fn list_users_paginated(&self, limit: u64, offset: u64) -> DbResult<Vec<User>> {
         let users = self.users.lock().await;
         Ok(users
@@ -1288,6 +1293,45 @@ impl LNVpsDbBase for MockDb {
         let mut all: Vec<_> = subscriptions
             .values()
             .filter(|s| user_id.map_or(true, |u| s.user_id == u))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
+    async fn admin_list_subscriptions_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        search: Option<&str>,
+        is_active: Option<bool>,
+        auto_renewal: Option<bool>,
+    ) -> DbResult<(Vec<Subscription>, u64)> {
+        let search = search
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let subscriptions = self.subscriptions.lock().await;
+        let mut all: Vec<_> = subscriptions
+            .values()
+            .filter(|s| user_id.map_or(true, |u| s.user_id == u))
+            .filter(|s| is_active.map_or(true, |a| s.is_active == a))
+            .filter(|s| auto_renewal.map_or(true, |a| s.auto_renewal_enabled == a))
+            .filter(|s| {
+                search.as_ref().map_or(true, |q| {
+                    s.name.to_lowercase().contains(q)
+                        || s.description
+                            .as_ref()
+                            .map_or(false, |d| d.to_lowercase().contains(q))
+                })
+            })
             .cloned()
             .collect();
         all.sort_by(|a, b| b.id.cmp(&a.id));

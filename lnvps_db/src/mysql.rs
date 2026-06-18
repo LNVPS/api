@@ -258,6 +258,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn list_users_by_ids(&self, ids: &[u64]) -> DbResult<Vec<User>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new("SELECT * FROM users WHERE id IN (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
     async fn list_users_paginated(&self, limit: u64, offset: u64) -> DbResult<Vec<User>> {
         Ok(
             sqlx::query_as("select * from users order by id limit ? offset ?")
@@ -1470,6 +1483,110 @@ impl LNVpsDbBase for LNVpsDbMysql {
                     .await?;
             (total, rows)
         };
+        Ok((rows, total as u64))
+    }
+
+    async fn admin_list_subscriptions_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        search: Option<&str>,
+        is_active: Option<bool>,
+        auto_renewal: Option<bool>,
+    ) -> DbResult<(Vec<Subscription>, u64)> {
+        let base_from = "subscription";
+
+        let mut count_query = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM ");
+        count_query.push(base_from);
+
+        let mut data_query = sqlx::QueryBuilder::new("SELECT * FROM ");
+        data_query.push(base_from);
+
+        let mut has_conditions = false;
+
+        if let Some(uid) = user_id {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("user_id = ").push_bind(uid);
+            data_query.push("user_id = ").push_bind(uid);
+        }
+
+        if let Some(search) = search.map(str::trim).filter(|s| !s.is_empty()) {
+            // Escape LIKE wildcards so the term is matched literally, then wrap in %...%
+            let escaped = search
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{}%", escaped.to_lowercase());
+
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query
+                .push("(LOWER(name) LIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR LOWER(COALESCE(description, '')) LIKE ")
+                .push_bind(pattern.clone())
+                .push(")");
+            data_query
+                .push("(LOWER(name) LIKE ")
+                .push_bind(pattern.clone())
+                .push(" OR LOWER(COALESCE(description, '')) LIKE ")
+                .push_bind(pattern)
+                .push(")");
+        }
+
+        if let Some(active) = is_active {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+                has_conditions = true;
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query.push("is_active = ").push_bind(active);
+            data_query.push("is_active = ").push_bind(active);
+        }
+
+        if let Some(auto_renewal) = auto_renewal {
+            if !has_conditions {
+                count_query.push(" WHERE ");
+                data_query.push(" WHERE ");
+            } else {
+                count_query.push(" AND ");
+                data_query.push(" AND ");
+            }
+            count_query
+                .push("auto_renewal_enabled = ")
+                .push_bind(auto_renewal);
+            data_query
+                .push("auto_renewal_enabled = ")
+                .push_bind(auto_renewal);
+        }
+
+        let total: i64 = count_query.build_query_scalar().fetch_one(&self.db).await?;
+
+        data_query
+            .push(" ORDER BY id DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+
+        let rows: Vec<Subscription> = data_query.build_query_as().fetch_all(&self.db).await?;
+
         Ok((rows, total as u64))
     }
 

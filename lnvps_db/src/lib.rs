@@ -108,6 +108,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 
+    /// Fetch multiple users by id in a single query. Missing ids are simply absent
+    /// from the result; an empty `ids` slice returns an empty vec.
+    async fn list_users_by_ids(&self, ids: &[u64]) -> DbResult<Vec<User>>;
+
     /// List users with pagination
     async fn list_users_paginated(&self, limit: u64, offset: u64) -> DbResult<Vec<User>>;
 
@@ -458,6 +462,20 @@ pub trait LNVpsDbBase: Send + Sync {
         user_id: Option<u64>,
         limit: u64,
         offset: u64,
+    ) -> DbResult<(Vec<Subscription>, u64)>;
+    /// List subscriptions with database-level pagination and admin filtering.
+    /// All filters are optional and combine with AND. `search` is a case-insensitive
+    /// substring match against name and description; `is_active` filters on the active
+    /// flag; `auto_renewal` filters on the auto-renewal flag. Returns (rows, total_count)
+    /// where the count reflects the filtered set.
+    async fn admin_list_subscriptions_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        search: Option<&str>,
+        is_active: Option<bool>,
+        auto_renewal: Option<bool>,
     ) -> DbResult<(Vec<Subscription>, u64)>;
     async fn list_subscriptions_active(&self, user_id: u64) -> DbResult<Vec<Subscription>>;
     async fn get_subscription(&self, id: u64) -> DbResult<Subscription>;
