@@ -263,7 +263,10 @@ impl VmProvisioner {
             subscription_type: SubscriptionType::Vps,
             name: pricing.name.clone(),
             description: None,
-            amount: 0, // computed dynamically
+            // Recorded base monthly amount; the exact charge is recomputed from
+            // the VM's specs (and IP assignments) at payment time. Filled in
+            // below once the VM id is known.
+            amount: 0,
             setup_amount: 0,
             configuration: None,
         };
@@ -302,6 +305,10 @@ impl VmProvisioner {
             .get_subscription_line_item(subscription_line_item_id)
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
+        // Record the base monthly amount now that the VM id is known. With no IP
+        // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
+        let price = PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
         Ok(new_vm)
@@ -1909,6 +1916,12 @@ mod tests {
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
         assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::Vps);
+        // Regression: the recorded line item amount must reflect the base monthly
+        // cost of the custom template, not zero.
+        assert!(
+            line_item.amount > 0,
+            "custom VM line_item.amount must be the base cost, not zero"
+        );
 
         let sub = db.get_subscription(line_item.subscription_id).await?;
         assert_eq!(sub.user_id, user.id);
