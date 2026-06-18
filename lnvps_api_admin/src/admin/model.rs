@@ -6,7 +6,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use lnvps_api_common::{
-    ApiDiskInterface, ApiDiskType, ApiIntervalType, ApiOsDistribution, VmRunningState,
+    ApiDiskInterface, ApiDiskType, ApiIntervalType, ApiOsDistribution,
+    ApiSubscriptionLineItemResource, VmRunningState,
 };
 use lnvps_db::{
     AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
@@ -2392,11 +2393,17 @@ impl AdminCreateSubscriptionRequest {
 pub struct AdminSubscriptionLineItemInfo {
     pub id: u64,
     pub subscription_id: u64,
+    pub subscription_type: SubscriptionType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,
     pub setup_amount: u64,
+    /// Raw upgrade configuration stored on the line item (e.g. `new_cpu` /
+    /// `new_memory` / `new_disk`). This is NOT a resource link — see `resource`.
     pub configuration: Option<serde_json::Value>,
+    /// Typed reference to the resource this line item bills for, resolved from
+    /// `subscription_type` (`null` when there is no linked resource).
+    pub resource: Option<ApiSubscriptionLineItemResource>,
 }
 
 #[derive(Deserialize)]
@@ -2412,7 +2419,8 @@ pub struct AdminCreateSubscriptionLineItemRequest {
 
 #[derive(Deserialize)]
 pub struct AdminUpdateSubscriptionLineItemRequest {
-    pub subscription_type: Option<SubscriptionType>,
+    // `subscription_type` is intentionally absent: a line item is bound to its
+    // resource at creation time and its type must not change afterwards.
     pub name: Option<String>,
     pub description: Option<String>,
     pub amount: Option<u64>,
@@ -2420,16 +2428,25 @@ pub struct AdminUpdateSubscriptionLineItemRequest {
     pub configuration: Option<serde_json::Value>,
 }
 
-impl From<lnvps_db::SubscriptionLineItem> for AdminSubscriptionLineItemInfo {
-    fn from(line_item: lnvps_db::SubscriptionLineItem) -> Self {
+impl AdminSubscriptionLineItemInfo {
+    /// Build from a line item, resolving the linked `resource` from the line
+    /// item's subscription type via the DB back-reference tables.
+    pub async fn from_line_item<D: lnvps_db::LNVpsDbBase + ?Sized>(
+        db: &D,
+        line_item: lnvps_db::SubscriptionLineItem,
+    ) -> Self {
+        let resource = ApiSubscriptionLineItemResource::resolve(db, &line_item).await;
+
         Self {
             id: line_item.id,
             subscription_id: line_item.subscription_id,
+            subscription_type: line_item.subscription_type,
             name: line_item.name,
             description: line_item.description,
             amount: line_item.amount,
             setup_amount: line_item.setup_amount,
             configuration: line_item.configuration,
+            resource,
         }
     }
 }

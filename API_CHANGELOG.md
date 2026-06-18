@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **2026-06-18** - Subscription line items now expose a typed `resource` reference
+  - `SubscriptionLineItem` (public `GET /api/v1/subscriptions/{id}`) and `AdminSubscriptionLineItemInfo` (admin subscription + line-item endpoints) gain a `resource` field: a tagged union resolved server-side from the line item's subscription type. Shapes: `{ "type": "vps", "vm_id": number }`, `{ "type": "ip_range", "ip_range_subscription_id": number }`, or `null` when there is no linked resource.
+  - `AdminSubscriptionLineItemInfo` now also includes the `subscription_type` discriminant.
+
+### Changed
+
+- **2026-06-18** - `subscription_type` is now immutable on subscription line items
+  - `PATCH /api/admin/v1/subscription_line_items/{id}` no longer accepts `subscription_type`. A line item is bound to its resource at creation time, so its type must not change afterward (previously the field was accepted but silently ignored).
+
+
+- **2026-06-18** - `configuration` on subscription line items is now upgrade bookkeeping only
+  - Previously documented as a tagged resource link (`{ "type": "vps", "vm_id": ... }`). It is now returned as raw JSON holding upgrade data (e.g. `new_cpu`/`new_memory`/`new_disk`) and is `null` for line items that have never been upgraded. Resolve the linked resource via the new `resource` field instead.
+  - **SubscriptionType** values are now serialized in `snake_case` (`"vps"`, `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`) wherever the enum appears in JSON (e.g. the admin `subscription_type` field and the create-line-item request body), matching the rest of the API.
+
 ## [v0.3.0] - 2026-06-18
 
 ### Added

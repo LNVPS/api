@@ -104,10 +104,12 @@ impl AdminSubscriptionInfo {
             .await
             .unwrap_or_default();
 
-        let line_item_infos: Vec<AdminSubscriptionLineItemInfo> = line_items
-            .into_iter()
-            .map(AdminSubscriptionLineItemInfo::from)
-            .collect();
+        let mut line_item_infos: Vec<AdminSubscriptionLineItemInfo> =
+            Vec::with_capacity(line_items.len());
+        for item in line_items {
+            line_item_infos
+                .push(AdminSubscriptionLineItemInfo::from_line_item(db.as_ref(), item).await);
+        }
 
         // Count payments
         let payments = db
@@ -320,10 +322,12 @@ async fn admin_list_subscription_line_items(
         .db
         .list_subscription_line_items(subscription_id)
         .await?;
-    let line_item_infos: Vec<AdminSubscriptionLineItemInfo> = line_items
-        .into_iter()
-        .map(AdminSubscriptionLineItemInfo::from)
-        .collect();
+    let mut line_item_infos: Vec<AdminSubscriptionLineItemInfo> =
+        Vec::with_capacity(line_items.len());
+    for item in line_items {
+        line_item_infos
+            .push(AdminSubscriptionLineItemInfo::from_line_item(this.db.as_ref(), item).await);
+    }
 
     ApiData::ok(line_item_infos)
 }
@@ -337,7 +341,7 @@ async fn admin_get_subscription_line_item(
     auth.require_permission(AdminResource::SubscriptionLineItems, AdminAction::View)?;
 
     let line_item = this.db.get_subscription_line_item(id).await?;
-    ApiData::ok(AdminSubscriptionLineItemInfo::from(line_item))
+    ApiData::ok(AdminSubscriptionLineItemInfo::from_line_item(this.db.as_ref(), line_item).await)
 }
 
 /// Create subscription line item
@@ -355,7 +359,9 @@ async fn admin_create_subscription_line_item(
 
     let line_item_id = this.db.insert_subscription_line_item(&line_item).await?;
     let created_line_item = this.db.get_subscription_line_item(line_item_id).await?;
-    ApiData::ok(AdminSubscriptionLineItemInfo::from(created_line_item))
+    ApiData::ok(
+        AdminSubscriptionLineItemInfo::from_line_item(this.db.as_ref(), created_line_item).await,
+    )
 }
 
 /// Update subscription line item
@@ -370,7 +376,9 @@ async fn admin_update_subscription_line_item(
     // Get existing line item
     let mut line_item = this.db.get_subscription_line_item(id).await?;
 
-    // Update fields if provided
+    // Update fields if provided. `subscription_type` is intentionally NOT
+    // mutable: a line item is bound to its resource at creation time and
+    // changing the type would orphan that link.
     if let Some(name) = request.name {
         if name.trim().is_empty() {
             return Err(anyhow::anyhow!("Line item name cannot be empty").into());
@@ -391,7 +399,7 @@ async fn admin_update_subscription_line_item(
     }
 
     this.db.update_subscription_line_item(&line_item).await?;
-    ApiData::ok(AdminSubscriptionLineItemInfo::from(line_item))
+    ApiData::ok(AdminSubscriptionLineItemInfo::from_line_item(this.db.as_ref(), line_item).await)
 }
 
 /// Delete subscription line item

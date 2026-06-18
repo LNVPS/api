@@ -618,12 +618,12 @@ impl ApiSubscription {
         db: &dyn lnvps_db::LNVpsDbBase,
         subscription: lnvps_db::Subscription,
     ) -> anyhow::Result<Self> {
-        let line_items = db
-            .list_subscription_line_items(subscription.id)
-            .await?
-            .into_iter()
-            .map(|item| ApiSubscriptionLineItem::from_with_currency(item, &subscription.currency))
-            .collect();
+        let raw_line_items = db.list_subscription_line_items(subscription.id).await?;
+        let mut line_items = Vec::with_capacity(raw_line_items.len());
+        for item in raw_line_items {
+            line_items
+                .push(ApiSubscriptionLineItem::from_line_item(db, item, &subscription.currency).await);
+        }
 
         Ok(Self {
             id: subscription.id,
@@ -646,21 +646,27 @@ pub struct ApiSubscriptionLineItem {
     pub description: Option<String>,
     pub price: ApiPrice,
     pub setup_fee: ApiPrice,
-    pub configuration: Option<ApiSubscriptionLineItemConfiguration>,
+    /// Raw upgrade configuration stored on the line item (e.g. `new_cpu` /
+    /// `new_memory` / `new_disk`). This is NOT a resource link — see `resource`.
+    pub configuration: Option<serde_json::Value>,
+    /// Typed reference to the resource this line item bills for, resolved from
+    /// the line item's subscription type (`null` when there is no linked resource).
+    pub resource: Option<ApiSubscriptionLineItemResource>,
 }
 
 impl ApiSubscriptionLineItem {
-    pub fn from_with_currency(line_item: lnvps_db::SubscriptionLineItem, currency: &str) -> Self {
+    pub async fn from_line_item<D: lnvps_db::LNVpsDbBase + ?Sized>(
+        db: &D,
+        line_item: lnvps_db::SubscriptionLineItem,
+        currency: &str,
+    ) -> Self {
         let api_currency: ApiCurrency =
             currency.parse::<Currency>().unwrap_or(Currency::USD).into();
 
         let price = CurrencyAmount::from_u64(api_currency.into(), line_item.amount);
         let setup_fee = CurrencyAmount::from_u64(api_currency.into(), line_item.setup_amount);
 
-        let configuration = line_item
-            .configuration
-            .as_ref()
-            .and_then(|v| ApiSubscriptionLineItemConfiguration::from_raw_value(v));
+        let resource = ApiSubscriptionLineItemResource::resolve(db, &line_item).await;
 
         Self {
             id: line_item.id,
@@ -669,7 +675,8 @@ impl ApiSubscriptionLineItem {
             description: line_item.description,
             price: price.into(),
             setup_fee: setup_fee.into(),
-            configuration,
+            configuration: line_item.configuration,
+            resource,
         }
     }
 }

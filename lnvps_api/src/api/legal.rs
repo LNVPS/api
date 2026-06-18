@@ -222,43 +222,44 @@ async fn v1_generate_lir_agreement_from_subscription(
     let total_recurring: u64 = line_items.iter().map(|li| li.amount).sum();
     let total_setup: u64 = line_items.iter().map(|li| li.setup_amount).sum();
 
-    // Build resources list from line items
-    let resources: Vec<ResourceRequest> = line_items
-        .iter()
-        .map(|li| {
-            let resource_type = match li.subscription_type {
-                lnvps_db::SubscriptionType::IpRange => li
-                    .configuration
-                    .as_ref()
-                    .and_then(|cfg| cfg.get("cidr").and_then(|c| c.as_str()))
-                    .map(|cidr| {
-                        if cidr.contains(':') {
-                            "IPv6 PI"
-                        } else {
-                            "IPv4 PI"
-                        }
-                    })
-                    .unwrap_or("IP Range")
-                    .to_string(),
-                lnvps_db::SubscriptionType::AsnSponsoring => "AS Number".to_string(),
-                lnvps_db::SubscriptionType::DnsHosting => "DNS Hosting".to_string(),
-                lnvps_db::SubscriptionType::Vps => "VPS".to_string(),
-            };
-
-            let quantity = li
-                .configuration
-                .as_ref()
-                .and_then(|cfg| cfg.get("cidr").and_then(|c| c.as_str()))
-                .unwrap_or("—")
+    // Build resources list from line items. The linked resource is resolved
+    // from each line item's subscription type via the back-reference tables —
+    // never from the `configuration` column (which holds upgrade data only).
+    let mut resources: Vec<ResourceRequest> = Vec::with_capacity(line_items.len());
+    for li in &line_items {
+        let (resource_type, quantity) = match li.subscription_type {
+            lnvps_db::SubscriptionType::IpRange => {
+                // Look up the allocated CIDR via ip_range_subscription
+                let cidr = this
+                    .db
+                    .list_ip_range_subscriptions_by_line_item(li.id)
+                    .await
+                    .ok()
+                    .and_then(|subs| subs.into_iter().next())
+                    .map(|sub| sub.cidr);
+                let resource_type = match cidr.as_deref() {
+                    Some(c) if c.contains(':') => "IPv6 PI",
+                    Some(_) => "IPv4 PI",
+                    None => "IP Range",
+                }
                 .to_string();
-
-            ResourceRequest {
-                resource_type,
-                quantity,
-                purpose: li.description.clone().unwrap_or_else(|| li.name.clone()),
+                (resource_type, cidr.unwrap_or_else(|| "—".to_string()))
             }
-        })
-        .collect();
+            lnvps_db::SubscriptionType::AsnSponsoring => {
+                ("AS Number".to_string(), "—".to_string())
+            }
+            lnvps_db::SubscriptionType::DnsHosting => {
+                ("DNS Hosting".to_string(), "—".to_string())
+            }
+            lnvps_db::SubscriptionType::Vps => ("VPS".to_string(), "—".to_string()),
+        };
+
+        resources.push(ResourceRequest {
+            resource_type,
+            quantity,
+            purpose: li.description.clone().unwrap_or_else(|| li.name.clone()),
+        });
+    }
 
     // Get end user npub - convert from nostr::PublicKey to nostr_sdk::PublicKey for bech32
     let end_user_npub = NostrSdkPublicKey::from_slice(&pubkey_bytes)

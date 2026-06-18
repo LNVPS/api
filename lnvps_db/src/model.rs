@@ -1570,6 +1570,7 @@ pub struct Subscription {
 /// Subscription Type - Type of service being sold
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]
+#[serde(rename_all = "snake_case")]
 pub enum SubscriptionType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
@@ -1599,6 +1600,15 @@ pub struct SubscriptionLineItem {
     pub description: Option<String>,
     pub amount: u64,
     pub setup_amount: u64,
+    /// Upgrade bookkeeping for this line item, serialized as JSON.
+    ///
+    /// This stores upgrade configuration only (e.g. `UpgradeConfig` —
+    /// `new_cpu` / `new_memory` / `new_disk`) recorded when a VM's specs are
+    /// changed. It is NOT a link to the resource this line item bills for:
+    /// the linked resource is resolved from [`SubscriptionType`] via the
+    /// back-reference tables (`vm.subscription_line_item_id`,
+    /// `ip_range_subscription.subscription_line_item_id`, ...), never by
+    /// parsing this column.
     pub configuration: Option<serde_json::Value>,
 }
 

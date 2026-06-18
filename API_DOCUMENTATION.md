@@ -272,14 +272,16 @@ interface SubscriptionLineItem {
   description?: string;
   price: Price; // Recurring cost per billing cycle
   setup_fee: Price; // One-time setup fee
-  configuration?: SubscriptionLineItemConfiguration; // Service-specific configuration (tagged union)
+  configuration?: object; // Raw upgrade bookkeeping only (e.g. new_cpu/new_memory/new_disk); NOT a resource link
+  resource?: SubscriptionLineItemResource; // Linked resource, resolved from the line item's subscription type
 }
 
+// Typed reference to the resource this line item bills for, resolved server-side
+// from the line item's subscription type (null when there is no linked resource).
 // Tagged union discriminated by the "type" field.
-type SubscriptionLineItemConfiguration =
+type SubscriptionLineItemResource =
   | { type: "vps"; vm_id: number }
-  | { type: "ip_range"; ip_space_pricing_id: number };
-}
+  | { type: "ip_range"; ip_range_subscription_id: number };
 
 interface SubscriptionPayment {
   id: string; // Hex-encoded payment ID

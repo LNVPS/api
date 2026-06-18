@@ -20,7 +20,7 @@ Admin API request/response format reference for LLM consumption.
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
 **SubscriptionPaymentType**: `"purchase"`, `"renewal"`, `"upgrade"`
-**SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`
+**SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`, `"vps"`
 **InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
 **CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
 **CpuArch**: `"unknown"`, `"x86_64"`, `"arm64"`
@@ -198,7 +198,7 @@ The response includes a `subscription` field (type: `AdminSubscriptionInfo`) whe
 - `interval_amount` / `interval_type` — billing interval
 - `currency` — billing currency
 - `payment_count` — total number of payments made
-- `line_items` — array of `AdminSubscriptionLineItemInfo` objects
+- `line_items` — array of `AdminSubscriptionLineItemInfo` objects (see [Subscription Line Item response shape](#subscription-line-item-response-shape))
 
 Example (abbreviated):
 ```json
@@ -212,7 +212,14 @@ Example (abbreviated):
       "interval_type": "month",
       "currency": "USD",
       "payment_count": 3,
-      "line_items": [{ "id": 12, "amount": 999, "setup_amount": 0 }]
+      "line_items": [{
+        "id": 12,
+        "subscription_type": "vps",
+        "amount": 999,
+        "setup_amount": 0,
+        "configuration": null,
+        "resource": { "type": "vps", "vm_id": 42 }
+      }]
     }
   }
 }
@@ -532,7 +539,7 @@ All filters are optional and combine with AND. Filtering is applied before pagin
 
 Required Permission: `subscriptions::view`
 
-Returns paginated list of subscriptions with embedded line items and payment count. Each `AdminSubscriptionInfo` includes a `user_pubkey` field (hex-encoded Nostr pubkey of the owning user) alongside `user_id`.
+Returns paginated list of subscriptions with embedded line items and payment count. Each `AdminSubscriptionInfo` includes a `user_pubkey` field (hex-encoded Nostr pubkey of the owning user) alongside `user_id`. Embedded line items use the [Subscription Line Item response shape](#subscription-line-item-response-shape).
 
 #### Get Subscription Details
 
@@ -542,7 +549,7 @@ GET /api/admin/v1/subscriptions/{id}
 
 Required Permission: `subscriptions::view`
 
-Returns complete subscription information including all line items and payment count.
+Returns complete subscription information including all line items and payment count. Line items use the [Subscription Line Item response shape](#subscription-line-item-response-shape).
 
 #### Create Subscription
 
@@ -640,6 +647,35 @@ Response:
 }
 ```
 
+#### Subscription Line Item response shape
+
+`AdminSubscriptionLineItemInfo` objects (returned by the line-item endpoints below and embedded in subscription/VM responses) have the form:
+
+```json
+{
+  "id": number,
+  "subscription_id": number,
+  "subscription_type": "ip_range" | "asn_sponsoring" | "dns_hosting" | "vps",
+  "name": string,
+  "description": string | null,
+  "amount": number,        // recurring cost in cents/millisats
+  "setup_amount": number,  // one-time setup fee in cents/millisats
+  "configuration": object | null,
+  "resource": object | null
+}
+```
+
+`subscription_type` is the **SubscriptionType** discriminant identifying the kind of service this line item bills for.
+
+`resource` is a typed, tagged reference to the linked resource, **resolved from `subscription_type`** by looking up the back-reference tables (e.g. `vm.subscription_line_item_id`, `ip_range_subscription.subscription_line_item_id`). Use it to resolve the linked resource directly. Current shapes:
+
+- `{ "type": "vps", "vm_id": number }` — links to a VM
+- `{ "type": "ip_range", "ip_range_subscription_id": number }` — links to an IP range subscription
+
+`resource` is `null` when the type has no linkable resource (`asn_sponsoring`, `dns_hosting`) or the back-reference row cannot be found.
+
+`configuration` is raw JSON used for **upgrade bookkeeping only** (e.g. `{ "new_cpu": 4, "new_memory": 8589934592, "new_disk": null }`) — it is recorded when a VM's specs are changed and is **not** a resource link. Do not use it to resolve the linked resource; use `resource` instead. It is `null` for line items that have never been upgraded.
+
 #### List Subscription Line Items
 
 ```
@@ -648,7 +684,7 @@ GET /api/admin/v1/subscriptions/{subscription_id}/line_items
 
 Required Permission: `subscription_line_items::view`
 
-Returns all line items for a specific subscription. Note that line items are also included in subscription responses.
+Returns all line items for a specific subscription (see [response shape](#subscription-line-item-response-shape)). Note that line items are also included in subscription responses.
 
 #### Get Subscription Line Item
 
@@ -657,6 +693,8 @@ GET /api/admin/v1/subscription_line_items/{id}
 ```
 
 Required Permission: `subscription_line_items::view`
+
+Returns a single line item (see [response shape](#subscription-line-item-response-shape)).
 
 #### Create Subscription Line Item
 
@@ -671,6 +709,7 @@ Request body:
 ```json
 {
   "subscription_id": number,
+  "subscription_type": "ip_range" | "asn_sponsoring" | "dns_hosting" | "vps",
   "name": string,
   "description": string
   (optional),
@@ -680,11 +719,13 @@ Request body:
   // one-time setup fee in cents/millisats
   "configuration": object
   (optional)
-  // service-specific JSON config
+  // raw upgrade bookkeeping JSON only (e.g. new_cpu/new_memory/new_disk);
+  // NOT a resource link. The linked resource is resolved from
+  // subscription_type and returned as `resource` in responses.
 }
 ```
 
-Response: Created line item
+Response: Created line item (see [response shape](#subscription-line-item-response-shape)). The `resource` field is resolved from `subscription_type`; `configuration` is echoed back as stored.
 
 #### Update Subscription Line Item
 
@@ -698,15 +739,17 @@ Request body (all fields optional):
 
 ```json
 {
+  "subscription_type": "ip_range" | "asn_sponsoring" | "dns_hosting" | "vps",
   "name": string,
   "description": string,
   "amount": number,
   "setup_amount": number,
   "configuration": object
+  // raw upgrade bookkeeping JSON only; NOT a resource link
 }
 ```
 
-Response: Updated line item
+Response: Updated line item (see [response shape](#subscription-line-item-response-shape)). Changing `subscription_type` changes which resource the `resource` field resolves against.
 
 #### Delete Subscription Line Item
 
