@@ -126,6 +126,15 @@ pub enum WorkJob {
     DownloadOsImages { image_id: Option<u64> },
     /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
     CheckSubscriptions,
+    /// Poll routers for tunnel/BGP state and record per-tunnel traffic samples.
+    SampleRouterTraffic,
+    /// Enable or disable a BGP session on a router (admin action).
+    ToggleBgpSession {
+        router_id: u64,
+        /// Backend session id (protocol name on BIRD, `.id` on Mikrotik)
+        session_id: String,
+        enabled: bool,
+    },
 }
 
 impl WorkJob {
@@ -167,6 +176,8 @@ impl fmt::Display for WorkJob {
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
+            WorkJob::SampleRouterTraffic => write!(f, "SampleRouterTraffic"),
+            WorkJob::ToggleBgpSession { .. } => write!(f, "ToggleBgpSession"),
         }
     }
 }

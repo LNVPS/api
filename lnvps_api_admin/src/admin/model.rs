@@ -100,6 +100,7 @@ impl From<AdminNetworkAccessPolicy> for NetworkAccessPolicy {
 pub enum AdminRouterKind {
     Mikrotik,
     OvhAdditionalIp,
+    LinuxSsh,
 }
 
 impl From<RouterKind> for AdminRouterKind {
@@ -107,6 +108,7 @@ impl From<RouterKind> for AdminRouterKind {
         match router_kind {
             RouterKind::Mikrotik => AdminRouterKind::Mikrotik,
             RouterKind::OvhAdditionalIp => AdminRouterKind::OvhAdditionalIp,
+            RouterKind::LinuxSsh => AdminRouterKind::LinuxSsh,
             // MockRouter is a test-only variant and should never appear in production.
             // Map it to Mikrotik as a safe fallback rather than panicking.
             RouterKind::MockRouter => AdminRouterKind::Mikrotik,
@@ -119,6 +121,7 @@ impl From<AdminRouterKind> for RouterKind {
         match admin_router_kind {
             AdminRouterKind::Mikrotik => RouterKind::Mikrotik,
             AdminRouterKind::OvhAdditionalIp => RouterKind::OvhAdditionalIp,
+            AdminRouterKind::LinuxSsh => RouterKind::LinuxSsh,
         }
     }
 }
@@ -1868,6 +1871,112 @@ impl From<lnvps_db::Router> for AdminRouterDetail {
     }
 }
 
+/// A cached tunnel discovered on a router
+#[derive(Serialize)]
+pub struct AdminRouterTunnel {
+    pub id: u64,
+    pub router_id: u64,
+    pub name: String,
+    pub kind: String,
+    pub local_addr: Option<String>,
+    pub remote_addr: Option<String>,
+    pub enabled: bool,
+    pub last_seen: DateTime<Utc>,
+}
+
+impl From<lnvps_db::RouterTunnel> for AdminRouterTunnel {
+    fn from(t: lnvps_db::RouterTunnel) -> Self {
+        let kind = match t.kind {
+            lnvps_db::RouterTunnelKind::Gre => "gre",
+            lnvps_db::RouterTunnelKind::Vxlan => "vxlan",
+            lnvps_db::RouterTunnelKind::Wireguard => "wireguard",
+        }
+        .to_string();
+        Self {
+            id: t.id,
+            router_id: t.router_id,
+            name: t.name,
+            kind,
+            local_addr: t.local_addr,
+            remote_addr: t.remote_addr,
+            enabled: t.enabled,
+            last_seen: t.last_seen,
+        }
+    }
+}
+
+/// A single per-tunnel traffic sample
+#[derive(Serialize)]
+pub struct AdminRouterTunnelTraffic {
+    pub tunnel_name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub sampled_at: DateTime<Utc>,
+}
+
+impl From<lnvps_db::RouterTunnelTraffic> for AdminRouterTunnelTraffic {
+    fn from(t: lnvps_db::RouterTunnelTraffic) -> Self {
+        Self {
+            tunnel_name: t.tunnel_name,
+            rx_bytes: t.rx_bytes,
+            tx_bytes: t.tx_bytes,
+            sampled_at: t.sampled_at,
+        }
+    }
+}
+
+/// A cached BGP session on a router
+#[derive(Serialize)]
+pub struct AdminRouterBgpSession {
+    pub id: u64,
+    pub router_id: u64,
+    /// Backend session id used for toggling (protocol name / RouterOS .id)
+    pub name: String,
+    pub peer_ip: Option<String>,
+    pub peer_asn: Option<u32>,
+    pub local_asn: Option<u32>,
+    pub state: String,
+    pub prefixes_received: Option<u64>,
+    pub prefixes_sent: Option<u64>,
+    pub enabled: bool,
+    pub direction: String,
+    pub last_seen: DateTime<Utc>,
+}
+
+impl From<lnvps_db::RouterBgpSession> for AdminRouterBgpSession {
+    fn from(s: lnvps_db::RouterBgpSession) -> Self {
+        let direction = match s.direction {
+            lnvps_db::RouterBgpDirection::Upstream => "upstream",
+            lnvps_db::RouterBgpDirection::Downstream => "downstream",
+            lnvps_db::RouterBgpDirection::Peer => "peer",
+            lnvps_db::RouterBgpDirection::Unknown => "unknown",
+        }
+        .to_string();
+        Self {
+            id: s.id,
+            router_id: s.router_id,
+            name: s.name,
+            peer_ip: s.peer_ip,
+            peer_asn: s.peer_asn,
+            local_asn: s.local_asn,
+            state: s.state,
+            prefixes_received: s.prefixes_received,
+            prefixes_sent: s.prefixes_sent,
+            enabled: s.enabled,
+            direction,
+            last_seen: s.last_seen,
+        }
+    }
+}
+
+/// Toggle a BGP session on/off
+#[derive(Deserialize)]
+pub struct ToggleBgpSessionRequest {
+    /// Backend session id (protocol name on BIRD, `.id` on Mikrotik)
+    pub session_id: String,
+    pub enabled: bool,
+}
+
 impl CreateRouterRequest {
     pub fn to_router(&self) -> anyhow::Result<lnvps_db::Router> {
         let db_kind = RouterKind::from(self.kind);
@@ -3346,5 +3455,73 @@ mod tests {
         let json = r#"{"cpu_mfg": "amd"}"#;
         let req: UpdateCustomPricingRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.cpu_mfg, Some(Some("amd".to_string())));
+    }
+
+    #[test]
+    fn test_admin_router_tunnel_from() {
+        use chrono::Utc;
+        let t = lnvps_db::RouterTunnel {
+            id: 7,
+            router_id: 1,
+            name: "wg0".to_string(),
+            kind: lnvps_db::RouterTunnelKind::Wireguard,
+            local_addr: Some("10.0.0.1".to_string()),
+            remote_addr: None,
+            enabled: true,
+            last_seen: Utc::now(),
+        };
+        let a = AdminRouterTunnel::from(t);
+        assert_eq!(a.id, 7);
+        assert_eq!(a.kind, "wireguard");
+        assert_eq!(a.local_addr.as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_admin_router_tunnel_traffic_from() {
+        use chrono::Utc;
+        let t = lnvps_db::RouterTunnelTraffic {
+            id: 1,
+            router_id: 1,
+            tunnel_name: "gre1".to_string(),
+            rx_bytes: 100,
+            tx_bytes: 200,
+            sampled_at: Utc::now(),
+        };
+        let a = AdminRouterTunnelTraffic::from(t);
+        assert_eq!(a.tunnel_name, "gre1");
+        assert_eq!(a.rx_bytes, 100);
+        assert_eq!(a.tx_bytes, 200);
+    }
+
+    #[test]
+    fn test_admin_router_bgp_session_from() {
+        use chrono::Utc;
+        let s = lnvps_db::RouterBgpSession {
+            id: 3,
+            router_id: 1,
+            name: "peer1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: Some(5),
+            prefixes_sent: Some(1),
+            enabled: true,
+            direction: lnvps_db::RouterBgpDirection::Upstream,
+            last_seen: Utc::now(),
+        };
+        let a = AdminRouterBgpSession::from(s);
+        assert_eq!(a.id, 3);
+        assert_eq!(a.peer_asn, Some(64512));
+        assert_eq!(a.direction, "upstream");
+        assert_eq!(a.state, "Established");
+    }
+
+    #[test]
+    fn test_toggle_bgp_session_request_deserialize() {
+        let json = r#"{"session_id": "bgp1", "enabled": false}"#;
+        let req: ToggleBgpSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.session_id, "bgp1");
+        assert!(!req.enabled);
     }
 }

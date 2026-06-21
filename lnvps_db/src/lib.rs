@@ -1,5 +1,6 @@
 use anyhow::{Error, Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::migrate::MigrateError;
 use thiserror::Error;
 
@@ -373,6 +374,36 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List all routers
     async fn list_routers(&self) -> DbResult<Vec<Router>>;
+
+    /// List cached tunnels for a router
+    async fn list_router_tunnels(&self, router_id: u64) -> DbResult<Vec<RouterTunnel>>;
+
+    /// Insert or update (by router_id+name) a cached tunnel, returning its id
+    async fn upsert_router_tunnel(&self, tunnel: &RouterTunnel) -> DbResult<u64>;
+
+    /// Delete a cached tunnel by id
+    async fn delete_router_tunnel(&self, id: u64) -> DbResult<()>;
+
+    /// Insert a per-tunnel traffic sample, returning its id
+    async fn insert_router_tunnel_traffic(&self, sample: &RouterTunnelTraffic) -> DbResult<u64>;
+
+    /// List traffic samples for a router/tunnel within a time window
+    async fn list_router_tunnel_traffic(
+        &self,
+        router_id: u64,
+        tunnel_name: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> DbResult<Vec<RouterTunnelTraffic>>;
+
+    /// List cached BGP sessions for a router
+    async fn list_router_bgp_sessions(&self, router_id: u64) -> DbResult<Vec<RouterBgpSession>>;
+
+    /// Insert or update (by router_id+name) a cached BGP session, returning its id
+    async fn upsert_router_bgp_session(&self, session: &RouterBgpSession) -> DbResult<u64>;
+
+    /// Delete a cached BGP session by id
+    async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()>;
 
     /// Get VM IP assignment
     async fn get_vm_ip_assignment(&self, id: u64) -> DbResult<VmIpAssignment>;

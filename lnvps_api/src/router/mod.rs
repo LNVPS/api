@@ -19,6 +19,272 @@ pub trait Router: Send + Sync {
     async fn add_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
     async fn remove_arp_entry(&self, id: &str) -> OpResult<()>;
     async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
+
+    /// Tunnel-management capability, if this router supports it.
+    ///
+    /// Returns `None` for routers that cannot manage GRE/VXLAN/WireGuard tunnels.
+    fn tunnel(&self) -> Option<&dyn TunnelRouter> {
+        None
+    }
+
+    /// BGP capability, if this router supports it.
+    ///
+    /// Returns `None` for routers that do not run BGP.
+    fn bgp(&self) -> Option<&dyn BgpRouter> {
+        None
+    }
+}
+
+/// Optional capability for routers that run BGP (route servers / edge routers).
+///
+/// Note: BGP itself exposes no per-session byte counters — traffic accounting is
+/// done at the tunnel/interface level (see [`TunnelRouter`]).
+#[async_trait]
+pub trait BgpRouter: Send + Sync {
+    /// Detect configured BGP sessions and their state (issue task 2)
+    async fn list_sessions(&self) -> OpResult<Vec<BgpSession>>;
+    /// Detect which of the `candidates` prefixes (e.g. VM IP ranges) the router
+    /// actually originates/announces (issue task 3).
+    ///
+    /// Scoped to a candidate set rather than enumerating the table so it stays
+    /// bounded on routers carrying a full DFZ table (~1M+ routes). Passing an
+    /// empty slice returns all locally-originated prefixes (which is inherently
+    /// small — a router only originates its own ranges).
+    async fn originated_routes(&self, candidates: &[String]) -> OpResult<Vec<BgpRoute>>;
+    /// Detect a default route, if present (issue task 4 — route-server detection)
+    async fn default_route(&self) -> OpResult<Option<BgpRoute>>;
+    /// Discover BGP peers and classify upstream/downstream (issue task 5)
+    async fn discover_peers(&self) -> OpResult<Vec<BgpPeer>>;
+    /// Enable or disable a BGP session by its backend id (issue task 6)
+    async fn set_session_enabled(&self, id: &str, enabled: bool) -> OpResult<()>;
+}
+
+/// Relationship of a BGP peer relative to this router
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BgpPeerDirection {
+    /// The peer is a transit provider (we are its customer)
+    Upstream,
+    /// The peer is our customer (we provide transit)
+    Downstream,
+    /// Settlement-free / lateral peer
+    Peer,
+    /// Relationship could not be determined
+    #[default]
+    Unknown,
+}
+
+/// A detected BGP session
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BgpSession {
+    /// Backend identifier used for toggling (protocol name on BIRD, `.id` on Mikrotik)
+    pub id: String,
+    /// Human-readable session/protocol name
+    pub name: String,
+    /// Neighbour address
+    pub peer_ip: Option<String>,
+    /// Neighbour AS number
+    pub peer_asn: Option<u32>,
+    /// Local AS number
+    pub local_asn: Option<u32>,
+    /// Session state (e.g. `Established`, `Active`, `Idle`)
+    pub state: String,
+    /// Number of prefixes received from the peer
+    pub prefixes_received: Option<u64>,
+    /// Number of prefixes sent to the peer
+    pub prefixes_sent: Option<u64>,
+    /// Whether the session is administratively enabled
+    pub enabled: bool,
+    /// Inferred peer relationship
+    pub direction: BgpPeerDirection,
+}
+
+/// A discovered BGP peer
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BgpPeer {
+    /// Peer address
+    pub peer_ip: Option<String>,
+    /// Peer AS number
+    pub asn: Option<u32>,
+    /// Inferred relationship
+    pub direction: BgpPeerDirection,
+}
+
+/// A route in the routing table
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BgpRoute {
+    /// Destination prefix (CIDR)
+    pub prefix: String,
+    /// Next hop / gateway, if any
+    pub next_hop: Option<String>,
+}
+
+/// Optional capability for routers that can manage point-to-point/overlay tunnels
+/// (GRE, VXLAN, WireGuard) and report per-tunnel traffic counters.
+///
+/// Per-tunnel byte counters are the canonical source of "per session" traffic for
+/// route servers — BGP itself exposes no byte counters.
+#[async_trait]
+pub trait TunnelRouter: Send + Sync {
+    /// List all tunnels currently configured on the router
+    async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>>;
+    /// Create a new tunnel
+    async fn add_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel>;
+    /// Remove a tunnel by its backend id (interface name on Linux)
+    async fn remove_tunnel(&self, id: &str) -> OpResult<()>;
+    /// Update an existing tunnel
+    async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel>;
+    /// Report per-tunnel rx/tx byte counters
+    async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>>;
+}
+
+/// The kind of a tunnel interface
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelKind {
+    Gre,
+    Vxlan,
+    Wireguard,
+}
+
+/// A tunnel interface (GRE, VXLAN or WireGuard)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tunnel {
+    /// Backend identifier (interface name on Linux, `.id` on Mikrotik)
+    pub id: Option<String>,
+    /// Interface name
+    pub name: String,
+    /// Local tunnel endpoint address
+    pub local_addr: Option<String>,
+    /// Remote tunnel endpoint address
+    pub remote_addr: Option<String>,
+    /// Whether the interface is administratively up
+    pub enabled: bool,
+    /// Kind-specific configuration
+    pub config: TunnelConfig,
+}
+
+impl Tunnel {
+    /// The kind of this tunnel, derived from its config
+    pub fn kind(&self) -> TunnelKind {
+        match self.config {
+            TunnelConfig::Gre(_) => TunnelKind::Gre,
+            TunnelConfig::Vxlan(_) => TunnelKind::Vxlan,
+            TunnelConfig::Wireguard(_) => TunnelKind::Wireguard,
+        }
+    }
+}
+
+/// Kind-specific tunnel configuration
+#[derive(Debug, Clone, PartialEq)]
+pub enum TunnelConfig {
+    Gre(GreConfig),
+    Vxlan(VxlanConfig),
+    Wireguard(WireguardConfig),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GreConfig {
+    /// GRE key (shared between local/remote tunnel ends)
+    pub key: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VxlanConfig {
+    /// VXLAN network identifier (VNI)
+    pub vni: u32,
+    /// UDP destination port (default 4789)
+    pub dst_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireguardConfig {
+    /// UDP listen port
+    pub listen_port: Option<u16>,
+    /// Interface private key (PEM/base64); never returned when listing
+    pub private_key: Option<String>,
+    /// Interface public key
+    pub public_key: Option<String>,
+    /// Configured peers
+    pub peers: Vec<WireguardPeer>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireguardPeer {
+    /// Peer public key
+    pub public_key: String,
+    /// Peer endpoint (host:port)
+    pub endpoint: Option<String>,
+    /// Allowed IP ranges (CIDR)
+    pub allowed_ips: Vec<String>,
+    /// Persistent keepalive interval in seconds
+    pub persistent_keepalive: Option<u16>,
+}
+
+/// Per-tunnel traffic counters
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelTraffic {
+    /// Tunnel interface name
+    pub name: String,
+    /// Bytes received
+    pub rx_bytes: u64,
+    /// Bytes transmitted
+    pub tx_bytes: u64,
+}
+
+impl From<TunnelKind> for lnvps_db::RouterTunnelKind {
+    fn from(k: TunnelKind) -> Self {
+        match k {
+            TunnelKind::Gre => lnvps_db::RouterTunnelKind::Gre,
+            TunnelKind::Vxlan => lnvps_db::RouterTunnelKind::Vxlan,
+            TunnelKind::Wireguard => lnvps_db::RouterTunnelKind::Wireguard,
+        }
+    }
+}
+
+impl Tunnel {
+    /// Build a cacheable DB row for this tunnel under the given router.
+    pub fn to_db(&self, router_id: u64) -> lnvps_db::RouterTunnel {
+        lnvps_db::RouterTunnel {
+            id: 0,
+            router_id,
+            name: self.name.clone(),
+            kind: self.kind().into(),
+            local_addr: self.local_addr.clone(),
+            remote_addr: self.remote_addr.clone(),
+            enabled: self.enabled,
+            last_seen: chrono::Utc::now(),
+        }
+    }
+}
+
+impl From<BgpPeerDirection> for lnvps_db::RouterBgpDirection {
+    fn from(d: BgpPeerDirection) -> Self {
+        match d {
+            BgpPeerDirection::Upstream => lnvps_db::RouterBgpDirection::Upstream,
+            BgpPeerDirection::Downstream => lnvps_db::RouterBgpDirection::Downstream,
+            BgpPeerDirection::Peer => lnvps_db::RouterBgpDirection::Peer,
+            BgpPeerDirection::Unknown => lnvps_db::RouterBgpDirection::Unknown,
+        }
+    }
+}
+
+impl BgpSession {
+    /// Build a cacheable DB row for this session under the given router.
+    pub fn to_db(&self, router_id: u64) -> lnvps_db::RouterBgpSession {
+        lnvps_db::RouterBgpSession {
+            id: 0,
+            router_id,
+            name: self.name.clone(),
+            peer_ip: self.peer_ip.clone(),
+            peer_asn: self.peer_asn,
+            local_asn: self.local_asn,
+            state: self.state.clone(),
+            prefixes_received: self.prefixes_received,
+            prefixes_sent: self.prefixes_sent,
+            enabled: self.enabled,
+            direction: self.direction.into(),
+            last_seen: chrono::Utc::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,10 +312,14 @@ impl ArpEntry {
     }
 }
 
+#[cfg(feature = "linux-ssh")]
+mod linux_ssh;
 #[cfg(feature = "mikrotik")]
 mod mikrotik;
 mod ovh;
 
+#[cfg(feature = "linux-ssh")]
+pub use linux_ssh::LinuxSshRouter;
 #[cfg(feature = "mikrotik")]
 pub use mikrotik::MikrotikRouter;
 pub use ovh::OvhDedicatedServerVMacRouter;
@@ -68,6 +338,12 @@ pub async fn get_router(db: &Arc<dyn LNVpsDb>, router_id: u64) -> OpResult<Arc<d
         RouterKind::OvhAdditionalIp => Ok(Arc::new(
             OvhDedicatedServerVMacRouter::new(&cfg.url, &cfg.name, cfg.token.as_str()).await?,
         )),
+        #[cfg(feature = "linux-ssh")]
+        RouterKind::LinuxSsh => Ok(Arc::new(LinuxSshRouter::new(&cfg.url, cfg.token.as_str())?)),
+        #[cfg(not(feature = "linux-ssh"))]
+        RouterKind::LinuxSsh => Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
+            "LinuxSsh router support is not enabled in this build"
+        ))),
         RouterKind::MockRouter => {
             #[cfg(test)]
             return Ok(Arc::new(crate::mocks::MockRouter::new()));
@@ -77,5 +353,105 @@ pub async fn get_router(db: &Arc<dyn LNVpsDb>, router_id: u64) -> OpResult<Arc<d
                 panic!("Cant use mock router outside tests!")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mocks::MockRouter;
+
+    fn sample_tunnel(name: &str) -> Tunnel {
+        Tunnel {
+            id: None,
+            name: name.to_string(),
+            local_addr: Some("10.0.0.1".to_string()),
+            remote_addr: Some("10.0.0.2".to_string()),
+            enabled: false,
+            config: TunnelConfig::Gre(GreConfig { key: Some(7) }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_tunnel_lifecycle() -> anyhow::Result<()> {
+        let r = MockRouter::new();
+        r.clear().await;
+        let tr = r.tunnel().expect("mock router supports tunnels");
+
+        assert!(tr.list_tunnels().await.unwrap().is_empty());
+
+        let added = tr.add_tunnel(&sample_tunnel("gre1")).await.unwrap();
+        assert_eq!(added.id.as_deref(), Some("gre1"));
+        assert!(added.enabled);
+        assert_eq!(added.kind(), TunnelKind::Gre);
+
+        // duplicate add fails
+        assert!(tr.add_tunnel(&sample_tunnel("gre1")).await.is_err());
+
+        let list = tr.list_tunnels().await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        let traffic = tr.tunnel_traffic().await.unwrap();
+        assert_eq!(traffic.len(), 1);
+        assert_eq!(traffic[0].name, "gre1");
+
+        let mut upd = sample_tunnel("gre1");
+        upd.remote_addr = Some("10.0.0.9".to_string());
+        let updated = tr.update_tunnel(&upd).await.unwrap();
+        assert_eq!(updated.remote_addr.as_deref(), Some("10.0.0.9"));
+
+        tr.remove_tunnel("gre1").await.unwrap();
+        assert!(tr.list_tunnels().await.unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mock_bgp() -> anyhow::Result<()> {
+        let r = MockRouter::new();
+        r.clear().await;
+        r.add_session(BgpSession {
+            id: "s1".to_string(),
+            name: "upstream1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: Some(10),
+            prefixes_sent: Some(2),
+            enabled: true,
+            direction: BgpPeerDirection::Upstream,
+        })
+        .await;
+        let bgp = r.bgp().expect("mock router supports bgp");
+
+        let sessions = bgp.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].peer_asn, Some(64512));
+
+        let peers = bgp.discover_peers().await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].direction, BgpPeerDirection::Upstream);
+
+        // empty candidates => all originated; scoped candidates => filtered subset
+        assert!(!bgp.originated_routes(&[]).await.unwrap().is_empty());
+        assert_eq!(
+            bgp.originated_routes(&["203.0.113.0/24".to_string()])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            bgp.originated_routes(&["10.0.0.0/8".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(bgp.default_route().await.unwrap().is_some());
+
+        bgp.set_session_enabled("s1", false).await.unwrap();
+        let sessions = bgp.list_sessions().await.unwrap();
+        assert!(!sessions[0].enabled);
+        Ok(())
     }
 }

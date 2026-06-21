@@ -18,8 +18,8 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, Subscription, SubscriptionLineItem,
-    SubscriptionType, Vm, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionType, Vm, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
@@ -441,6 +441,111 @@ impl Worker {
     }
 
     /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
+    /// Poll every enabled router for tunnel/BGP state and record per-tunnel
+    /// traffic samples.
+    ///
+    /// Only tunnel traffic counters are sampled into the time-series table; BGP
+    /// sessions are refreshed as cached state (no byte counters exist for BGP).
+    /// All route/tunnel queries used here are bounded and full-table safe.
+    pub async fn sample_router_traffic(&self) -> Result<()> {
+        let routers = self.db.list_routers().await?;
+        for router in routers.iter().filter(|r| r.enabled) {
+            if let Err(e) = self.sample_one_router(router.id).await {
+                error!("Failed to sample router {}: {}", router.id, e);
+            }
+        }
+        Ok(())
+    }
+
+    async fn sample_one_router(&self, router_id: u64) -> Result<()> {
+        let router = crate::router::get_router(&self.db, router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
+
+        // Tunnels: refresh cached inventory and record traffic samples
+        if let Some(tr) = router.tunnel() {
+            match tr.list_tunnels().await {
+                Ok(tunnels) => {
+                    for t in &tunnels {
+                        if let Err(e) = self.db.upsert_router_tunnel(&t.to_db(router_id)).await {
+                            warn!(
+                                "Failed to cache tunnel {} on router {}: {}",
+                                t.name, router_id, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list tunnels on router {}: {}", router_id, e),
+            }
+            match tr.tunnel_traffic().await {
+                Ok(traffic) => {
+                    for tt in traffic {
+                        let sample = RouterTunnelTraffic {
+                            id: 0,
+                            router_id,
+                            tunnel_name: tt.name,
+                            rx_bytes: tt.rx_bytes,
+                            tx_bytes: tt.tx_bytes,
+                            sampled_at: Utc::now(),
+                        };
+                        if let Err(e) = self.db.insert_router_tunnel_traffic(&sample).await {
+                            warn!("Failed to record traffic on router {}: {}", router_id, e);
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed to read tunnel traffic on router {}: {}",
+                    router_id, e
+                ),
+            }
+        }
+
+        // BGP: refresh cached session state (no traffic counters)
+        if let Some(bgp) = router.bgp() {
+            match bgp.list_sessions().await {
+                Ok(sessions) => {
+                    for s in &sessions {
+                        if let Err(e) = self.db.upsert_router_bgp_session(&s.to_db(router_id)).await
+                        {
+                            warn!(
+                                "Failed to cache BGP session {} on router {}: {}",
+                                s.name, router_id, e
+                            );
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list BGP sessions on router {}: {}", router_id, e),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enable/disable a BGP session on a router and refresh its cached state.
+    pub async fn toggle_bgp_session(
+        &self,
+        router_id: u64,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let router = crate::router::get_router(&self.db, router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
+        let bgp = router.bgp().context("router does not support BGP")?;
+        bgp.set_session_enabled(session_id, enabled)
+            .await
+            .map_err(|e| anyhow!("failed to toggle BGP session: {}", e))?;
+        // Refresh cached session state so the admin API reflects the change
+        if let Ok(sessions) = bgp.list_sessions().await {
+            for s in &sessions {
+                if let Err(e) = self.db.upsert_router_bgp_session(&s.to_db(router_id)).await {
+                    warn!("Failed to refresh BGP session cache: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn check_subscriptions(&self) -> Result<()> {
         let last_check = self.get_last_check_subscriptions().await?;
         let time_since = Utc::now().signed_duration_since(last_check);
@@ -1719,6 +1824,17 @@ impl Worker {
             WorkJob::CheckSubscriptions => {
                 self.check_subscriptions().await?;
             }
+            WorkJob::SampleRouterTraffic => {
+                self.sample_router_traffic().await?;
+            }
+            WorkJob::ToggleBgpSession {
+                router_id,
+                session_id,
+                enabled,
+            } => {
+                self.toggle_bgp_session(*router_id, session_id, *enabled)
+                    .await?;
+            }
             WorkJob::DeleteVm {
                 vm_id,
                 reason,
@@ -2909,6 +3025,134 @@ mod tests {
             second, 0,
             "expired notification must NOT repeat on subsequent cycles within grace"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sample_router_traffic() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::{
+            BgpPeerDirection, BgpSession, GreConfig, Router as _, Tunnel, TunnelConfig,
+        };
+        use lnvps_db::{Router, RouterKind};
+
+        let db = Arc::new(MockDb::empty());
+        {
+            let mut routers = db.router.lock().await;
+            routers.insert(
+                1,
+                Router {
+                    id: 1,
+                    name: "r1".to_string(),
+                    enabled: true,
+                    kind: RouterKind::MockRouter,
+                    url: "mock://".to_string(),
+                    token: "".into(),
+                },
+            );
+        }
+
+        // Seed the shared mock-router state with a tunnel and a BGP session
+        let mr = MockRouter::new();
+        mr.clear().await;
+        mr.tunnel()
+            .unwrap()
+            .add_tunnel(&Tunnel {
+                id: None,
+                name: "gre1".to_string(),
+                local_addr: None,
+                remote_addr: None,
+                enabled: true,
+                config: TunnelConfig::Gre(GreConfig { key: None }),
+            })
+            .await
+            .unwrap();
+        mr.add_session(BgpSession {
+            id: "s1".to_string(),
+            name: "peer1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: Some(5),
+            prefixes_sent: Some(1),
+            enabled: true,
+            direction: BgpPeerDirection::Upstream,
+        })
+        .await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.sample_router_traffic().await?;
+
+        let tunnels = db.list_router_tunnels(1).await?;
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].name, "gre1");
+
+        let traffic = db
+            .list_router_tunnel_traffic(
+                1,
+                "gre1",
+                Utc::now() - TimeDelta::hours(1),
+                Utc::now() + TimeDelta::hours(1),
+            )
+            .await?;
+        assert_eq!(traffic.len(), 1);
+
+        let sessions = db.list_router_bgp_sessions(1).await?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].peer_asn, Some(64512));
+
+        // Clean up shared state for other tests
+        mr.clear().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_toggle_bgp_session() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::{BgpPeerDirection, BgpSession};
+        use lnvps_db::{Router, RouterKind};
+
+        let db = Arc::new(MockDb::empty());
+        {
+            let mut routers = db.router.lock().await;
+            routers.insert(
+                1,
+                Router {
+                    id: 1,
+                    name: "r1".to_string(),
+                    enabled: true,
+                    kind: RouterKind::MockRouter,
+                    url: "mock://".to_string(),
+                    token: "".into(),
+                },
+            );
+        }
+        let mr = MockRouter::new();
+        mr.clear().await;
+        mr.add_session(BgpSession {
+            id: "s1".to_string(),
+            name: "peer1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: None,
+            prefixes_sent: None,
+            enabled: true,
+            direction: BgpPeerDirection::Upstream,
+        })
+        .await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.toggle_bgp_session(1, "s1", false).await?;
+
+        // The cached session should reflect the disabled state after refresh
+        let sessions = db.list_router_bgp_sessions(1).await?;
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions[0].enabled);
+
+        mr.clear().await;
         Ok(())
     }
 }

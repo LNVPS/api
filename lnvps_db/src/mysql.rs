@@ -1,11 +1,11 @@
 use crate::{
     AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IntervalType, IpRange,
     IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
-    PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
-    Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmForMigration,
-    VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmPaymentRaw, VmTemplate,
+    PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router,
+    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmForMigration, VmHistory, VmHost,
+    VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -13,6 +13,7 @@ use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
 #[derive(Clone)]
@@ -1234,6 +1235,127 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as("select * from router")
             .fetch_all(&self.db)
             .await?)
+    }
+
+    async fn list_router_tunnels(&self, router_id: u64) -> DbResult<Vec<RouterTunnel>> {
+        Ok(
+            sqlx::query_as("select * from router_tunnel where router_id=?")
+                .bind(router_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn upsert_router_tunnel(&self, tunnel: &RouterTunnel) -> DbResult<u64> {
+        Ok(sqlx::query(
+            r#"insert into router_tunnel (router_id, name, kind, local_addr, remote_addr, enabled, last_seen)
+               values (?, ?, ?, ?, ?, ?, current_timestamp)
+               on duplicate key update
+                 kind = values(kind),
+                 local_addr = values(local_addr),
+                 remote_addr = values(remote_addr),
+                 enabled = values(enabled),
+                 last_seen = current_timestamp"#,
+        )
+        .bind(tunnel.router_id)
+        .bind(&tunnel.name)
+        .bind(tunnel.kind)
+        .bind(&tunnel.local_addr)
+        .bind(&tunnel.remote_addr)
+        .bind(tunnel.enabled)
+        .execute(&self.db)
+        .await?
+        .last_insert_id())
+    }
+
+    async fn delete_router_tunnel(&self, id: u64) -> DbResult<()> {
+        sqlx::query("delete from router_tunnel where id=?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_router_tunnel_traffic(&self, sample: &RouterTunnelTraffic) -> DbResult<u64> {
+        Ok(sqlx::query(
+            r#"insert into router_tunnel_traffic (router_id, tunnel_name, rx_bytes, tx_bytes, sampled_at)
+               values (?, ?, ?, ?, current_timestamp)"#,
+        )
+        .bind(sample.router_id)
+        .bind(&sample.tunnel_name)
+        .bind(sample.rx_bytes)
+        .bind(sample.tx_bytes)
+        .execute(&self.db)
+        .await?
+        .last_insert_id())
+    }
+
+    async fn list_router_tunnel_traffic(
+        &self,
+        router_id: u64,
+        tunnel_name: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> DbResult<Vec<RouterTunnelTraffic>> {
+        Ok(sqlx::query_as(
+            r#"select * from router_tunnel_traffic
+               where router_id=? and tunnel_name=? and sampled_at >= ? and sampled_at <= ?
+               order by sampled_at asc"#,
+        )
+        .bind(router_id)
+        .bind(tunnel_name)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_router_bgp_sessions(&self, router_id: u64) -> DbResult<Vec<RouterBgpSession>> {
+        Ok(
+            sqlx::query_as("select * from router_bgp_session where router_id=?")
+                .bind(router_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn upsert_router_bgp_session(&self, session: &RouterBgpSession) -> DbResult<u64> {
+        Ok(sqlx::query(
+            r#"insert into router_bgp_session
+                 (router_id, name, peer_ip, peer_asn, local_asn, state, prefixes_received, prefixes_sent, enabled, direction, last_seen)
+               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+               on duplicate key update
+                 peer_ip = values(peer_ip),
+                 peer_asn = values(peer_asn),
+                 local_asn = values(local_asn),
+                 state = values(state),
+                 prefixes_received = values(prefixes_received),
+                 prefixes_sent = values(prefixes_sent),
+                 enabled = values(enabled),
+                 direction = values(direction),
+                 last_seen = current_timestamp"#,
+        )
+        .bind(session.router_id)
+        .bind(&session.name)
+        .bind(&session.peer_ip)
+        .bind(session.peer_asn)
+        .bind(session.local_asn)
+        .bind(&session.state)
+        .bind(session.prefixes_received)
+        .bind(session.prefixes_sent)
+        .bind(session.enabled)
+        .bind(session.direction)
+        .execute(&self.db)
+        .await?
+        .last_insert_id())
+    }
+
+    async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()> {
+        sqlx::query("delete from router_bgp_session where id=?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn get_vm_ip_assignment(&self, id: u64) -> DbResult<VmIpAssignment> {

@@ -154,6 +154,9 @@ async fn main() -> Result<(), Error> {
 
         tasks.push(worker.spawn_job_interval(WorkJob::CheckVms, Duration::from_secs(30)));
         tasks.push(worker.spawn_job_interval(WorkJob::CheckSubscriptions, Duration::from_secs(30)));
+        // Sample router tunnel traffic + refresh BGP/tunnel state every 60s
+        tasks
+            .push(worker.spawn_job_interval(WorkJob::SampleRouterTraffic, Duration::from_secs(60)));
         tasks.push(worker.spawn_handler_loop());
 
         // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)

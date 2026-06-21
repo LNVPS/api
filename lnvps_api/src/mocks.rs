@@ -4,7 +4,9 @@ use crate::host::dummy_host::DummyVmHost;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
-use crate::router::{ArpEntry, Router};
+use crate::router::{
+    ArpEntry, BgpPeer, BgpRoute, BgpRouter, BgpSession, Router, Tunnel, TunnelRouter, TunnelTraffic,
+};
 
 /// Type alias so tests can refer to the in-memory VM host as `MockVmHost`.
 pub type MockVmHost = DummyVmHost;
@@ -44,6 +46,8 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct MockRouter {
     arp: Arc<Mutex<HashMap<u64, ArpEntry>>>,
+    tunnels: Arc<Mutex<HashMap<String, Tunnel>>>,
+    sessions: Arc<Mutex<HashMap<String, BgpSession>>>,
 }
 
 impl Default for MockRouter {
@@ -56,16 +60,32 @@ impl MockRouter {
     pub fn new() -> Self {
         static LAZY_ARP: LazyLock<Arc<Mutex<HashMap<u64, ArpEntry>>>> =
             LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        static LAZY_TUNNELS: LazyLock<Arc<Mutex<HashMap<String, Tunnel>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        static LAZY_SESSIONS: LazyLock<Arc<Mutex<HashMap<String, BgpSession>>>> =
+            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
         Self {
             arp: LAZY_ARP.clone(),
+            tunnels: LAZY_TUNNELS.clone(),
+            sessions: LAZY_SESSIONS.clone(),
         }
     }
 
-    /// Clear all ARP entries - useful for test isolation
+    /// Clear all ARP entries, tunnels and BGP sessions - useful for test isolation
     pub async fn clear(&self) {
         let mut arp = self.arp.lock().await;
         arp.clear();
+        let mut tunnels = self.tunnels.lock().await;
+        tunnels.clear();
+        let mut sessions = self.sessions.lock().await;
+        sessions.clear();
+    }
+
+    /// Seed a BGP session for tests
+    pub async fn add_session(&self, session: BgpSession) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.insert(session.id.clone(), session);
     }
 }
 
@@ -159,6 +179,117 @@ impl Router for MockRouter {
             }
         }
         Ok(entry.clone())
+    }
+
+    fn tunnel(&self) -> Option<&dyn TunnelRouter> {
+        Some(self)
+    }
+
+    fn bgp(&self) -> Option<&dyn BgpRouter> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl TunnelRouter for MockRouter {
+    async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>> {
+        let tunnels = self.tunnels.lock().await;
+        Ok(tunnels.values().cloned().collect())
+    }
+
+    async fn add_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+        let mut tunnels = self.tunnels.lock().await;
+        if tunnels.contains_key(&tunnel.name) {
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Tunnel already exists: {}",
+                tunnel.name
+            )));
+        }
+        let stored = Tunnel {
+            id: Some(tunnel.name.clone()),
+            enabled: true,
+            ..tunnel.clone()
+        };
+        tunnels.insert(tunnel.name.clone(), stored.clone());
+        Ok(stored)
+    }
+
+    async fn remove_tunnel(&self, id: &str) -> OpResult<()> {
+        let mut tunnels = self.tunnels.lock().await;
+        tunnels.remove(id);
+        Ok(())
+    }
+
+    async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+        let mut tunnels = self.tunnels.lock().await;
+        let stored = Tunnel {
+            id: Some(tunnel.name.clone()),
+            ..tunnel.clone()
+        };
+        tunnels.insert(tunnel.name.clone(), stored.clone());
+        Ok(stored)
+    }
+
+    async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
+        let tunnels = self.tunnels.lock().await;
+        Ok(tunnels
+            .values()
+            .map(|t| TunnelTraffic {
+                name: t.name.clone(),
+                rx_bytes: 0,
+                tx_bytes: 0,
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
+impl BgpRouter for MockRouter {
+    async fn list_sessions(&self) -> OpResult<Vec<BgpSession>> {
+        let sessions = self.sessions.lock().await;
+        Ok(sessions.values().cloned().collect())
+    }
+
+    async fn originated_routes(&self, candidates: &[String]) -> OpResult<Vec<BgpRoute>> {
+        let all = vec![BgpRoute {
+            prefix: "203.0.113.0/24".to_string(),
+            next_hop: None,
+        }];
+        if candidates.is_empty() {
+            Ok(all)
+        } else {
+            Ok(all
+                .into_iter()
+                .filter(|r| candidates.contains(&r.prefix))
+                .collect())
+        }
+    }
+
+    async fn default_route(&self) -> OpResult<Option<BgpRoute>> {
+        Ok(Some(BgpRoute {
+            prefix: "0.0.0.0/0".to_string(),
+            next_hop: Some("192.0.2.1".to_string()),
+        }))
+    }
+
+    async fn discover_peers(&self) -> OpResult<Vec<BgpPeer>> {
+        let sessions = self.sessions.lock().await;
+        Ok(sessions
+            .values()
+            .map(|s| BgpPeer {
+                peer_ip: s.peer_ip.clone(),
+                asn: s.peer_asn,
+                direction: s.direction,
+            })
+            .collect())
+    }
+
+    async fn set_session_enabled(&self, id: &str, enabled: bool) -> OpResult<()> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(id) {
+            s.enabled = enabled;
+        }
+        Ok(())
     }
 }
 
