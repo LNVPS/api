@@ -6,10 +6,11 @@ use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
     DiskType, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing,
     LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey,
-    Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost,
-    VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, RouterBgpSession,
+    RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -48,6 +49,9 @@ pub struct MockDb {
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
+    pub router_tunnels: Arc<Mutex<HashMap<u64, RouterTunnel>>>,
+    pub router_tunnel_traffic: Arc<Mutex<Vec<RouterTunnelTraffic>>>,
+    pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
 }
 
 impl MockDb {
@@ -297,6 +301,9 @@ impl Default for MockDb {
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
+            router_tunnels: Arc::new(Default::default()),
+            router_tunnel_traffic: Arc::new(Default::default()),
+            router_bgp_sessions: Arc::new(Default::default()),
         }
     }
 }
@@ -1095,6 +1102,119 @@ impl LNVpsDbBase for MockDb {
     async fn list_routers(&self) -> DbResult<Vec<Router>> {
         let routers = self.router.lock().await;
         Ok(routers.values().cloned().collect())
+    }
+
+    async fn list_router_tunnels(&self, router_id: u64) -> DbResult<Vec<RouterTunnel>> {
+        let t = self.router_tunnels.lock().await;
+        Ok(t.values()
+            .filter(|x| x.router_id == router_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn upsert_router_tunnel(&self, tunnel: &RouterTunnel) -> DbResult<u64> {
+        let mut t = self.router_tunnels.lock().await;
+        if let Some(existing) = t
+            .values_mut()
+            .find(|x| x.router_id == tunnel.router_id && x.name == tunnel.name)
+        {
+            let id = existing.id;
+            *existing = RouterTunnel {
+                id,
+                last_seen: Utc::now(),
+                ..tunnel.clone()
+            };
+            return Ok(id);
+        }
+        let id = t.keys().max().copied().unwrap_or(0) + 1;
+        t.insert(
+            id,
+            RouterTunnel {
+                id,
+                last_seen: Utc::now(),
+                ..tunnel.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn delete_router_tunnel(&self, id: u64) -> DbResult<()> {
+        let mut t = self.router_tunnels.lock().await;
+        t.remove(&id);
+        Ok(())
+    }
+
+    async fn insert_router_tunnel_traffic(&self, sample: &RouterTunnelTraffic) -> DbResult<u64> {
+        let mut t = self.router_tunnel_traffic.lock().await;
+        let id = t.len() as u64 + 1;
+        t.push(RouterTunnelTraffic {
+            id,
+            sampled_at: Utc::now(),
+            ..sample.clone()
+        });
+        Ok(id)
+    }
+
+    async fn list_router_tunnel_traffic(
+        &self,
+        router_id: u64,
+        tunnel_name: &str,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+    ) -> DbResult<Vec<RouterTunnelTraffic>> {
+        let t = self.router_tunnel_traffic.lock().await;
+        let mut out: Vec<RouterTunnelTraffic> = t
+            .iter()
+            .filter(|x| {
+                x.router_id == router_id
+                    && x.tunnel_name == tunnel_name
+                    && x.sampled_at >= from
+                    && x.sampled_at <= to
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|x| x.sampled_at);
+        Ok(out)
+    }
+
+    async fn list_router_bgp_sessions(&self, router_id: u64) -> DbResult<Vec<RouterBgpSession>> {
+        let s = self.router_bgp_sessions.lock().await;
+        Ok(s.values()
+            .filter(|x| x.router_id == router_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn upsert_router_bgp_session(&self, session: &RouterBgpSession) -> DbResult<u64> {
+        let mut s = self.router_bgp_sessions.lock().await;
+        if let Some(existing) = s
+            .values_mut()
+            .find(|x| x.router_id == session.router_id && x.name == session.name)
+        {
+            let id = existing.id;
+            *existing = RouterBgpSession {
+                id,
+                last_seen: Utc::now(),
+                ..session.clone()
+            };
+            return Ok(id);
+        }
+        let id = s.keys().max().copied().unwrap_or(0) + 1;
+        s.insert(
+            id,
+            RouterBgpSession {
+                id,
+                last_seen: Utc::now(),
+                ..session.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()> {
+        let mut s = self.router_bgp_sessions.lock().await;
+        s.remove(&id);
+        Ok(())
     }
 
     async fn get_vm_ip_assignment(&self, id: u64) -> DbResult<VmIpAssignment> {
@@ -3373,5 +3493,106 @@ mod tests {
         let updated = ip_subs.get(&inserted_id).unwrap();
         assert!(!updated.is_active);
         assert!(updated.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_router_tunnel_crud() {
+        use lnvps_db::{RouterTunnel, RouterTunnelKind};
+        let db = MockDb::empty();
+
+        let t = RouterTunnel {
+            id: 0,
+            router_id: 1,
+            name: "gre1".to_string(),
+            kind: RouterTunnelKind::Gre,
+            local_addr: Some("10.0.0.1".to_string()),
+            remote_addr: Some("10.0.0.2".to_string()),
+            enabled: true,
+            last_seen: Utc::now(),
+        };
+        let id = db.upsert_router_tunnel(&t).await.unwrap();
+        assert_eq!(db.list_router_tunnels(1).await.unwrap().len(), 1);
+
+        // upsert by (router_id, name) updates in place
+        let mut t2 = t.clone();
+        t2.enabled = false;
+        let id2 = db.upsert_router_tunnel(&t2).await.unwrap();
+        assert_eq!(id, id2);
+        let tunnels = db.list_router_tunnels(1).await.unwrap();
+        assert_eq!(tunnels.len(), 1);
+        assert!(!tunnels[0].enabled);
+
+        db.delete_router_tunnel(id).await.unwrap();
+        assert!(db.list_router_tunnels(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_router_tunnel_traffic_window() {
+        use lnvps_db::RouterTunnelTraffic;
+        let db = MockDb::empty();
+        db.insert_router_tunnel_traffic(&RouterTunnelTraffic {
+            id: 0,
+            router_id: 1,
+            tunnel_name: "gre1".to_string(),
+            rx_bytes: 100,
+            tx_bytes: 200,
+            sampled_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        let in_window = db
+            .list_router_tunnel_traffic(
+                1,
+                "gre1",
+                Utc::now() - chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(in_window.len(), 1);
+
+        let out_window = db
+            .list_router_tunnel_traffic(
+                1,
+                "gre1",
+                Utc::now() + chrono::Duration::hours(1),
+                Utc::now() + chrono::Duration::hours(2),
+            )
+            .await
+            .unwrap();
+        assert!(out_window.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_router_bgp_session_crud() {
+        use lnvps_db::{RouterBgpDirection, RouterBgpSession};
+        let db = MockDb::empty();
+        let s = RouterBgpSession {
+            id: 0,
+            router_id: 1,
+            name: "peer1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: Some(5),
+            prefixes_sent: Some(1),
+            enabled: true,
+            direction: RouterBgpDirection::Upstream,
+            last_seen: Utc::now(),
+        };
+        let id = db.upsert_router_bgp_session(&s).await.unwrap();
+        assert_eq!(db.list_router_bgp_sessions(1).await.unwrap().len(), 1);
+
+        let mut s2 = s.clone();
+        s2.state = "Idle".to_string();
+        let id2 = db.upsert_router_bgp_session(&s2).await.unwrap();
+        assert_eq!(id, id2);
+        let sessions = db.list_router_bgp_sessions(1).await.unwrap();
+        assert_eq!(sessions[0].state, "Idle");
+
+        db.delete_router_bgp_session(id).await.unwrap();
+        assert!(db.list_router_bgp_sessions(1).await.unwrap().is_empty());
     }
 }

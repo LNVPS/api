@@ -16,7 +16,7 @@ Admin API request/response format reference for LLM consumption.
 `"redhatenterprise"`
 **IpRangeAllocationMode**: `"random"`, `"sequential"`, `"slaac_eui64"`
 **NetworkAccessPolicyKind**: `"static_arp"`
-**RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`
+**RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`, `"linux_ssh"`
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
 **SubscriptionPaymentType**: `"purchase"`, `"renewal"`, `"upgrade"`
@@ -2319,6 +2319,64 @@ Required Permission: `router::delete`
 
 Note: Routers that are used by access policies cannot be deleted. You must first remove the router from all access
 policies before deleting it.
+
+#### List Router Tunnels
+
+```
+GET /api/admin/v1/routers/{router_id}/tunnels
+```
+
+Required Permission: `router::view`
+
+Returns the cached tunnel inventory discovered on the router (GRE/VXLAN/WireGuard). Each entry: `id`, `router_id`,
+`name`, `kind` (`"gre"` | `"vxlan"` | `"wireguard"`), `local_addr`, `remote_addr`, `enabled`, `last_seen`. Refreshed
+by a background sampler (~60s).
+
+#### Get Tunnel Traffic History
+
+```
+GET /api/admin/v1/routers/{router_id}/tunnels/{tunnel_name}/traffic
+```
+
+Required Permission: `router::view`
+
+Query parameters (optional): `from`, `to` (RFC3339 timestamps; default: last 24 hours).
+
+Returns per-tunnel traffic samples: `tunnel_name`, `rx_bytes`, `tx_bytes`, `sampled_at`. Tunnel interface counters
+are the canonical per-session traffic source — BGP sessions expose no byte counters.
+
+#### List BGP Sessions
+
+```
+GET /api/admin/v1/routers/{router_id}/bgp/sessions
+```
+
+Required Permission: `router::view`
+
+Returns cached BGP sessions: `id`, `router_id`, `name`, `peer_ip`, `peer_asn`, `local_asn`, `state`,
+`prefixes_received`, `prefixes_sent`, `enabled`, `direction` (`"upstream"` | `"downstream"` | `"peer"` |
+`"unknown"`), `last_seen`.
+
+#### Toggle BGP Session
+
+```
+POST /api/admin/v1/routers/{router_id}/bgp/sessions/toggle
+```
+
+Required Permission: `router::update`
+
+Body:
+
+```json
+{
+  "session_id": "string",
+  // Backend session id from the sessions listing (protocol name on BIRD, .id on Mikrotik)
+  "enabled": boolean
+}
+```
+
+Returns a `JobResponse` (`{ "job_id": "string" }`). The enable/disable is applied asynchronously by the worker and
+the session cache is refreshed afterwards.
 
 ### VM IP Assignment Management
 

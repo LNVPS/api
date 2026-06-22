@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-06-21** - Route server management: BGP session and tunnel visibility/control (admin)
+  - New `RouterKind` value `linux_ssh` — a Linux router managed over SSH (BIRD/Pathvector routing, iproute2/WireGuard tunnels). Configure with `url = ssh://<user>@<host>[:<port>]/<interface>` and `token` = the SSH private key (PEM). Selectable via `kind` on `POST/PATCH /api/admin/v1/routers`.
+  - `GET /api/admin/v1/routers/{id}/tunnels` — list cached tunnels discovered on the router. Each `AdminRouterTunnel`: `id`, `router_id`, `name`, `kind` (`gre`|`vxlan`|`wireguard`), `local_addr`, `remote_addr`, `enabled`, `last_seen`. Requires `router::view`.
+  - `GET /api/admin/v1/routers/{id}/tunnels/{name}/traffic` — per-tunnel traffic history (`AdminRouterTunnelTraffic`: `tunnel_name`, `rx_bytes`, `tx_bytes`, `sampled_at`). Optional `from`/`to` RFC3339 query params (default: last 24h). Tunnel interface counters are the canonical per-session traffic source — BGP sessions have no byte counters. Requires `router::view`.
+  - `GET /api/admin/v1/routers/{id}/bgp/sessions` — list cached BGP sessions (`AdminRouterBgpSession`: `id`, `router_id`, `name`, `peer_ip`, `peer_asn`, `local_asn`, `state`, `prefixes_received`, `prefixes_sent`, `enabled`, `direction` (`upstream`|`downstream`|`peer`|`unknown`), `last_seen`). Requires `router::view`.
+  - `POST /api/admin/v1/routers/{id}/bgp/sessions/toggle` — enable/disable a BGP session. Body: `{ "session_id": string, "enabled": boolean }` (`session_id` is the backend id from the sessions listing — protocol name on BIRD, `.id` on Mikrotik). Returns a `JobResponse` (`{ "job_id": string }`); the action is applied asynchronously and the session cache refreshed. Requires `router::update`.
+  - Tunnel inventory, per-tunnel traffic, and BGP session state are refreshed by a background sampler (~60s). All router queries are bounded and safe on routers carrying a full DFZ table.
+
 - **2026-06-18** - Subscription line items now expose a typed `resource` reference
   - `SubscriptionLineItem` (public `GET /api/v1/subscriptions/{id}`) and `AdminSubscriptionLineItemInfo` (admin subscription + line-item endpoints) gain a `resource` field: a tagged union resolved server-side from the line item's subscription type. Shapes: `{ "type": "vps", "vm_id": number }`, `{ "type": "ip_range", "ip_range_subscription_id": number }`, or `null` when there is no linked resource.
   - `AdminSubscriptionLineItemInfo` now also includes the `subscription_type` discriminant.

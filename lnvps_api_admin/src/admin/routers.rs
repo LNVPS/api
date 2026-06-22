@@ -1,13 +1,19 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminRouterDetail, AdminRouterKind, CreateRouterRequest, UpdateRouterRequest,
+    AdminRouterBgpSession, AdminRouterDetail, AdminRouterTunnel, AdminRouterTunnelTraffic,
+    CreateRouterRequest, JobResponse, ToggleBgpSessionRequest, UpdateRouterRequest,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use chrono::{DateTime, TimeDelta, Utc};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
+};
 use lnvps_db::{AdminAction, AdminResource};
+use log::{error, info};
+use serde::Deserialize;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -21,6 +27,99 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_update_router)
                 .delete(admin_delete_router),
         )
+        .route(
+            "/api/admin/v1/routers/{id}/tunnels",
+            get(admin_list_router_tunnels),
+        )
+        .route(
+            "/api/admin/v1/routers/{id}/tunnels/{name}/traffic",
+            get(admin_get_tunnel_traffic),
+        )
+        .route(
+            "/api/admin/v1/routers/{id}/bgp/sessions",
+            get(admin_list_bgp_sessions),
+        )
+        .route(
+            "/api/admin/v1/routers/{id}/bgp/sessions/toggle",
+            post(admin_toggle_bgp_session),
+        )
+}
+
+/// Time-range filter for traffic history (defaults to the last 24 hours)
+#[derive(Deserialize)]
+struct TrafficQuery {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+async fn admin_list_router_tunnels(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+) -> ApiResult<Vec<AdminRouterTunnel>> {
+    auth.require_permission(AdminResource::Router, AdminAction::View)?;
+    let tunnels = this.db.list_router_tunnels(router_id).await?;
+    ApiData::ok(tunnels.into_iter().map(AdminRouterTunnel::from).collect())
+}
+
+async fn admin_get_tunnel_traffic(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((router_id, name)): Path<(u64, String)>,
+    Query(q): Query<TrafficQuery>,
+) -> ApiResult<Vec<AdminRouterTunnelTraffic>> {
+    auth.require_permission(AdminResource::Router, AdminAction::View)?;
+    let to = q.to.unwrap_or_else(Utc::now);
+    let from = q.from.unwrap_or_else(|| to - TimeDelta::hours(24));
+    let samples = this
+        .db
+        .list_router_tunnel_traffic(router_id, &name, from, to)
+        .await?;
+    ApiData::ok(
+        samples
+            .into_iter()
+            .map(AdminRouterTunnelTraffic::from)
+            .collect(),
+    )
+}
+
+async fn admin_list_bgp_sessions(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+) -> ApiResult<Vec<AdminRouterBgpSession>> {
+    auth.require_permission(AdminResource::Router, AdminAction::View)?;
+    let sessions = this.db.list_router_bgp_sessions(router_id).await?;
+    ApiData::ok(
+        sessions
+            .into_iter()
+            .map(AdminRouterBgpSession::from)
+            .collect(),
+    )
+}
+
+async fn admin_toggle_bgp_session(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+    Json(request): Json<ToggleBgpSessionRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::Router, AdminAction::Update)?;
+    let job = WorkJob::ToggleBgpSession {
+        router_id,
+        session_id: request.session_id,
+        enabled: request.enabled,
+    };
+    match this.work_commander.send(job).await {
+        Ok(stream_id) => {
+            info!("BGP toggle job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue BGP toggle job: {}", e);
+            ApiData::err("Failed to queue BGP toggle job")
+        }
+    }
 }
 
 async fn admin_list_routers(
@@ -110,10 +209,7 @@ async fn admin_update_router(
         router.enabled = enabled;
     }
     if let Some(kind) = &request.kind {
-        router.kind = match kind {
-            AdminRouterKind::Mikrotik => lnvps_db::RouterKind::Mikrotik,
-            AdminRouterKind::OvhAdditionalIp => lnvps_db::RouterKind::OvhAdditionalIp,
-        };
+        router.kind = lnvps_db::RouterKind::from(*kind);
     }
     if let Some(url) = &request.url {
         router.url = url.trim().to_string();

@@ -8,7 +8,7 @@ pub mod payments;
 pub mod provisioner;
 pub mod router;
 pub mod settings;
-#[cfg(feature = "proxmox")]
+#[cfg(any(feature = "proxmox", feature = "linux-ssh"))]
 pub mod ssh_client;
 pub mod subscription;
 pub mod worker;

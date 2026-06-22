@@ -683,8 +683,71 @@ pub enum RouterKind {
     Mikrotik = 0,
     /// A pseudo-router which allows adding virtual mac addresses to a dedicated server
     OvhAdditionalIp = 1,
+    /// A Linux machine managed over SSH (BIRD/Pathvector routing, iproute2 tunnels)
+    LinuxSsh = 2,
     /// Mock router access in tests
     MockRouter = u16::MAX,
+}
+
+/// Cached tunnel inventory discovered on a router (GRE/VXLAN/WireGuard)
+#[derive(FromRow, Clone, Debug)]
+pub struct RouterTunnel {
+    pub id: u64,
+    pub router_id: u64,
+    /// Tunnel interface name
+    pub name: String,
+    pub kind: RouterTunnelKind,
+    pub local_addr: Option<String>,
+    pub remote_addr: Option<String>,
+    pub enabled: bool,
+    pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq)]
+#[repr(u16)]
+pub enum RouterTunnelKind {
+    Gre = 0,
+    Vxlan = 1,
+    Wireguard = 2,
+}
+
+/// A single per-tunnel traffic sample. Tunnel interface counters are the
+/// canonical source of per-session traffic for route servers (BGP has none).
+#[derive(FromRow, Clone, Debug)]
+pub struct RouterTunnelTraffic {
+    pub id: u64,
+    pub router_id: u64,
+    pub tunnel_name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub sampled_at: DateTime<Utc>,
+}
+
+/// Cached BGP session discovery state (no byte counters)
+#[derive(FromRow, Clone, Debug)]
+pub struct RouterBgpSession {
+    pub id: u64,
+    pub router_id: u64,
+    pub name: String,
+    pub peer_ip: Option<String>,
+    pub peer_asn: Option<u32>,
+    pub local_asn: Option<u32>,
+    pub state: String,
+    pub prefixes_received: Option<u64>,
+    pub prefixes_sent: Option<u64>,
+    pub enabled: bool,
+    pub direction: RouterBgpDirection,
+    pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum RouterBgpDirection {
+    #[default]
+    Unknown = 0,
+    Upstream = 1,
+    Downstream = 2,
+    Peer = 3,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

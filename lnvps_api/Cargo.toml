@@ -15,6 +15,7 @@ default = [
     "nostr-nwc",
     "nostr-domain",
     "proxmox",
+    "linux-ssh",
     "lnd",
     "cloudflare",
     "revolut",
@@ -24,6 +25,8 @@ default = [
 ]
 openapi = ["dep:openapi-build-gen"]
 mikrotik = []
+# Linux router managed over SSH (shares the ssh2-based SshClient with proxmox)
+linux-ssh = ["dep:ssh2"]
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain", "dep:uuid"]
