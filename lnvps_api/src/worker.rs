@@ -535,7 +535,9 @@ impl Worker {
         bgp.set_session_enabled(session_id, enabled)
             .await
             .map_err(|e| anyhow!("failed to toggle BGP session: {}", e))?;
-        // Refresh cached session state so the admin API reflects the change
+        // Refresh cached session state so the admin API reflects the change.
+        // The upsert only sets `enabled` on first import; for existing rows the
+        // database flag is authoritative, so persist the requested value here.
         if let Ok(sessions) = bgp.list_sessions().await {
             for s in &sessions {
                 if let Err(e) = self.db.upsert_router_bgp_session(&s.to_db(router_id)).await {
@@ -543,6 +545,10 @@ impl Worker {
                 }
             }
         }
+        self.db
+            .set_router_bgp_session_enabled(router_id, session_id, enabled)
+            .await
+            .map_err(|e| anyhow!("failed to persist BGP session enabled flag: {}", e))?;
         Ok(())
     }
 

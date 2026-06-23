@@ -280,7 +280,10 @@ impl BgpSession {
             state: self.state.clone(),
             prefixes_received: self.prefixes_received,
             prefixes_sent: self.prefixes_sent,
-            enabled: self.enabled,
+            // Initial import value only: a protocol in "Down" state is treated as
+            // administratively disabled. On subsequent refreshes the database
+            // `enabled` flag is authoritative and is preserved by the upsert.
+            enabled: !self.state.eq_ignore_ascii_case("down"),
             direction: self.direction.into(),
             last_seen: chrono::Utc::now(),
         }
@@ -453,5 +456,38 @@ mod tests {
         let sessions = bgp.list_sessions().await.unwrap();
         assert!(!sessions[0].enabled);
         Ok(())
+    }
+
+    /// Regression: a "Down" BGP state is cached as administratively disabled,
+    /// so disabling a session (which drives BIRD to state "Down") is reflected
+    /// in the database on the next discovery refresh.
+    #[test]
+    fn test_to_db_state_down_is_disabled() {
+        let base = BgpSession {
+            id: "s1".to_string(),
+            name: "peer1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: Some(10),
+            prefixes_sent: Some(2),
+            enabled: true,
+            direction: BgpPeerDirection::Upstream,
+        };
+        assert!(base.to_db(1).enabled);
+
+        let down = BgpSession {
+            state: "Down".to_string(),
+            ..base.clone()
+        };
+        assert!(!down.to_db(1).enabled);
+
+        // case-insensitive
+        let down_lc = BgpSession {
+            state: "down".to_string(),
+            ..base
+        };
+        assert!(!down_lc.to_db(1).enabled);
     }
 }

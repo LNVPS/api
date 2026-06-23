@@ -1331,7 +1331,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  state = values(state),
                  prefixes_received = values(prefixes_received),
                  prefixes_sent = values(prefixes_sent),
-                 enabled = values(enabled),
+                 -- `enabled` is only set on first import (from the BGP state); once
+                 -- the row exists it is administratively controlled via toggle and
+                 -- must NOT be overwritten by discovery refreshes.
                  direction = values(direction),
                  last_seen = current_timestamp"#,
         )
@@ -1348,6 +1350,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&self.db)
         .await?
         .last_insert_id())
+    }
+
+    async fn set_router_bgp_session_enabled(
+        &self,
+        router_id: u64,
+        name: &str,
+        enabled: bool,
+    ) -> DbResult<()> {
+        sqlx::query("update router_bgp_session set enabled=? where router_id=? and name=?")
+            .bind(enabled)
+            .bind(router_id)
+            .bind(name)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()> {

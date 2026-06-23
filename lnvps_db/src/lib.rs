@@ -402,6 +402,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Insert or update (by router_id+name) a cached BGP session, returning its id
     async fn upsert_router_bgp_session(&self, session: &RouterBgpSession) -> DbResult<u64>;
 
+    /// Set the administrative enabled flag for a cached BGP session (by router_id+name)
+    async fn set_router_bgp_session_enabled(
+        &self,
+        router_id: u64,
+        name: &str,
+        enabled: bool,
+    ) -> DbResult<()>;
+
     /// Delete a cached BGP session by id
     async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()>;
 

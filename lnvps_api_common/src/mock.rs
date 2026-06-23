@@ -1192,8 +1192,12 @@ impl LNVpsDbBase for MockDb {
             .find(|x| x.router_id == session.router_id && x.name == session.name)
         {
             let id = existing.id;
+            // `enabled` is only set on first import; afterwards it is admin-controlled
+            // and discovery refreshes must not clobber it.
+            let enabled = existing.enabled;
             *existing = RouterBgpSession {
                 id,
+                enabled,
                 last_seen: Utc::now(),
                 ..session.clone()
             };
@@ -1209,6 +1213,22 @@ impl LNVpsDbBase for MockDb {
             },
         );
         Ok(id)
+    }
+
+    async fn set_router_bgp_session_enabled(
+        &self,
+        router_id: u64,
+        name: &str,
+        enabled: bool,
+    ) -> DbResult<()> {
+        let mut s = self.router_bgp_sessions.lock().await;
+        if let Some(existing) = s
+            .values_mut()
+            .find(|x| x.router_id == router_id && x.name == name)
+        {
+            existing.enabled = enabled;
+        }
+        Ok(())
     }
 
     async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()> {
@@ -3594,5 +3614,46 @@ mod tests {
 
         db.delete_router_bgp_session(id).await.unwrap();
         assert!(db.list_router_bgp_sessions(1).await.unwrap().is_empty());
+    }
+
+    /// Regression: `enabled` is set on first import, but afterwards the database
+    /// flag is authoritative — discovery refreshes must not overwrite it, and the
+    /// explicit toggle must persist.
+    #[tokio::test]
+    async fn test_router_bgp_session_enabled_is_authoritative_after_import() {
+        use lnvps_db::{RouterBgpDirection, RouterBgpSession};
+        let db = MockDb::empty();
+        let s = RouterBgpSession {
+            id: 0,
+            router_id: 1,
+            name: "peer1".to_string(),
+            peer_ip: Some("192.0.2.1".to_string()),
+            peer_asn: Some(64512),
+            local_asn: Some(64500),
+            state: "Established".to_string(),
+            prefixes_received: Some(5),
+            prefixes_sent: Some(1),
+            enabled: true,
+            direction: RouterBgpDirection::Upstream,
+            last_seen: Utc::now(),
+        };
+        // Initial import keeps the provided (state-derived) value.
+        db.upsert_router_bgp_session(&s).await.unwrap();
+        assert!(db.list_router_bgp_sessions(1).await.unwrap()[0].enabled);
+
+        // Admin disables the session.
+        db.set_router_bgp_session_enabled(1, "peer1", false)
+            .await
+            .unwrap();
+        assert!(!db.list_router_bgp_sessions(1).await.unwrap()[0].enabled);
+
+        // A later discovery refresh reporting enabled=true must NOT re-enable it.
+        let mut refreshed = s.clone();
+        refreshed.state = "Idle".to_string();
+        refreshed.enabled = true;
+        db.upsert_router_bgp_session(&refreshed).await.unwrap();
+        let sessions = db.list_router_bgp_sessions(1).await.unwrap();
+        assert_eq!(sessions[0].state, "Idle");
+        assert!(!sessions[0].enabled, "discovery must not re-enable the session");
     }
 }
