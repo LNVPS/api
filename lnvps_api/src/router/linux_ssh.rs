@@ -262,13 +262,21 @@ impl BgpRouter for LinuxSshRouter {
 }
 
 /// Map a BIRD/RFC-9234 role string to a peer relationship (best-effort).
+///
+/// The role parsed from `show protocols all` is the *local* role (BIRD prints
+/// the "Local capabilities" block, and therefore its `Role:` line, before the
+/// "Neighbor capabilities" block), so we map it to the neighbor's relationship.
+/// BIRD emits role names with underscores (`rs_server`, `rs_client`; see
+/// `bgp_format_role_name` in BIRD's bgp.c), so we normalise `-`/`_` to accept
+/// either spelling.
 fn role_to_direction(role: &str) -> BgpPeerDirection {
-    match role.to_ascii_lowercase().as_str() {
-        // RFC 9234 role is the *local* role; map to the neighbor relationship.
+    match role.to_ascii_lowercase().replace('-', "_").as_str() {
         // role customer  => neighbor is our provider  => upstream
         // role provider  => neighbor is our customer  => downstream
-        "customer" | "rs-client" => BgpPeerDirection::Upstream,
-        "provider" | "rs-server" => BgpPeerDirection::Downstream,
+        // role rs_client => neighbor is the route server => upstream
+        // role rs_server => neighbor is a route-server client => downstream
+        "customer" | "rs_client" => BgpPeerDirection::Upstream,
+        "provider" | "rs_server" => BgpPeerDirection::Downstream,
         "peer" => BgpPeerDirection::Peer,
         _ => BgpPeerDirection::Unknown,
     }
@@ -936,7 +944,13 @@ mod tests {
             "    Neighbor address: 192.0.2.1",
             "    Neighbor AS:      64512",
             "    Local AS:         64500",
-            "    Role:             customer",
+            // Real BIRD output nests the role under capability blocks and prints
+            // the local role first, then the neighbor role. We must pick the
+            // local one (customer => neighbor is our provider => upstream).
+            "    Local capabilities",
+            "      Role: customer",
+            "    Neighbor capabilities",
+            "      Role: provider",
             "  Channel ipv4",
             "    Routes:         5 imported, 2 exported, 3 preferred",
             "bgp2       BGP        ---        down   2024-06-01    disabled",
@@ -1029,6 +1043,9 @@ mod tests {
         assert_eq!(role_to_direction("customer"), BgpPeerDirection::Upstream);
         assert_eq!(role_to_direction("provider"), BgpPeerDirection::Downstream);
         assert_eq!(role_to_direction("peer"), BgpPeerDirection::Peer);
+        // BIRD emits underscores; also accept hyphenated spelling.
+        assert_eq!(role_to_direction("rs_client"), BgpPeerDirection::Upstream);
+        assert_eq!(role_to_direction("rs_server"), BgpPeerDirection::Downstream);
         assert_eq!(role_to_direction("rs-client"), BgpPeerDirection::Upstream);
         assert_eq!(role_to_direction("weird"), BgpPeerDirection::Unknown);
     }
