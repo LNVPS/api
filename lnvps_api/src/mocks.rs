@@ -282,8 +282,14 @@ impl BgpRouter for MockRouter {
         }
     }
 
-    async fn default_route(&self) -> OpResult<Option<BgpRoute>> {
-        Ok(self.default_route.lock().await.clone())
+    async fn default_routes(&self) -> OpResult<Vec<BgpRoute>> {
+        Ok(self
+            .default_route
+            .lock()
+            .await
+            .clone()
+            .into_iter()
+            .collect())
     }
 
     async fn set_default_route(&self, next_hop: &str) -> OpResult<()> {

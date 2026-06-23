@@ -50,9 +50,17 @@ pub trait BgpRouter: Send + Sync {
     /// bounded on routers carrying a full DFZ table (~1M+ routes). Passing an
     /// empty slice returns all locally-originated prefixes (which is inherently
     /// small — a router only originates its own ranges).
+    ///
+    /// The returned routes always have `next_hop == None`: an originated prefix
+    /// is injected into BGP by a static route for which the router is itself the
+    /// source, so there is no gateway to report.
     async fn originated_routes(&self, candidates: &[String]) -> OpResult<Vec<BgpRoute>>;
-    /// Detect a default route, if present (issue task 4 — route-server detection)
-    async fn default_route(&self) -> OpResult<Option<BgpRoute>>;
+    /// Detect default route(s), if present (issue task 4 — route-server detection).
+    ///
+    /// Returns one entry per next-hop. A router using ECMP for its default route
+    /// reports multiple next-hops, so the result is a `Vec` rather than a single
+    /// route. An empty vec means no default route is installed.
+    async fn default_routes(&self) -> OpResult<Vec<BgpRoute>>;
     /// Install or replace the static default route pointing at `next_hop`.
     ///
     /// The address family of the default (`0.0.0.0/0` vs `::/0`) is inferred from
@@ -123,7 +131,13 @@ pub struct BgpPeer {
 pub struct BgpRoute {
     /// Destination prefix (CIDR)
     pub prefix: String,
-    /// Next hop / gateway, if any
+    /// Next hop / gateway, if any.
+    ///
+    /// Always `None` for originated routes (see [`BgpRouter::originated_routes`]):
+    /// a router *originates* a prefix into BGP via a static unicast/blackhole
+    /// route to which it is itself the source, so there is no gateway. A next hop
+    /// is only meaningful for routes the router *forwards* through (e.g. the
+    /// default route).
     pub next_hop: Option<String>,
 }
 
@@ -476,7 +490,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(bgp.default_route().await.unwrap().is_some());
+        assert!(!bgp.default_routes().await.unwrap().is_empty());
 
         bgp.set_session_enabled("s1", false).await.unwrap();
         let sessions = bgp.list_sessions().await.unwrap();

@@ -156,22 +156,22 @@ impl BgpRouter for MikrotikRouter {
         Ok(out)
     }
 
-    async fn default_route(&self) -> OpResult<Option<BgpRoute>> {
-        // Filter server-side; do not fetch the whole table.
+    async fn default_routes(&self) -> OpResult<Vec<BgpRoute>> {
+        // Filter server-side; do not fetch the whole table. Collect every default
+        // route across both families so ECMP next-hops are all reported.
+        let mut out = Vec::new();
         for dst in ["0.0.0.0/0", "::/0"] {
             let path = format!(
                 "/rest/ip/route?dst-address={}&.proplist=dst-address,gateway",
                 dst
             );
             let routes: Vec<MtRoute> = self.api.req::<_, ()>(Method::GET, &path, None).await?;
-            if let Some(r) = routes.into_iter().next() {
-                return Ok(Some(BgpRoute {
-                    prefix: r.dst_address.unwrap_or_else(|| dst.to_string()),
-                    next_hop: r.gateway,
-                }));
-            }
+            out.extend(routes.into_iter().map(|r| BgpRoute {
+                prefix: r.dst_address.unwrap_or_else(|| dst.to_string()),
+                next_hop: r.gateway,
+            }));
         }
-        Ok(None)
+        Ok(out)
     }
 
     async fn discover_peers(&self) -> OpResult<Vec<BgpPeer>> {

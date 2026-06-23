@@ -530,9 +530,10 @@ impl Worker {
                         .iter()
                         .map(|r| r.to_db(router_id, false))
                         .collect();
-                    match bgp.default_route().await {
-                        Ok(Some(route)) => routes.push(route.to_db(router_id, true)),
-                        Ok(None) => {}
+                    match bgp.default_routes().await {
+                        Ok(default_routes) => {
+                            routes.extend(default_routes.iter().map(|r| r.to_db(router_id, true)))
+                        }
                         Err(e) => warn!(
                             "Failed to detect default route on router {}: {}",
                             router_id, e
@@ -3330,14 +3331,17 @@ mod tests {
 
         // Set a new default route; the backend reflects it and the cache is synced.
         worker.set_router_default_route(1, "198.51.100.1").await?;
-        let route = mr.bgp().unwrap().default_route().await.unwrap();
-        assert_eq!(route.unwrap().next_hop.as_deref(), Some("198.51.100.1"));
+        let route = mr.bgp().unwrap().default_routes().await.unwrap();
+        assert_eq!(
+            route.first().and_then(|r| r.next_hop.as_deref()),
+            Some("198.51.100.1")
+        );
         let cached = db.list_router_bgp_routes(1).await?;
         assert!(cached.iter().any(|r| r.is_default));
 
         // Clear the default route; the backend no longer reports one.
         worker.clear_router_default_route(1).await?;
-        assert!(mr.bgp().unwrap().default_route().await.unwrap().is_none());
+        assert!(mr.bgp().unwrap().default_routes().await.unwrap().is_empty());
 
         // Restore the mock's shared default route for other tests.
         mr.bgp()

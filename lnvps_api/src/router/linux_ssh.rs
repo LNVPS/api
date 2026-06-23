@@ -188,8 +188,13 @@ impl BgpRouter for LinuxSshRouter {
         // Routes locally originated by static protocols. The `where` filter is a
         // single in-memory pass in birdc and the *output* is bounded to our own
         // originated prefixes, so this is safe even with a full table loaded.
+        //
+        // Restrict to real unicast announcements: static protocols also carry
+        // blackhole/unreachable/prohibit "anchor" routes (e.g. discard prefixes
+        // and router-id host routes) that are not customer announcements and
+        // would otherwise show up as noisy next_hop-less entries in the cache.
         let out = self
-            .exec_checked("birdc -r 'show route where source = RTS_STATIC'")
+            .exec_checked("birdc -r 'show route where source = RTS_STATIC && dest = RTD_UNICAST'")
             .await?;
         let mut routes = parse_bird_routes(&out);
         if !candidates.is_empty() {
@@ -200,16 +205,15 @@ impl BgpRouter for LinuxSshRouter {
         Ok(routes)
     }
 
-    async fn default_route(&self) -> OpResult<Option<BgpRoute>> {
-        let v4 = self
-            .exec_checked("birdc -r 'show route for 0.0.0.0/0'")
-            .await?;
-        let mut routes = parse_bird_routes(&v4);
-        if routes.is_empty() {
-            let v6 = self.exec_checked("birdc -r 'show route for ::/0'").await?;
-            routes = parse_bird_routes(&v6);
-        }
-        Ok(routes.into_iter().next())
+    async fn default_routes(&self) -> OpResult<Vec<BgpRoute>> {
+        // `ip ro show default` is independent of BIRD's ACL config and reports
+        // the default route(s) actually installed in the kernel, including every
+        // ECMP next-hop.
+        let v4 = self.exec_checked("ip -4 ro show default").await?;
+        let v6 = self.exec_checked("ip -6 ro show default").await?;
+        let mut routes = parse_ip_default_routes(&v4);
+        routes.extend(parse_ip_default_routes(&v6));
+        Ok(routes)
     }
 
     async fn discover_peers(&self) -> OpResult<Vec<BgpPeer>> {
@@ -359,6 +363,38 @@ fn parse_bird_routes_stats(block: &str) -> (Option<u64>, Option<u64>) {
         }
     }
     (None, None)
+}
+
+/// Parse `ip ro show default` output into routes, one per next-hop.
+///
+/// Handles both the single-path form:
+///   default via 10.0.0.1 dev eth0 proto static metric 100
+/// and the ECMP form, where each path is on its own `nexthop via ...` line:
+///   default proto static metric 100
+///       nexthop via 10.0.0.1 dev eth0 weight 1
+///       nexthop via 10.0.0.2 dev eth0 weight 1
+///
+/// The prefix (`0.0.0.0/0` vs `::/0`) is inferred from each next-hop's family.
+fn parse_ip_default_routes(out: &str) -> Vec<BgpRoute> {
+    out.lines()
+        .filter_map(|line| {
+            // Both `default via X` and `nexthop via X` lines contain `via `.
+            let via = line.split("via ").nth(1)?.split_whitespace().next()?;
+            if via.parse::<std::net::Ipv4Addr>().is_ok() {
+                Some(BgpRoute {
+                    prefix: "0.0.0.0/0".to_string(),
+                    next_hop: Some(via.to_string()),
+                })
+            } else if via.parse::<std::net::Ipv6Addr>().is_ok() {
+                Some(BgpRoute {
+                    prefix: "::/0".to_string(),
+                    next_hop: Some(via.to_string()),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Parse `birdc show route` output into routes.
@@ -946,6 +982,46 @@ mod tests {
         assert_eq!(routes[0].next_hop.as_deref(), Some("192.0.2.1"));
         assert_eq!(routes[1].prefix, "203.0.113.0/24");
         assert_eq!(routes[1].next_hop, None);
+    }
+
+    #[test]
+    fn test_parse_ip_default_routes_single() {
+        let out = "default via 10.0.0.1 dev eth0 proto static metric 100";
+        let routes = parse_ip_default_routes(out);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "0.0.0.0/0");
+        assert_eq!(routes[0].next_hop.as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_parse_ip_default_routes_ecmp() {
+        let out = [
+            "default proto static metric 100",
+            "\tnexthop via 10.0.0.1 dev eth0 weight 1",
+            "\tnexthop via 10.0.0.2 dev eth1 weight 1",
+        ]
+        .join("\n");
+        let routes = parse_ip_default_routes(&out);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].next_hop.as_deref(), Some("10.0.0.1"));
+        assert_eq!(routes[1].next_hop.as_deref(), Some("10.0.0.2"));
+        assert!(routes.iter().all(|r| r.prefix == "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_parse_ip_default_routes_v6() {
+        let out = "default via fe80::1 dev eth0 proto static metric 1024";
+        let routes = parse_ip_default_routes(out);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "::/0");
+        assert_eq!(routes[0].next_hop.as_deref(), Some("fe80::1"));
+    }
+
+    #[test]
+    fn test_parse_ip_default_routes_empty() {
+        assert!(parse_ip_default_routes("").is_empty());
+        // A directly-connected default (no `via`) yields no next-hop entry.
+        assert!(parse_ip_default_routes("default dev wg0 scope link").is_empty());
     }
 
     #[test]
