@@ -53,6 +53,15 @@ pub trait BgpRouter: Send + Sync {
     async fn originated_routes(&self, candidates: &[String]) -> OpResult<Vec<BgpRoute>>;
     /// Detect a default route, if present (issue task 4 — route-server detection)
     async fn default_route(&self) -> OpResult<Option<BgpRoute>>;
+    /// Install or replace the static default route pointing at `next_hop`.
+    ///
+    /// The address family of the default (`0.0.0.0/0` vs `::/0`) is inferred from
+    /// `next_hop`: an IPv6 next hop manages the IPv6 default, otherwise the IPv4
+    /// default. Replaces any existing static default for that family.
+    async fn set_default_route(&self, next_hop: &str) -> OpResult<()>;
+    /// Remove the static default route(s). Idempotent — succeeds even when no
+    /// default route is configured.
+    async fn clear_default_route(&self) -> OpResult<()>;
     /// Discover BGP peers and classify upstream/downstream (issue task 5)
     async fn discover_peers(&self) -> OpResult<Vec<BgpPeer>>;
     /// Enable or disable a BGP session by its backend id (issue task 6)
@@ -290,6 +299,20 @@ impl BgpSession {
     }
 }
 
+impl BgpRoute {
+    /// Build a cacheable DB row for this route under the given router.
+    pub fn to_db(&self, router_id: u64, is_default: bool) -> lnvps_db::RouterBgpRoute {
+        lnvps_db::RouterBgpRoute {
+            id: 0,
+            router_id,
+            prefix: self.prefix.clone(),
+            next_hop: self.next_hop.clone(),
+            is_default,
+            last_seen: chrono::Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArpEntry {
     pub id: Option<String>,
@@ -489,5 +512,25 @@ mod tests {
             ..base
         };
         assert!(!down_lc.to_db(1).enabled);
+    }
+
+    #[test]
+    fn test_bgp_route_to_db() {
+        let route = BgpRoute {
+            prefix: "192.0.2.0/24".to_string(),
+            next_hop: Some("192.0.2.1".to_string()),
+        };
+        let originated = route.to_db(7, false);
+        assert_eq!(originated.router_id, 7);
+        assert_eq!(originated.prefix, "192.0.2.0/24");
+        assert_eq!(originated.next_hop.as_deref(), Some("192.0.2.1"));
+        assert!(!originated.is_default);
+
+        let default = BgpRoute {
+            prefix: "0.0.0.0/0".to_string(),
+            next_hop: None,
+        }
+        .to_db(7, true);
+        assert!(default.is_default);
     }
 }

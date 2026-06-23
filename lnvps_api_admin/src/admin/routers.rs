@@ -1,11 +1,12 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminRouterBgpSession, AdminRouterDetail, AdminRouterTunnel, AdminRouterTunnelTraffic,
-    CreateRouterRequest, JobResponse, ToggleBgpSessionRequest, UpdateRouterRequest,
+    AdminRouterBgpRoute, AdminRouterBgpSession, AdminRouterDetail, AdminRouterTunnel,
+    AdminRouterTunnelTraffic, CreateRouterRequest, JobResponse, SetDefaultRouteRequest,
+    ToggleBgpSessionRequest, UpdateRouterRequest,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, TimeDelta, Utc};
 use lnvps_api_common::{
@@ -40,8 +41,16 @@ pub fn router() -> Router<RouterState> {
             get(admin_list_bgp_sessions),
         )
         .route(
+            "/api/admin/v1/routers/{id}/bgp/routes",
+            get(admin_list_bgp_routes),
+        )
+        .route(
             "/api/admin/v1/routers/{id}/bgp/sessions/toggle",
             post(admin_toggle_bgp_session),
+        )
+        .route(
+            "/api/admin/v1/routers/{id}/routes/default",
+            post(admin_set_default_route).delete(admin_clear_default_route),
         )
 }
 
@@ -96,6 +105,65 @@ async fn admin_list_bgp_sessions(
             .map(AdminRouterBgpSession::from)
             .collect(),
     )
+}
+
+async fn admin_list_bgp_routes(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+) -> ApiResult<Vec<AdminRouterBgpRoute>> {
+    auth.require_permission(AdminResource::Router, AdminAction::View)?;
+    let routes = this.db.list_router_bgp_routes(router_id).await?;
+    ApiData::ok(routes.into_iter().map(AdminRouterBgpRoute::from).collect())
+}
+
+async fn admin_set_default_route(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+    Json(request): Json<SetDefaultRouteRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::Router, AdminAction::Update)?;
+    let next_hop = request.next_hop.trim().to_string();
+    if next_hop.parse::<std::net::IpAddr>().is_err() {
+        return ApiData::err("next_hop must be a valid IP address");
+    }
+    let job = WorkJob::SetRouterDefaultRoute {
+        router_id,
+        next_hop,
+    };
+    match this.work_commander.send(job).await {
+        Ok(stream_id) => {
+            info!("Set default route job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue set default route job: {}", e);
+            ApiData::err("Failed to queue set default route job")
+        }
+    }
+}
+
+async fn admin_clear_default_route(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(router_id): Path<u64>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::Router, AdminAction::Update)?;
+    let job = WorkJob::ClearRouterDefaultRoute { router_id };
+    match this.work_commander.send(job).await {
+        Ok(stream_id) => {
+            info!(
+                "Clear default route job queued with stream ID: {}",
+                stream_id
+            );
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue clear default route job: {}", e);
+            ApiData::err("Failed to queue clear default route job")
+        }
+    }
 }
 
 async fn admin_toggle_bgp_session(

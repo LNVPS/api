@@ -2036,6 +2036,10 @@ Required Permission: `ip_range::view`
 
 Returns paginated list of IP ranges with region names, access policy names, and assignment counts.
 
+Each IP range also includes a `routers` array — the routers that route the range, resolved via the range's access
+policy. Each entry is `{ "id": number, "name": string }`. The array is empty when the range has no access policy or
+the policy has no router configured.
+
 #### Get IP Range Details
 
 ```
@@ -2411,6 +2415,62 @@ Body:
 
 Returns a `JobResponse` (`{ "job_id": "string" }`). The enable/disable is applied asynchronously by the worker and
 the session cache is refreshed afterwards.
+
+#### List BGP Routes
+
+```
+GET /api/admin/v1/routers/{router_id}/bgp/routes
+```
+
+Required Permission: `router::view`
+
+Returns the router's cached BGP route table — the prefixes the router originates/announces, plus a detected default
+route. Each `AdminRouterBgpRoute`:
+
+- `router_id` — owning router id.
+- `prefix` — destination prefix in CIDR notation.
+- `next_hop` — next hop / gateway, or `null`.
+- `is_default` — `true` when this entry is the router's default route (`0.0.0.0/0` / `::/0`).
+- `last_seen` — when the background sampler last refreshed this route's cached state.
+
+Routes are refreshed (~60s) alongside tunnels and BGP sessions; prefixes the router no longer originates are pruned.
+The originated-route query is scoped to locally-originated prefixes, so it stays bounded even on routers carrying a
+full DFZ table.
+
+#### Set Default Route
+
+```
+POST /api/admin/v1/routers/{router_id}/routes/default
+```
+
+Required Permission: `router::update`
+
+Install or replace the router's **static** default route.
+
+Body:
+
+```json
+{
+  "next_hop": "string"
+  // Next-hop / gateway IP address. The address family of the default route
+  // (0.0.0.0/0 vs ::/0) is inferred from this value.
+}
+```
+
+Returns a `JobResponse` (`{ "job_id": "string" }`). The change is applied asynchronously by the worker and the route
+cache is refreshed afterwards. An invalid `next_hop` (not an IP address) is rejected. Only available on routers that
+support BGP/routing.
+
+#### Clear Default Route
+
+```
+DELETE /api/admin/v1/routers/{router_id}/routes/default
+```
+
+Required Permission: `router::update`
+
+Remove the router's static default route(s). Idempotent — succeeds even when no default route is configured. Returns a
+`JobResponse`.
 
 ### VM IP Assignment Management
 

@@ -440,24 +440,23 @@ impl Worker {
         msg
     }
 
-    /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
-    /// Poll every enabled router for tunnel/BGP state and record per-tunnel
-    /// traffic samples.
+    /// Poll every enabled router to refresh cached tunnel/BGP session/route state
+    /// and record per-tunnel traffic samples.
     ///
     /// Only tunnel traffic counters are sampled into the time-series table; BGP
-    /// sessions are refreshed as cached state (no byte counters exist for BGP).
-    /// All route/tunnel queries used here are bounded and full-table safe.
-    pub async fn sample_router_traffic(&self) -> Result<()> {
+    /// sessions and routes are refreshed as cached state (no byte counters exist
+    /// for BGP). All route/tunnel queries used here are bounded and full-table safe.
+    pub async fn sync_router_state(&self) -> Result<()> {
         let routers = self.db.list_routers().await?;
         for router in routers.iter().filter(|r| r.enabled) {
-            if let Err(e) = self.sample_one_router(router.id).await {
-                error!("Failed to sample router {}: {}", router.id, e);
+            if let Err(e) = self.sync_one_router(router.id).await {
+                error!("Failed to sync router {}: {}", router.id, e);
             }
         }
         Ok(())
     }
 
-    async fn sample_one_router(&self, router_id: u64) -> Result<()> {
+    async fn sync_one_router(&self, router_id: u64) -> Result<()> {
         let router = crate::router::get_router(&self.db, router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
@@ -516,6 +515,69 @@ impl Worker {
                 }
                 Err(e) => warn!("Failed to list BGP sessions on router {}: {}", router_id, e),
             }
+
+            // Routes: refresh the cached route table (locally-originated prefixes
+            // plus a detected default route). Passing an empty candidate set returns
+            // all locally-originated prefixes, which is inherently small.
+            let sync_started = Utc::now();
+            let mut any_route_synced = false;
+            match bgp.originated_routes(&[]).await {
+                Ok(routes) => {
+                    for r in &routes {
+                        if let Err(e) = self
+                            .db
+                            .upsert_router_bgp_route(&r.to_db(router_id, false))
+                            .await
+                        {
+                            warn!(
+                                "Failed to cache route {} on router {}: {}",
+                                r.prefix, router_id, e
+                            );
+                        } else {
+                            any_route_synced = true;
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed to list originated routes on router {}: {}",
+                    router_id, e
+                ),
+            }
+            match bgp.default_route().await {
+                Ok(Some(route)) => {
+                    if let Err(e) = self
+                        .db
+                        .upsert_router_bgp_route(&route.to_db(router_id, true))
+                        .await
+                    {
+                        warn!(
+                            "Failed to cache default route on router {}: {}",
+                            router_id, e
+                        );
+                    } else {
+                        any_route_synced = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    "Failed to detect default route on router {}: {}",
+                    router_id, e
+                ),
+            }
+            // Prune routes the router no longer originates. Only prune when at least
+            // one route was refreshed, so a transient query failure does not wipe the
+            // cache.
+            if any_route_synced
+                && let Err(e) = self
+                    .db
+                    .delete_stale_router_bgp_routes(router_id, sync_started)
+                    .await
+            {
+                warn!(
+                    "Failed to prune stale routes on router {}: {}",
+                    router_id, e
+                );
+            }
         }
 
         Ok(())
@@ -549,6 +611,44 @@ impl Worker {
             .set_router_bgp_session_enabled(router_id, session_id, enabled)
             .await
             .map_err(|e| anyhow!("failed to persist BGP session enabled flag: {}", e))?;
+        Ok(())
+    }
+
+    /// Install or replace the static default route on a router, then refresh the
+    /// cached route table so the admin API reflects the change.
+    pub async fn set_router_default_route(&self, router_id: u64, next_hop: &str) -> Result<()> {
+        let router = crate::router::get_router(&self.db, router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
+        let bgp = router.bgp().context("router does not support BGP")?;
+        bgp.set_default_route(next_hop)
+            .await
+            .map_err(|e| anyhow!("failed to set default route: {}", e))?;
+        if let Err(e) = self.sync_one_router(router_id).await {
+            warn!(
+                "Failed to refresh router {} state after set: {}",
+                router_id, e
+            );
+        }
+        Ok(())
+    }
+
+    /// Remove the static default route(s) from a router, then refresh the cached
+    /// route table so the admin API reflects the change.
+    pub async fn clear_router_default_route(&self, router_id: u64) -> Result<()> {
+        let router = crate::router::get_router(&self.db, router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
+        let bgp = router.bgp().context("router does not support BGP")?;
+        bgp.clear_default_route()
+            .await
+            .map_err(|e| anyhow!("failed to clear default route: {}", e))?;
+        if let Err(e) = self.sync_one_router(router_id).await {
+            warn!(
+                "Failed to refresh router {} state after clear: {}",
+                router_id, e
+            );
+        }
         Ok(())
     }
 
@@ -1840,8 +1940,8 @@ impl Worker {
             WorkJob::CheckSubscriptions => {
                 self.check_subscriptions().await?;
             }
-            WorkJob::SampleRouterTraffic => {
-                self.sample_router_traffic().await?;
+            WorkJob::SyncRouterState => {
+                self.sync_router_state().await?;
             }
             WorkJob::ToggleBgpSession {
                 router_id,
@@ -1850,6 +1950,15 @@ impl Worker {
             } => {
                 self.toggle_bgp_session(*router_id, session_id, *enabled)
                     .await?;
+            }
+            WorkJob::SetRouterDefaultRoute {
+                router_id,
+                next_hop,
+            } => {
+                self.set_router_default_route(*router_id, next_hop).await?;
+            }
+            WorkJob::ClearRouterDefaultRoute { router_id } => {
+                self.clear_router_default_route(*router_id).await?;
             }
             WorkJob::DeleteVm {
                 vm_id,
@@ -3045,7 +3154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sample_router_traffic() -> Result<()> {
+    async fn test_sync_router_state() -> Result<()> {
         use crate::mocks::MockRouter;
         use crate::router::{
             BgpPeerDirection, BgpSession, GreConfig, Router as _, Tunnel, TunnelConfig,
@@ -3098,7 +3207,7 @@ mod tests {
         .await;
 
         let worker = setup_worker(db.clone()).await?;
-        worker.sample_router_traffic().await?;
+        worker.sync_router_state().await?;
 
         let tunnels = db.list_router_tunnels(1).await?;
         assert_eq!(tunnels.len(), 1);
@@ -3168,6 +3277,53 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert!(!sessions[0].enabled);
 
+        mr.clear().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_set_and_clear_default_route() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::Router as _;
+        use lnvps_db::{Router, RouterKind};
+
+        let db = Arc::new(MockDb::empty());
+        {
+            let mut routers = db.router.lock().await;
+            routers.insert(
+                1,
+                Router {
+                    id: 1,
+                    name: "r1".to_string(),
+                    enabled: true,
+                    kind: RouterKind::MockRouter,
+                    url: "mock://".to_string(),
+                    token: "".into(),
+                },
+            );
+        }
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let worker = setup_worker(db.clone()).await?;
+
+        // Set a new default route; the backend reflects it and the cache is synced.
+        worker.set_router_default_route(1, "198.51.100.1").await?;
+        let route = mr.bgp().unwrap().default_route().await.unwrap();
+        assert_eq!(route.unwrap().next_hop.as_deref(), Some("198.51.100.1"));
+        let cached = db.list_router_bgp_routes(1).await?;
+        assert!(cached.iter().any(|r| r.is_default));
+
+        // Clear the default route; the backend no longer reports one.
+        worker.clear_router_default_route(1).await?;
+        assert!(mr.bgp().unwrap().default_route().await.unwrap().is_none());
+
+        // Restore the mock's shared default route for other tests.
+        mr.bgp()
+            .unwrap()
+            .set_default_route("192.0.2.1")
+            .await
+            .unwrap();
         mr.clear().await;
         Ok(())
     }

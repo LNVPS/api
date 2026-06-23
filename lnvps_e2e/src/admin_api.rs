@@ -736,6 +736,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_list_router_bgp_routes() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/routers").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        if let Some(routers) = body["data"].as_array()
+            && let Some(r) = routers.first()
+        {
+            let r_id = r["id"].as_u64().unwrap();
+            let resp = client
+                .get_auth(&format!("/api/admin/v1/routers/{r_id}/bgp/routes"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_set_default_route_validation() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/routers").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        if let Some(routers) = body["data"].as_array()
+            && let Some(r) = routers.first()
+        {
+            let r_id = r["id"].as_u64().unwrap();
+            // Invalid next_hop is rejected by the handler.
+            let resp = client
+                .post_auth(
+                    &format!("/api/admin/v1/routers/{r_id}/routes/default"),
+                    &serde_json::json!({ "next_hop": "not-an-ip" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert!(!body["success"].as_bool().unwrap_or(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_clear_default_route() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/routers").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        if let Some(routers) = body["data"].as_array()
+            && let Some(r) = routers.first()
+        {
+            let r_id = r["id"].as_u64().unwrap();
+            let resp = client
+                .delete_auth(&format!("/api/admin/v1/routers/{r_id}/routes/default"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
     async fn test_admin_list_vm_ip_assignments() {
         let client = setup().await;
         let resp = client

@@ -1,7 +1,8 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminIpRangeAllocationMode, AdminIpRangeInfo, CreateIpRangeRequest, UpdateIpRangeRequest,
+    AdminIpRangeAllocationMode, AdminIpRangeInfo, AdminIpRangeRouter, CreateIpRangeRequest,
+    UpdateIpRangeRequest,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -28,6 +29,31 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/ip_ranges/{id}/free_ips",
             get(admin_list_free_ips),
         )
+}
+
+/// Resolve the routers that route a given IP range via its access policy.
+/// Returns an empty list when the range has no access policy or the policy has
+/// no router configured.
+async fn resolve_ip_range_routers(
+    this: &RouterState,
+    access_policy_id: Option<u64>,
+) -> Vec<AdminIpRangeRouter> {
+    let Some(policy_id) = access_policy_id else {
+        return Vec::new();
+    };
+    let Ok(policy) = this.db.get_access_policy(policy_id).await else {
+        return Vec::new();
+    };
+    let Some(router_id) = policy.router_id else {
+        return Vec::new();
+    };
+    match this.db.get_router(router_id).await {
+        Ok(router) => vec![AdminIpRangeRouter {
+            id: router.id,
+            name: router.name,
+        }],
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Validate and normalize gateway format for API responses.
@@ -93,12 +119,14 @@ async fn admin_list_ip_ranges(
         };
 
         let available_ips = NetworkProvisioner::count_available_ips(&ip_range, assignment_count);
+        let routers = resolve_ip_range_routers(&this, ip_range.access_policy_id).await;
 
         let mut admin_ip_range = AdminIpRangeInfo::from(ip_range);
         admin_ip_range.assignment_count = assignment_count;
         admin_ip_range.region_name = region_name;
         admin_ip_range.access_policy_name = access_policy_name;
         admin_ip_range.available_ips = available_ips;
+        admin_ip_range.routers = routers;
         ip_ranges.push(admin_ip_range);
     }
 
@@ -138,12 +166,14 @@ async fn admin_get_ip_range(
     };
 
     let available_ips = NetworkProvisioner::count_available_ips(&ip_range, assignment_count);
+    let routers = resolve_ip_range_routers(&this, ip_range.access_policy_id).await;
 
     let mut admin_ip_range = AdminIpRangeInfo::from(ip_range);
     admin_ip_range.assignment_count = assignment_count;
     admin_ip_range.region_name = region_name;
     admin_ip_range.access_policy_name = access_policy_name;
     admin_ip_range.available_ips = available_ips;
+    admin_ip_range.routers = routers;
 
     ApiData::ok(admin_ip_range)
 }
@@ -214,12 +244,14 @@ async fn admin_create_ip_range(
     };
 
     let available_ips = NetworkProvisioner::count_available_ips(&created_ip_range, 0);
+    let routers = resolve_ip_range_routers(&this, created_ip_range.access_policy_id).await;
 
     let mut admin_ip_range = AdminIpRangeInfo::from(created_ip_range);
     admin_ip_range.region_name = region_name;
     admin_ip_range.access_policy_name = access_policy_name;
     admin_ip_range.assignment_count = 0; // New range has no assignments
     admin_ip_range.available_ips = available_ips;
+    admin_ip_range.routers = routers;
 
     ApiData::ok(admin_ip_range)
 }
@@ -329,12 +361,14 @@ async fn admin_update_ip_range(
     };
 
     let available_ips = NetworkProvisioner::count_available_ips(&ip_range, assignment_count);
+    let routers = resolve_ip_range_routers(&this, ip_range.access_policy_id).await;
 
     let mut admin_ip_range = AdminIpRangeInfo::from(ip_range);
     admin_ip_range.assignment_count = assignment_count;
     admin_ip_range.region_name = region_name;
     admin_ip_range.access_policy_name = access_policy_name;
     admin_ip_range.available_ips = available_ips;
+    admin_ip_range.routers = routers;
 
     ApiData::ok(admin_ip_range)
 }

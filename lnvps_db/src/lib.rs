@@ -413,6 +413,20 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a cached BGP session by id
     async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()>;
 
+    /// List cached BGP routes (originated + default) for a router
+    async fn list_router_bgp_routes(&self, router_id: u64) -> DbResult<Vec<RouterBgpRoute>>;
+
+    /// Insert or update (by router_id+prefix) a cached BGP route, returning its id
+    async fn upsert_router_bgp_route(&self, route: &RouterBgpRoute) -> DbResult<u64>;
+
+    /// Delete cached BGP routes for a router last seen before the given cutoff
+    /// (used to prune routes the router no longer originates)
+    async fn delete_stale_router_bgp_routes(
+        &self,
+        router_id: u64,
+        before: DateTime<Utc>,
+    ) -> DbResult<()>;
+
     /// Get VM IP assignment
     async fn get_vm_ip_assignment(&self, id: u64) -> DbResult<VmIpAssignment>;
 

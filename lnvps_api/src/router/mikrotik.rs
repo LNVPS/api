@@ -186,6 +186,70 @@ impl BgpRouter for MikrotikRouter {
             .collect())
     }
 
+    async fn set_default_route(&self, next_hop: &str) -> OpResult<()> {
+        // Infer the family from the next hop; an IPv6 next hop manages `::/0`.
+        let is_v6 = next_hop.parse::<std::net::Ipv6Addr>().is_ok();
+        let (menu, dst) = if is_v6 {
+            ("ipv6", "::/0")
+        } else {
+            ("ip", "0.0.0.0/0")
+        };
+        // Replace an existing static default for this family, else add a new one.
+        let existing: Vec<MtRouteId> = self
+            .api
+            .req::<_, ()>(
+                Method::GET,
+                &format!("/rest/{}/route?dst-address={}&.proplist=.id", menu, dst),
+                None,
+            )
+            .await
+            .unwrap_or_default();
+        if let Some(id) = existing.into_iter().find_map(|r| r.id) {
+            let _: serde_json::Value = self
+                .api
+                .req(
+                    Method::PATCH,
+                    &format!("/rest/{}/route/{}", menu, id),
+                    Some(json!({ "gateway": next_hop })),
+                )
+                .await?;
+        } else {
+            let _: serde_json::Value = self
+                .api
+                .req(
+                    Method::POST,
+                    &format!("/rest/{}/route", menu),
+                    Some(json!({ "dst-address": dst, "gateway": next_hop })),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_default_route(&self) -> OpResult<()> {
+        for (menu, dst) in [("ip", "0.0.0.0/0"), ("ipv6", "::/0")] {
+            let existing: Vec<MtRouteId> = self
+                .api
+                .req::<_, ()>(
+                    Method::GET,
+                    &format!("/rest/{}/route?dst-address={}&.proplist=.id", menu, dst),
+                    None,
+                )
+                .await
+                .unwrap_or_default();
+            for id in existing.into_iter().filter_map(|r| r.id) {
+                self.api
+                    .req_status::<()>(
+                        Method::DELETE,
+                        &format!("/rest/{}/route/{}", menu, id),
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn set_session_enabled(&self, id: &str, enabled: bool) -> OpResult<()> {
         let body = json!({ "disabled": (!enabled).to_string() });
         let _: serde_json::Value = self
@@ -231,6 +295,12 @@ struct MtRoute {
     #[serde(rename = "dst-address")]
     dst_address: Option<String>,
     gateway: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MtRouteId {
+    #[serde(rename = ".id")]
+    id: Option<String>,
 }
 
 /// RouterOS REST menu path for a tunnel kind

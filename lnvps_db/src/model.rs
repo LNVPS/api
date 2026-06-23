@@ -750,6 +750,21 @@ pub enum RouterBgpDirection {
     Peer = 3,
 }
 
+/// Cached BGP route table entry for a router: a prefix the router
+/// originates/announces, or the detected default route.
+#[derive(FromRow, Clone, Debug)]
+pub struct RouterBgpRoute {
+    pub id: u64,
+    pub router_id: u64,
+    /// Destination prefix in CIDR notation
+    pub prefix: String,
+    /// Next hop / gateway, if any
+    pub next_hop: Option<String>,
+    /// Whether this entry is the router's default route
+    pub is_default: bool,
+    pub last_seen: DateTime<Utc>,
+}
+
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct IpRange {
     pub id: u64,

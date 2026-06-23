@@ -1637,6 +1637,16 @@ pub struct AdminIpRangeInfo {
     pub assignment_count: u64, // Number of active IP assignments in this range
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_ips: Option<u64>, // Number of available IPs (only for IPv4 ranges)
+    /// Routers that route this range, resolved via the range's access policy.
+    /// Empty when the range has no access policy or the policy has no router.
+    pub routers: Vec<AdminIpRangeRouter>,
+}
+
+/// A router associated with an IP range (via its access policy)
+#[derive(Serialize, Clone)]
+pub struct AdminIpRangeRouter {
+    pub id: u64,
+    pub name: String,
 }
 
 #[derive(Deserialize)]
@@ -1697,6 +1707,7 @@ impl From<lnvps_db::IpRange> for AdminIpRangeInfo {
             use_full_range: ip_range.use_full_range,
             assignment_count: 0, // Will be filled by handler
             available_ips: None, // Will be filled by handler for IPv4 ranges
+            routers: Vec::new(), // Will be filled by handler
         }
     }
 }
@@ -1996,12 +2007,46 @@ impl From<lnvps_db::RouterBgpSession> for AdminRouterBgpSession {
     }
 }
 
+/// A cached BGP route on a router (locally-originated prefix or default route)
+#[derive(Serialize)]
+pub struct AdminRouterBgpRoute {
+    pub router_id: u64,
+    /// Destination prefix in CIDR notation
+    pub prefix: String,
+    /// Next hop / gateway, if any
+    pub next_hop: Option<String>,
+    /// Whether this entry is the router's default route
+    pub is_default: bool,
+    /// When the background sampler last refreshed this route's cached state.
+    pub last_seen: DateTime<Utc>,
+}
+
+impl From<lnvps_db::RouterBgpRoute> for AdminRouterBgpRoute {
+    fn from(r: lnvps_db::RouterBgpRoute) -> Self {
+        Self {
+            router_id: r.router_id,
+            prefix: r.prefix,
+            next_hop: r.next_hop,
+            is_default: r.is_default,
+            last_seen: r.last_seen,
+        }
+    }
+}
+
 /// Toggle a BGP session on/off
 #[derive(Deserialize)]
 pub struct ToggleBgpSessionRequest {
     /// Backend session id (protocol name on BIRD, `.id` on Mikrotik)
     pub session_id: String,
     pub enabled: bool,
+}
+
+/// Set the static default route on a router
+#[derive(Deserialize)]
+pub struct SetDefaultRouteRequest {
+    /// Next-hop / gateway address. The address family (`0.0.0.0/0` vs `::/0`) is
+    /// inferred from this value.
+    pub next_hop: String,
 }
 
 impl CreateRouterRequest {
@@ -3542,6 +3587,24 @@ mod tests {
         assert_eq!(a.peer_asn, Some(64512));
         assert_eq!(a.direction, "upstream");
         assert_eq!(a.state, "Established");
+    }
+
+    #[test]
+    fn test_admin_router_bgp_route_from() {
+        use chrono::Utc;
+        let r = lnvps_db::RouterBgpRoute {
+            id: 7,
+            router_id: 2,
+            prefix: "192.0.2.0/24".to_string(),
+            next_hop: Some("192.0.2.1".to_string()),
+            is_default: false,
+            last_seen: Utc::now(),
+        };
+        let a = AdminRouterBgpRoute::from(r);
+        assert_eq!(a.router_id, 2);
+        assert_eq!(a.prefix, "192.0.2.0/24");
+        assert_eq!(a.next_hop.as_deref(), Some("192.0.2.1"));
+        assert!(!a.is_default);
     }
 
     #[test]

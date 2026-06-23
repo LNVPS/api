@@ -126,8 +126,9 @@ pub enum WorkJob {
     DownloadOsImages { image_id: Option<u64> },
     /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
     CheckSubscriptions,
-    /// Poll routers for tunnel/BGP state and record per-tunnel traffic samples.
-    SampleRouterTraffic,
+    /// Poll routers to refresh cached tunnel/BGP session/route state and record
+    /// per-tunnel traffic samples.
+    SyncRouterState,
     /// Enable or disable a BGP session on a router (admin action).
     ToggleBgpSession {
         router_id: u64,
@@ -135,6 +136,11 @@ pub enum WorkJob {
         session_id: String,
         enabled: bool,
     },
+    /// Install or replace the static default route on a router (admin action).
+    /// The address family is inferred from `next_hop`.
+    SetRouterDefaultRoute { router_id: u64, next_hop: String },
+    /// Remove the static default route(s) from a router (admin action).
+    ClearRouterDefaultRoute { router_id: u64 },
 }
 
 impl WorkJob {
@@ -176,8 +182,31 @@ impl fmt::Display for WorkJob {
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
-            WorkJob::SampleRouterTraffic => write!(f, "SampleRouterTraffic"),
+            WorkJob::SyncRouterState => write!(f, "SyncRouterState"),
             WorkJob::ToggleBgpSession { .. } => write!(f, "ToggleBgpSession"),
+            WorkJob::SetRouterDefaultRoute { .. } => write!(f, "SetRouterDefaultRoute"),
+            WorkJob::ClearRouterDefaultRoute { .. } => write!(f, "ClearRouterDefaultRoute"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_router_default_route_job_display() {
+        assert_eq!(
+            WorkJob::SetRouterDefaultRoute {
+                router_id: 1,
+                next_hop: "192.0.2.1".to_string(),
+            }
+            .to_string(),
+            "SetRouterDefaultRoute"
+        );
+        assert_eq!(
+            WorkJob::ClearRouterDefaultRoute { router_id: 1 }.to_string(),
+            "ClearRouterDefaultRoute"
+        );
     }
 }

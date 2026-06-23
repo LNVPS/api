@@ -12,6 +12,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-06-23** - Set/clear the static default route on a router (admin)
+  - `POST /api/admin/v1/routers/{id}/routes/default` — install or replace the router's static default route. Body: `{ "next_hop": string }` (an IP address; the address family `0.0.0.0/0` vs `::/0` is inferred from it). Returns a `JobResponse` (`{ "job_id": string }`); applied asynchronously by the worker, which refreshes the route cache afterwards. Requires `router::update`.
+  - `DELETE /api/admin/v1/routers/{id}/routes/default` — remove the router's static default route(s) (idempotent). Returns a `JobResponse`. Requires `router::update`.
+  - Backed by new `BgpRouter::set_default_route`/`clear_default_route` capabilities (Linux/iproute2 `ip route replace|del default`, RouterOS `/ip|/ipv6/route`). Only available on routers that support BGP/routing.
+
+- **2026-06-23** - Router BGP route table visibility + IP range router attribution (admin)
+  - `GET /api/admin/v1/routers/{id}/bgp/routes` — list the router's cached BGP route table: the prefixes it originates/announces plus a detected default route. Each `AdminRouterBgpRoute`: `router_id`, `prefix` (CIDR), `next_hop`, `is_default`, `last_seen`. Refreshed by the background sampler (~60s) alongside tunnels/BGP sessions; stale routes are pruned. Requires `router::view`.
+  - IP range responses (`GET /api/admin/v1/ip_ranges`, `GET /api/admin/v1/ip_ranges/{id}`, and create/update) now include a `routers` array (`{ id, name }`) listing the routers that route the range, resolved via the range's access policy. Empty when the range has no access policy or the policy has no router.
+
 - **2026-06-21** - Route server management: BGP session and tunnel visibility/control (admin)
   - New `RouterKind` value `linux_ssh` — a Linux router managed over SSH (BIRD/Pathvector routing, iproute2/WireGuard tunnels). Configure with `url = ssh://<user>@<host>[:<port>]/<interface>` and `token` = the SSH private key (PEM). Selectable via `kind` on `POST/PATCH /api/admin/v1/routers`.
   - `GET /api/admin/v1/routers/{id}/tunnels` — list cached tunnels discovered on the router. Each `AdminRouterTunnel`: `id`, `router_id`, `name`, `kind` (`gre`|`vxlan`|`wireguard`), `local_addr`, `remote_addr`, `enabled`, `last_seen`. Requires `router::view`.

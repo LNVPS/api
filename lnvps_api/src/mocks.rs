@@ -48,6 +48,7 @@ pub struct MockRouter {
     arp: Arc<Mutex<HashMap<u64, ArpEntry>>>,
     tunnels: Arc<Mutex<HashMap<String, Tunnel>>>,
     sessions: Arc<Mutex<HashMap<String, BgpSession>>>,
+    default_route: Arc<Mutex<Option<BgpRoute>>>,
 }
 
 impl Default for MockRouter {
@@ -64,11 +65,18 @@ impl MockRouter {
             LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
         static LAZY_SESSIONS: LazyLock<Arc<Mutex<HashMap<String, BgpSession>>>> =
             LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        static LAZY_DEFAULT_ROUTE: LazyLock<Arc<Mutex<Option<BgpRoute>>>> = LazyLock::new(|| {
+            Arc::new(Mutex::new(Some(BgpRoute {
+                prefix: "0.0.0.0/0".to_string(),
+                next_hop: Some("192.0.2.1".to_string()),
+            })))
+        });
 
         Self {
             arp: LAZY_ARP.clone(),
             tunnels: LAZY_TUNNELS.clone(),
             sessions: LAZY_SESSIONS.clone(),
+            default_route: LAZY_DEFAULT_ROUTE.clone(),
         }
     }
 
@@ -266,10 +274,22 @@ impl BgpRouter for MockRouter {
     }
 
     async fn default_route(&self) -> OpResult<Option<BgpRoute>> {
-        Ok(Some(BgpRoute {
-            prefix: "0.0.0.0/0".to_string(),
-            next_hop: Some("192.0.2.1".to_string()),
-        }))
+        Ok(self.default_route.lock().await.clone())
+    }
+
+    async fn set_default_route(&self, next_hop: &str) -> OpResult<()> {
+        let is_v6 = next_hop.parse::<std::net::Ipv6Addr>().is_ok();
+        let prefix = if is_v6 { "::/0" } else { "0.0.0.0/0" };
+        *self.default_route.lock().await = Some(BgpRoute {
+            prefix: prefix.to_string(),
+            next_hop: Some(next_hop.to_string()),
+        });
+        Ok(())
+    }
+
+    async fn clear_default_route(&self) -> OpResult<()> {
+        *self.default_route.lock().await = None;
+        Ok(())
     }
 
     async fn discover_peers(&self) -> OpResult<Vec<BgpPeer>> {

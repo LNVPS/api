@@ -224,6 +224,31 @@ impl BgpRouter for LinuxSshRouter {
             .collect())
     }
 
+    async fn set_default_route(&self, next_hop: &str) -> OpResult<()> {
+        // Infer the family from the next hop; an IPv6 next hop manages `::/0`.
+        let is_v6 = next_hop.parse::<std::net::Ipv6Addr>().is_ok();
+        let family = if is_v6 { "-6" } else { "-4" };
+        // `ip route replace default` installs the route or replaces an existing
+        // static default for that family.
+        self.exec_checked(&format!(
+            "ip {} route replace default via {}",
+            family,
+            shq(next_hop)
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_default_route(&self) -> OpResult<()> {
+        // Remove both the IPv4 and IPv6 defaults; tolerate a missing route so the
+        // operation is idempotent.
+        self.exec_checked(
+            "sh -c 'ip -4 route del default 2>/dev/null; ip -6 route del default 2>/dev/null; true'",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn set_session_enabled(&self, id: &str, enabled: bool) -> OpResult<()> {
         let action = if enabled { "enable" } else { "disable" };
         self.exec_checked(&format!("birdc {} {}", action, shq(id)))

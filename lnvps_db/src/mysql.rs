@@ -1,7 +1,7 @@
 use crate::{
     AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IntervalType, IpRange,
     IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
-    PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router,
+    PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmForMigration, VmHistory, VmHost,
@@ -1370,6 +1370,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()> {
         sqlx::query("delete from router_bgp_session where id=?")
             .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_router_bgp_routes(&self, router_id: u64) -> DbResult<Vec<RouterBgpRoute>> {
+        Ok(
+            sqlx::query_as("select * from router_bgp_route where router_id=?")
+                .bind(router_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn upsert_router_bgp_route(&self, route: &RouterBgpRoute) -> DbResult<u64> {
+        Ok(sqlx::query(
+            r#"insert into router_bgp_route
+                 (router_id, prefix, next_hop, is_default, last_seen)
+               values (?, ?, ?, ?, current_timestamp)
+               on duplicate key update
+                 next_hop = values(next_hop),
+                 is_default = values(is_default),
+                 last_seen = current_timestamp"#,
+        )
+        .bind(route.router_id)
+        .bind(&route.prefix)
+        .bind(&route.next_hop)
+        .bind(route.is_default)
+        .execute(&self.db)
+        .await?
+        .last_insert_id())
+    }
+
+    async fn delete_stale_router_bgp_routes(
+        &self,
+        router_id: u64,
+        before: DateTime<Utc>,
+    ) -> DbResult<()> {
+        sqlx::query("delete from router_bgp_route where router_id=? and last_seen < ?")
+            .bind(router_id)
+            .bind(before)
             .execute(&self.db)
             .await?;
         Ok(())

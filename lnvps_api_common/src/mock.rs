@@ -6,11 +6,11 @@ use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
     DiskType, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing,
     LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, RouterBgpSession,
-    RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
+    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -52,6 +52,7 @@ pub struct MockDb {
     pub router_tunnels: Arc<Mutex<HashMap<u64, RouterTunnel>>>,
     pub router_tunnel_traffic: Arc<Mutex<Vec<RouterTunnelTraffic>>>,
     pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
+    pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
 }
 
 impl MockDb {
@@ -304,6 +305,7 @@ impl Default for MockDb {
             router_tunnels: Arc::new(Default::default()),
             router_tunnel_traffic: Arc::new(Default::default()),
             router_bgp_sessions: Arc::new(Default::default()),
+            router_bgp_routes: Arc::new(Default::default()),
         }
     }
 }
@@ -1234,6 +1236,50 @@ impl LNVpsDbBase for MockDb {
     async fn delete_router_bgp_session(&self, id: u64) -> DbResult<()> {
         let mut s = self.router_bgp_sessions.lock().await;
         s.remove(&id);
+        Ok(())
+    }
+
+    async fn list_router_bgp_routes(&self, router_id: u64) -> DbResult<Vec<RouterBgpRoute>> {
+        let r = self.router_bgp_routes.lock().await;
+        Ok(r.values()
+            .filter(|x| x.router_id == router_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn upsert_router_bgp_route(&self, route: &RouterBgpRoute) -> DbResult<u64> {
+        let mut r = self.router_bgp_routes.lock().await;
+        if let Some(existing) = r
+            .values_mut()
+            .find(|x| x.router_id == route.router_id && x.prefix == route.prefix)
+        {
+            let id = existing.id;
+            *existing = RouterBgpRoute {
+                id,
+                last_seen: Utc::now(),
+                ..route.clone()
+            };
+            return Ok(id);
+        }
+        let id = r.keys().max().copied().unwrap_or(0) + 1;
+        r.insert(
+            id,
+            RouterBgpRoute {
+                id,
+                last_seen: Utc::now(),
+                ..route.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn delete_stale_router_bgp_routes(
+        &self,
+        router_id: u64,
+        before: chrono::DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut r = self.router_bgp_routes.lock().await;
+        r.retain(|_, x| !(x.router_id == router_id && x.last_seen < before));
         Ok(())
     }
 
@@ -3654,6 +3700,57 @@ mod tests {
         db.upsert_router_bgp_session(&refreshed).await.unwrap();
         let sessions = db.list_router_bgp_sessions(1).await.unwrap();
         assert_eq!(sessions[0].state, "Idle");
-        assert!(!sessions[0].enabled, "discovery must not re-enable the session");
+        assert!(
+            !sessions[0].enabled,
+            "discovery must not re-enable the session"
+        );
+    }
+
+    /// Route cache: upsert by (router_id, prefix), refresh next_hop/is_default,
+    /// and prune stale entries older than a cutoff.
+    #[tokio::test]
+    async fn test_router_bgp_route_cache() {
+        use lnvps_db::RouterBgpRoute;
+        let db = MockDb::empty();
+        let r = RouterBgpRoute {
+            id: 0,
+            router_id: 1,
+            prefix: "192.0.2.0/24".to_string(),
+            next_hop: None,
+            is_default: false,
+            last_seen: Utc::now(),
+        };
+        let id = db.upsert_router_bgp_route(&r).await.unwrap();
+        assert_eq!(db.list_router_bgp_routes(1).await.unwrap().len(), 1);
+
+        // Upsert with same prefix updates in place (same id).
+        let mut r2 = r.clone();
+        r2.next_hop = Some("192.0.2.1".to_string());
+        let id2 = db.upsert_router_bgp_route(&r2).await.unwrap();
+        assert_eq!(id, id2);
+        let routes = db.list_router_bgp_routes(1).await.unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].next_hop.as_deref(), Some("192.0.2.1"));
+
+        // A default route is a separate entry.
+        let def = RouterBgpRoute {
+            id: 0,
+            router_id: 1,
+            prefix: "0.0.0.0/0".to_string(),
+            next_hop: Some("192.0.2.254".to_string()),
+            is_default: true,
+            last_seen: Utc::now(),
+        };
+        db.upsert_router_bgp_route(&def).await.unwrap();
+        assert_eq!(db.list_router_bgp_routes(1).await.unwrap().len(), 2);
+
+        // Routes for a different router are isolated.
+        assert!(db.list_router_bgp_routes(2).await.unwrap().is_empty());
+
+        // Prune entries last seen before a future cutoff removes everything.
+        db.delete_stale_router_bgp_routes(1, Utc::now() + chrono::Duration::seconds(10))
+            .await
+            .unwrap();
+        assert!(db.list_router_bgp_routes(1).await.unwrap().is_empty());
     }
 }
