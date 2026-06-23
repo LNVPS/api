@@ -1877,10 +1877,18 @@ pub struct AdminRouterTunnel {
     pub id: u64,
     pub router_id: u64,
     pub name: String,
+    /// Tunnel type: `"gre"`, `"vxlan"` or `"wireguard"`
     pub kind: String,
+    /// Local tunnel endpoint. `"any"` means no specific endpoint is bound
+    /// (e.g. the catch-all `gre0`/`gretap0` template devices, usually unused).
     pub local_addr: Option<String>,
+    /// Remote tunnel endpoint. `"any"` means no specific endpoint is bound.
     pub remote_addr: Option<String>,
+    /// **Administrative** state. `true` = the interface is configured and not
+    /// shut down. Independent of whether the tunnel is actually passing traffic.
     pub enabled: bool,
+    /// When the background sampler last observed this interface in the router's
+    /// inventory (not a traffic timestamp).
     pub last_seen: DateTime<Utc>,
 }
 
@@ -1935,11 +1943,30 @@ pub struct AdminRouterBgpSession {
     pub peer_ip: Option<String>,
     pub peer_asn: Option<u32>,
     pub local_asn: Option<u32>,
+    /// **Operational** BGP FSM state, reported live by the routing daemon and
+    /// copied verbatim. This is NOT a boolean and does NOT mean "disabled".
+    /// Progression: `Idle` -> `Connect` -> `Active` -> `OpenSent` ->
+    /// `OpenConfirm` -> `Established`, plus `Down` (BIRD: protocol not started
+    /// or not up). Only `Established` means the session is up and exchanging
+    /// routes. `Active` = locally trying to reach an unresponsive peer.
+    ///
+    /// Independent of [`enabled`](Self::enabled): a session can be
+    /// `enabled == true` (admin on) while `state == "Down"` (protocol not up).
     pub state: String,
+    /// Routes received from the peer; `None` until the session is `Established`.
     pub prefixes_received: Option<u64>,
+    /// Routes advertised to the peer; `None` until the session is `Established`.
     pub prefixes_sent: Option<u64>,
+    /// **Administrative** state. `true` = the session is configured and not
+    /// administratively shut down (operator wants it up). NOT the same as the
+    /// session being up — see [`state`](Self::state). Changed via the toggle
+    /// endpoint.
     pub enabled: bool,
+    /// Peer classification relative to us: `"upstream"` (transit), `"downstream"`
+    /// (customer), `"peer"` (settlement-free peer) or `"unknown"` (not yet
+    /// classified — common for sessions that are not `Established`).
     pub direction: String,
+    /// When the background sampler last refreshed this session's cached state.
     pub last_seen: DateTime<Utc>,
 }
 

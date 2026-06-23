@@ -2332,6 +2332,15 @@ Returns the cached tunnel inventory discovered on the router (GRE/VXLAN/WireGuar
 `name`, `kind` (`"gre"` | `"vxlan"` | `"wireguard"`), `local_addr`, `remote_addr`, `enabled`, `last_seen`. Refreshed
 by a background sampler (~60s).
 
+Field meanings:
+
+- `enabled` — **administrative** state. `true` = the interface is configured and not shut down. This is independent of
+  whether the tunnel is actually passing traffic.
+- `local_addr` / `remote_addr` — tunnel endpoints. A value of `"any"` (e.g. the catch-all `gre0`/`gretap0` template
+  interfaces) means no specific endpoint is bound; these are usually unused template devices.
+- `last_seen` — when the background sampler last observed this interface in the router's inventory (not a traffic
+  timestamp).
+
 #### Get Tunnel Traffic History
 
 ```
@@ -2356,6 +2365,31 @@ Required Permission: `router::view`
 Returns cached BGP sessions: `id`, `router_id`, `name`, `peer_ip`, `peer_asn`, `local_asn`, `state`,
 `prefixes_received`, `prefixes_sent`, `enabled`, `direction` (`"upstream"` | `"downstream"` | `"peer"` |
 `"unknown"`), `last_seen`.
+
+Field meanings (note that `enabled` and `state` are **independent** — `enabled` is admin config, `state` is the live
+protocol status):
+
+- `enabled` — **administrative** state. `true` = the session is configured and not administratively shut down
+  (the operator wants it up). This is *not* the same as the session being up. Toggled via the endpoint below.
+- `state` — **operational** BGP FSM state, reported live by the routing daemon and copied verbatim. It is **not**
+  a boolean and does **not** mean "disabled". Standard progression is
+  `Idle` → `Connect` → `Active` → `OpenSent` → `OpenConfirm` → `Established`, plus `Down` (BIRD: protocol not started
+  or not up). Only `Established` means the session is up and exchanging routes.
+  - `"Established"` — session is up; `prefixes_received`/`prefixes_sent` are populated.
+  - `"Active"` — the local router is actively trying to reach the peer (TCP not yet established) — typically the
+    peer is unreachable or not answering.
+  - `"Down"` / `"Idle"` — session is enabled but not up (transport down, neighbor mis-config, AFI not enabled on the
+    remote side, ACL/next-hop reachability, etc.).
+- `prefixes_received` / `prefixes_sent` — route counts; `null` until the session reaches `Established`.
+- `direction` — peer classification relative to us: `"upstream"` (transit provider), `"downstream"` (customer),
+  `"peer"` (settlement-free peer), or `"unknown"` (not yet classified — common for sessions that are not
+  `Established`).
+- `last_seen` — when the background sampler last refreshed this session's cached state.
+
+> **Common confusion:** a session showing `"enabled": true` with `"state": "Down"` is *not* a contradiction — it is
+> administratively on but the BGP protocol has not come up. A frequent real-world pattern is an IPv6 session being
+> `Established` while the IPv4 session to the same peer is `Down`/`Active`, which points to an IPv4-transport or
+> IPv4-AFI problem rather than a disabled session.
 
 #### Toggle BGP Session
 
