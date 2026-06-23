@@ -414,6 +414,12 @@ impl LinuxSshRouter {
     ) -> Option<Tunnel> {
         let info = link.linkinfo.as_ref()?;
         let mapped = kind_from_info(&info.info_kind)?;
+        // Skip the kernel fallback GRE devices (`gre0`, `gretap0`). These are
+        // created automatically when the `ip_gre`/`ip_gretap` modules load and
+        // are not real configured tunnels.
+        if matches!(link.ifname.as_str(), "gre0" | "gretap0") {
+            return None;
+        }
         let data = info.info_data.clone().unwrap_or_default();
         let enabled = link.flags.iter().any(|f| f == "UP");
         let config = match mapped {
