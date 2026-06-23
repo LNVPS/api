@@ -611,6 +611,63 @@ impl ProxmoxClient {
         Ok(())
     }
 
+    /// Fetch the raw VM config as a key/value map.
+    ///
+    /// Unlike [`get_vm_config`], this preserves dynamically-named keys such as
+    /// `unused0`, `unused1`, ... which are not modelled on [`VmConfig`].
+    pub async fn get_vm_config_raw(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+    ) -> OpResult<HashMap<String, serde_json::Value>> {
+        let rsp: ResponseBase<HashMap<String, serde_json::Value>> = self
+            .api
+            .get(&format!("/api2/json/nodes/{}/qemu/{}/config", node, vm))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Force-remove the primary disk (`scsi0`) and any orphaned `unused[n]`
+    /// disks from a VM.
+    ///
+    /// Proxmox moves a still-referenced disk to an `unused[n]` config entry
+    /// (instead of deleting it) whenever a new disk is imported into a slot
+    /// that is already populated — e.g. a retried/repeated `import-from` during
+    /// reinstall. Left unchecked these accumulate indefinitely, so this enumerates
+    /// the current config and physically removes the primary disk plus every
+    /// `unused[n]` entry in a single request. Unlinking is a no-op when there is
+    /// nothing to remove.
+    async fn cleanup_vm_disks(&self, vm: ProxmoxVmId, include_primary: bool) -> OpResult<()> {
+        let cfg = self.get_vm_config_raw(&self.node, vm).await?;
+        let mut to_remove: Vec<String> = cfg
+            .keys()
+            .filter(|k| {
+                let rest = match k.strip_prefix("unused") {
+                    Some(r) => r,
+                    None => return false,
+                };
+                !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+            })
+            .cloned()
+            .collect();
+
+        if include_primary && cfg.contains_key("scsi0") {
+            to_remove.push("scsi0".to_string());
+        }
+
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Removing {} disk(s) from VM {}: {:?}",
+            to_remove.len(),
+            vm,
+            to_remove
+        );
+        self.unlink_disk(&self.node, vm, to_remove, true).await
+    }
+
     /// Get VM firewall config
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/options
@@ -980,6 +1037,13 @@ impl ProxmoxClient {
     async fn import_disk(&self, req: &FullVmInfo) -> OpResult<()> {
         let vm_id = req.vm.id.into();
         let limits = req.limits();
+
+        // Ensure the scsi0 slot is empty before importing. If scsi0 is still
+        // populated (e.g. a retried import during reinstall), Proxmox would move
+        // the existing disk to an `unused[n]` entry instead of overwriting it,
+        // leaking volumes on every retry. This also sweeps up any pre-existing
+        // orphaned `unused[n]` disks. Keeps import idempotent.
+        self.cleanup_vm_disks(vm_id, true).await?;
 
         // import primary disk from image (scsi0); throttle limits are set here
         // alongside discard/ssd and apply to the resulting disk without a second request
@@ -1370,8 +1434,14 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
-        self.unlink_disk(&self.node, vm.id.into(), vec!["scsi0".to_string()], true)
-            .await
+        // Remove the primary disk and any orphaned `unused[n]` disks left behind
+        // by previous reinstalls so they don't accumulate.
+        self.cleanup_vm_disks(vm.id.into(), true).await
+    }
+
+    async fn delete_unused_disks(&self, vm: &Vm) -> OpResult<()> {
+        // Only remove orphaned `unused[n]` disks — never the live scsi0.
+        self.cleanup_vm_disks(vm.id.into(), false).await
     }
 
     async fn import_template_disk(&self, req: &FullVmInfo) -> OpResult<()> {
@@ -2756,6 +2826,136 @@ mod tests {
             "expected mbps_wr=100 in scsi0, got: {}",
             scsi0
         );
+
+        Ok(())
+    }
+
+    fn test_qemu_config() -> QemuConfig {
+        QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            firewall_config: None,
+        }
+    }
+
+    /// `cleanup_vm_disks` must force-unlink every `unused[n]` disk (and the
+    /// primary disk when requested) so reinstalls don't leak orphaned volumes.
+    #[tokio::test]
+    async fn test_cleanup_vm_disks_removes_unused() -> Result<()> {
+        let server = MockServer::start().await;
+
+        let config_body = serde_json::json!({
+            "data": {
+                "scsi0": "local-lvm:vm-100-disk-0,size=20G",
+                "unused0": "local-lvm:vm-100-disk-1",
+                "unused1": "local-lvm:vm-100-disk-2",
+                "unused12": "local-lvm:vm-100-disk-3",
+                "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+                "memory": "2048"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&config_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(r".*/qemu/\d+/unlink$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ProxmoxClient::new(
+            server.uri().parse()?,
+            "pve",
+            "",
+            None,
+            test_qemu_config(),
+            None,
+        );
+
+        // include_primary = false: only the unused disks should be removed
+        client.cleanup_vm_disks(ProxmoxVmId(100), false).await?;
+
+        let requests = server.received_requests().await.unwrap();
+        let unlink = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::PUT)
+            .expect("expected a PUT to /unlink");
+        let query = unlink.url.query().unwrap_or("");
+        assert!(
+            query.contains("force=1"),
+            "expected force=1, got: {}",
+            query
+        );
+        let idlist = unlink
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "idlist")
+            .map(|(_, v)| v.into_owned())
+            .expect("idlist query param");
+        let ids: std::collections::HashSet<&str> = idlist.split(',').collect();
+        assert_eq!(
+            ids,
+            ["unused0", "unused1", "unused12"].into_iter().collect()
+        );
+        assert!(
+            !ids.contains("scsi0"),
+            "scsi0 must not be removed when include_primary=false"
+        );
+
+        Ok(())
+    }
+
+    /// When there are no unused disks and the primary is excluded, no unlink
+    /// request should be made.
+    #[tokio::test]
+    async fn test_cleanup_vm_disks_noop_when_nothing_to_remove() -> Result<()> {
+        let server = MockServer::start().await;
+
+        let config_body = serde_json::json!({
+            "data": {
+                "scsi0": "local-lvm:vm-100-disk-0,size=20G",
+                "memory": "2048"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&config_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // No PUT mock mounted: any unlink call would 404 and fail the test.
+        let client = ProxmoxClient::new(
+            server.uri().parse()?,
+            "pve",
+            "",
+            None,
+            test_qemu_config(),
+            None,
+        );
+
+        client.cleanup_vm_disks(ProxmoxVmId(100), false).await?;
+
+        let made_unlink = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.method == wiremock::http::Method::PUT);
+        assert!(!made_unlink, "no unlink request expected");
 
         Ok(())
     }

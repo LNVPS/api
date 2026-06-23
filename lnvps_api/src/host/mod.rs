@@ -54,6 +54,16 @@ pub trait VmHostClient: Send + Sync {
     /// Unlink/delete the primary disk of a VM
     async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()>;
 
+    /// Remove any orphaned/unused disks left attached to a VM.
+    ///
+    /// This must never touch the live primary disk — it only sweeps up disks
+    /// that are detached from the running config (e.g. Proxmox `unused[n]`
+    /// entries accumulated by repeated reinstalls). Defaults to a no-op for
+    /// hosts that don't support the concept.
+    async fn delete_unused_disks(&self, _vm: &Vm) -> OpResult<()> {
+        Ok(())
+    }
+
     /// Import a fresh disk from the OS template
     async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()>;
 

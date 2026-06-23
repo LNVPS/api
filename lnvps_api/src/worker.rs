@@ -1111,6 +1111,16 @@ impl Worker {
         // Patch firewall configuration for all VMs on this host
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
+            // Sweep up orphaned/unused disks for every live VM. Repeated
+            // reinstalls can leave Proxmox `unused[n]` disks attached which
+            // accumulate over time; this only removes detached disks and never
+            // touches the live primary disk.
+            if !vm.deleted {
+                if let Err(e) = client.delete_unused_disks(vm).await {
+                    warn!("Failed to delete unused disks for VM {}: {}", vm.id, e);
+                }
+            }
+
             if !vm.deleted
                 && self
                     .vm_expires(vm)
