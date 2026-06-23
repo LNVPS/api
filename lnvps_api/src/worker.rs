@@ -518,65 +518,34 @@ impl Worker {
 
             // Routes: refresh the cached route table (locally-originated prefixes
             // plus a detected default route). Passing an empty candidate set returns
-            // all locally-originated prefixes, which is inherently small.
-            let sync_started = Utc::now();
-            let mut any_route_synced = false;
+            // all locally-originated prefixes, which is inherently small. The whole
+            // snapshot is replaced atomically, so multiple routes to the same prefix
+            // (ECMP / differing next-hops) are preserved.
+            //
+            // Only refresh the cache when the originated-routes query succeeds, so a
+            // transient failure does not wipe the cached snapshot.
             match bgp.originated_routes(&[]).await {
-                Ok(routes) => {
-                    for r in &routes {
-                        if let Err(e) = self
-                            .db
-                            .upsert_router_bgp_route(&r.to_db(router_id, false))
-                            .await
-                        {
-                            warn!(
-                                "Failed to cache route {} on router {}: {}",
-                                r.prefix, router_id, e
-                            );
-                        } else {
-                            any_route_synced = true;
-                        }
+                Ok(originated) => {
+                    let mut routes: Vec<_> = originated
+                        .iter()
+                        .map(|r| r.to_db(router_id, false))
+                        .collect();
+                    match bgp.default_route().await {
+                        Ok(Some(route)) => routes.push(route.to_db(router_id, true)),
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            "Failed to detect default route on router {}: {}",
+                            router_id, e
+                        ),
+                    }
+                    if let Err(e) = self.db.replace_router_bgp_routes(router_id, &routes).await {
+                        warn!("Failed to cache routes on router {}: {}", router_id, e);
                     }
                 }
                 Err(e) => warn!(
                     "Failed to list originated routes on router {}: {}",
                     router_id, e
                 ),
-            }
-            match bgp.default_route().await {
-                Ok(Some(route)) => {
-                    if let Err(e) = self
-                        .db
-                        .upsert_router_bgp_route(&route.to_db(router_id, true))
-                        .await
-                    {
-                        warn!(
-                            "Failed to cache default route on router {}: {}",
-                            router_id, e
-                        );
-                    } else {
-                        any_route_synced = true;
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => warn!(
-                    "Failed to detect default route on router {}: {}",
-                    router_id, e
-                ),
-            }
-            // Prune routes the router no longer originates. Only prune when at least
-            // one route was refreshed, so a transient query failure does not wipe the
-            // cache.
-            if any_route_synced
-                && let Err(e) = self
-                    .db
-                    .delete_stale_router_bgp_routes(router_id, sync_started)
-                    .await
-            {
-                warn!(
-                    "Failed to prune stale routes on router {}: {}",
-                    router_id, e
-                );
             }
         }
 

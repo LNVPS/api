@@ -416,15 +416,15 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List cached BGP routes (originated + default) for a router
     async fn list_router_bgp_routes(&self, router_id: u64) -> DbResult<Vec<RouterBgpRoute>>;
 
-    /// Insert or update (by router_id+prefix) a cached BGP route, returning its id
-    async fn upsert_router_bgp_route(&self, route: &RouterBgpRoute) -> DbResult<u64>;
-
-    /// Delete cached BGP routes for a router last seen before the given cutoff
-    /// (used to prune routes the router no longer originates)
-    async fn delete_stale_router_bgp_routes(
+    /// Replace the cached route snapshot for a router with `routes`.
+    ///
+    /// A router's table can hold multiple routes to the same prefix (differing
+    /// next-hops / metrics / ECMP), so routes are not keyed by prefix — the whole
+    /// snapshot is replaced atomically on each refresh.
+    async fn replace_router_bgp_routes(
         &self,
         router_id: u64,
-        before: DateTime<Utc>,
+        routes: &[RouterBgpRoute],
     ) -> DbResult<()>;
 
     /// Get VM IP assignment

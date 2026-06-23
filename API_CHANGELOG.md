@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Backed by new `BgpRouter::set_default_route`/`clear_default_route` capabilities (Linux/iproute2 `ip route replace|del default`, RouterOS `/ip|/ipv6/route`). Only available on routers that support BGP/routing.
 
 - **2026-06-23** - Router BGP route table visibility + IP range router attribution (admin)
-  - `GET /api/admin/v1/routers/{id}/bgp/routes` — list the router's cached BGP route table: the prefixes it originates/announces plus a detected default route. Each `AdminRouterBgpRoute`: `router_id`, `prefix` (CIDR), `next_hop`, `is_default`, `last_seen`. Refreshed by the background sampler (~60s) alongside tunnels/BGP sessions; stale routes are pruned. Requires `router::view`.
+  - `GET /api/admin/v1/routers/{id}/bgp/routes` — list the router's cached BGP route table: the prefixes it originates/announces plus a detected default route. Each `AdminRouterBgpRoute`: `router_id`, `prefix` (CIDR), `next_hop`, `is_default`, `last_seen`. Refreshed by the background sampler (~60s) alongside tunnels/BGP sessions, which replaces the whole per-router snapshot each cycle. Multiple routes to the same prefix (ECMP / differing next-hops) are preserved. Requires `router::view`.
   - IP range responses (`GET /api/admin/v1/ip_ranges`, `GET /api/admin/v1/ip_ranges/{id}`, and create/update) now include a `routers` array (`{ id, name }`) listing the routers that route the range, resolved via the range's access policy. Empty when the range has no access policy or the policy has no router.
 
 - **2026-06-21** - Route server management: BGP session and tunnel visibility/control (admin)

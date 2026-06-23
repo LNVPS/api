@@ -2433,9 +2433,10 @@ route. Each `AdminRouterBgpRoute`:
 - `is_default` — `true` when this entry is the router's default route (`0.0.0.0/0` / `::/0`).
 - `last_seen` — when the background sampler last refreshed this route's cached state.
 
-Routes are refreshed (~60s) alongside tunnels and BGP sessions; prefixes the router no longer originates are pruned.
-The originated-route query is scoped to locally-originated prefixes, so it stays bounded even on routers carrying a
-full DFZ table.
+Routes are refreshed (~60s) alongside tunnels and BGP sessions by replacing the whole per-router snapshot each cycle,
+so prefixes the router no longer originates disappear. Multiple routes to the same prefix (ECMP / differing
+next-hops) are preserved — prefix is not a unique key. The originated-route query is scoped to locally-originated
+prefixes, so it stays bounded even on routers carrying a full DFZ table.
 
 #### Set Default Route
 

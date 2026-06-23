@@ -1247,39 +1247,26 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn upsert_router_bgp_route(&self, route: &RouterBgpRoute) -> DbResult<u64> {
-        let mut r = self.router_bgp_routes.lock().await;
-        if let Some(existing) = r
-            .values_mut()
-            .find(|x| x.router_id == route.router_id && x.prefix == route.prefix)
-        {
-            let id = existing.id;
-            *existing = RouterBgpRoute {
-                id,
-                last_seen: Utc::now(),
-                ..route.clone()
-            };
-            return Ok(id);
-        }
-        let id = r.keys().max().copied().unwrap_or(0) + 1;
-        r.insert(
-            id,
-            RouterBgpRoute {
-                id,
-                last_seen: Utc::now(),
-                ..route.clone()
-            },
-        );
-        Ok(id)
-    }
-
-    async fn delete_stale_router_bgp_routes(
+    async fn replace_router_bgp_routes(
         &self,
         router_id: u64,
-        before: chrono::DateTime<Utc>,
+        routes: &[RouterBgpRoute],
     ) -> DbResult<()> {
         let mut r = self.router_bgp_routes.lock().await;
-        r.retain(|_, x| !(x.router_id == router_id && x.last_seen < before));
+        r.retain(|_, x| x.router_id != router_id);
+        let mut next_id = r.keys().max().copied().unwrap_or(0) + 1;
+        for route in routes {
+            r.insert(
+                next_id,
+                RouterBgpRoute {
+                    id: next_id,
+                    router_id,
+                    last_seen: Utc::now(),
+                    ..route.clone()
+                },
+            );
+            next_id += 1;
+        }
         Ok(())
     }
 
@@ -3706,51 +3693,60 @@ mod tests {
         );
     }
 
-    /// Route cache: upsert by (router_id, prefix), refresh next_hop/is_default,
-    /// and prune stale entries older than a cutoff.
+    /// Route cache: the whole per-router snapshot is replaced on each refresh,
+    /// and multiple routes to the same prefix (ECMP / differing next-hops) are
+    /// preserved.
     #[tokio::test]
     async fn test_router_bgp_route_cache() {
         use lnvps_db::RouterBgpRoute;
         let db = MockDb::empty();
-        let r = RouterBgpRoute {
-            id: 0,
-            router_id: 1,
-            prefix: "192.0.2.0/24".to_string(),
-            next_hop: None,
-            is_default: false,
-            last_seen: Utc::now(),
+        let mk = |router_id: u64, prefix: &str, next_hop: Option<&str>, is_default: bool| {
+            RouterBgpRoute {
+                id: 0,
+                router_id,
+                prefix: prefix.to_string(),
+                next_hop: next_hop.map(|s| s.to_string()),
+                is_default,
+                last_seen: Utc::now(),
+            }
         };
-        let id = db.upsert_router_bgp_route(&r).await.unwrap();
-        assert_eq!(db.list_router_bgp_routes(1).await.unwrap().len(), 1);
 
-        // Upsert with same prefix updates in place (same id).
-        let mut r2 = r.clone();
-        r2.next_hop = Some("192.0.2.1".to_string());
-        let id2 = db.upsert_router_bgp_route(&r2).await.unwrap();
-        assert_eq!(id, id2);
+        // Two routes to the same prefix (ECMP) plus a default — all retained.
+        db.replace_router_bgp_routes(
+            1,
+            &[
+                mk(1, "192.0.2.0/24", Some("10.0.0.1"), false),
+                mk(1, "192.0.2.0/24", Some("10.0.0.2"), false),
+                mk(1, "0.0.0.0/0", Some("10.0.0.254"), true),
+            ],
+        )
+        .await
+        .unwrap();
         let routes = db.list_router_bgp_routes(1).await.unwrap();
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].next_hop.as_deref(), Some("192.0.2.1"));
+        assert_eq!(routes.len(), 3);
+        assert_eq!(
+            routes.iter().filter(|r| r.prefix == "192.0.2.0/24").count(),
+            2
+        );
+        assert!(routes.iter().any(|r| r.is_default));
 
-        // A default route is a separate entry.
-        let def = RouterBgpRoute {
-            id: 0,
-            router_id: 1,
-            prefix: "0.0.0.0/0".to_string(),
-            next_hop: Some("192.0.2.254".to_string()),
-            is_default: true,
-            last_seen: Utc::now(),
-        };
-        db.upsert_router_bgp_route(&def).await.unwrap();
-        assert_eq!(db.list_router_bgp_routes(1).await.unwrap().len(), 2);
-
-        // Routes for a different router are isolated.
-        assert!(db.list_router_bgp_routes(2).await.unwrap().is_empty());
-
-        // Prune entries last seen before a future cutoff removes everything.
-        db.delete_stale_router_bgp_routes(1, Utc::now() + chrono::Duration::seconds(10))
+        // Routes for a different router are isolated by replace.
+        db.replace_router_bgp_routes(2, &[mk(2, "203.0.113.0/24", None, false)])
             .await
             .unwrap();
+        assert_eq!(db.list_router_bgp_routes(1).await.unwrap().len(), 3);
+        assert_eq!(db.list_router_bgp_routes(2).await.unwrap().len(), 1);
+
+        // Replacing with a smaller set drops the old snapshot.
+        db.replace_router_bgp_routes(1, &[mk(1, "198.51.100.0/24", None, false)])
+            .await
+            .unwrap();
+        let routes = db.list_router_bgp_routes(1).await.unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].prefix, "198.51.100.0/24");
+
+        // Replacing with an empty set clears the cache.
+        db.replace_router_bgp_routes(1, &[]).await.unwrap();
         assert!(db.list_router_bgp_routes(1).await.unwrap().is_empty());
     }
 }
