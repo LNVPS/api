@@ -141,7 +141,9 @@ async fn admin_list_subscriptions(
     let limit = params.page.limit.unwrap_or(50).min(100);
     let offset = params.page.offset.unwrap_or(0);
 
-    let is_active = params.status.map(|s| matches!(s, SubscriptionStatus::Active));
+    let is_active = params
+        .status
+        .map(|s| matches!(s, SubscriptionStatus::Active));
 
     let (subscriptions, total) = this
         .db

@@ -694,7 +694,9 @@ mod tests {
             .unwrap();
         if resp.status() == StatusCode::OK {
             let quote = serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
-            let new_renewal_cost = quote["data"]["new_renewal_cost"]["amount"].as_u64().unwrap();
+            let new_renewal_cost = quote["data"]["new_renewal_cost"]["amount"]
+                .as_u64()
+                .unwrap();
             eprintln!(
                 "Upgrade quote: cost_diff={}, new_renewal={new_renewal_cost}",
                 quote["data"]["cost_difference"]["amount"],
@@ -729,10 +731,7 @@ mod tests {
                 let cpu_upgraded = poll_until(30, 500, || {
                     let user = user_client();
                     async move {
-                        let r = user
-                            .get_auth(&format!("/api/v1/vm/{vm_id}"))
-                            .await
-                            .unwrap();
+                        let r = user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap();
                         let body: serde_json::Value =
                             serde_json::from_str(&r.text().await.unwrap()).unwrap();
                         body["data"]["template"]["cpu"].as_u64().unwrap_or(0) == 2
@@ -767,8 +766,7 @@ mod tests {
                     sub_after_upgrade["is_setup"].as_bool().unwrap_or(false),
                     "Subscription should still be set-up after upgrade"
                 );
-                let interval_type =
-                    sub_after_upgrade["interval_type"].as_str().unwrap_or("");
+                let interval_type = sub_after_upgrade["interval_type"].as_str().unwrap_or("");
                 assert_eq!(
                     interval_type, "month",
                     "Subscription interval_type should be 'month' after upgrade, got '{interval_type}'"
@@ -823,8 +821,7 @@ mod tests {
                             .unwrap(),
                     )
                     .await;
-                    let post_upgrade_amount =
-                        post_upg_paid["data"]["amount"].as_u64().unwrap();
+                    let post_upgrade_amount = post_upg_paid["data"]["amount"].as_u64().unwrap();
 
                     // The upgraded VM (CPU 1→2) should cost more than before
                     assert!(
@@ -841,17 +838,12 @@ mod tests {
                     );
 
                     // Expiry should have advanced
-                    let vm_after_post_upg_renew = json_ok(
-                        user.get_auth(&format!("/api/v1/vm/{vm_id}"))
-                            .await
-                            .unwrap(),
-                    )
-                    .await;
-                    let expires_after_renew =
-                        vm_after_post_upg_renew["data"]["expires"]
-                            .as_str()
-                            .unwrap()
-                            .to_string();
+                    let vm_after_post_upg_renew =
+                        json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
+                    let expires_after_renew = vm_after_post_upg_renew["data"]["expires"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
                     assert_ne!(
                         expires_after_renew, expires_before_renew,
                         "VM expiry should have advanced after post-upgrade renewal"

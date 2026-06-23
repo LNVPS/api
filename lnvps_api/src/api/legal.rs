@@ -245,12 +245,8 @@ async fn v1_generate_lir_agreement_from_subscription(
                 .to_string();
                 (resource_type, cidr.unwrap_or_else(|| "—".to_string()))
             }
-            lnvps_db::SubscriptionType::AsnSponsoring => {
-                ("AS Number".to_string(), "—".to_string())
-            }
-            lnvps_db::SubscriptionType::DnsHosting => {
-                ("DNS Hosting".to_string(), "—".to_string())
-            }
+            lnvps_db::SubscriptionType::AsnSponsoring => ("AS Number".to_string(), "—".to_string()),
+            lnvps_db::SubscriptionType::DnsHosting => ("DNS Hosting".to_string(), "—".to_string()),
             lnvps_db::SubscriptionType::Vps => ("VPS".to_string(), "—".to_string()),
         };
 

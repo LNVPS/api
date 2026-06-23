@@ -621,8 +621,9 @@ impl ApiSubscription {
         let raw_line_items = db.list_subscription_line_items(subscription.id).await?;
         let mut line_items = Vec::with_capacity(raw_line_items.len());
         for item in raw_line_items {
-            line_items
-                .push(ApiSubscriptionLineItem::from_line_item(db, item, &subscription.currency).await);
+            line_items.push(
+                ApiSubscriptionLineItem::from_line_item(db, item, &subscription.currency).await,
+            );
         }
 
         Ok(Self {

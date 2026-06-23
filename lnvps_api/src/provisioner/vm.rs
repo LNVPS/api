@@ -307,7 +307,8 @@ impl VmProvisioner {
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         // Record the base monthly amount now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
-        let price = PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        let price =
+            PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
         li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
