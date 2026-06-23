@@ -600,15 +600,26 @@ impl Worker {
         // Refresh cached session state so the admin API reflects the change.
         // The upsert only sets `enabled` on first import; for existing rows the
         // database flag is authoritative, so persist the requested value here.
+        //
+        // The cache is keyed by session *name*, but `session_id` is the backend
+        // id (the BIRD protocol name or RouterOS `.id`) — these differ on
+        // Mikrotik. Resolve the cache key from the listing so the persist targets
+        // the right row; fall back to `session_id` when the session can't be
+        // found (on BIRD the id equals the name).
+        let mut cache_name: Option<String> = None;
         if let Ok(sessions) = bgp.list_sessions().await {
             for s in &sessions {
+                if s.id == session_id {
+                    cache_name = Some(s.name.clone());
+                }
                 if let Err(e) = self.db.upsert_router_bgp_session(&s.to_db(router_id)).await {
                     warn!("Failed to refresh BGP session cache: {}", e);
                 }
             }
         }
+        let cache_name = cache_name.as_deref().unwrap_or(session_id);
         self.db
-            .set_router_bgp_session_enabled(router_id, session_id, enabled)
+            .set_router_bgp_session_enabled(router_id, cache_name, enabled)
             .await
             .map_err(|e| anyhow!("failed to persist BGP session enabled flag: {}", e))?;
         Ok(())

@@ -33,6 +33,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `SubscriptionLineItem` (public `GET /api/v1/subscriptions/{id}`) and `AdminSubscriptionLineItemInfo` (admin subscription + line-item endpoints) gain a `resource` field: a tagged union resolved server-side from the line item's subscription type. Shapes: `{ "type": "vps", "vm_id": number }`, `{ "type": "ip_range", "ip_range_subscription_id": number }`, or `null` when there is no linked resource.
   - `AdminSubscriptionLineItemInfo` now also includes the `subscription_type` discriminant.
 
+### Fixed
+
+- **2026-06-23** - Toggling a BGP session now persists on routers where the backend session id differs from the session name (e.g. Mikrotik, where the id is `.id` and the name is the protocol name). Previously `POST /api/admin/v1/routers/{id}/bgp/sessions/toggle` updated nothing in the cache for such routers because the persist was keyed by the backend id instead of the cached session name.
+
 ### Changed
 
 - **2026-06-18** - `subscription_type` is now immutable on subscription line items
