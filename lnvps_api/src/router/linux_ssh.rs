@@ -235,8 +235,11 @@ impl BgpRouter for LinuxSshRouter {
 /// Map a BIRD/RFC-9234 role string to a peer relationship (best-effort).
 fn role_to_direction(role: &str) -> BgpPeerDirection {
     match role.to_ascii_lowercase().as_str() {
-        "provider" | "rs-server" => BgpPeerDirection::Upstream,
-        "customer" | "rs-client" => BgpPeerDirection::Downstream,
+        // RFC 9234 role is the *local* role; map to the neighbor relationship.
+        // role customer  => neighbor is our provider  => upstream
+        // role provider  => neighbor is our customer  => downstream
+        "customer" | "rs-client" => BgpPeerDirection::Upstream,
+        "provider" | "rs-server" => BgpPeerDirection::Downstream,
         "peer" => BgpPeerDirection::Peer,
         _ => BgpPeerDirection::Unknown,
     }
@@ -858,7 +861,7 @@ mod tests {
             "    Neighbor address: 192.0.2.1",
             "    Neighbor AS:      64512",
             "    Local AS:         64500",
-            "    Role:             provider",
+            "    Role:             customer",
             "  Channel ipv4",
             "    Routes:         5 imported, 2 exported, 3 preferred",
             "bgp2       BGP        ---        down   2024-06-01    disabled",
@@ -908,10 +911,10 @@ mod tests {
 
     #[test]
     fn test_role_to_direction() {
-        assert_eq!(role_to_direction("provider"), BgpPeerDirection::Upstream);
-        assert_eq!(role_to_direction("customer"), BgpPeerDirection::Downstream);
+        assert_eq!(role_to_direction("customer"), BgpPeerDirection::Upstream);
+        assert_eq!(role_to_direction("provider"), BgpPeerDirection::Downstream);
         assert_eq!(role_to_direction("peer"), BgpPeerDirection::Peer);
-        assert_eq!(role_to_direction("rs-server"), BgpPeerDirection::Upstream);
+        assert_eq!(role_to_direction("rs-client"), BgpPeerDirection::Upstream);
         assert_eq!(role_to_direction("weird"), BgpPeerDirection::Unknown);
     }
 
