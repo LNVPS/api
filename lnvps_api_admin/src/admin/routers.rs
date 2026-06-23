@@ -3,7 +3,7 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminRouterBgpRoute, AdminRouterBgpSession, AdminRouterDetail, AdminRouterTunnel,
     AdminRouterTunnelTraffic, CreateRouterRequest, JobResponse, SetDefaultRouteRequest,
-    ToggleBgpSessionRequest, UpdateRouterRequest,
+    ToggleBgpSessionRequest, ToggleTunnelRequest, UpdateRouterRequest,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post};
@@ -35,6 +35,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/routers/{id}/tunnels/{name}/traffic",
             get(admin_get_tunnel_traffic),
+        )
+        .route(
+            "/api/admin/v1/routers/{id}/tunnels/{name}/toggle",
+            post(admin_toggle_tunnel),
         )
         .route(
             "/api/admin/v1/routers/{id}/bgp/sessions",
@@ -69,6 +73,30 @@ async fn admin_list_router_tunnels(
     auth.require_permission(AdminResource::Router, AdminAction::View)?;
     let tunnels = this.db.list_router_tunnels(router_id).await?;
     ApiData::ok(tunnels.into_iter().map(AdminRouterTunnel::from).collect())
+}
+
+async fn admin_toggle_tunnel(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((router_id, name)): Path<(u64, String)>,
+    Json(request): Json<ToggleTunnelRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::Router, AdminAction::Update)?;
+    let job = WorkJob::ToggleTunnel {
+        router_id,
+        name,
+        enabled: request.enabled,
+    };
+    match this.work_commander.send(job).await {
+        Ok(stream_id) => {
+            info!("Tunnel toggle job queued with stream ID: {}", stream_id);
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue tunnel toggle job: {}", e);
+            ApiData::err("Failed to queue tunnel toggle job")
+        }
+    }
 }
 
 async fn admin_get_tunnel_traffic(

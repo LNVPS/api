@@ -566,6 +566,14 @@ impl TunnelRouter for LinuxSshRouter {
         self.add_tunnel(tunnel).await
     }
 
+    async fn set_tunnel_enabled(&self, id: &str, enabled: bool) -> OpResult<()> {
+        // On Linux the tunnel backend id is the interface name.
+        let state = if enabled { "up" } else { "down" };
+        self.exec_checked(&format!("ip link set {} {}", shq(id), state))
+            .await?;
+        Ok(())
+    }
+
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
         let out = self.exec_checked("ip -s -d -j link show").await?;
         let links: Vec<IpLink> = match serde_json::from_str(&out) {

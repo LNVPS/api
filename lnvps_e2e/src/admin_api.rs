@@ -793,6 +793,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_toggle_tunnel() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/routers").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        if let Some(routers) = body["data"].as_array()
+            && let Some(r) = routers.first()
+        {
+            let r_id = r["id"].as_u64().unwrap();
+            let resp = client
+                .post_auth(
+                    &format!("/api/admin/v1/routers/{r_id}/tunnels/gre1/toggle"),
+                    &serde_json::json!({ "enabled": false }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
     async fn test_admin_list_vm_ip_assignments() {
         let client = setup().await;
         let resp = client

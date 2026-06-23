@@ -2041,6 +2041,12 @@ pub struct ToggleBgpSessionRequest {
     pub enabled: bool,
 }
 
+/// Enable or disable a tunnel
+#[derive(Deserialize)]
+pub struct ToggleTunnelRequest {
+    pub enabled: bool,
+}
+
 /// Set the static default route on a router
 #[derive(Deserialize)]
 pub struct SetDefaultRouteRequest {

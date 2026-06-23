@@ -238,6 +238,15 @@ impl TunnelRouter for MockRouter {
         Ok(stored)
     }
 
+    async fn set_tunnel_enabled(&self, id: &str, enabled: bool) -> OpResult<()> {
+        // The mock keys tunnels by name, which is also their backend id.
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(t) = tunnels.get_mut(id) {
+            t.enabled = enabled;
+        }
+        Ok(())
+    }
+
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
         let tunnels = self.tunnels.lock().await;
         Ok(tunnels

@@ -594,6 +594,40 @@ impl Worker {
         Ok(())
     }
 
+    /// Enable/disable a tunnel on a router and refresh its cached state.
+    pub async fn toggle_tunnel(&self, router_id: u64, name: &str, enabled: bool) -> Result<()> {
+        let router = crate::router::get_router(&self.db, router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
+        let tr = router.tunnel().context("router does not support tunnels")?;
+        // The admin API addresses tunnels by name (the cache key), but the backend
+        // toggles by its own id (interface name on Linux, `<kind>:<.id>` on
+        // Mikrotik). Resolve the id from the live listing.
+        let tunnels = tr
+            .list_tunnels()
+            .await
+            .map_err(|e| anyhow!("failed to list tunnels: {}", e))?;
+        let target = tunnels
+            .iter()
+            .find(|t| t.name == name)
+            .context("tunnel not found")?;
+        let id = target.id.as_deref().unwrap_or(name);
+        tr.set_tunnel_enabled(id, enabled)
+            .await
+            .map_err(|e| anyhow!("failed to toggle tunnel: {}", e))?;
+        // Refresh the cached inventory so the admin API reflects the new state.
+        // The tunnel `enabled` flag is discovery-authoritative (the interface
+        // up/down state), so re-listing after the change is sufficient.
+        if let Ok(tunnels) = tr.list_tunnels().await {
+            for t in &tunnels {
+                if let Err(e) = self.db.upsert_router_tunnel(&t.to_db(router_id)).await {
+                    warn!("Failed to refresh tunnel cache: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Install or replace the static default route on a router, then refresh the
     /// cached route table so the admin API reflects the change.
     pub async fn set_router_default_route(&self, router_id: u64, next_hop: &str) -> Result<()> {
@@ -1939,6 +1973,13 @@ impl Worker {
             }
             WorkJob::ClearRouterDefaultRoute { router_id } => {
                 self.clear_router_default_route(*router_id).await?;
+            }
+            WorkJob::ToggleTunnel {
+                router_id,
+                name,
+                enabled,
+            } => {
+                self.toggle_tunnel(*router_id, name, *enabled).await?;
             }
             WorkJob::DeleteVm {
                 vm_id,
@@ -3304,6 +3345,54 @@ mod tests {
             .set_default_route("192.0.2.1")
             .await
             .unwrap();
+        mr.clear().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_toggle_tunnel() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::{GreConfig, Router as _, Tunnel, TunnelConfig};
+        use lnvps_db::{Router, RouterKind};
+
+        let db = Arc::new(MockDb::empty());
+        {
+            let mut routers = db.router.lock().await;
+            routers.insert(
+                1,
+                Router {
+                    id: 1,
+                    name: "r1".to_string(),
+                    enabled: true,
+                    kind: RouterKind::MockRouter,
+                    url: "mock://".to_string(),
+                    token: "".into(),
+                },
+            );
+        }
+        let mr = MockRouter::new();
+        mr.clear().await;
+        mr.tunnel()
+            .unwrap()
+            .add_tunnel(&Tunnel {
+                id: None,
+                name: "gre1".to_string(),
+                local_addr: None,
+                remote_addr: None,
+                enabled: true,
+                config: TunnelConfig::Gre(GreConfig { key: None }),
+            })
+            .await
+            .unwrap();
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.toggle_tunnel(1, "gre1", false).await?;
+
+        // The cached tunnel should reflect the disabled state after refresh.
+        let tunnels = db.list_router_tunnels(1).await?;
+        assert_eq!(tunnels.len(), 1);
+        assert!(!tunnels[0].enabled);
+
         mr.clear().await;
         Ok(())
     }

@@ -498,6 +498,20 @@ impl TunnelRouter for MikrotikRouter {
         Ok(tunnel.clone())
     }
 
+    async fn set_tunnel_enabled(&self, id: &str, enabled: bool) -> OpResult<()> {
+        let (endpoint, ros_id) = split_tunnel_id(id)?;
+        let body = json!({ "disabled": (!enabled).to_string() });
+        let _: serde_json::Value = self
+            .api
+            .req(
+                Method::PATCH,
+                &format!("/rest/interface/{}/{}", endpoint, ros_id),
+                Some(body),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
         let ifaces: Vec<MtInterface> = self
             .api

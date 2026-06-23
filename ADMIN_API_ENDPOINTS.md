@@ -2358,6 +2358,28 @@ Query parameters (optional): `from`, `to` (RFC3339 timestamps; default: last 24 
 Returns per-tunnel traffic samples: `tunnel_name`, `rx_bytes`, `tx_bytes`, `sampled_at`. Tunnel interface counters
 are the canonical per-session traffic source — BGP sessions expose no byte counters.
 
+#### Toggle Tunnel
+
+```
+POST /api/admin/v1/routers/{router_id}/tunnels/{tunnel_name}/toggle
+```
+
+Required Permission: `router::update`
+
+Enable or disable a tunnel interface.
+
+Body:
+
+```json
+{
+  "enabled": boolean
+}
+```
+
+Returns a `JobResponse` (`{ "job_id": "string" }`). The change is applied asynchronously by the worker (Linux
+`ip link set <iface> up|down`, RouterOS `disabled` flag) and the tunnel cache is refreshed afterwards. The cached
+`enabled` flag reflects the interface's live up/down state.
+
 #### List BGP Sessions
 
 ```

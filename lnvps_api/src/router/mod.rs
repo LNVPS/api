@@ -142,6 +142,9 @@ pub trait TunnelRouter: Send + Sync {
     async fn remove_tunnel(&self, id: &str) -> OpResult<()>;
     /// Update an existing tunnel
     async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel>;
+    /// Enable or disable a tunnel by its backend id (interface name on Linux,
+    /// `"<kind>:<.id>"` on Mikrotik).
+    async fn set_tunnel_enabled(&self, id: &str, enabled: bool) -> OpResult<()>;
     /// Report per-tunnel rx/tx byte counters
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>>;
 }

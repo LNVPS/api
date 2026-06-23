@@ -141,6 +141,13 @@ pub enum WorkJob {
     SetRouterDefaultRoute { router_id: u64, next_hop: String },
     /// Remove the static default route(s) from a router (admin action).
     ClearRouterDefaultRoute { router_id: u64 },
+    /// Enable or disable a tunnel on a router (admin action).
+    ToggleTunnel {
+        router_id: u64,
+        /// Tunnel interface name (the cache key)
+        name: String,
+        enabled: bool,
+    },
 }
 
 impl WorkJob {
@@ -186,6 +193,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ToggleBgpSession { .. } => write!(f, "ToggleBgpSession"),
             WorkJob::SetRouterDefaultRoute { .. } => write!(f, "SetRouterDefaultRoute"),
             WorkJob::ClearRouterDefaultRoute { .. } => write!(f, "ClearRouterDefaultRoute"),
+            WorkJob::ToggleTunnel { .. } => write!(f, "ToggleTunnel"),
         }
     }
 }
@@ -207,6 +215,15 @@ mod tests {
         assert_eq!(
             WorkJob::ClearRouterDefaultRoute { router_id: 1 }.to_string(),
             "ClearRouterDefaultRoute"
+        );
+        assert_eq!(
+            WorkJob::ToggleTunnel {
+                router_id: 1,
+                name: "gre1".to_string(),
+                enabled: false,
+            }
+            .to_string(),
+            "ToggleTunnel"
         );
     }
 }

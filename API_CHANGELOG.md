@@ -12,6 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-06-23** - Enable/disable a tunnel on a router (admin)
+  - `POST /api/admin/v1/routers/{id}/tunnels/{name}/toggle` — enable or disable a tunnel interface. Body: `{ "enabled": boolean }`. Returns a `JobResponse` (`{ "job_id": string }`); applied asynchronously by the worker (Linux `ip link set <iface> up|down`, RouterOS `disabled` flag), which then refreshes the tunnel cache. Requires `router::update`.
+
 - **2026-06-23** - Set/clear the static default route on a router (admin)
   - `POST /api/admin/v1/routers/{id}/routes/default` — install or replace the router's static default route. Body: `{ "next_hop": string }` (an IP address; the address family `0.0.0.0/0` vs `::/0` is inferred from it). Returns a `JobResponse` (`{ "job_id": string }`); applied asynchronously by the worker, which refreshes the route cache afterwards. Requires `router::update`.
   - `DELETE /api/admin/v1/routers/{id}/routes/default` — remove the router's static default route(s) (idempotent). Returns a `JobResponse`. Requires `router::update`.
