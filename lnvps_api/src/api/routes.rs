@@ -857,14 +857,12 @@ async fn v1_reinstall_vm(
         })
         .step("import_template_disk", |ctx| {
             Box::pin(async move {
+                // import_template_disk already imports AND resizes the primary
+                // disk to the template size; a separate resize step here would
+                // ask Proxmox to resize to the same size, which it rejects as a
+                // disallowed shrink and surfaces as a 500 (see issue #142).
                 info!("Importing template disk for VM {}", ctx.vm_id);
                 ctx.client.import_template_disk(&ctx.info).await
-            })
-        })
-        .step("resize_disk", |ctx| {
-            Box::pin(async move {
-                info!("Resizing disk for VM {}", ctx.vm_id);
-                ctx.client.resize_disk(&ctx.info).await
             })
         })
         .step("start_vm", |ctx| {
