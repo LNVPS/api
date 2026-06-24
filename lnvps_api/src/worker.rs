@@ -3025,6 +3025,36 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: an admin-extended VM whose subscription is older than 1 hour must NOT be
+    /// deleted. `admin_extend_vm` marks the subscription `is_setup = true`; the worker's cleanup
+    /// keys off `is_setup`, so without that flag the VM would be wrongly deleted as unpaid.
+    #[tokio::test]
+    async fn test_check_vms_skips_admin_extended_vm() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        // Simulate an admin extension: subscription is old but marked set up/active with a
+        // future expiry (what admin_extend_vm now does).
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&subscription_id).expect("subscription exists");
+            sub.is_setup = true;
+            sub.is_active = true;
+            sub.expires = Some(Utc::now().add(TimeDelta::days(30)));
+        }
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(true);
+        assert!(
+            !deleted,
+            "Admin-extended (is_setup) VM should not be deleted even when older than 1 hour"
+        );
+        Ok(())
+    }
+
     /// An unpaid VM whose subscription was created less than 1 hour ago must NOT be deleted.
     #[tokio::test]
     async fn test_check_vms_skips_unpaid_vm_within_one_hour() -> Result<()> {

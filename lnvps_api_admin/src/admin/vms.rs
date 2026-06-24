@@ -474,6 +474,11 @@ async fn admin_extend_vm(
     let old_expires = sub.expires.unwrap_or(Utc::now());
     let new_expires = old_expires + Days::new(req.days as u64);
     sub.expires = Some(new_expires);
+    // Granting paid time marks the subscription as set up and active, otherwise the
+    // worker's unpaid-VM cleanup (which keys off `is_setup`) would delete this VM
+    // despite the admin having extended it.
+    sub.is_setup = true;
+    sub.is_active = true;
     this.db.update_subscription(&sub).await?;
 
     // Log the extension in VM history
