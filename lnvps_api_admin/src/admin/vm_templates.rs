@@ -201,6 +201,7 @@ async fn admin_create_vm_template(
         disk_mbps_write: req.disk_mbps_write,
         network_mbps: req.network_mbps,
         cpu_limit: req.cpu_limit,
+        firewall_rule_limit: None,
     };
 
     let template_id = this.db.insert_vm_template(&template).await?;

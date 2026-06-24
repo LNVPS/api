@@ -5,8 +5,8 @@ use futures::future::join_all;
 use lnvps_api_common::VmRunningState;
 use lnvps_api_common::retry::OpResult;
 use lnvps_db::{
-    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind,
-    VmIpAssignment, VmOsImage, VmTemplate,
+    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmFirewallRule, VmHost, VmHostDisk,
+    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -154,6 +154,8 @@ pub struct FullVmInfo {
     pub ranges: Vec<IpRange>,
     /// SSH key to access the VM
     pub ssh_key: UserSshKey,
+    /// User-configured firewall rules for this VM (ordered by priority)
+    pub firewall_rules: Vec<VmFirewallRule>,
 }
 
 impl FullVmInfo {
@@ -183,6 +185,7 @@ impl FullVmInfo {
         } else {
             None
         };
+        let firewall_rules = db.list_vm_firewall_rules(vm_id).await?;
         // create VM
         Ok(FullVmInfo {
             vm,
@@ -194,6 +197,7 @@ impl FullVmInfo {
             disk,
             ranges,
             ssh_key,
+            firewall_rules,
         })
     }
 
@@ -484,6 +488,7 @@ mod tests {
                 created: Default::default(),
                 key_data: "ssh-ed25519 AAA=".into(),
             },
+            firewall_rules: vec![],
         }
     }
 }

@@ -598,6 +598,210 @@ pub struct ApiVmUpgradeQuote {
 }
 
 // ============================================================================
+// Firewall Models (#36)
+// ============================================================================
+
+/// Direction a firewall rule applies to
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiFirewallDirection {
+    Inbound,
+    Outbound,
+}
+
+impl From<lnvps_db::VmFirewallDirection> for ApiFirewallDirection {
+    fn from(v: lnvps_db::VmFirewallDirection) -> Self {
+        match v {
+            lnvps_db::VmFirewallDirection::Inbound => ApiFirewallDirection::Inbound,
+            lnvps_db::VmFirewallDirection::Outbound => ApiFirewallDirection::Outbound,
+        }
+    }
+}
+
+impl From<ApiFirewallDirection> for lnvps_db::VmFirewallDirection {
+    fn from(v: ApiFirewallDirection) -> Self {
+        match v {
+            ApiFirewallDirection::Inbound => lnvps_db::VmFirewallDirection::Inbound,
+            ApiFirewallDirection::Outbound => lnvps_db::VmFirewallDirection::Outbound,
+        }
+    }
+}
+
+/// Protocol a firewall rule matches
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiFirewallProtocol {
+    Any,
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl From<lnvps_db::VmFirewallProtocol> for ApiFirewallProtocol {
+    fn from(v: lnvps_db::VmFirewallProtocol) -> Self {
+        match v {
+            lnvps_db::VmFirewallProtocol::Any => ApiFirewallProtocol::Any,
+            lnvps_db::VmFirewallProtocol::Tcp => ApiFirewallProtocol::Tcp,
+            lnvps_db::VmFirewallProtocol::Udp => ApiFirewallProtocol::Udp,
+            lnvps_db::VmFirewallProtocol::Icmp => ApiFirewallProtocol::Icmp,
+        }
+    }
+}
+
+impl From<ApiFirewallProtocol> for lnvps_db::VmFirewallProtocol {
+    fn from(v: ApiFirewallProtocol) -> Self {
+        match v {
+            ApiFirewallProtocol::Any => lnvps_db::VmFirewallProtocol::Any,
+            ApiFirewallProtocol::Tcp => lnvps_db::VmFirewallProtocol::Tcp,
+            ApiFirewallProtocol::Udp => lnvps_db::VmFirewallProtocol::Udp,
+            ApiFirewallProtocol::Icmp => lnvps_db::VmFirewallProtocol::Icmp,
+        }
+    }
+}
+
+/// Action taken when a firewall rule matches
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiFirewallAction {
+    Drop,
+    Accept,
+}
+
+impl From<lnvps_db::VmFirewallRuleAction> for ApiFirewallAction {
+    fn from(v: lnvps_db::VmFirewallRuleAction) -> Self {
+        match v {
+            lnvps_db::VmFirewallRuleAction::Drop => ApiFirewallAction::Drop,
+            lnvps_db::VmFirewallRuleAction::Accept => ApiFirewallAction::Accept,
+        }
+    }
+}
+
+impl From<ApiFirewallAction> for lnvps_db::VmFirewallRuleAction {
+    fn from(v: ApiFirewallAction) -> Self {
+        match v {
+            ApiFirewallAction::Drop => lnvps_db::VmFirewallRuleAction::Drop,
+            ApiFirewallAction::Accept => lnvps_db::VmFirewallRuleAction::Accept,
+        }
+    }
+}
+
+/// A user-configurable per-VM firewall rule
+#[derive(Serialize, Deserialize)]
+pub struct ApiVmFirewallRule {
+    pub id: u64,
+    /// Evaluation order; lower priority is evaluated first
+    pub priority: u16,
+    pub direction: ApiFirewallDirection,
+    pub protocol: ApiFirewallProtocol,
+    pub action: ApiFirewallAction,
+    /// Optional source CIDR (None = any)
+    pub src_cidr: Option<String>,
+    /// Optional inclusive destination port range start (None = any)
+    pub dst_port_start: Option<u32>,
+    /// Optional inclusive destination port range end (None = single port / any)
+    pub dst_port_end: Option<u32>,
+    pub enabled: bool,
+}
+
+impl From<lnvps_db::VmFirewallRule> for ApiVmFirewallRule {
+    fn from(r: lnvps_db::VmFirewallRule) -> Self {
+        ApiVmFirewallRule {
+            id: r.id,
+            priority: r.priority,
+            direction: r.direction.into(),
+            protocol: r.protocol.into(),
+            action: r.action.into(),
+            src_cidr: r.src_cidr,
+            dst_port_start: r.dst_port_start,
+            dst_port_end: r.dst_port_end,
+            enabled: r.enabled,
+        }
+    }
+}
+
+/// Request body to create a firewall rule
+#[derive(Serialize, Deserialize)]
+pub struct CreateVmFirewallRule {
+    #[serde(default)]
+    pub priority: u16,
+    pub direction: ApiFirewallDirection,
+    pub protocol: ApiFirewallProtocol,
+    pub action: ApiFirewallAction,
+    pub src_cidr: Option<String>,
+    pub dst_port_start: Option<u32>,
+    pub dst_port_end: Option<u32>,
+    /// Whether the rule is active (defaults to true)
+    pub enabled: Option<bool>,
+}
+
+/// Request body to update a firewall rule (all fields optional)
+#[derive(Serialize, Deserialize)]
+pub struct PatchVmFirewallRule {
+    pub priority: Option<u16>,
+    pub direction: Option<ApiFirewallDirection>,
+    pub protocol: Option<ApiFirewallProtocol>,
+    pub action: Option<ApiFirewallAction>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub src_cidr: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub dst_port_start: Option<Option<u32>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub dst_port_end: Option<Option<u32>>,
+    pub enabled: Option<bool>,
+}
+
+/// Validate a source CIDR string, returning a normalised error message on failure.
+pub fn validate_firewall_cidr(cidr: &str) -> Result<(), String> {
+    use std::str::FromStr;
+    ipnetwork::IpNetwork::from_str(cidr)
+        .map(|_| ())
+        .map_err(|_| format!("Invalid src_cidr: {}", cidr))
+}
+
+/// Validate a destination port range. Returns the normalised (start, end) where
+/// end defaults to start when only a single port is supplied.
+pub fn validate_firewall_ports(
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<(Option<u32>, Option<u32>), String> {
+    let check = |p: u32| -> Result<(), String> {
+        if p == 0 || p > 65535 {
+            Err(format!("Port out of range (1-65535): {}", p))
+        } else {
+            Ok(())
+        }
+    };
+    match (start, end) {
+        (None, None) => Ok((None, None)),
+        (Some(s), None) => {
+            check(s)?;
+            Ok((Some(s), None))
+        }
+        (None, Some(_)) => Err("dst_port_end set without dst_port_start".to_string()),
+        (Some(s), Some(e)) => {
+            check(s)?;
+            check(e)?;
+            if s > e {
+                return Err("dst_port_start must be <= dst_port_end".to_string());
+            }
+            Ok((Some(s), Some(e)))
+        }
+    }
+}
+
+// ============================================================================
 // Subscription Models
 // ============================================================================
 
@@ -1016,5 +1220,88 @@ mod tests {
         assert_eq!(item.formatted_amount, "EUR 5.00");
         assert_eq!(item.formatted_tax, "EUR 1.15");
         assert!(!item.formatted_duration.is_empty());
+    }
+
+    #[test]
+    fn test_validate_firewall_cidr() {
+        assert!(validate_firewall_cidr("1.2.3.0/24").is_ok());
+        assert!(validate_firewall_cidr("2001:db8::/32").is_ok());
+        assert!(validate_firewall_cidr("10.0.0.1").is_ok());
+        assert!(validate_firewall_cidr("not-a-cidr").is_err());
+        assert!(validate_firewall_cidr("1.2.3.4/99").is_err());
+    }
+
+    #[test]
+    fn test_validate_firewall_ports() {
+        assert_eq!(validate_firewall_ports(None, None), Ok((None, None)));
+        assert_eq!(
+            validate_firewall_ports(Some(80), None),
+            Ok((Some(80), None))
+        );
+        assert_eq!(
+            validate_firewall_ports(Some(80), Some(443)),
+            Ok((Some(80), Some(443)))
+        );
+        // end without start
+        assert!(validate_firewall_ports(None, Some(80)).is_err());
+        // start > end
+        assert!(validate_firewall_ports(Some(443), Some(80)).is_err());
+        // out of range
+        assert!(validate_firewall_ports(Some(0), None).is_err());
+        assert!(validate_firewall_ports(Some(70000), None).is_err());
+        assert!(validate_firewall_ports(Some(1), Some(70000)).is_err());
+    }
+
+    #[test]
+    fn test_firewall_enum_roundtrip() {
+        use lnvps_db::{VmFirewallDirection, VmFirewallProtocol, VmFirewallRuleAction};
+
+        for d in [VmFirewallDirection::Inbound, VmFirewallDirection::Outbound] {
+            let api: ApiFirewallDirection = d.into();
+            let back: VmFirewallDirection = api.into();
+            assert_eq!(d, back);
+        }
+        for p in [
+            VmFirewallProtocol::Any,
+            VmFirewallProtocol::Tcp,
+            VmFirewallProtocol::Udp,
+            VmFirewallProtocol::Icmp,
+        ] {
+            let api: ApiFirewallProtocol = p.into();
+            let back: VmFirewallProtocol = api.into();
+            assert_eq!(p, back);
+        }
+        for a in [VmFirewallRuleAction::Drop, VmFirewallRuleAction::Accept] {
+            let api: ApiFirewallAction = a.into();
+            let back: VmFirewallRuleAction = api.into();
+            assert_eq!(a, back);
+        }
+    }
+
+    #[test]
+    fn test_api_firewall_rule_from_db() {
+        let rule = lnvps_db::VmFirewallRule {
+            id: 7,
+            vm_id: 3,
+            priority: 5,
+            direction: lnvps_db::VmFirewallDirection::Inbound,
+            protocol: lnvps_db::VmFirewallProtocol::Tcp,
+            action: lnvps_db::VmFirewallRuleAction::Accept,
+            src_cidr: Some("1.2.3.0/24".to_string()),
+            dst_port_start: Some(22),
+            dst_port_end: None,
+            enabled: true,
+            created: Utc::now(),
+            updated: Utc::now(),
+        };
+        let api = ApiVmFirewallRule::from(rule);
+        assert_eq!(api.id, 7);
+        assert_eq!(api.priority, 5);
+        assert_eq!(api.direction, ApiFirewallDirection::Inbound);
+        assert_eq!(api.protocol, ApiFirewallProtocol::Tcp);
+        assert_eq!(api.action, ApiFirewallAction::Accept);
+        assert_eq!(api.src_cidr.as_deref(), Some("1.2.3.0/24"));
+        assert_eq!(api.dst_port_start, Some(22));
+        assert!(api.enabled);
     }
 }

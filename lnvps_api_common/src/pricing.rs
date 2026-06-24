@@ -617,6 +617,7 @@ impl PricingEngine {
             disk_mbps_write: pricing.disk_mbps_write,
             network_mbps: pricing.network_mbps,
             cpu_limit: pricing.cpu_limit,
+            firewall_rule_limit: None,
         };
         Ok(new_custom_template)
     }

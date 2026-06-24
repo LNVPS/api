@@ -862,6 +862,8 @@ pub struct VmTemplate {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%; None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Maximum number of user firewall rules per VM (None = use global default)
+    pub firewall_rule_limit: Option<u16>,
 }
 
 /// A custom pricing template, used for billing calculation of a specific VM
@@ -890,6 +892,8 @@ pub struct VmCustomTemplate {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%; None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Maximum number of user firewall rules per VM (None = use global default)
+    pub firewall_rule_limit: Option<u16>,
 }
 
 /// Custom pricing template, usually 1 per region
@@ -1048,6 +1052,69 @@ impl Display for VmIpAssignment {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.ip)
     }
+}
+
+/// Direction a firewall rule applies to
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum VmFirewallDirection {
+    /// Traffic arriving at the VM
+    #[default]
+    Inbound = 0,
+    /// Traffic leaving the VM
+    Outbound = 1,
+}
+
+/// Protocol a firewall rule matches
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum VmFirewallProtocol {
+    /// Match any protocol
+    #[default]
+    Any = 0,
+    Tcp = 1,
+    Udp = 2,
+    Icmp = 3,
+}
+
+/// Action taken when a firewall rule matches
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum VmFirewallRuleAction {
+    /// Silently drop the packet
+    Drop = 0,
+    /// Accept the packet
+    #[default]
+    Accept = 1,
+}
+
+/// A user-configurable per-VM firewall rule (#36)
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VmFirewallRule {
+    /// Unique id of this rule
+    pub id: u64,
+    /// VM this rule applies to
+    pub vm_id: u64,
+    /// Evaluation order; lower priority is evaluated first
+    pub priority: u16,
+    /// Direction this rule applies to
+    pub direction: VmFirewallDirection,
+    /// Protocol matched by this rule
+    pub protocol: VmFirewallProtocol,
+    /// Action taken when the rule matches
+    pub action: VmFirewallRuleAction,
+    /// Optional source CIDR (None = any)
+    pub src_cidr: Option<String>,
+    /// Optional inclusive destination port range start (None = any)
+    pub dst_port_start: Option<u32>,
+    /// Optional inclusive destination port range end (None = any)
+    pub dst_port_end: Option<u32>,
+    /// Whether this rule is active
+    pub enabled: bool,
+    /// When this rule was created
+    pub created: DateTime<Utc>,
+    /// When this rule was last updated
+    pub updated: DateTime<Utc>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

@@ -83,6 +83,8 @@ pub enum WorkJob {
         vm_id: u64,
         admin_user_id: Option<u64>,
     },
+    /// Re-apply the firewall ruleset for a VM (after firewall rule changes)
+    ApplyVmFirewall { vm_id: u64 },
     /// Assign an IP to a VM using the provisioner (handles all additional steps)
     AssignVmIp {
         vm_id: u64,
@@ -180,6 +182,7 @@ impl fmt::Display for WorkJob {
             WorkJob::CheckNostrDomains => write!(f, "CheckNostrDomains"),
             WorkJob::ProcessVmUpgrade { .. } => write!(f, "ProcessVmUpgrade"),
             WorkJob::ConfigureVm { .. } => write!(f, "ConfigureVm"),
+            WorkJob::ApplyVmFirewall { .. } => write!(f, "ApplyVmFirewall"),
             WorkJob::AssignVmIp { .. } => write!(f, "AssignVmIp"),
             WorkJob::UnassignVmIp { .. } => write!(f, "UnassignVmIp"),
             WorkJob::UpdateVmIp { .. } => write!(f, "UpdateVmIp"),
