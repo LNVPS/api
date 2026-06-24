@@ -81,6 +81,14 @@ pub struct AccountPatchRequest {
     /// Whether a Telegram chat is linked (read-only, ignored on PATCH)
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub telegram_linked: Option<bool>,
+    #[serde(default)]
+    pub contact_whatsapp: bool,
+    /// The verified WhatsApp number, if any (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub whatsapp_number: Option<String>,
+    /// Whether the WhatsApp number is verified (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub whatsapp_verified: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -153,6 +161,9 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             contact_email: user.contact_email,
             contact_telegram: user.contact_telegram,
             telegram_linked: Some(user.telegram_chat_id.is_some()),
+            contact_whatsapp: user.contact_whatsapp,
+            whatsapp_number: user.whatsapp_number.clone(),
+            whatsapp_verified: Some(user.whatsapp_verified),
             country_code: Some(user.country_code),
             name: Some(user.billing_name),
             address_1: Some(user.billing_address_1),

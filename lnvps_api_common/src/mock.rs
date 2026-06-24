@@ -359,6 +359,10 @@ impl LNVpsDbBase for MockDb {
             u.contact_telegram = user.contact_telegram;
             u.telegram_chat_id = user.telegram_chat_id;
             u.telegram_link_token = user.telegram_link_token.clone();
+            u.contact_whatsapp = user.contact_whatsapp;
+            u.whatsapp_number = user.whatsapp_number.clone();
+            u.whatsapp_verified = user.whatsapp_verified;
+            u.whatsapp_verify_code = user.whatsapp_verify_code.clone();
         }
         Ok(())
     }

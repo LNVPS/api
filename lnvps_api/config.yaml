@@ -34,3 +34,13 @@ captcha:
 #telegram:
 #  bot-token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 #  bot-username: "my_lnvps_bot"
+# WhatsApp notification channel (optional) via the Meta Cloud API.
+# Both templates must be approved and have a single body parameter {{1}}.
+#whatsapp:
+#  access-token: "EAAG..."
+#  phone-number-id: "1234567890"
+#  api-version: "v21.0"
+#  message-template: "lnvps_notification"
+#  message-template-lang: "en"
+#  verify-template: "lnvps_verification"
+#  verify-template-lang: "en"

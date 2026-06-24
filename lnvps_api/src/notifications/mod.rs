@@ -12,10 +12,12 @@
 mod email;
 mod nip17;
 mod telegram;
+mod whatsapp;
 
 pub use email::{EmailChannel, send_email};
 pub use nip17::Nip17Channel;
-pub use telegram::{TelegramChannel, TelegramClient, TelegramBot};
+pub use telegram::{TelegramBot, TelegramChannel, TelegramClient};
+pub use whatsapp::{WhatsAppChannel, WhatsAppClient, normalize_number};
 
 use crate::worker::WorkerSettings;
 use async_trait::async_trait;
@@ -95,6 +97,10 @@ pub fn build_channels(
     if let Some(tg) = settings.telegram.as_ref() {
         let client = TelegramClient::new(tg.bot_token.clone(), http.clone());
         channels.push(Arc::new(TelegramChannel::new(client)));
+    }
+
+    if let Some(wa) = settings.whatsapp.as_ref() {
+        channels.push(Arc::new(WhatsAppChannel::new(wa, http.clone())));
     }
 
     channels

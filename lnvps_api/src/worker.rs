@@ -3,7 +3,7 @@ use crate::notifications::{
     Notification, NotificationChannel, build_channels, send_email,
 };
 use crate::provisioner::VmProvisioner;
-use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig};
+use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig, WhatsAppConfig};
 use crate::ssh_client::SshClient;
 use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result, anyhow, bail};
@@ -112,6 +112,7 @@ pub struct WorkerSettings {
     pub delete_after: u16,
     pub smtp: Option<SmtpConfig>,
     pub telegram: Option<TelegramConfig>,
+    pub whatsapp: Option<WhatsAppConfig>,
     pub provisioner_config: ProvisionerConfig,
     pub redis: Option<RedisConfig>,
     pub nostr_hostname: Option<String>,
@@ -123,6 +124,7 @@ impl From<&Settings> for WorkerSettings {
             delete_after: val.delete_after,
             smtp: val.smtp.clone(),
             telegram: val.telegram.clone(),
+            whatsapp: val.whatsapp.clone(),
             provisioner_config: val.provisioner.clone(),
             redis: val.redis.clone(),
             nostr_hostname: val.nostr_address_host.clone(),

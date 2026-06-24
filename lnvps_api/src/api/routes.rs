@@ -50,6 +50,14 @@ pub fn routes() -> Router<RouterState> {
             "/api/v1/account/telegram/link",
             post(v1_telegram_link).delete(v1_telegram_unlink),
         )
+        .route(
+            "/api/v1/account/whatsapp/verify",
+            post(v1_whatsapp_verify).delete(v1_whatsapp_unlink),
+        )
+        .route(
+            "/api/v1/account/whatsapp/confirm",
+            post(v1_whatsapp_confirm),
+        )
         .route("/api/v1/vm", get(v1_list_vms))
         .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
         .route("/api/v1/image", get(v1_list_vm_images))
@@ -197,9 +205,15 @@ async fn v1_patch_account(
         return ApiData::err("Link your Telegram account before enabling Telegram notifications");
     }
 
+    // WhatsApp notifications require a verified number
+    if req.contact_whatsapp && !user.whatsapp_verified {
+        return ApiData::err("Verify your WhatsApp number before enabling WhatsApp notifications");
+    }
+
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
     user.contact_telegram = req.contact_telegram;
+    user.contact_whatsapp = req.contact_whatsapp;
     if let Some(country_code) = &req.country_code {
         user.country_code = country_code
             .as_ref()
@@ -380,6 +394,97 @@ async fn v1_telegram_unlink(
     user.telegram_chat_id = None;
     user.telegram_link_token = None;
     user.contact_telegram = false;
+    this.db.update_user(&user).await?;
+
+    ApiData::ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct WhatsappVerifyRequest {
+    /// Phone number in E.164 format, e.g. `+15551234567`
+    number: String,
+}
+
+#[derive(serde::Deserialize)]
+struct WhatsappConfirmRequest {
+    code: String,
+}
+
+/// Start WhatsApp verification: store the number, generate a code and send it
+/// via the configured verification template.
+async fn v1_whatsapp_verify(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Json(req): Json<WhatsappVerifyRequest>,
+) -> ApiResult<()> {
+    let Some(wa) = this.settings.whatsapp.as_ref() else {
+        return ApiData::err("WhatsApp notifications are not enabled on this server");
+    };
+    let number = req.number.trim();
+    if crate::notifications::normalize_number(number).len() < 6 {
+        return ApiData::err("A valid phone number in international format is required");
+    }
+
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let mut user = this.db.get_user(uid).await?;
+
+    // 6-digit numeric code
+    let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
+    user.whatsapp_number = Some(number.to_string());
+    user.whatsapp_verified = false;
+    user.whatsapp_verify_code = Some(code.clone());
+    this.db.update_user(&user).await?;
+
+    let client =
+        crate::notifications::WhatsAppClient::new(wa, reqwest::Client::new());
+    if let Err(e) = client
+        .send_template(number, &wa.verify_template, &wa.verify_template_lang, &code)
+        .await
+    {
+        error!("Failed to send WhatsApp verification to {}: {}", number, e);
+        return ApiData::err("Failed to send verification code, please check the number");
+    }
+
+    ApiData::ok(())
+}
+
+/// Confirm WhatsApp verification by matching the code; enables the number.
+async fn v1_whatsapp_confirm(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Json(req): Json<WhatsappConfirmRequest>,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let mut user = this.db.get_user(uid).await?;
+
+    let code = req.code.trim();
+    match &user.whatsapp_verify_code {
+        Some(expected) if !expected.is_empty() && expected == code => {
+            user.whatsapp_verified = true;
+            user.whatsapp_verify_code = None;
+            user.contact_whatsapp = true;
+            this.db.update_user(&user).await?;
+            ApiData::ok(())
+        }
+        _ => ApiData::err("Invalid or expired verification code"),
+    }
+}
+
+/// Remove the user's WhatsApp number and disable WhatsApp notifications.
+async fn v1_whatsapp_unlink(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let mut user = this.db.get_user(uid).await?;
+
+    user.whatsapp_number = None;
+    user.whatsapp_verified = false;
+    user.whatsapp_verify_code = None;
+    user.contact_whatsapp = false;
     this.db.update_user(&user).await?;
 
     ApiData::ok(())
