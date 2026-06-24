@@ -106,6 +106,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get user by email verification token
     async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User>;
 
+    /// Get user by their pending Telegram link token
+    async fn get_user_by_telegram_link_token(&self, token: &str) -> DbResult<User>;
+
+    /// Complete Telegram linking: store the chat id, enable the contact
+    /// preference, and clear the one-time link token for the given user.
+    async fn link_telegram_chat(&self, user_id: u64, chat_id: i64) -> DbResult<()>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 

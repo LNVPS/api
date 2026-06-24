@@ -42,6 +42,9 @@ pub struct Settings {
     /// Nostr config for sending DMs
     pub nostr: Option<NostrConfig>,
 
+    /// Telegram bot config for sending notifications
+    pub telegram: Option<TelegramConfig>,
+
     /// Config for accepting revolut payments
     pub revolut: Option<payments_rs::fiat::RevolutConfig>,
 
@@ -89,6 +92,16 @@ pub enum LightningConfig {
 pub struct NostrConfig {
     pub relays: Vec<String>,
     pub nsec: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TelegramConfig {
+    /// Bot API token from @BotFather
+    pub bot_token: String,
+    /// Bot username (without @), used to build account-linking deep links
+    /// e.g. `https://t.me/<bot-username>?start=<token>`
+    pub bot_username: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -294,6 +307,7 @@ pub fn mock_settings() -> Settings {
             api: DnsServerApi::Mock,
         }),
         nostr: None,
+        telegram: None,
         revolut: None,
         tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
         nostr_address_host: None,

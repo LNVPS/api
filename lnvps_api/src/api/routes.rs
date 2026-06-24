@@ -46,6 +46,10 @@ pub fn routes() -> Router<RouterState> {
             get(v1_get_account).patch(v1_patch_account),
         )
         .route("/api/v1/account/verify-email", get(v1_verify_email))
+        .route(
+            "/api/v1/account/telegram/link",
+            post(v1_telegram_link).delete(v1_telegram_unlink),
+        )
         .route("/api/v1/vm", get(v1_list_vms))
         .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
         .route("/api/v1/image", get(v1_list_vm_images))
@@ -188,8 +192,14 @@ async fn v1_patch_account(
         return ApiData::err("An email address is required to enable email notifications");
     }
 
+    // Telegram notifications require a linked chat
+    if req.contact_telegram && user.telegram_chat_id.is_none() {
+        return ApiData::err("Link your Telegram account before enabling Telegram notifications");
+    }
+
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
+    user.contact_telegram = req.contact_telegram;
     if let Some(country_code) = &req.country_code {
         user.country_code = country_code
             .as_ref()
@@ -323,6 +333,56 @@ async fn v1_get_account(
     let user = this.db.get_user(uid).await?;
 
     ApiData::ok(user.into())
+}
+
+#[derive(serde::Serialize)]
+struct TelegramLinkResponse {
+    /// Deep link the user should open to link their Telegram chat
+    url: String,
+    /// One-time token embedded in the deep link
+    token: String,
+}
+
+/// Generate a Telegram account-linking deep link.
+///
+/// Stores a fresh one-time token on the user; the bot completes linking when
+/// the user opens the returned URL and presses Start.
+async fn v1_telegram_link(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<TelegramLinkResponse> {
+    let Some(tg) = this.settings.telegram.as_ref() else {
+        return ApiData::err("Telegram notifications are not enabled on this server");
+    };
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let mut user = this.db.get_user(uid).await?;
+
+    let token = hex::encode(rand::random::<[u8; 16]>());
+    user.telegram_link_token = Some(token.clone());
+    this.db.update_user(&user).await?;
+
+    ApiData::ok(TelegramLinkResponse {
+        url: format!("https://t.me/{}?start={}", tg.bot_username, token),
+        token,
+    })
+}
+
+/// Unlink the user's Telegram chat and disable Telegram notifications.
+async fn v1_telegram_unlink(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let mut user = this.db.get_user(uid).await?;
+
+    user.telegram_chat_id = None;
+    user.telegram_link_token = None;
+    user.contact_telegram = false;
+    this.db.update_user(&user).await?;
+
+    ApiData::ok(())
 }
 
 /// List VMs belonging to user

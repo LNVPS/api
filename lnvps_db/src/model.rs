@@ -30,6 +30,13 @@ pub struct User {
     pub contact_nip17: bool,
     /// If user should be contacted via email for notifications
     pub contact_email: bool,
+    /// If user should be contacted via Telegram for notifications
+    pub contact_telegram: bool,
+    /// Telegram chat id to deliver messages to (set once the account is linked)
+    pub telegram_chat_id: Option<i64>,
+    /// One-time token used to link a Telegram chat to this account.
+    /// Empty/`None` once linking has completed.
+    pub telegram_link_token: Option<String>,
     /// Users country
     pub country_code: Option<String>,
     /// Name to show on invoices

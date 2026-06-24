@@ -76,6 +76,11 @@ pub struct AccountPatchRequest {
     pub email_verified: Option<bool>,
     pub contact_nip17: bool,
     pub contact_email: bool,
+    #[serde(default)]
+    pub contact_telegram: bool,
+    /// Whether a Telegram chat is linked (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub telegram_linked: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -146,6 +151,8 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             email_verified: has_email.then_some(user.email_verified),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
+            contact_telegram: user.contact_telegram,
+            telegram_linked: Some(user.telegram_chat_id.is_some()),
             country_code: Some(user.country_code),
             name: Some(user.billing_name),
             address_1: Some(user.billing_address_1),

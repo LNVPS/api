@@ -200,6 +200,23 @@ async fn main() -> Result<(), Error> {
     // request for host info to be patched
     worker.send(WorkJob::PatchHosts).await?;
 
+    // Telegram bot poller completes account linking (single getUpdates consumer).
+    // Run it in API mode where account linking originates.
+    if mode.contains(&ExecMode::Api)
+        && let Some(tg) = &settings.telegram
+    {
+        let bot = lnvps_api::notifications::TelegramBot::new(
+            tg.bot_token.clone(),
+            reqwest::Client::new(),
+            db.clone(),
+        );
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = bot.run().await {
+                error!("Telegram bot poller exited: {}", e);
+            }
+        }));
+    }
+
     if mode.contains(&ExecMode::Api) {
         let ip: SocketAddr = match &settings.listen {
             Some(i) => i.parse()?,

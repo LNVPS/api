@@ -356,6 +356,9 @@ impl LNVpsDbBase for MockDb {
             u.email_verify_token = user.email_verify_token.clone();
             u.contact_email = user.contact_email;
             u.contact_nip17 = user.contact_nip17;
+            u.contact_telegram = user.contact_telegram;
+            u.telegram_chat_id = user.telegram_chat_id;
+            u.telegram_link_token = user.telegram_link_token.clone();
         }
         Ok(())
     }
@@ -373,6 +376,25 @@ impl LNVpsDbBase for MockDb {
             .find(|u| !u.email_verify_token.is_empty() && u.email_verify_token == token)
             .cloned()
             .ok_or_else(|| DbError::Other(anyhow!("no user with that token")))
+    }
+
+    async fn get_user_by_telegram_link_token(&self, token: &str) -> DbResult<User> {
+        let users = self.users.lock().await;
+        users
+            .values()
+            .find(|u| u.telegram_link_token.as_deref() == Some(token))
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no user with that token")))
+    }
+
+    async fn link_telegram_chat(&self, user_id: u64, chat_id: i64) -> DbResult<()> {
+        let mut users = self.users.lock().await;
+        if let Some(u) = users.get_mut(&user_id) {
+            u.telegram_chat_id = Some(chat_id);
+            u.contact_telegram = true;
+            u.telegram_link_token = None;
+        }
+        Ok(())
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {

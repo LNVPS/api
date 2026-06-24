@@ -3,7 +3,7 @@ use crate::notifications::{
     Notification, NotificationChannel, build_channels, send_email,
 };
 use crate::provisioner::VmProvisioner;
-use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
+use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig};
 use crate::ssh_client::SshClient;
 use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result, anyhow, bail};
@@ -111,6 +111,7 @@ pub struct Worker {
 pub struct WorkerSettings {
     pub delete_after: u16,
     pub smtp: Option<SmtpConfig>,
+    pub telegram: Option<TelegramConfig>,
     pub provisioner_config: ProvisionerConfig,
     pub redis: Option<RedisConfig>,
     pub nostr_hostname: Option<String>,
@@ -121,6 +122,7 @@ impl From<&Settings> for WorkerSettings {
         WorkerSettings {
             delete_after: val.delete_after,
             smtp: val.smtp.clone(),
+            telegram: val.telegram.clone(),
             provisioner_config: val.provisioner.clone(),
             redis: val.redis.clone(),
             nostr_hostname: val.nostr_address_host.clone(),
@@ -157,7 +159,7 @@ impl Worker {
             .timeout(Duration::from_secs(10))
             .build()?;
 
-        let notification_channels = build_channels(&settings, nostr.as_ref());
+        let notification_channels = build_channels(&settings, nostr.as_ref(), &http_client);
 
         Ok(Self {
             db,

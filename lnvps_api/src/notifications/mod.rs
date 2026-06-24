@@ -11,9 +11,11 @@
 
 mod email;
 mod nip17;
+mod telegram;
 
 pub use email::{EmailChannel, send_email};
 pub use nip17::Nip17Channel;
+pub use telegram::{TelegramChannel, TelegramClient, TelegramBot};
 
 use crate::worker::WorkerSettings;
 use async_trait::async_trait;
@@ -78,6 +80,7 @@ pub trait NotificationChannel: Send + Sync {
 pub fn build_channels(
     settings: &WorkerSettings,
     nostr: Option<&Client>,
+    http: &reqwest::Client,
 ) -> Vec<Arc<dyn NotificationChannel>> {
     let mut channels: Vec<Arc<dyn NotificationChannel>> = Vec::new();
 
@@ -87,6 +90,11 @@ pub fn build_channels(
 
     if let Some(client) = nostr {
         channels.push(Arc::new(Nip17Channel::new(client.clone())));
+    }
+
+    if let Some(tg) = settings.telegram.as_ref() {
+        let client = TelegramClient::new(tg.bot_token.clone(), http.clone());
+        channels.push(Arc::new(TelegramChannel::new(client)));
     }
 
     channels

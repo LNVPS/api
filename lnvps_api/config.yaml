@@ -28,3 +28,9 @@ captcha:
   # Turnstile is a Cloudflare captcha product
   turnstile:
     secret-key: "1x0000000000000000000000000000000AA"
+# Telegram notification channel (optional). Create a bot via @BotFather.
+# When set, users can link their chat from account settings and receive
+# notifications via Telegram.
+#telegram:
+#  bot-token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+#  bot-username: "my_lnvps_bot"
