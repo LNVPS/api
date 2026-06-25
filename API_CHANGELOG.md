@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **2026-06-23** - Documented the BGP session and tunnel field semantics in `ADMIN_API_ENDPOINTS.md` and rustdoc. Clarified that `enabled` (administrative on/off) and `state` (live BGP FSM state: `Idle`/`Connect`/`Active`/`OpenSent`/`OpenConfirm`/`Established`/`Down`) are independent — `"enabled": true` with `"state": "Down"` is administratively on but not yet up, not a contradiction. Also documented tunnel `"any"` endpoints and the `direction` classification.
 
+### Fixed
+
+- **2026-06-25** - Admin VM `template_id` is now `null` for custom-template VMs
+  - `AdminVmInfo.template_id` (returned by `GET /api/admin/v1/vms` and `GET /api/admin/v1/vms/{id}`) changed from `u64` to a nullable integer. VMs on a custom template previously reported `template_id: 0`; they now correctly report `template_id: null` (with the linked template carried by `custom_template_id`). Standard-template VMs are unaffected.
+
+- **2026-06-25** - Expired subscriptions are now handled even when expiry predates the last check
+  - The worker's `CheckSubscriptions` expiry handling previously only fired when a subscription crossed its expiry between two check cycles (`expires >= last_check`). Subscriptions that expired before the last check (admin/retroactive expiry, clock changes, or worker downtime) were left running until the grace period elapsed. The worker now fires the one-shot expiry handling (stop VM + notify) for any expired-but-in-grace subscription, using VM history as an idempotency marker so it still acts exactly once.
+
 ### Changed
 
 - **2026-06-25** - Subscription payments now include the payment data needed to pay

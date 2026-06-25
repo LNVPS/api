@@ -208,9 +208,13 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             return Ok(());
         }
         info!("Stopping expired VM {}", self.vm.id);
+        // Stop is best-effort (the host may be unreachable or the VM already
+        // stopped), but the history entry must always be written: it is the
+        // idempotency marker the worker uses to avoid re-firing expiry handling.
         if let Err(e) = self.provisioner.stop_vm(self.vm.id).await {
             warn!("Failed to stop VM {}: {}", self.vm.id, e);
-        } else if let Err(e) = self
+        }
+        if let Err(e) = self
             .vm_history_logger
             .log_vm_expired(self.vm.id, None)
             .await

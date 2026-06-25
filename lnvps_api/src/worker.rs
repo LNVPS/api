@@ -18,7 +18,8 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionType, Vm, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    SubscriptionLineItem, SubscriptionType, Vm, VmHistoryActionType, VmHost, VmHostKind,
+    VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, PublicKey, ToBech32};
@@ -336,32 +337,83 @@ impl Worker {
                     Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
-        } else if expires < Utc::now() && expires >= last_check {
-            // Edge-triggered: only fire on the first check after expiry crosses. The
-            // subscription stays `is_active = 1` (and thus keeps being returned by
-            // `list_lifecycle_subscriptions`) throughout the grace period until it is either
-            // renewed or the grace branch above deactivates it. Without the `expires >=
-            // last_check` guard this branch re-ran every CheckSubscriptions cycle (~30s),
-            // re-stopping the VM and re-sending the "expired" notification on a loop.
-            self.queue_notification(
-                sub.user_id,
-                format!("Your subscription has expired.\n{}", sub_notification_descr),
-                Some(format!("[{}] Expired", sub_notification_subject)),
-            )
-            .await;
-            for li in &line_items {
-                match self.subscription_handler.make_line_item_handler(li).await {
-                    Ok(h) => {
-                        if let Err(e) = h.on_expired(sub, li).await {
-                            warn!("on_expired failed for line item {}: {}", li.id, e);
+        } else if expires < Utc::now() {
+            // Subscription is expired but still within the grace window. Fire the
+            // "expired" handling exactly once.
+            //
+            // For a real-time crossing this is the first check after `expires`
+            // (`expires >= last_check`). For subscriptions that expired *before*
+            // `last_check` — retroactive/admin expiry, clock changes, or worker
+            // downtime — the simple `expires >= last_check` edge guard would never
+            // fire, leaving the VM running until the grace period elapsed. We instead
+            // detect whether the expiry was already handled (via VM history) so we act
+            // once rather than re-stopping/re-notifying every CheckSubscriptions cycle.
+            let already_handled = self
+                .subscription_expiry_already_handled(sub, &line_items, last_check)
+                .await;
+            if !already_handled {
+                self.queue_notification(
+                    sub.user_id,
+                    format!("Your subscription has expired.\n{}", sub_notification_descr),
+                    Some(format!("[{}] Expired", sub_notification_subject)),
+                )
+                .await;
+                for li in &line_items {
+                    match self.subscription_handler.make_line_item_handler(li).await {
+                        Ok(h) => {
+                            if let Err(e) = h.on_expired(sub, li).await {
+                                warn!("on_expired failed for line item {}: {}", li.id, e);
+                            }
                         }
+                        Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                     }
-                    Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Whether the one-shot "expired" handling for `sub` has already run.
+    ///
+    /// VPS line items are authoritative: a VM-history `Expired` entry recorded at
+    /// or after the subscription's `expires` means we already stopped/notified, so
+    /// the worker must not fire again. For subscriptions without a VPS line item we
+    /// fall back to the edge-trigger semantics (`expires < last_check` ⇒ a previous
+    /// cycle handled it) since there is no VM history to consult.
+    async fn subscription_expiry_already_handled(
+        &self,
+        sub: &Subscription,
+        line_items: &[SubscriptionLineItem],
+        last_check: DateTime<Utc>,
+    ) -> bool {
+        let Some(expires) = sub.expires else {
+            return true;
+        };
+        let mut has_vps = false;
+        for li in line_items {
+            if li.subscription_type != SubscriptionType::Vps {
+                continue;
+            }
+            has_vps = true;
+            let Ok(vm) = self.db.get_vm_by_line_item(li.id).await else {
+                continue;
+            };
+            if let Ok(history) = self.db.list_vm_history(vm.id).await
+                && history.iter().any(|h| {
+                    matches!(h.action_type, VmHistoryActionType::Expired) && h.timestamp >= expires
+                })
+            {
+                return true;
+            }
+        }
+        if has_vps {
+            // VPS line item(s) present but no Expired entry yet — not handled.
+            false
+        } else {
+            // No VM history to consult; approximate prior handling with the edge guard.
+            expires < last_check
+        }
     }
 
     /// Get the subscription notification subject line
