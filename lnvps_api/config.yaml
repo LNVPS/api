@@ -32,8 +32,8 @@ captcha:
 # When set, users can link their chat from account settings and receive
 # notifications via Telegram.
 #telegram:
-#  bot-token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-#  bot-username: "my_lnvps_bot"
+#  token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+#  username: "my_lnvps_bot"
 # WhatsApp notification channel (optional) via the Meta Cloud API.
 # Both templates must be approved and have a single body parameter {{1}}.
 #whatsapp:

@@ -12,6 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-06-25** - List configured notification channels
+  - `GET /api/v1/notification/channels` — returns which notification channels are configured on this server so the UI can show/hide the relevant contact inputs. Response: `{ "nip17": boolean, "email": boolean, "telegram": boolean, "whatsapp": boolean }`. No authentication required.
+
 - **2026-06-24** - Basic per-VM firewall rules (user API)
   - `GET /api/v1/vm/{id}/firewall` — list a VM's firewall rules (ordered by `priority`).
   - `POST /api/v1/vm/{id}/firewall` — create a rule. Body: `{ priority?, direction: "inbound"|"outbound", protocol: "any"|"tcp"|"udp"|"icmp", action: "accept"|"drop"|"reject", src_cidr?, dst_port_start?, dst_port_end?, enabled? }`. Returns the created `FirewallRule`. Enforces a per-VM rule limit (configurable per template, default 20) and validates `src_cidr` (CIDR) and the port range (1–65535, start ≤ end).

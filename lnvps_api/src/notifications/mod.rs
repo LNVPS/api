@@ -95,7 +95,7 @@ pub fn build_channels(
     }
 
     if let Some(tg) = settings.telegram.as_ref() {
-        let client = TelegramClient::new(tg.bot_token.clone(), http.clone());
+        let client = TelegramClient::new(tg.token.clone(), http.clone());
         channels.push(Arc::new(TelegramChannel::new(client)));
     }
 

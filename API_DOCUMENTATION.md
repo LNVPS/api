@@ -371,6 +371,12 @@ interface VmUpgradeQuote {
 - **Query**: `token` — the verification token from the verification email
 - **Response**: `null`
 
+#### List Configured Notification Channels
+- **GET** `/api/v1/notification/channels`
+- **Auth**: Not required
+- **Notes**: Indicates which notification channels are configured on the server so the UI can show/hide the relevant contact inputs.
+- **Response**: `{ "nip17": boolean, "email": boolean, "telegram": boolean, "whatsapp": boolean }`
+
 ### Automatic Renewal with Nostr Wallet Connect
 
 The LNVPS platform supports automatic VM renewal using Nostr Wallet Connect (NWC). This feature allows users to set up their Lightning wallets to automatically pay for VM renewals before expiration.

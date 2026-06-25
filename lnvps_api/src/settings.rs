@@ -101,10 +101,10 @@ pub struct NostrConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct TelegramConfig {
     /// Bot API token from @BotFather
-    pub bot_token: String,
+    pub token: String,
     /// Bot username (without @), used to build account-linking deep links
-    /// e.g. `https://t.me/<bot-username>?start=<token>`
-    pub bot_username: String,
+    /// e.g. `https://t.me/<username>?start=<token>`
+    pub username: String,
 }
 
 fn default_whatsapp_api_version() -> String {

@@ -28,9 +28,11 @@ use tower_http::cors::CorsLayer;
 #[derive(Parser)]
 #[clap(about, version, author)]
 struct Args {
-    /// Path to the config file
+    /// Path to one or more config files. Files are layered in order, so values
+    /// in later files override earlier ones. Defaults to `config.yaml` when no
+    /// paths are given.
     #[clap(short, long)]
-    config: Option<PathBuf>,
+    config: Vec<PathBuf>,
 
     /// Where to write the log file
     #[clap(long)]
@@ -66,12 +68,18 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let mut tasks = Vec::new();
 
-    let settings: Settings = Config::builder()
-        .add_source(File::from(
-            args.config.unwrap_or(PathBuf::from("config.yaml")),
-        ))
-        .build()?
-        .try_deserialize()?;
+    let settings: Settings = {
+        let mut builder = Config::builder();
+        if args.config.is_empty() {
+            builder = builder.add_source(File::from(PathBuf::from("config.yaml")));
+        } else {
+            // Explicit files are layered in order; later files override earlier.
+            for path in &args.config {
+                builder = builder.add_source(File::from(path.clone()));
+            }
+        }
+        builder.build()?.try_deserialize()?
+    };
 
     // Initialize encryption if configured
     if let Some(ref encryption_config) = settings.encryption {
@@ -206,7 +214,7 @@ async fn main() -> Result<(), Error> {
         && let Some(tg) = &settings.telegram
     {
         let bot = lnvps_api::notifications::TelegramBot::new(
-            tg.bot_token.clone(),
+            tg.token.clone(),
             reqwest::Client::new(),
             db.clone(),
         );

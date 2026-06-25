@@ -58,6 +58,10 @@ pub fn routes() -> Router<RouterState> {
             "/api/v1/account/whatsapp/confirm",
             post(v1_whatsapp_confirm),
         )
+        .route(
+            "/api/v1/notification/channels",
+            get(v1_notification_channels),
+        )
         .route("/api/v1/vm", get(v1_list_vms))
         .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
         .route("/api/v1/image", get(v1_list_vm_images))
@@ -349,6 +353,33 @@ async fn v1_get_account(
     ApiData::ok(user.into())
 }
 
+/// Notification channels configured on this server. The UI can use this to
+/// show/hide the relevant contact inputs since there's no point offering a
+/// channel that isn't configured on the backend.
+#[derive(serde::Serialize)]
+struct NotificationChannels {
+    /// Nostr NIP-17 direct messages
+    nip17: bool,
+    /// Email (SMTP) notifications
+    email: bool,
+    /// Telegram bot notifications
+    telegram: bool,
+    /// WhatsApp Cloud API notifications
+    whatsapp: bool,
+}
+
+/// List which notification channels are configured on this server.
+async fn v1_notification_channels(
+    State(this): State<RouterState>,
+) -> ApiResult<NotificationChannels> {
+    ApiData::ok(NotificationChannels {
+        nip17: this.settings.nostr.is_some(),
+        email: this.settings.smtp.is_some(),
+        telegram: this.settings.telegram.is_some(),
+        whatsapp: this.settings.whatsapp.is_some(),
+    })
+}
+
 #[derive(serde::Serialize)]
 struct TelegramLinkResponse {
     /// Deep link the user should open to link their Telegram chat
@@ -377,7 +408,7 @@ async fn v1_telegram_link(
     this.db.update_user(&user).await?;
 
     ApiData::ok(TelegramLinkResponse {
-        url: format!("https://t.me/{}?start={}", tg.bot_username, token),
+        url: format!("https://t.me/{}?start={}", tg.username, token),
         token,
     })
 }
