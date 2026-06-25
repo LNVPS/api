@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **2026-06-23** - Documented the BGP session and tunnel field semantics in `ADMIN_API_ENDPOINTS.md` and rustdoc. Clarified that `enabled` (administrative on/off) and `state` (live BGP FSM state: `Idle`/`Connect`/`Active`/`OpenSent`/`OpenConfirm`/`Established`/`Down`) are independent — `"enabled": true` with `"state": "Down"` is administratively on but not yet up, not a contradiction. Also documented tunnel `"any"` endpoints and the `direction` classification.
 
+### Changed
+
+- **2026-06-25** - Email verification is only required to order a VM when SMTP is configured
+  - `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` previously always rejected orders from users without a verified email. The check is now skipped when the server has no `smtp` config (verification emails can't be sent), so ordering remains usable on installs without email. The API logs a startup warning when SMTP is unconfigured.
+
 ### Added
 
 - **2026-06-25** - List configured notification channels

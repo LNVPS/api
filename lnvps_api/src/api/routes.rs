@@ -734,7 +734,10 @@ async fn v1_create_custom_vm_order(
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let user = this.db.get_user(uid).await?;
-    if !user.email_verified {
+    // Email verification is only enforced when SMTP is configured; otherwise
+    // there's no way to send the verification email, so the requirement is
+    // skipped to keep ordering usable on installs without email.
+    if this.settings.smtp.is_some() && !user.email_verified {
         return Err(ApiError::new(
             "Email verification is required before creating a VM",
         ));
@@ -821,7 +824,9 @@ async fn v1_create_vm_order(
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let user = this.db.get_user(uid).await?;
-    if !user.email_verified {
+    // Email verification is only enforced when SMTP is configured (see
+    // v1_create_custom_vm_order for rationale).
+    if this.settings.smtp.is_some() && !user.email_verified {
         return Err(ApiError::new(
             "Email verification is required before creating a VM",
         ));

@@ -81,11 +81,12 @@ async fn main() -> Result<(), Error> {
         builder.build()?.try_deserialize()?
     };
 
-    // Email verification is required before a user can order a VM, so a missing
-    // SMTP config means no user can ever complete an order. Warn loudly at startup.
+    // Email verification gates VM ordering, but it can only be delivered over
+    // SMTP. When SMTP is unconfigured the verification requirement is skipped so
+    // ordering still works — warn so the operator knows this is in effect.
     if settings.smtp.is_none() {
         warn!(
-            "SMTP is not configured: email verification is required to order VMs, so no orders can be completed until `smtp` is set in the config"
+            "SMTP is not configured: email verification is disabled and VM ordering will not require a verified email"
         );
     }
 
