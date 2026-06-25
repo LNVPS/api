@@ -200,9 +200,10 @@ async fn main() -> Result<(), Error> {
     }));
 
     #[cfg(feature = "nostr-dvm")]
-    {
-        let nostr_client = nostr_client.unwrap();
+    if let Some(nostr_client) = &nostr_client {
         tasks.push(start_dvms(nostr_client.clone(), sub_handler.clone()));
+    } else {
+        log::warn!("nostr-dvm feature is enabled but no nostr config is set; skipping DVMs");
     }
 
     // request for host info to be patched
