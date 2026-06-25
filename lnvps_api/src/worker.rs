@@ -246,8 +246,15 @@ impl Worker {
         let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
         // --- Expiring soon ---
-        let expiry_window = Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
-        if expires < expiry_window
+        // Only subscriptions that have NOT yet expired can be "expiring soon".
+        // The `expires > now` guard is important: without it, an already-expired
+        // subscription would wrongly match this branch whenever `last_check` is
+        // stale (e.g. a freshly-started worker whose last check defaults to the
+        // unix epoch), starving the expired/grace branches below.
+        let now = Utc::now();
+        let expiry_window = now.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
+        if expires > now
+            && expires < expiry_window
             && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS))
         {
             // Track whether NWC auto-renewal was attempted and succeeded (so we skip the
