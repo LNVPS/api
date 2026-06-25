@@ -11,7 +11,7 @@ use lnvps_api_common::{VmStateCache, WorkJob, make_exchange_service};
 use std::fmt::{Display, Formatter};
 
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
-use log::{error, info};
+use log::{error, info, warn};
 use nostr_sdk::{Client, Keys};
 
 use axum::Router;
@@ -80,6 +80,14 @@ async fn main() -> Result<(), Error> {
         }
         builder.build()?.try_deserialize()?
     };
+
+    // Email verification is required before a user can order a VM, so a missing
+    // SMTP config means no user can ever complete an order. Warn loudly at startup.
+    if settings.smtp.is_none() {
+        warn!(
+            "SMTP is not configured: email verification is required to order VMs, so no orders can be completed until `smtp` is set in the config"
+        );
+    }
 
     // Initialize encryption if configured
     if let Some(ref encryption_config) = settings.encryption {
@@ -203,7 +211,7 @@ async fn main() -> Result<(), Error> {
     if let Some(nostr_client) = &nostr_client {
         tasks.push(start_dvms(nostr_client.clone(), sub_handler.clone()));
     } else {
-        log::warn!("nostr-dvm feature is enabled but no nostr config is set; skipping DVMs");
+        warn!("nostr-dvm feature is enabled but no nostr config is set; skipping DVMs");
     }
 
     // request for host info to be patched
