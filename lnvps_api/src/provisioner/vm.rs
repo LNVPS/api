@@ -166,6 +166,8 @@ impl VmProvisioner {
             deleted: false,
             ref_code,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
 
         let new_id = self.db.insert_vm(&new_vm).await?;
@@ -290,6 +292,8 @@ impl VmProvisioner {
             deleted: false,
             ref_code,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
 
         let new_id = self.db.insert_vm(&new_vm).await?;

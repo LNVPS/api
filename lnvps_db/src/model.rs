@@ -982,6 +982,10 @@ pub struct Vm {
     pub ref_code: Option<String>,
     /// Whether the VM is disabled by admin
     pub disabled: bool,
+    /// Default inbound firewall policy (None = inherit host default / accept)
+    pub fw_policy_in: Option<VmFirewallPolicy>,
+    /// Default outbound firewall policy (None = inherit host default / accept)
+    pub fw_policy_out: Option<VmFirewallPolicy>,
 }
 
 /// Raw vm_payment row with external_data as a plain String (not decrypted).
@@ -1086,6 +1090,21 @@ pub enum VmFirewallRuleAction {
     /// Accept the packet
     #[default]
     Accept = 1,
+    /// Reject the packet (drop and send an ICMP/TCP-RST rejection)
+    Reject = 2,
+}
+
+/// Default policy applied to traffic in a given direction when no rule matches
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, Default)]
+#[repr(u16)]
+pub enum VmFirewallPolicy {
+    /// Accept the packet (allow-all default; current behaviour)
+    #[default]
+    Accept = 0,
+    /// Silently drop the packet
+    Drop = 1,
+    /// Reject the packet (drop and send an ICMP/TCP-RST rejection)
+    Reject = 2,
 }
 
 /// A user-configurable per-VM firewall rule (#36)

@@ -905,6 +905,16 @@ impl ProxmoxClient {
         }
     }
 
+    /// Translate a user-defined per-VM default firewall policy into a Proxmox
+    /// policy value.
+    fn convert_vm_firewall_policy(policy: lnvps_db::VmFirewallPolicy) -> VmFirewallPolicy {
+        match policy {
+            lnvps_db::VmFirewallPolicy::Accept => VmFirewallPolicy::ACCEPT,
+            lnvps_db::VmFirewallPolicy::Drop => VmFirewallPolicy::DROP,
+            lnvps_db::VmFirewallPolicy::Reject => VmFirewallPolicy::REJECT,
+        }
+    }
+
     /// Translate a user-defined DB firewall rule into a Proxmox PVE firewall rule.
     ///
     /// The rule is tagged with a [`USER_FW_MARKER`]-prefixed comment so it can be
@@ -916,6 +926,7 @@ impl ProxmoxClient {
         let action = match rule.action {
             VmFirewallRuleAction::Accept => VmFirewallAction::ACCEPT,
             VmFirewallRuleAction::Drop => VmFirewallAction::DROP,
+            VmFirewallRuleAction::Reject => VmFirewallAction::REJECT,
         };
         let rule_type = match rule.direction {
             VmFirewallDirection::Inbound => VmFirewallRuleType::In,
@@ -1623,6 +1634,23 @@ impl VmHostClient for ProxmoxClient {
         }
 
         let fw_cfg = self.config.firewall_config.as_ref().unwrap();
+        // Per-VM default policy (user-configured) overrides the host default when
+        // set; otherwise fall back to the host-level configured policy.
+        let policy_in = cfg
+            .vm
+            .fw_policy_in
+            .map(Self::convert_vm_firewall_policy)
+            .or_else(|| fw_cfg.policy_in.as_ref().map(Self::convert_firewall_policy));
+        let policy_out = cfg
+            .vm
+            .fw_policy_out
+            .map(Self::convert_vm_firewall_policy)
+            .or_else(|| {
+                fw_cfg
+                    .policy_out
+                    .as_ref()
+                    .map(Self::convert_firewall_policy)
+            });
         // Use configured firewall options or disable firewall if no config
         let firewall_config = VmFirewallConfig {
             dhcp: fw_cfg.dhcp,
@@ -1630,11 +1658,8 @@ impl VmHostClient for ProxmoxClient {
             ip_filter: fw_cfg.ip_filter,
             mac_filter: fw_cfg.mac_filter,
             ndp: fw_cfg.ndp,
-            policy_in: fw_cfg.policy_in.as_ref().map(Self::convert_firewall_policy),
-            policy_out: fw_cfg
-                .policy_out
-                .as_ref()
-                .map(Self::convert_firewall_policy),
+            policy_in,
+            policy_out,
         };
 
         // Re-apply firewall configuration
@@ -2768,6 +2793,42 @@ mod tests {
         assert_eq!(pve.dport.as_deref(), Some("53"));
         assert_eq!(pve.source, None);
         assert_eq!(pve.enable, Some(0));
+    }
+
+    #[test]
+    fn test_to_pve_firewall_rule_reject_action() {
+        let rule = lnvps_db::VmFirewallRule {
+            id: 9,
+            vm_id: 1,
+            priority: 0,
+            direction: lnvps_db::VmFirewallDirection::Inbound,
+            protocol: lnvps_db::VmFirewallProtocol::Tcp,
+            action: lnvps_db::VmFirewallRuleAction::Reject,
+            src_cidr: None,
+            dst_port_start: Some(25),
+            dst_port_end: None,
+            enabled: true,
+            created: Default::default(),
+            updated: Default::default(),
+        };
+        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
+        assert_eq!(pve.action, VmFirewallAction::REJECT);
+    }
+
+    #[test]
+    fn test_convert_vm_firewall_policy() {
+        assert!(matches!(
+            ProxmoxClient::convert_vm_firewall_policy(lnvps_db::VmFirewallPolicy::Accept),
+            VmFirewallPolicy::ACCEPT
+        ));
+        assert!(matches!(
+            ProxmoxClient::convert_vm_firewall_policy(lnvps_db::VmFirewallPolicy::Drop),
+            VmFirewallPolicy::DROP
+        ));
+        assert!(matches!(
+            ProxmoxClient::convert_vm_firewall_policy(lnvps_db::VmFirewallPolicy::Reject),
+            VmFirewallPolicy::REJECT
+        ));
     }
 
     #[test]

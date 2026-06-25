@@ -471,6 +471,8 @@ mod tests {
             deleted: false,
             ref_code: None,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
         logger.log_vm_created(&vm, Some(1), None).await.unwrap();
         let history = logger.db.list_vm_history(42).await.unwrap();
@@ -656,6 +658,8 @@ mod tests {
             deleted: false,
             ref_code: None,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
         let mut new_vm = old_vm.clone();
         new_vm.image_id = 2;

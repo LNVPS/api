@@ -517,10 +517,12 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 
 ### VM Firewall
 
-Basic per-VM firewall rules. User-defined ACCEPT/DROP rules are evaluated in
-`priority` order (lower first) before the default policy. The default policy is
-allow-all inbound and outbound (no change from prior behaviour). Anti-spoofing
-(IP filter) protection is always enforced by the host regardless of user rules.
+Basic per-VM firewall rules. User-defined ACCEPT/DROP/REJECT rules are evaluated
+in `priority` order (lower first) before the default policy. The default policy
+per direction is configurable per-VM (`accept`/`drop`/`reject`); when unset it
+inherits the host default, which is allow-all inbound and outbound (no change
+from prior behaviour). Anti-spoofing (IP filter) protection is always enforced
+by the host regardless of user rules.
 
 The maximum number of rules per VM is configurable at the template level and
 defaults to **20**. Any change to the rules queues an asynchronous re-apply of
@@ -533,7 +535,7 @@ the full firewall ruleset on the host.
   priority: number;                       // evaluation order, lower first
   direction: "inbound" | "outbound";
   protocol: "any" | "tcp" | "udp" | "icmp";
-  action: "accept" | "drop";
+  action: "accept" | "drop" | "reject";
   src_cidr?: string | null;               // optional source CIDR, null = any
   dst_port_start?: number | null;         // optional inclusive port range start, null = any
   dst_port_end?: number | null;           // optional inclusive port range end, null = single port
@@ -563,6 +565,26 @@ the full firewall ruleset on the host.
 - **DELETE** `/api/v1/vm/{id}/firewall/{rule_id}`
 - **Auth**: Required
 - **Response**: `null`
+
+**`FirewallPolicy` type**
+```typescript
+{
+  policy_in?: "accept" | "drop" | "reject" | null;   // null = inherit host default (allow-all)
+  policy_out?: "accept" | "drop" | "reject" | null;  // null = inherit host default (allow-all)
+}
+```
+
+#### Get Firewall Policy
+- **GET** `/api/v1/vm/{id}/firewall/policy`
+- **Auth**: Required
+- **Response**: `FirewallPolicy`
+
+#### Update Firewall Policy
+- **PATCH** `/api/v1/vm/{id}/firewall/policy`
+- **Auth**: Required
+- **Body**: `{ policy_in?, policy_out? }`. Omit a field to leave it unchanged, send `null` to reset it to the host default, or a value (`"accept"|"drop"|"reject"`) to set it explicitly.
+- **Response**: `FirewallPolicy`
+- **Description**: Sets the VM's default inbound/outbound policy and queues a firewall re-apply.
 
 ### Templates and Images
 

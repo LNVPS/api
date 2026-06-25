@@ -314,6 +314,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a firewall rule by id
     async fn delete_vm_firewall_rule(&self, rule_id: u64) -> DbResult<()>;
 
+    /// Update the per-VM default firewall policy (None = inherit host default)
+    async fn update_vm_firewall_policy(
+        &self,
+        vm_id: u64,
+        policy_in: Option<VmFirewallPolicy>,
+        policy_out: Option<VmFirewallPolicy>,
+    ) -> DbResult<()>;
+
     /// List payments by VM id
     async fn list_vm_payment(&self, vm_id: u64) -> DbResult<Vec<VmPayment>>;
 

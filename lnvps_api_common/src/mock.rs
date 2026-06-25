@@ -9,8 +9,9 @@ use lnvps_db::{
     PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallRule, VmHistory, VmHost,
-    VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -118,6 +119,8 @@ impl MockDb {
             deleted: false,
             ref_code: None,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         }
     }
 }
@@ -976,6 +979,20 @@ impl LNVpsDbBase for MockDb {
     async fn delete_vm_firewall_rule(&self, rule_id: u64) -> DbResult<()> {
         let mut rules = self.firewall_rules.lock().await;
         rules.remove(&rule_id);
+        Ok(())
+    }
+
+    async fn update_vm_firewall_policy(
+        &self,
+        vm_id: u64,
+        policy_in: Option<VmFirewallPolicy>,
+        policy_out: Option<VmFirewallPolicy>,
+    ) -> DbResult<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(vm) = vms.get_mut(&vm_id) {
+            vm.fw_policy_in = policy_in;
+            vm.fw_policy_out = policy_out;
+        }
         Ok(())
     }
 
@@ -3332,6 +3349,44 @@ mod tests {
         db.delete_vm_firewall_rule(id_a).await.unwrap();
         assert!(db.get_vm_firewall_rule(id_a).await.is_err());
         assert_eq!(db.list_vm_firewall_rules(1).await.unwrap().len(), 1);
+    }
+
+    /// Per-VM firewall policy update via the mock DB.
+    #[tokio::test]
+    async fn test_firewall_policy_update() {
+        use lnvps_db::{Vm, VmFirewallPolicy};
+
+        let db = MockDb::default();
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                ..Default::default()
+            },
+        );
+
+        // default is inherit (None)
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.fw_policy_in, None);
+        assert_eq!(vm.fw_policy_out, None);
+
+        // set policies
+        db.update_vm_firewall_policy(
+            1,
+            Some(VmFirewallPolicy::Drop),
+            Some(VmFirewallPolicy::Reject),
+        )
+        .await
+        .unwrap();
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.fw_policy_in, Some(VmFirewallPolicy::Drop));
+        assert_eq!(vm.fw_policy_out, Some(VmFirewallPolicy::Reject));
+
+        // reset to inherit
+        db.update_vm_firewall_policy(1, None, None).await.unwrap();
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.fw_policy_in, None);
+        assert_eq!(vm.fw_policy_out, None);
     }
 
     /// subscription_payment_paid marks the payment as paid and sets paid_at.

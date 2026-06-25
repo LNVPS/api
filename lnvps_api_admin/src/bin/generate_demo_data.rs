@@ -1182,6 +1182,8 @@ async fn create_vms(
             deleted: false,
             ref_code: ref_code.clone(),
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
 
         let id = db.insert_vm(&vm).await?;
@@ -1226,6 +1228,8 @@ async fn create_vms(
             deleted: false,
             ref_code: None,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
 
         let id = db.insert_vm(&vm).await?;

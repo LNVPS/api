@@ -29,10 +29,11 @@ use lnvps_db::{
 
 use crate::api::model::{
     AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallRule,
-    ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
-    CreateVmFirewallRule, CreateVmRequest, PatchVmFirewallRule, VMPatchRequest,
-    validate_firewall_cidr, validate_firewall_ports, vm_to_status,
+    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy,
+    ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote,
+    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    PatchVmFirewallPolicy, PatchVmFirewallRule, VMPatchRequest, validate_firewall_cidr,
+    validate_firewall_ports, vm_to_status,
 };
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
@@ -95,6 +96,10 @@ pub fn routes() -> Router<RouterState> {
         .route(
             "/api/v1/vm/{id}/firewall",
             get(v1_list_firewall_rules).post(v1_create_firewall_rule),
+        )
+        .route(
+            "/api/v1/vm/{id}/firewall/policy",
+            get(v1_get_firewall_policy).patch(v1_patch_firewall_policy),
         )
         .route(
             "/api/v1/vm/{id}/firewall/{rule_id}",
@@ -1390,6 +1395,48 @@ async fn v1_list_firewall_rules(
     let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
     let rules = this.db.list_vm_firewall_rules(vm.id).await?;
     ApiData::ok(rules.into_iter().map(ApiVmFirewallRule::from).collect())
+}
+
+/// Get the per-VM default firewall policy
+async fn v1_get_firewall_policy(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiVmFirewallPolicy> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ApiData::ok(ApiVmFirewallPolicy {
+        policy_in: vm.fw_policy_in.map(Into::into),
+        policy_out: vm.fw_policy_out.map(Into::into),
+    })
+}
+
+/// Update the per-VM default firewall policy
+async fn v1_patch_firewall_policy(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<PatchVmFirewallPolicy>,
+) -> ApiResult<ApiVmFirewallPolicy> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    let policy_in = match req.policy_in {
+        Some(v) => v.map(Into::into),
+        None => vm.fw_policy_in,
+    };
+    let policy_out = match req.policy_out {
+        Some(v) => v.map(Into::into),
+        None => vm.fw_policy_out,
+    };
+
+    this.db
+        .update_vm_firewall_policy(vm.id, policy_in, policy_out)
+        .await?;
+    apply_firewall(&this, vm.id).await?;
+
+    ApiData::ok(ApiVmFirewallPolicy {
+        policy_in: policy_in.map(Into::into),
+        policy_out: policy_out.map(Into::into),
+    })
 }
 
 /// Create a firewall rule for a VM

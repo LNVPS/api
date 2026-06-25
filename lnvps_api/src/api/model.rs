@@ -665,6 +665,7 @@ impl From<ApiFirewallProtocol> for lnvps_db::VmFirewallProtocol {
 pub enum ApiFirewallAction {
     Drop,
     Accept,
+    Reject,
 }
 
 impl From<lnvps_db::VmFirewallRuleAction> for ApiFirewallAction {
@@ -672,6 +673,7 @@ impl From<lnvps_db::VmFirewallRuleAction> for ApiFirewallAction {
         match v {
             lnvps_db::VmFirewallRuleAction::Drop => ApiFirewallAction::Drop,
             lnvps_db::VmFirewallRuleAction::Accept => ApiFirewallAction::Accept,
+            lnvps_db::VmFirewallRuleAction::Reject => ApiFirewallAction::Reject,
         }
     }
 }
@@ -681,8 +683,67 @@ impl From<ApiFirewallAction> for lnvps_db::VmFirewallRuleAction {
         match v {
             ApiFirewallAction::Drop => lnvps_db::VmFirewallRuleAction::Drop,
             ApiFirewallAction::Accept => lnvps_db::VmFirewallRuleAction::Accept,
+            ApiFirewallAction::Reject => lnvps_db::VmFirewallRuleAction::Reject,
         }
     }
+}
+
+/// Default policy applied to a traffic direction when no rule matches
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiFirewallPolicy {
+    Accept,
+    Drop,
+    Reject,
+}
+
+impl From<lnvps_db::VmFirewallPolicy> for ApiFirewallPolicy {
+    fn from(v: lnvps_db::VmFirewallPolicy) -> Self {
+        match v {
+            lnvps_db::VmFirewallPolicy::Accept => ApiFirewallPolicy::Accept,
+            lnvps_db::VmFirewallPolicy::Drop => ApiFirewallPolicy::Drop,
+            lnvps_db::VmFirewallPolicy::Reject => ApiFirewallPolicy::Reject,
+        }
+    }
+}
+
+impl From<ApiFirewallPolicy> for lnvps_db::VmFirewallPolicy {
+    fn from(v: ApiFirewallPolicy) -> Self {
+        match v {
+            ApiFirewallPolicy::Accept => lnvps_db::VmFirewallPolicy::Accept,
+            ApiFirewallPolicy::Drop => lnvps_db::VmFirewallPolicy::Drop,
+            ApiFirewallPolicy::Reject => lnvps_db::VmFirewallPolicy::Reject,
+        }
+    }
+}
+
+/// Per-VM default firewall policy (None = inherit host default / accept)
+#[derive(Serialize, Deserialize)]
+pub struct ApiVmFirewallPolicy {
+    /// Inbound default policy (None = inherit host default / accept)
+    pub policy_in: Option<ApiFirewallPolicy>,
+    /// Outbound default policy (None = inherit host default / accept)
+    pub policy_out: Option<ApiFirewallPolicy>,
+}
+
+/// Request body to update the per-VM default firewall policy.
+///
+/// Each field is a nullable-option: omit to leave unchanged, `null` to reset to
+/// the host default (accept), or a value to set explicitly.
+#[derive(Serialize, Deserialize)]
+pub struct PatchVmFirewallPolicy {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub policy_in: Option<Option<ApiFirewallPolicy>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub policy_out: Option<Option<ApiFirewallPolicy>>,
 }
 
 /// A user-configurable per-VM firewall rule
@@ -1271,10 +1332,29 @@ mod tests {
             let back: VmFirewallProtocol = api.into();
             assert_eq!(p, back);
         }
-        for a in [VmFirewallRuleAction::Drop, VmFirewallRuleAction::Accept] {
+        for a in [
+            VmFirewallRuleAction::Drop,
+            VmFirewallRuleAction::Accept,
+            VmFirewallRuleAction::Reject,
+        ] {
             let api: ApiFirewallAction = a.into();
             let back: VmFirewallRuleAction = api.into();
             assert_eq!(a, back);
+        }
+    }
+
+    #[test]
+    fn test_firewall_policy_enum_roundtrip() {
+        use lnvps_db::VmFirewallPolicy;
+
+        for p in [
+            VmFirewallPolicy::Accept,
+            VmFirewallPolicy::Drop,
+            VmFirewallPolicy::Reject,
+        ] {
+            let api: ApiFirewallPolicy = p.into();
+            let back: VmFirewallPolicy = api.into();
+            assert_eq!(p, back);
         }
     }
 

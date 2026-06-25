@@ -12,7 +12,7 @@ create table vm_firewall_rule
     direction      smallint unsigned not null default 0,
     -- 0 = any, 1 = tcp, 2 = udp, 3 = icmp
     protocol       smallint unsigned not null default 0,
-    -- 0 = drop, 1 = accept
+    -- 0 = drop, 1 = accept, 2 = reject
     action         smallint unsigned not null default 1,
     -- Optional source CIDR (e.g. 1.2.3.0/24 or ::/0); NULL = any
     src_cidr       varchar(64)      null     default null,
@@ -31,3 +31,8 @@ create index ix_vm_firewall_rule_vm on vm_firewall_rule (vm_id);
 -- Per-template max firewall rule count (NULL = use global default)
 alter table vm_template        add column firewall_rule_limit smallint unsigned null default null;
 alter table vm_custom_template add column firewall_rule_limit smallint unsigned null default null;
+
+-- Per-VM default firewall policy applied when no user rule matches.
+-- NULL = inherit host default (allow-all); 0 = accept, 1 = drop, 2 = reject.
+alter table vm add column fw_policy_in  smallint unsigned null default null;
+alter table vm add column fw_policy_out smallint unsigned null default null;

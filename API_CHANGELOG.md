@@ -14,9 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **2026-06-24** - Basic per-VM firewall rules (user API)
   - `GET /api/v1/vm/{id}/firewall` — list a VM's firewall rules (ordered by `priority`).
-  - `POST /api/v1/vm/{id}/firewall` — create a rule. Body: `{ priority?, direction: "inbound"|"outbound", protocol: "any"|"tcp"|"udp"|"icmp", action: "accept"|"drop", src_cidr?, dst_port_start?, dst_port_end?, enabled? }`. Returns the created `FirewallRule`. Enforces a per-VM rule limit (configurable per template, default 20) and validates `src_cidr` (CIDR) and the port range (1–65535, start ≤ end).
+  - `POST /api/v1/vm/{id}/firewall` — create a rule. Body: `{ priority?, direction: "inbound"|"outbound", protocol: "any"|"tcp"|"udp"|"icmp", action: "accept"|"drop"|"reject", src_cidr?, dst_port_start?, dst_port_end?, enabled? }`. Returns the created `FirewallRule`. Enforces a per-VM rule limit (configurable per template, default 20) and validates `src_cidr` (CIDR) and the port range (1–65535, start ≤ end).
   - `PATCH /api/v1/vm/{id}/firewall/{rule_id}` — update a rule; all fields optional. Send `src_cidr: null` / `dst_port_*: null` to clear a field to "any".
   - `DELETE /api/v1/vm/{id}/firewall/{rule_id}` — delete a rule.
+  - `GET /api/v1/vm/{id}/firewall/policy` — get the per-VM default firewall policy. Returns `{ policy_in, policy_out }` where each is `"accept"|"drop"|"reject"` or `null` (inherit the host default, i.e. allow-all).
+  - `PATCH /api/v1/vm/{id}/firewall/policy` — set the per-VM default inbound/outbound policy. Body: `{ policy_in?, policy_out? }`; omit a field to leave it unchanged, send `null` to reset it to the host default, or a value (`"accept"|"drop"|"reject"`) to set it explicitly.
   - Any change queues an asynchronous re-apply (`ApplyVmFirewall`) of the full ruleset on the host. Default policy remains allow-all inbound/outbound; host anti-spoof (IP filter) protection is always enforced regardless of user rules. Backend rule application on the host is implemented separately.
 
 - **2026-06-23** - Enable/disable a tunnel on a router (admin)
