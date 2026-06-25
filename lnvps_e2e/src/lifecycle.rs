@@ -1098,10 +1098,13 @@ mod tests {
 
         pool.close().await;
 
-        // Drop the per-run test database so it does not accumulate across runs.
-        // The API servers must be stopped before this point (CI tears them down
-        // in the Cleanup step after tests finish, so this is safe here).
-        crate::db::drop_test_database().await.unwrap();
+        // NOTE: do not drop the per-run test database here. Tests run serially
+        // (`--test-threads=1`) against a shared database and `test_full_lifecycle`
+        // is not the last test to run (e.g. `rbac`, `user_api`, and
+        // `test_unpaid_vm_cleanup` follow it alphabetically). Dropping the
+        // database mid-suite would wipe it out from under those tests. The
+        // per-run database is torn down by the harness instead (the run-e2e
+        // script's `docker compose down -v` destroys the DB container/volume).
 
         eprintln!("=== Full lifecycle test passed ===");
     }
