@@ -2160,6 +2160,9 @@ impl Worker {
             } => {
                 self.configure_vm(*vm_id, *admin_user_id).await?;
             }
+            WorkJob::ApplyVmFirewall { vm_id } => {
+                self.apply_vm_firewall(*vm_id).await?;
+            }
             WorkJob::CheckNostrDomains => {
                 self.check_nostr_domains().await?;
             }
@@ -2606,6 +2609,25 @@ impl Worker {
             "Successfully re-configured VM {} using current database settings",
             vm_id
         );
+        Ok(())
+    }
+
+    /// Re-apply the firewall ruleset for a VM using current database configuration.
+    async fn apply_vm_firewall(&self, vm_id: u64) -> Result<()> {
+        info!("Re-applying firewall for VM {}", vm_id);
+
+        let vm = self.db.get_vm(vm_id).await?;
+        if vm.deleted {
+            bail!("Cannot apply firewall to deleted VM {}", vm_id);
+        }
+
+        let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        let host = self.db.get_host(full_info.host.id).await?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+
+        client.patch_firewall(&full_info).await?;
+
+        info!("Successfully re-applied firewall for VM {}", vm_id);
         Ok(())
     }
 

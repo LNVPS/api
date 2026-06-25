@@ -553,6 +553,8 @@ mod tests {
             ref_code: None,
             deleted: false,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         };
         let vm_id = db.insert_vm(&vm).await?;
         vm.id = vm_id;

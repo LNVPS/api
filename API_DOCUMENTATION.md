@@ -515,6 +515,77 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **Protocol**: WebSocket upgrade — bidirectional relay between the client and the VM's serial console
 - **Description**: Opens a WebSocket connection to the VM's serial terminal. Raw bytes in either direction are forwarded to/from the VM's serial port on the host. The connection is closed when either side disconnects or an error occurs.
 
+### VM Firewall
+
+Basic per-VM firewall rules. User-defined ACCEPT/DROP/REJECT rules are evaluated
+in `priority` order (lower first) before the default policy. The default policy
+per direction is configurable per-VM (`accept`/`drop`/`reject`); when unset it
+inherits the host default, which is allow-all inbound and outbound (no change
+from prior behaviour). Anti-spoofing (IP filter) protection is always enforced
+by the host regardless of user rules.
+
+The maximum number of rules per VM is configurable at the template level and
+defaults to **20**. Any change to the rules queues an asynchronous re-apply of
+the full firewall ruleset on the host.
+
+**`FirewallRule` type**
+```typescript
+{
+  id: number;
+  priority: number;                       // evaluation order, lower first
+  direction: "inbound" | "outbound";
+  protocol: "any" | "tcp" | "udp" | "icmp";
+  action: "accept" | "drop" | "reject";
+  src_cidr?: string | null;               // optional source CIDR, null = any
+  dst_port_start?: number | null;         // optional inclusive port range start, null = any
+  dst_port_end?: number | null;           // optional inclusive port range end, null = single port
+  enabled: boolean;
+}
+```
+
+#### List Firewall Rules
+- **GET** `/api/v1/vm/{id}/firewall`
+- **Auth**: Required
+- **Response**: `FirewallRule[]`
+
+#### Create Firewall Rule
+- **POST** `/api/v1/vm/{id}/firewall`
+- **Auth**: Required
+- **Body**: `{ priority?: number, direction, protocol, action, src_cidr?, dst_port_start?, dst_port_end?, enabled? }`
+- **Response**: `FirewallRule`
+- **Description**: Creates a rule and queues a firewall re-apply. Fails if the per-VM rule limit is reached, or if `src_cidr`/port range are invalid (ports 1–65535, `dst_port_start <= dst_port_end`).
+
+#### Update Firewall Rule
+- **PATCH** `/api/v1/vm/{id}/firewall/{rule_id}`
+- **Auth**: Required
+- **Body**: Partial `FirewallRule` fields (all optional). Send `src_cidr: null` / `dst_port_*: null` to clear a field to "any".
+- **Response**: `FirewallRule`
+
+#### Delete Firewall Rule
+- **DELETE** `/api/v1/vm/{id}/firewall/{rule_id}`
+- **Auth**: Required
+- **Response**: `null`
+
+**`FirewallPolicy` type**
+```typescript
+{
+  policy_in?: "accept" | "drop" | "reject" | null;   // null = inherit host default (allow-all)
+  policy_out?: "accept" | "drop" | "reject" | null;  // null = inherit host default (allow-all)
+}
+```
+
+#### Get Firewall Policy
+- **GET** `/api/v1/vm/{id}/firewall/policy`
+- **Auth**: Required
+- **Response**: `FirewallPolicy`
+
+#### Update Firewall Policy
+- **PATCH** `/api/v1/vm/{id}/firewall/policy`
+- **Auth**: Required
+- **Body**: `{ policy_in?, policy_out? }`. Omit a field to leave it unchanged, send `null` to reset it to the host default, or a value (`"accept"|"drop"|"reject"`) to set it explicitly.
+- **Response**: `FirewallPolicy`
+- **Description**: Sets the VM's default inbound/outbound policy and queues a firewall re-apply.
+
 ### Templates and Images
 
 #### List VM Templates

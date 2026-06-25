@@ -4,8 +4,9 @@ use crate::{
     PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmForMigration, VmHistory, VmHost,
-    VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmForMigration, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage,
+    VmPayment, VmPaymentRaw, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -784,7 +785,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=?,fw_policy_in=?,fw_policy_out=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
@@ -794,6 +795,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(vm.disabled)
+            .bind(vm.fw_policy_in)
+            .bind(vm.fw_policy_out)
             .bind(vm.id)
             .execute(&self.db)
             .await?;
@@ -960,6 +963,83 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
         sqlx::query("update vm_ip_assignment set deleted = 1 where id = ?")
             .bind(assignment_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_vm_firewall_rule(&self, rule: &VmFirewallRule) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "insert into vm_firewall_rule(vm_id,priority,direction,protocol,action,src_cidr,dst_port_start,dst_port_end,enabled) values(?,?,?,?,?,?,?,?,?) returning id",
+        )
+            .bind(rule.vm_id)
+            .bind(rule.priority)
+            .bind(rule.direction)
+            .bind(rule.protocol)
+            .bind(rule.action)
+            .bind(&rule.src_cidr)
+            .bind(rule.dst_port_start)
+            .bind(rule.dst_port_end)
+            .bind(rule.enabled)
+            .fetch_one(&self.db)
+            .await?
+            .try_get(0)?)
+    }
+
+    async fn get_vm_firewall_rule(&self, rule_id: u64) -> DbResult<VmFirewallRule> {
+        Ok(
+            sqlx::query_as("select * from vm_firewall_rule where id = ?")
+                .bind(rule_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_vm_firewall_rules(&self, vm_id: u64) -> DbResult<Vec<VmFirewallRule>> {
+        Ok(sqlx::query_as(
+            "select * from vm_firewall_rule where vm_id = ? order by priority asc, id asc",
+        )
+        .bind(vm_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn update_vm_firewall_rule(&self, rule: &VmFirewallRule) -> DbResult<()> {
+        sqlx::query(
+            "update vm_firewall_rule set priority=?, direction=?, protocol=?, action=?, src_cidr=?, dst_port_start=?, dst_port_end=?, enabled=? where id=?",
+        )
+            .bind(rule.priority)
+            .bind(rule.direction)
+            .bind(rule.protocol)
+            .bind(rule.action)
+            .bind(&rule.src_cidr)
+            .bind(rule.dst_port_start)
+            .bind(rule.dst_port_end)
+            .bind(rule.enabled)
+            .bind(rule.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_vm_firewall_rule(&self, rule_id: u64) -> DbResult<()> {
+        sqlx::query("delete from vm_firewall_rule where id = ?")
+            .bind(rule_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_vm_firewall_policy(
+        &self,
+        vm_id: u64,
+        policy_in: Option<VmFirewallPolicy>,
+        policy_out: Option<VmFirewallPolicy>,
+    ) -> DbResult<()> {
+        sqlx::query("update vm set fw_policy_in=?, fw_policy_out=? where id=?")
+            .bind(policy_in)
+            .bind(policy_out)
+            .bind(vm_id)
             .execute(&self.db)
             .await?;
         Ok(())

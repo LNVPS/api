@@ -9,8 +9,9 @@ use lnvps_db::{
     PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
+    VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -53,6 +54,7 @@ pub struct MockDb {
     pub router_tunnel_traffic: Arc<Mutex<Vec<RouterTunnelTraffic>>>,
     pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
+    pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
 }
 
 impl MockDb {
@@ -97,6 +99,7 @@ impl MockDb {
             disk_mbps_write: None,
             network_mbps: None,
             cpu_limit: None,
+            firewall_rule_limit: None,
         }
     }
 
@@ -116,6 +119,8 @@ impl MockDb {
             deleted: false,
             ref_code: None,
             disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
         }
     }
 }
@@ -306,6 +311,7 @@ impl Default for MockDb {
             router_tunnel_traffic: Arc::new(Default::default()),
             router_bgp_sessions: Arc::new(Default::default()),
             router_bgp_routes: Arc::new(Default::default()),
+            firewall_rules: Arc::new(Default::default()),
         }
     }
 }
@@ -924,6 +930,68 @@ impl LNVpsDbBase for MockDb {
             if ip_assignment.id == assignment_id {
                 ip_assignment.deleted = true;
             }
+        }
+        Ok(())
+    }
+
+    async fn insert_vm_firewall_rule(&self, rule: &VmFirewallRule) -> DbResult<u64> {
+        let mut rules = self.firewall_rules.lock().await;
+        let max = *rules.keys().max().unwrap_or(&0);
+        let id = max + 1;
+        rules.insert(id, VmFirewallRule { id, ..rule.clone() });
+        Ok(id)
+    }
+
+    async fn get_vm_firewall_rule(&self, rule_id: u64) -> DbResult<VmFirewallRule> {
+        let rules = self.firewall_rules.lock().await;
+        rules
+            .get(&rule_id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("Firewall rule not found")))
+    }
+
+    async fn list_vm_firewall_rules(&self, vm_id: u64) -> DbResult<Vec<VmFirewallRule>> {
+        let rules = self.firewall_rules.lock().await;
+        let mut out: Vec<VmFirewallRule> = rules
+            .values()
+            .filter(|r| r.vm_id == vm_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    async fn update_vm_firewall_rule(&self, rule: &VmFirewallRule) -> DbResult<()> {
+        let mut rules = self.firewall_rules.lock().await;
+        if let Some(r) = rules.get_mut(&rule.id) {
+            r.priority = rule.priority;
+            r.direction = rule.direction;
+            r.protocol = rule.protocol;
+            r.action = rule.action;
+            r.src_cidr = rule.src_cidr.clone();
+            r.dst_port_start = rule.dst_port_start;
+            r.dst_port_end = rule.dst_port_end;
+            r.enabled = rule.enabled;
+        }
+        Ok(())
+    }
+
+    async fn delete_vm_firewall_rule(&self, rule_id: u64) -> DbResult<()> {
+        let mut rules = self.firewall_rules.lock().await;
+        rules.remove(&rule_id);
+        Ok(())
+    }
+
+    async fn update_vm_firewall_policy(
+        &self,
+        vm_id: u64,
+        policy_in: Option<VmFirewallPolicy>,
+        policy_out: Option<VmFirewallPolicy>,
+    ) -> DbResult<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(vm) = vms.get_mut(&vm_id) {
+            vm.fw_policy_in = policy_in;
+            vm.fw_policy_out = policy_out;
         }
         Ok(())
     }
@@ -3228,6 +3296,97 @@ mod tests {
             processing_fee: 0,
             paid_at: None,
         }
+    }
+
+    /// Firewall rule CRUD via the mock DB.
+    #[tokio::test]
+    async fn test_firewall_rule_crud() {
+        use lnvps_db::{
+            VmFirewallDirection, VmFirewallProtocol, VmFirewallRule, VmFirewallRuleAction,
+        };
+
+        let db = MockDb::default();
+        let mk = |vm_id: u64, priority: u16| VmFirewallRule {
+            id: 0,
+            vm_id,
+            priority,
+            direction: VmFirewallDirection::Inbound,
+            protocol: VmFirewallProtocol::Tcp,
+            action: VmFirewallRuleAction::Accept,
+            src_cidr: None,
+            dst_port_start: Some(22),
+            dst_port_end: None,
+            enabled: true,
+            created: Utc::now(),
+            updated: Utc::now(),
+        };
+
+        // insert two rules for vm 1 (out of order priority) and one for vm 2
+        let id_a = db.insert_vm_firewall_rule(&mk(1, 10)).await.unwrap();
+        let _id_b = db.insert_vm_firewall_rule(&mk(1, 1)).await.unwrap();
+        let _id_c = db.insert_vm_firewall_rule(&mk(2, 5)).await.unwrap();
+
+        // list returns only vm 1 rules ordered by priority
+        let rules = db.list_vm_firewall_rules(1).await.unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].priority, 1);
+        assert_eq!(rules[1].priority, 10);
+
+        // get
+        let got = db.get_vm_firewall_rule(id_a).await.unwrap();
+        assert_eq!(got.vm_id, 1);
+
+        // update
+        let mut upd = got.clone();
+        upd.action = VmFirewallRuleAction::Drop;
+        upd.dst_port_end = Some(80);
+        db.update_vm_firewall_rule(&upd).await.unwrap();
+        let got = db.get_vm_firewall_rule(id_a).await.unwrap();
+        assert_eq!(got.action, VmFirewallRuleAction::Drop);
+        assert_eq!(got.dst_port_end, Some(80));
+
+        // delete
+        db.delete_vm_firewall_rule(id_a).await.unwrap();
+        assert!(db.get_vm_firewall_rule(id_a).await.is_err());
+        assert_eq!(db.list_vm_firewall_rules(1).await.unwrap().len(), 1);
+    }
+
+    /// Per-VM firewall policy update via the mock DB.
+    #[tokio::test]
+    async fn test_firewall_policy_update() {
+        use lnvps_db::{Vm, VmFirewallPolicy};
+
+        let db = MockDb::default();
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                ..Default::default()
+            },
+        );
+
+        // default is inherit (None)
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.fw_policy_in, None);
+        assert_eq!(vm.fw_policy_out, None);
+
+        // set policies
+        db.update_vm_firewall_policy(
+            1,
+            Some(VmFirewallPolicy::Drop),
+            Some(VmFirewallPolicy::Reject),
+        )
+        .await
+        .unwrap();
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.fw_policy_in, Some(VmFirewallPolicy::Drop));
+        assert_eq!(vm.fw_policy_out, Some(VmFirewallPolicy::Reject));
+
+        // reset to inherit
+        db.update_vm_firewall_policy(1, None, None).await.unwrap();
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.fw_policy_in, None);
+        assert_eq!(vm.fw_policy_out, None);
     }
 
     /// subscription_payment_paid marks the payment as paid and sets paid_at.

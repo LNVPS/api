@@ -29,9 +29,11 @@ use lnvps_db::{
 
 use crate::api::model::{
     AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmHistory,
-    ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
-    CreateVmRequest, VMPatchRequest, vm_to_status,
+    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy,
+    ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote,
+    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    PatchVmFirewallPolicy, PatchVmFirewallRule, VMPatchRequest, validate_firewall_cidr,
+    validate_firewall_ports, vm_to_status,
 };
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
@@ -91,6 +93,18 @@ pub fn routes() -> Router<RouterState> {
         .route("/api/v1/vm/{id}/history", get(v1_get_vm_history))
         .route("/api/v1/vm/{id}/upgrade/quote", post(v1_vm_upgrade_quote))
         .route("/api/v1/vm/{id}/upgrade", post(v1_vm_upgrade))
+        .route(
+            "/api/v1/vm/{id}/firewall",
+            get(v1_list_firewall_rules).post(v1_create_firewall_rule),
+        )
+        .route(
+            "/api/v1/vm/{id}/firewall/policy",
+            get(v1_get_firewall_policy).patch(v1_patch_firewall_policy),
+        )
+        .route(
+            "/api/v1/vm/{id}/firewall/{rule_id}",
+            patch(v1_patch_firewall_rule).delete(v1_delete_firewall_rule),
+        )
 }
 
 /// Update user account
@@ -1354,6 +1368,210 @@ async fn v1_vm_upgrade(
 
     // Note: The actual upgrade happens after payment is confirmed
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
+}
+
+/// Default maximum number of user firewall rules per VM when no template limit is set.
+const DEFAULT_FIREWALL_RULE_LIMIT: u16 = 20;
+
+/// Resolve the firewall rule limit for a VM from its (custom) template,
+/// falling back to the global default.
+async fn vm_firewall_rule_limit(this: &RouterState, vm: &Vm) -> Result<u16, ApiError> {
+    let limit = if let Some(t) = vm.template_id {
+        this.db.get_vm_template(t).await?.firewall_rule_limit
+    } else if let Some(t) = vm.custom_template_id {
+        this.db.get_custom_vm_template(t).await?.firewall_rule_limit
+    } else {
+        None
+    };
+    Ok(limit.unwrap_or(DEFAULT_FIREWALL_RULE_LIMIT))
+}
+
+/// List firewall rules for a VM
+async fn v1_list_firewall_rules(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<ApiVmFirewallRule>> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let rules = this.db.list_vm_firewall_rules(vm.id).await?;
+    ApiData::ok(rules.into_iter().map(ApiVmFirewallRule::from).collect())
+}
+
+/// Get the per-VM default firewall policy
+async fn v1_get_firewall_policy(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiVmFirewallPolicy> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ApiData::ok(ApiVmFirewallPolicy {
+        policy_in: vm.fw_policy_in.map(Into::into),
+        policy_out: vm.fw_policy_out.map(Into::into),
+    })
+}
+
+/// Update the per-VM default firewall policy
+async fn v1_patch_firewall_policy(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<PatchVmFirewallPolicy>,
+) -> ApiResult<ApiVmFirewallPolicy> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    let policy_in = match req.policy_in {
+        Some(v) => v.map(Into::into),
+        None => vm.fw_policy_in,
+    };
+    let policy_out = match req.policy_out {
+        Some(v) => v.map(Into::into),
+        None => vm.fw_policy_out,
+    };
+
+    this.db
+        .update_vm_firewall_policy(vm.id, policy_in, policy_out)
+        .await?;
+    apply_firewall(&this, vm.id).await?;
+
+    ApiData::ok(ApiVmFirewallPolicy {
+        policy_in: policy_in.map(Into::into),
+        policy_out: policy_out.map(Into::into),
+    })
+}
+
+/// Create a firewall rule for a VM
+async fn v1_create_firewall_rule(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<CreateVmFirewallRule>,
+) -> ApiResult<ApiVmFirewallRule> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    // Enforce the per-VM rule limit
+    let limit = vm_firewall_rule_limit(&this, &vm).await?;
+    let existing = this.db.list_vm_firewall_rules(vm.id).await?;
+    if existing.len() as u16 >= limit {
+        return ApiData::err(&format!("Firewall rule limit reached ({})", limit));
+    }
+
+    // Validate inputs
+    if let Some(cidr) = &req.src_cidr {
+        if let Err(e) = validate_firewall_cidr(cidr) {
+            return ApiData::err(&e);
+        }
+    }
+    let (dst_port_start, dst_port_end) =
+        match validate_firewall_ports(req.dst_port_start, req.dst_port_end) {
+            Ok(v) => v,
+            Err(e) => return ApiData::err(&e),
+        };
+
+    let rule = lnvps_db::VmFirewallRule {
+        id: 0,
+        vm_id: vm.id,
+        priority: req.priority,
+        direction: req.direction.into(),
+        protocol: req.protocol.into(),
+        action: req.action.into(),
+        src_cidr: req.src_cidr,
+        dst_port_start,
+        dst_port_end,
+        enabled: req.enabled.unwrap_or(true),
+        created: Utc::now(),
+        updated: Utc::now(),
+    };
+    let rule_id = this.db.insert_vm_firewall_rule(&rule).await?;
+
+    apply_firewall(&this, vm.id).await?;
+
+    let created = this.db.get_vm_firewall_rule(rule_id).await?;
+    ApiData::ok(ApiVmFirewallRule::from(created))
+}
+
+/// Update a firewall rule
+async fn v1_patch_firewall_rule(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, rule_id)): Path<(u64, u64)>,
+    Json(req): Json<PatchVmFirewallRule>,
+) -> ApiResult<ApiVmFirewallRule> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    let mut rule = this.db.get_vm_firewall_rule(rule_id).await?;
+    if rule.vm_id != vm.id {
+        return ApiData::err("Firewall rule does not belong to this VM");
+    }
+
+    if let Some(p) = req.priority {
+        rule.priority = p;
+    }
+    if let Some(d) = req.direction {
+        rule.direction = d.into();
+    }
+    if let Some(p) = req.protocol {
+        rule.protocol = p.into();
+    }
+    if let Some(a) = req.action {
+        rule.action = a.into();
+    }
+    if let Some(c) = req.src_cidr {
+        if let Some(cidr) = &c {
+            if let Err(e) = validate_firewall_cidr(cidr) {
+                return ApiData::err(&e);
+            }
+        }
+        rule.src_cidr = c;
+    }
+    if let Some(s) = req.dst_port_start {
+        rule.dst_port_start = s;
+    }
+    if let Some(e) = req.dst_port_end {
+        rule.dst_port_end = e;
+    }
+    match validate_firewall_ports(rule.dst_port_start, rule.dst_port_end) {
+        Ok((s, e)) => {
+            rule.dst_port_start = s;
+            rule.dst_port_end = e;
+        }
+        Err(e) => return ApiData::err(&e),
+    }
+    if let Some(en) = req.enabled {
+        rule.enabled = en;
+    }
+
+    this.db.update_vm_firewall_rule(&rule).await?;
+    apply_firewall(&this, vm.id).await?;
+
+    let updated = this.db.get_vm_firewall_rule(rule_id).await?;
+    ApiData::ok(ApiVmFirewallRule::from(updated))
+}
+
+/// Delete a firewall rule
+async fn v1_delete_firewall_rule(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, rule_id)): Path<(u64, u64)>,
+) -> ApiResult<()> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    let rule = this.db.get_vm_firewall_rule(rule_id).await?;
+    if rule.vm_id != vm.id {
+        return ApiData::err("Firewall rule does not belong to this VM");
+    }
+
+    this.db.delete_vm_firewall_rule(rule_id).await?;
+    apply_firewall(&this, vm.id).await?;
+    ApiData::ok(())
+}
+
+/// Queue a firewall re-apply job for the VM.
+async fn apply_firewall(this: &RouterState, vm_id: u64) -> Result<(), ApiError> {
+    this.work_sender
+        .send(WorkJob::ApplyVmFirewall { vm_id })
+        .await
+        .map_err(|e| ApiError::new(&format!("Failed to queue firewall update: {}", e)))?;
+    Ok(())
 }
 
 async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u64, Vm), ApiError> {

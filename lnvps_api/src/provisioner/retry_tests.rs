@@ -216,6 +216,8 @@ mod tests {
                 deleted: false,
                 ref_code: None,
                 disabled: false,
+                fw_policy_in: None,
+                fw_policy_out: None,
             })
             .await?;
 

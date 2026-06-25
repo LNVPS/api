@@ -23,6 +23,10 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::time::sleep;
 
+/// Comment prefix used to tag user-defined firewall rules (#36) on Proxmox so
+/// they can be identified and re-synced without disturbing system rules.
+const USER_FW_MARKER: &str = "lnvps-fw";
+
 #[derive(Clone)]
 pub struct ProxmoxClient {
     api: JsonApi,
@@ -868,6 +872,28 @@ impl ProxmoxClient {
             .await?;
         Ok(())
     }
+
+    /// Delete a VM firewall rule by its position
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/index.html#/nodes/{node}/qemu/{vmid}/firewall/rules/{pos}
+    pub async fn delete_vm_firewall_rule(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+        pos: i32,
+    ) -> OpResult<()> {
+        self.api
+            .req_status::<()>(
+                Method::DELETE,
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/firewall/rules/{}",
+                    node, vm_id, pos
+                ),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 impl ProxmoxClient {
@@ -876,6 +902,57 @@ impl ProxmoxClient {
             crate::settings::FirewallPolicy::Accept => VmFirewallPolicy::ACCEPT,
             crate::settings::FirewallPolicy::Reject => VmFirewallPolicy::REJECT,
             crate::settings::FirewallPolicy::Drop => VmFirewallPolicy::DROP,
+        }
+    }
+
+    /// Translate a user-defined per-VM default firewall policy into a Proxmox
+    /// policy value.
+    fn convert_vm_firewall_policy(policy: lnvps_db::VmFirewallPolicy) -> VmFirewallPolicy {
+        match policy {
+            lnvps_db::VmFirewallPolicy::Accept => VmFirewallPolicy::ACCEPT,
+            lnvps_db::VmFirewallPolicy::Drop => VmFirewallPolicy::DROP,
+            lnvps_db::VmFirewallPolicy::Reject => VmFirewallPolicy::REJECT,
+        }
+    }
+
+    /// Translate a user-defined DB firewall rule into a Proxmox PVE firewall rule.
+    ///
+    /// The rule is tagged with a [`USER_FW_MARKER`]-prefixed comment so it can be
+    /// identified and re-synced on subsequent applies without disturbing the
+    /// always-enforced ipfilter (anti-spoof) rule.
+    fn to_pve_firewall_rule(rule: &lnvps_db::VmFirewallRule) -> VmFirewallRule {
+        use lnvps_db::{VmFirewallDirection, VmFirewallProtocol, VmFirewallRuleAction};
+
+        let action = match rule.action {
+            VmFirewallRuleAction::Accept => VmFirewallAction::ACCEPT,
+            VmFirewallRuleAction::Drop => VmFirewallAction::DROP,
+            VmFirewallRuleAction::Reject => VmFirewallAction::REJECT,
+        };
+        let rule_type = match rule.direction {
+            VmFirewallDirection::Inbound => VmFirewallRuleType::In,
+            VmFirewallDirection::Outbound => VmFirewallRuleType::Out,
+        };
+        let proto = match rule.protocol {
+            VmFirewallProtocol::Any => None,
+            VmFirewallProtocol::Tcp => Some("tcp".to_string()),
+            VmFirewallProtocol::Udp => Some("udp".to_string()),
+            VmFirewallProtocol::Icmp => Some("icmp".to_string()),
+        };
+        let dport = match (rule.dst_port_start, rule.dst_port_end) {
+            (Some(s), Some(e)) if e != s => Some(format!("{}:{}", s, e)),
+            (Some(s), _) => Some(s.to_string()),
+            (None, _) => None,
+        };
+
+        VmFirewallRule {
+            action,
+            rule_type,
+            proto,
+            dport,
+            source: rule.src_cidr.clone(),
+            enable: Some(if rule.enabled { 1 } else { 0 }),
+            comment: Some(format!("{}:{}", USER_FW_MARKER, rule.id)),
+            ..Default::default()
         }
     }
 
@@ -1557,6 +1634,23 @@ impl VmHostClient for ProxmoxClient {
         }
 
         let fw_cfg = self.config.firewall_config.as_ref().unwrap();
+        // Per-VM default policy (user-configured) overrides the host default when
+        // set; otherwise fall back to the host-level configured policy.
+        let policy_in = cfg
+            .vm
+            .fw_policy_in
+            .map(Self::convert_vm_firewall_policy)
+            .or_else(|| fw_cfg.policy_in.as_ref().map(Self::convert_firewall_policy));
+        let policy_out = cfg
+            .vm
+            .fw_policy_out
+            .map(Self::convert_vm_firewall_policy)
+            .or_else(|| {
+                fw_cfg
+                    .policy_out
+                    .as_ref()
+                    .map(Self::convert_firewall_policy)
+            });
         // Use configured firewall options or disable firewall if no config
         let firewall_config = VmFirewallConfig {
             dhcp: fw_cfg.dhcp,
@@ -1564,11 +1658,8 @@ impl VmHostClient for ProxmoxClient {
             ip_filter: fw_cfg.ip_filter,
             mac_filter: fw_cfg.mac_filter,
             ndp: fw_cfg.ndp,
-            policy_in: fw_cfg.policy_in.as_ref().map(Self::convert_firewall_policy),
-            policy_out: fw_cfg
-                .policy_out
-                .as_ref()
-                .map(Self::convert_firewall_policy),
+            policy_in,
+            policy_out,
         };
 
         // Re-apply firewall configuration
@@ -1663,6 +1754,33 @@ impl VmHostClient for ProxmoxClient {
 
         if !rule_exists {
             self.add_vm_firewall_rule(&self.node, vm_id, allow_rule)
+                .await?;
+        }
+
+        // Sync user-defined firewall rules (#36).
+        // Remove any previously-applied user rules (tagged with USER_FW_MARKER),
+        // then re-add the current set. Deletion is done by position in
+        // descending order so positions don't shift mid-loop. PVE inserts new
+        // rules at the top, so we add in reverse priority order to preserve the
+        // intended top-to-bottom (priority ascending) evaluation order.
+        let current_rules = self.list_vm_firewall_rules(&self.node, vm_id).await?;
+        let mut stale_positions: Vec<i32> = current_rules
+            .iter()
+            .filter(|r| {
+                r.comment
+                    .as_deref()
+                    .map(|c| c.starts_with(USER_FW_MARKER))
+                    .unwrap_or(false)
+            })
+            .filter_map(|r| r.pos)
+            .collect();
+        stale_positions.sort_unstable_by(|a, b| b.cmp(a));
+        for pos in stale_positions {
+            self.delete_vm_firewall_rule(&self.node, vm_id, pos).await?;
+        }
+
+        for rule in cfg.firewall_rules.iter().rev() {
+            self.add_vm_firewall_rule(&self.node, vm_id, Self::to_pve_firewall_rule(rule))
                 .await?;
         }
 
@@ -2624,6 +2742,93 @@ mod tests {
         let vm = p.make_config(&cfg, None)?;
         assert_eq!(vm.cpu_limit, Some(0.5));
         Ok(())
+    }
+
+    #[test]
+    fn test_to_pve_firewall_rule_inbound_tcp_port_range() {
+        let rule = lnvps_db::VmFirewallRule {
+            id: 42,
+            vm_id: 1,
+            priority: 0,
+            direction: lnvps_db::VmFirewallDirection::Inbound,
+            protocol: lnvps_db::VmFirewallProtocol::Tcp,
+            action: lnvps_db::VmFirewallRuleAction::Accept,
+            src_cidr: Some("1.2.3.0/24".to_string()),
+            dst_port_start: Some(80),
+            dst_port_end: Some(443),
+            enabled: true,
+            created: Default::default(),
+            updated: Default::default(),
+        };
+        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
+        assert_eq!(pve.action, VmFirewallAction::ACCEPT);
+        assert_eq!(pve.rule_type, VmFirewallRuleType::In);
+        assert_eq!(pve.proto.as_deref(), Some("tcp"));
+        assert_eq!(pve.dport.as_deref(), Some("80:443"));
+        assert_eq!(pve.source.as_deref(), Some("1.2.3.0/24"));
+        assert_eq!(pve.enable, Some(1));
+        assert_eq!(pve.comment.as_deref(), Some("lnvps-fw:42"));
+    }
+
+    #[test]
+    fn test_to_pve_firewall_rule_outbound_any_single_port_disabled() {
+        let rule = lnvps_db::VmFirewallRule {
+            id: 7,
+            vm_id: 1,
+            priority: 3,
+            direction: lnvps_db::VmFirewallDirection::Outbound,
+            protocol: lnvps_db::VmFirewallProtocol::Any,
+            action: lnvps_db::VmFirewallRuleAction::Drop,
+            src_cidr: None,
+            dst_port_start: Some(53),
+            dst_port_end: None,
+            enabled: false,
+            created: Default::default(),
+            updated: Default::default(),
+        };
+        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
+        assert_eq!(pve.action, VmFirewallAction::DROP);
+        assert_eq!(pve.rule_type, VmFirewallRuleType::Out);
+        assert_eq!(pve.proto, None);
+        assert_eq!(pve.dport.as_deref(), Some("53"));
+        assert_eq!(pve.source, None);
+        assert_eq!(pve.enable, Some(0));
+    }
+
+    #[test]
+    fn test_to_pve_firewall_rule_reject_action() {
+        let rule = lnvps_db::VmFirewallRule {
+            id: 9,
+            vm_id: 1,
+            priority: 0,
+            direction: lnvps_db::VmFirewallDirection::Inbound,
+            protocol: lnvps_db::VmFirewallProtocol::Tcp,
+            action: lnvps_db::VmFirewallRuleAction::Reject,
+            src_cidr: None,
+            dst_port_start: Some(25),
+            dst_port_end: None,
+            enabled: true,
+            created: Default::default(),
+            updated: Default::default(),
+        };
+        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
+        assert_eq!(pve.action, VmFirewallAction::REJECT);
+    }
+
+    #[test]
+    fn test_convert_vm_firewall_policy() {
+        assert!(matches!(
+            ProxmoxClient::convert_vm_firewall_policy(lnvps_db::VmFirewallPolicy::Accept),
+            VmFirewallPolicy::ACCEPT
+        ));
+        assert!(matches!(
+            ProxmoxClient::convert_vm_firewall_policy(lnvps_db::VmFirewallPolicy::Drop),
+            VmFirewallPolicy::DROP
+        ));
+        assert!(matches!(
+            ProxmoxClient::convert_vm_firewall_policy(lnvps_db::VmFirewallPolicy::Reject),
+            VmFirewallPolicy::REJECT
+        ));
     }
 
     #[test]
