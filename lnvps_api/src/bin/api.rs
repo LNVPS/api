@@ -11,7 +11,7 @@ use lnvps_api_common::{VmStateCache, WorkJob, make_exchange_service};
 use std::fmt::{Display, Formatter};
 
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
-use log::{error, info};
+use log::{error, info, warn};
 use nostr_sdk::{Client, Keys};
 
 use axum::Router;
@@ -28,9 +28,11 @@ use tower_http::cors::CorsLayer;
 #[derive(Parser)]
 #[clap(about, version, author)]
 struct Args {
-    /// Path to the config file
+    /// Path to one or more config files. Files are layered in order, so values
+    /// in later files override earlier ones. Defaults to `config.yaml` when no
+    /// paths are given.
     #[clap(short, long)]
-    config: Option<PathBuf>,
+    config: Vec<PathBuf>,
 
     /// Where to write the log file
     #[clap(long)]
@@ -66,12 +68,27 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let mut tasks = Vec::new();
 
-    let settings: Settings = Config::builder()
-        .add_source(File::from(
-            args.config.unwrap_or(PathBuf::from("config.yaml")),
-        ))
-        .build()?
-        .try_deserialize()?;
+    let settings: Settings = {
+        let mut builder = Config::builder();
+        if args.config.is_empty() {
+            builder = builder.add_source(File::from(PathBuf::from("config.yaml")));
+        } else {
+            // Explicit files are layered in order; later files override earlier.
+            for path in &args.config {
+                builder = builder.add_source(File::from(path.clone()));
+            }
+        }
+        builder.build()?.try_deserialize()?
+    };
+
+    // Email verification gates VM ordering, but it can only be delivered over
+    // SMTP. When SMTP is unconfigured the verification requirement is skipped so
+    // ordering still works — warn so the operator knows this is in effect.
+    if settings.smtp.is_none() {
+        warn!(
+            "SMTP is not configured: email verification is disabled and VM ordering will not require a verified email"
+        );
+    }
 
     // Initialize encryption if configured
     if let Some(ref encryption_config) = settings.encryption {
@@ -192,13 +209,31 @@ async fn main() -> Result<(), Error> {
     }));
 
     #[cfg(feature = "nostr-dvm")]
-    {
-        let nostr_client = nostr_client.unwrap();
+    if let Some(nostr_client) = &nostr_client {
         tasks.push(start_dvms(nostr_client.clone(), sub_handler.clone()));
+    } else {
+        warn!("nostr-dvm feature is enabled but no nostr config is set; skipping DVMs");
     }
 
     // request for host info to be patched
     worker.send(WorkJob::PatchHosts).await?;
+
+    // Telegram bot poller completes account linking (single getUpdates consumer).
+    // Run it in API mode where account linking originates.
+    if mode.contains(&ExecMode::Api)
+        && let Some(tg) = &settings.telegram
+    {
+        let bot = lnvps_api::notifications::TelegramBot::new(
+            tg.token.clone(),
+            reqwest::Client::new(),
+            db.clone(),
+        );
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = bot.run().await {
+                error!("Telegram bot poller exited: {}", e);
+            }
+        }));
+    }
 
     if mode.contains(&ExecMode::Api) {
         let ip: SocketAddr = match &settings.listen {

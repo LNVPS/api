@@ -2,10 +2,11 @@ db: "mysql://root:root@localhost:3376/lnvps"
 lightning:
   lnd:
     url: "https://127.0.0.1:10003"
-    cert: "/home/kieran/.polar/networks/2/volumes/lnd/alice/tls.cert"
-    macaroon: "/home/kieran/.polar/networks/2/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
+    cert: "/home/kieran/.polar/networks/1/volumes/lnd/alice/tls.cert"
+    macaroon: "/home/kieran/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
 delete-after: 3
 public-url: "https://api.lnvps.net"
+read-only: false
 redis:
   url: "redis://localhost:6398"
   ttl: 30
@@ -14,7 +15,6 @@ encryption:
   auto-generate: true
 provisioner:
   proxmox:
-    read-only: false
     qemu:
       bios: "ovmf"
       machine: "q35"
@@ -23,8 +23,25 @@ provisioner:
       cpu: "host"
       vlan: 100
       kvm: false
+      arch: x86_64
 # Captcha is used in various places to prevent spam
 captcha:
   # Turnstile is a Cloudflare captcha product
   turnstile:
     secret-key: "1x0000000000000000000000000000000AA"
+# Telegram notification channel (optional). Create a bot via @BotFather.
+# When set, users can link their chat from account settings and receive
+# notifications via Telegram.
+#telegram:
+#  token: "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+#  username: "my_lnvps_bot"
+# WhatsApp notification channel (optional) via the Meta Cloud API.
+# Both templates must be approved and have a single body parameter {{1}}.
+#whatsapp:
+#  access-token: "EAAG..."
+#  phone-number-id: "1234567890"
+#  api-version: "v21.0"
+#  message-template: "lnvps_notification"
+#  message-template-lang: "en"
+#  verify-template: "lnvps_verification"
+#  verify-template-lang: "en"

@@ -10,7 +10,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **2026-06-23** - Documented the BGP session and tunnel field semantics in `ADMIN_API_ENDPOINTS.md` and rustdoc. Clarified that `enabled` (administrative on/off) and `state` (live BGP FSM state: `Idle`/`Connect`/`Active`/`OpenSent`/`OpenConfirm`/`Established`/`Down`) are independent — `"enabled": true` with `"state": "Down"` is administratively on but not yet up, not a contradiction. Also documented tunnel `"any"` endpoints and the `direction` classification.
 
+### Fixed
+
+- **2026-06-25** - Admin VM `template_id` is now `null` for custom-template VMs
+  - `AdminVmInfo.template_id` (returned by `GET /api/admin/v1/vms` and `GET /api/admin/v1/vms/{id}`) changed from `u64` to a nullable integer. VMs on a custom template previously reported `template_id: 0`; they now correctly report `template_id: null` (with the linked template carried by `custom_template_id`). Standard-template VMs are unaffected.
+
+- **2026-06-25** - Expired subscriptions are now handled even when expiry predates the last check
+  - The worker's `CheckSubscriptions` expiry handling previously only fired when a subscription crossed its expiry between two check cycles (`expires >= last_check`). Subscriptions that expired before the last check (admin/retroactive expiry, clock changes, or worker downtime) were left running until the grace period elapsed. The worker now fires the one-shot expiry handling (stop VM + notify) for any expired-but-in-grace subscription, using VM history as an idempotency marker so it still acts exactly once.
+
+### Changed
+
+- **2026-06-25** - Subscription payments now include the payment data needed to pay
+  - `ApiSubscriptionPayment` (returned by `GET /api/v1/subscriptions/{id}/renew`, `GET /api/v1/subscriptions/{id}/payments`, and the admin subscription-payment endpoints) gains a `data` field carrying the payment-method-specific data, e.g. `{ "lightning": "lnbc..." }` for Lightning. Previously the renew endpoint returned a payment record with no way to actually pay it.
+
+- **2026-06-25** - Email verification is only required to order a VM when SMTP is configured
+  - `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` previously always rejected orders from users without a verified email. The check is now skipped when the server has no `smtp` config (verification emails can't be sent), so ordering remains usable on installs without email. The API logs a startup warning when SMTP is unconfigured.
+
 ### Added
+
+- **2026-06-25** - List configured notification channels
+  - `GET /api/v1/notification/channels` — returns which notification channels are configured on this server so the UI can show/hide the relevant contact inputs. Response: `{ "nip17": boolean, "email": boolean, "telegram": boolean, "whatsapp": boolean }`. No authentication required.
 
 - **2026-06-24** - Basic per-VM firewall rules (user API)
   - `GET /api/v1/vm/{id}/firewall` — list a VM's firewall rules (ordered by `priority`).

@@ -42,6 +42,12 @@ pub struct Settings {
     /// Nostr config for sending DMs
     pub nostr: Option<NostrConfig>,
 
+    /// Telegram bot config for sending notifications
+    pub telegram: Option<TelegramConfig>,
+
+    /// WhatsApp Cloud API config for sending notifications
+    pub whatsapp: Option<WhatsAppConfig>,
+
     /// Config for accepting revolut payments
     pub revolut: Option<payments_rs::fiat::RevolutConfig>,
 
@@ -89,6 +95,42 @@ pub enum LightningConfig {
 pub struct NostrConfig {
     pub relays: Vec<String>,
     pub nsec: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TelegramConfig {
+    /// Bot API token from @BotFather
+    pub token: String,
+    /// Bot username (without @), used to build account-linking deep links
+    /// e.g. `https://t.me/<username>?start=<token>`
+    pub username: String,
+}
+
+fn default_whatsapp_api_version() -> String {
+    "v21.0".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WhatsAppConfig {
+    /// Permanent (or temporary) access token for the WhatsApp Cloud API
+    pub access_token: String,
+    /// Phone number ID of the sending WhatsApp business number
+    pub phone_number_id: String,
+    /// Graph API version, e.g. `v21.0`
+    #[serde(default = "default_whatsapp_api_version")]
+    pub api_version: String,
+    /// Approved template used to deliver notifications. Must have a single body
+    /// parameter `{{1}}` which receives the message text.
+    pub message_template: String,
+    /// Language code of the message template (e.g. `en`, `en_US`)
+    pub message_template_lang: String,
+    /// Approved template used to deliver verification codes. Must have a single
+    /// body parameter `{{1}}` which receives the code.
+    pub verify_template: String,
+    /// Language code of the verification template
+    pub verify_template_lang: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -294,6 +336,8 @@ pub fn mock_settings() -> Settings {
             api: DnsServerApi::Mock,
         }),
         nostr: None,
+        telegram: None,
+        whatsapp: None,
         revolut: None,
         tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
         nostr_address_host: None,

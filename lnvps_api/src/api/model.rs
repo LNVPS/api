@@ -76,6 +76,19 @@ pub struct AccountPatchRequest {
     pub email_verified: Option<bool>,
     pub contact_nip17: bool,
     pub contact_email: bool,
+    #[serde(default)]
+    pub contact_telegram: bool,
+    /// Whether a Telegram chat is linked (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub telegram_linked: Option<bool>,
+    #[serde(default)]
+    pub contact_whatsapp: bool,
+    /// The verified WhatsApp number, if any (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub whatsapp_number: Option<String>,
+    /// Whether the WhatsApp number is verified (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub whatsapp_verified: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -146,6 +159,11 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             email_verified: has_email.then_some(user.email_verified),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
+            contact_telegram: user.contact_telegram,
+            telegram_linked: Some(user.telegram_chat_id.is_some()),
+            contact_whatsapp: user.contact_whatsapp,
+            whatsapp_number: user.whatsapp_number.clone(),
+            whatsapp_verified: Some(user.whatsapp_verified),
             country_code: Some(user.country_code),
             name: Some(user.billing_name),
             address_1: Some(user.billing_address_1),
@@ -961,6 +979,9 @@ pub struct ApiSubscriptionPayment {
     pub paid_at: Option<DateTime<Utc>>,
     pub tax: ApiPrice,
     pub processing_fee: ApiPrice,
+    /// Payment-method-specific data needed to complete the payment
+    /// (e.g. the Lightning invoice for `payment_method == "lightning"`).
+    pub data: ApiPaymentData,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -992,6 +1013,36 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
         let tax = CurrencyAmount::from_u64(currency.into(), payment.tax);
         let processing_fee = CurrencyAmount::from_u64(currency.into(), payment.processing_fee);
 
+        // Surface the payment-method data (e.g. the Lightning invoice) so callers
+        // can actually pay. Non-lightning external data is best-effort parsed.
+        let data = match &payment.payment_method {
+            PaymentMethod::Lightning => {
+                ApiPaymentData::Lightning(payment.external_data.clone().into())
+            }
+            PaymentMethod::Revolut => {
+                #[derive(Deserialize)]
+                struct RevolutData {
+                    pub token: String,
+                }
+                let token = serde_json::from_str::<RevolutData>(payment.external_data.as_str())
+                    .map(|d| d.token)
+                    .unwrap_or_default();
+                ApiPaymentData::Revolut { token }
+            }
+            PaymentMethod::Stripe => {
+                #[derive(Deserialize)]
+                struct StripeData {
+                    pub session_id: String,
+                }
+                let session_id =
+                    serde_json::from_str::<StripeData>(payment.external_data.as_str())
+                        .map(|d| d.session_id)
+                        .unwrap_or_default();
+                ApiPaymentData::Stripe { session_id }
+            }
+            PaymentMethod::Paypal => ApiPaymentData::Lightning(String::new()),
+        };
+
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
@@ -1004,6 +1055,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             paid_at: payment.paid_at,
             tax: tax.into(),
             processing_fee: processing_fee.into(),
+            data,
         }
     }
 }

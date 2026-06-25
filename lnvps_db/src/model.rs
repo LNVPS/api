@@ -30,6 +30,22 @@ pub struct User {
     pub contact_nip17: bool,
     /// If user should be contacted via email for notifications
     pub contact_email: bool,
+    /// If user should be contacted via Telegram for notifications
+    pub contact_telegram: bool,
+    /// Telegram chat id to deliver messages to (set once the account is linked)
+    pub telegram_chat_id: Option<i64>,
+    /// One-time token used to link a Telegram chat to this account.
+    /// Empty/`None` once linking has completed.
+    pub telegram_link_token: Option<String>,
+    /// If user should be contacted via WhatsApp for notifications
+    pub contact_whatsapp: bool,
+    /// WhatsApp phone number in E.164 format (e.g. `+15551234567`)
+    pub whatsapp_number: Option<String>,
+    /// Whether the WhatsApp number has been verified
+    pub whatsapp_verified: bool,
+    /// Pending one-time verification code sent to the WhatsApp number.
+    /// `None` once verification has completed.
+    pub whatsapp_verify_code: Option<String>,
     /// Users country
     pub country_code: Option<String>,
     /// Name to show on invoices

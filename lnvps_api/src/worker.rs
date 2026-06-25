@@ -1,15 +1,14 @@
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
+use crate::notifications::{
+    Notification, NotificationChannel, build_channels, send_email,
+};
 use crate::provisioner::VmProvisioner;
-use crate::settings::{ProvisionerConfig, Settings, SmtpConfig};
+use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig, WhatsAppConfig};
 use crate::ssh_client::SshClient;
 use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Datelike, Days, TimeDelta, Utc};
+use chrono::{DateTime, Days, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
-use lettre::AsyncTransport;
-use lettre::message::{MessageBuilder, MultiPart};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, Tokio1Executor};
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
@@ -19,10 +18,11 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionType, Vm, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    SubscriptionLineItem, SubscriptionType, Vm, VmHistoryActionType, VmHost, VmHostKind,
+    VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
-use nostr_sdk::{Client, EventBuilder, PublicKey, ToBech32};
+use nostr_sdk::{Client, PublicKey, ToBech32};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -99,7 +99,7 @@ pub struct Worker {
     settings: WorkerSettings,
     db: Arc<dyn LNVpsDb>,
     subscription_handler: SubscriptionHandler,
-    nostr: Option<Client>,
+    notification_channels: Vec<Arc<dyn NotificationChannel>>,
     vm_history_logger: VmHistoryLogger,
     vm_state_cache: VmStateCache,
     work_commander: Arc<dyn WorkCommander>,
@@ -112,6 +112,8 @@ pub struct Worker {
 pub struct WorkerSettings {
     pub delete_after: u16,
     pub smtp: Option<SmtpConfig>,
+    pub telegram: Option<TelegramConfig>,
+    pub whatsapp: Option<WhatsAppConfig>,
     pub provisioner_config: ProvisionerConfig,
     pub redis: Option<RedisConfig>,
     pub nostr_hostname: Option<String>,
@@ -122,6 +124,8 @@ impl From<&Settings> for WorkerSettings {
         WorkerSettings {
             delete_after: val.delete_after,
             smtp: val.smtp.clone(),
+            telegram: val.telegram.clone(),
+            whatsapp: val.whatsapp.clone(),
             provisioner_config: val.provisioner.clone(),
             redis: val.redis.clone(),
             nostr_hostname: val.nostr_address_host.clone(),
@@ -158,11 +162,13 @@ impl Worker {
             .timeout(Duration::from_secs(10))
             .build()?;
 
+        let notification_channels = build_channels(&settings, nostr.as_ref(), &http_client);
+
         Ok(Self {
             db,
             subscription_handler,
             vm_state_cache,
-            nostr,
+            notification_channels,
             kv,
             feedback,
             vm_history_logger,
@@ -240,8 +246,15 @@ impl Worker {
         let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
         // --- Expiring soon ---
-        let expiry_window = Utc::now().add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
-        if expires < expiry_window
+        // Only subscriptions that have NOT yet expired can be "expiring soon".
+        // The `expires > now` guard is important: without it, an already-expired
+        // subscription would wrongly match this branch whenever `last_check` is
+        // stale (e.g. a freshly-started worker whose last check defaults to the
+        // unix epoch), starving the expired/grace branches below.
+        let now = Utc::now();
+        let expiry_window = now.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
+        if expires > now
+            && expires < expiry_window
             && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS))
         {
             // Track whether NWC auto-renewal was attempted and succeeded (so we skip the
@@ -331,32 +344,83 @@ impl Worker {
                     Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
-        } else if expires < Utc::now() && expires >= last_check {
-            // Edge-triggered: only fire on the first check after expiry crosses. The
-            // subscription stays `is_active = 1` (and thus keeps being returned by
-            // `list_lifecycle_subscriptions`) throughout the grace period until it is either
-            // renewed or the grace branch above deactivates it. Without the `expires >=
-            // last_check` guard this branch re-ran every CheckSubscriptions cycle (~30s),
-            // re-stopping the VM and re-sending the "expired" notification on a loop.
-            self.queue_notification(
-                sub.user_id,
-                format!("Your subscription has expired.\n{}", sub_notification_descr),
-                Some(format!("[{}] Expired", sub_notification_subject)),
-            )
-            .await;
-            for li in &line_items {
-                match self.subscription_handler.make_line_item_handler(li).await {
-                    Ok(h) => {
-                        if let Err(e) = h.on_expired(sub, li).await {
-                            warn!("on_expired failed for line item {}: {}", li.id, e);
+        } else if expires < Utc::now() {
+            // Subscription is expired but still within the grace window. Fire the
+            // "expired" handling exactly once.
+            //
+            // For a real-time crossing this is the first check after `expires`
+            // (`expires >= last_check`). For subscriptions that expired *before*
+            // `last_check` — retroactive/admin expiry, clock changes, or worker
+            // downtime — the simple `expires >= last_check` edge guard would never
+            // fire, leaving the VM running until the grace period elapsed. We instead
+            // detect whether the expiry was already handled (via VM history) so we act
+            // once rather than re-stopping/re-notifying every CheckSubscriptions cycle.
+            let already_handled = self
+                .subscription_expiry_already_handled(sub, &line_items, last_check)
+                .await;
+            if !already_handled {
+                self.queue_notification(
+                    sub.user_id,
+                    format!("Your subscription has expired.\n{}", sub_notification_descr),
+                    Some(format!("[{}] Expired", sub_notification_subject)),
+                )
+                .await;
+                for li in &line_items {
+                    match self.subscription_handler.make_line_item_handler(li).await {
+                        Ok(h) => {
+                            if let Err(e) = h.on_expired(sub, li).await {
+                                warn!("on_expired failed for line item {}: {}", li.id, e);
+                            }
                         }
+                        Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                     }
-                    Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Whether the one-shot "expired" handling for `sub` has already run.
+    ///
+    /// VPS line items are authoritative: a VM-history `Expired` entry recorded at
+    /// or after the subscription's `expires` means we already stopped/notified, so
+    /// the worker must not fire again. For subscriptions without a VPS line item we
+    /// fall back to the edge-trigger semantics (`expires < last_check` ⇒ a previous
+    /// cycle handled it) since there is no VM history to consult.
+    async fn subscription_expiry_already_handled(
+        &self,
+        sub: &Subscription,
+        line_items: &[SubscriptionLineItem],
+        last_check: DateTime<Utc>,
+    ) -> bool {
+        let Some(expires) = sub.expires else {
+            return true;
+        };
+        let mut has_vps = false;
+        for li in line_items {
+            if li.subscription_type != SubscriptionType::Vps {
+                continue;
+            }
+            has_vps = true;
+            let Ok(vm) = self.db.get_vm_by_line_item(li.id).await else {
+                continue;
+            };
+            if let Ok(history) = self.db.list_vm_history(vm.id).await
+                && history.iter().any(|h| {
+                    matches!(h.action_type, VmHistoryActionType::Expired) && h.timestamp >= expires
+                })
+            {
+                return true;
+            }
+        }
+        if has_vps {
+            // VPS line item(s) present but no Expired entry yet — not handled.
+            false
+        } else {
+            // No VM history to consult; approximate prior handling with the edge guard.
+            expires < last_check
+        }
     }
 
     /// Get the subscription notification subject line
@@ -958,61 +1022,6 @@ impl Worker {
         Ok(())
     }
 
-    /// Shared function for sending an email via SMTP using the HTML email template.
-    /// If `html_message` is provided, it will be used in the HTML template instead of `plain_message`.
-    /// Returns `OpError::Fatal` for permanent SMTP errors (5xx) and `OpError::Transient` for temporary failures.
-    async fn send_email(
-        smtp: &SmtpConfig,
-        to: &str,
-        subject: &str,
-        plain_message: &str,
-        html_message: Option<&str>,
-    ) -> Result<(), OpError<anyhow::Error>> {
-        #[derive(serde::Serialize)]
-        struct EmailData {
-            message: String,
-            year: String,
-        }
-        let template = mustache::compile_str(include_str!("../email.html"))
-            .map_err(|e| OpError::Fatal(e.into()))?;
-        let data = EmailData {
-            message: html_message.unwrap_or(plain_message).to_string(),
-            year: Utc::now().year().to_string(),
-        };
-        let rendered = template
-            .render_to_string(&data)
-            .map_err(|e| OpError::Fatal(e.into()))?;
-        let html = MultiPart::alternative_plain_html(plain_message.to_string(), rendered);
-        let mut b = MessageBuilder::new()
-            .to(to
-                .parse()
-                .map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?)
-            .subject(subject);
-        if let Some(f) = &smtp.from {
-            b = b.from(
-                f.parse()
-                    .map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?,
-            );
-        }
-        let msg = b.multipart(html).map_err(|e| OpError::Fatal(e.into()))?;
-        let sender = AsyncSmtpTransport::<Tokio1Executor>::relay(&smtp.server)
-            .map_err(|e| OpError::Transient(e.into()))?
-            .credentials(Credentials::new(
-                smtp.username.to_string(),
-                smtp.password.to_string(),
-            ))
-            .timeout(Some(Duration::from_secs(10)))
-            .build();
-        sender.send(msg).await.map_err(|e| {
-            if e.is_permanent() {
-                OpError::Fatal(e.into())
-            } else {
-                OpError::Transient(e.into())
-            }
-        })?;
-        Ok(())
-    }
-
     async fn send_notification(
         &self,
         user_id: u64,
@@ -1020,31 +1029,22 @@ impl Worker {
         title: Option<String>,
     ) -> Result<()> {
         let user = self.db.get_user(user_id).await?;
-        if let Some(smtp) = self.settings.smtp.as_ref()
-            && user.contact_email
-            && !user.email.is_empty()
-        {
-            let to = user.email.as_str().to_string();
-            let subject = title.as_deref().unwrap_or("Notification");
-            if let Err(e) = Self::send_email(smtp, &to, subject, &message, None).await {
+        let notification = Notification::new(title, message);
+        for channel in &self.notification_channels {
+            if !channel.wants(&user) {
+                continue;
+            }
+            if let Err(e) = channel.send(&user, &notification).await {
                 match e {
-                    OpError::Fatal(e) => warn!("Permanent email error to {}, skipping: {}", to, e),
+                    OpError::Fatal(e) => warn!(
+                        "Permanent {} notification error for user {}, skipping: {}",
+                        channel.name(),
+                        user_id,
+                        e
+                    ),
                     OpError::Transient(e) => return Err(e),
                 }
             }
-        }
-        if user.contact_nip17
-            && let Some(c) = self.nostr.as_ref()
-        {
-            let sig = c.signer().await?;
-            let ev = EventBuilder::private_msg(
-                &sig,
-                PublicKey::from_slice(&user.pubkey)?,
-                message,
-                None,
-            )
-            .await?;
-            c.send_event(&ev).await?;
         }
         Ok(())
     }
@@ -1073,7 +1073,7 @@ impl Worker {
             r#"Please verify your email address by clicking the link below:<br><br><a href="{}">Verify Email Address</a>"#,
             verify_url
         );
-        Self::send_email(
+        send_email(
             smtp,
             user.email.as_str(),
             "Verify your email address",

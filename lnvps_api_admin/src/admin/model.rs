@@ -368,8 +368,8 @@ pub struct AdminVmInfo {
     pub image_id: u64,
     /// OS Image name/version with distribution (e.g., "Ubuntu 22.04 Server")
     pub image_name: String,
-    /// Template ID for linking (standard template if used)
-    pub template_id: u64,
+    /// Template ID for linking (standard template if used; `null` for custom templates)
+    pub template_id: Option<u64>,
     /// Template name (simplified, no cost details)
     pub template_name: String,
     /// Custom template ID for linking (custom template if used)
@@ -459,7 +459,7 @@ impl AdminVmInfo {
         ) = if let Some(template_id) = vm.template_id {
             let template = db.get_vm_template(template_id).await?;
             (
-                template_id,
+                Some(template_id),
                 template.name.clone(),
                 None,
                 true,
@@ -488,7 +488,7 @@ impl AdminVmInfo {
             let custom_template = db.get_custom_vm_template(custom_template_id).await?;
             let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
             (
-                0, // No standard template ID
+                None, // No standard template ID
                 format!("Custom - {}", pricing.name),
                 Some(custom_template_id),
                 false,
@@ -515,7 +515,7 @@ impl AdminVmInfo {
             )
         } else {
             (
-                0,
+                None,
                 "Unknown".to_string(),
                 None,
                 true,
