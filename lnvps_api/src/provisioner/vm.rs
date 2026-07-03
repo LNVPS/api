@@ -36,6 +36,7 @@ pub struct VmProvisioner {
     pub network: VmNetworkProvisioner,
     provisioner_config: ProvisionerConfig,
     pub delete_after: u16,
+    pub delete_after_daily: u16,
 }
 
 impl VmProvisioner {
@@ -55,6 +56,7 @@ impl VmProvisioner {
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
             delete_after: settings.delete_after,
+            delete_after_daily: settings.delete_after_daily,
             db,
         }
     }

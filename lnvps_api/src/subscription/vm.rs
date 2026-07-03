@@ -7,8 +7,8 @@ use lnvps_api_common::{
     WorkJob,
 };
 use lnvps_db::{
-    LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    SubscriptionType, Vm,
+    IntervalType, LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentType, SubscriptionType, Vm,
 };
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -200,13 +200,17 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
 
     async fn on_expired(
         &self,
-        _sub: &Subscription,
+        sub: &Subscription,
         line_item: &SubscriptionLineItem,
     ) -> Result<()> {
         // skip anything that isn't the vm line item (skip upgrade lines)
         if line_item.subscription_type != SubscriptionType::Vps {
             return Ok(());
         }
+        let grace_days = match sub.interval_type {
+            IntervalType::Day => self.provisioner.delete_after_daily,
+            IntervalType::Month | IntervalType::Year => self.provisioner.delete_after,
+        };
         info!("Stopping expired VM {}", self.vm.id);
         // Stop is best-effort (the host may be unreachable or the VM already
         // stopped), but the history entry must always be written: it is the
@@ -225,7 +229,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             self.vm.user_id,
             format!(
                 "Your VM #{} has expired and has been stopped.\n\nPlease renew your subscription within {} day(s) to restore access. If not renewed, the VM and all its data will be permanently deleted.",
-                self.vm.id, self.provisioner.delete_after
+                self.vm.id, grace_days
             ),
             Some(format!("[VM{}] Expired", self.vm.id)),
         ).await;

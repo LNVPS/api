@@ -111,6 +111,7 @@ pub struct Worker {
 #[derive(Clone)]
 pub struct WorkerSettings {
     pub delete_after: u16,
+    pub delete_after_daily: u16,
     pub smtp: Option<SmtpConfig>,
     pub telegram: Option<TelegramConfig>,
     pub whatsapp: Option<WhatsAppConfig>,
@@ -123,6 +124,7 @@ impl From<&Settings> for WorkerSettings {
     fn from(val: &Settings) -> Self {
         WorkerSettings {
             delete_after: val.delete_after,
+            delete_after_daily: val.delete_after_daily,
             smtp: val.smtp.clone(),
             telegram: val.telegram.clone(),
             whatsapp: val.whatsapp.clone(),
@@ -316,7 +318,7 @@ impl Worker {
                 )
                 .await;
             }
-        } else if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
+        } else if expires.add(Days::new(self.grace_period_days(sub) as u64)) < Utc::now() {
             // mark subscription as not-active
             let mut sub = sub.clone();
             sub.is_active = false;
@@ -379,6 +381,16 @@ impl Worker {
         }
 
         Ok(())
+    }
+
+    /// Grace period (in days) for a subscription, based on billing interval.
+    /// Daily-billed subscriptions get a shorter grace window (default: 1 day).
+    /// Monthly/yearly billed subscriptions use the standard `delete_after` (default: 3 days).
+    fn grace_period_days(&self, sub: &Subscription) -> u16 {
+        match sub.interval_type {
+            IntervalType::Day => self.settings.delete_after_daily,
+            IntervalType::Month | IntervalType::Year => self.settings.delete_after,
+        }
     }
 
     /// Whether the one-shot "expired" handling for `sub` has already run.
