@@ -33,10 +33,6 @@ pub struct Settings {
     /// Number of days after an expired VM is deleted (monthly/yearly billing)
     pub delete_after: u16,
 
-    /// Number of days after an expired daily-billed VM is deleted
-    #[serde(default = "default_delete_after_daily")]
-    pub delete_after_daily: u16,
-
     /// SMTP settings for sending emails
     pub smtp: Option<SmtpConfig>,
 
@@ -113,10 +109,6 @@ pub struct TelegramConfig {
 
 fn default_whatsapp_api_version() -> String {
     "v21.0".to_string()
-}
-
-fn default_delete_after_daily() -> u16 {
-    1
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -338,7 +330,6 @@ pub fn mock_settings() -> Settings {
             libvirt: None,
         },
         delete_after: 0,
-        delete_after_daily: 0,
         smtp: None,
         dns: Some(DnsServerConfig {
             forward_zone_id: "mock-forward-zone-id".to_string(),
