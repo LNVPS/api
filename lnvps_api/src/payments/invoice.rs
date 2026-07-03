@@ -393,4 +393,179 @@ mod tests {
 
         Ok(())
     }
+
+    /// regression: renew_amount must credit the correct VM when VM ID != subscription ID.
+    /// Before #152, the LNURL-pay callback passed vm_line.subscription_id to renew_amount(),
+    /// which expects a VM ID — causing payments to land on whichever VM shared the numeric
+    /// subscription ID rather than the VM whose LNURL link was scanned.
+    #[tokio::test]
+    async fn test_renew_amount_uses_vm_id_not_subscription_id() -> Result<()> {
+        use lnvps_api_common::Ticker;
+        use lnvps_db::{LNVpsDbBase, UserSshKey};
+
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(Ticker::btc_rate("EUR")?, 100_000.0)
+            .await;
+
+        // Create a user
+        let pubkey: [u8; 32] = [3u8; 32];
+        let user_id = db.upsert_user(&pubkey).await?;
+
+        // Create SSH key (FK requirement)
+        let ssh_key_id = db
+            .insert_user_ssh_key(&UserSshKey {
+                id: 0,
+                name: "test".to_string(),
+                user_id,
+                created: Utc::now(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await?;
+
+        // --- Create TWO subscriptions with TWO VMs so IDs diverge ---
+        let (sub1_id, li1_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "sub1".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::Vps,
+                    name: "vm1 renewal".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let (sub2_id, li2_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "sub2".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::Vps,
+                    name: "vm2 renewal".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        // Insert VMs with different subscription line items
+        let vm1_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id,
+                image_id: 1,
+                template_id: Some(1),
+                custom_template_id: None,
+                subscription_line_item_id: li1_ids[0],
+                ssh_key_id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:01".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+
+        let vm2_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id,
+                image_id: 1,
+                template_id: Some(1),
+                custom_template_id: None,
+                subscription_line_item_id: li2_ids[0],
+                ssh_key_id,
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:02".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+
+        // The IDs must be divergent for this test to be meaningful
+        assert_ne!(
+            vm1_id, sub1_id,
+            "VM1 ID ({vm1_id}) must differ from its subscription ID ({sub1_id})"
+        );
+
+        let sub_handler = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node.clone(),
+            rates,
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )?;
+
+        // Call renew_amount with VM1's VM ID — correct usage after the fix.
+        // The resulting payment's subscription_id MUST match VM1's subscription (sub1),
+        // not some other subscription. If subscription_id were passed instead of vm_id,
+        // the lookup would go to the wrong VM and derive the wrong subscription_id.
+        let payment = sub_handler
+            .renew_amount(
+                vm1_id,
+                CurrencyAmount::millisats(100_000_000),
+                PaymentMethod::Lightning,
+            )
+            .await?;
+
+        // The payment must be associated with VM1's subscription, not VM2's
+        assert_eq!(
+            payment.subscription_id, sub1_id,
+            "payment.subscription_id should be {sub1_id} (VM1's subscription), got {} (would mean wrong VM was credited)",
+            payment.subscription_id
+        );
+        assert_ne!(
+            payment.subscription_id, sub2_id,
+            "payment.subscription_id must NOT be {sub2_id} (VM2's subscription)"
+        );
+
+        // Also verify the payment references the correct user
+        assert_eq!(payment.user_id, user_id);
+
+        Ok(())
+    }
 }
