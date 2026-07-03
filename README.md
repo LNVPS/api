@@ -102,10 +102,8 @@ public-url: "https://api.example.com"
 # HTTP listen address (default: 0.0.0.0:8000)
 listen: "0.0.0.0:8000"
 
-# Days after VM expiry before hard deletion (monthly/yearly billing)
+# Days after VM expiry before hard deletion
 delete-after: 3
-# Days after VM expiry before hard deletion (daily-billed VMs)
-delete-after-daily: 1
 
 # Prevent VM creation/deletion
 read-only: false
