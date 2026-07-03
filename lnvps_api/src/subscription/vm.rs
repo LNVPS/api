@@ -2,6 +2,7 @@ use crate::provisioner::VmProvisioner;
 use crate::subscription::SubscriptionLineItemHandler;
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Utc;
 use lnvps_api_common::{
     UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
     WorkJob,
@@ -207,7 +208,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         if line_item.subscription_type != SubscriptionType::Vps {
             return Ok(());
         }
-        let grace_days = crate::worker::grace_period_days_for_sub(sub, self.provisioner.delete_after);
+        let grace_days = crate::worker::grace_period_days_for_sub(sub, Utc::now(), self.provisioner.delete_after);
         info!("Stopping expired VM {}", self.vm.id);
         // Stop is best-effort (the host may be unreachable or the VM already
         // stopped), but the history entry must always be written: it is the

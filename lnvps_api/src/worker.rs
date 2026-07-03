@@ -381,49 +381,45 @@ impl Worker {
         Ok(())
     }
 
-/// Grace period (days) for a subscription, tiered by billing interval length.
-/// Shorter billing cycles get shorter grace windows so resources aren't held open
-/// for days after a single-day VM expires.
+/// Grace period (days) for a subscription, tiered by how long the subscription
+/// has existed (age-based). Newer subscriptions get shorter grace windows so
+/// resources aren't held open for days after a brand-new VM expires.
 ///
-/// | Billing interval (days) | Grace (days) |
-/// |-------------------------|---------------|
-/// | ≤ 1                     | 1             |
-/// | ≤ 7                     | 2             |
-/// | ≤ 28                    | 7             |
-/// | ≤ 180                   | 14            |
-/// | > 180                   | delete_after  |
-pub fn grace_period_days_for_sub(sub: &Subscription, delete_after: u16) -> u16 {
-    let interval_days = match sub.interval_type {
-        IntervalType::Day => sub.interval_amount,
-        IntervalType::Month => sub.interval_amount * 30,
-        IntervalType::Year => sub.interval_amount * 365,
-    };
-    if interval_days <= 1 {
+/// | Age (days) | Grace (days) |
+/// |------------|---------------|
+/// | ≤ 1        | 1             |
+/// | ≤ 7        | 2             |
+/// | ≤ 28       | 7             |
+/// | ≤ 180      | 14            |
+/// | > 180      | delete_after  |
+pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_after: u16) -> u16 {
+    let age_days = (now - sub.created).num_days().max(0);
+    if age_days <= 1 {
         1
-    } else if interval_days <= 7 {
+    } else if age_days <= 7 {
         2
-    } else if interval_days <= 28 {
+    } else if age_days <= 28 {
         7
-    } else if interval_days <= 180 {
+    } else if age_days <= 180 {
         14
     } else {
         delete_after
     }
 }
 
-    /// Grace period (in days) for a subscription, tiered by billing interval length.
-    /// Shorter billing cycles get shorter grace windows so resources aren't held open
-    /// for days after a single-day VM expires.
+    /// Grace period (in days) for a subscription, tiered by subscription age.
+    /// Newer subscriptions get shorter grace windows so resources aren't held open
+    /// for days after a brand-new VM expires.
     ///
-    /// | Billing interval (days) | Grace (days) |
-    /// |-------------------------|---------------|
-    /// | ≤ 1                     | 1             |
-    /// | ≤ 7                     | 2             |
-    /// | ≤ 28                    | 7             |
-    /// | ≤ 180                   | 14            |
-    /// | > 180                   | delete_after  |
+    /// | Age (days) | Grace (days) |
+    /// |------------|---------------|
+    /// | ≤ 1        | 1             |
+    /// | ≤ 7        | 2             |
+    /// | ≤ 28       | 7             |
+    /// | ≤ 180      | 14            |
+    /// | > 180      | delete_after  |
     fn grace_period_days(&self, sub: &Subscription) -> u16 {
-        grace_period_days_for_sub(sub, self.settings.delete_after)
+        grace_period_days_for_sub(sub, Utc::now(), self.settings.delete_after)
     }
 
     /// Whether the one-shot "expired" handling for `sub` has already run.
