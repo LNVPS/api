@@ -914,19 +914,10 @@ async fn v1_renew_vm_lnurlp(
         }
         .into());
     }
-    let vm_line = this
-        .db
-        .get_subscription_line_item(vm.subscription_line_item_id)
-        .await
-        .map_err(|_| {
-            Json(lnurl::Response::Error {
-                reason: "VM not found".to_string(),
-            })
-        })?;
     let rsp = this
         .sub_handler
         .renew_amount(
-            vm_line.subscription_id,
+            id,
             CurrencyAmount::millisats(q.amount),
             PaymentMethod::Lightning,
         )
