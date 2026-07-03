@@ -381,6 +381,8 @@ impl Worker {
         Ok(())
     }
 
+}
+
 /// Grace period (days) for a subscription, tiered by how long the subscription
 /// has existed (age-based). Newer subscriptions get shorter grace windows so
 /// resources aren't held open for days after a brand-new VM expires.
@@ -406,6 +408,8 @@ pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_
         delete_after
     }
 }
+
+impl Worker {
 
     /// Grace period (in days) for a subscription, tiered by subscription age.
     /// Newer subscriptions get shorter grace windows so resources aren't held open
