@@ -316,7 +316,7 @@ impl Worker {
                 )
                 .await;
             }
-        } else if expires.add(Days::new(self.settings.delete_after as u64)) < Utc::now() {
+        } else if expires.add(Days::new(self.grace_period_days(sub) as u64)) < Utc::now() {
             // mark subscription as not-active
             let mut sub = sub.clone();
             sub.is_active = false;
@@ -379,6 +379,51 @@ impl Worker {
         }
 
         Ok(())
+    }
+
+}
+
+/// Grace period (days) for a subscription, tiered by how long the subscription
+/// has existed (age-based). Newer subscriptions get shorter grace windows so
+/// resources aren't held open for days after a brand-new VM expires.
+///
+/// | Age (days) | Grace (days) |
+/// |------------|---------------|
+/// | ≤ 1        | 1             |
+/// | ≤ 7        | 2             |
+/// | ≤ 28       | 7             |
+/// | ≤ 180      | 14            |
+/// | > 180      | delete_after  |
+pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_after: u16) -> u16 {
+    let age_days = (now - sub.created).num_days().max(0);
+    if age_days <= 1 {
+        1
+    } else if age_days <= 7 {
+        2
+    } else if age_days <= 28 {
+        7
+    } else if age_days <= 180 {
+        14
+    } else {
+        delete_after
+    }
+}
+
+impl Worker {
+
+    /// Grace period (in days) for a subscription, tiered by subscription age.
+    /// Newer subscriptions get shorter grace windows so resources aren't held open
+    /// for days after a brand-new VM expires.
+    ///
+    /// | Age (days) | Grace (days) |
+    /// |------------|---------------|
+    /// | ≤ 1        | 1             |
+    /// | ≤ 7        | 2             |
+    /// | ≤ 28       | 7             |
+    /// | ≤ 180      | 14            |
+    /// | > 180      | delete_after  |
+    fn grace_period_days(&self, sub: &Subscription) -> u16 {
+        grace_period_days_for_sub(sub, Utc::now(), self.settings.delete_after)
     }
 
     /// Whether the one-shot "expired" handling for `sub` has already run.

@@ -30,7 +30,7 @@ pub struct Settings {
     /// Provisioning profiles
     pub provisioner: ProvisionerConfig,
 
-    /// Number of days after an expired VM is deleted
+    /// Number of days after an expired VM is deleted (monthly/yearly billing)
     pub delete_after: u16,
 
     /// SMTP settings for sending emails
