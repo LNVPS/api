@@ -79,6 +79,7 @@ isocountry = "0.3"
 hickory-resolver = "0.26"
 humantime = "2.2"
 lightning-invoice = "0.34"
+regex = "1"
 
 # nostr (for signing agreements)
 nostr = { version = "0.44", default-features = false, features = ["std"] }

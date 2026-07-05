@@ -22,12 +22,20 @@
 //! subscription to credit is therefore exactly `N`, and the intended VM is
 //! `get_vm_by_subscription(N)`.
 //!
-//! ## Why the `--before` cutoff matters
+//! ## Why the time window matters
 //!
-//! After the fix, the same memo carries a real VM id rather than a subscription id, so
-//! post-fix topups must NOT be re-pointed. We therefore only consider payments created
-//! before the fix went live. The default cutoff is the PR #152 merge date; override it
-//! with `--before` to match the actual production deploy time.
+//! The bug only existed between commit f104ada (2026-03-10, which changed the LNURL
+//! callback to pass `subscription_id`) and the fix in d9b0cd4 (2026-07-03). OUTSIDE that
+//! window the memo number `N` is a real VM id, not a subscription id:
+//!
+//!   * Before 2026-03-10 the callback correctly passed the VM id, so `N` is a VM id and
+//!     the topup was credited correctly. Re-pointing these would move funds to an
+//!     unrelated VM — potentially a different user's VM (verified against production).
+//!   * After the fix `N` is again a real VM id.
+//!
+//! We therefore ONLY consider payments created within `[--after, --before)`. The defaults
+//! are the bug-introduction and fix commit dates; override them to match the actual
+//! production deploy times of those two commits for full precision.
 //!
 //! ## Actions
 //!
@@ -50,15 +58,30 @@ use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use lnvps_api::settings::Settings;
 use lnvps_db::{
     EncryptionContext, LNVpsDb, LNVpsDbMysql, PaymentMethod, SubscriptionPayment,
+    SubscriptionPaymentType,
 };
 use log::{info, warn};
+use regex::Regex;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-/// Default cutoff: the merge date of PR #152 (the fix). Only payments created
-/// strictly before this instant are considered. Override with `--before` to
-/// match the real production deploy time.
+/// Captures the first number following `VM` in a topup memo, regardless of the
+/// exact wording in between. This tolerates the different historical memo
+/// formats (`"VM renewal {N} to ..."`, `"Renew VM {N}"`, `"Extend VM {N}"`,
+/// `"VM {N}"`). Memos without a `VM <number>` (e.g. `"Subscription renewal: ..."`)
+/// don't match. Upgrade/purchase memos are excluded separately by payment type.
+static TOPUP_MEMO_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"VM[^0-9]*([0-9]+)").expect("valid regex"));
+
+/// Lower bound of the bug window: commit f104ada (2026-03-10) first introduced
+/// the `renew_amount(subscription_id)` mistake. Topups created before this were
+/// credited correctly. Override with `--after` to match the deploy time.
+const DEFAULT_AFTER: &str = "2026-03-10T00:00:00Z";
+
+/// Upper bound of the bug window: the fix (d9b0cd4 / PR #152, 2026-07-03).
+/// Only payments created strictly before this instant are considered. Override
+/// with `--before` to match the real production deploy time.
 const DEFAULT_BEFORE: &str = "2026-07-03T00:00:00Z";
 
 #[derive(Parser)]
@@ -69,8 +92,13 @@ struct Args {
     #[clap(short, long)]
     config: Vec<PathBuf>,
 
-    /// Only consider payments created strictly before this RFC3339 timestamp.
-    /// Defaults to the PR #152 merge date.
+    /// Only consider payments created at or after this RFC3339 timestamp
+    /// (lower bound of the bug window). Defaults to the bug-introduction date.
+    #[clap(long, default_value = DEFAULT_AFTER)]
+    after: String,
+
+    /// Only consider payments created strictly before this RFC3339 timestamp
+    /// (upper bound of the bug window). Defaults to the fix date.
     #[clap(long, default_value = DEFAULT_BEFORE)]
     before: String,
 
@@ -83,9 +111,12 @@ struct Args {
 /// returning `N` (the intended subscription id). Returns `None` for any other
 /// memo (e.g. normal subscription renewals or description-hash invoices).
 fn parse_topup_memo(memo: &str) -> Option<u64> {
-    let rest = memo.strip_prefix("VM renewal ")?;
-    let (num, _) = rest.split_once(" to ")?;
-    num.trim().parse::<u64>().ok()
+    TOPUP_MEMO_RE
+        .captures(memo)?
+        .get(1)?
+        .as_str()
+        .parse::<u64>()
+        .ok()
 }
 
 /// Extract the plaintext description from a stored BOLT11 payment request.
@@ -104,20 +135,23 @@ mod tests {
 
     #[test]
     fn parses_topup_memo() {
-        // Real format: format!("VM renewal {vm_id} to {}", p.new_expiry)
+        // Current format: format!("VM renewal {vm_id} to {}", p.new_expiry)
         assert_eq!(
             parse_topup_memo("VM renewal 42 to 2026-08-01 00:00:00 UTC"),
             Some(42)
         );
-        assert_eq!(parse_topup_memo("VM renewal 1 to whenever"), Some(1));
+        // First number after VM wins (not the year in the expiry).
+        assert_eq!(parse_topup_memo("VM renewal 290 to 2026-09-06"), Some(290));
+        // Older / alternate memo formats.
+        assert_eq!(parse_topup_memo("Extend VM 7"), Some(7));
+        assert_eq!(parse_topup_memo("Renew VM 15"), Some(15));
+        assert_eq!(parse_topup_memo("VM 99"), Some(99));
     }
 
     #[test]
     fn ignores_non_topup_memos() {
         assert_eq!(parse_topup_memo("Subscription renewal: my-sub"), None);
-        assert_eq!(parse_topup_memo("VM upgrade 7"), None);
-        assert_eq!(parse_topup_memo("VM renewal xyz to now"), None);
-        assert_eq!(parse_topup_memo("VM renewal 42"), None); // no " to "
+        assert_eq!(parse_topup_memo("VM renewal xyz"), None);
         assert_eq!(parse_topup_memo(""), None);
     }
 
@@ -132,9 +166,13 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
+    let after: DateTime<Utc> = DateTime::parse_from_rfc3339(&args.after)
+        .context("invalid --after timestamp (expected RFC3339)")?
+        .with_timezone(&Utc);
     let before: DateTime<Utc> = DateTime::parse_from_rfc3339(&args.before)
         .context("invalid --before timestamp (expected RFC3339)")?
         .with_timezone(&Utc);
+    anyhow::ensure!(after < before, "--after must be earlier than --before");
 
     let settings: Settings = {
         let mut builder = Config::builder();
@@ -160,7 +198,8 @@ async fn main() -> Result<()> {
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
     info!(
-        "Scanning LNURLp topups created before {} ({} mode)",
+        "Scanning LNURLp topups in bug window [{}, {}) ({} mode)",
+        after,
         before,
         if args.apply { "APPLY" } else { "DRY-RUN" }
     );
@@ -177,9 +216,15 @@ async fn main() -> Result<()> {
         for payment in payments {
             scanned += 1;
 
-            // Only paid Lightning topups created before the fix are candidates.
+            // Only paid Lightning renewal topups created within the bug window
+            // are candidates. Restricting to Renewal excludes upgrade/purchase
+            // payments whose memos also contain "VM <number>". Outside the window
+            // the memo number is a real VM id, not a subscription id, so
+            // re-pointing would corrupt correct data.
             if !payment.is_paid
                 || payment.payment_method != PaymentMethod::Lightning
+                || payment.payment_type != SubscriptionPaymentType::Renewal
+                || payment.created < after
                 || payment.created >= before
             {
                 continue;
