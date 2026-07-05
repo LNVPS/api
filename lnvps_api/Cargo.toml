@@ -7,6 +7,12 @@ edition.workspace = true
 name = "lnvps_api"
 path = "src/bin/api.rs"
 
+# One-shot admin tool: re-credit LNURL-pay topups that landed on the wrong VM
+# (see PR #152). Decodes the stored BOLT11 memo in-process; no LND connection.
+[[bin]]
+name = "fix_lnurlp_topups"
+path = "src/bin/fix_lnurlp_topups.rs"
+
 [features]
 default = [
     "mikrotik",
@@ -72,6 +78,7 @@ mustache = "0.9"
 isocountry = "0.3"
 hickory-resolver = "0.26"
 humantime = "2.2"
+lightning-invoice = "0.34"
 
 # nostr (for signing agreements)
 nostr = { version = "0.44", default-features = false, features = ["std"] }
@@ -95,7 +102,6 @@ quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = tr
 
 [dev-dependencies]
 env_logger = "0.11"
-lightning-invoice = "0.34"
 bitcoin = "0.32"
 wiremock = "0.6"
 

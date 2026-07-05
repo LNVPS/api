@@ -6,7 +6,7 @@ WORKDIR /app/src
 COPY . .
 RUN apt update && apt -y install protobuf-compiler libvirt-dev libva-dev
 RUN cargo test --locked --package lnvps_api -- --test-threads=1 \
-  && cargo install --locked --root /app/build --path lnvps_api lnvps_api
+  && cargo install --locked --root /app/build --path lnvps_api --bin lnvps_api --bin fix_lnurlp_topups
 
 # Download host-info binaries from pre-built multi-arch images using crane
 FROM gcr.io/go-containerregistry/crane:latest AS crane-bin
