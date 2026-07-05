@@ -400,8 +400,9 @@ mod tests {
     /// subscription ID rather than the VM whose LNURL link was scanned.
     #[tokio::test]
     async fn test_renew_amount_uses_vm_id_not_subscription_id() -> Result<()> {
-        use lnvps_api_common::Ticker;
-        use lnvps_db::{LNVpsDbBase, UserSshKey};
+        use lnvps_api_common::{ExchangeRateService, Ticker};
+        use lnvps_db::{LNVpsDbBase, PaymentMethod, UserSshKey};
+        use payments_rs::currency::CurrencyAmount;
 
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
