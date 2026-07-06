@@ -284,8 +284,10 @@ mod tests {
         assert!(
             resp.status() == StatusCode::OK
                 || resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::CONFLICT
                 || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
-            "Refund calc should return 200, 400, or 500, got: {}",
+            "Refund calc should return 200, 400, 404, 409, or 500, got: {}",
             resp.status()
         );
     }
@@ -308,8 +310,10 @@ mod tests {
         assert!(
             resp.status() == StatusCode::OK
                 || resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::CONFLICT
                 || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
-            "VM extend should return 200, 400, or 500, got: {}",
+            "VM extend should return 200, 400, 404, 409, or 500, got: {}",
             resp.status()
         );
     }

@@ -215,7 +215,7 @@ async fn v1_signup_referral(
 
     // Check if already enrolled
     if this.db.get_referral_by_user(uid).await.is_ok() {
-        return ApiData::err("Already enrolled in referral program");
+        return Err(ApiError::conflict("Already enrolled in referral program"));
     }
 
     // Validate that at least one payout method is specified

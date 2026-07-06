@@ -563,7 +563,7 @@ async fn v1_patch_vm(
     if let Some(k) = data.ssh_key_id {
         let ssh_key = this.db.get_user_ssh_key(k).await?;
         if ssh_key.user_id != uid {
-            return ApiData::err("SSH key doesnt belong to you");
+            return Err(ApiError::forbidden("SSH key doesnt belong to you"));
         }
         vm.ssh_key_id = ssh_key.id;
         vm_config = true;
@@ -937,7 +937,7 @@ async fn v1_lnurlp(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> Result<Json<PayResponse>, &'static str> {
-    let vm = this.db.get_vm(id).await.map_err(|_e| "VM not found")?;
+    let vm = this.db.get_vm(id).await.map_err(|_| "VM not found")?;
     if vm.deleted {
         return Err("VM not found");
     }
@@ -1294,7 +1294,7 @@ async fn v1_get_payment(
         .get_vm_by_subscription(payment.subscription_id)
         .await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, vm.id)?)
@@ -1451,7 +1451,7 @@ async fn v1_payment_history(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     let payments = {
@@ -1480,7 +1480,7 @@ async fn v1_get_vm_history(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     let history = match (q.limit, q.offset) {
@@ -1508,7 +1508,7 @@ async fn v1_vm_upgrade_quote(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     // Create UpgradeConfig from request
@@ -1552,7 +1552,7 @@ async fn v1_vm_upgrade(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     // Create UpgradeConfig from request
@@ -1708,7 +1708,7 @@ async fn v1_patch_firewall_rule(
 
     let mut rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
-        return ApiData::err("Firewall rule does not belong to this VM");
+        return Err(ApiError::not_found("Firewall rule does not belong to this VM"));
     }
 
     if let Some(p) = req.priority {
@@ -1765,7 +1765,7 @@ async fn v1_delete_firewall_rule(
 
     let rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
-        return ApiData::err("Firewall rule does not belong to this VM");
+        return Err(ApiError::not_found("Firewall rule does not belong to this VM"));
     }
 
     this.db.delete_vm_firewall_rule(rule_id).await?;

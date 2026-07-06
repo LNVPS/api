@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmTemplate};
 use std::sync::Arc;
 
@@ -155,7 +155,7 @@ async fn admin_create_vm_template(
             .unwrap_or(lnvps_api_common::ApiIntervalType::Month);
 
         if cost_plan_interval_amount == 0 {
-            return Err(anyhow::anyhow!("Cost plan interval amount cannot be zero").into());
+            return Err(ApiError::bad_request("Cost plan interval amount cannot be zero"));
         }
 
         let new_cost_plan = lnvps_db::VmCostPlan {
@@ -282,7 +282,7 @@ async fn admin_update_vm_template(
         // Update cost plan fields if provided
         if let Some(cost_plan_name) = req.cost_plan_name {
             if cost_plan_name.trim().is_empty() {
-                return Err(anyhow::anyhow!("Cost plan name cannot be empty").into());
+                return Err(ApiError::bad_request("Cost plan name cannot be empty"));
             }
             cost_plan.name = cost_plan_name.trim().to_string();
         }
@@ -291,13 +291,13 @@ async fn admin_update_vm_template(
         }
         if let Some(cost_plan_currency) = req.cost_plan_currency {
             if cost_plan_currency.trim().is_empty() {
-                return Err(anyhow::anyhow!("Cost plan currency cannot be empty").into());
+                return Err(ApiError::bad_request("Cost plan currency cannot be empty"));
             }
             cost_plan.currency = cost_plan_currency.trim().to_uppercase();
         }
         if let Some(cost_plan_interval_amount) = req.cost_plan_interval_amount {
             if cost_plan_interval_amount == 0 {
-                return Err(anyhow::anyhow!("Cost plan interval amount cannot be zero").into());
+                return Err(ApiError::bad_request("Cost plan interval amount cannot be zero"));
             }
             cost_plan.interval_amount = cost_plan_interval_amount;
         }

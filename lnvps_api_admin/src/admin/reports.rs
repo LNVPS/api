@@ -4,7 +4,7 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use chrono::NaiveDate;
-use lnvps_api_common::{ApiData, ApiResult};
+use lnvps_api_common::{ApiData, ApiError, ApiResult};
 use lnvps_db::{AdminAction, AdminResource};
 use serde::{Deserialize, Serialize};
 
@@ -119,7 +119,7 @@ async fn admin_time_series_report(
         .map_err(|_| anyhow::anyhow!("Invalid end_date format. Use YYYY-MM-DD"))?;
 
     if start_date_parsed >= end_date_parsed {
-        return Err(anyhow::anyhow!("start_date must be before end_date").into());
+        return Err(ApiError::bad_request("start_date must be before end_date"));
     }
 
     // Validate currency if provided
@@ -198,7 +198,7 @@ async fn admin_referral_time_series_report(
         .map_err(|_| anyhow::anyhow!("Invalid end_date format. Use YYYY-MM-DD"))?;
 
     if start_date_parsed >= end_date_parsed {
-        return Err(anyhow::anyhow!("start_date must be before end_date").into());
+        return Err(ApiError::bad_request("start_date must be before end_date"));
     }
 
     // Convert dates to UTC datetime for database query

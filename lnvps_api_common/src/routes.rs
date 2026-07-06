@@ -106,6 +106,11 @@ impl ApiError {
         Self::with_status(StatusCode::CONFLICT, message)
     }
 
+    /// Create a 501 Not Implemented error
+    pub fn not_implemented(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::NOT_IMPLEMENTED, message)
+    }
+
     /// Create an API error from an internal error, logging the full details
     /// but only returning a generic message to the client (in non-admin mode)
     #[cfg(not(feature = "admin"))]

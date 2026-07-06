@@ -124,10 +124,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- **2026-07-06** - More accurate HTTP status codes on error responses. API errors previously almost always returned `500 Internal Server Error`; they now use appropriate codes:
-  - Client/validation errors (e.g. invalid SSH key, invalid lightning address) return `400 Bad Request`.
-  - Accessing a VM you don't own, or ordering before email verification, returns `403 Forbidden`.
-  - Missing resources return `404 Not Found` — including any database lookup that finds no matching row (applies across the user and admin APIs).
+- **2026-07-06** - More accurate HTTP status codes on error responses (full audit of the user and admin APIs). API errors previously almost always returned `500 Internal Server Error`; they now use appropriate codes:
+  - `400 Bad Request` — client/validation errors (e.g. invalid SSH key, invalid lightning address, empty/invalid fields on admin create/update, invalid date ranges on reports). Many admin validation errors previously returned `500`.
+  - `401 Unauthorized` — authentication failures.
+  - `403 Forbidden` — accessing a resource you don't own (VM/subscription/SSH key), ordering before email verification, modifying system roles, and **insufficient admin permissions** (previously `500`).
+  - `404 Not Found` — missing resources, including any database lookup that finds no matching row, and nested resources not under their parent (e.g. a firewall rule / payment / history entry that doesn't belong to the given VM).
+  - `409 Conflict` — state conflicts (e.g. already enrolled in referrals, acting on an already-deleted VM, a payment that is already completed, assigning an IP to a deleted/expired VM).
+  - `501 Not Implemented` — not-yet-implemented subscription types (ASN sponsoring, DNS hosting).
   - Genuine internal failures continue to return `500`. Response bodies are unchanged (`{ "error": string }`).
 
 

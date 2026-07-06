@@ -8,7 +8,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkJob,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource};
 use serde::Deserialize;
@@ -107,7 +107,7 @@ async fn admin_create_vm_ip_assignment(
     // Validate VM exists
     let vm = this.db.get_vm(req.vm_id).await?;
     if vm.deleted {
-        return ApiData::err("Cannot assign IP to a deleted VM");
+        return Err(ApiError::conflict("Cannot assign IP to a deleted VM"));
     }
 
     // Check subscription state (use shortcut function)
@@ -117,17 +117,17 @@ async fn admin_create_vm_ip_assignment(
         .await?;
 
     if !sub.is_setup {
-        return ApiData::err("Cannot assign IP to a new VM");
+        return Err(ApiError::conflict("Cannot assign IP to a new VM"));
     }
 
     if sub.expires.map(|e| e < Utc::now()).unwrap_or(true) {
-        return ApiData::err("Cannot assign IP to an expired VM");
+        return Err(ApiError::conflict("Cannot assign IP to an expired VM"));
     }
 
     // Validate IP range exists and is enabled
     let ip_range = this.db.admin_get_ip_range(req.ip_range_id).await?;
     if !ip_range.enabled {
-        return ApiData::err("Cannot assign IP from a disabled IP range");
+        return Err(ApiError::conflict("Cannot assign IP from a disabled IP range"));
     }
 
     // If IP is provided, validate it's within the range

@@ -74,7 +74,7 @@ mod tests {
         setup_rbac().await;
         let client = admin_client_with_keys(no_role_keys().clone());
         let resp = client.get_auth("/api/admin/v1/users").await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = resp.text().await.unwrap();
         assert!(body.contains("Insufficient permissions"));
     }
@@ -84,7 +84,7 @@ mod tests {
         setup_rbac().await;
         let client = admin_client_with_keys(no_role_keys().clone());
         let resp = client.get_auth("/api/admin/v1/vms").await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = resp.text().await.unwrap();
         assert!(body.contains("Insufficient permissions"));
     }
@@ -130,7 +130,7 @@ mod tests {
             .post_auth("/api/admin/v1/regions", &body)
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let text = resp.text().await.unwrap();
         assert!(text.contains("Insufficient permissions"));
     }
@@ -147,7 +147,7 @@ mod tests {
             .post_auth("/api/admin/v1/roles", &body)
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // ========================================================================
@@ -190,7 +190,7 @@ mod tests {
             .post_auth("/api/admin/v1/roles", &body)
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // ========================================================================
@@ -238,7 +238,7 @@ mod tests {
         setup_rbac().await;
         let client = admin_client_with_keys(payment_manager_keys().clone());
         let resp = client.get_auth("/api/admin/v1/vms").await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -275,7 +275,7 @@ mod tests {
 
         // Should now be denied
         let resp = client.get_auth("/api/admin/v1/users").await.unwrap();
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = resp.text().await.unwrap();
         assert!(body.contains("Insufficient permissions"));
     }
