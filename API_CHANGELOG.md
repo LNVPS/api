@@ -118,6 +118,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Mark a VM payment as paid, extend VM expiry, and dispatch provisioning (requires `payments::update`)
   - `POST /api/admin/v1/subscription_payments/{id}/complete` — Mark a subscription payment as paid, extend subscription by 30 days, and activate it (requires `subscription_payments::update`)
 
+### Fixed
+
+- **2026-07-06** - `PATCH /api/v1/vm/{id}/re-install` on an expired VM now returns `402 Payment Required` with a clear message instead of `500 Internal Server Error`. The expiry is checked up-front (before touching the host) so an expired VM can no longer trigger a failed reinstall pipeline. (#141)
+
 ### Changed
 
 - **2026-06-25** - Subscription payments now include the payment data needed to pay

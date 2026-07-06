@@ -48,6 +48,10 @@ impl<T: Serialize> ApiPaginatedData<T> {
 #[derive(Serialize)]
 pub struct ApiError {
     pub error: String,
+    /// HTTP status code to return for this error. Skipped during serialization
+    /// (the response body only carries the `error` message).
+    #[serde(skip)]
+    pub code: StatusCode,
 }
 
 impl ApiError {
@@ -55,7 +59,21 @@ impl ApiError {
     pub fn new(message: impl ToString) -> Self {
         Self {
             error: message.to_string(),
+            code: StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    /// Create an API error with a specific HTTP status code
+    pub fn with_status(code: StatusCode, message: impl ToString) -> Self {
+        Self {
+            error: message.to_string(),
+            code,
+        }
+    }
+
+    /// Create a 402 Payment Required error
+    pub fn payment_required(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::PAYMENT_REQUIRED, message)
     }
 
     /// Create an API error from an internal error, logging the full details
@@ -65,6 +83,7 @@ impl ApiError {
         error!("Internal error: {}", err);
         Self {
             error: "An internal error occurred".to_string(),
+            code: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -74,6 +93,7 @@ impl ApiError {
         error!("Internal error: {}", err);
         Self {
             error: err.to_string(),
+            code: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -116,7 +136,7 @@ impl From<String> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response()
+        (self.code, Json(self)).into_response()
     }
 }
 

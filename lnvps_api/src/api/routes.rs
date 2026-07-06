@@ -1030,6 +1030,22 @@ async fn v1_reinstall_vm(
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    // Reject re-install on an expired VM. The VM may already be stopped/removed
+    // on the host, so running the reinstall pipeline would fail with a 500.
+    // The expiry is authoritative on the VM's subscription.
+    let vm_expires = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await
+        .ok()
+        .and_then(|s| s.expires);
+    if is_vm_expired(vm_expires, Utc::now()) {
+        return Err(ApiError::payment_required(
+            "Cannot re-install an expired VM, please renew it first",
+        ));
+    }
+
     let old_image_id = vm.image_id;
     let host = this.db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &this.settings.provisioner)?;
@@ -1779,6 +1795,14 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
     Ok((uid, vm))
 }
 
+/// Determine whether a VM is expired based on its subscription expiry.
+///
+/// A `None` expiry means the VM has never been paid for and is treated as
+/// expired. An expiry at or before `now` is also expired.
+fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    expires.map(|e| e <= now).unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2004,5 +2028,31 @@ mod tests {
             result[0].currencies,
             vec![ApiCurrency::EUR, ApiCurrency::USD]
         );
+    }
+
+    // Regression test for issue #141: re-installing an expired VM must be
+    // rejected up-front (mapped to 402 PaymentRequired) instead of running the
+    // reinstall pipeline that fails with a 500.
+    #[test]
+    fn test_is_vm_expired() {
+        let now = Utc::now();
+
+        // Never paid (no subscription expiry) -> expired
+        assert!(is_vm_expired(None, now));
+
+        // Expired in the past -> expired
+        assert!(is_vm_expired(Some(now - chrono::Duration::hours(1)), now));
+
+        // Exactly now -> expired (boundary)
+        assert!(is_vm_expired(Some(now), now));
+
+        // Future expiry -> not expired
+        assert!(!is_vm_expired(Some(now + chrono::Duration::hours(1)), now));
+    }
+
+    #[test]
+    fn test_expired_vm_reinstall_error_is_payment_required() {
+        let err = ApiError::payment_required("Cannot re-install an expired VM");
+        assert_eq!(err.code, axum::http::StatusCode::PAYMENT_REQUIRED);
     }
 }
