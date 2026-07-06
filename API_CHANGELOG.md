@@ -4,27 +4,7 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
-
-### Documentation
-
-- **2026-06-23** - Documented the BGP session and tunnel field semantics in `ADMIN_API_ENDPOINTS.md` and rustdoc. Clarified that `enabled` (administrative on/off) and `state` (live BGP FSM state: `Idle`/`Connect`/`Active`/`OpenSent`/`OpenConfirm`/`Established`/`Down`) are independent — `"enabled": true` with `"state": "Down"` is administratively on but not yet up, not a contradiction. Also documented tunnel `"any"` endpoints and the `direction` classification.
-
-### Fixed
-
-- **2026-06-25** - Admin VM `template_id` is now `null` for custom-template VMs
-  - `AdminVmInfo.template_id` (returned by `GET /api/admin/v1/vms` and `GET /api/admin/v1/vms/{id}`) changed from `u64` to a nullable integer. VMs on a custom template previously reported `template_id: 0`; they now correctly report `template_id: null` (with the linked template carried by `custom_template_id`). Standard-template VMs are unaffected.
-
-- **2026-06-25** - Expired subscriptions are now handled even when expiry predates the last check
-  - The worker's `CheckSubscriptions` expiry handling previously only fired when a subscription crossed its expiry between two check cycles (`expires >= last_check`). Subscriptions that expired before the last check (admin/retroactive expiry, clock changes, or worker downtime) were left running until the grace period elapsed. The worker now fires the one-shot expiry handling (stop VM + notify) for any expired-but-in-grace subscription, using VM history as an idempotency marker so it still acts exactly once.
-
-### Changed
-
-- **2026-06-25** - Subscription payments now include the payment data needed to pay
-  - `ApiSubscriptionPayment` (returned by `GET /api/v1/subscriptions/{id}/renew`, `GET /api/v1/subscriptions/{id}/payments`, and the admin subscription-payment endpoints) gains a `data` field carrying the payment-method-specific data, e.g. `{ "lightning": "lnbc..." }` for Lightning. Previously the renew endpoint returned a payment record with no way to actually pay it.
-
-- **2026-06-25** - Email verification is only required to order a VM when SMTP is configured
-  - `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` previously always rejected orders from users without a verified email. The check is now skipped when the server has no `smtp` config (verification emails can't be sent), so ordering remains usable on installs without email. The API logs a startup warning when SMTP is unconfigured.
+## [0.3.0] - Unreleased
 
 ### Added
 
@@ -63,24 +43,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **2026-06-18** - Subscription line items now expose a typed `resource` reference
   - `SubscriptionLineItem` (public `GET /api/v1/subscriptions/{id}`) and `AdminSubscriptionLineItemInfo` (admin subscription + line-item endpoints) gain a `resource` field: a tagged union resolved server-side from the line item's subscription type. Shapes: `{ "type": "vps", "vm_id": number }`, `{ "type": "ip_range", "ip_range_subscription_id": number }`, or `null` when there is no linked resource.
   - `AdminSubscriptionLineItemInfo` now also includes the `subscription_type` discriminant.
-
-### Fixed
-
-- **2026-06-23** - Toggling a BGP session now persists on routers where the backend session id differs from the session name (e.g. Mikrotik, where the id is `.id` and the name is the protocol name). Previously `POST /api/admin/v1/routers/{id}/bgp/sessions/toggle` updated nothing in the cache for such routers because the persist was keyed by the backend id instead of the cached session name.
-
-### Changed
-
-- **2026-06-18** - `subscription_type` is now immutable on subscription line items
-  - `PATCH /api/admin/v1/subscription_line_items/{id}` no longer accepts `subscription_type`. A line item is bound to its resource at creation time, so its type must not change afterward (previously the field was accepted but silently ignored).
-
-
-- **2026-06-18** - `configuration` on subscription line items is now upgrade bookkeeping only
-  - Previously documented as a tagged resource link (`{ "type": "vps", "vm_id": ... }`). It is now returned as raw JSON holding upgrade data (e.g. `new_cpu`/`new_memory`/`new_disk`) and is `null` for line items that have never been upgraded. Resolve the linked resource via the new `resource` field instead.
-  - **SubscriptionType** values are now serialized in `snake_case` (`"vps"`, `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`) wherever the enum appears in JSON (e.g. the admin `subscription_type` field and the create-line-item request body), matching the rest of the API.
-
-## [v0.3.0] - 2026-06-18
-
-### Added
 
 - **2026-06-18** - `GET /api/admin/v1/subscriptions` — new optional filter query parameters
   - `search` (string) — case-insensitive substring match against subscription name and description
@@ -158,6 +120,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **2026-06-25** - Subscription payments now include the payment data needed to pay
+  - `ApiSubscriptionPayment` (returned by `GET /api/v1/subscriptions/{id}/renew`, `GET /api/v1/subscriptions/{id}/payments`, and the admin subscription-payment endpoints) gains a `data` field carrying the payment-method-specific data, e.g. `{ "lightning": "lnbc..." }` for Lightning. Previously the renew endpoint returned a payment record with no way to actually pay it.
+
+- **2026-06-25** - Email verification is only required to order a VM when SMTP is configured
+  - `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` previously always rejected orders from users without a verified email. The check is now skipped when the server has no `smtp` config (verification emails can't be sent), so ordering remains usable on installs without email. The API logs a startup warning when SMTP is unconfigured.
+
+- **2026-06-18** - `subscription_type` is now immutable on subscription line items
+  - `PATCH /api/admin/v1/subscription_line_items/{id}` no longer accepts `subscription_type`. A line item is bound to its resource at creation time, so its type must not change afterward (previously the field was accepted but silently ignored).
+
+- **2026-06-18** - `configuration` on subscription line items is now upgrade bookkeeping only
+  - Previously documented as a tagged resource link (`{ "type": "vps", "vm_id": ... }`). It is now returned as raw JSON holding upgrade data (e.g. `new_cpu`/`new_memory`/`new_disk`) and is `null` for line items that have never been upgraded. Resolve the linked resource via the new `resource` field instead.
+  - **SubscriptionType** values are now serialized in `snake_case` (`"vps"`, `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`) wherever the enum appears in JSON (e.g. the admin `subscription_type` field and the create-line-item request body), matching the rest of the API.
+
 - **2026-04-03** - Unpaid VMs with a non-expired pending payment are no longer auto-deleted
   - The worker cleanup loop now skips deletion of unpaid VMs that still have a pending (non-expired) payment, giving slower payment methods (e.g. Revolut) time to settle before the VM is removed.
 
@@ -217,6 +192,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **2026-06-25** - Admin VM `template_id` is now `null` for custom-template VMs
+  - `AdminVmInfo.template_id` (returned by `GET /api/admin/v1/vms` and `GET /api/admin/v1/vms/{id}`) changed from `u64` to a nullable integer. VMs on a custom template previously reported `template_id: 0`; they now correctly report `template_id: null` (with the linked template carried by `custom_template_id`). Standard-template VMs are unaffected.
+
+- **2026-06-25** - Expired subscriptions are now handled even when expiry predates the last check
+  - The worker's `CheckSubscriptions` expiry handling previously only fired when a subscription crossed its expiry between two check cycles (`expires >= last_check`). Subscriptions that expired before the last check (admin/retroactive expiry, clock changes, or worker downtime) were left running until the grace period elapsed. The worker now fires the one-shot expiry handling (stop VM + notify) for any expired-but-in-grace subscription, using VM history as an idempotency marker so it still acts exactly once.
+
+- **2026-06-23** - Toggling a BGP session now persists on routers where the backend session id differs from the session name (e.g. Mikrotik, where the id is `.id` and the name is the protocol name). Previously `POST /api/admin/v1/routers/{id}/bgp/sessions/toggle` updated nothing in the cache for such routers because the persist was keyed by the backend id instead of the cached session name.
+
 - **2026-06-16** - VM→subscription backfill now runs reliably at startup
   - The backfill is executed during app startup, after schema migrations and before any VM read, and preserves each VM's existing expiry and auto-renewal preference. The legacy `vm.expires` / `vm.created` columns are no longer dropped before the backfill runs, which previously caused the backfill to fail for every VM and break all VM reads. (No external API surface change — listed for operator awareness.)
 
@@ -248,6 +231,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `PATCH /api/admin/v1/custom_pricing/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
   - `PATCH /api/admin/v1/hosts/{id}` — Now supports setting `cpu_mfg`, `cpu_arch`, `cpu_features` to `null` to clear values
   - Previously, sending `null` for these fields was treated the same as omitting them (no change)
+
+### Documentation
+
+- **2026-07-06** - Documented previously-undocumented user API endpoints in `API_DOCUMENTATION.md`
+  - Added docs for the Telegram/WhatsApp notification-linking endpoints: `POST`/`DELETE /api/v1/account/telegram/link`, `POST`/`DELETE /api/v1/account/whatsapp/verify`, and `POST /api/v1/account/whatsapp/confirm`.
+  - Added a new "Nostr Domains (NIP-05)" section documenting `GET`/`POST /api/v1/nostr/domain`, `GET`/`POST /api/v1/nostr/domain/{dom}/handle`, and `DELETE /api/v1/nostr/domain/{dom}/handle/{handle}`, including the `NostrDomain` and `NostrDomainHandle` data types. No API behaviour changed.
+
+- **2026-06-23** - Documented the BGP session and tunnel field semantics in `ADMIN_API_ENDPOINTS.md` and rustdoc. Clarified that `enabled` (administrative on/off) and `state` (live BGP FSM state: `Idle`/`Connect`/`Active`/`OpenSent`/`OpenConfirm`/`Established`/`Down`) are independent — `"enabled": true` with `"state": "Down"` is administratively on but not yet up, not a contradiction. Also documented tunnel `"any"` endpoints and the `direction` classification.
 
 ## [v0.2.0] - 2026-02-22
 

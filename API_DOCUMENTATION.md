@@ -377,6 +377,38 @@ interface VmUpgradeQuote {
 - **Notes**: Indicates which notification channels are configured on the server so the UI can show/hide the relevant contact inputs.
 - **Response**: `{ "nip17": boolean, "email": boolean, "telegram": boolean, "whatsapp": boolean }`
 
+#### Link Telegram
+- **POST** `/api/v1/account/telegram/link`
+- **Auth**: Required
+- **Notes**: Generates a fresh one-time token and returns a Telegram deep link. Linking completes when the user opens the URL and presses **Start** in the bot. Returns an error if Telegram notifications are not enabled on the server.
+- **Response**: `{ "url": string, "token": string }` — e.g. `{ "url": "https://t.me/MyBot?start=<token>", "token": "<token>" }`
+
+#### Unlink Telegram
+- **DELETE** `/api/v1/account/telegram/link`
+- **Auth**: Required
+- **Notes**: Clears the linked chat and link token and sets `contact_telegram` to `false`.
+- **Response**: `null`
+
+#### Start WhatsApp Verification
+- **POST** `/api/v1/account/whatsapp/verify`
+- **Auth**: Required
+- **Body**: `{ "number": string }` — phone number in E.164 format, e.g. `+15551234567`
+- **Notes**: Stores the number, generates a 6-digit code and sends it via the configured WhatsApp verification template. Returns an error if WhatsApp notifications are not enabled on the server, if the number is invalid, or if the message fails to send.
+- **Response**: `null`
+
+#### Confirm WhatsApp Verification
+- **POST** `/api/v1/account/whatsapp/confirm`
+- **Auth**: Required
+- **Body**: `{ "code": string }` — the 6-digit code received via WhatsApp
+- **Notes**: On a correct code, marks the number verified and sets `contact_whatsapp` to `true`. Returns an error for an invalid or expired code.
+- **Response**: `null`
+
+#### Unlink WhatsApp
+- **DELETE** `/api/v1/account/whatsapp/verify`
+- **Auth**: Required
+- **Notes**: Removes the stored number, clears verification state and sets `contact_whatsapp` to `false`.
+- **Response**: `null`
+
 ### Automatic Renewal with Nostr Wallet Connect
 
 The LNVPS platform supports automatic VM renewal using Nostr Wallet Connect (NWC). This feature allows users to set up their Lightning wallets to automatically pay for VM renewals before expiration.
@@ -844,6 +876,66 @@ interface ReferralState extends Referral {
 - **Query Params**:
   - `amount`: Amount in millisatoshis (minimum 1000)
 - **Response**: Lightning Network invoice
+
+### Nostr Domains (NIP-05)
+
+Manage NIP-05 identity domains and their handles. All endpoints require NIP-98 authentication and only operate on domains owned by the caller.
+
+Data types:
+
+```typescript
+interface NostrDomain {
+  id: number;
+  name: string;          // domain name, e.g. "example.com"
+  enabled: boolean;      // activated by an operator after DNS is configured
+  handles: number;       // number of handles registered under this domain
+  created: string;       // ISO 8601 timestamp
+  relays: string[];      // relay hints advertised for the domain
+}
+
+interface NostrDomainHandle {
+  id: number;
+  domain_id: number;
+  handle: string;        // the local part, e.g. "alice" for alice@example.com
+  pubkey: string;        // 32-byte public key, hex-encoded
+  created: string;       // ISO 8601 timestamp
+  relays: string[];      // relay hints for this handle
+}
+```
+
+#### List Nostr Domains
+- **GET** `/api/v1/nostr/domain`
+- **Auth**: NIP-98
+- **Response**: `{ "domains": NostrDomain[], "cname": string }` — `cname` is the target hostname to point domain DNS records at.
+
+#### Create Nostr Domain
+- **POST** `/api/v1/nostr/domain`
+- **Auth**: NIP-98
+- **Body**: `{ "name": string }` — the domain name to register
+- **Notes**: The domain is created disabled with an activation hash; an operator enables it once DNS/CNAME is configured.
+- **Response**: `NostrDomain`
+
+#### List Domain Handles
+- **GET** `/api/v1/nostr/domain/{dom}/handle`
+- **Auth**: NIP-98
+- **Path Params**: `dom` — the domain id
+- **Notes**: Returns an error if the domain is not owned by the caller.
+- **Response**: `NostrDomainHandle[]`
+
+#### Create Domain Handle
+- **POST** `/api/v1/nostr/domain/{dom}/handle`
+- **Auth**: NIP-98
+- **Path Params**: `dom` — the domain id
+- **Body**: `{ "name": string, "pubkey": string }` — `name` is the handle (local part); `pubkey` is a 32-byte public key, hex-encoded
+- **Notes**: Returns an error if the domain is not owned by the caller or if the public key is not valid 32-byte hex.
+- **Response**: `NostrDomainHandle`
+
+#### Delete Domain Handle
+- **DELETE** `/api/v1/nostr/domain/{dom}/handle/{handle}`
+- **Auth**: NIP-98
+- **Path Params**: `dom` — the domain id; `handle` — the handle id
+- **Notes**: Returns an error if the domain is not owned by the caller.
+- **Response**: `null`
 
 ### Legal Documents
 
