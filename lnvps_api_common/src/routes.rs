@@ -55,11 +55,16 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    /// Create an API error with a user-safe message
+    /// Create an API error with a user-safe message (HTTP 400 Bad Request).
+    ///
+    /// `new` is intended for client-caused errors carrying a user-safe
+    /// message. For internal failures that should not leak details use
+    /// [`ApiError::internal`]; for other client errors use the dedicated
+    /// [`ApiError::not_found`], [`ApiError::forbidden`], etc. helpers.
     pub fn new(message: impl ToString) -> Self {
         Self {
             error: message.to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR,
+            code: StatusCode::BAD_REQUEST,
         }
     }
 
@@ -71,9 +76,34 @@ impl ApiError {
         }
     }
 
+    /// Create a 400 Bad Request error (explicit alias for [`ApiError::new`])
+    pub fn bad_request(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::BAD_REQUEST, message)
+    }
+
+    /// Create a 401 Unauthorized error
+    pub fn unauthorized(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::UNAUTHORIZED, message)
+    }
+
+    /// Create a 403 Forbidden error
+    pub fn forbidden(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::FORBIDDEN, message)
+    }
+
+    /// Create a 404 Not Found error
+    pub fn not_found(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::NOT_FOUND, message)
+    }
+
     /// Create a 402 Payment Required error
     pub fn payment_required(message: impl ToString) -> Self {
         Self::with_status(StatusCode::PAYMENT_REQUIRED, message)
+    }
+
+    /// Create a 409 Conflict error
+    pub fn conflict(message: impl ToString) -> Self {
+        Self::with_status(StatusCode::CONFLICT, message)
     }
 
     /// Create an API error from an internal error, logging the full details
@@ -106,6 +136,10 @@ impl From<anyhow::Error> for ApiError {
 
 impl From<lnvps_db::DbError> for ApiError {
     fn from(value: lnvps_db::DbError) -> Self {
+        // A missing row is a client-side "not found", not an internal error.
+        if value.is_row_not_found() {
+            return Self::not_found("Resource not found");
+        }
         Self::internal(value)
     }
 }
@@ -149,6 +183,39 @@ mod tests {
         let error = ApiError::new("Something went wrong");
         let json = serde_json::to_string(&error).unwrap();
         assert_eq!(json, r#"{"error":"Something went wrong"}"#);
+    }
+
+    #[test]
+    fn test_api_error_status_codes() {
+        assert_eq!(ApiError::new("x").code, StatusCode::BAD_REQUEST);
+        assert_eq!(ApiError::bad_request("x").code, StatusCode::BAD_REQUEST);
+        assert_eq!(ApiError::unauthorized("x").code, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            ApiError::payment_required("x").code,
+            StatusCode::PAYMENT_REQUIRED
+        );
+        assert_eq!(ApiError::forbidden("x").code, StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::not_found("x").code, StatusCode::NOT_FOUND);
+        assert_eq!(ApiError::conflict("x").code, StatusCode::CONFLICT);
+        assert_eq!(
+            ApiError::internal("x").code,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ApiError::with_status(StatusCode::IM_A_TEAPOT, "x").code,
+            StatusCode::IM_A_TEAPOT
+        );
+    }
+
+    #[test]
+    fn test_db_row_not_found_maps_to_404() {
+        // A missing DB row must become a 404, not a 500.
+        let err: ApiError = lnvps_db::DbError::SqlxError(sqlx::Error::RowNotFound).into();
+        assert_eq!(err.code, StatusCode::NOT_FOUND);
+
+        // Any other DB error stays a 500.
+        let err: ApiError = lnvps_db::DbError::Unknown.into();
+        assert_eq!(err.code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

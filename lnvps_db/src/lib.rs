@@ -53,6 +53,15 @@ pub enum DbError {
     Unknown,
 }
 
+impl DbError {
+    /// Whether this error represents a "row not found" result, i.e. a query
+    /// that expected exactly one row returned none. Useful for mapping to an
+    /// HTTP 404 at the API layer.
+    pub fn is_row_not_found(&self) -> bool {
+        matches!(self, DbError::SqlxError(sqlx::Error::RowNotFound))
+    }
+}
+
 impl From<DbError> for OpError<anyhow::Error> {
     fn from(e: DbError) -> OpError<Error> {
         match &e {
@@ -811,3 +820,15 @@ impl<T> LNVpsDb for T where T: LNVpsDbBase + LNVPSNostrDb + Send + Sync {}
 
 #[cfg(all(not(feature = "admin"), not(feature = "nostr-domain")))]
 impl<T> LNVpsDb for T where T: LNVpsDbBase + Send + Sync {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_row_not_found() {
+        assert!(DbError::SqlxError(sqlx::Error::RowNotFound).is_row_not_found());
+        assert!(!DbError::Unknown.is_row_not_found());
+        assert!(!DbError::SqlxError(sqlx::Error::PoolClosed).is_row_not_found());
+    }
+}

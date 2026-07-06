@@ -145,7 +145,7 @@ async fn v1_patch_account(
                 let info = client
                     .get_info()
                     .await
-                    .map_err(|e| ApiError::new(format!("Failed to connect to NWC: {}", e)))?;
+                    .map_err(|e| ApiError::bad_request(format!("Failed to connect to NWC: {}", e)))?;
                 if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
                     return ApiData::err("NWC connection must allow pay_invoice");
                 }
@@ -160,7 +160,7 @@ async fn v1_patch_account(
         let result = vat_client
             .validate_vat_number(tax_id, None)
             .await
-            .map_err(|e| ApiError::new(format!("Failed to validate tax ID: {}", e)))?;
+            .map_err(|e| ApiError::bad_request(format!("Failed to validate tax ID: {}", e)))?;
         if !result.valid {
             return ApiData::err("Invalid tax ID");
         }
@@ -738,7 +738,7 @@ async fn v1_create_custom_vm_order(
     // there's no way to send the verification email, so the requirement is
     // skipped to keep ordering usable on installs without email.
     if this.settings.smtp.is_some() && !user.email_verified {
-        return Err(ApiError::new(
+        return Err(ApiError::forbidden(
             "Email verification is required before creating a VM",
         ));
     }
@@ -788,7 +788,7 @@ async fn v1_add_ssh_key(
     let pk: PublicKey = req
         .key_data
         .parse()
-        .map_err(|_| ApiError::new("Invalid SSH public key format"))?;
+        .map_err(|_| ApiError::bad_request("Invalid SSH public key format"))?;
     let key_name = if !req.name.is_empty() {
         &req.name
     } else {
@@ -799,7 +799,7 @@ async fn v1_add_ssh_key(
         user_id: uid,
         key_data: pk
             .to_openssh()
-            .map_err(|_| ApiError::new("Failed to encode SSH key"))?
+            .map_err(|e| ApiError::internal(format!("Failed to encode SSH key: {}", e)))?
             .into(),
         ..Default::default()
     };
@@ -827,7 +827,7 @@ async fn v1_create_vm_order(
     // Email verification is only enforced when SMTP is configured (see
     // v1_create_custom_vm_order for rationale).
     if this.settings.smtp.is_some() && !user.email_verified {
-        return Err(ApiError::new(
+        return Err(ApiError::forbidden(
             "Email verification is required before creating a VM",
         ));
     }
@@ -1778,7 +1778,7 @@ async fn apply_firewall(this: &RouterState, vm_id: u64) -> Result<(), ApiError> 
     this.work_sender
         .send(WorkJob::ApplyVmFirewall { vm_id })
         .await
-        .map_err(|e| ApiError::new(&format!("Failed to queue firewall update: {}", e)))?;
+        .map_err(|e| ApiError::internal(format!("Failed to queue firewall update: {}", e)))?;
     Ok(())
 }
 
@@ -1787,10 +1787,10 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if uid != vm.user_id {
-        return Err(ApiError::new("VM does not belong to you"));
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
     if vm.deleted {
-        return Err(ApiError::new("VM not found"));
+        return Err(ApiError::not_found("VM not found"));
     }
     Ok((uid, vm))
 }

@@ -188,7 +188,7 @@ async fn v1_get_referral(
         .db
         .get_referral_by_user(uid)
         .await
-        .map_err(|_| ApiError::new("Not enrolled in referral program"))?;
+        .map_err(|_| ApiError::not_found("Not enrolled in referral program"))?;
 
     let (usage, payouts, referrals_failed) = tokio::try_join!(
         this.db.list_referral_usage(&referral.code),
@@ -267,7 +267,7 @@ async fn v1_update_referral(
         .db
         .get_referral_by_user(uid)
         .await
-        .map_err(|_| ApiError::new("Not enrolled in referral program"))?;
+        .map_err(|_| ApiError::not_found("Not enrolled in referral program"))?;
 
     if let Some(ref addr) = req.lightning_address {
         if let Some(a) = addr {

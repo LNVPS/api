@@ -124,6 +124,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **2026-07-06** - More accurate HTTP status codes on error responses. API errors previously almost always returned `500 Internal Server Error`; they now use appropriate codes:
+  - Client/validation errors (e.g. invalid SSH key, invalid lightning address) return `400 Bad Request`.
+  - Accessing a VM you don't own, or ordering before email verification, returns `403 Forbidden`.
+  - Missing resources return `404 Not Found` — including any database lookup that finds no matching row (applies across the user and admin APIs).
+  - Genuine internal failures continue to return `500`. Response bodies are unchanged (`{ "error": string }`).
+
+
 - **2026-06-25** - Subscription payments now include the payment data needed to pay
   - `ApiSubscriptionPayment` (returned by `GET /api/v1/subscriptions/{id}/renew`, `GET /api/v1/subscriptions/{id}/payments`, and the admin subscription-payment endpoints) gains a `data` field carrying the payment-method-specific data, e.g. `{ "lightning": "lnbc..." }` for Lightning. Previously the renew endpoint returned a payment record with no way to actually pay it.
 
