@@ -1734,27 +1734,29 @@ impl VmHostClient for ProxmoxClient {
             }
         }
 
-        // Add firewall rule to allow traffic from ipfilter-net0 IPset
-        let allow_rule = VmFirewallRule {
-            action: VmFirewallAction::ACCEPT,
-            dest: Some("+guest/ipfilter-net0".to_string()),
-            rule_type: VmFirewallRuleType::In,
-            enable: Some(1),
-            comment: Some("Allow traffic to ipfilter-net0 IPset".to_string()),
-            ..Default::default()
-        };
-
-        // Check if this rule already exists to avoid duplicates
+        // NOTE: We intentionally do NOT add a blanket `IN ACCEPT -dest
+        // +guest/ipfilter-net0` rule. Anti-spoofing is already provided by the
+        // Proxmox `ipfilter` option (source-address filtering via the
+        // ipfilter-net0 IPset above). A blanket inbound accept for the VM's own
+        // IPs would sit above the default `policy_in` and silently neutralize a
+        // default-deny inbound policy. Inbound traffic is governed by
+        // `policy_in` plus the user-defined firewall rules (#36) below.
+        //
+        // Remove any such rule left over from previously-provisioned VMs so the
+        // input policy behaves as configured going forward.
         let existing_rules = self.list_vm_firewall_rules(&self.node, vm_id).await?;
-        let rule_exists = existing_rules.iter().any(|rule| {
-            rule.action == VmFirewallAction::ACCEPT
-                && rule.dest.as_deref() == Some("+guest/ipfilter-net0")
-                && rule.rule_type == VmFirewallRuleType::In
-        });
-
-        if !rule_exists {
-            self.add_vm_firewall_rule(&self.node, vm_id, allow_rule)
-                .await?;
+        let mut stale_ipfilter_positions: Vec<i32> = existing_rules
+            .iter()
+            .filter(|rule| {
+                rule.action == VmFirewallAction::ACCEPT
+                    && rule.dest.as_deref() == Some("+guest/ipfilter-net0")
+                    && rule.rule_type == VmFirewallRuleType::In
+            })
+            .filter_map(|rule| rule.pos)
+            .collect();
+        stale_ipfilter_positions.sort_unstable_by(|a, b| b.cmp(a));
+        for pos in stale_ipfilter_positions {
+            self.delete_vm_firewall_rule(&self.node, vm_id, pos).await?;
         }
 
         // Sync user-defined firewall rules (#36).

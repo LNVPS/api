@@ -20,8 +20,8 @@ impl Nip98Auth {
         if self
             .event
             .created_at
-            .as_u64()
-            .abs_diff(Timestamp::now().as_u64())
+            .as_secs()
+            .abs_diff(Timestamp::now().as_secs())
             > 600
         {
             bail!("Created timestamp is out of range");

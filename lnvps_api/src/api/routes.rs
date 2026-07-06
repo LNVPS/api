@@ -138,10 +138,10 @@ async fn v1_patch_account(
     if let Some(Some(nwc)) = &req.nwc_connection_string
         && !nwc.is_empty()
     {
-        match nwc::prelude::NostrWalletConnectURI::parse(nwc) {
+        match nwc::prelude::NostrWalletConnectUri::parse(nwc) {
             Ok(s) => {
                 // test connection
-                let client = nwc::NWC::new(s);
+                let client = nwc::NostrWalletConnect::new(s);
                 let info = client
                     .get_info()
                     .await

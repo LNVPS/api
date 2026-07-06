@@ -1,4 +1,4 @@
-use crate::host::{FullVmInfo, VmHostClient, get_host_client};
+use crate::host::{FullVmInfo, get_host_client};
 use crate::notifications::{
     Notification, NotificationChannel, build_channels, send_email,
 };

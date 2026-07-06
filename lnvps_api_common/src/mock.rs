@@ -543,7 +543,7 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_host_disks(&self, _TB: u64) -> DbResult<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, _tb: u64) -> DbResult<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
         Ok(disks.values().filter(|d| d.enabled).cloned().collect())
     }
@@ -1121,7 +1121,7 @@ impl LNVpsDbBase for MockDb {
             .count() as u64)
     }
 
-    async fn list_custom_pricing(&self, _TB: u64) -> DbResult<Vec<VmCustomPricing>> {
+    async fn list_custom_pricing(&self, _tb: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().cloned().collect())
     }
