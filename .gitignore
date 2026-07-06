@@ -13,3 +13,6 @@ lnvps_agent/conversation_history/
 lnvps_api/config.prodtest.yaml
 config.local.yaml
 *.swp
+
+# Node tooling artifacts (not used by this Rust project)
+node_modules/
