@@ -322,19 +322,32 @@ async fn run_checks(
     Ok(())
 }
 
+/// Split a `type:middle:field2:field1` check id into
+/// `(kind, middle, field2, field1)` where `middle` may itself contain colons
+/// (e.g. an IPv6 DNS server address). Returns None if there aren't enough
+/// segments. The two trailing fields are parsed from the right so the colon-rich
+/// middle segment stays intact.
+fn parse_check_id(check_id: &str) -> Option<(&str, &str, &str, &str)> {
+    let (kind, rest) = check_id.split_once(':')?;
+    // rest = "middle:field2:field1"; take the two trailing fields from the right.
+    let (rest, field1) = rest.rsplit_once(':')?;
+    let (middle, field2) = rest.rsplit_once(':')?;
+    if middle.is_empty() {
+        return None;
+    }
+    Some((kind, middle, field2, field1))
+}
+
 /// Record type-specific metrics based on check ID pattern
 fn record_check_metric(metrics: &HealthMetrics, check_id: &str, result: &checks::CheckResult) {
-    let parts: Vec<&str> = check_id.split(':').collect();
-    if parts.is_empty() {
+    let Some((kind, middle, field2, family)) = parse_check_id(check_id) else {
         return;
-    }
+    };
 
-    match parts[0] {
-        "mss" if parts.len() >= 4 => {
-            // mss:host:port:family
-            let host = parts[1];
-            let port = parts[2];
-            let family = parts[3];
+    match kind {
+        "mss" => {
+            // mss:host:port:family (host may be an IPv6 literal with colons)
+            let (host, port) = (middle, field2);
             if let Some(value) = result.metric_value {
                 metrics
                     .mss_gauge
@@ -348,11 +361,9 @@ fn record_check_metric(metrics: &HealthMetrics, check_id: &str, result: &checks:
                     .set(pmtu);
             }
         }
-        "dns" if parts.len() >= 4 => {
-            // dns:server:query:family
-            let server = parts[1];
-            let query = parts[2];
-            let family = parts[3];
+        "dns" => {
+            // dns:server:query:family (server may be an IPv6 address with colons)
+            let (server, query) = (middle, field2);
             if let Some(value) = result.metric_value {
                 metrics
                     .dns_latency_gauge
@@ -365,8 +376,47 @@ fn record_check_metric(metrics: &HealthMetrics, check_id: &str, result: &checks:
 }
 
 async fn bind_address(address: SocketAddr) -> std::io::Result<TcpListener> {
-    let socket = TcpSocket::new_v4()?;
+    // Create a socket matching the address family so IPv6 bind addresses work.
+    let socket = if address.is_ipv6() {
+        TcpSocket::new_v6()?
+    } else {
+        TcpSocket::new_v4()?
+    };
     socket.set_reuseaddr(true)?;
     socket.bind(address)?;
     socket.listen(1024)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_check_id;
+
+    /// Regression: an IPv6 DNS server address contains colons, so naive
+    /// `split(':')` mis-labelled the exported metrics. parse_check_id keeps the
+    /// colon-rich server segment intact and parses the trailing fields from the
+    /// right.
+    #[test]
+    fn parse_check_id_handles_ipv6_server() {
+        let (kind, server, query, family) =
+            parse_check_id("dns:2606:4700:4700::1111:example.com:v6").unwrap();
+        assert_eq!(kind, "dns");
+        assert_eq!(server, "2606:4700:4700::1111");
+        assert_eq!(query, "example.com");
+        assert_eq!(family, "v6");
+    }
+
+    #[test]
+    fn parse_check_id_handles_ipv4() {
+        let (kind, server, query, family) = parse_check_id("dns:1.1.1.1:example.com:v4").unwrap();
+        assert_eq!(kind, "dns");
+        assert_eq!(server, "1.1.1.1");
+        assert_eq!(query, "example.com");
+        assert_eq!(family, "v4");
+    }
+
+    #[test]
+    fn parse_check_id_rejects_too_short() {
+        assert!(parse_check_id("dns:only").is_none());
+        assert!(parse_check_id("dns").is_none());
+    }
 }

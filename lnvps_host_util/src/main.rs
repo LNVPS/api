@@ -426,22 +426,20 @@ fn detect_cpu_features() -> Vec<String> {
 /// Check for SHA512 extensions via CPUID (leaf 7, subleaf 1, EAX bit 0)
 #[cfg(target_arch = "x86_64")]
 fn has_sha512_extensions() -> bool {
-    // raw-cpuid doesn't expose subleaf 1 directly, so we use inline asm
-    // CPUID leaf 7, subleaf 1, EAX bit 0 = SHA512
-    let eax: u32;
+    // Use the `__cpuid_count` intrinsic instead of hand-written asm: it correctly
+    // preserves rbx and doesn't rely on the (previously incorrect) `nostack`
+    // option, which is UB when the asm pushes/pops the stack.
+    use std::arch::x86_64::__cpuid_count;
     unsafe {
-        std::arch::asm!(
-            "push rbx",       // Save rbx (used by LLVM)
-            "cpuid",
-            "pop rbx",        // Restore rbx
-            inout("eax") 7u32 => eax,
-            inout("ecx") 1u32 => _,
-            out("edx") _,
-            options(nostack),
-        );
+        // Guard: leaf 7 must be supported. The maximum basic leaf is returned in
+        // EAX of leaf 0; executing leaf 7 on an older CPU returns garbage.
+        let max_leaf = __cpuid_count(0, 0).eax;
+        if max_leaf < 7 {
+            return false;
+        }
+        // CPUID leaf 7, subleaf 1, EAX bit 0 = SHA512
+        (__cpuid_count(7, 1).eax & 1) != 0
     }
-    // Bit 0 of EAX = SHA512
-    (eax & 1) != 0
 }
 
 #[cfg(not(target_arch = "x86_64"))]
