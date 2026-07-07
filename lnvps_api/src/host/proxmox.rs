@@ -80,6 +80,24 @@ impl ProxmoxClient {
         Ok(rsp.data)
     }
 
+    /// Like [`get_vm_status`] but returns `Ok(None)` when the VM does not exist
+    /// (404). Transient failures (timeout, connection error, 5xx) are returned
+    /// as `Err` so callers can tell "gone" apart from "couldn't reach the host".
+    pub async fn get_vm_status_opt(
+        &self,
+        node: &str,
+        vm_id: ProxmoxVmId,
+    ) -> OpResult<Option<VmInfo>> {
+        let rsp: Option<ResponseBase<VmInfo>> = self
+            .api
+            .get_opt(&format!(
+                "/api2/json/nodes/{}/qemu/{}/status/current",
+                node, vm_id
+            ))
+            .await?;
+        Ok(rsp.map(|r| r.data))
+    }
+
     pub async fn list_vms(&self, node: &str) -> OpResult<Vec<VmInfo>> {
         let rsp: ResponseBase<Vec<VmInfo>> = self
             .api
@@ -1168,16 +1186,27 @@ impl ProxmoxClient {
 
     /// Destroy a VM by ID (stop first, then delete via SSH)
     async fn destroy_vm(&self, vm_id: ProxmoxVmId) -> OpResult<()> {
-        // Check if VM exists first
-        if self.get_vm_status(&self.node, vm_id).await.is_err() {
+        // Check if VM exists first. Only a definitive 404 (Ok(None)) means the VM
+        // is already gone; a transient failure returns Err and must abort the
+        // destroy so we don't free the DB record / IPs while the VM is still
+        // running on the host.
+        if self.get_vm_status_opt(&self.node, vm_id).await?.is_none() {
             info!("VM {} doesn't exist, skipping destroy", vm_id);
             return Ok(());
         }
 
+        // Destroying requires SSH access to run `qm destroy`. Without it we can
+        // only stop the VM, which would leave it undestroyed while the caller
+        // proceeds to release its resources — fail loudly instead.
+        let ssh = match &self.ssh {
+            Some(ssh) => ssh,
+            None => op_fatal!("Cannot destroy VM {}: no SSH access configured", vm_id),
+        };
+
         // Stop first, ignoring errors
         self.stop_vm(&self.node, vm_id).await.ok();
 
-        if let Some(ssh) = &self.ssh {
+        {
             let mut ses = SshClient::new().map_err(OpError::Transient)?;
             ses.connect(
                 (self.api.base().host().unwrap().to_string(), 22),
@@ -1548,6 +1577,10 @@ impl VmHostClient for ProxmoxClient {
         let mut states = Vec::new();
 
         for vm in vm_list {
+            // Skip VMs not managed by LNVPS (vmid < 100 has no valid db id).
+            if vm.vm_id < 100 {
+                continue;
+            }
             let vmid: ProxmoxVmId = vm.vm_id.into();
             states.push((vmid.0, vm.into()));
         }
@@ -1951,7 +1984,10 @@ impl From<u64> for ProxmoxVmId {
 
 impl From<i32> for ProxmoxVmId {
     fn from(value: i32) -> Self {
-        Self(value as u64 - 100)
+        // LNVPS VMs use vmid = db_id + 100. Saturate instead of wrapping so a
+        // non-LNVPS VM with vmid < 100 can't underflow into a huge u64 (release)
+        // or panic (debug). Ids below 100 aren't managed by us anyway.
+        Self((value as i64 - 100).max(0) as u64)
     }
 }
 
@@ -2857,6 +2893,24 @@ mod tests {
         );
         assert_eq!(vm.cpu_limit, None);
         Ok(())
+    }
+
+    /// Regression: converting an i32 vmid below 100 (a VM not managed by LNVPS)
+    /// must not underflow/panic. Ids >= 100 map to db_id = vmid - 100.
+    #[test]
+    fn test_proxmox_vm_id_from_i32_no_underflow() {
+        // Below 100 saturates to 0 rather than wrapping / panicking.
+        assert_eq!(ProxmoxVmId::from(0i32).0, 0);
+        assert_eq!(ProxmoxVmId::from(50i32).0, 0);
+        assert_eq!(ProxmoxVmId::from(99i32).0, 0);
+        // Normal LNVPS ids map correctly.
+        assert_eq!(ProxmoxVmId::from(100i32).0, 0);
+        assert_eq!(ProxmoxVmId::from(101i32).0, 1);
+        assert_eq!(ProxmoxVmId::from(600i32).0, 500);
+        // Round-trip for a valid id.
+        let id = ProxmoxVmId::from(1234u64);
+        let back: i32 = id.into();
+        assert_eq!(back, 1334);
     }
 
     #[test]

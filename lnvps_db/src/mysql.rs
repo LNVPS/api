@@ -2072,8 +2072,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let result: (String,) = sqlx::query_as(
             "SELECT c.base_currency 
              FROM subscription s
-             JOIN users u ON s.user_id = u.id
-             JOIN company c ON u.id = c.id
+             JOIN company c ON s.company_id = c.id
              WHERE s.id = ?",
         )
         .bind(subscription_id)
@@ -2254,7 +2253,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
              LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
              JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
                                      THEN vhr.company_id
-                                     ELSE s.user_id END) = c.id
+                                     ELSE s.company_id END) = c.id
              WHERE sp.id = ?",
         )
         .bind(id)
@@ -2320,11 +2319,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         let mut tx = self.db.begin().await?;
 
-        // Mark payment as paid
-        sqlx::query("UPDATE subscription_payment SET is_paid = 1, paid_at = NOW() WHERE id = ?")
-            .bind(&payment.id)
-            .execute(tx.as_mut())
-            .await?;
+        // Mark payment as paid. The `AND is_paid = 0` guard makes this idempotent:
+        // duplicate webhook deliveries / replayed settle events affect 0 rows and
+        // are skipped below, so the subscription expiry is never extended twice.
+        let paid = sqlx::query(
+            "UPDATE subscription_payment SET is_paid = 1, external_data = ?, paid_at = NOW() WHERE id = ? AND is_paid = 0",
+        )
+        .bind(&payment.external_data)
+        .bind(&payment.id)
+        .execute(tx.as_mut())
+        .await?;
+
+        if paid.rows_affected() == 0 {
+            // Already paid (or unknown id) — nothing to extend, commit no-op.
+            tx.commit().await?;
+            return Ok(());
+        }
 
         // Un-delete any VM linked to this subscription (e.g. auto-cleaned up before
         // payment arrived). This handles payment methods with longer timeouts.
@@ -2465,7 +2475,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64> {
         let result = sqlx::query(
-            "INSERT INTO available_ip_space (cidr, min_prefix_size, max_prefix_size, registry, external_id, is_available, is_reserved, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO available_ip_space (cidr, min_prefix_size, max_prefix_size, registry, external_id, is_available, is_reserved, metadata, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&space.cidr)
         .bind(space.min_prefix_size)
@@ -2475,6 +2485,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(space.is_available)
         .bind(space.is_reserved)
         .bind(&space.metadata)
+        .bind(space.company_id)
         .execute(&self.db)
         .await?;
 
@@ -2483,7 +2494,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<()> {
         sqlx::query(
-            "UPDATE available_ip_space SET cidr = ?, min_prefix_size = ?, max_prefix_size = ?, registry = ?, external_id = ?, is_available = ?, is_reserved = ?, metadata = ? WHERE id = ?"
+            "UPDATE available_ip_space SET cidr = ?, min_prefix_size = ?, max_prefix_size = ?, registry = ?, external_id = ?, is_available = ?, is_reserved = ?, metadata = ?, company_id = ? WHERE id = ?"
         )
         .bind(&space.cidr)
         .bind(space.min_prefix_size)
@@ -2493,6 +2504,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(space.is_available)
         .bind(space.is_reserved)
         .bind(&space.metadata)
+        .bind(space.company_id)
         .bind(space.id)
         .execute(&self.db)
         .await?;
@@ -3744,20 +3756,30 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
         // Get comprehensive region statistics with a single efficient query
         // Use CAST to ensure we get the right SQL types for Rust compatibility
+        // Host aggregates (cpu/memory) must be summed over the deduplicated host
+        // set. Using SUM(DISTINCT h.cpu) deduplicated by *value*, so two hosts
+        // with identical cpu/memory were counted once. Compute host totals and
+        // VM/IP counts in separate subqueries to avoid both the value-dedup bug
+        // and row multiplication from the joins.
         let row: (i64, i64, Option<u64>, Option<u64>, i64) = sqlx::query_as(
             r#"
-            SELECT 
-                COUNT(DISTINCT h.id) as host_count,
-                COUNT(DISTINCT CASE WHEN v.deleted = 0 THEN v.id END) as total_vms,
-                CAST(COALESCE(SUM(DISTINCT h.cpu), 0) AS UNSIGNED) as total_cpu_cores,
-                CAST(COALESCE(SUM(DISTINCT h.memory), 0) AS UNSIGNED) as total_memory_bytes,
-                COUNT(DISTINCT CASE WHEN v.deleted = 0 THEN ip.id END) as total_ip_assignments
-            FROM vm_host h
-            LEFT JOIN vm v ON v.host_id = h.id
-            LEFT JOIN vm_ip_assignment ip ON ip.vm_id = v.id AND ip.deleted = 0
-            WHERE h.region_id = ?
+            SELECT
+                (SELECT COUNT(*) FROM vm_host WHERE region_id = ?) as host_count,
+                (SELECT COUNT(*) FROM vm v
+                    JOIN vm_host h ON v.host_id = h.id
+                    WHERE h.region_id = ? AND v.deleted = 0) as total_vms,
+                CAST((SELECT COALESCE(SUM(cpu), 0) FROM vm_host WHERE region_id = ?) AS UNSIGNED) as total_cpu_cores,
+                CAST((SELECT COALESCE(SUM(memory), 0) FROM vm_host WHERE region_id = ?) AS UNSIGNED) as total_memory_bytes,
+                (SELECT COUNT(*) FROM vm_ip_assignment ip
+                    JOIN vm v ON ip.vm_id = v.id
+                    JOIN vm_host h ON v.host_id = h.id
+                    WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0) as total_ip_assignments
             "#,
         )
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
         .bind(region_id)
         .fetch_one(&self.db)
         .await?;
@@ -4288,7 +4310,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"UPDATE company SET 
                name = ?, address_1 = ?, address_2 = ?, city = ?, state = ?, 
-               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?
+               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?
                WHERE id = ?"#,
         )
         .bind(&company.name)
@@ -4301,6 +4323,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.postcode)
         .bind(&company.phone)
         .bind(&company.email)
+        .bind(&company.base_currency)
         .bind(company.id)
         .execute(&self.db)
         .await?;
@@ -4362,7 +4385,7 @@ impl AdminDb for LNVpsDbMysql {
              LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
              JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
                                      THEN vhr.company_id
-                                     ELSE s.user_id END) = c.id
+                                     ELSE s.company_id END) = c.id
              WHERE sp.created >= ",
         );
         query.push_bind(start_date);

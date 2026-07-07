@@ -229,9 +229,23 @@ impl JsonApi {
                     op_fatal!("Failed to parse JSON from {}: {} {}", path, text, e);
                 }
             }
-        } else {
-            // TODO: handle status codes as fatal/transient
+        } else if is_retryable_status(status) {
             op_transient!("{} {}: {}: {}", method, path, status, &text);
+        } else {
+            // Definitive client errors (404/401/403/400 ...) must not be retried:
+            // e.g. a 404 means the resource really is gone, not a transient outage.
+            op_fatal!("{} {}: {}: {}", method, path, status, &text);
+        }
+    }
+
+    /// GET that maps a 404 Not Found response to `Ok(None)`, so callers can
+    /// distinguish "the resource definitively does not exist" from a transient
+    /// failure (timeout, connection error, 5xx) which is returned as `Err`.
+    pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> OpResult<Option<T>> {
+        match self.get::<T>(path).await {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if is_not_found_error(e.inner()) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -272,15 +286,56 @@ impl JsonApi {
         debug!("<< {}", text);
         if status.is_success() {
             Ok(status.as_u16())
-        } else {
+        } else if is_retryable_status(status) {
             op_transient!("{} {}: {}: {}", method, path, status, &text);
+        } else {
+            op_fatal!("{} {}: {}: {}", method, path, status, &text);
         }
     }
 }
 
+/// HTTP status codes that are worth retrying: server errors (5xx) plus the two
+/// retryable client errors (408 Request Timeout, 429 Too Many Requests). All
+/// other 4xx codes are definitive and should be treated as fatal.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Detect whether a fatal request error was caused by a 404 Not Found response.
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("404 Not Found")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_stale_connection_message;
+    use super::{is_not_found_error, is_retryable_status, is_stale_connection_message};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn only_5xx_408_429_are_retryable() {
+        // Retryable
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        // Definitive (fatal) — must NOT be retried
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn detects_404_not_found_error() {
+        // Mirrors the message built in req(): "GET /path: 404 Not Found: body"
+        let err = anyhow::anyhow!("GET /api2/json/nodes/n/qemu/100: 404 Not Found: ");
+        assert!(is_not_found_error(&err));
+        let other = anyhow::anyhow!("GET /api2/json/nodes/n/qemu/100: 500 Internal Server Error: ");
+        assert!(!is_not_found_error(&other));
+    }
 
     #[test]
     fn detects_connection_closed_before_message_completed() {
