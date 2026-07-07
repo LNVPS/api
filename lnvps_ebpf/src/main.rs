@@ -97,7 +97,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, &'static str> {
             let udp = ptr_at::<UdpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
             handle_l4(ctx, L4Packet::UdpV4 { eth, ip, udp })
         }
-        IpProto::Ipv6Icmp => {
+        IpProto::Icmp => {
             let icmp = ptr_at::<IcmpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
             handle_l4(ctx, L4Packet::IcmpV4 { eth, ip, icmp })
         }
@@ -131,9 +131,9 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, &'static str> {
 fn handle_l4(ctx: &XdpContext, pkt: L4Packet<'_>) -> Result<u32, &'static str> {
     match pkt {
         L4Packet::TcpV4 { ip, tcp, .. } => {
-            let syn_flag = tcp.syn();
-            // Is only SYN flag set
-            if syn_flag != 0 && syn_flag == syn_flag {
+            // Only count genuine connection-initiating SYNs (SYN set, ACK clear)
+            // so that SYN-ACK replies to outbound connections aren't rate limited.
+            if tcp.syn() != 0 && tcp.ack() == 0 {
                 // test SYN rate limits
                 if !Bucket::syn_dest_v4(ctx, ip)? {
                     info!(ctx, "L4 TCPv4 SYN DROP");
