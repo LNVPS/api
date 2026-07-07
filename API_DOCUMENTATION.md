@@ -546,6 +546,7 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **PATCH** `/api/v1/vm/{id}/re-install`
 - **Auth**: Required
 - **Response**: `null`
+- **Errors**: `402 Payment Required` if the VM is expired (renew it first); `403 Forbidden` if the VM is not yours; `404 Not Found` if the VM does not exist.
 
 #### VM Serial Console (WebSocket)
 - **WebSocket** `/api/v1/vm/{id}/console`
@@ -965,9 +966,12 @@ Common HTTP status codes:
 - `200`: Success
 - `400`: Bad Request (validation errors)
 - `401`: Unauthorized (invalid or missing authentication)
-- `403`: Forbidden (insufficient permissions)
-- `404`: Not Found
+- `402`: Payment Required (e.g. acting on an expired VM that must be renewed first)
+- `403`: Forbidden (accessing a resource you don't own, or insufficient permissions)
+- `404`: Not Found (missing resource, or a nested resource that doesn't belong to the parent in the path)
+- `409`: Conflict (the resource's current state conflicts with the request, e.g. an already-deleted VM or an already-completed payment)
 - `500`: Internal Server Error
+- `501`: Not Implemented (feature not yet available)
 
 ## Rate Limiting
 
@@ -1256,8 +1260,8 @@ Get detailed information about a specific IP space block.
 **Response**: `ApiResponse<AvailableIpSpace>`
 
 **Error Responses**:
-- `"IP space not available"` - IP space is not available for purchase
-- Not found error if ID doesn't exist
+- `"IP space not available"` (`400 Bad Request`) - IP space is not available for purchase
+- `404 Not Found` - IP space ID does not exist
 
 **Example Request**:
 
@@ -1289,7 +1293,7 @@ List all IP ranges allocated to a specific subscription.
 **Response**: `ApiPaginatedResponse<IpRangeSubscription>`
 
 **Error Responses**:
-- `"Access denied: not your subscription"` - User doesn't own this subscription
+- `"Access denied: not your subscription"` (`403 Forbidden`) - User doesn't own this subscription
 
 **Example Request**:
 
@@ -1333,7 +1337,7 @@ interface AddIpRangeToSubscriptionRequest {
 **Response**: `ApiResponse<IpRangeSubscription>`
 
 **Error Responses**:
-- `"Access denied: not your subscription"` - User doesn't own this subscription
+- `"Access denied: not your subscription"` (`403 Forbidden`) - User doesn't own this subscription
 - `"IP space is not available for allocation"` - IP space is no longer available
 - `"IP range allocation not yet implemented - please contact support to manually allocate IP ranges"` - Feature not yet complete (current status)
 

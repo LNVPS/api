@@ -2965,10 +2965,11 @@ All error responses follow the format:
 
 Common HTTP status codes:
 
-- `400` - Bad Request (invalid input)
+- `400` - Bad Request (invalid input / validation errors)
 - `401` - Unauthorized (invalid or missing authentication)
-- `403` - Forbidden (insufficient permissions)
-- `404` - Not Found
+- `403` - Forbidden (insufficient permissions; also protected/system resources)
+- `404` - Not Found (missing resource, or a nested resource that doesn't belong to the parent in the path, e.g. a payment/history entry that isn't for the given VM)
+- `409` - Conflict (the resource's current state conflicts with the request, e.g. acting on an already-deleted VM or an already-completed payment)
 - `500` - Internal Server Error
 
 ## Pagination
