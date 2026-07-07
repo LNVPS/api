@@ -246,10 +246,15 @@ pub async fn vm_to_status(
     let ips = db.list_vm_ip_assignments(vm.id).await?;
     let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
     let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
+    // Propagate errors instead of silently dropping failed range lookups — a
+    // dropped range later caused an `.expect()` panic when building the IP
+    // assignments below.
     let ip_ranges: HashMap<u64, IpRange> = join_all(ip_ranges)
         .await
         .into_iter()
-        .filter_map(Result::ok)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)?
+        .into_iter()
         .map(|i| (i.id, i))
         .collect();
 
@@ -277,10 +282,10 @@ pub async fn vm_to_status(
             .map(|i| {
                 let range = ip_ranges
                     .get(&i.ip_range_id)
-                    .expect("ip range id not found");
-                ApiVmIpAssignment::from(&i, range)
+                    .ok_or_else(|| anyhow::anyhow!("ip range {} not found", i.ip_range_id))?;
+                Ok(ApiVmIpAssignment::from(&i, range))
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         auto_renewal_enabled: sub_auto_renewal,
     })
 }
