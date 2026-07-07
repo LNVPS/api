@@ -7,6 +7,22 @@ use crate::identity::{Requester, SenderIdentity};
 use crate::nip98::Nip98Signer;
 use crate::settings::Settings;
 
+/// Percent-encode a string for safe use as a URL query-component value.
+/// Only the RFC 3986 unreserved characters are passed through verbatim;
+/// everything else (including `&`, `=`, `+`, space, `@`) is percent-encoded.
+fn encode_query_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 /// HTTP client for calling the LNVPS admin and user APIs.
 ///
 /// Generates fresh NIP-98 auth tokens from an nsec key on every request.
@@ -228,7 +244,12 @@ impl ApiClient {
 
     /// Lookup a user by email address via the indexed email_hash column.
     pub async fn admin_find_user_by_email(&self, email: &str) -> Result<Option<serde_json::Value>> {
-        let request_path = format!("/api/admin/v1/users/by-email?email={}", email);
+        // Percent-encode the (untrusted) email so characters like `&`/`=`/space
+        // can't inject extra query parameters into the admin API request.
+        let request_path = format!(
+            "/api/admin/v1/users/by-email?email={}",
+            encode_query_component(email)
+        );
         let rsp: serde_json::Value = self
             .admin_request(
                 Method::GET,
@@ -377,4 +398,20 @@ struct ApiResponseWrapper<T> {
     #[serde(default)]
     #[allow(dead_code)]
     error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_query_component;
+
+    /// Regression: untrusted email values must be percent-encoded so they can't
+    /// inject extra query parameters into the admin API request.
+    #[test]
+    fn encode_query_component_escapes_injection() {
+        assert_eq!(encode_query_component("a@b.com"), "a%40b.com");
+        assert_eq!(encode_query_component("x&admin=1"), "x%26admin%3D1");
+        assert_eq!(encode_query_component("a b"), "a%20b");
+        // Unreserved chars pass through.
+        assert_eq!(encode_query_component("A9-_.~"), "A9-_.~");
+    }
 }

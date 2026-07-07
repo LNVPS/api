@@ -122,7 +122,7 @@ impl Kind1SupportChannel {
                                     "Kind1 mention from {} (event {}): {}",
                                     &author_hex[..16.min(author_hex.len())],
                                     event.id,
-                                    &event.content[..event.content.len().min(100)]
+                                    event.content.chars().take(100).collect::<String>()
                                 );
 
                                 let req = IncomingSupportRequest {
