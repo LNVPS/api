@@ -124,6 +124,7 @@ fn detection_flip_and_cooldown() {
         block_ttl_ns: SECOND_NS,
         escalate_pass_pps: u64::MAX,
         max_real_sources: 10_000,
+        syn_proxy_pps: u64::MAX,
     };
     let mut state = DetectionState::default();
 

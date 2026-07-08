@@ -1,8 +1,11 @@
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{LpmTrie, LruHashMap, LruPerCpuHashMap};
-use lnvps_fw_common::{DEST_MODE_NORMAL, DestCounters, DestState, LastSeen, PortKeyV4, PortKeyV6};
+use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, ProgramArray};
+use lnvps_fw_common::{
+    COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
+    LastSeen, PortKeyV4, PortKeyV6,
+};
 
 /// Max number of destination IPs to track (per address family)
 pub const MAX_DST_IPS: u32 = 256 * 1024;
@@ -186,3 +189,42 @@ macro_rules! cidr_block_check {
 
 cidr_block_check!(cidr_blocked_v4, [u8; 4], 32, V4_CIDR_SRC);
 cidr_block_check!(cidr_blocked_v6, [u8; 16], 128, V6_CIDR_SRC);
+
+/// Verified (non-spoofed) IPv4 sources that completed a SYN-cookie handshake.
+#[map]
+pub static VERIFIED_V4: LruHashMap<[u8; 4], u64> = LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
+
+/// Rotating SYN-cookie secret: slot 0 current, slot 1 previous.
+#[map]
+pub static COOKIE_SECRET: Array<u32> = Array::with_max_entries(2, 0);
+
+/// Tail-call jump table for the SYN-proxy sub-programs (slot 0 = IPv4).
+#[map]
+pub static SYN_PROXY_JUMP: ProgramArray = ProgramArray::with_max_entries(4, 0);
+
+/// Current and previous SYN-cookie secrets (0 if unset).
+#[inline(always)]
+pub fn cookie_secrets() -> (u32, u32) {
+    let cur = COOKIE_SECRET
+        .get(COOKIE_SECRET_CURRENT)
+        .copied()
+        .unwrap_or(0);
+    let prev = COOKIE_SECRET
+        .get(COOKIE_SECRET_PREVIOUS)
+        .copied()
+        .unwrap_or(0);
+    (cur, prev)
+}
+
+/// True if `src` has completed a SYN-cookie handshake.
+#[inline(always)]
+pub fn src_verified_v4(src: &[u8; 4]) -> bool {
+    unsafe { VERIFIED_V4.get(src) }.is_some()
+}
+
+/// Record `src` as verified.
+#[inline(always)]
+pub fn mark_verified_v4(src: &[u8; 4]) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let _ = VERIFIED_V4.insert(src, &now, 0);
+}

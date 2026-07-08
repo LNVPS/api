@@ -132,6 +132,9 @@ fn default_escalate_pass_pps() -> u64 {
 fn default_max_real_sources() -> usize {
     10_000
 }
+fn default_syn_proxy_syn_pps() -> u64 {
+    5_000
+}
 
 impl Default for LearningConfig {
     fn default() -> Self {
@@ -182,6 +185,10 @@ pub struct Escalation {
     /// the flood is treated as spoofed and source blocking is skipped.
     #[serde(default = "default_max_real_sources")]
     pub max_real_sources: usize,
+    /// Enable the SYN_PROXY flag on a mitigating dest/prefix once its SYN rate
+    /// reaches this many SYNs/second (spoofed SYN floods to open TCP ports).
+    #[serde(default = "default_syn_proxy_syn_pps")]
+    pub syn_proxy_syn_pps: u64,
 }
 
 impl Default for Escalation {
@@ -192,6 +199,7 @@ impl Default for Escalation {
             block_ttl_secs: default_block_ttl_secs(),
             escalate_pass_pps: default_escalate_pass_pps(),
             max_real_sources: default_max_real_sources(),
+            syn_proxy_syn_pps: default_syn_proxy_syn_pps(),
         }
     }
 }
@@ -344,6 +352,7 @@ impl Config {
             block_ttl_ns: self.escalation.block_ttl_secs * 1_000_000_000,
             escalate_pass_pps: self.escalation.escalate_pass_pps,
             max_real_sources: self.escalation.max_real_sources,
+            syn_proxy_pps: self.escalation.syn_proxy_syn_pps,
         })
     }
 }

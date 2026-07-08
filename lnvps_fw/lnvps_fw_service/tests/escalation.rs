@@ -44,8 +44,9 @@ fn cidr_escalation_aggregates_offending_v24() {
         src_rate_pps: 10, // a source sending >=10pps is an offender
         fanout: 4,        // 4 sources in a /24 collapse to the /24
         block_ttl_ns: SECOND_NS,
-        escalate_pass_pps: 0,     // (unused here; trie is checked directly)
-        max_real_sources: 10_000, // 4 offenders are well under the spoof gate
+        escalate_pass_pps: 0, // (unused here; trie is checked directly)
+        max_real_sources: 10_000,
+        syn_proxy_pps: u64::MAX, // 4 offenders are well under the spoof gate
     };
     let mut state = DetectionState::default();
 

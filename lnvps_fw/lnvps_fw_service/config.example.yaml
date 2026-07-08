@@ -70,3 +70,6 @@ escalation:
   # treat the flood as spoofed and skip source blocking entirely (rely on the
   # port filter). Source blocking only makes sense for bounded, real botnets.
   max-real-sources: 10000
+  # Enable the SYN-proxy (SYN-cookie handshake validation) on a mitigating
+  # dest/prefix once its SYN rate reaches this many SYNs/second.
+  syn-proxy-syn-pps: 5000

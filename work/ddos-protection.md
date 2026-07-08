@@ -357,6 +357,71 @@ Escalation is residual-driven + spoof-gated (userspace, `runtime`):
       seeding) — own task. SYN-proxy (level 2) is inc 6; UDP per-(dst,port)
       caps (level 3) later.
 
+## Increment 6 — SYN-proxy / SYN-cookies ✅ DONE (validated as root)
+
+**ROOT CAUSE of the earlier EFAULT: a data-dependent `while` loop** (the
+checksum fold `while sum>>16 != 0`). The XDP verifier rejects it here as an
+opaque `EFAULT` ("func#0 @0", no dmesg). Fix: loop-free double-fold. Also had to
+avoid whole-array field assignments (they lower to `memmove` on packet memory =>
+verifier state explosion) via byte-wise swaps, and use bounds-checked typed
+header pointers (not raw usize packet arithmetic).
+
+Working implementation:
+- eBPF: `xdp_syn_proxy` tail-call program (PROG_ARRAY `SYN_PROXY_JUMP`, slot
+  `SLOT_SYN_PROXY_V4`). Main prog tail-calls it for TCP-to-open-port packets
+  from unverified sources when the SYN_PROXY flag is set. SYN -> craft SYN-ACK
+  with `syn_cookie_v4` cookie as seq (byte-wise rewrite + IP/TCP checksums) and
+  XDP_TX. ACK -> validate cookie (current+prev secret) -> mark source verified
+  in `VERIFIED_V4`; verified sources pass through. Cookie = FNV-1a mix over the
+  4-tuple + rotating `COOKIE_SECRET` (2 slots).
+- userspace: service loads `xdp_syn_proxy` + populates the jump table (via
+  `ProgramFd::try_clone`), seeds + rotates the cookie secret (120s), GCs
+  `VERIFIED_V4` by TTL. `enforced_flags` OR's in SYN_PROXY once a mitigating
+  entity's syn_pps >= `syn-proxy-syn-pps` (config).
+- tests/syn_proxy.rs (root): real client completes the cookie handshake (proves
+  XDP_TX + checksums + cookie; confirms XDP_TX works in SKB mode on veth) and is
+  verified; spoofed SYNs never verify. Both pass.
+- v6 SYN-proxy deferred (doubles the rewrite); IPv4 only this increment.
+- VALIDATED as root: 15 harness + 34 unit tests green.
+
+### Historical: earlier blocked attempts (kept for reference)
+
+- [x] Shared SYN-cookie algorithm `syn_cookie_v4` in lnvps_fw_common (FNV-1a
+      mix over the 4-tuple + rotating secret; non-crypto is fine — spoofed
+      sources never see the SYN-ACK so can't learn the cookie). Unit-tested
+      (deterministic + tuple/secret sensitive). COOKIE_SECRET_CURRENT/PREVIOUS
+      constants. **This is committed foundation; the rest is not.**
+- [~] TAIL-CALL ARCHITECTURE: BUILT + STRUCTURALLY VALIDATED, packet-rewrite
+      still blocked. Three verifier walls hit in sequence:
+      1. inline rewrite in main prog => ENOSPC (>1M insns).
+      2. `#[inline(never)]` helper => global subprogram, unknown ctx, can't
+         prove packet bounds => EACCES.
+      3. Separate `#[xdp] xdp_syn_proxy` tail-called via a ProgramArray
+         (SYN_PROXY_JUMP, slot SLOT_SYN_PROXY_V4): the MAIN program loads fine
+         with the tail_call, and a STUB xdp_syn_proxy (returns XDP_DROP) loads +
+         attaches — so the structure works. But the real packet-rewrite
+         (tx_synack_v4) => BPF_PROG_LOAD EFAULT with only `func#0 @0` from the
+         verifier. Isolated: parse + cookie + ACK-validate + mark_verified all
+         load; only tx_synack_v4's in-place rewrite EFAULTs. Ruled out
+         core::mem::swap and the network-types bitfield setters (removed both,
+         still EFAULT). Signature points to a BTF/subprogram toolchain issue
+         (rewrite not inlined -> malformed func_info), NOT a logic rejection.
+      Blocked on tooling: no bpftool/veristat here + aya truncates the verifier
+      log. NEXT: debug on a lab host with bpftool/veristat (full verifier log,
+      func_info/BTF), or force-inline / reimplement xdp_syn_proxy in C, or bump
+      aya/bpf-linker. The working tail-call wiring (ProgramArray load + set via
+      ProgramFd::try_clone; main-prog tail_call branch) is proven and recoverable
+      from this session's history.
+- [ ] Also pending: VERIFIED_V4 map + verified-source pass-through, cookie
+      secret rotation (userspace), SYN_PROXY flag enable when SYN-to-open
+      residual persists, verified GC, harness test (raw SYN -> SYN-ACK cookie;
+      completed handshake verifies source; spoofed never verifies). v6 parity
+      deferred (doubles the rewrite code).
+- Datapath attempt was reverted so the firewall keeps loading (13 harness +
+      32 svc + 2 common tests green). Only the cookie foundation remains.
+- Feasibility still to confirm: XDP_TX in SKB/generic mode on veth (harness);
+      may need a lab host for final validation like native-mode.
+
 ## Notes
 
 - Increment order is dependency-driven; 1→2→3→4 delivers the user's phase-1

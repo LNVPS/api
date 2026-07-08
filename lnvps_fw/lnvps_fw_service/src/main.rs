@@ -3,13 +3,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use aya::maps::{HashMap as AyaHashMap, PerCpuHashMap};
+use aya::maps::{Array, HashMap as AyaHashMap, PerCpuHashMap, ProgramArray};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_clsact};
 use aya::util::KernelVersion;
 use aya::{Ebpf, include_bytes_aligned};
 use log::{info, warn};
 
-use lnvps_fw_common::{DestCounters, LastSeen, PortKeyV4, PortKeyV6};
+use lnvps_fw_common::{
+    COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DestCounters, LastSeen, PortKeyV4, PortKeyV6,
+    SLOT_SYN_PROXY_V4,
+};
 
 use lnvps_fw_service::config::Config;
 use lnvps_fw_service::gc;
@@ -119,7 +122,62 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
         info!("TC egress attached to {iface}");
     }
 
+    // SYN-proxy tail-call program: load it (not attached to an interface -- it
+    // is only reached via bpf_tail_call) and register it in the jump table.
+    {
+        let syn_fd = {
+            let sp: &mut Xdp = bpf
+                .program_mut("xdp_syn_proxy")
+                .context("xdp_syn_proxy program not found")?
+                .try_into()?;
+            sp.load()?;
+            sp.fd()?.try_clone()?
+        };
+        let mut jt: ProgramArray<_> = ProgramArray::try_from(
+            bpf.map_mut("SYN_PROXY_JUMP")
+                .context("jump table missing")?,
+        )?;
+        jt.set(SLOT_SYN_PROXY_V4, &syn_fd, 0)?;
+        info!("SYN-proxy program loaded into jump table");
+    }
+    // Seed an initial SYN-cookie secret.
+    rotate_cookie_secret(&mut bpf, gc::monotonic_now_ns() as u32 | 1)?;
+
     Ok(bpf)
+}
+
+/// Expire verified sources whose verification is older than `ttl_ns`.
+fn gc_verified(bpf: &mut Ebpf, ttl_ns: u64) -> Result<usize> {
+    let now = gc::monotonic_now_ns();
+    let mut map: AyaHashMap<_, [u8; 4], u64> =
+        AyaHashMap::try_from(bpf.map_mut("VERIFIED_V4").context("VERIFIED_V4 missing")?)?;
+    let expired: Vec<[u8; 4]> = map
+        .keys()
+        .flatten()
+        .filter(|k| match map.get(k, 0) {
+            Ok(ts) => gc::is_expired(ts, now, ttl_ns),
+            Err(_) => false,
+        })
+        .collect();
+    let mut removed = 0;
+    for k in &expired {
+        if map.remove(k).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Rotate the SYN-cookie secret: previous <- current, current <- `new`.
+fn rotate_cookie_secret(bpf: &mut Ebpf, new: u32) -> Result<()> {
+    let mut secret: Array<_, u32> = Array::try_from(
+        bpf.map_mut("COOKIE_SECRET")
+            .context("COOKIE_SECRET missing")?,
+    )?;
+    let cur = secret.get(&COOKIE_SECRET_CURRENT, 0).unwrap_or(0);
+    secret.set(COOKIE_SECRET_PREVIOUS, cur, 0)?;
+    secret.set(COOKIE_SECRET_CURRENT, new, 0)?;
+    Ok(())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -147,6 +205,10 @@ async fn main() -> Result<()> {
     } else {
         stats_secs
     }));
+    // Rotate the SYN-cookie secret periodically; cookies issued in the previous
+    // window still validate against the prev slot.
+    let mut cookie_timer = tokio::time::interval(Duration::from_secs(120));
+    let verified_ttl_ns = ttl_ns;
 
     info!(
         "Learning: port TTL {}s, GC every {}s",
@@ -177,6 +239,15 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => info!("GC removed {n} expired learned port(s)"),
                     Ok(_) => {}
                     Err(e) => warn!("GC failed: {e}"),
+                }
+                if let Err(e) = gc_verified(&mut bpf, verified_ttl_ns) {
+                    warn!("verified GC failed: {e}");
+                }
+            }
+            _ = cookie_timer.tick() => {
+                let new = gc::monotonic_now_ns() as u32 | 1;
+                if let Err(e) = rotate_cookie_secret(&mut bpf, new) {
+                    warn!("cookie rotation failed: {e}");
                 }
             }
             _ = stats_timer.tick(), if stats_secs > 0 => {

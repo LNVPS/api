@@ -116,8 +116,18 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   network threshold and flips the whole prefix to mitigation via one dest-state
   LPM entry; addresses outside the prefix stay normal; cooldown restores it.
 
+`tests/syn_proxy.rs` (SYN-proxy / SYN-cookie datapath):
+- `syn_proxy_verifies_real_client` — under the SYN_PROXY flag, a real client's
+  TCP handshake completes through the XDP-crafted SYN-cookie SYN-ACK (the client
+  kernel only accepts it if the IP/TCP checksums and cookie are correct), and
+  the source is then marked verified. Also confirms XDP_TX works in SKB mode on
+  veth.
+- `syn_proxy_spoofed_not_verified` — spoofed SYNs that never complete the
+  handshake are never verified.
+
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
-mitigation`, `--test escalation`, `--test carpet_bomb`, `--test smoke`).
+mitigation`, `--test escalation`, `--test carpet_bomb`, `--test syn_proxy`,
+`--test smoke`).
 
 ## Service configuration
 

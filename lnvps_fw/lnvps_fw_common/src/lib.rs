@@ -74,6 +74,55 @@ pub struct DestState {
     pub entered_at: u64,
 }
 
+/// Compute a SYN-cookie for an IPv4 4-tuple under `secret`. Used by the XDP
+/// SYN-proxy: the challenge SYN-ACK carries this value as its sequence number;
+/// a legitimate client echoes it back as `ack_seq - 1`, proving it can complete
+/// a handshake (i.e. its source address is not spoofed). Userspace rotates
+/// `secret` so old cookies expire.
+///
+/// This is a fast non-cryptographic mix (FNV-1a style). It does not need to be
+/// cryptographically strong: a spoofed source never receives the SYN-ACK, so it
+/// cannot learn the cookie regardless. Ports/addresses are passed as raw header
+/// bytes so both the generate and verify sides agree without endianness care.
+#[inline(always)]
+pub fn syn_cookie_v4(
+    secret: u32,
+    saddr: [u8; 4],
+    daddr: [u8; 4],
+    sport: [u8; 2],
+    dport: [u8; 2],
+) -> u32 {
+    let mut h: u32 = 2_166_136_261u32 ^ secret;
+    let mut mix = |b: u8| {
+        h ^= b as u32;
+        h = h.wrapping_mul(16_777_619);
+    };
+    for b in saddr {
+        mix(b);
+    }
+    for b in daddr {
+        mix(b);
+    }
+    for b in sport {
+        mix(b);
+    }
+    for b in dport {
+        mix(b);
+    }
+    h
+}
+
+/// Config-map keys for the two-slot rotating SYN-cookie secret (current +
+/// previous, so cookies issued just before a rotation still validate).
+pub const COOKIE_SECRET_CURRENT: u32 = 0;
+pub const COOKIE_SECRET_PREVIOUS: u32 = 1;
+
+/// PROG_ARRAY slot of the IPv4 SYN-proxy tail-call program. The main XDP
+/// program tail-calls here (rather than inlining the packet-rewrite, which
+/// blows the verifier budget) so the rewrite program is verified independently
+/// with a full XDP context.
+pub const SLOT_SYN_PROXY_V4: u32 = 0;
+
 /// Value stored in the learned-open-ports maps: when the port was last seen
 /// serving traffic (via passive egress observation), on the
 /// `bpf_ktime_get_ns` monotonic clock. Userspace GC expires entries whose
@@ -155,6 +204,22 @@ mod user {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_is_deterministic_and_tuple_sensitive() {
+        let a = syn_cookie_v4(0x1234, [10, 0, 0, 2], [10, 0, 1, 2], [0x30, 0x39], [0, 80]);
+        let b = syn_cookie_v4(0x1234, [10, 0, 0, 2], [10, 0, 1, 2], [0x30, 0x39], [0, 80]);
+        assert_eq!(a, b, "same inputs must give same cookie");
+        // Different source port -> different cookie.
+        let c = syn_cookie_v4(0x1234, [10, 0, 0, 2], [10, 0, 1, 2], [0x30, 0x40], [0, 80]);
+        assert_ne!(a, c);
+        // Different secret -> different cookie.
+        let d = syn_cookie_v4(0x9999, [10, 0, 0, 2], [10, 0, 1, 2], [0x30, 0x39], [0, 80]);
+        assert_ne!(a, d);
+        // Different source address -> different cookie.
+        let e = syn_cookie_v4(0x1234, [10, 0, 0, 3], [10, 0, 1, 2], [0x30, 0x39], [0, 80]);
+        assert_ne!(a, e);
+    }
 
     #[test]
     fn key_sizes_have_no_hidden_padding() {

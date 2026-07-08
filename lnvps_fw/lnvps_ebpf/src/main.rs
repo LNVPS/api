@@ -2,12 +2,13 @@
 #![no_main]
 
 use aya_ebpf::bindings::TC_ACT_OK;
-use aya_ebpf::bindings::xdp_action::{XDP_DROP, XDP_PASS};
+use aya_ebpf::bindings::xdp_action::{XDP_DROP, XDP_PASS, XDP_TX};
 use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
-    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, PROTO_ICMP, PROTO_ICMPV6,
-    PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
+    PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4,
+    syn_cookie_v4,
 };
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
@@ -17,9 +18,10 @@ use network_types::udp::UdpHdr;
 mod maps;
 
 use maps::{
-    OPEN_PORTS_V4, OPEN_PORTS_V6, cidr_blocked_v4, cidr_blocked_v6, count_src_v4, count_src_v6,
-    counters_v4, counters_v6, dest_mode_v4, dest_mode_v6, learn_port_v4, learn_port_v6,
-    port_is_open_v4, port_is_open_v6,
+    OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cidr_blocked_v4, cidr_blocked_v6, cookie_secrets,
+    count_src_v4, count_src_v6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
+    learn_port_v4, learn_port_v6, mark_verified_v4, port_is_open_v4, port_is_open_v6,
+    src_verified_v4,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -117,11 +119,12 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
 
     // Steady state is pass-all (just count + learn). Enforcement happens only
     // once userspace sets one or more protection flags on this destination.
+    let src = ip.src_addr;
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
     let flags = dest_mode_v4(&dst);
     if flags != DEST_MODE_NORMAL {
-        verdict = mitigate_v4(&dst, &ip.src_addr, &meta, flags);
+        verdict = mitigate_v4(ctx, &dst, &src, &meta, flags);
     }
     account(ctx, counters, &meta, PROTO_ICMP, verdict);
     Ok(verdict)
@@ -159,9 +162,18 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
 /// - PORT_FILTER: drop non-first fragments and traffic to non-learned ports
 ///   (ICMP passes); this sheds the bulk of reflection/carpet-bomb floods.
 #[inline(always)]
-fn mitigate_v4(dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta, flags: u32) -> u32 {
+fn mitigate_v4(ctx: &XdpContext, dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta, flags: u32) -> u32 {
     count_src_v4(src);
     if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v4(*src) {
+        return XDP_DROP;
+    }
+    if flags & DEST_MODE_SYN_PROXY != 0
+        && meta.proto == PROTO_TCP
+        && meta.has_port
+        && port_is_open_v4(*dst, meta.dst_port, PROTO_TCP)
+        && !src_verified_v4(src)
+    {
+        unsafe { SYN_PROXY_JUMP.tail_call(ctx, SLOT_SYN_PROXY_V4) };
         return XDP_DROP;
     }
     if flags & DEST_MODE_PORT_FILTER != 0 {
@@ -349,6 +361,216 @@ fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
         learn_port_v6(&OPEN_PORTS_V6, &key);
     }
     Ok(())
+}
+
+// --- SYN-proxy tail-call program (IPv4) ---
+const TCP_OFF: usize = EthHdr::LEN + Ipv4Hdr::LEN;
+
+#[xdp]
+pub fn xdp_syn_proxy(ctx: XdpContext) -> u32 {
+    match try_syn_proxy(&ctx) {
+        Ok(v) => v,
+        Err(()) => XDP_DROP,
+    }
+}
+
+#[inline(always)]
+fn try_syn_proxy(ctx: &XdpContext) -> Result<u32, ()> {
+    let ip = ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
+    let src = ip.src_addr;
+    let dst = ip.dst_addr;
+    let tcp = ptr_at::<TcpHdr>(ctx, TCP_OFF)?;
+    let syn = tcp.syn() != 0;
+    let ack = tcp.ack() != 0;
+    let sport = tcp.source;
+    let dport = tcp.dest;
+    let client_ack = u32::from_be_bytes(tcp.ack_seq);
+    let (cur, prev) = cookie_secrets();
+
+    if syn && !ack {
+        let cookie = syn_cookie_v4(cur, src, dst, sport, dport);
+        return Ok(tx_synack_v4(ctx, cookie));
+    }
+    if ack && !syn {
+        let echoed = client_ack.wrapping_sub(1);
+        let c_cur = syn_cookie_v4(cur, src, dst, sport, dport);
+        let c_prev = syn_cookie_v4(prev, src, dst, sport, dport);
+        if echoed == c_cur || echoed == c_prev {
+            mark_verified_v4(&src);
+        }
+        return Ok(XDP_DROP);
+    }
+    Ok(XDP_DROP)
+}
+
+#[inline(always)]
+fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    if start + offset + size_of::<T>() > end {
+        return Err(());
+    }
+    Ok((start + offset) as *mut T)
+}
+
+#[inline(always)]
+fn fold(sum: u32) -> u16 {
+    // Loop-free: folding a sum of at most ~10 16-bit words twice always brings
+    // it within 16 bits. Data-dependent `while` loops are rejected by the XDP
+    // verifier here (they surface as an opaque EFAULT at load).
+    let sum = (sum & 0xffff) + (sum >> 16);
+    let sum = (sum & 0xffff) + (sum >> 16);
+    !(sum as u16)
+}
+/// Big-endian u16 from two bytes.
+#[inline(always)]
+fn be16(hi: u8, lo: u8) -> u32 {
+    ((hi as u32) << 8) | lo as u32
+}
+
+/// Rewrite the in-place IPv4 TCP SYN into a SYN-ACK carrying `cookie`. Every
+/// operation is byte-wise on bounds-checked typed header pointers: whole-array
+/// field assignments lower to `memmove`/`memcpy` on packet memory, which blow
+/// up the XDP verifier's state space, so we avoid them entirely. Checksums are
+/// computed from field bytes. Returns XDP_TX, or XDP_PASS if truncated.
+#[inline(always)]
+fn tx_synack_v4(ctx: &XdpContext, cookie: u32) -> u32 {
+    let eth = match ptr_at_mut::<EthHdr>(ctx, 0) {
+        Ok(p) => unsafe { &mut *p },
+        Err(()) => return XDP_PASS,
+    };
+    let ip = match ptr_at_mut::<Ipv4Hdr>(ctx, EthHdr::LEN) {
+        Ok(p) => unsafe { &mut *p },
+        Err(()) => return XDP_PASS,
+    };
+    let tcp = match ptr_at_mut::<TcpHdr>(ctx, TCP_OFF) {
+        Ok(p) => unsafe { &mut *p },
+        Err(()) => return XDP_PASS,
+    };
+
+    // Swap MAC + IPv4 addresses byte-wise (whole-array assignment lowers to
+    // memmove on packet memory, which explodes the verifier state space).
+    {
+        let t = eth.dst_addr[0];
+        eth.dst_addr[0] = eth.src_addr[0];
+        eth.src_addr[0] = t;
+    }
+    {
+        let t = eth.dst_addr[1];
+        eth.dst_addr[1] = eth.src_addr[1];
+        eth.src_addr[1] = t;
+    }
+    {
+        let t = eth.dst_addr[2];
+        eth.dst_addr[2] = eth.src_addr[2];
+        eth.src_addr[2] = t;
+    }
+    {
+        let t = eth.dst_addr[3];
+        eth.dst_addr[3] = eth.src_addr[3];
+        eth.src_addr[3] = t;
+    }
+    {
+        let t = eth.dst_addr[4];
+        eth.dst_addr[4] = eth.src_addr[4];
+        eth.src_addr[4] = t;
+    }
+    {
+        let t = eth.dst_addr[5];
+        eth.dst_addr[5] = eth.src_addr[5];
+        eth.src_addr[5] = t;
+    }
+    {
+        let t = ip.src_addr[0];
+        ip.src_addr[0] = ip.dst_addr[0];
+        ip.dst_addr[0] = t;
+    }
+    {
+        let t = ip.src_addr[1];
+        ip.src_addr[1] = ip.dst_addr[1];
+        ip.dst_addr[1] = t;
+    }
+    {
+        let t = ip.src_addr[2];
+        ip.src_addr[2] = ip.dst_addr[2];
+        ip.dst_addr[2] = t;
+    }
+    {
+        let t = ip.src_addr[3];
+        ip.src_addr[3] = ip.dst_addr[3];
+        ip.dst_addr[3] = t;
+    }
+    ip.tot_len[0] = 0;
+    ip.tot_len[1] = 40; // 20 IP + 20 TCP
+    ip.ttl = 64;
+    ip.check[0] = 0;
+    ip.check[1] = 0;
+    let ipsum = be16(ip.vihl, ip.tos)
+        + be16(ip.tot_len[0], ip.tot_len[1])
+        + be16(ip.id[0], ip.id[1])
+        + be16(ip.frags[0], ip.frags[1])
+        + be16(ip.ttl, ip.proto)
+        + be16(ip.src_addr[0], ip.src_addr[1])
+        + be16(ip.src_addr[2], ip.src_addr[3])
+        + be16(ip.dst_addr[0], ip.dst_addr[1])
+        + be16(ip.dst_addr[2], ip.dst_addr[3]);
+    let ipck = fold(ipsum);
+    ip.check[0] = (ipck >> 8) as u8;
+    ip.check[1] = ipck as u8;
+
+    // Swap TCP ports byte-wise.
+    {
+        let a = tcp.source[0];
+        let b = tcp.source[1];
+        tcp.source[0] = tcp.dest[0];
+        tcp.source[1] = tcp.dest[1];
+        tcp.dest[0] = a;
+        tcp.dest[1] = b;
+    }
+    let client_seq = ((tcp.seq[0] as u32) << 24)
+        | ((tcp.seq[1] as u32) << 16)
+        | ((tcp.seq[2] as u32) << 8)
+        | tcp.seq[3] as u32;
+    let ackn = client_seq.wrapping_add(1);
+    tcp.seq[0] = (cookie >> 24) as u8;
+    tcp.seq[1] = (cookie >> 16) as u8;
+    tcp.seq[2] = (cookie >> 8) as u8;
+    tcp.seq[3] = cookie as u8;
+    tcp.ack_seq[0] = (ackn >> 24) as u8;
+    tcp.ack_seq[1] = (ackn >> 16) as u8;
+    tcp.ack_seq[2] = (ackn >> 8) as u8;
+    tcp.ack_seq[3] = ackn as u8;
+    // Data offset (5 words) + flags (SYN|ACK) as the two wire bytes at TCP
+    // offset 12/13, via the validated typed pointer.
+    let tb = tcp as *mut TcpHdr as *mut u8;
+    unsafe {
+        *tb.add(12) = 0x50;
+        *tb.add(13) = 0x12;
+    }
+    tcp.window[0] = 0xff;
+    tcp.window[1] = 0xff;
+    tcp.urg_ptr[0] = 0;
+    tcp.urg_ptr[1] = 0;
+    tcp.check[0] = 0;
+    tcp.check[1] = 0;
+    let tsum = be16(ip.src_addr[0], ip.src_addr[1])
+        + be16(ip.src_addr[2], ip.src_addr[3])
+        + be16(ip.dst_addr[0], ip.dst_addr[1])
+        + be16(ip.dst_addr[2], ip.dst_addr[3])
+        + PROTO_TCP as u32
+        + 20u32
+        + be16(tcp.source[0], tcp.source[1])
+        + be16(tcp.dest[0], tcp.dest[1])
+        + (cookie >> 16)
+        + (cookie & 0xffff)
+        + (ackn >> 16)
+        + (ackn & 0xffff)
+        + 0x5012u32
+        + 0xffffu32;
+    let tck = fold(tsum);
+    tcp.check[0] = (tck >> 8) as u8;
+    tcp.check[1] = tck as u8;
+    XDP_TX
 }
 
 #[cfg(not(test))]

@@ -26,7 +26,8 @@ use aya::{Ebpf, Pod};
 use log::{info, warn};
 
 use lnvps_fw_common::{
-    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DestCounters, DestState,
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
+    DestCounters, DestState,
 };
 
 use crate::cidr::{
@@ -60,6 +61,9 @@ pub struct RuntimeConfig {
     /// window, treat the flood as spoofed and skip source blocking entirely
     /// (rely on the port filter instead of chasing unblockable /32s).
     pub max_real_sources: usize,
+    /// Enable the SYN_PROXY flag once a mitigating entity's SYN rate reaches
+    /// this many SYNs/second.
+    pub syn_proxy_pps: u64,
 }
 
 /// Per-address-family control state kept across sample windows.
@@ -108,8 +112,18 @@ fn dest_state(level: u32, now_ns: u64) -> DestState {
 /// (bounded/real offenders present) and traffic is still getting through after
 /// the port filter. Other flags (SYN_PROXY, RATE_CAPS) are OR'd in here as they
 /// are implemented, so any subset can be active at once.
-fn enforced_flags(rates: &Rates, source_block_active: bool, escalate_pass_pps: u64) -> u32 {
+fn enforced_flags(
+    rates: &Rates,
+    source_block_active: bool,
+    escalate_pass_pps: u64,
+    syn_proxy_pps: u64,
+) -> u32 {
     let mut flags = DEST_MODE_PORT_FILTER;
+    // A sustained SYN flood engages the SYN-proxy (validate handshakes to open
+    // TCP ports with cookies). High efficacy vs spoofed SYN floods, low FP.
+    if rates.syn_pps >= syn_proxy_pps {
+        flags |= DEST_MODE_SYN_PROXY;
+    }
     if source_block_active && rates.pass_pps >= escalate_pass_pps {
         flags |= DEST_MODE_SOURCE_BLOCK;
     }
@@ -141,6 +155,7 @@ fn detect_family<K>(
     cfg: &DetectionConfig,
     source_block_active: bool,
     escalate_pass_pps: u64,
+    syn_proxy_pps: u64,
     now_ns: u64,
     elapsed_ns: u64,
     fmt_ip: impl Fn(&K) -> String,
@@ -160,7 +175,12 @@ fn detect_family<K>(
             continue;
         }
         // Active: pick the enforcement level and (re)write it if changed.
-        let target = enforced_flags(&rates, source_block_active, escalate_pass_pps);
+        let target = enforced_flags(
+            &rates,
+            source_block_active,
+            escalate_pass_pps,
+            syn_proxy_pps,
+        );
         if transition == Transition::Entered {
             let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
             tracker.flags = target;
@@ -187,6 +207,7 @@ fn detect_prefix<K>(
     cfg: &DetectionConfig,
     source_block_active: bool,
     escalate_pass_pps: u64,
+    syn_proxy_pps: u64,
     now_ns: u64,
     elapsed_ns: u64,
     fmt: impl Fn(u32, &K) -> String,
@@ -215,7 +236,12 @@ fn detect_prefix<K>(
         }
         return;
     }
-    let target = enforced_flags(&rates, source_block_active, escalate_pass_pps);
+    let target = enforced_flags(
+        &rates,
+        source_block_active,
+        escalate_pass_pps,
+        syn_proxy_pps,
+    );
     if transition == Transition::Entered {
         let _ = trie.insert(
             &Key::new(prefix_len, network),
@@ -420,6 +446,7 @@ pub fn run_control(
             &cfg.detection,
             sba4,
             cfg.escalate_pass_pps,
+            cfg.syn_proxy_pps,
             now_ns,
             elapsed,
             |k| Ipv4Addr::from(*k).to_string(),
@@ -435,6 +462,7 @@ pub fn run_control(
                 &cfg.network,
                 sba4,
                 cfg.escalate_pass_pps,
+                cfg.syn_proxy_pps,
                 now_ns,
                 elapsed,
                 |l, n| format!("{}/{}", Ipv4Addr::from(*n), l),
@@ -453,6 +481,7 @@ pub fn run_control(
             &cfg.detection,
             sba6,
             cfg.escalate_pass_pps,
+            cfg.syn_proxy_pps,
             now_ns,
             elapsed,
             |k| Ipv6Addr::from(*k).to_string(),
@@ -468,6 +497,7 @@ pub fn run_control(
                 &cfg.network,
                 sba6,
                 cfg.escalate_pass_pps,
+                cfg.syn_proxy_pps,
                 now_ns,
                 elapsed,
                 |l, n| format!("{}/{}", Ipv6Addr::from(*n), l),
