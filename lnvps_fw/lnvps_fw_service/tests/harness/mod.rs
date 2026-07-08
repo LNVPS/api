@@ -22,11 +22,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsFd;
 
 use aya::maps::{HashMap as AyaHashMap, PerCpuHashMap};
-use aya::programs::{Xdp, XdpMode};
+use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_clsact};
 use aya::{Ebpf, EbpfLoader};
 use nix::sched::{CloneFlags, setns};
 
-use lnvps_fw_common::{Bucket, DestCounters, PacketLimits};
+use lnvps_fw_common::{Bucket, DestCounters, LastSeen, PacketLimits, PortKeyV4, PortKeyV6};
 
 use netns::NetnsTopology;
 
@@ -62,19 +62,33 @@ impl Harness {
         let topo = NetnsTopology::new()?;
 
         let mut bpf = EbpfLoader::new().load(EBPF_OBJECT)?;
-        let prog: &mut Xdp = bpf
-            .program_mut("xdp_lnvps")
-            .ok_or_else(|| anyhow::anyhow!("xdp_lnvps program not found"))?
-            .try_into()?;
-        prog.load()?;
 
-        // XDP attach resolves the interface index in the *current* thread's
-        // network namespace, so switch into the filter namespace just for the
-        // attach, then switch back. Map access afterwards is fd-based and
-        // namespace-independent.
+        // XDP/TC attach resolves the interface index in the *current* thread's
+        // network namespace, so switch into the filter namespace for the
+        // load+attach, then switch back. Map access afterwards is fd-based and
+        // namespace-independent. Both programs attach to the uplink veth
+        // (f_up): XDP inspects ingress (attack) traffic, TC egress learns open
+        // ports from the VM's outbound replies. Each program's borrow of `bpf`
+        // is scoped so the two do not overlap.
         {
             let _guard = NetnsSwitch::enter(&topo.filter_ns_path())?;
-            prog.attach(&topo.filter_up_if, XdpMode::Skb)?;
+            {
+                let prog: &mut Xdp = bpf
+                    .program_mut("xdp_lnvps")
+                    .ok_or_else(|| anyhow::anyhow!("xdp_lnvps program not found"))?
+                    .try_into()?;
+                prog.load()?;
+                prog.attach(&topo.filter_up_if, XdpMode::Skb)?;
+            }
+            {
+                let tc: &mut SchedClassifier = bpf
+                    .program_mut("tc_lnvps_egress")
+                    .ok_or_else(|| anyhow::anyhow!("tc_lnvps_egress program not found"))?
+                    .try_into()?;
+                tc.load()?;
+                let _ = qdisc_add_clsact(&topo.filter_up_if);
+                tc.attach(&topo.filter_up_if, TcAttachType::Egress)?;
+            }
         }
 
         Ok(Self { topo, bpf })
@@ -113,6 +127,61 @@ impl Harness {
             AyaHashMap::try_from(self.bpf.map_mut("V4_SYN_RATE_LIMITS").unwrap())?;
         map.insert(ip.octets(), limits, 0)?;
         Ok(())
+    }
+
+    /// Look up a learned IPv4 open port, returning its `LastSeen` if present.
+    /// `port`/`proto` use the same host-order/`PROTO_*` convention the eBPF
+    /// program writes.
+    pub fn open_port_v4(
+        &self,
+        ip: Ipv4Addr,
+        port: u16,
+        proto: u8,
+    ) -> anyhow::Result<Option<LastSeen>> {
+        let map: AyaHashMap<_, PortKeyV4, LastSeen> =
+            AyaHashMap::try_from(self.bpf.map("OPEN_PORTS_V4").unwrap())?;
+        let key = PortKeyV4 {
+            addr: ip.octets(),
+            port,
+            proto,
+            _pad: 0,
+        };
+        Ok(map.get(&key, 0).ok())
+    }
+
+    /// Number of IPv4 learned-open-port entries currently in the map.
+    pub fn open_port_count_v4(&self) -> anyhow::Result<usize> {
+        let map: AyaHashMap<_, PortKeyV4, LastSeen> =
+            AyaHashMap::try_from(self.bpf.map("OPEN_PORTS_V4").unwrap())?;
+        Ok(map.keys().flatten().count())
+    }
+
+    /// Run the userspace learned-port GC (as the daemon does) over the IPv4
+    /// map with the given TTL, returning the number of entries removed. Uses
+    /// the shared `gc` logic so the harness test exercises real code.
+    pub fn gc_open_ports_v4(&mut self, ttl_ns: u64) -> anyhow::Result<usize> {
+        let now = lnvps_fw_service::gc::monotonic_now_ns();
+        let mut map: AyaHashMap<_, PortKeyV4, LastSeen> =
+            AyaHashMap::try_from(self.bpf.map_mut("OPEN_PORTS_V4").unwrap())?;
+        Ok(lnvps_fw_service::gc::gc_open_ports(&mut map, now, ttl_ns))
+    }
+
+    /// Provide access to the raw v6 port key type for callers building keys.
+    pub fn open_port_v6(
+        &self,
+        ip: Ipv6Addr,
+        port: u16,
+        proto: u8,
+    ) -> anyhow::Result<Option<LastSeen>> {
+        let map: AyaHashMap<_, PortKeyV6, LastSeen> =
+            AyaHashMap::try_from(self.bpf.map("OPEN_PORTS_V6").unwrap())?;
+        let key = PortKeyV6 {
+            addr: ip.octets(),
+            port,
+            proto,
+            _pad: 0,
+        };
+        Ok(map.get(&key, 0).ok())
     }
 }
 

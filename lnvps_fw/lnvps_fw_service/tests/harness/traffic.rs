@@ -8,9 +8,9 @@
 
 use std::fs::File;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::AsFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sched::{CloneFlags, setns};
 
@@ -61,15 +61,62 @@ pub fn udp_recv_once(
 
 /// Send a single UDP datagram from `ns_path` to `dst`.
 pub fn udp_send(ns_path: &str, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
+    udp_send_from(ns_path, 0, dst, payload)
+}
+
+/// Send a single UDP datagram from `ns_path` to `dst`, binding a specific
+/// local source port (0 = ephemeral). Useful for learning-path assertions
+/// where the test needs to know the source port the egress program observes.
+pub fn udp_send_from(
+    ns_path: &str,
+    src_port: u16,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> io::Result<()> {
     let payload = payload.to_vec();
     in_netns(ns_path, move || {
         let bind: SocketAddr = match dst {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, src_port)),
+            SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, src_port)),
         };
         let sock = UdpSocket::bind(bind)?;
         sock.send_to(&payload, dst)?;
         Ok(())
+    })?
+}
+
+/// Bind a TCP listener in `ns_path` and wait up to `timeout` to accept one
+/// connection. Returns `true` if a connection was accepted. The accepted
+/// stream is closed immediately; the point is to drive the SYN-ACK reply that
+/// the egress learner observes.
+pub fn tcp_listen_accept(ns_path: &str, bind: SocketAddr, timeout: Duration) -> io::Result<bool> {
+    in_netns(ns_path, move || {
+        let listener = TcpListener::bind(bind)?;
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    drop(stream);
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    })?
+}
+
+/// Attempt a TCP connection from `ns_path` to `dst`, returning whether it
+/// completed within `timeout`.
+pub fn tcp_connect(ns_path: &str, dst: SocketAddr, timeout: Duration) -> io::Result<bool> {
+    in_netns(ns_path, move || {
+        Ok(TcpStream::connect_timeout(&dst, timeout).is_ok())
     })?
 }
 

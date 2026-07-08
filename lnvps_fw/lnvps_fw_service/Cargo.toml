@@ -11,6 +11,9 @@ log.workspace = true
 env_logger.workspace = true
 aya = "0.14.0"
 aya-log = "0.3.0"
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+libc = "0.2"
 
 [build-dependencies]
 aya-build = "0.2.0"
@@ -19,4 +22,3 @@ aya-build = "0.2.0"
 # Firewall datapath test harness (root-only, #[ignore]d): netns setns + raw
 # sockets for traffic generation.
 nix = { version = "0.29", features = ["sched"] }
-libc = "0.2"

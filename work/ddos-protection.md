@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-08
-**Last updated:** 2026-07-08 (Increment 2 complete)
+**Last updated:** 2026-07-08 (Increment 3 complete)
 
 ## Goal
 
@@ -147,22 +147,37 @@ Key notes:
       real netns/veth datapath (attach, counters, UDP forward-to-vm, SYN-rate
       drop) in ~3s on kernel 6.12.
 
-### Increment 3 — Passive egress port learning (M-L)
-- [ ] TC egress (clsact/SchedClassifier) program in `lnvps_ebpf`: parse
-      outbound packets; on TCP SYN-ACK from `src ip:port` insert/update
-      `OPEN_PORTS_V4/V6: LruHashMap<IpPortKey, LastSeen>`; on outbound UDP
-      from `ip:port` mark UDP service (guard against learning ephemeral
-      client ports: only learn UDP src port if seen replying — heuristic:
-      learn all, rely on TTL + attack-time relearn; document tradeoff)
-- [ ] Refresh `LastSeen` on subsequent matching egress traffic
-- [ ] fw_service: load + attach both programs (XDP ingress + TC egress) to
-      configured interfaces; shared map handles
-- [ ] fw_service: periodic GC task expiring `OPEN_PORTS_*` entries older than
-      TTL (default e.g. 10 min, configurable)
-- [ ] Local TOML config for fw_service: interfaces, TTLs, thresholds
-      (API sync comes in increment 7)
-- [ ] Harness tests: VM-side listener → SYN-ACK egress learns TCP port;
-      outbound UDP learns UDP port; TTL expiry removes entries
+### Increment 3 — Passive egress port learning (M-L) ✅ DONE
+- [x] TC egress (SchedClassifier `tc_lnvps_egress`) in `lnvps_ebpf`: parses
+      outbound eth/v4/v6 + tcp/udp; TCP SYN-ACK from `src ip:port` →
+      `OPEN_PORTS_V4/V6: LruHashMap<PortKeyV4/V6, LastSeen>`; outbound UDP
+      from `ip:port` → UDP service. Always `TC_ACT_OK` (never drops/mutates).
+      Ports decoded host-order via `from_be_bytes` on both learn + (future)
+      lookup sides for endianness consistency
+- [x] UDP ephemeral-port pollution: learn-all + short TTL + attack-time
+      relearn tradeoff documented in the classifier doc-comment
+- [x] `learn_port_v4/v6` refresh `last_seen` on existing entries (LRU insert
+      otherwise); `LastSeen` added to lnvps_fw_common (Pod, size test)
+- [x] fw_service loads + attaches BOTH programs (XDP ingress + TC egress) to
+      every configured interface; `qdisc_add_clsact` best-effort for <6.6,
+      TCX on 6.6+
+- [x] GC: `gc::gc_open_ports` sweeps `OPEN_PORTS_*` removing entries older
+      than TTL (monotonic clock == bpf_ktime_get_ns); tokio interval loop.
+      Pure `is_expired` unit-tested
+- [x] YAML config (NOT toml — user pref) via serde_yaml_ng, kebab-case to
+      match LNVPS API config style: interfaces, learning TTL/GC/stats,
+      thresholds (parsed now, consumed inc 4). `config.example.yaml`.
+      11 config/gc unit tests
+- [x] Refactor: `src/lib.rs` exposes `config` + `gc` so the harness reuses the
+      real GC (bin + lib in one package)
+- [x] Harness: TC egress attached on f_up too; `open_port_v4/v6`,
+      `open_port_count_v4`, `gc_open_ports_v4` accessors; traffic helpers
+      `tcp_listen_accept`, `tcp_connect`, `udp_send_from`
+- [x] Harness tests (`tests/learning.rs`, root-gated): SYN-ACK egress learns
+      TCP port; outbound UDP learns UDP port; TTL expiry (long-TTL keeps,
+      zero-TTL removes). All 3 pass via `scripts/fw-e2e.sh --test learning`
+- VALIDATED as root: 4 smoke + 3 learning harness tests green; 8 common + 11
+      service unit tests green; clippy/fmt clean
 
 ### Increment 4 — Attack detection + phase-1 enforcement (L)
 - [ ] fw_service detection loop: sample per-dest counters at interval

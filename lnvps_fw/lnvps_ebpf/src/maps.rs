@@ -2,11 +2,26 @@ use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LruHashMap, LruPerCpuHashMap};
 use lnvps_fw_common::{
-    Bucket, DEFAULT_SYN_RATE_BURST_LIMIT, DEFAULT_SYN_RATE_LIMIT, DestCounters, PacketLimits,
+    Bucket, DEFAULT_SYN_RATE_BURST_LIMIT, DEFAULT_SYN_RATE_LIMIT, DestCounters, LastSeen,
+    PacketLimits, PortKeyV4, PortKeyV6,
 };
 
 /// Max number of destination IPs to track (per address family)
 pub const MAX_DST_IPS: u32 = 256 * 1024;
+
+/// Max number of learned (ip, port, proto) tuples to track (per family)
+pub const MAX_OPEN_PORTS: u32 = 1024 * 1024;
+
+/// Learned-open TCP/UDP ports for local IPv4 addresses, discovered by passive
+/// egress observation. Read by the XDP ingress program under mitigation.
+#[map]
+pub static OPEN_PORTS_V4: LruHashMap<PortKeyV4, LastSeen> =
+    LruHashMap::with_max_entries(MAX_OPEN_PORTS, 0);
+
+/// Learned-open TCP/UDP ports for local IPv6 addresses.
+#[map]
+pub static OPEN_PORTS_V6: LruHashMap<PortKeyV6, LastSeen> =
+    LruHashMap::with_max_entries(MAX_OPEN_PORTS, 0);
 
 /// Per-destination traffic counters (IPv4), sampled by userspace detection loop
 #[map]
@@ -87,3 +102,29 @@ macro_rules! counters_for {
 
 counters_for!(counters_v4, [u8; 4], V4_DEST_COUNTERS);
 counters_for!(counters_v6, [u8; 16], V6_DEST_COUNTERS);
+
+/// Generate a learn-open-port function for one address family. Called from the
+/// TC egress program with the local (source) address/port of an outbound
+/// packet that indicates an open service (TCP SYN-ACK or any UDP). Inserts a
+/// fresh entry or refreshes `last_seen` on an existing one. Fails open (best
+/// effort) if the map is full.
+macro_rules! learn_port_for {
+    ($name:ident, $key:ty) => {
+        #[inline(always)]
+        pub fn $name(map: &$crate::maps::OpenPortsMapAlias<$key>, key: &$key) {
+            let now = unsafe { bpf_ktime_get_ns() };
+            if let Some(v) = map.get_ptr_mut(key) {
+                unsafe { (*v).last_seen = now };
+            } else {
+                let seen = LastSeen { last_seen: now };
+                let _ = map.insert(key, &seen, 0);
+            }
+        }
+    };
+}
+
+/// Type alias so the macro can name the concrete `LruHashMap` type generically.
+pub type OpenPortsMapAlias<K> = LruHashMap<K, LastSeen>;
+
+learn_port_for!(learn_port_v4, PortKeyV4);
+learn_port_for!(learn_port_v6, PortKeyV6);

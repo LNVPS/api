@@ -1,0 +1,24 @@
+# Example lnvps_fw_service configuration.
+#
+# Run with:  lnvps_fw_service --config config.yaml
+# (or pass bare interface names:  lnvps_fw_service eno2 eno3)
+
+# Uplink interface(s) to attach the XDP ingress + TC egress programs to.
+interfaces:
+  - eno2
+
+# Passive port-learning / garbage-collection parameters.
+learning:
+  # Forget a learned open port after this long without matching egress traffic.
+  port-ttl-secs: 600
+  # How often the userspace GC sweeps expired learned ports.
+  gc-interval-secs: 60
+  # How often per-destination stats are logged (0 disables logging).
+  stats-interval-secs: 5
+
+# Attack-detection thresholds per destination IP.
+# (Parsed now; consumed by the detection state machine from increment 4.)
+thresholds:
+  pps: 100000
+  syn-pps: 10000
+  bps: 1000000000

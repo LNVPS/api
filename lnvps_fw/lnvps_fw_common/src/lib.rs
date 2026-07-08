@@ -124,13 +124,25 @@ pub struct DestState {
     pub entered_at: u64,
 }
 
+/// Value stored in the learned-open-ports maps: when the port was last seen
+/// serving traffic (via passive egress observation), on the
+/// `bpf_ktime_get_ns` monotonic clock. Userspace GC expires entries whose
+/// `last_seen` is older than the configured TTL.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LastSeen {
+    /// bpf_ktime_get_ns timestamp of the most recent matching egress packet
+    pub last_seen: u64,
+}
+
 /// Key for the learned-open-ports maps (IPv4).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PortKeyV4 {
-    /// Destination address (network byte order, as seen in the IP header)
+    /// Local address bytes, exactly as they appear in the IP header
     pub addr: [u8; 4],
-    /// Port (network byte order, as seen in the L4 header)
+    /// Port in host byte order (both learning and lookup decode via
+    /// `u16::from_be_bytes`, so the two sides always agree)
     pub port: u16,
     /// PROTO_TCP or PROTO_UDP
     pub proto: u8,
@@ -141,9 +153,10 @@ pub struct PortKeyV4 {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PortKeyV6 {
-    /// Destination address (network byte order, as seen in the IP header)
+    /// Local address bytes, exactly as they appear in the IP header
     pub addr: [u8; 16],
-    /// Port (network byte order, as seen in the L4 header)
+    /// Port in host byte order (both learning and lookup decode via
+    /// `u16::from_be_bytes`, so the two sides always agree)
     pub port: u16,
     /// PROTO_TCP or PROTO_UDP
     pub proto: u8,
@@ -158,6 +171,7 @@ mod user {
     unsafe impl aya::Pod for PacketLimits {}
     unsafe impl aya::Pod for DestCounters {}
     unsafe impl aya::Pod for DestState {}
+    unsafe impl aya::Pod for LastSeen {}
     unsafe impl aya::Pod for PortKeyV4 {}
     unsafe impl aya::Pod for PortKeyV6 {}
 }
@@ -257,6 +271,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<PortKeyV4>(), 8);
         assert_eq!(core::mem::size_of::<PortKeyV6>(), 20);
         assert_eq!(core::mem::size_of::<DestState>(), 16);
+        assert_eq!(core::mem::size_of::<LastSeen>(), 8);
         assert_eq!(core::mem::size_of::<Bucket>(), 16);
         assert_eq!(core::mem::size_of::<PacketLimits>(), 16);
         assert_eq!(core::mem::size_of::<DestCounters>(), 56);

@@ -73,8 +73,9 @@ to read.
 A normal `cargo test` (unprivileged) stays green: the harness tests are
 `#[ignore]`d and additionally short-circuit via `require_root()`.
 
-## Current scenarios (`tests/smoke.rs`)
+## Current scenarios
 
+`tests/smoke.rs` (increment 1 datapath):
 - `prog_attaches_on_veth` — the XDP program attaches to a veth uplink.
 - `dest_counters_increment` — UDP to the VM address increments per-dest
   counters.
@@ -82,6 +83,23 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   to a real listener in the `vm` namespace.
 - `syn_rate_limit_drops_over_rate` — with tightened limits, over-rate SYNs are
   dropped (`dropped` counter rises).
+
+`tests/learning.rs` (increment 3 passive port learning):
+- `tcp_open_port_learned` — a VM TCP listener's SYN-ACK teaches the TC egress
+  learner that the port is open (`OPEN_PORTS_V4`).
+- `udp_service_learned` — outbound UDP from a VM source port is learned.
+- `ttl_expiry_removes_entry` — the shared userspace GC keeps fresh entries and
+  removes them under a zero-TTL sweep.
+
+Run a single binary with `scripts/fw-e2e.sh --test learning`.
+
+## Service configuration
+
+`lnvps_fw_service` loads a YAML config (kebab-case keys, matching the LNVPS API
+config style); see `lnvps_fw/lnvps_fw_service/config.example.yaml`. It sets the
+uplink interfaces, learned-port TTL / GC interval, stats logging cadence, and
+(from increment 4) detection thresholds. Bare interface names may be passed on
+the CLI instead of `--config` for quick runs.
 
 ## Adding a scenario
 
