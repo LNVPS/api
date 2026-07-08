@@ -2,7 +2,8 @@
 
 **Status:** in-progress
 **Started:** 2026-07-08
-**Last updated:** 2026-07-08 (Increment 6 complete: SYN-proxy v4+v6)
+**Last updated:** 2026-07-08 (Increment 6 complete; Increment 7 re-scoped to a
+DB-less RESTful control API on fw_service)
 
 ## Goal
 
@@ -21,9 +22,12 @@ the LNVPS API with metrics and admin visibility.
 - **Enforcement:** only under attack. Steady state is pass-all (learning
   continuously). When per-dest thresholds trip (pps / SYN/s / bytes/s), that
   dest IP enters mitigation mode; hysteresis + cooldown to exit.
-- **Deployment:** `lnvps_fw_service` becomes a daemon on each VM host,
-  attaching XDP to uplink NIC(s), syncing config (its IP ranges, thresholds)
-  from the LNVPS API, exporting metrics.
+- **Deployment:** `lnvps_fw_service` is a stateless daemon on each protected
+  host (router / VM host / edge box), attaching XDP to uplink NIC(s). It holds
+  **no database**: it exposes a token-authed RESTful API (inc 7) that the
+  primary `lnvps_api` service calls to push rules and poll state/events;
+  `lnvps_api` is the source of truth and retains all durable rules + incident
+  logs.
 - **Full scope:** per-src rate limits + CIDR escalation, IPv6 parity,
   SYN-proxy/cookies phase, metrics + admin API visibility.
 
@@ -50,11 +54,12 @@ the LNVPS API with metrics and admin visibility.
       │   machine (NORMAL → MITIGATE → SYN_PROXY), writes    │
       │   dest state map with hysteresis/cooldown            │
       │ - GC of learned-port TTLs and stale buckets          │
-      │ - syncs protected prefixes + thresholds from API     │
-      │ - prometheus metrics + mitigation event reporting    │
+      │ - in-memory rules (pushed by lnvps_api) + event ring │
+      │ - RESTful control API (token auth), NO local DB      │
       └──────────────────────────────────────────────────────┘
-                     │ HTTPS
-                LNVPS API / admin API / DB
+                     ▲ HTTP (lnvps_api → fw_service:
+                     │  push rules, poll state/events)
+                LNVPS API  (source of truth: rules + incident-log DB, admin API)
 ```
 
 Key notes:
@@ -277,17 +282,64 @@ field assignments lower to `memmove` on packet memory and explode verifier
 state — do byte-wise swaps. Use bounds-checked typed header pointers, not raw
 `usize` packet arithmetic.
 
-### Increment 7 — Control plane integration (L)
-- [ ] DB: host agent auth (token per host) + `host_mitigation_event` table
-      (host_id, ip, started, ended, trigger, peak rates, drops); migration
-- [ ] Internal API endpoints for fw_service: fetch protected prefixes for the
-      host (from ip_assignment/ip_range), thresholds/overrides; POST
-      mitigation events + periodic stats
-- [ ] fw_service: API sync loop replacing/augmenting local TOML (TOML keeps
-      bootstrap: API URL, token, interfaces)
-- [ ] Admin API: list active/historical mitigation events, per-IP mitigation
-      state, manual override (force mitigate / whitelist)
-- [ ] ADMIN_API_ENDPOINTS.md + API_CHANGELOG.md updates
+### Increment 7 — RESTful control API on fw_service (M)
+
+**Scope:** fw_service exposes a small, token-authenticated RESTful API and is
+the *server*; the primary service (`lnvps_api`) is the *client*. fw_service
+holds **no database** — rules live in memory (pushed by `lnvps_api`, which is
+the source of truth and re-pushes on reconnect) and events live in a bounded
+in-memory ring buffer that `lnvps_api` polls and persists. This keeps the
+datapath host stateless and puts all durable rules/incident-log storage in
+`lnvps_api`.
+
+Direction of calls: `lnvps_api` → fw_service (push rules, read state/events,
+issue manual overrides). fw_service never calls `lnvps_api` and never touches a
+DB.
+
+- [ ] **HTTP server** in fw_service (lightweight async framework, e.g. `axum`
+      or `hyper`; NOT Rocket — keep the datapath deps minimal), bound to a
+      configurable `api.listen` address (default loopback / management iface),
+      running alongside the existing tokio control loop.
+- [ ] **API-token auth**: a static bearer token from config (`api.token`, or an
+      env var), checked on every request via `Authorization: Bearer <token>`
+      with a constant-time compare. Optional allow-list of source IPs. TLS is
+      out of scope (terminate at a reverse proxy / private link) — document it.
+- [ ] **Config**: new `api` section (`listen`, `token`, optional `allow-ips`,
+      `events-buffer` size). Local YAML still bootstraps interfaces/thresholds;
+      rules pushed over the API override/augment the local defaults in memory.
+- [ ] **Rules endpoints** (in-memory ruleset behind an `Arc<RwLock<_>>`, applied
+      to the BPF maps by the control loop):
+  - `GET  /api/v1/rules` — current protected prefixes, per-prefix thresholds,
+    and manual overrides.
+  - `PUT  /api/v1/rules` — replace the full ruleset atomically (idempotent;
+    `lnvps_api` re-pushes the desired state, e.g. on fw_service restart).
+- [ ] **Manual override endpoints** (operator / `lnvps_api`-driven):
+  - `POST   /api/v1/mitigations` — force a dest/prefix into mitigation with an
+    explicit protection-flag set (e.g. pin PORT_FILTER|SYN_PROXY).
+  - `DELETE /api/v1/mitigations/{cidr}` — clear a manual override / force-exit.
+- [ ] **State + events endpoints** (read-only, for `lnvps_api` to poll & store):
+  - `GET /api/v1/status` — daemon health: version, uptime, attached
+    interfaces, map occupancy, active-mitigation count.
+  - `GET /api/v1/mitigations` — currently active mitigations (dest/prefix,
+    flags, since, peak pps/bps/syn, drop counters).
+  - `GET /api/v1/events?since=<cursor>` — mitigation start/stop events from the
+    bounded in-memory ring buffer, with a monotonic cursor so `lnvps_api` polls
+    incrementally and persists them itself. Overflow drops oldest (documented;
+    `lnvps_api` owns durable history).
+- [ ] **Wire the detection loop to the ring buffer**: every MITIGATION
+      START/STOP already logged also pushes a structured event into the buffer.
+- [ ] **Docs**: `docs/agents/fw-api.md` — endpoint reference, auth, the
+      push-rules / poll-events model, and the `lnvps_api`-side integration
+      contract (what `lnvps_api` must implement: a client that pushes rules and
+      a poller that persists events into its own DB + admin surface).
+- [ ] **Tests**: API handler unit/integration tests (auth accept/reject,
+      rules round-trip PUT→GET, manual mitigation reflected in the dest-state
+      map via the harness, event buffer cursor/overflow semantics).
+
+Deferred to `lnvps_api` (separate repo-side task, out of this increment): the
+database schema for rules/incident logs, the rules-push client, the
+event-poll-and-persist loop, and the admin API/UI that reads them. This
+increment only delivers the fw_service server side of that contract.
 
 ### Increment 8 — Metrics, packaging, hardening (M)
 - [ ] Prometheus metrics endpoint on fw_service: per-dest pass/drop, learned
