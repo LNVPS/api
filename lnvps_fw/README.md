@@ -7,8 +7,11 @@ NIC(s), passively learns which ports each protected IP actually serves, and —
 only when a destination comes under attack — sheds illegitimate traffic in the
 kernel at line rate while leaving legitimate traffic untouched.
 
-The protected IPs behind it can be anything the box routes or hosts: guest VMs,
-services on the host itself, or downstream hosts on a router.
+The protected IPs behind it can be **anything** the box routes or hosts — guest
+VMs, dedicated / bare-metal servers, colocated boxes, services on the host
+itself, or any downstream host reachable through a router. The system is
+agnostic to what lives behind the protected address; it only cares about the
+traffic to it.
 
 It is designed around a real threat model: **spoofed carpet-bomb / reflection
 floods from millions of source IPs across a whole prefix**, not just targeted
