@@ -17,7 +17,6 @@ use std::time::Duration;
 use harness::netns::{ATTACKER_V4, VM_V4};
 use harness::traffic;
 use harness::{Harness, require_root};
-use lnvps_fw_common::PacketLimits;
 
 /// The XDP program attaches cleanly to a veth uplink in SKB mode.
 #[test]
@@ -74,24 +73,16 @@ fn udp_delivered_to_vm_listener() {
     assert_eq!(got.as_deref(), Some(&b"hello-vm"[..]));
 }
 
-/// Over-rate SYNs to a destination are dropped by the per-dest SYN limiter.
+/// SYN packets are counted per destination (used by userspace SYN-flood
+/// detection). Steady state passes everything — the eBPF side no longer
+/// rate-limits on its own.
 #[test]
 #[ignore = "requires root / CAP_NET_ADMIN"]
-fn syn_rate_limit_drops_over_rate() {
+fn syn_packets_counted() {
     if !require_root() {
         return;
     }
-    let mut h = Harness::new().expect("harness setup");
-
-    // Tighten the limiter so a small burst trips it: 5-token burst, 10/s.
-    h.set_syn_limits_v4(
-        VM_V4,
-        PacketLimits {
-            limit: 10,
-            burst: 5,
-        },
-    )
-    .expect("set syn limits");
+    let h = Harness::new().expect("harness setup");
 
     let sent =
         traffic::syn_flood_v4(&attacker_ns(&h), ATTACKER_V4, VM_V4, 80, 50).expect("syn flood");
@@ -106,11 +97,8 @@ fn syn_rate_limit_drops_over_rate() {
         "syn_packets={}",
         counters.syn_packets
     );
-    assert!(
-        counters.dropped >= 1,
-        "expected drops, dropped={}",
-        counters.dropped
-    );
+    // Steady state (NORMAL): nothing is dropped by the datapath.
+    assert_eq!(counters.dropped, 0, "dropped={}", counters.dropped);
 }
 
 fn attacker_ns(h: &Harness) -> String {

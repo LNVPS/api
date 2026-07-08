@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-08
-**Last updated:** 2026-07-08 (Increment 5 complete)
+**Last updated:** 2026-07-08 (Increment 5 + count/enforce refactor complete)
 
 ## Goal
 
@@ -277,6 +277,41 @@ Key notes:
       production builds; remove `error!` log-per-packet hot paths
 - [ ] Load-test script (scripts/) using e.g. trafgen/hping3 notes to validate
       detection + mitigation end-to-end on a lab host
+
+## Architecture refactor (2026-07-08, user directive)
+
+**eBPF = count + enforce only; userspace = all decisions.** Removed all
+in-kernel token buckets (SYN/per-source/ICMP rate limiting). eBPF now:
+- writes counters only (per-dest `DestCounters`; per-source packet counts in a
+  **bounded LRU** `V4/V6_SRC_COUNTERS`, incremented only under mitigation);
+- enforces userspace-written tables via pure lookups: `DEST_STATE` mode,
+  `OPEN_PORTS_*` allow-list, `V4/V6_CIDR_SRC` LPM block trie.
+- Steady state (NORMAL) is pass-all + learn; SYN protection folds into detection
+  (high syn_pps -> mitigate), no always-on limiter.
+
+Userspace `runtime::run_control` (one tick, injectable clock): dest detection +
+per-source rate math -> multi-level CIDR aggregation (/32->/24->/16->/8,
+/128->/64->/48->/32 via `cidr::aggregate_v4/v6`) -> reconcile LPM trie with TTL
+decay. The trie is the single bounded block structure (holds /32s and aggregated
+prefixes); the per-source counter map is LRU-bounded. No flat per-/32 block map.
+
+**Threat-model note (user, 2026-07-08):** real threat is spoofed carpet-bomb /
+reflection floods from millions of source IPs across the whole prefix. Source
+blocking is the WRONG axis for that (LRU thrashes, spoofed IPs unblockable) and
+is kept only for real botnets. The scaling defences are per-destination
+mitigation + drop-to-non-open-ports (source-count-independent) and SYN-proxy
+(inc 6) for open TCP ports.
+
+### NEXT (in progress) — Prefix-level (carpet-bomb) detection
+- [ ] Convert `DEST_STATE` HashMap -> LPM trie so a whole protected prefix can
+      be mitigated in one entry (`203.0.113.0/22 -> MITIGATE`); single IP is a
+      /32 entry. XDP does one LPM lookup for dest mode.
+- [ ] `protected` prefixes in config (from API in inc 7).
+- [ ] Network-aggregate detection: sum per-dest counters across each protected
+      prefix each tick; flip the prefix when the aggregate crosses a network
+      threshold (thin carpet bombs that never trip any single /32).
+- [ ] Harness test: thin spread across a /24 (no single dst trips) -> whole
+      prefix flips to mitigate.
 
 ## Notes
 

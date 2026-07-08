@@ -12,7 +12,7 @@ use harness::traffic;
 use harness::{Harness, require_root};
 use lnvps_fw_common::{DEST_MODE_MITIGATE, DEST_MODE_NORMAL, PROTO_TCP};
 use lnvps_fw_service::detect::DetectionConfig;
-use lnvps_fw_service::runtime::DetectionState;
+use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig};
 
 const SECOND_NS: u64 = 1_000_000_000;
 
@@ -99,18 +99,23 @@ fn detection_flip_and_cooldown() {
     }
     let mut h = Harness::new().expect("harness setup");
 
-    let cfg = DetectionConfig {
-        pps: 100,
-        syn_pps: u64::MAX, // don't trip on SYNs
-        bps: u64::MAX,     // don't trip on bytes
-        exit_pct: 50,
-        cooldown_ns: SECOND_NS,
+    let cfg = RuntimeConfig {
+        detection: DetectionConfig {
+            pps: 100,
+            syn_pps: u64::MAX, // don't trip on SYNs
+            bps: u64::MAX,     // don't trip on bytes
+            exit_pct: 50,
+            cooldown_ns: SECOND_NS,
+        },
+        src_rate_pps: u64::MAX, // don't block sources in this test
+        fanout: 4,
+        block_ttl_ns: SECOND_NS,
     };
     let mut state = DetectionState::default();
 
     // t0 (=1s): seed snapshots. A non-zero base avoids the `last_sample_ns==0`
     // first-run sentinel colliding with a real timestamp of 0.
-    h.run_detection_tick(&mut state, &cfg, SECOND_NS)
+    h.run_control_tick(&mut state, &cfg, SECOND_NS)
         .expect("tick t0");
     assert_eq!(h.dest_mode_v4(VM_V4).unwrap(), DEST_MODE_NORMAL);
 
@@ -118,7 +123,7 @@ fn detection_flip_and_cooldown() {
     let dst = SocketAddr::from((VM_V4, 9999));
     let sent = traffic::udp_send_burst(&attacker_ns(&h), dst, 500).expect("flood");
     assert!(sent >= 400, "sent only {sent}");
-    h.run_detection_tick(&mut state, &cfg, 2 * SECOND_NS)
+    h.run_control_tick(&mut state, &cfg, 2 * SECOND_NS)
         .expect("tick t1");
     assert_eq!(
         h.dest_mode_v4(VM_V4).unwrap(),
@@ -127,10 +132,10 @@ fn detection_flip_and_cooldown() {
     );
 
     // Flood stops. Sample at t2 (starts cooldown) and t3 (cooldown elapsed).
-    h.run_detection_tick(&mut state, &cfg, 3 * SECOND_NS)
+    h.run_control_tick(&mut state, &cfg, 3 * SECOND_NS)
         .expect("tick t2");
     assert_eq!(h.dest_mode_v4(VM_V4).unwrap(), DEST_MODE_MITIGATE);
-    h.run_detection_tick(&mut state, &cfg, 4 * SECOND_NS)
+    h.run_control_tick(&mut state, &cfg, 4 * SECOND_NS)
         .expect("tick t3");
     assert_eq!(
         h.dest_mode_v4(VM_V4).unwrap(),

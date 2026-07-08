@@ -16,10 +16,9 @@ use network_types::udp::UdpHdr;
 mod maps;
 
 use maps::{
-    OPEN_PORTS_V4, OPEN_PORTS_V6, cidr_blocked_v4, cidr_blocked_v6, counters_v4, counters_v6,
-    dest_mode_v4, dest_mode_v6, icmp_allowed_v4, icmp_allowed_v6, learn_port_v4, learn_port_v6,
-    port_is_open_v4, port_is_open_v6, record_src_drop_v4, record_src_drop_v6, src_allowed_v4,
-    src_allowed_v6, syn_allowed_v4, syn_allowed_v6,
+    OPEN_PORTS_V4, OPEN_PORTS_V6, cidr_blocked_v4, cidr_blocked_v6, count_src_v4, count_src_v6,
+    counters_v4, counters_v6, dest_mode_v4, dest_mode_v6, learn_port_v4, learn_port_v6,
+    port_is_open_v4, port_is_open_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -115,12 +114,11 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
         fill_l4(ctx, &mut meta, EthHdr::LEN + Ipv4Hdr::LEN)?;
     }
 
+    // Steady state is pass-all (just count + learn). Enforcement happens only
+    // once userspace flips this destination into MITIGATE.
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
-    if meta.is_syn && !syn_allowed_v4(&dst) {
-        verdict = XDP_DROP;
-    }
-    if verdict == XDP_PASS && dest_mode_v4(&dst) == DEST_MODE_MITIGATE {
+    if dest_mode_v4(&dst) == DEST_MODE_MITIGATE {
         verdict = mitigate_v4(&dst, &ip.src_addr, &meta);
     }
     account(ctx, counters, &meta, PROTO_ICMP, verdict);
@@ -140,32 +138,30 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
 
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
-    if meta.is_syn && !syn_allowed_v6(&dst) {
-        verdict = XDP_DROP;
-    }
-    if verdict == XDP_PASS && dest_mode_v6(&dst) == DEST_MODE_MITIGATE {
+    if dest_mode_v6(&dst) == DEST_MODE_MITIGATE {
         verdict = mitigate_v6(&dst, &ip.src_addr, &meta);
     }
     account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
 }
 
-/// Phase-1 mitigation verdict for a destination in MITIGATE mode:
-/// 1. drop non-first fragments (no L4 header),
-/// 2. hard-drop sources in a blocked CIDR (escalation result),
-/// 3. per-source rate-limit (over-rate sources are dropped and flagged as
-///    offenders for CIDR escalation),
-/// 4. pass only learned-open TCP/UDP ports, rate-limit ICMP, drop the rest.
+/// Phase-1 mitigation verdict for a destination in MITIGATE mode. The eBPF
+/// side only counts and enforces userspace-decided policy:
+/// 1. count this source (bounded LRU) so userspace can compute per-source
+///    rates and decide blocks — pure counting, no decision here,
+/// 2. drop non-first fragments (no L4 header),
+/// 3. drop sources matching a blocked CIDR (the LPM trie is the single,
+///    bounded block structure written by userspace; individual /32s and
+///    aggregated prefixes both live here),
+/// 4. pass only learned-open TCP/UDP ports; pass ICMP (a flooding ICMP source
+///    is counted and blocked by userspace via the trie); drop the rest.
 #[inline(always)]
 fn mitigate_v4(dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta) -> u32 {
+    count_src_v4(src);
     if meta.is_fragment {
         return XDP_DROP;
     }
     if cidr_blocked_v4(*src) {
-        return XDP_DROP;
-    }
-    if !src_allowed_v4(src) {
-        record_src_drop_v4(src);
         return XDP_DROP;
     }
     dest_policy_v4(dst, meta)
@@ -181,11 +177,7 @@ fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
             XDP_DROP
         }
     } else if meta.proto == PROTO_ICMP {
-        if icmp_allowed_v4(dst) {
-            XDP_PASS
-        } else {
-            XDP_DROP
-        }
+        XDP_PASS
     } else {
         XDP_DROP
     }
@@ -193,14 +185,11 @@ fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
 
 #[inline(always)]
 fn mitigate_v6(dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta) -> u32 {
+    count_src_v6(src);
     if meta.is_fragment {
         return XDP_DROP;
     }
     if cidr_blocked_v6(*src) {
-        return XDP_DROP;
-    }
-    if !src_allowed_v6(src) {
-        record_src_drop_v6(src);
         return XDP_DROP;
     }
     dest_policy_v6(dst, meta)
@@ -215,11 +204,7 @@ fn dest_policy_v6(dst: &[u8; 16], meta: &L4Meta) -> u32 {
             XDP_DROP
         }
     } else if meta.proto == PROTO_ICMPV6 {
-        if icmp_allowed_v6(dst) {
-            XDP_PASS
-        } else {
-            XDP_DROP
-        }
+        XDP_PASS
     } else {
         XDP_DROP
     }

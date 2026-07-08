@@ -96,20 +96,14 @@ fn default_cooldown_secs() -> u64 {
 fn default_sample_interval_ms() -> u64 {
     500
 }
-fn default_min_src_drops() -> u64 {
-    100
-}
-fn default_min_sources() -> usize {
-    5
+fn default_agg_fanout() -> usize {
+    4
 }
 fn default_block_ttl_secs() -> u64 {
     300
 }
 fn default_src_rate_pps() -> u64 {
     500
-}
-fn default_src_rate_burst() -> u64 {
-    1_000
 }
 
 impl Default for LearningConfig {
@@ -136,24 +130,20 @@ impl Default for Thresholds {
 }
 
 /// Per-source rate limiting and CIDR escalation parameters (applied while a
-/// destination is mitigating).
+/// destination is mitigating). The eBPF datapath only counts per source; these
+/// drive the userspace decision of what to block.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Escalation {
-    /// Per-source packets/second budget under mitigation.
+    /// A source is an offender once its per-window rate reaches this many
+    /// packets/second toward a mitigated destination.
     #[serde(default = "default_src_rate_pps")]
     pub src_rate_pps: u64,
-    /// Per-source burst budget under mitigation.
-    #[serde(default = "default_src_rate_burst")]
-    pub src_rate_burst: u64,
-    /// A source counts as an offender once its per-window drop delta reaches
-    /// this many packets.
-    #[serde(default = "default_min_src_drops")]
-    pub min_src_drops: u64,
-    /// A prefix (/24 v4, /64 v6) is hard-blocked once this many distinct
-    /// offending sources fall within it.
-    #[serde(default = "default_min_sources")]
-    pub min_sources: usize,
+    /// Aggregation fan-out: this many child prefixes under a common parent
+    /// collapse into one wider block (/32->/24->/16->/8), keeping the LPM trie
+    /// bounded under distributed floods.
+    #[serde(default = "default_agg_fanout")]
+    pub agg_fanout: usize,
     /// A CIDR block is lifted after this many seconds without being refreshed.
     #[serde(default = "default_block_ttl_secs")]
     pub block_ttl_secs: u64,
@@ -163,9 +153,7 @@ impl Default for Escalation {
     fn default() -> Self {
         Self {
             src_rate_pps: default_src_rate_pps(),
-            src_rate_burst: default_src_rate_burst(),
-            min_src_drops: default_min_src_drops(),
-            min_sources: default_min_sources(),
+            agg_fanout: default_agg_fanout(),
             block_ttl_secs: default_block_ttl_secs(),
         }
     }
@@ -235,17 +223,14 @@ impl Config {
         }
     }
 
-    /// Build the pure escalation config from the parsed settings.
-    pub fn escalation_config(&self) -> crate::cidr::EscalationConfig {
-        crate::cidr::EscalationConfig {
-            min_src_drops: self.escalation.min_src_drops,
-            min_sources: self.escalation.min_sources,
+    /// Build the runtime control-tick config from the parsed settings.
+    pub fn runtime_config(&self) -> crate::runtime::RuntimeConfig {
+        crate::runtime::RuntimeConfig {
+            detection: self.detection_config(),
+            src_rate_pps: self.escalation.src_rate_pps,
+            fanout: self.escalation.agg_fanout,
+            block_ttl_ns: self.escalation.block_ttl_secs * 1_000_000_000,
         }
-    }
-
-    /// CIDR block TTL in nanoseconds.
-    pub fn block_ttl_ns(&self) -> u64 {
-        self.escalation.block_ttl_secs * 1_000_000_000
     }
 }
 

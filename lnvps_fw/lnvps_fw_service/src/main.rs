@@ -9,13 +9,11 @@ use aya::util::KernelVersion;
 use aya::{Ebpf, include_bytes_aligned};
 use log::{info, warn};
 
-use lnvps_fw_common::{
-    DestCounters, LastSeen, PacketLimits, PortKeyV4, PortKeyV6, SRC_RATE_CONFIG_KEY,
-};
+use lnvps_fw_common::{DestCounters, LastSeen, PortKeyV4, PortKeyV6};
 
 use lnvps_fw_service::config::Config;
 use lnvps_fw_service::gc;
-use lnvps_fw_service::runtime::{DetectionState, run_detection, run_escalation, sum_counters};
+use lnvps_fw_service::runtime::{DetectionState, run_control, sum_counters};
 
 fn format_counters(c: &DestCounters) -> String {
     format!(
@@ -107,22 +105,6 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
     }
 
     // TC egress port learning.
-    // Push the per-source rate limit from config into the datapath config map.
-    {
-        let mut src_limits: AyaHashMap<_, u32, PacketLimits> = AyaHashMap::try_from(
-            bpf.map_mut("SRC_RATE_LIMITS")
-                .context("SRC_RATE_LIMITS missing")?,
-        )?;
-        src_limits.insert(
-            SRC_RATE_CONFIG_KEY,
-            PacketLimits {
-                limit: cfg.escalation.src_rate_pps,
-                burst: cfg.escalation.src_rate_burst,
-            },
-            0,
-        )?;
-    }
-
     let tc: &mut SchedClassifier = bpf
         .program_mut("tc_lnvps_egress")
         .context("tc_lnvps_egress program not found")?
@@ -154,9 +136,7 @@ async fn main() -> Result<()> {
     let mut bpf = attach_programs(&cfg)?;
 
     let ttl_ns = cfg.port_ttl().as_nanos() as u64;
-    let detection_cfg = cfg.detection_config();
-    let escalation_cfg = cfg.escalation_config();
-    let block_ttl_ns = cfg.block_ttl_ns();
+    let runtime_cfg = cfg.runtime_config();
     let mut detection_state = DetectionState::default();
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
@@ -188,13 +168,8 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
             _ = detect_timer.tick() => {
                 let now = gc::monotonic_now_ns();
-                if let Err(e) = run_detection(&mut bpf, &mut detection_state, &detection_cfg, now) {
-                    warn!("detection tick failed: {e}");
-                }
-                if let Err(e) = run_escalation(
-                    &mut bpf, &mut detection_state, &escalation_cfg, block_ttl_ns, now,
-                ) {
-                    warn!("escalation tick failed: {e}");
+                if let Err(e) = run_control(&mut bpf, &mut detection_state, &runtime_cfg, now) {
+                    warn!("control tick failed: {e}");
                 }
             }
             _ = gc_timer.tick() => {

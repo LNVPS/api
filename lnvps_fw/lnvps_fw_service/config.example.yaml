@@ -30,16 +30,19 @@ thresholds:
   # How often the detection loop samples the per-destination counters.
   sample-interval-ms: 500
 
-# Per-source rate limiting and CIDR escalation while a destination is mitigating.
+# Per-source detection + CIDR aggregation while a destination is mitigating.
+# NOTE: the eBPF datapath only COUNTS per source (bounded LRU) and enforces the
+# CIDR block trie; all rate math and block decisions are made here in userspace.
+# This is a secondary defence aimed at real (unspoofed) botnets; spoofed
+# carpet-bomb floods are handled by per-destination mitigation + the
+# drop-to-non-open-ports policy, not by source blocking.
 escalation:
-  # Per-source packets/second budget (and burst) under mitigation. Sources
-  # exceeding this are dropped and flagged as offenders.
+  # A source is an offender once its per-window rate reaches this many pps
+  # toward a mitigated destination.
   src-rate-pps: 500
-  src-rate-burst: 1000
-  # A source counts as an offender once its per-window drop delta reaches this.
-  min-src-drops: 100
-  # A /24 (v4) or /64 (v6) is hard-blocked once this many distinct offending
-  # sources fall within it.
-  min-sources: 5
+  # Aggregation fan-out: this many child prefixes under a common parent
+  # collapse into one wider block (/32->/24->/16->/8), keeping the LPM trie
+  # bounded under distributed floods.
+  agg-fanout: 4
   # A CIDR block is lifted this many seconds after it stops being refreshed.
   block-ttl-secs: 300

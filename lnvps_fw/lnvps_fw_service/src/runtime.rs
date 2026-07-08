@@ -1,10 +1,13 @@
-//! BPF-facing detection driver: samples the per-destination counters, runs the
-//! pure [`crate::detect`] state machine for each destination, and applies mode
-//! transitions to the `*_DEST_STATE` maps (insert on enter, remove on exit),
-//! emitting structured mitigation events.
+//! BPF-facing control loop. Each tick:
+//! 1. sample per-destination counters and run the pure detection state machine
+//!    ([`crate::detect`]), writing modes into `*_DEST_STATE`;
+//! 2. sample the bounded per-source counters, compute per-source rates, pick
+//!    offenders, aggregate them into CIDR blocks ([`crate::cidr`]) and reconcile
+//!    the `*_CIDR_SRC` LPM tries (install new, decay stale).
 //!
-//! The timestamp is injected (`now_ns`) so the datapath test harness can drive
-//! deterministic sample windows; production passes the monotonic clock.
+//! The eBPF side only counts and enforces; every rate/threshold decision is made
+//! here. The timestamp is injected (`now_ns`) so the datapath test harness can
+//! drive deterministic sample windows.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -18,21 +21,33 @@ use log::{info, warn};
 
 use lnvps_fw_common::{DEST_MODE_MITIGATE, DestCounters, DestState};
 
-use crate::cidr::{
-    CidrV4, CidrV6, EscalationConfig, drop_deltas, offending_cidrs_v4, offending_cidrs_v6,
-};
+use crate::cidr::{CidrV4, CidrV6, aggregate_v4, aggregate_v6, offenders, per_source_pps};
 use crate::detect::{DestTracker, DetectionConfig, Rates, Transition, process_sample};
 
-/// Per-address-family detection state kept across sample windows.
+/// Runtime configuration for one control tick.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeConfig {
+    /// Per-destination detection thresholds + hysteresis.
+    pub detection: DetectionConfig,
+    /// Per-source packets/second that marks a source as an offender.
+    pub src_rate_pps: u64,
+    /// Aggregation fan-out: this many child prefixes under a parent collapse to
+    /// the parent (/32->/24->/16->/8, /128->/64->/48->/32).
+    pub fanout: usize,
+    /// A CIDR block is lifted this many ns after it stops being refreshed.
+    pub block_ttl_ns: u64,
+}
+
+/// Per-address-family control state kept across sample windows.
 #[derive(Default)]
 pub struct DetectionState {
     pub v4: HashMap<[u8; 4], DestTracker>,
     pub v6: HashMap<[u8; 16], DestTracker>,
     /// Injected timestamp of the previous sample (0 = first run).
     pub last_sample_ns: u64,
-    /// Previous cumulative per-source drop snapshots (for escalation deltas).
-    pub prev_drops_v4: HashMap<[u8; 4], u64>,
-    pub prev_drops_v6: HashMap<[u8; 16], u64>,
+    /// Previous cumulative per-source counter snapshots (for rate deltas).
+    pub prev_src_v4: HashMap<[u8; 4], u64>,
+    pub prev_src_v6: HashMap<[u8; 16], u64>,
     /// Active CIDR blocks -> timestamp last refreshed (for TTL decay).
     pub blocks_v4: HashMap<CidrV4, u64>,
     pub blocks_v6: HashMap<CidrV6, u64>,
@@ -108,6 +123,7 @@ fn detect_family<K>(
     }
 }
 
+/// Read + per-CPU-sum a `DestCounters` map into an owned vec.
 fn read_counters<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, DestCounters)>>
 where
     K: Pod,
@@ -122,32 +138,32 @@ where
     Ok(out)
 }
 
-/// Read a cumulative per-source drop map into an owned vec.
-fn read_drops<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, u64)>>
+/// Read + per-CPU-sum a per-source `u64` counter map into an owned vec.
+fn read_src_counters<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, u64)>>
 where
     K: Pod,
 {
-    let map: AyaHashMap<_, K, u64> =
-        AyaHashMap::try_from(bpf.map(name).with_context(|| format!("{name} missing"))?)?;
+    let map: PerCpuHashMap<_, K, u64> =
+        PerCpuHashMap::try_from(bpf.map(name).with_context(|| format!("{name} missing"))?)?;
     let mut out = Vec::new();
     for entry in map.iter() {
-        let (k, v) = entry?;
-        out.push((k, v));
+        let (k, values) = entry?;
+        out.push((k, values.iter().copied().sum()));
     }
     Ok(out)
 }
 
-/// Escalate offending sources of one address family into hard CIDR blocks, and
-/// decay blocks whose refresh timestamp is older than `block_ttl_ns`. Returns
-/// nothing; logs CIDR BLOCK / UNBLOCK events.
+/// Reconcile one family's CIDR block trie with the freshly-computed `desired`
+/// block set: install/refresh desired blocks, then decay any not refreshed
+/// within the TTL. Updates `prev_src` for the next window's deltas.
 #[allow(clippy::too_many_arguments)]
-fn escalate_family<K, C>(
-    cur_drops: Vec<(K, u64)>,
-    prev_drops: &mut HashMap<K, u64>,
+fn reconcile_blocks<K, C>(
+    cur_src: Vec<(K, u64)>,
+    prev_src: &mut HashMap<K, u64>,
     blocks: &mut HashMap<C, u64>,
     trie: &mut LpmTrie<&mut MapData, K, u8>,
-    offending: Vec<C>,
-    cfg_block_ttl_ns: u64,
+    desired: Vec<C>,
+    block_ttl_ns: u64,
     now_ns: u64,
     key_of: impl Fn(&C) -> Key<K>,
     fmt_cidr: impl Fn(&C) -> String,
@@ -155,10 +171,8 @@ fn escalate_family<K, C>(
     K: Pod + Eq + Hash + Copy,
     C: Eq + Hash + Copy,
 {
-    // Install / refresh blocks for currently-offending prefixes.
-    for cidr in offending {
-        let newly = blocks.insert(cidr, now_ns).is_none();
-        if newly {
+    for cidr in desired {
+        if blocks.insert(cidr, now_ns).is_none() {
             if let Err(e) = trie.insert(&key_of(&cidr), 1, 0) {
                 warn!("failed to install CIDR block {}: {e}", fmt_cidr(&cidr));
                 blocks.remove(&cidr);
@@ -167,10 +181,9 @@ fn escalate_family<K, C>(
             warn!("CIDR BLOCK {}", fmt_cidr(&cidr));
         }
     }
-    // Decay blocks that have not been refreshed within the TTL.
     let expired: Vec<C> = blocks
         .iter()
-        .filter(|(_, ts)| now_ns.saturating_sub(**ts) > cfg_block_ttl_ns)
+        .filter(|(_, ts)| now_ns.saturating_sub(**ts) > block_ttl_ns)
         .map(|(c, _)| *c)
         .collect();
     for cidr in expired {
@@ -178,64 +191,17 @@ fn escalate_family<K, C>(
         blocks.remove(&cidr);
         info!("CIDR UNBLOCK {}", fmt_cidr(&cidr));
     }
-    *prev_drops = cur_drops.into_iter().collect();
+    *prev_src = cur_src.into_iter().collect();
 }
 
-/// One escalation tick across both address families: aggregate per-source drop
-/// deltas into /24 (v4) and /64 (v6) blocks, install/refresh them in the LPM
-/// tries, and decay stale blocks.
-pub fn run_escalation(
+/// One control tick at the injected `now_ns`: detection + source control across
+/// both address families, sharing a single elapsed window. The first tick
+/// (`last_sample_ns == 0`) seeds snapshots with a zero elapsed so it never
+/// computes spurious rates.
+pub fn run_control(
     bpf: &mut Ebpf,
     state: &mut DetectionState,
-    cfg: &EscalationConfig,
-    block_ttl_ns: u64,
-    now_ns: u64,
-) -> Result<()> {
-    let cur4 = read_drops::<[u8; 4]>(bpf, "V4_SRC_DROPS")?;
-    let offending4 = offending_cidrs_v4(&drop_deltas(&state.prev_drops_v4, &cur4), cfg);
-    {
-        let mut trie: LpmTrie<_, [u8; 4], u8> =
-            LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
-        escalate_family(
-            cur4,
-            &mut state.prev_drops_v4,
-            &mut state.blocks_v4,
-            &mut trie,
-            offending4,
-            block_ttl_ns,
-            now_ns,
-            |c| Key::new(c.prefix_len, c.network),
-            |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
-        );
-    }
-
-    let cur6 = read_drops::<[u8; 16]>(bpf, "V6_SRC_DROPS")?;
-    let offending6 = offending_cidrs_v6(&drop_deltas(&state.prev_drops_v6, &cur6), cfg);
-    {
-        let mut trie: LpmTrie<_, [u8; 16], u8> =
-            LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
-        escalate_family(
-            cur6,
-            &mut state.prev_drops_v6,
-            &mut state.blocks_v6,
-            &mut trie,
-            offending6,
-            block_ttl_ns,
-            now_ns,
-            |c| Key::new(c.prefix_len, c.network),
-            |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
-        );
-    }
-    Ok(())
-}
-
-/// One detection tick across both address families at the injected `now_ns`.
-/// The first tick (when `last_sample_ns == 0`) seeds the previous snapshots
-/// with a zero elapsed window so it never computes spurious rates.
-pub fn run_detection(
-    bpf: &mut Ebpf,
-    state: &mut DetectionState,
-    cfg: &DetectionConfig,
+    cfg: &RuntimeConfig,
     now_ns: u64,
 ) -> Result<()> {
     let elapsed = if state.last_sample_ns == 0 {
@@ -245,22 +211,79 @@ pub fn run_detection(
     };
     state.last_sample_ns = now_ns;
 
+    // --- Per-destination detection ---
     let v4 = read_counters::<[u8; 4]>(bpf, "V4_DEST_COUNTERS")?;
     {
         let mut sm: AyaHashMap<_, [u8; 4], DestState> =
             AyaHashMap::try_from(bpf.map_mut("V4_DEST_STATE").context("v4 state missing")?)?;
-        detect_family(v4, &mut sm, &mut state.v4, cfg, now_ns, elapsed, |k| {
-            Ipv4Addr::from(*k).to_string()
-        });
+        detect_family(
+            v4,
+            &mut sm,
+            &mut state.v4,
+            &cfg.detection,
+            now_ns,
+            elapsed,
+            |k| Ipv4Addr::from(*k).to_string(),
+        );
     }
-
     let v6 = read_counters::<[u8; 16]>(bpf, "V6_DEST_COUNTERS")?;
     {
         let mut sm: AyaHashMap<_, [u8; 16], DestState> =
             AyaHashMap::try_from(bpf.map_mut("V6_DEST_STATE").context("v6 state missing")?)?;
-        detect_family(v6, &mut sm, &mut state.v6, cfg, now_ns, elapsed, |k| {
-            Ipv6Addr::from(*k).to_string()
-        });
+        detect_family(
+            v6,
+            &mut sm,
+            &mut state.v6,
+            &cfg.detection,
+            now_ns,
+            elapsed,
+            |k| Ipv6Addr::from(*k).to_string(),
+        );
+    }
+
+    // --- Per-source control (rate -> CIDR blocks) ---
+    let s4 = read_src_counters::<[u8; 4]>(bpf, "V4_SRC_COUNTERS")?;
+    let off4 = offenders(
+        &per_source_pps(&state.prev_src_v4, &s4, elapsed),
+        cfg.src_rate_pps,
+    );
+    let desired4 = aggregate_v4(&off4, cfg.fanout);
+    {
+        let mut trie: LpmTrie<_, [u8; 4], u8> =
+            LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
+        reconcile_blocks(
+            s4,
+            &mut state.prev_src_v4,
+            &mut state.blocks_v4,
+            &mut trie,
+            desired4,
+            cfg.block_ttl_ns,
+            now_ns,
+            |c| Key::new(c.prefix_len, c.network),
+            |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
+        );
+    }
+
+    let s6 = read_src_counters::<[u8; 16]>(bpf, "V6_SRC_COUNTERS")?;
+    let off6 = offenders(
+        &per_source_pps(&state.prev_src_v6, &s6, elapsed),
+        cfg.src_rate_pps,
+    );
+    let desired6 = aggregate_v6(&off6, cfg.fanout);
+    {
+        let mut trie: LpmTrie<_, [u8; 16], u8> =
+            LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
+        reconcile_blocks(
+            s6,
+            &mut state.prev_src_v6,
+            &mut state.blocks_v6,
+            &mut trie,
+            desired6,
+            cfg.block_ttl_ns,
+            now_ns,
+            |c| Key::new(c.prefix_len, c.network),
+            |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
+        );
     }
     Ok(())
 }
