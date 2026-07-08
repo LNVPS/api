@@ -21,6 +21,7 @@ use std::fs::File;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsFd;
 
+use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{HashMap as AyaHashMap, PerCpuHashMap};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_clsact};
 use aya::{Ebpf, EbpfLoader};
@@ -28,10 +29,11 @@ use nix::sched::{CloneFlags, setns};
 
 use lnvps_fw_common::{
     Bucket, DEST_MODE_MITIGATE, DestCounters, DestState, LastSeen, PacketLimits, PortKeyV4,
-    PortKeyV6,
+    PortKeyV6, SRC_RATE_CONFIG_KEY,
 };
+use lnvps_fw_service::cidr::EscalationConfig;
 use lnvps_fw_service::detect::DetectionConfig;
-use lnvps_fw_service::runtime::{DetectionState, run_detection};
+use lnvps_fw_service::runtime::{DetectionState, run_detection, run_escalation};
 
 use netns::NetnsTopology;
 
@@ -202,6 +204,39 @@ impl Harness {
         now_ns: u64,
     ) -> anyhow::Result<()> {
         run_detection(&mut self.bpf, state, cfg, now_ns)
+    }
+
+    /// Run one real escalation tick (using the daemon's `runtime::run_escalation`).
+    pub fn run_escalation_tick(
+        &mut self,
+        state: &mut DetectionState,
+        cfg: &EscalationConfig,
+        block_ttl_ns: u64,
+        now_ns: u64,
+    ) -> anyhow::Result<()> {
+        run_escalation(&mut self.bpf, state, cfg, block_ttl_ns, now_ns)
+    }
+
+    /// Set the global per-source rate limit in the datapath config map.
+    pub fn set_src_rate_limits(&mut self, limit: u64, burst: u64) -> anyhow::Result<()> {
+        let mut map: AyaHashMap<_, u32, PacketLimits> =
+            AyaHashMap::try_from(self.bpf.map_mut("SRC_RATE_LIMITS").unwrap())?;
+        map.insert(SRC_RATE_CONFIG_KEY, PacketLimits { limit, burst }, 0)?;
+        Ok(())
+    }
+
+    /// True if `ip` is covered by a blocked source CIDR in `V4_CIDR_SRC`.
+    pub fn cidr_blocked_v4(&self, ip: Ipv4Addr) -> anyhow::Result<bool> {
+        let trie: LpmTrie<_, [u8; 4], u8> =
+            LpmTrie::try_from(self.bpf.map("V4_CIDR_SRC").unwrap())?;
+        Ok(trie.get(&Key::new(32, ip.octets()), 0).is_ok())
+    }
+
+    /// Cumulative recorded per-source drops for `ip` (offense counter).
+    pub fn src_drops_v4(&self, ip: Ipv4Addr) -> anyhow::Result<u64> {
+        let map: AyaHashMap<_, [u8; 4], u64> =
+            AyaHashMap::try_from(self.bpf.map("V4_SRC_DROPS").unwrap())?;
+        Ok(map.get(&ip.octets(), 0).unwrap_or(0))
     }
 
     /// Provide access to the raw v6 port key type for callers building keys.

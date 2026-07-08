@@ -16,9 +16,10 @@ use network_types::udp::UdpHdr;
 mod maps;
 
 use maps::{
-    OPEN_PORTS_V4, OPEN_PORTS_V6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
-    icmp_allowed_v4, icmp_allowed_v6, learn_port_v4, learn_port_v6, port_is_open_v4,
-    port_is_open_v6, syn_allowed_v4, syn_allowed_v6,
+    OPEN_PORTS_V4, OPEN_PORTS_V6, cidr_blocked_v4, cidr_blocked_v6, counters_v4, counters_v6,
+    dest_mode_v4, dest_mode_v6, icmp_allowed_v4, icmp_allowed_v6, learn_port_v4, learn_port_v6,
+    port_is_open_v4, port_is_open_v6, record_src_drop_v4, record_src_drop_v6, src_allowed_v4,
+    src_allowed_v6, syn_allowed_v4, syn_allowed_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -120,7 +121,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
         verdict = XDP_DROP;
     }
     if verdict == XDP_PASS && dest_mode_v4(&dst) == DEST_MODE_MITIGATE {
-        verdict = mitigate_v4(&dst, &meta);
+        verdict = mitigate_v4(&dst, &ip.src_addr, &meta);
     }
     account(ctx, counters, &meta, PROTO_ICMP, verdict);
     Ok(verdict)
@@ -143,20 +144,36 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
         verdict = XDP_DROP;
     }
     if verdict == XDP_PASS && dest_mode_v6(&dst) == DEST_MODE_MITIGATE {
-        verdict = mitigate_v6(&dst, &meta);
+        verdict = mitigate_v6(&dst, &ip.src_addr, &meta);
     }
     account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
 }
 
-/// Phase-1 mitigation verdict for a destination in MITIGATE mode: pass only
-/// traffic to learned-open TCP/UDP ports, rate-limit ICMP, and drop everything
-/// else (including fragments and non-TCP/UDP/ICMP protocols).
+/// Phase-1 mitigation verdict for a destination in MITIGATE mode:
+/// 1. drop non-first fragments (no L4 header),
+/// 2. hard-drop sources in a blocked CIDR (escalation result),
+/// 3. per-source rate-limit (over-rate sources are dropped and flagged as
+///    offenders for CIDR escalation),
+/// 4. pass only learned-open TCP/UDP ports, rate-limit ICMP, drop the rest.
 #[inline(always)]
-fn mitigate_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
+fn mitigate_v4(dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta) -> u32 {
     if meta.is_fragment {
         return XDP_DROP;
     }
+    if cidr_blocked_v4(*src) {
+        return XDP_DROP;
+    }
+    if !src_allowed_v4(src) {
+        record_src_drop_v4(src);
+        return XDP_DROP;
+    }
+    dest_policy_v4(dst, meta)
+}
+
+/// Destination-port policy under mitigation (after source checks pass).
+#[inline(always)]
+fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
     if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
         if meta.has_port && port_is_open_v4(*dst, meta.dst_port, meta.proto) {
             XDP_PASS
@@ -175,10 +192,22 @@ fn mitigate_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
 }
 
 #[inline(always)]
-fn mitigate_v6(dst: &[u8; 16], meta: &L4Meta) -> u32 {
+fn mitigate_v6(dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta) -> u32 {
     if meta.is_fragment {
         return XDP_DROP;
     }
+    if cidr_blocked_v6(*src) {
+        return XDP_DROP;
+    }
+    if !src_allowed_v6(src) {
+        record_src_drop_v6(src);
+        return XDP_DROP;
+    }
+    dest_policy_v6(dst, meta)
+}
+
+#[inline(always)]
+fn dest_policy_v6(dst: &[u8; 16], meta: &L4Meta) -> u32 {
     if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
         if meta.has_port && port_is_open_v6(*dst, meta.dst_port, meta.proto) {
             XDP_PASS

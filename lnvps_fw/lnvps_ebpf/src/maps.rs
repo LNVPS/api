@@ -1,10 +1,11 @@
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, LruHashMap, LruPerCpuHashMap};
+use aya_ebpf::maps::lpm_trie::Key;
+use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap};
 use lnvps_fw_common::{
-    Bucket, DEFAULT_ICMP_RATE_BURST_LIMIT, DEFAULT_ICMP_RATE_LIMIT, DEFAULT_SYN_RATE_BURST_LIMIT,
-    DEFAULT_SYN_RATE_LIMIT, DEST_MODE_NORMAL, DestCounters, DestState, LastSeen, PacketLimits,
-    PortKeyV4, PortKeyV6,
+    Bucket, DEFAULT_ICMP_RATE_BURST_LIMIT, DEFAULT_ICMP_RATE_LIMIT, DEFAULT_SRC_RATE_BURST_LIMIT,
+    DEFAULT_SRC_RATE_LIMIT, DEFAULT_SYN_RATE_BURST_LIMIT, DEFAULT_SYN_RATE_LIMIT, DEST_MODE_NORMAL,
+    DestCounters, DestState, LastSeen, PacketLimits, PortKeyV4, PortKeyV6, SRC_RATE_CONFIG_KEY,
 };
 
 /// Max number of destination IPs to track (per address family)
@@ -78,6 +79,101 @@ const DEFAULT_ICMP_LIMITS: PacketLimits = PacketLimits {
     limit: DEFAULT_ICMP_RATE_LIMIT,
     burst: DEFAULT_ICMP_RATE_BURST_LIMIT,
 };
+
+const DEFAULT_SRC_LIMITS: PacketLimits = PacketLimits {
+    limit: DEFAULT_SRC_RATE_LIMIT,
+    burst: DEFAULT_SRC_RATE_BURST_LIMIT,
+};
+
+/// Per-source token bucket (IPv4), consulted only while the destination is
+/// mitigating.
+#[map]
+pub static V4_SRC_RATE: LruHashMap<[u8; 4], Bucket> = LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Per-source token bucket (IPv6).
+#[map]
+pub static V6_SRC_RATE: LruHashMap<[u8; 16], Bucket> = LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Cumulative per-source drop counter (IPv4): incremented when a source
+/// exceeds its per-source rate under mitigation. Sampled by userspace to drive
+/// CIDR escalation.
+#[map]
+pub static V4_SRC_DROPS: LruHashMap<[u8; 4], u64> = LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Cumulative per-source drop counter (IPv6).
+#[map]
+pub static V6_SRC_DROPS: LruHashMap<[u8; 16], u64> = LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Blocked source CIDRs (IPv4), an LPM trie of network-order address bytes.
+/// Written by userspace escalation; any source matching a prefix is dropped.
+#[map]
+pub static V4_CIDR_SRC: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_DST_IPS, 0);
+
+/// Blocked source CIDRs (IPv6).
+#[map]
+pub static V6_CIDR_SRC: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_DST_IPS, 0);
+
+/// Global per-source rate-limit override (key `SRC_RATE_CONFIG_KEY`), set by
+/// userspace from config; falls back to `DEFAULT_SRC_LIMITS`.
+#[map]
+pub static SRC_RATE_LIMITS: HashMap<u32, PacketLimits> = HashMap::with_max_entries(1, 0);
+
+/// Per-source rate gate for one address family (used under mitigation). Returns
+/// true if the packet is within the source's rate budget.
+macro_rules! src_gate {
+    ($name:ident, $key:ty, $rate_map:ident) => {
+        #[inline(always)]
+        pub fn $name(src: &$key) -> bool {
+            let limits =
+                unsafe { SRC_RATE_LIMITS.get(&SRC_RATE_CONFIG_KEY) }.unwrap_or(&DEFAULT_SRC_LIMITS);
+            let now = unsafe { bpf_ktime_get_ns() };
+            if let Some(b) = $rate_map.get_ptr_mut(src) {
+                let bucket = unsafe { &mut *b };
+                bucket.try_consume(now, limits)
+            } else {
+                let new_bucket = Bucket::seeded(limits, now);
+                let _ = $rate_map.insert(src, &new_bucket, 0);
+                true
+            }
+        }
+    };
+}
+
+src_gate!(src_allowed_v4, [u8; 4], V4_SRC_RATE);
+src_gate!(src_allowed_v6, [u8; 16], V6_SRC_RATE);
+
+/// Record a per-source offense (rate-limit drop) for one address family.
+macro_rules! src_drop_recorder {
+    ($name:ident, $key:ty, $map:ident) => {
+        #[inline(always)]
+        pub fn $name(src: &$key) {
+            if let Some(c) = $map.get_ptr_mut(src) {
+                unsafe { *c += 1 };
+            } else {
+                let one: u64 = 1;
+                let _ = $map.insert(src, &one, 0);
+            }
+        }
+    };
+}
+
+src_drop_recorder!(record_src_drop_v4, [u8; 4], V4_SRC_DROPS);
+src_drop_recorder!(record_src_drop_v6, [u8; 16], V6_SRC_DROPS);
+
+/// CIDR block check for one address family: true if `src` matches a blocked
+/// prefix. A full-length prefix lookup returns the longest covering entry.
+macro_rules! cidr_block_check {
+    ($name:ident, $key:ty, $bits:expr, $map:ident) => {
+        #[inline(always)]
+        pub fn $name(src: $key) -> bool {
+            let key = Key::new($bits, src);
+            $map.get(&key).is_some()
+        }
+    };
+}
+
+cidr_block_check!(cidr_blocked_v4, [u8; 4], 32, V4_CIDR_SRC);
+cidr_block_check!(cidr_blocked_v6, [u8; 16], 128, V6_CIDR_SRC);
 
 /// Generate a dest-mode reader for one address family: returns the current
 /// mitigation mode (DEST_MODE_*) for `dst`, defaulting to NORMAL.

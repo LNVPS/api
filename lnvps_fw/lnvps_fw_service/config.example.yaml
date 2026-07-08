@@ -29,3 +29,17 @@ thresholds:
   cooldown-secs: 30
   # How often the detection loop samples the per-destination counters.
   sample-interval-ms: 500
+
+# Per-source rate limiting and CIDR escalation while a destination is mitigating.
+escalation:
+  # Per-source packets/second budget (and burst) under mitigation. Sources
+  # exceeding this are dropped and flagged as offenders.
+  src-rate-pps: 500
+  src-rate-burst: 1000
+  # A source counts as an offender once its per-window drop delta reaches this.
+  min-src-drops: 100
+  # A /24 (v4) or /64 (v6) is hard-blocked once this many distinct offending
+  # sources fall within it.
+  min-sources: 5
+  # A CIDR block is lifted this many seconds after it stops being refreshed.
+  block-ttl-secs: 300

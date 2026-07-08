@@ -11,12 +11,16 @@ use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result};
+use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{HashMap as AyaHashMap, MapData, PerCpuHashMap};
 use aya::{Ebpf, Pod};
 use log::{info, warn};
 
 use lnvps_fw_common::{DEST_MODE_MITIGATE, DestCounters, DestState};
 
+use crate::cidr::{
+    CidrV4, CidrV6, EscalationConfig, drop_deltas, offending_cidrs_v4, offending_cidrs_v6,
+};
 use crate::detect::{DestTracker, DetectionConfig, Rates, Transition, process_sample};
 
 /// Per-address-family detection state kept across sample windows.
@@ -26,6 +30,12 @@ pub struct DetectionState {
     pub v6: HashMap<[u8; 16], DestTracker>,
     /// Injected timestamp of the previous sample (0 = first run).
     pub last_sample_ns: u64,
+    /// Previous cumulative per-source drop snapshots (for escalation deltas).
+    pub prev_drops_v4: HashMap<[u8; 4], u64>,
+    pub prev_drops_v6: HashMap<[u8; 16], u64>,
+    /// Active CIDR blocks -> timestamp last refreshed (for TTL decay).
+    pub blocks_v4: HashMap<CidrV4, u64>,
+    pub blocks_v6: HashMap<CidrV6, u64>,
 }
 
 /// Sum per-CPU `DestCounters` slots into one total.
@@ -45,15 +55,15 @@ pub fn sum_counters<'a>(values: impl IntoIterator<Item = &'a DestCounters>) -> D
 
 fn log_event_start(ip: &str, rates: &Rates) {
     warn!(
-        "MITIGATION START dest={ip} pps={} syn_pps={} bps={}",
-        rates.pps, rates.syn_pps, rates.bps
+        "MITIGATION START dest={ip} pps={} syn_pps={} bps={} drop_pps={} pass_pps={}",
+        rates.pps, rates.syn_pps, rates.bps, rates.drop_pps, rates.pass_pps
     );
 }
 
 fn log_event_stop(ip: &str, peak: &Rates, dropped_total: u64) {
     info!(
-        "MITIGATION STOP dest={ip} peak_pps={} peak_syn_pps={} peak_bps={} dropped_total={dropped_total}",
-        peak.pps, peak.syn_pps, peak.bps
+        "MITIGATION STOP dest={ip} peak_pps={} peak_syn_pps={} peak_bps={} peak_drop_pps={} peak_pass_pps={} dropped_total={dropped_total}",
+        peak.pps, peak.syn_pps, peak.bps, peak.drop_pps, peak.pass_pps
     );
 }
 
@@ -110,6 +120,113 @@ where
         out.push((k, sum_counters(values.iter())));
     }
     Ok(out)
+}
+
+/// Read a cumulative per-source drop map into an owned vec.
+fn read_drops<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, u64)>>
+where
+    K: Pod,
+{
+    let map: AyaHashMap<_, K, u64> =
+        AyaHashMap::try_from(bpf.map(name).with_context(|| format!("{name} missing"))?)?;
+    let mut out = Vec::new();
+    for entry in map.iter() {
+        let (k, v) = entry?;
+        out.push((k, v));
+    }
+    Ok(out)
+}
+
+/// Escalate offending sources of one address family into hard CIDR blocks, and
+/// decay blocks whose refresh timestamp is older than `block_ttl_ns`. Returns
+/// nothing; logs CIDR BLOCK / UNBLOCK events.
+#[allow(clippy::too_many_arguments)]
+fn escalate_family<K, C>(
+    cur_drops: Vec<(K, u64)>,
+    prev_drops: &mut HashMap<K, u64>,
+    blocks: &mut HashMap<C, u64>,
+    trie: &mut LpmTrie<&mut MapData, K, u8>,
+    offending: Vec<C>,
+    cfg_block_ttl_ns: u64,
+    now_ns: u64,
+    key_of: impl Fn(&C) -> Key<K>,
+    fmt_cidr: impl Fn(&C) -> String,
+) where
+    K: Pod + Eq + Hash + Copy,
+    C: Eq + Hash + Copy,
+{
+    // Install / refresh blocks for currently-offending prefixes.
+    for cidr in offending {
+        let newly = blocks.insert(cidr, now_ns).is_none();
+        if newly {
+            if let Err(e) = trie.insert(&key_of(&cidr), 1, 0) {
+                warn!("failed to install CIDR block {}: {e}", fmt_cidr(&cidr));
+                blocks.remove(&cidr);
+                continue;
+            }
+            warn!("CIDR BLOCK {}", fmt_cidr(&cidr));
+        }
+    }
+    // Decay blocks that have not been refreshed within the TTL.
+    let expired: Vec<C> = blocks
+        .iter()
+        .filter(|(_, ts)| now_ns.saturating_sub(**ts) > cfg_block_ttl_ns)
+        .map(|(c, _)| *c)
+        .collect();
+    for cidr in expired {
+        let _ = trie.remove(&key_of(&cidr));
+        blocks.remove(&cidr);
+        info!("CIDR UNBLOCK {}", fmt_cidr(&cidr));
+    }
+    *prev_drops = cur_drops.into_iter().collect();
+}
+
+/// One escalation tick across both address families: aggregate per-source drop
+/// deltas into /24 (v4) and /64 (v6) blocks, install/refresh them in the LPM
+/// tries, and decay stale blocks.
+pub fn run_escalation(
+    bpf: &mut Ebpf,
+    state: &mut DetectionState,
+    cfg: &EscalationConfig,
+    block_ttl_ns: u64,
+    now_ns: u64,
+) -> Result<()> {
+    let cur4 = read_drops::<[u8; 4]>(bpf, "V4_SRC_DROPS")?;
+    let offending4 = offending_cidrs_v4(&drop_deltas(&state.prev_drops_v4, &cur4), cfg);
+    {
+        let mut trie: LpmTrie<_, [u8; 4], u8> =
+            LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
+        escalate_family(
+            cur4,
+            &mut state.prev_drops_v4,
+            &mut state.blocks_v4,
+            &mut trie,
+            offending4,
+            block_ttl_ns,
+            now_ns,
+            |c| Key::new(c.prefix_len, c.network),
+            |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
+        );
+    }
+
+    let cur6 = read_drops::<[u8; 16]>(bpf, "V6_SRC_DROPS")?;
+    let offending6 = offending_cidrs_v6(&drop_deltas(&state.prev_drops_v6, &cur6), cfg);
+    {
+        let mut trie: LpmTrie<_, [u8; 16], u8> =
+            LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
+        escalate_family(
+            cur6,
+            &mut state.prev_drops_v6,
+            &mut state.blocks_v6,
+            &mut trie,
+            offending6,
+            block_ttl_ns,
+            now_ns,
+            |c| Key::new(c.prefix_len, c.network),
+            |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
+        );
+    }
+    Ok(())
 }
 
 /// One detection tick across both address families at the injected `now_ns`.

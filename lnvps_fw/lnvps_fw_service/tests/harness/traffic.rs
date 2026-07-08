@@ -234,6 +234,85 @@ fn raw_syn_flood_v4(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, count: u32) -> 
     Ok(sent)
 }
 
+/// Send `per_src` UDP packets from each spoofed source address to
+/// `dst_ip:dst_port`, using a raw `IP_HDRINCL` socket. Returns the total number
+/// of packets the kernel accepted. IPv4 only. Spoofed sources let a single
+/// attacker namespace emulate a multi-source (distributed) flood.
+pub fn udp_flood_sources_v4(
+    ns_path: &str,
+    sources: &[Ipv4Addr],
+    dst: Ipv4Addr,
+    dst_port: u16,
+    per_src: u32,
+) -> io::Result<u32> {
+    let sources = sources.to_vec();
+    in_netns(ns_path, move || {
+        // SAFETY: standard raw socket setup, fd closed on drop.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(fd);
+        let one: libc::c_int = 1;
+        // SAFETY: enabling IP_HDRINCL so we supply the IP header.
+        unsafe {
+            libc::setsockopt(
+                fd.0,
+                libc::IPPROTO_IP,
+                libc::IP_HDRINCL,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = dst_port.to_be();
+        addr.sin_addr.s_addr = u32::from_ne_bytes(dst.octets());
+
+        let mut sent = 0u32;
+        for src in &sources {
+            for i in 0..per_src {
+                let pkt = build_udp_v4(*src, dst, 1024 + (i % 40000) as u16, dst_port);
+                // SAFETY: sending a well-formed buffer to sockaddr_in.
+                let n = unsafe {
+                    libc::sendto(
+                        fd.0,
+                        pkt.as_ptr() as *const libc::c_void,
+                        pkt.len(),
+                        0,
+                        &addr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                };
+                if n >= 0 {
+                    sent += 1;
+                }
+            }
+        }
+        Ok(sent)
+    })?
+}
+
+/// Build a 28-byte IPv4 + UDP packet with an empty payload.
+fn build_udp_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> [u8; 28] {
+    let mut p = [0u8; 28];
+    // IPv4 header (20 bytes).
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&28u16.to_be_bytes()); // total length
+    p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // don't fragment
+    p[8] = 64; // ttl
+    p[9] = 17; // protocol = UDP
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    let ip_csum = checksum(&p[0..20]);
+    p[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    // UDP header (8 bytes); checksum 0 (optional for IPv4).
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p[24..26].copy_from_slice(&8u16.to_be_bytes()); // length
+    p
+}
+
 /// Build a 40-byte IPv4 + TCP SYN packet.
 fn build_syn_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, seq: u32) -> [u8; 40] {
     let mut p = [0u8; 40];

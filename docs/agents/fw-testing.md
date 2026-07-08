@@ -100,8 +100,14 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   real `runtime::run_detection` with injected timestamps) and the cooldown
   returns it to NORMAL once the flood stops.
 
+`tests/escalation.rs` (increment 5 per-source rate + CIDR escalation):
+- `cidr_escalation_blocks_offending_v24` — a spoofed-source flood across a /24
+  (raw sockets emulate many sources) escalates to a CIDR-wide block via the
+  real `runtime::run_escalation`; an unrelated /24 is unaffected; the block
+  decays after its TTL once the flood stops.
+
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
-mitigation`, `--test smoke`).
+mitigation`, `--test escalation`, `--test smoke`).
 
 ## Service configuration
 

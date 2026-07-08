@@ -11,12 +11,16 @@ use lnvps_fw_common::{DEST_MODE_MITIGATE, DEST_MODE_NORMAL, DestCounters};
 /// Traffic rates for a single destination over the last sample window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rates {
-    /// Packets per second.
+    /// Packets per second (all verdicts).
     pub pps: u64,
     /// TCP SYNs per second.
     pub syn_pps: u64,
     /// Bytes per second.
     pub bps: u64,
+    /// Packets per second dropped by any protection stage.
+    pub drop_pps: u64,
+    /// Packets per second passed (accepted) = pps - drop_pps.
+    pub pass_pps: u64,
 }
 
 /// Detection parameters (entry thresholds + hysteresis).
@@ -81,10 +85,15 @@ pub fn compute_rates(prev: &DestCounters, cur: &DestCounters, elapsed_ns: u64) -
     let per_sec =
         |delta: u64| -> u64 { ((delta as u128 * 1_000_000_000u128) / elapsed_ns as u128) as u64 };
     let d = |cur: u64, prev: u64| cur.saturating_sub(prev);
+    // Accepted packets per snapshot = packets - dropped; take the delta of that.
+    let cur_pass = cur.packets.saturating_sub(cur.dropped);
+    let prev_pass = prev.packets.saturating_sub(prev.dropped);
     Rates {
         pps: per_sec(d(cur.packets, prev.packets)),
         syn_pps: per_sec(d(cur.syn_packets, prev.syn_packets)),
         bps: per_sec(d(cur.bytes, prev.bytes)),
+        drop_pps: per_sec(d(cur.dropped, prev.dropped)),
+        pass_pps: per_sec(d(cur_pass, prev_pass)),
     }
 }
 
@@ -137,6 +146,8 @@ fn max_rates(a: Rates, b: Rates) -> Rates {
         pps: a.pps.max(b.pps),
         syn_pps: a.syn_pps.max(b.syn_pps),
         bps: a.bps.max(b.bps),
+        drop_pps: a.drop_pps.max(b.drop_pps),
+        pass_pps: a.pass_pps.max(b.pass_pps),
     }
 }
 
@@ -194,6 +205,20 @@ mod tests {
     }
 
     #[test]
+    fn drop_and_pass_rates_computed() {
+        let prev = DestCounters::default();
+        let cur = DestCounters {
+            packets: 1_000,
+            dropped: 300,
+            ..Default::default()
+        };
+        let r = compute_rates(&prev, &cur, 1_000_000_000);
+        assert_eq!(r.pps, 1_000);
+        assert_eq!(r.drop_pps, 300);
+        assert_eq!(r.pass_pps, 700);
+    }
+
+    #[test]
     fn rates_computed_over_one_second() {
         let prev = counters(0, 0, 0);
         let cur = counters(2_000, 300, 500_000);
@@ -224,6 +249,7 @@ mod tests {
             pps: 1_000,
             syn_pps: 0,
             bps: 0,
+            ..Default::default()
         };
         let (mode, t) = evaluate(DEST_MODE_NORMAL, &r, &CFG, 0, &mut below);
         assert_eq!(mode, DEST_MODE_MITIGATE);
@@ -237,6 +263,7 @@ mod tests {
             pps: 1,
             syn_pps: 500,
             bps: 1,
+            ..Default::default()
         };
         let (mode, t) = evaluate(DEST_MODE_NORMAL, &r, &CFG, 0, &mut below);
         assert_eq!(mode, DEST_MODE_MITIGATE);
@@ -250,6 +277,7 @@ mod tests {
             pps: 999,
             syn_pps: 499,
             bps: 999_999,
+            ..Default::default()
         };
         let (mode, t) = evaluate(DEST_MODE_NORMAL, &r, &CFG, 0, &mut below);
         assert_eq!(mode, DEST_MODE_NORMAL);
@@ -263,6 +291,7 @@ mod tests {
             pps: 100,
             syn_pps: 10,
             bps: 10_000,
+            ..Default::default()
         };
         let mut below = None;
 
@@ -301,11 +330,13 @@ mod tests {
             pps: 100,
             syn_pps: 10,
             bps: 10_000,
+            ..Default::default()
         };
         let high = Rates {
             pps: 2_000,
             syn_pps: 0,
             bps: 0,
+            ..Default::default()
         };
         let mut below = None;
 
@@ -369,6 +400,7 @@ mod tests {
             pps: 700,
             syn_pps: 0,
             bps: 0,
+            ..Default::default()
         };
         let mut below = None;
         let (mode, t) = evaluate(DEST_MODE_MITIGATE, &mid, &CFG, 0, &mut below);

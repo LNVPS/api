@@ -27,6 +27,16 @@ pub const DEFAULT_ICMP_RATE_LIMIT: u64 = 100;
 /// Default ICMP burst limit per destination while mitigating.
 pub const DEFAULT_ICMP_RATE_BURST_LIMIT: u64 = 200;
 
+/// Default per-source rate limit while mitigating (packets/second). A source
+/// exceeding this toward a mitigated destination is dropped and flagged as an
+/// offender (candidate for CIDR escalation).
+pub const DEFAULT_SRC_RATE_LIMIT: u64 = 500;
+/// Default per-source burst limit while mitigating.
+pub const DEFAULT_SRC_RATE_BURST_LIMIT: u64 = 1_000;
+
+/// Config-map key for the global per-source rate limit override.
+pub const SRC_RATE_CONFIG_KEY: u32 = 0;
+
 /// Destination is not under attack; all traffic passes (learning continues).
 pub const DEST_MODE_NORMAL: u32 = 0;
 /// Destination is under attack; only traffic to learned-open ports passes.

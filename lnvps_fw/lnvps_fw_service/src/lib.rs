@@ -2,6 +2,7 @@
 //! (`main.rs`) and the integration test harness. Keeps the userspace logic
 //! (config parsing, learned-port GC) unit-testable and reusable.
 
+pub mod cidr;
 pub mod config;
 pub mod detect;
 pub mod gc;

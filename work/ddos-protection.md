@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-08
-**Last updated:** 2026-07-08 (Increment 4 complete)
+**Last updated:** 2026-07-08 (Increment 5 complete)
 
 ## Goal
 
@@ -210,18 +210,35 @@ Key notes:
       + 8 common + 22 service unit tests green; clippy/fmt clean
 - Note: PortKeyV4/V6 gained `::new()` (zeroes _pad) used by lookup + learn
 
-### Increment 5 — Per-source rate limits + CIDR escalation (L)
-- [ ] For dests in Mitigate: per-src token buckets
-      (`LruHashMap<SrcIp, Bucket>`), drop sources exceeding limits
-- [ ] CIDR escalation per maps.rs design: userspace aggregates offending
-      /32s; when count in a /24 (…up to /8 per V4_MIN_CIDR/V4_MAX_CIDR)
-      breaches threshold, insert wider entry into `V4_CIDR_SRC` LpmTrie and
-      remove overlapped narrower entries; XDP checks LpmTrie first
-- [ ] v6 equivalent (LpmTrie<[u8;16]>, /64-based escalation)
-- [ ] Expiry/decay of CIDR blocks in userspace GC
-- [ ] Tests for aggregation/escalation logic
-- [ ] Harness tests: multi-source flood (aliased addrs in attacker netns
-      across a /24) triggers CIDR-wide block; unrelated source unaffected
+### Increment 5 — Per-source rate limits + CIDR escalation (L) ✅ DONE
+- [x] Per-source token buckets (`V4/V6_SRC_RATE`) consulted under mitigation;
+      over-rate sources dropped and flagged (`record_src_drop_*` →
+      `V4/V6_SRC_DROPS`). Global limit via `SRC_RATE_LIMITS` config map (set
+      from config; DEFAULT_SRC_* fallback). Order in mitigate_*: fragment →
+      CIDR block → per-source rate → dest port/icmp policy
+- [x] CIDR escalation: userspace aggregates offending sources by /24 (v4) /
+      /64 (v6) via pure `cidr.rs` (offending_cidrs_v4/v6, drop_deltas);
+      installs blocks into `V4/V6_CIDR_SRC` LpmTrie; XDP checks trie first
+      (`cidr_blocked_*`, full-length LPM lookup). Single-level aggregation
+      (deeper /16,/8 escalation deferred; noted below)
+- [x] v6 equivalent (LpmTrie<[u8;16],u8>, /64 grouping)
+- [x] Decay: `run_escalation` refreshes block timestamps for still-offending
+      prefixes and removes blocks not refreshed within block-ttl-secs
+- [x] Pure aggregation unit tests (6 in cidr.rs: /24 grouping, min-sources,
+      distinct /24s, repeat-source, v6 /64, drop_deltas reset/new)
+- [x] Harness test (`tests/escalation.rs`): spoofed multi-source /24 flood
+      (raw IP_HDRINCL UDP, sources emulated in one netns) → /24 blocked;
+      unrelated /24 safe; block decays after TTL. Passes
+- [x] BONUS (user ask): drop/accept RATE tracking — `Rates` now carries
+      drop_pps/pass_pps (computed from dropped delta + packets-dropped delta),
+      peak-tracked, surfaced in MITIGATION START/STOP events
+- [x] Config: `escalation` section (src-rate-pps/burst, min-src-drops,
+      min-sources, block-ttl-secs); escalation_config()/block_ttl_ns()
+- Design note: only aggregated CIDRs live in the trie (no /32s); individual
+      sources are rate-limited via buckets, so no overlap-removal needed.
+      Multi-level escalation (/24→/16→/8) is a future extension
+- VALIDATED as root: 11 harness tests (4 smoke + 3 learning + 3 mitigation +
+      1 escalation) + 8 common + 29 service unit tests green; clippy/fmt clean
 
 ### Increment 6 — SYN-proxy / SYN-cookie stage (L)
 - [ ] Escalation: Mitigate → SynProxy when SYN flood persists on learned-open
