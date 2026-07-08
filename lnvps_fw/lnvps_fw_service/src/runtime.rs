@@ -15,20 +15,29 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result};
 use aya::maps::lpm_trie::{Key, LpmTrie};
-use aya::maps::{HashMap as AyaHashMap, MapData, PerCpuHashMap};
+use aya::maps::{MapData, PerCpuHashMap};
 use aya::{Ebpf, Pod};
 use log::{info, warn};
 
 use lnvps_fw_common::{DEST_MODE_MITIGATE, DestCounters, DestState};
 
-use crate::cidr::{CidrV4, CidrV6, aggregate_v4, aggregate_v6, offenders, per_source_pps};
+use crate::cidr::{
+    CidrV4, CidrV6, aggregate_v4, aggregate_v6, mask_v4, mask_v6, offenders, per_source_pps,
+};
 use crate::detect::{DestTracker, DetectionConfig, Rates, Transition, process_sample};
 
 /// Runtime configuration for one control tick.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
-    /// Per-destination detection thresholds + hysteresis.
+    /// Per-destination detection thresholds + hysteresis (single-IP attacks).
     pub detection: DetectionConfig,
+    /// Per-protected-prefix aggregate thresholds (carpet-bomb / thin-spread
+    /// floods that never trip any single destination).
+    pub network: DetectionConfig,
+    /// Protected IPv4 prefixes as (prefix_len, network-bytes).
+    pub protected_v4: Vec<(u32, [u8; 4])>,
+    /// Protected IPv6 prefixes.
+    pub protected_v6: Vec<(u32, [u8; 16])>,
     /// Per-source packets/second that marks a source as an offender.
     pub src_rate_pps: u64,
     /// Aggregation fan-out: this many child prefixes under a parent collapse to
@@ -45,6 +54,9 @@ pub struct DetectionState {
     pub v6: HashMap<[u8; 16], DestTracker>,
     /// Injected timestamp of the previous sample (0 = first run).
     pub last_sample_ns: u64,
+    /// Per-protected-prefix detection trackers, keyed by (prefix_len, network).
+    pub prefix_v4: HashMap<(u32, [u8; 4]), DestTracker>,
+    pub prefix_v6: HashMap<(u32, [u8; 16]), DestTracker>,
     /// Previous cumulative per-source counter snapshots (for rate deltas).
     pub prev_src_v4: HashMap<[u8; 4], u64>,
     pub prev_src_v6: HashMap<[u8; 16], u64>,
@@ -82,11 +94,21 @@ fn log_event_stop(ip: &str, peak: &Rates, dropped_total: u64) {
     );
 }
 
-/// Run the detection state machine for every sampled destination of one family
-/// and apply transitions to `state_map`.
+fn mitigate_state(now_ns: u64) -> DestState {
+    DestState {
+        mode: DEST_MODE_MITIGATE,
+        _pad: 0,
+        entered_at: now_ns,
+    }
+}
+
+/// Run the detection state machine for every sampled destination of one family,
+/// writing /32|/128 entries into the dest-state LPM trie on transitions.
+#[allow(clippy::too_many_arguments)]
 fn detect_family<K>(
-    samples: Vec<(K, DestCounters)>,
-    state_map: &mut AyaHashMap<&mut MapData, K, DestState>,
+    samples: &[(K, DestCounters)],
+    trie: &mut LpmTrie<&mut MapData, K, DestState>,
+    bits: u32,
     trackers: &mut HashMap<K, DestTracker>,
     cfg: &DetectionConfig,
     now_ns: u64,
@@ -96,30 +118,81 @@ fn detect_family<K>(
     K: Pod + Eq + Hash + Copy,
 {
     for (key, cur) in samples {
-        let tracker = trackers.entry(key).or_default();
-        let (transition, rates) = process_sample(cur, tracker, cfg, now_ns, elapsed_ns);
+        let tracker = trackers.entry(*key).or_default();
+        let (transition, rates) = process_sample(*cur, tracker, cfg, now_ns, elapsed_ns);
         match transition {
             Transition::Entered => {
-                let st = DestState {
-                    mode: DEST_MODE_MITIGATE,
-                    _pad: 0,
-                    entered_at: now_ns,
-                };
-                if let Err(e) = state_map.insert(key, st, 0) {
-                    warn!("failed to set mitigate state for {}: {e}", fmt_ip(&key));
+                if let Err(e) = trie.insert(&Key::new(bits, *key), mitigate_state(now_ns), 0) {
+                    warn!("failed to set mitigate state for {}: {e}", fmt_ip(key));
                 }
-                log_event_start(&fmt_ip(&key), &rates);
+                log_event_start(&fmt_ip(key), &rates);
             }
             Transition::Exited => {
                 let peak = tracker.peak;
-                if let Err(e) = state_map.remove(&key) {
-                    warn!("failed to clear mitigate state for {}: {e}", fmt_ip(&key));
-                }
-                log_event_stop(&fmt_ip(&key), &peak, cur.dropped);
+                let _ = trie.remove(&Key::new(bits, *key));
+                log_event_stop(&fmt_ip(key), &peak, cur.dropped);
                 tracker.peak = Rates::default();
             }
             Transition::None => {}
         }
+    }
+}
+
+/// Aggregate the sampled per-destination counters over one protected prefix and
+/// run the network-level state machine, writing a prefix-wide entry into the
+/// dest-state LPM trie on transition. This catches thin carpet-bomb floods that
+/// never trip any single destination.
+#[allow(clippy::too_many_arguments)]
+fn detect_prefix<K>(
+    samples: &[(K, DestCounters)],
+    trie: &mut LpmTrie<&mut MapData, K, DestState>,
+    prefix_len: u32,
+    network: K,
+    mask: impl Fn(K, u32) -> K,
+    trackers: &mut HashMap<(u32, K), DestTracker>,
+    cfg: &DetectionConfig,
+    now_ns: u64,
+    elapsed_ns: u64,
+    fmt: impl Fn(u32, &K) -> String,
+) where
+    K: Pod + Eq + Hash + Copy,
+{
+    let mut agg = DestCounters::default();
+    for (addr, c) in samples {
+        if mask(*addr, prefix_len) == network {
+            agg.packets += c.packets;
+            agg.bytes += c.bytes;
+            agg.syn_packets += c.syn_packets;
+            agg.tcp_packets += c.tcp_packets;
+            agg.udp_packets += c.udp_packets;
+            agg.icmp_packets += c.icmp_packets;
+            agg.dropped += c.dropped;
+        }
+    }
+    let tracker = trackers.entry((prefix_len, network)).or_default();
+    let (transition, rates) = process_sample(agg, tracker, cfg, now_ns, elapsed_ns);
+    match transition {
+        Transition::Entered => {
+            if let Err(e) = trie.insert(&Key::new(prefix_len, network), mitigate_state(now_ns), 0) {
+                warn!(
+                    "failed to set prefix mitigate {}: {e}",
+                    fmt(prefix_len, &network)
+                );
+            }
+            warn!(
+                "PREFIX MITIGATION START net={} pps={} bps={} syn_pps={}",
+                fmt(prefix_len, &network),
+                rates.pps,
+                rates.bps,
+                rates.syn_pps
+            );
+        }
+        Transition::Exited => {
+            let _ = trie.remove(&Key::new(prefix_len, network));
+            info!("PREFIX MITIGATION STOP net={}", fmt(prefix_len, &network));
+            tracker.peak = Rates::default();
+        }
+        Transition::None => {}
     }
 }
 
@@ -211,34 +284,64 @@ pub fn run_control(
     };
     state.last_sample_ns = now_ns;
 
-    // --- Per-destination detection ---
+    // --- Per-destination + per-prefix detection (shared dest-state trie) ---
     let v4 = read_counters::<[u8; 4]>(bpf, "V4_DEST_COUNTERS")?;
     {
-        let mut sm: AyaHashMap<_, [u8; 4], DestState> =
-            AyaHashMap::try_from(bpf.map_mut("V4_DEST_STATE").context("v4 state missing")?)?;
+        let mut trie: LpmTrie<_, [u8; 4], DestState> =
+            LpmTrie::try_from(bpf.map_mut("V4_DEST_STATE").context("v4 state missing")?)?;
         detect_family(
-            v4,
-            &mut sm,
+            &v4,
+            &mut trie,
+            32,
             &mut state.v4,
             &cfg.detection,
             now_ns,
             elapsed,
             |k| Ipv4Addr::from(*k).to_string(),
         );
+        for &(len, net) in &cfg.protected_v4 {
+            detect_prefix(
+                &v4,
+                &mut trie,
+                len,
+                net,
+                mask_v4,
+                &mut state.prefix_v4,
+                &cfg.network,
+                now_ns,
+                elapsed,
+                |l, n| format!("{}/{}", Ipv4Addr::from(*n), l),
+            );
+        }
     }
     let v6 = read_counters::<[u8; 16]>(bpf, "V6_DEST_COUNTERS")?;
     {
-        let mut sm: AyaHashMap<_, [u8; 16], DestState> =
-            AyaHashMap::try_from(bpf.map_mut("V6_DEST_STATE").context("v6 state missing")?)?;
+        let mut trie: LpmTrie<_, [u8; 16], DestState> =
+            LpmTrie::try_from(bpf.map_mut("V6_DEST_STATE").context("v6 state missing")?)?;
         detect_family(
-            v6,
-            &mut sm,
+            &v6,
+            &mut trie,
+            128,
             &mut state.v6,
             &cfg.detection,
             now_ns,
             elapsed,
             |k| Ipv6Addr::from(*k).to_string(),
         );
+        for &(len, net) in &cfg.protected_v6 {
+            detect_prefix(
+                &v6,
+                &mut trie,
+                len,
+                net,
+                mask_v6,
+                &mut state.prefix_v6,
+                &cfg.network,
+                now_ns,
+                elapsed,
+                |l, n| format!("{}/{}", Ipv6Addr::from(*n), l),
+            );
+        }
     }
 
     // --- Per-source control (rate -> CIDR blocks) ---

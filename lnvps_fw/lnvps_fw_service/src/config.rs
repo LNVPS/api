@@ -10,6 +10,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Protected IPv4 prefixes as (prefix_len, network-bytes).
+pub type ProtectedV4 = Vec<(u32, [u8; 4])>;
+/// Protected IPv6 prefixes as (prefix_len, network-bytes).
+pub type ProtectedV6 = Vec<(u32, [u8; 16])>;
+
 /// Top-level service configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -25,6 +30,13 @@ pub struct Config {
     /// Per-source rate limiting and CIDR escalation while mitigating.
     #[serde(default)]
     pub escalation: Escalation,
+    /// Protected prefixes (CIDR strings) this host serves. Used for prefix-wide
+    /// (carpet-bomb) mitigation. Populated from the API in a later increment.
+    #[serde(default)]
+    pub protected: Vec<String>,
+    /// Aggregate per-prefix detection thresholds (carpet-bomb floods).
+    #[serde(default)]
+    pub network: NetworkThresholds,
 }
 
 /// Port-learning / garbage-collection parameters.
@@ -99,6 +111,15 @@ fn default_sample_interval_ms() -> u64 {
 fn default_agg_fanout() -> usize {
     4
 }
+fn default_net_pps() -> u64 {
+    500_000
+}
+fn default_net_syn_pps() -> u64 {
+    50_000
+}
+fn default_net_bps() -> u64 {
+    5_000_000_000
+}
 fn default_block_ttl_secs() -> u64 {
     300
 }
@@ -159,6 +180,35 @@ impl Default for Escalation {
     }
 }
 
+/// Aggregate detection thresholds applied per protected prefix. Defaults are
+/// large (network-scale) so a prefix only flips under a genuine carpet bomb.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct NetworkThresholds {
+    #[serde(default = "default_net_pps")]
+    pub pps: u64,
+    #[serde(default = "default_net_syn_pps")]
+    pub syn_pps: u64,
+    #[serde(default = "default_net_bps")]
+    pub bps: u64,
+    #[serde(default = "default_exit_pct")]
+    pub exit_pct: u64,
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for NetworkThresholds {
+    fn default() -> Self {
+        Self {
+            pps: default_net_pps(),
+            syn_pps: default_net_syn_pps(),
+            bps: default_net_bps(),
+            exit_pct: default_exit_pct(),
+            cooldown_secs: default_cooldown_secs(),
+        }
+    }
+}
+
 impl Config {
     /// Load and validate a config from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -178,6 +228,8 @@ impl Config {
             learning: LearningConfig::default(),
             thresholds: Thresholds::default(),
             escalation: Escalation::default(),
+            protected: Vec::new(),
+            network: NetworkThresholds::default(),
         }
     }
 
@@ -223,14 +275,58 @@ impl Config {
         }
     }
 
+    /// Aggregate (per-prefix) detection config.
+    pub fn network_config(&self) -> crate::detect::DetectionConfig {
+        crate::detect::DetectionConfig {
+            pps: self.network.pps,
+            syn_pps: self.network.syn_pps,
+            bps: self.network.bps,
+            exit_pct: self.network.exit_pct,
+            cooldown_ns: self.network.cooldown_secs * 1_000_000_000,
+        }
+    }
+
+    /// Parse the `protected` CIDR strings into (prefix_len, network-bytes) pairs
+    /// per address family, with host bits masked off.
+    pub fn parse_protected(&self) -> Result<(ProtectedV4, ProtectedV6)> {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for cidr in &self.protected {
+            let (addr, len) = cidr
+                .split_once('/')
+                .with_context(|| format!("protected entry '{cidr}' is not CIDR (addr/len)"))?;
+            let len: u32 = len
+                .parse()
+                .with_context(|| format!("invalid prefix length in '{cidr}'"))?;
+            let ip: std::net::IpAddr = addr
+                .parse()
+                .with_context(|| format!("invalid address in '{cidr}'"))?;
+            match ip {
+                std::net::IpAddr::V4(a) => {
+                    anyhow::ensure!(len <= 32, "IPv4 prefix >32 in '{cidr}'");
+                    v4.push((len, crate::cidr::mask_v4(a.octets(), len)));
+                }
+                std::net::IpAddr::V6(a) => {
+                    anyhow::ensure!(len <= 128, "IPv6 prefix >128 in '{cidr}'");
+                    v6.push((len, crate::cidr::mask_v6(a.octets(), len)));
+                }
+            }
+        }
+        Ok((v4, v6))
+    }
+
     /// Build the runtime control-tick config from the parsed settings.
-    pub fn runtime_config(&self) -> crate::runtime::RuntimeConfig {
-        crate::runtime::RuntimeConfig {
+    pub fn runtime_config(&self) -> Result<crate::runtime::RuntimeConfig> {
+        let (protected_v4, protected_v6) = self.parse_protected()?;
+        Ok(crate::runtime::RuntimeConfig {
             detection: self.detection_config(),
+            network: self.network_config(),
+            protected_v4,
+            protected_v6,
             src_rate_pps: self.escalation.src_rate_pps,
             fanout: self.escalation.agg_fanout,
             block_ttl_ns: self.escalation.block_ttl_secs * 1_000_000_000,
-        }
+        })
     }
 }
 
@@ -290,6 +386,30 @@ thresholds:
         let mut cfg = Config::from_interfaces(vec!["eno2".to_string()]);
         cfg.learning.gc_interval_secs = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_and_masks_protected_prefixes() {
+        let cfg: Config = serde_yaml_ng::from_str(
+            "interfaces: [eno1]\nprotected:\n  - 10.0.1.130/24\n  - fd00:1::5/64\n",
+        )
+        .unwrap();
+        let (v4, v6) = cfg.parse_protected().unwrap();
+        // Host bits masked off: 10.0.1.130/24 -> 10.0.1.0/24.
+        assert_eq!(v4, vec![(24, [10, 0, 1, 0])]);
+        assert_eq!(v6.len(), 1);
+        assert_eq!(v6[0].0, 64);
+        assert_eq!(&v6[0].1[..8], &[0xfd, 0x00, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(&v6[0].1[8..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn rejects_bad_protected_cidr() {
+        let cfg = Config {
+            protected: vec!["not-a-cidr".to_string()],
+            ..Config::from_interfaces(vec!["e".to_string()])
+        };
+        assert!(cfg.parse_protected().is_err());
     }
 
     #[test]

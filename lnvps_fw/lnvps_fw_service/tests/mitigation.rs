@@ -99,14 +99,24 @@ fn detection_flip_and_cooldown() {
     }
     let mut h = Harness::new().expect("harness setup");
 
+    let det = DetectionConfig {
+        pps: 100,
+        syn_pps: u64::MAX, // don't trip on SYNs
+        bps: u64::MAX,     // don't trip on bytes
+        exit_pct: 50,
+        cooldown_ns: SECOND_NS,
+    };
     let cfg = RuntimeConfig {
-        detection: DetectionConfig {
-            pps: 100,
-            syn_pps: u64::MAX, // don't trip on SYNs
-            bps: u64::MAX,     // don't trip on bytes
+        detection: det,
+        network: DetectionConfig {
+            pps: u64::MAX,
+            syn_pps: u64::MAX,
+            bps: u64::MAX,
             exit_pct: 50,
             cooldown_ns: SECOND_NS,
         },
+        protected_v4: Vec::new(),
+        protected_v6: Vec::new(),
         src_rate_pps: u64::MAX, // don't block sources in this test
         fanout: 4,
         block_ttl_ns: SECOND_NS,

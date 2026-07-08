@@ -106,8 +106,14 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   real `runtime::run_escalation`; an unrelated /24 is unaffected; the block
   decays after its TTL once the flood stops.
 
+`tests/carpet_bomb.rs` (prefix-level / carpet-bomb defense):
+- `thin_carpet_bomb_flips_whole_prefix` — a flood spread thinly across a
+  protected /24 (no single dest trips its threshold) trips the aggregate
+  network threshold and flips the whole prefix to mitigation via one dest-state
+  LPM entry; addresses outside the prefix stay normal; cooldown restores it.
+
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
-mitigation`, `--test escalation`, `--test smoke`).
+mitigation`, `--test escalation`, `--test carpet_bomb`, `--test smoke`).
 
 ## Service configuration
 

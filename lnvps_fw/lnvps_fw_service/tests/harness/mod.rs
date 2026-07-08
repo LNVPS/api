@@ -155,26 +155,35 @@ impl Harness {
         Ok(lnvps_fw_service::gc::gc_open_ports(&mut map, now, ttl_ns))
     }
 
-    /// Force an IPv4 destination into MITIGATE mode (as the detection loop
-    /// would), for testing enforcement independently of detection.
+    /// Force an IPv4 destination (or prefix) into MITIGATE mode by writing the
+    /// dest-state LPM trie, for testing enforcement independently of detection.
+    /// `prefix_len` of 32 blocks a single IP; a shorter length a whole prefix.
     pub fn set_mitigate_v4(&mut self, ip: Ipv4Addr) -> anyhow::Result<()> {
-        let mut map: AyaHashMap<_, [u8; 4], DestState> =
-            AyaHashMap::try_from(self.bpf.map_mut("V4_DEST_STATE").unwrap())?;
+        self.set_mitigate_prefix_v4(ip, 32)
+    }
+
+    /// Write a MITIGATE entry at an arbitrary prefix length.
+    pub fn set_mitigate_prefix_v4(&mut self, net: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
+        let mut trie: LpmTrie<_, [u8; 4], DestState> =
+            LpmTrie::try_from(self.bpf.map_mut("V4_DEST_STATE").unwrap())?;
         let st = DestState {
             mode: DEST_MODE_MITIGATE,
             _pad: 0,
             entered_at: 0,
         };
-        map.insert(ip.octets(), st, 0)?;
+        trie.insert(&Key::new(prefix_len, net.octets()), st, 0)?;
         Ok(())
     }
 
-    /// Read the current mitigation mode for an IPv4 destination (default
-    /// NORMAL = 0 if no entry).
+    /// Read the effective mitigation mode covering an IPv4 destination via a
+    /// longest-prefix lookup (default NORMAL = 0 if no covering entry).
     pub fn dest_mode_v4(&self, ip: Ipv4Addr) -> anyhow::Result<u32> {
-        let map: AyaHashMap<_, [u8; 4], DestState> =
-            AyaHashMap::try_from(self.bpf.map("V4_DEST_STATE").unwrap())?;
-        Ok(map.get(&ip.octets(), 0).map(|s| s.mode).unwrap_or(0))
+        let trie: LpmTrie<_, [u8; 4], DestState> =
+            LpmTrie::try_from(self.bpf.map("V4_DEST_STATE").unwrap())?;
+        Ok(trie
+            .get(&Key::new(32, ip.octets()), 0)
+            .map(|s| s.mode)
+            .unwrap_or(0))
     }
 
     /// Run one real control tick (the daemon's `runtime::run_control`, i.e.

@@ -302,16 +302,24 @@ is kept only for real botnets. The scaling defences are per-destination
 mitigation + drop-to-non-open-ports (source-count-independent) and SYN-proxy
 (inc 6) for open TCP ports.
 
-### NEXT (in progress) — Prefix-level (carpet-bomb) detection
-- [ ] Convert `DEST_STATE` HashMap -> LPM trie so a whole protected prefix can
-      be mitigated in one entry (`203.0.113.0/22 -> MITIGATE`); single IP is a
-      /32 entry. XDP does one LPM lookup for dest mode.
-- [ ] `protected` prefixes in config (from API in inc 7).
-- [ ] Network-aggregate detection: sum per-dest counters across each protected
-      prefix each tick; flip the prefix when the aggregate crosses a network
-      threshold (thin carpet bombs that never trip any single /32).
-- [ ] Harness test: thin spread across a /24 (no single dst trips) -> whole
-      prefix flips to mitigate.
+### Prefix-level (carpet-bomb) detection ✅ DONE
+- [x] `DEST_STATE` converted HashMap -> LPM trie: userspace mitigates a single
+      IP (/32 entry) or a whole protected prefix (/22 etc.) with one entry;
+      XDP does one longest-prefix lookup for dest mode.
+- [x] `protected` prefixes in config (CIDR strings, host bits masked, bit-level
+      mask supports non-byte-aligned like /22); API-sourced later (inc 7).
+- [x] Network-aggregate detection (`runtime::detect_prefix`): sums per-dest
+      counters across each protected prefix each tick; flips the prefix when the
+      aggregate crosses the `network` thresholds. PREFIX MITIGATION START/STOP
+      events. Separate per-prefix trackers with hysteresis/cooldown.
+- [x] Harness test (`tests/carpet_bomb.rs`): thin spread across a /24 (no single
+      dst trips) -> whole /24 flips to mitigate; outside-prefix stays normal;
+      cooldown restores. Passes.
+- Config: `network` thresholds section (network-scale defaults) + `protected`
+      list; parse_protected unit-tested. RuntimeConfig now carries network cfg +
+      protected prefixes; run_control does per-dest AND per-prefix detection
+      into the shared dest-state trie.
+- VALIDATED as root: 12 harness tests + 32 service unit tests green.
 
 ## Notes
 

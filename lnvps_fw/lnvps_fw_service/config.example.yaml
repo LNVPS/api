@@ -7,6 +7,23 @@
 interfaces:
   - eno2
 
+# Protected prefixes this host serves. Enables prefix-wide (carpet-bomb)
+# mitigation: if the aggregate rate across a whole prefix crosses the network
+# thresholds, the entire prefix flips to mitigation in one LPM entry, even if no
+# single IP trips its own threshold. (Populated from the API in a later step.)
+protected:
+  - 203.0.113.0/24
+  # - 2001:db8:1::/48
+
+# Aggregate per-prefix detection thresholds (defaults are network-scale so a
+# prefix only flips under a genuine carpet bomb).
+network:
+  pps: 500000
+  syn-pps: 50000
+  bps: 5000000000
+  exit-pct: 50
+  cooldown-secs: 30
+
 # Passive port-learning / garbage-collection parameters.
 learning:
   # Forget a learned open port after this long without matching egress traffic.

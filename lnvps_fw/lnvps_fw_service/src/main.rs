@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     let mut bpf = attach_programs(&cfg)?;
 
     let ttl_ns = cfg.port_ttl().as_nanos() as u64;
-    let runtime_cfg = cfg.runtime_config();
+    let runtime_cfg = cfg.runtime_config()?;
     let mut detection_state = DetectionState::default();
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());

@@ -1,7 +1,7 @@
 use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap};
+use aya_ebpf::maps::{LpmTrie, LruHashMap, LruPerCpuHashMap};
 use lnvps_fw_common::{DEST_MODE_NORMAL, DestCounters, DestState, LastSeen, PortKeyV4, PortKeyV6};
 
 /// Max number of destination IPs to track (per address family)
@@ -42,13 +42,15 @@ pub static V4_SRC_COUNTERS: LruPerCpuHashMap<[u8; 4], u64> =
 pub static V6_SRC_COUNTERS: LruPerCpuHashMap<[u8; 16], u64> =
     LruPerCpuHashMap::with_max_entries(MAX_SRC_IPS, 0);
 
-/// Mitigation state per dest IPv4 (written by userspace detection loop)
+/// Mitigation state per destination (IPv4), an LPM trie written by userspace.
+/// Using a trie lets userspace mitigate a single IP (a /32 entry) or a whole
+/// protected prefix (e.g. a /22 entry, for carpet-bomb floods) with one lookup.
 #[map]
-pub static V4_DEST_STATE: HashMap<[u8; 4], DestState> = HashMap::with_max_entries(MAX_DST_IPS, 0);
+pub static V4_DEST_STATE: LpmTrie<[u8; 4], DestState> = LpmTrie::with_max_entries(MAX_DST_IPS, 0);
 
-/// Mitigation state per dest IPv6
+/// Mitigation state per destination (IPv6).
 #[map]
-pub static V6_DEST_STATE: HashMap<[u8; 16], DestState> = HashMap::with_max_entries(MAX_DST_IPS, 0);
+pub static V6_DEST_STATE: LpmTrie<[u8; 16], DestState> = LpmTrie::with_max_entries(MAX_DST_IPS, 0);
 
 /// Learned-open TCP/UDP ports for local IPv4 addresses, discovered by passive
 /// egress observation. Read by the XDP ingress program under mitigation.
@@ -71,13 +73,15 @@ pub static V4_CIDR_SRC: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CID
 #[map]
 pub static V6_CIDR_SRC: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
 
-/// Generate a dest-mode reader for one address family: returns the current
-/// mitigation mode (DEST_MODE_*) for `dst`, defaulting to NORMAL.
+/// Generate a dest-mode reader for one address family: a longest-prefix lookup
+/// returns the covering mitigation state (a /32|/128 exact entry or a wider
+/// protected-prefix entry), defaulting to NORMAL.
 macro_rules! dest_mode_for {
-    ($name:ident, $key:ty, $map:ident) => {
+    ($name:ident, $key:ty, $bits:expr, $map:ident) => {
         #[inline(always)]
         pub fn $name(dst: &$key) -> u32 {
-            match unsafe { $map.get(dst) } {
+            let key = Key::new($bits, *dst);
+            match $map.get(&key) {
                 Some(s) => s.mode,
                 None => DEST_MODE_NORMAL,
             }
@@ -85,8 +89,8 @@ macro_rules! dest_mode_for {
     };
 }
 
-dest_mode_for!(dest_mode_v4, [u8; 4], V4_DEST_STATE);
-dest_mode_for!(dest_mode_v6, [u8; 16], V6_DEST_STATE);
+dest_mode_for!(dest_mode_v4, [u8; 4], 32, V4_DEST_STATE);
+dest_mode_for!(dest_mode_v6, [u8; 16], 128, V6_DEST_STATE);
 
 /// Generate a counters-accessor for one address family: returns a pointer to
 /// the current-CPU counters slot for `dst`, creating it if missing.

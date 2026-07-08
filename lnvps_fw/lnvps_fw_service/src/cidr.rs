@@ -38,19 +38,29 @@ const V4_LEVELS: [u32; 3] = [24, 16, 8];
 /// IPv6 aggregation levels: offenders start as /128 and collapse toward /32.
 const V6_LEVELS: [u32; 3] = [64, 48, 32];
 
-/// Zero the host bits of a byte-aligned IPv4 prefix.
-fn mask_v4(addr: [u8; 4], prefix: u32) -> [u8; 4] {
-    let bytes = (prefix / 8) as usize;
-    let mut out = [0u8; 4];
-    out[..bytes].copy_from_slice(&addr[..bytes]);
-    out
+/// Zero the host bits of an IPv4 prefix (supports non-byte-aligned lengths
+/// like /22).
+pub fn mask_v4(addr: [u8; 4], prefix: u32) -> [u8; 4] {
+    mask_bytes::<4>(addr, prefix.min(32))
 }
 
-/// Zero the host bits of a byte-aligned IPv6 prefix.
-fn mask_v6(addr: [u8; 16], prefix: u32) -> [u8; 16] {
-    let bytes = (prefix / 8) as usize;
-    let mut out = [0u8; 16];
-    out[..bytes].copy_from_slice(&addr[..bytes]);
+/// Zero the host bits of an IPv6 prefix.
+pub fn mask_v6(addr: [u8; 16], prefix: u32) -> [u8; 16] {
+    mask_bytes::<16>(addr, prefix.min(128))
+}
+
+/// Bit-level network mask over an N-byte address.
+fn mask_bytes<const N: usize>(addr: [u8; N], prefix: u32) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        let bit_start = (i as u32) * 8;
+        if bit_start + 8 <= prefix {
+            *o = addr[i];
+        } else if bit_start < prefix {
+            let keep = prefix - bit_start; // 1..=7 bits from this byte
+            *o = addr[i] & (0xFFu8 << (8 - keep));
+        }
+    }
     out
 }
 

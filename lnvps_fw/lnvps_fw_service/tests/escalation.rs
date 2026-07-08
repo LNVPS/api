@@ -28,15 +28,19 @@ fn cidr_escalation_aggregates_offending_v24() {
     let mut h = Harness::new().expect("harness setup");
     h.set_mitigate_v4(VM_V4).expect("mitigate");
 
+    let quiet = DetectionConfig {
+        pps: u64::MAX,
+        syn_pps: u64::MAX,
+        bps: u64::MAX,
+        exit_pct: 50,
+        cooldown_ns: SECOND_NS,
+    };
     let cfg = RuntimeConfig {
-        // Keep dest detection out of the way; drive DEST_STATE manually.
-        detection: DetectionConfig {
-            pps: u64::MAX,
-            syn_pps: u64::MAX,
-            bps: u64::MAX,
-            exit_pct: 50,
-            cooldown_ns: SECOND_NS,
-        },
+        // Keep dest + prefix detection out of the way; drive DEST_STATE manually.
+        detection: quiet,
+        network: quiet,
+        protected_v4: Vec::new(),
+        protected_v6: Vec::new(),
         src_rate_pps: 10, // a source sending >=10pps is an offender
         fanout: 4,        // 4 sources in a /24 collapse to the /24
         block_ttl_ns: SECOND_NS,
