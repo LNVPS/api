@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-08
-**Last updated:** 2026-07-08 (Increment 1 complete)
+**Last updated:** 2026-07-08 (Increment 2 complete)
 
 ## Goal
 
@@ -114,30 +114,38 @@ Key notes:
       real reader (defining them now risks dead-code elimination of unused
       maps and adds untestable surface)
 
-### Increment 2 — Virtualized-network test harness (M-L)
-- [ ] Harness crate/module (`lnvps_fw_service/tests/` + `tests/harness/`):
-      builds a virtual network with netns + veth pairs:
-      `attacker` netns ⇄ veth ⇄ `filter` netns (uplink side, XDP attached in
-      `XdpFlags::SKB_MODE` — veth supports generic XDP) ⇄ veth ⇄ `vm` netns
-      simulating a guest with real listening sockets
-- [ ] Rust `NetnsTopology` helper: create/teardown netns, veth, addrs (v4+v6),
-      routes; idempotent cleanup on panic (RAII drop). Shell out to `ip`
-      (iproute2) — no extra deps
-- [ ] Harness loads the compiled ebpf object (XDP ingress + TC egress from
-      later increments) inside the filter netns and exposes typed map handles
-      to assertions
-- [ ] Traffic generators in-test: TCP connect/listen via std sockets run
-      inside a netns (`setns` via `nix` or spawn `ip netns exec`), UDP
-      send/recv, SYN flood via raw socket (needs root)
-- [ ] Assertions API: read maps (counters, open ports, dest state), check
-      packet delivery/drops from the vm-side socket's perspective
-- [ ] Tests gated behind `#[ignore]` + root check (run via
-      `sudo -E cargo test -- --ignored`); `scripts/fw-e2e.sh` wrapper that
-      builds the ebpf object first, then runs harness tests
-- [ ] Smoke tests using increment-1 functionality: prog attaches on veth,
-      per-dest counters increment, v4 SYN rate limit drops over-rate SYNs
-- [ ] Doc: docs/agents/fw-testing.md (how to run, kernel prereqs, adding
-      scenarios)
+### Increment 2 — Virtualized-network test harness (M-L) ✅ DONE
+- [x] Harness module (`lnvps_fw_service/tests/harness/`): builds a virtual
+      network with netns + veth pairs: `attacker` ⇄ veth ⇄ `filter` (uplink
+      side, XDP attached in SKB/generic mode on `f_up`) ⇄ veth ⇄ `vm` netns
+      with real listening sockets; `filter` forwards between its veth ends
+- [x] `NetnsTopology` (`tests/harness/netns.rs`): create/teardown netns, veth,
+      addrs (v4+v6), routes, forwarding sysctls; RAII Drop deletes netns
+      (tears down veths) even on panic. Shells out to `ip` only — no extra
+      deps for topology. Unique per-instance names so instances can coexist
+- [x] Harness loads the compiled ebpf object (`include_bytes_aligned!` of the
+      build.rs OUT_DIR object) inside the filter netns via a per-thread
+      `setns` switch for the XDP attach, then reads maps fd-based from the
+      main thread; typed accessors (`dest_counters_v4/v6`, `syn_bucket_v4`,
+      `set_syn_limits_v4`)
+- [x] Traffic generators (`tests/harness/traffic.rs`): UDP send/recv via std
+      sockets on threads pinned with `setns` (nix); raw-socket IPv4 SYN flood
+      (libc, IP_HDRINCL, manual IP+TCP checksums)
+- [x] Assertions read maps (per-dest counters, SYN buckets) and check packet
+      delivery from the vm-side socket's perspective
+- [x] Tests gated behind `#[ignore]` + `require_root()`; `scripts/fw-e2e.sh`
+      wrapper builds the ebpf object as the user, then runs `--ignored` as
+      root (`sudo -E`)
+- [x] Smoke tests (`tests/smoke.rs`): prog attaches on veth; per-dest counters
+      increment (UDP); UDP forwarded to a real vm listener; v4 SYN rate limit
+      drops over-rate SYNs
+- [x] Doc: docs/agents/fw-testing.md (how to run, kernel prereqs, adding
+      scenarios); registered in AGENTS.md index
+- Dev-deps added to lnvps_fw_service: `nix` (sched/setns) + `libc` (raw
+      sockets), test-only. Normal `cargo test` stays green (4 tests ignored).
+- VALIDATED: `scripts/fw-e2e.sh` run as root — all 4 smoke tests pass on the
+      real netns/veth datapath (attach, counters, UDP forward-to-vm, SYN-rate
+      drop) in ~3s on kernel 6.12.
 
 ### Increment 3 — Passive egress port learning (M-L)
 - [ ] TC egress (clsact/SchedClassifier) program in `lnvps_ebpf`: parse
