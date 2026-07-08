@@ -1,10 +1,14 @@
-# lnvps_fw — XDP/eBPF DDoS Protection for VM Hosts
+# lnvps_fw — XDP/eBPF DDoS Protection
 
-`lnvps_fw` is a self-contained DDoS mitigation system that runs on every LNVPS
-VM host. It attaches XDP + TC eBPF programs to the uplink NIC(s), passively
-learns which ports each guest IP actually serves, and — only when a destination
-comes under attack — sheds illegitimate traffic in the kernel at line rate while
-leaving legitimate traffic untouched.
+`lnvps_fw` is a self-contained DDoS mitigation system that can run on **any**
+Linux box in the traffic path — routers, VM hosts, edge/scrubbing boxes,
+wherever protection is needed. It attaches XDP + TC eBPF programs to the uplink
+NIC(s), passively learns which ports each protected IP actually serves, and —
+only when a destination comes under attack — sheds illegitimate traffic in the
+kernel at line rate while leaving legitimate traffic untouched.
+
+The protected IPs behind it can be anything the box routes or hosts: guest VMs,
+services on the host itself, or downstream hosts on a router.
 
 It is designed around a real threat model: **spoofed carpet-bomb / reflection
 floods from millions of source IPs across a whole prefix**, not just targeted
@@ -112,14 +116,14 @@ cheaper layers have not already shed the attack:
 ### How each threat is handled
 
 - **Reflection / amplification** (UDP replies from src port 53/123/11211/…): land
-  on ports the guest never opened → dropped by `PORT_FILTER`. Source-count
+  on ports the protected host never opened → dropped by `PORT_FILTER`. Source-count
   independent.
 - **Carpet bombing** (thin spread across many IPs): no single IP trips its
   threshold, but the aggregate over a protected prefix does → the whole prefix
   flips to `PORT_FILTER` in one LPM entry.
 - **Spoofed SYN flood to an open TCP port**: `SYN_PROXY` answers with a
   SYN-cookie SYN-ACK; spoofed sources can't complete the handshake, so they
-  never reach the guest; real clients complete it and are allow-listed.
+  never reach the protected host; real clients complete it and are allow-listed.
 - **Real botnet hammering open services**: bounded real sources are aggregated
   into CIDR blocks (`SOURCE_BLOCK`).
 
@@ -137,7 +141,7 @@ tail-called into `xdp_syn_proxy`, which:
    original SYN,
 3. on the client's ACK, validates `ack_seq - 1 == cookie`; a match marks the
    source **verified** (`VERIFIED_V4`). Verified sources pass straight through,
-   so the client's connection retry reaches the guest.
+   so the client's connection retry reaches the protected host.
 
 The cookie need not be cryptographic: a spoofed source never receives the
 SYN-ACK, so it can never learn the cookie. The secret is rotated by the daemon;
