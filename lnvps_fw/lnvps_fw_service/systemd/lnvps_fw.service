@@ -1,0 +1,21 @@
+[Unit]
+Description=LNVPS XDP/eBPF DDoS protection firewall
+Documentation=https://github.com/LNVPS/api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lnvps_fw_service --config /etc/lnvps_fw/config.yaml
+Restart=on-failure
+RestartSec=5
+# Loading XDP/eBPF programs and locking map memory needs full privileges;
+# run as root for broad kernel compatibility.
+User=root
+LimitMEMLOCK=infinity
+# Light hardening that does not interfere with the eBPF datapath.
+ProtectHome=true
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

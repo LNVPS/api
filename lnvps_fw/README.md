@@ -285,9 +285,14 @@ The control API (increment 7) is implemented on the fw_service side: HTTPS +
 token auth, in-memory rules pushed by `lnvps_api`, an event ring buffer, manual
 overrides, and the dashboard.
 
+Packaging: a GitHub Actions workflow (`.github/workflows/lnvps_fw-deb.yml`)
+builds a `.deb` (via `cargo-deb`) that installs the daemon binary, a systemd
+unit (`lnvps_fw.service`), and the example config; it is attached to GitHub
+releases on version tags.
+
 Not yet done: `RATE_CAPS` (per-`(dst,port)` caps for open UDP); the `lnvps_api`
 side of the contract (rules-push client, event-poll-and-persist loop, DB +
-admin UI); a Prometheus metrics endpoint; and systemd/Docker packaging.
+admin UI); and a Prometheus metrics endpoint.
 
 See [`work/ddos-protection.md`](../work/ddos-protection.md) (repo root) for the
 detailed increment log, design decisions, and verifier notes.

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ ! -f /etc/lnvps_fw/config.yaml ]; then
+        echo "lnvps_fw: no /etc/lnvps_fw/config.yaml found." >&2
+        echo "          Copy /etc/lnvps_fw/config.example.yaml to config.yaml, set your" >&2
+        echo "          interfaces (and optionally the api section), then run:" >&2
+        echo "              systemctl enable --now lnvps_fw" >&2
+    fi
+fi
+
+exit 0

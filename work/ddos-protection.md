@@ -358,7 +358,14 @@ increment only delivers the fw_service server side of that contract.
 ### Increment 8 — Metrics, packaging, hardening (M)
 - [ ] Prometheus metrics endpoint on fw_service: per-dest pass/drop, learned
       port counts, state distribution, map occupancy, event counters
-- [ ] Systemd unit + Dockerfile (host-privileged) for fw_service; docs in
+- [x] **Debian package + systemd unit** via `cargo-deb`
+      (`.github/workflows/lnvps_fw-deb.yml`, on `v*` tags + dispatch): installs
+      `/usr/bin/lnvps_fw_service`, `lnvps_fw.service`, and the example config
+      (a conffile under `/etc/lnvps_fw/`); postinst daemon-reloads + prompts to
+      configure; prerm stops/disables. Metadata in `lnvps_fw_service/Cargo.toml`
+      `[package.metadata.deb]`; unit in `systemd/`, scripts in `debian/`.
+      Validated locally: `cargo deb` builds a well-formed .deb.
+- [ ] Optional Dockerfile (host-privileged) for fw_service; docs in
       docs/agents/ for running/debugging (mirroring lnvps_host_util pattern)
 - [ ] Fail-open review: every map error path must XDP_PASS, never ABORT in
       production builds; remove `error!` log-per-packet hot paths

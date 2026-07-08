@@ -2,6 +2,30 @@
 name = "lnvps_fw_service"
 version.workspace = true
 edition.workspace = true
+license = "MIT"
+description = "LNVPS XDP/eBPF DDoS protection firewall daemon"
+
+# Debian packaging (cargo-deb): builds a .deb that installs the daemon binary,
+# a systemd unit, and the example config. See .github/workflows/lnvps_fw-deb.yml.
+[package.metadata.deb]
+name = "lnvps-fw"
+maintainer = "LNVPS <admin@lnvps.net>"
+copyright = "LNVPS"
+section = "net"
+priority = "optional"
+extended-description = """\
+XDP/eBPF DDoS protection firewall for any Linux host in the traffic path
+(routers, VM/dedicated hosts, edge/scrubbing boxes). Passively learns open
+ports per protected IP and, only under attack, sheds illegitimate traffic in
+the kernel (open-port allow-list, SYN-cookies, spoof-gated CIDR blocking).
+Managed via a token-authed HTTPS control API with an internal dashboard."""
+depends = "$auto"
+maintainer-scripts = "debian/"
+assets = [
+    ["target/release/lnvps_fw_service", "usr/bin/lnvps_fw_service", "755"],
+    ["systemd/lnvps_fw.service", "lib/systemd/system/lnvps_fw.service", "644"],
+    ["config.example.yaml", "etc/lnvps_fw/config.example.yaml", "644"],
+]
 
 [dependencies]
 lnvps_fw_common = { workspace = true, features = ["user"] }
