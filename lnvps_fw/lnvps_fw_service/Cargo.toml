@@ -1,0 +1,16 @@
+[package]
+name = "lnvps_fw_service"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lnvps_fw_common = { workspace = true, features = ["user"] }
+tokio = { version = "1.47.1", features = ["macros", "time", "rt", "signal"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+aya = "0.14.0"
+aya-log = "0.3.0"
+
+[build-dependencies]
+aya-build = "0.2.0"

@@ -12,6 +12,8 @@ members = [
     "lnvps_e2e",
     "lnvps_agent",
 ]
+# lnvps_fw is a separate workspace (eBPF build needs its own target/toolchain)
+exclude = ["lnvps_fw"]
 
 [workspace.package]
 version = "0.3.0"

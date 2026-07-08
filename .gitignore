@@ -16,3 +16,6 @@ config.local.yaml
 
 # Node tooling artifacts (not used by this Rust project)
 node_modules/
+
+# Agent tooling artifacts
+.pi-subagents/

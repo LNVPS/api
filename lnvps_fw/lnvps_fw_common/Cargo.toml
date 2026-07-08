@@ -1,0 +1,12 @@
+[package]
+name = "lnvps_fw_common"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Enable userspace support (aya Pod impls). Must stay off for the eBPF build.
+user = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.14.0", optional = true }

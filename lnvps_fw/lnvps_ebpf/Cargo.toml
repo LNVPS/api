@@ -1,0 +1,17 @@
+[package]
+name = "lnvps_ebpf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lnvps_fw_common = { workspace = true }
+aya-ebpf = { version = "0.2.1" }
+aya-log-ebpf = { version = "0.2.0" }
+network-types = "0.2.0"
+
+[build-dependencies]
+which = { version = "8.0.0", default-features = false, features = ["real-sys"] }
+
+[[bin]]
+name = "lnvps_ebpf"
+path = "src/main.rs"
