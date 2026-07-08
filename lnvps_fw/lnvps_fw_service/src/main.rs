@@ -11,7 +11,7 @@ use log::{info, warn};
 
 use lnvps_fw_common::{
     COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DestCounters, LastSeen, PortKeyV4, PortKeyV6,
-    SLOT_SYN_PROXY_V4,
+    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
 };
 
 use lnvps_fw_service::config::Config;
@@ -122,23 +122,27 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
         info!("TC egress attached to {iface}");
     }
 
-    // SYN-proxy tail-call program: load it (not attached to an interface -- it
-    // is only reached via bpf_tail_call) and register it in the jump table.
+    // SYN-proxy tail-call programs (v4 + v6): load them (not attached to an
+    // interface -- only reached via bpf_tail_call) and register in the jump
+    // table at their protocol slots.
     {
-        let syn_fd = {
+        let load = |bpf: &mut Ebpf, name: &str| -> Result<aya::programs::ProgramFd> {
             let sp: &mut Xdp = bpf
-                .program_mut("xdp_syn_proxy")
-                .context("xdp_syn_proxy program not found")?
+                .program_mut(name)
+                .with_context(|| format!("{name} program not found"))?
                 .try_into()?;
             sp.load()?;
-            sp.fd()?.try_clone()?
+            Ok(sp.fd()?.try_clone()?)
         };
+        let v4_fd = load(&mut bpf, "xdp_syn_proxy")?;
+        let v6_fd = load(&mut bpf, "xdp_syn_proxy_v6")?;
         let mut jt: ProgramArray<_> = ProgramArray::try_from(
             bpf.map_mut("SYN_PROXY_JUMP")
                 .context("jump table missing")?,
         )?;
-        jt.set(SLOT_SYN_PROXY_V4, &syn_fd, 0)?;
-        info!("SYN-proxy program loaded into jump table");
+        jt.set(SLOT_SYN_PROXY_V4, &v4_fd, 0)?;
+        jt.set(SLOT_SYN_PROXY_V6, &v6_fd, 0)?;
+        info!("SYN-proxy programs (v4+v6) loaded into jump table");
     }
     // Seed an initial SYN-cookie secret.
     rotate_cookie_secret(&mut bpf, gc::monotonic_now_ns() as u32 | 1)?;
@@ -146,12 +150,24 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
     Ok(bpf)
 }
 
-/// Expire verified sources whose verification is older than `ttl_ns`.
+/// Expire verified sources whose verification is older than `ttl_ns` (both
+/// address families).
 fn gc_verified(bpf: &mut Ebpf, ttl_ns: u64) -> Result<usize> {
+    let v4 = gc_verified_map::<[u8; 4]>(bpf, "VERIFIED_V4", ttl_ns)?;
+    let v6 = gc_verified_map::<[u8; 16]>(bpf, "VERIFIED_V6", ttl_ns)?;
+    Ok(v4 + v6)
+}
+
+fn gc_verified_map<K>(bpf: &mut Ebpf, name: &str, ttl_ns: u64) -> Result<usize>
+where
+    K: aya::Pod + Eq + std::hash::Hash,
+{
     let now = gc::monotonic_now_ns();
-    let mut map: AyaHashMap<_, [u8; 4], u64> =
-        AyaHashMap::try_from(bpf.map_mut("VERIFIED_V4").context("VERIFIED_V4 missing")?)?;
-    let expired: Vec<[u8; 4]> = map
+    let mut map: AyaHashMap<_, K, u64> = AyaHashMap::try_from(
+        bpf.map_mut(name)
+            .with_context(|| format!("{name} missing"))?,
+    )?;
+    let expired: Vec<K> = map
         .keys()
         .flatten()
         .filter(|k| match map.get(k, 0) {

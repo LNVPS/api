@@ -124,6 +124,9 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   veth.
 - `syn_proxy_spoofed_not_verified` — spoofed SYNs that never complete the
   handshake are never verified.
+- `syn_proxy_v6_verifies_real_client` — the IPv6 datapath (`xdp_syn_proxy_v6`,
+  40-byte header rewrite + pseudo-header TCP checksum): a real IPv6 client
+  completes the cookie handshake and is verified.
 
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
 mitigation`, `--test escalation`, `--test carpet_bomb`, `--test syn_proxy`,

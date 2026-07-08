@@ -29,7 +29,7 @@ use nix::sched::{CloneFlags, setns};
 
 use lnvps_fw_common::{
     DEST_MODE_PORT_FILTER, DestCounters, DestState, LastSeen, PortKeyV4, PortKeyV6,
-    SLOT_SYN_PROXY_V4,
+    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
 };
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control};
 
@@ -69,17 +69,20 @@ impl Harness {
         let mut bpf = EbpfLoader::new().load(EBPF_OBJECT)?;
 
         {
-            let syn_fd = {
+            let mut load = |name: &str| -> anyhow::Result<aya::programs::ProgramFd> {
                 let sp: &mut Xdp = bpf
-                    .program_mut("xdp_syn_proxy")
-                    .ok_or_else(|| anyhow::anyhow!("xdp_syn_proxy program not found"))?
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow::anyhow!("{name} program not found"))?
                     .try_into()?;
                 sp.load()?;
-                sp.fd()?.try_clone()?
+                Ok(sp.fd()?.try_clone()?)
             };
+            let v4_fd = load("xdp_syn_proxy")?;
+            let v6_fd = load("xdp_syn_proxy_v6")?;
             let mut jt: ProgramArray<_> =
                 ProgramArray::try_from(bpf.map_mut("SYN_PROXY_JUMP").unwrap())?;
-            jt.set(SLOT_SYN_PROXY_V4, &syn_fd, 0)?;
+            jt.set(SLOT_SYN_PROXY_V4, &v4_fd, 0)?;
+            jt.set(SLOT_SYN_PROXY_V6, &v6_fd, 0)?;
         }
 
         // XDP/TC attach resolves the interface index in the *current* thread's
@@ -271,6 +274,45 @@ impl Harness {
     pub fn is_verified_v4(&self, ip: Ipv4Addr) -> anyhow::Result<bool> {
         let map: AyaHashMap<_, [u8; 4], u64> =
             AyaHashMap::try_from(self.bpf.map("VERIFIED_V4").unwrap())?;
+        Ok(map.get(&ip.octets(), 0).is_ok())
+    }
+
+    /// Write an arbitrary protection-flag bitmask into the v6 dest-state trie.
+    pub fn set_dest_flags_v6(
+        &mut self,
+        net: Ipv6Addr,
+        prefix_len: u32,
+        flags: u32,
+    ) -> anyhow::Result<()> {
+        let mut trie: LpmTrie<_, [u8; 16], DestState> =
+            LpmTrie::try_from(self.bpf.map_mut("V6_DEST_STATE").unwrap())?;
+        let st = DestState {
+            mode: flags,
+            _pad: 0,
+            entered_at: 0,
+        };
+        trie.insert(&Key::new(prefix_len, net.octets()), st, 0)?;
+        Ok(())
+    }
+
+    /// Seed a learned-open IPv6 port directly (as passive learning would).
+    pub fn set_open_port_v6(&mut self, ip: Ipv6Addr, port: u16, proto: u8) -> anyhow::Result<()> {
+        let mut map: AyaHashMap<_, PortKeyV6, LastSeen> =
+            AyaHashMap::try_from(self.bpf.map_mut("OPEN_PORTS_V6").unwrap())?;
+        let key = PortKeyV6 {
+            addr: ip.octets(),
+            port,
+            proto,
+            _pad: 0,
+        };
+        map.insert(key, LastSeen { last_seen: 1 }, 0)?;
+        Ok(())
+    }
+
+    /// True if `ip` is in the verified IPv6 source set.
+    pub fn is_verified_v6(&self, ip: Ipv6Addr) -> anyhow::Result<bool> {
+        let map: AyaHashMap<_, [u8; 16], u64> =
+            AyaHashMap::try_from(self.bpf.map("VERIFIED_V6").unwrap())?;
         Ok(map.get(&ip.octets(), 0).is_ok())
     }
 

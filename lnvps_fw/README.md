@@ -135,15 +135,15 @@ cheaper layers have not already shed the attack:
 ## SYN-proxy / SYN-cookies
 
 Under `SYN_PROXY`, a TCP SYN to a learned-open port from an unverified source is
-tail-called into `xdp_syn_proxy`, which:
+tail-called into `xdp_syn_proxy` (IPv4) or `xdp_syn_proxy_v6` (IPv6), which:
 
-1. computes a cookie = fast keyed hash (`syn_cookie_v4`) of the 4-tuple + a
+1. computes a cookie = fast keyed hash (`syn_cookie_v4`/`_v6`) of the 4-tuple + a
    rotating secret (`COOKIE_SECRET`, current + previous slots),
 2. rewrites the SYN in place into a SYN-ACK carrying the cookie as its sequence
    number, recomputes IP/TCP checksums, and `XDP_TX`es it back — dropping the
    original SYN,
 3. on the client's ACK, validates `ack_seq - 1 == cookie`; a match marks the
-   source **verified** (`VERIFIED_V4`). Verified sources pass straight through,
+   source **verified** (`VERIFIED_V4`/`VERIFIED_V6`). Verified sources pass through,
    so the client's connection retry reaches the protected host.
 
 The cookie need not be cryptographic: a spoofed source never receives the
@@ -161,7 +161,7 @@ the previous slot keeps in-flight cookies valid across a rotation.
 | `V4/V6_DEST_STATE` | LPM trie → `DestState` | daemon | XDP (mode lookup) |
 | `OPEN_PORTS_V4/V6` | LRU hash → `LastSeen` | TC egress (learning) | XDP; daemon (TTL GC) |
 | `V4/V6_CIDR_SRC` | LPM trie | daemon (escalation) | XDP (`SOURCE_BLOCK`) |
-| `VERIFIED_V4` | LRU hash | XDP (`xdp_syn_proxy`) | XDP; daemon (TTL GC) |
+| `VERIFIED_V4/V6` | LRU hash | XDP (`xdp_syn_proxy`/`_v6`) | XDP; daemon (TTL GC) |
 | `COOKIE_SECRET` | array[2] | daemon (rotation) | XDP |
 | `SYN_PROXY_JUMP` | prog array | daemon (setup) | XDP (`tail_call`) |
 
@@ -254,7 +254,10 @@ per-prefix detection, the flag-based protection model (`PORT_FILTER`,
 `SOURCE_BLOCK`, `SYN_PROXY`), spoof-gated CIDR escalation, and the SYN-proxy
 datapath.
 
-Not yet done: `RATE_CAPS` (per-`(dst,port)` caps for open UDP), IPv6 SYN-proxy,
+The SYN-proxy covers both IPv4 and IPv6 (`xdp_syn_proxy` / `xdp_syn_proxy_v6`,
+tail-called at slots 0/1).
+
+Not yet done: `RATE_CAPS` (per-`(dst,port)` caps for open UDP),
 control-plane/API integration (host auth, prefixes/thresholds + mitigation
 events over the API), a Prometheus metrics endpoint, and systemd/Docker
 packaging.

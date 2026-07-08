@@ -8,7 +8,7 @@ use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
     PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4,
-    syn_cookie_v4,
+    SLOT_SYN_PROXY_V6, syn_cookie_v4, syn_cookie_v6,
 };
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
@@ -20,8 +20,8 @@ mod maps;
 use maps::{
     OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cidr_blocked_v4, cidr_blocked_v6, cookie_secrets,
     count_src_v4, count_src_v6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
-    learn_port_v4, learn_port_v6, mark_verified_v4, port_is_open_v4, port_is_open_v6,
-    src_verified_v4,
+    learn_port_v4, learn_port_v6, mark_verified_v4, mark_verified_v6, port_is_open_v4,
+    port_is_open_v6, src_verified_v4, src_verified_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -145,7 +145,7 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
     let mut verdict = XDP_PASS;
     let flags = dest_mode_v6(&dst);
     if flags != DEST_MODE_NORMAL {
-        verdict = mitigate_v6(&dst, &ip.src_addr, &meta, flags);
+        verdict = mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags);
     }
     account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
@@ -202,9 +202,18 @@ fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
 }
 
 #[inline(always)]
-fn mitigate_v6(dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta, flags: u32) -> u32 {
+fn mitigate_v6(ctx: &XdpContext, dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta, flags: u32) -> u32 {
     count_src_v6(src);
     if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v6(*src) {
+        return XDP_DROP;
+    }
+    if flags & DEST_MODE_SYN_PROXY != 0
+        && meta.proto == PROTO_TCP
+        && meta.has_port
+        && port_is_open_v6(*dst, meta.dst_port, PROTO_TCP)
+        && !src_verified_v6(src)
+    {
+        unsafe { SYN_PROXY_JUMP.tail_call(ctx, SLOT_SYN_PROXY_V6) };
         return XDP_DROP;
     }
     if flags & DEST_MODE_PORT_FILTER != 0 {
@@ -559,6 +568,153 @@ fn tx_synack_v4(ctx: &XdpContext, cookie: u32) -> u32 {
         + be16(ip.dst_addr[2], ip.dst_addr[3])
         + PROTO_TCP as u32
         + 20u32
+        + be16(tcp.source[0], tcp.source[1])
+        + be16(tcp.dest[0], tcp.dest[1])
+        + (cookie >> 16)
+        + (cookie & 0xffff)
+        + (ackn >> 16)
+        + (ackn & 0xffff)
+        + 0x5012u32
+        + 0xffffu32;
+    let tck = fold(tsum);
+    tcp.check[0] = (tck >> 8) as u8;
+    tcp.check[1] = tck as u8;
+    XDP_TX
+}
+
+// --- SYN-proxy tail-call program (IPv6) ---
+const TCP_OFF_V6: usize = EthHdr::LEN + Ipv6Hdr::LEN;
+
+#[xdp]
+pub fn xdp_syn_proxy_v6(ctx: XdpContext) -> u32 {
+    match try_syn_proxy_v6(&ctx) {
+        Ok(v) => v,
+        Err(()) => XDP_DROP,
+    }
+}
+
+#[inline(always)]
+fn try_syn_proxy_v6(ctx: &XdpContext) -> Result<u32, ()> {
+    let ip = ptr_at::<Ipv6Hdr>(ctx, EthHdr::LEN)?;
+    let src = ip.src_addr;
+    let dst = ip.dst_addr;
+    let tcp = ptr_at::<TcpHdr>(ctx, TCP_OFF_V6)?;
+    let syn = tcp.syn() != 0;
+    let ack = tcp.ack() != 0;
+    let sport = tcp.source;
+    let dport = tcp.dest;
+    let client_ack = u32::from_be_bytes(tcp.ack_seq);
+    let (cur, prev) = cookie_secrets();
+
+    if syn && !ack {
+        let cookie = syn_cookie_v6(cur, src, dst, sport, dport);
+        return Ok(tx_synack_v6(ctx, cookie));
+    }
+    if ack && !syn {
+        let echoed = client_ack.wrapping_sub(1);
+        let c_cur = syn_cookie_v6(cur, src, dst, sport, dport);
+        let c_prev = syn_cookie_v6(prev, src, dst, sport, dport);
+        if echoed == c_cur || echoed == c_prev {
+            mark_verified_v6(&src);
+        }
+        return Ok(XDP_DROP);
+    }
+    Ok(XDP_DROP)
+}
+
+/// IPv6 counterpart of [`tx_synack_v4`]. IPv6 has no header checksum, but the
+/// TCP checksum covers a 128-bit pseudo-header. All packet writes are byte-wise
+/// on bounds-checked typed pointers (see `tx_synack_v4` for why).
+#[inline(always)]
+fn tx_synack_v6(ctx: &XdpContext, cookie: u32) -> u32 {
+    let eth = match ptr_at_mut::<EthHdr>(ctx, 0) {
+        Ok(p) => unsafe { &mut *p },
+        Err(()) => return XDP_PASS,
+    };
+    let ip = match ptr_at_mut::<Ipv6Hdr>(ctx, EthHdr::LEN) {
+        Ok(p) => unsafe { &mut *p },
+        Err(()) => return XDP_PASS,
+    };
+    let tcp = match ptr_at_mut::<TcpHdr>(ctx, TCP_OFF_V6) {
+        Ok(p) => unsafe { &mut *p },
+        Err(()) => return XDP_PASS,
+    };
+
+    // Swap MAC addresses byte-wise (whole-array assignment lowers to memmove).
+    let mut i = 0usize;
+    while i < 6 {
+        let t = eth.dst_addr[i];
+        eth.dst_addr[i] = eth.src_addr[i];
+        eth.src_addr[i] = t;
+        i += 1;
+    }
+    // Swap the 16-byte IPv6 addresses byte-wise.
+    let mut j = 0usize;
+    while j < 16 {
+        let t = ip.src_addr[j];
+        ip.src_addr[j] = ip.dst_addr[j];
+        ip.dst_addr[j] = t;
+        j += 1;
+    }
+    ip.payload_len[0] = 0;
+    ip.payload_len[1] = 20; // TCP header only
+    ip.hop_limit = 64;
+    // next_hdr stays PROTO_TCP.
+
+    // IPv6 pseudo-header address word sum (commutes over the src/dst swap).
+    let addr_sum = be16(ip.src_addr[0], ip.src_addr[1])
+        + be16(ip.src_addr[2], ip.src_addr[3])
+        + be16(ip.src_addr[4], ip.src_addr[5])
+        + be16(ip.src_addr[6], ip.src_addr[7])
+        + be16(ip.src_addr[8], ip.src_addr[9])
+        + be16(ip.src_addr[10], ip.src_addr[11])
+        + be16(ip.src_addr[12], ip.src_addr[13])
+        + be16(ip.src_addr[14], ip.src_addr[15])
+        + be16(ip.dst_addr[0], ip.dst_addr[1])
+        + be16(ip.dst_addr[2], ip.dst_addr[3])
+        + be16(ip.dst_addr[4], ip.dst_addr[5])
+        + be16(ip.dst_addr[6], ip.dst_addr[7])
+        + be16(ip.dst_addr[8], ip.dst_addr[9])
+        + be16(ip.dst_addr[10], ip.dst_addr[11])
+        + be16(ip.dst_addr[12], ip.dst_addr[13])
+        + be16(ip.dst_addr[14], ip.dst_addr[15]);
+
+    // Swap TCP ports byte-wise.
+    {
+        let a = tcp.source[0];
+        let b = tcp.source[1];
+        tcp.source[0] = tcp.dest[0];
+        tcp.source[1] = tcp.dest[1];
+        tcp.dest[0] = a;
+        tcp.dest[1] = b;
+    }
+    let client_seq = ((tcp.seq[0] as u32) << 24)
+        | ((tcp.seq[1] as u32) << 16)
+        | ((tcp.seq[2] as u32) << 8)
+        | tcp.seq[3] as u32;
+    let ackn = client_seq.wrapping_add(1);
+    tcp.seq[0] = (cookie >> 24) as u8;
+    tcp.seq[1] = (cookie >> 16) as u8;
+    tcp.seq[2] = (cookie >> 8) as u8;
+    tcp.seq[3] = cookie as u8;
+    tcp.ack_seq[0] = (ackn >> 24) as u8;
+    tcp.ack_seq[1] = (ackn >> 16) as u8;
+    tcp.ack_seq[2] = (ackn >> 8) as u8;
+    tcp.ack_seq[3] = ackn as u8;
+    let tb = tcp as *mut TcpHdr as *mut u8;
+    unsafe {
+        *tb.add(12) = 0x50; // data offset 5 words
+        *tb.add(13) = 0x12; // SYN|ACK
+    }
+    tcp.window[0] = 0xff;
+    tcp.window[1] = 0xff;
+    tcp.urg_ptr[0] = 0;
+    tcp.urg_ptr[1] = 0;
+    tcp.check[0] = 0;
+    tcp.check[1] = 0;
+    let tsum = addr_sum
+        + PROTO_TCP as u32 // pseudo-header next-header
+        + 20u32 // pseudo-header upper-layer length
         + be16(tcp.source[0], tcp.source[1])
         + be16(tcp.dest[0], tcp.dest[1])
         + (cookie >> 16)

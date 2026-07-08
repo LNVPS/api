@@ -194,11 +194,16 @@ cidr_block_check!(cidr_blocked_v6, [u8; 16], 128, V6_CIDR_SRC);
 #[map]
 pub static VERIFIED_V4: LruHashMap<[u8; 4], u64> = LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
 
+/// Verified (non-spoofed) IPv6 sources that completed a SYN-cookie handshake.
+#[map]
+pub static VERIFIED_V6: LruHashMap<[u8; 16], u64> = LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
+
 /// Rotating SYN-cookie secret: slot 0 current, slot 1 previous.
 #[map]
 pub static COOKIE_SECRET: Array<u32> = Array::with_max_entries(2, 0);
 
-/// Tail-call jump table for the SYN-proxy sub-programs (slot 0 = IPv4).
+/// Tail-call jump table for the SYN-proxy sub-programs (slot 0 = IPv4, slot 1 =
+/// IPv6).
 #[map]
 pub static SYN_PROXY_JUMP: ProgramArray = ProgramArray::with_max_entries(4, 0);
 
@@ -227,4 +232,17 @@ pub fn src_verified_v4(src: &[u8; 4]) -> bool {
 pub fn mark_verified_v4(src: &[u8; 4]) {
     let now = unsafe { bpf_ktime_get_ns() };
     let _ = VERIFIED_V4.insert(src, &now, 0);
+}
+
+/// True if `src` has completed a SYN-cookie handshake (IPv6).
+#[inline(always)]
+pub fn src_verified_v6(src: &[u8; 16]) -> bool {
+    unsafe { VERIFIED_V6.get(src) }.is_some()
+}
+
+/// Record `src` as verified (IPv6).
+#[inline(always)]
+pub fn mark_verified_v6(src: &[u8; 16]) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let _ = VERIFIED_V6.insert(src, &now, 0);
 }

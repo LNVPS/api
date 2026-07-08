@@ -112,6 +112,36 @@ pub fn syn_cookie_v4(
     h
 }
 
+/// IPv6 SYN cookie — identical mix to [`syn_cookie_v4`] over the 128-bit
+/// address 4-tuple.
+#[inline(always)]
+pub fn syn_cookie_v6(
+    secret: u32,
+    saddr: [u8; 16],
+    daddr: [u8; 16],
+    sport: [u8; 2],
+    dport: [u8; 2],
+) -> u32 {
+    let mut h: u32 = 2_166_136_261u32 ^ secret;
+    let mut mix = |b: u8| {
+        h ^= b as u32;
+        h = h.wrapping_mul(16_777_619);
+    };
+    for b in saddr {
+        mix(b);
+    }
+    for b in daddr {
+        mix(b);
+    }
+    for b in sport {
+        mix(b);
+    }
+    for b in dport {
+        mix(b);
+    }
+    h
+}
+
 /// Config-map keys for the two-slot rotating SYN-cookie secret (current +
 /// previous, so cookies issued just before a rotation still validate).
 pub const COOKIE_SECRET_CURRENT: u32 = 0;
@@ -122,6 +152,9 @@ pub const COOKIE_SECRET_PREVIOUS: u32 = 1;
 /// blows the verifier budget) so the rewrite program is verified independently
 /// with a full XDP context.
 pub const SLOT_SYN_PROXY_V4: u32 = 0;
+
+/// PROG_ARRAY slot of the IPv6 SYN-proxy tail-call program.
+pub const SLOT_SYN_PROXY_V6: u32 = 1;
 
 /// Value stored in the learned-open-ports maps: when the port was last seen
 /// serving traffic (via passive egress observation), on the
@@ -219,6 +252,20 @@ mod tests {
         // Different source address -> different cookie.
         let e = syn_cookie_v4(0x1234, [10, 0, 0, 3], [10, 0, 1, 2], [0x30, 0x39], [0, 80]);
         assert_ne!(a, e);
+    }
+
+    #[test]
+    fn cookie_v6_is_deterministic_and_tuple_sensitive() {
+        let s = [0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let d = [0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9];
+        let a = syn_cookie_v6(0x1234, s, d, [0x30, 0x39], [0, 80]);
+        assert_eq!(a, syn_cookie_v6(0x1234, s, d, [0x30, 0x39], [0, 80]));
+        // Different source port / secret / address -> different cookie.
+        assert_ne!(a, syn_cookie_v6(0x1234, s, d, [0x30, 0x40], [0, 80]));
+        assert_ne!(a, syn_cookie_v6(0x9999, s, d, [0x30, 0x39], [0, 80]));
+        let mut s2 = s;
+        s2[15] = 3;
+        assert_ne!(a, syn_cookie_v6(0x1234, s2, d, [0x30, 0x39], [0, 80]));
     }
 
     #[test]

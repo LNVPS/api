@@ -381,7 +381,14 @@ Working implementation:
 - tests/syn_proxy.rs (root): real client completes the cookie handshake (proves
   XDP_TX + checksums + cookie; confirms XDP_TX works in SKB mode on veth) and is
   verified; spoofed SYNs never verify. Both pass.
-- v6 SYN-proxy deferred (doubles the rewrite); IPv4 only this increment.
+- IPv6 SYN-proxy DONE too: `xdp_syn_proxy_v6` at slot `SLOT_SYN_PROXY_V6=1`,
+  `syn_cookie_v6`, `VERIFIED_V6`, `mark/src_verified_v6`, `tx_synack_v6` (40-byte
+  header rewrite, 16-byte address swaps, TCP checksum over the v6 pseudo-header,
+  no IPv6 header checksum). `mitigate_v6` tail-calls it. Service loads both v4+v6
+  into the jump table and GCs both verified maps; harness loads both.
+  `tests/syn_proxy.rs::syn_proxy_v6_verifies_real_client` (root) proves it.
+  Note: constant-bound `while` loops (MAC/addr byte swaps) are fine — only
+  *data-dependent* bounds trip the verifier.
 - VALIDATED as root: 15 harness + 34 unit tests green.
 
 ### Historical: earlier blocked attempts (kept for reference)

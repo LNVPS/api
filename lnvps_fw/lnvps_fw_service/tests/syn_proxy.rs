@@ -10,7 +10,7 @@ mod harness;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use harness::netns::{ATTACKER_V4, VM_V4};
+use harness::netns::{ATTACKER_V4, ATTACKER_V6, VM_V4, VM_V6};
 use harness::traffic;
 use harness::{Harness, require_root};
 use lnvps_fw_common::{DEST_MODE_SYN_PROXY, PROTO_TCP};
@@ -70,6 +70,37 @@ fn syn_proxy_spoofed_not_verified() {
     assert!(
         !h.is_verified_v4(spoofed).unwrap(),
         "a source that never completes the handshake must not be verified"
+    );
+}
+
+/// IPv6 counterpart: a real client completes the IPv6 SYN-cookie handshake
+/// (exercising the 40-byte header rewrite + pseudo-header TCP checksum) and is
+/// then marked verified.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn syn_proxy_v6_verifies_real_client() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+    h.set_open_port_v6(VM_V6, 8080, PROTO_TCP)
+        .expect("seed open port");
+    h.set_cookie_secret(0x1234_5678).expect("set secret");
+    h.set_dest_flags_v6(VM_V6, 128, DEST_MODE_SYN_PROXY)
+        .expect("set syn-proxy flag");
+
+    let dst = SocketAddr::from((VM_V6, 8080));
+    let connected =
+        traffic::tcp_connect(&attacker_ns(&h), dst, Duration::from_secs(2)).expect("connect call");
+    assert!(
+        connected,
+        "the IPv6 SYN-cookie handshake should complete (SYN-ACK accepted)"
+    );
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.is_verified_v6(ATTACKER_V6).unwrap(),
+        "client should be verified after echoing the cookie in its ACK"
     );
 }
 
