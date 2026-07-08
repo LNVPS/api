@@ -19,9 +19,22 @@ impl Bucket {
     /// Tick bucket with rate/burst values
     #[inline(always)]
     pub fn tick(&mut self, now: u64, limits: &PacketLimits) {
-        let tokens_per_ns = 1_000_000_000 / limits.limit;
-        let elapsed = now - self.timestamp;
-        let new_tokens = (elapsed / tokens_per_ns) * limits.limit;
+        // A limit of 0 would divide by zero; treat it as "no refill".
+        if limits.limit == 0 {
+            self.timestamp = now;
+            return;
+        }
+        // Nanoseconds required to accrue a single token.
+        let ns_per_token = 1_000_000_000 / limits.limit;
+        if ns_per_token == 0 {
+            // Refill faster than 1 token/ns: just top up to burst.
+            self.tokens = limits.burst;
+            self.timestamp = now;
+            return;
+        }
+        let elapsed = now.saturating_sub(self.timestamp);
+        // Tokens accrued over the elapsed time (do NOT multiply by limit again).
+        let new_tokens = elapsed / ns_per_token;
         self.tokens = limits.burst.min(self.tokens.saturating_add(new_tokens));
         self.timestamp = now;
     }
@@ -46,11 +59,15 @@ impl Bucket {
                 Ok(false)
             }
         } else {
+            // First packet seen for this destination: seed the bucket with the
+            // configured burst (not the default) and consume one token for this
+            // packet. Fail open (pass) if the map insert fails rather than
+            // panicking into the abort handler.
             let new_bucket = Bucket {
-                tokens: DEFAULT_V4_SYN_RATE_BURST_LIMIT,
+                tokens: rate.burst.saturating_sub(1),
                 timestamp: now,
             };
-            V4_SYN_RATE.insert(&ip.dst_addr, &new_bucket, 0).unwrap();
+            let _ = V4_SYN_RATE.insert(&ip.dst_addr, &new_bucket, 0);
             Ok(true)
         }
     }

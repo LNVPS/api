@@ -310,17 +310,22 @@ impl SubscriptionHandler {
         let subscription_currency = Currency::from_str(&subscription.currency)
             .map_err(|_| anyhow::anyhow!("Invalid currency"))?;
 
-        // Convert non-VM amounts to the payment method currency if any exist
+        // Setup fees are charged once, on the first (purchase) invoice. They are
+        // denominated in the subscription currency and must be converted to the
+        // payment currency together with any non-VM line item cost. Include them
+        // even when there are no non-VM items (e.g. a VPS-only subscription),
+        // otherwise VPS setup fees are silently dropped.
+        let setup_fee_due = if subscription.is_setup { 0 } else { setup_fee };
+        let non_vm_base = non_vm_interval_cost + setup_fee_due;
+
+        // Convert non-VM amounts (+ setup fee) to the payment method currency
         let (non_vm_converted_amount, non_vm_rate, non_vm_tax, non_vm_processing_fee): (
             u64,
             f32,
             u64,
             u64,
-        ) = if non_vm_interval_cost > 0 {
-            let mut base = non_vm_interval_cost;
-            if !subscription.is_setup {
-                base += setup_fee;
-            }
+        ) = if non_vm_base > 0 {
+            let base = non_vm_base;
             let list_price = CurrencyAmount::from_u64(subscription_currency, base);
             let converted = self.pe.get_amount_and_rate(list_price, method).await?;
             let tax = self

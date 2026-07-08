@@ -165,17 +165,24 @@ impl EuVatClient {
         let (country, number) = if let Some(cc) = country_code {
             (cc.to_uppercase(), cleaned)
         } else {
-            // Extract country code from VAT number (first 2 characters)
-            if cleaned.len() < 3 {
-                bail!("VAT number too short");
-            }
-            let cc = &cleaned[..2];
-            if !cc.chars().all(|c| c.is_ascii_alphabetic()) {
+            // Extract country code from VAT number (first 2 characters).
+            // Operate on chars, not bytes: byte-slicing user-supplied input like
+            // "€12345" (where byte offset 2 is not a char boundary) would panic.
+            let mut chars = cleaned.chars();
+            let c0 = chars.next();
+            let c1 = chars.next();
+            let (c0, c1) = match (c0, c1) {
+                (Some(a), Some(b)) if chars.next().is_some() => (a, b),
+                _ => bail!("VAT number too short"),
+            };
+            if !c0.is_ascii_alphabetic() || !c1.is_ascii_alphabetic() {
                 bail!(
                     "VAT number must start with 2-letter country code or country_code must be provided"
                 );
             }
-            (cc.to_uppercase(), cleaned[2..].to_string())
+            let country = format!("{}{}", c0, c1).to_uppercase();
+            let number: String = cleaned.chars().skip(2).collect();
+            (country, number)
         };
 
         trace!("Validating VAT number: {} for country: {}", number, country);
@@ -302,5 +309,25 @@ mod tests {
         assert!(!result.valid, "Random VAT number should be invalid");
         assert_eq!(result.country_code, "DE");
         assert_eq!(result.vat_number, "123456789");
+    }
+
+    /// Regression: a VAT number starting with a multi-byte character (byte
+    /// offset 2 not on a char boundary) must return an error, not panic on
+    /// `&cleaned[..2]`. Parsing fails before any network call is made.
+    #[tokio::test]
+    async fn test_validate_vat_number_multibyte_does_not_panic() {
+        let client = EuVatClient::new();
+        let result = client.validate_vat_number("€12345", None).await;
+        assert!(
+            result.is_err(),
+            "multi-byte VAT number should error, not panic"
+        );
+    }
+
+    /// A single-character (too short) input must also error cleanly.
+    #[tokio::test]
+    async fn test_validate_vat_number_too_short() {
+        let client = EuVatClient::new();
+        assert!(client.validate_vat_number("D", None).await.is_err());
     }
 }

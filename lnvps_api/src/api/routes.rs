@@ -414,10 +414,7 @@ async fn v1_telegram_link(
 }
 
 /// Unlink the user's Telegram chat and disable Telegram notifications.
-async fn v1_telegram_unlink(
-    auth: Nip98Auth,
-    State(this): State<RouterState>,
-) -> ApiResult<()> {
+async fn v1_telegram_unlink(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
@@ -467,8 +464,7 @@ async fn v1_whatsapp_verify(
     user.whatsapp_verify_code = Some(code.clone());
     this.db.update_user(&user).await?;
 
-    let client =
-        crate::notifications::WhatsAppClient::new(wa, reqwest::Client::new());
+    let client = crate::notifications::WhatsAppClient::new(wa, reqwest::Client::new());
     if let Err(e) = client
         .send_template(number, &wa.verify_template, &wa.verify_template_lang, &code)
         .await
@@ -504,10 +500,7 @@ async fn v1_whatsapp_confirm(
 }
 
 /// Remove the user's WhatsApp number and disable WhatsApp notifications.
-async fn v1_whatsapp_unlink(
-    auth: Nip98Auth,
-    State(this): State<RouterState>,
-) -> ApiResult<()> {
+async fn v1_whatsapp_unlink(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
@@ -1009,7 +1002,9 @@ async fn v1_restart_vm(
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &this.settings.provisioner)?;
-    client.stop_vm(&vm).await?;
+    // Hard reset (restart) the VM — previously this only issued a stop, leaving
+    // the VM powered off.
+    client.reset_vm(&vm).await?;
 
     // Log VM restart
     this.history

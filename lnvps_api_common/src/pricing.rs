@@ -203,10 +203,14 @@ impl PricingEngine {
         let new_time = (cost.time_value as f64 * scale).floor() as u64;
         ensure!(new_time > 0, "Extend time is less than 1 second");
 
+        // Clamp the base to now for already-expired VMs, matching every other
+        // renewal path. Otherwise the paid time is added onto a past expiry and
+        // the VM can remain expired despite a real payment.
         let vm_expires = self
             .vm_subscription_expires(&vm)
             .await
-            .unwrap_or_else(Utc::now);
+            .unwrap_or_else(Utc::now)
+            .max(Utc::now());
         Ok(CostResult::New(NewPaymentInfo {
             amount: input.value(),
             currency: cost.currency,
@@ -243,13 +247,18 @@ impl PricingEngine {
             self.get_custom_vm_cost(&vm, method, company_id).await?
         };
 
+        // Total time this request would add (one interval's worth * intervals).
+        let requested_time = base_cost.time_value * intervals as u64;
+
         // Check for an existing pending (unpaid, non-expired) renewal payment.
-        // We match on payment_method + payment_type only — matching on time_value is
-        // unreliable because time_value is computed from vm.expires, which advances
-        // after each confirmed payment.
+        // Match on payment_method + payment_type AND the time value it covers, so
+        // that a pending 1-month invoice is NOT returned for a 12-month request
+        // (which would let the user pay the smaller invoice and get 1 month).
         let pending = self.db.list_pending_vm_subscription_payments(vm.id).await?;
         if let Some(px) = pending.into_iter().find(|p| {
-            p.payment_method == method && p.payment_type == SubscriptionPaymentType::Renewal
+            p.payment_method == method
+                && p.payment_type == SubscriptionPaymentType::Renewal
+                && p.time_value == Some(requested_time)
         }) {
             return Ok(CostResult::Existing(px));
         }
@@ -308,15 +317,51 @@ impl PricingEngine {
             })
             .count()
             .max(1); // must have at least 1
-        let disk_pricing =
-            if let Some(p) = pricing_disk.iter().find(|p| p.kind == template.disk_type) {
-                p
-            } else {
-                bail!("No disk price found")
-            };
-        // All costs are in smallest currency units (cents/millisats)
-        let disk_size_gb = template.disk_size / crate::GB;
-        let memory_gb = template.memory / crate::GB;
+        // Match disk pricing on BOTH kind and interface — pricing rows are keyed
+        // by (kind, interface), so matching on kind alone can bill the wrong rate
+        // (or a rate for an interface the user never requested).
+        let disk_pricing = if let Some(p) = pricing_disk
+            .iter()
+            .find(|p| p.kind == template.disk_type && p.interface == template.disk_interface)
+        {
+            p
+        } else {
+            bail!("No disk price found")
+        };
+
+        // Validate the requested spec against the plan's configured limits so a
+        // user cannot order out-of-range (or sub-GB, effectively free) resources.
+        if template.cpu < pricing.min_cpu || template.cpu > pricing.max_cpu {
+            bail!(
+                "CPU count {} out of range ({}-{})",
+                template.cpu,
+                pricing.min_cpu,
+                pricing.max_cpu
+            );
+        }
+        if template.memory < pricing.min_memory || template.memory > pricing.max_memory {
+            bail!(
+                "Memory {} out of range ({}-{})",
+                template.memory,
+                pricing.min_memory,
+                pricing.max_memory
+            );
+        }
+        if template.disk_size < disk_pricing.min_disk_size
+            || template.disk_size > disk_pricing.max_disk_size
+        {
+            bail!(
+                "Disk size {} out of range ({}-{})",
+                template.disk_size,
+                disk_pricing.min_disk_size,
+                disk_pricing.max_disk_size
+            );
+        }
+
+        // All costs are in smallest currency units (cents/millisats). Round GB
+        // counts UP so sub-GB fractions are billed rather than truncated to 0.
+        let disk_size_gb = template.disk_size.div_ceil(crate::GB);
+        let memory_gb = template.memory.div_ceil(crate::GB);
 
         let disk_cost = disk_size_gb * disk_pricing.cost;
         let cpu_cost = pricing.cpu_cost * template.cpu as u64;
@@ -1099,6 +1144,71 @@ mod tests {
         assert_eq!(400, price.disk_cost);
         assert_eq!(855, price.total());
 
+        Ok(())
+    }
+
+    /// Regression: sub-GB memory/disk must be billed (rounded up), not truncated
+    /// to 0. Previously `memory / GB` floored a request just under 2 GB to 1 GB
+    /// (and anything under 1 GB to free).
+    #[tokio::test]
+    async fn custom_pricing_rounds_up_partial_gb() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        // Request 1 byte over 1 GB of RAM and 1 byte over 5 GB disk.
+        {
+            let mut t = db.custom_template.lock().await;
+            let tpl = t.get_mut(&1).unwrap();
+            tpl.memory = crate::GB + 1;
+            tpl.disk_size = 5 * crate::GB + 1;
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let template = db.get_custom_vm_template(1).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        // memory rounds up to 2 GB * 50 = 100 cents
+        assert_eq!(100, price.memory_cost);
+        // disk rounds up to 6 GB * 5 = 30 cents
+        assert_eq!(30, price.disk_cost);
+        Ok(())
+    }
+
+    /// Regression: requests outside the plan's min/max limits must be rejected.
+    #[tokio::test]
+    async fn custom_pricing_rejects_out_of_range() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        {
+            let mut t = db.custom_template.lock().await;
+            // 0 CPUs is below min_cpu = 1
+            t.get_mut(&1).unwrap().cpu = 0;
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let template = db.get_custom_vm_template(1).await?;
+        let res = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        assert!(res.is_err(), "cpu=0 must be rejected (below min_cpu)");
+        Ok(())
+    }
+
+    /// Regression: disk pricing must match the requested interface, not just the
+    /// disk kind. A request for an interface with no pricing row must be rejected
+    /// rather than silently billed at another interface's rate.
+    #[tokio::test]
+    async fn custom_pricing_matches_disk_interface() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        {
+            let mut t = db.custom_template.lock().await;
+            // The only disk pricing row uses the default interface; request a
+            // different one for which no pricing exists.
+            let tpl = t.get_mut(&1).unwrap();
+            tpl.disk_interface = DiskInterface::PCIe;
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let template = db.get_custom_vm_template(1).await?;
+        let res = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        assert!(
+            res.is_err(),
+            "an interface with no pricing row must be rejected"
+        );
         Ok(())
     }
 
@@ -2175,7 +2285,21 @@ mod tests {
             },
         );
 
-        // Insert an existing unpaid renewal payment that has not yet expired
+        let db_arc: Arc<dyn LNVpsDb> = db.clone();
+        let pe = make_pe(db_arc).await;
+
+        // Determine the time_value the engine computes for a single-interval
+        // renewal, so the pending payment covers exactly the requested time.
+        let quoted_time = match pe
+            .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1)
+            .await?
+        {
+            CostResult::New(p) => p.time_value,
+            CostResult::Existing(_) => bail!("no pending payment expected yet"),
+        };
+
+        // Insert an existing unpaid renewal payment that has not yet expired and
+        // covers the same time value as the request.
         let existing = SubscriptionPayment {
             id: vec![0xabu8; 16],
             subscription_id: 1,
@@ -2190,7 +2314,7 @@ mod tests {
             external_id: None,
             is_paid: false,
             rate: MOCK_RATE,
-            time_value: Some(86400),
+            time_value: Some(quoted_time),
             metadata: None,
             tax: 0,
             processing_fee: 0,
@@ -2198,8 +2322,6 @@ mod tests {
         };
         db.insert_subscription_payment(&existing).await?;
 
-        let db_arc: Arc<dyn LNVpsDb> = db;
-        let pe = make_pe(db_arc).await;
         let result = pe
             .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1)
             .await?;
@@ -2209,6 +2331,71 @@ mod tests {
                 assert_eq!(p.id, existing.id, "should return the pre-existing payment");
             }
             CostResult::New(_) => bail!("expected Existing, got New"),
+        }
+        Ok(())
+    }
+
+    /// Regression: a pending 1-interval payment must NOT be reused for a request
+    /// covering more intervals. Otherwise a user could request 12 months, be
+    /// handed the pending 1-month invoice, and get only 1 month for the smaller
+    /// amount.
+    #[tokio::test]
+    async fn test_get_vm_cost_dedup_ignores_interval_mismatch() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.users.lock().await.insert(
+            1,
+            User {
+                id: 1,
+                pubkey: vec![],
+                ..Default::default()
+            },
+        );
+
+        let db_arc: Arc<dyn LNVpsDb> = db.clone();
+        let pe = make_pe(db_arc).await;
+
+        // Time value the engine computes for a single interval.
+        let one_interval_time = match pe
+            .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 1)
+            .await?
+        {
+            CostResult::New(p) => p.time_value,
+            CostResult::Existing(_) => bail!("no pending payment expected yet"),
+        };
+
+        // Insert a pending payment covering only ONE interval.
+        let existing = SubscriptionPayment {
+            id: vec![0xabu8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::minutes(10),
+            amount: 9999,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "lnbc_test".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: MOCK_RATE,
+            time_value: Some(one_interval_time),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+        };
+        db.insert_subscription_payment(&existing).await?;
+
+        // Requesting 12 intervals must NOT reuse the 1-interval pending payment.
+        let result = pe
+            .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, 12)
+            .await?;
+        match result {
+            CostResult::New(_) => {}
+            CostResult::Existing(_) => {
+                bail!("12-interval request must not reuse a 1-interval pending payment")
+            }
         }
         Ok(())
     }

@@ -903,6 +903,33 @@ mod tests {
         let start = json_ok(resp).await;
         eprintln!("Start job: {}", start["data"]["job_id"]);
 
+        // -- RESTART (user endpoint) --
+        // Regression: v1_restart_vm previously only issued a stop, leaving the VM
+        // powered off. It must now hard-reset the VM. The dummy host sets the VM
+        // Running on reset and Stopped on stop, so after a restart the VM must not
+        // be reported as stopped.
+        let resp = user
+            .patch_auth(
+                &format!("/api/v1/vm/{vm_id}/restart"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "user restart endpoint should succeed"
+        );
+        let vm_status = json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
+        let state = vm_status["data"]["status"]["state"].as_str();
+        assert_ne!(
+            state,
+            Some("stopped"),
+            "VM must not be stopped after a restart, got state={:?}",
+            state
+        );
+        eprintln!("Restart left VM {vm_id} in state {:?}", state);
+
         // -- DISABLE --
         let resp = admin
             .patch_auth(

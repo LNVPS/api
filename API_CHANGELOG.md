@@ -192,6 +192,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **2026-07-07** - Codebase audit: correctness and safety fixes
+  - **Payments:** subscription payment settlement is now idempotent — duplicate webhook deliveries or replayed Lightning settle events no longer extend a subscription's expiry more than once (`subscription_payment_paid` now guards on `is_paid` and skips the extension when the payment was already paid). Revolut order metadata is now persisted on settlement.
+  - **Custom VM orders:** requested CPU/memory/disk are now validated against the pricing plan's configured min/max limits, disk pricing is matched on both disk kind *and* interface, and sub-GB memory/disk is billed (rounded up) instead of truncating to zero. Previously a custom order could be under-billed or effectively free.
+  - **VM lifecycle:** `PATCH /api/v1/vm/{id}/restart` now actually restarts the VM (it previously only issued a stop, leaving the VM powered off). VM deletion no longer frees the DB record and IP assignments when the hypervisor is merely unreachable — only a definitive 404 is treated as "already gone"; transient errors abort the delete. Proxmox HTTP errors are now classified fatal/transient by status code instead of blanket-retrying 4xx.
+  - **Renewals & pricing:** a pending renewal invoice is no longer reused for a request covering a different number of intervals (which let a multi-interval request be paid off with a smaller single-interval invoice); VPS-only subscription setup fees are now charged on the first invoice; and extending an already-expired VM now clamps the new expiry to "now" consistently with every other renewal path.
+  - **Robustness:** fixed remote-triggerable panics in NIP-98 auth (malformed single-element tags) and VAT-number parsing (multi-byte input), and a panic in VM status when an IP range fails to load.
+  - **Admin/DB:** creating or updating available IP space now persists `company_id` (the insert previously failed on the NOT-NULL column); non-VM subscription payments are correctly attributed to their company in admin payment views and revenue reports; `admin_update_company` now persists `base_currency`; and per-region capacity stats no longer under-count hosts that share the same CPU/memory values.
+  - **Support agent, health checks & host tooling:** the support agent no longer crashes on non-ASCII messages or empty LLM responses, uses UID-based IMAP operations (no duplicate replies), and URL-encodes email lookups; health-check metrics handle IPv6 DNS servers and IPv6 bind addresses; and host CPU-feature detection uses a safe CPUID intrinsic with a max-leaf guard.
+  - **XDP firewall:** corrected the SYN rate-limiter token-bucket refill math (previously refilled far too fast, defeating the limit), stopped counting SYN-ACK replies, and guarded against a zero-limit division.
+
 - **2026-06-25** - Admin VM `template_id` is now `null` for custom-template VMs
   - `AdminVmInfo.template_id` (returned by `GET /api/admin/v1/vms` and `GET /api/admin/v1/vms/{id}`) changed from `u64` to a nullable integer. VMs on a custom template previously reported `template_id: 0`; they now correctly report `template_id: null` (with the linked template carried by `custom_template_id`). Standard-template VMs are unaffected.
 

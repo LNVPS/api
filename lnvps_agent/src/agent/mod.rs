@@ -21,6 +21,12 @@ use crate::settings::Settings;
 
 pub use executor::{LnvpsToolExecutor, PublicToolExecutor, ToolExecutor};
 
+/// Truncate a string to at most `max` characters for logging, without panicking
+/// on multi-byte UTF-8 boundaries (byte-index slicing would panic).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// Number of stored chat messages that triggers a compaction pass.
 const COMPACTION_THRESHOLD: usize = 30;
 
@@ -190,7 +196,10 @@ impl SupportAgent {
                 .build()?;
 
             let response = client.chat().create(request).await?;
-            let choice = &response.choices[0];
+            let choice = response
+                .choices
+                .first()
+                .ok_or_else(|| anyhow!("LLM returned no choices"))?;
 
             if let Some(ref tool_calls) = choice.message.tool_calls
                 && !tool_calls.is_empty()
@@ -219,7 +228,7 @@ impl SupportAgent {
                         Ok(content) => content,
                         Err(e) => format!("Error: {}", e),
                     };
-                    log::info!("Tool {} result: {}", name, &result[..result.len().min(200)]);
+                    log::info!("Tool {} result: {}", name, truncate_chars(&result, 200));
 
                     request_messages.push(
                         ChatCompletionRequestToolMessageArgs::default()
@@ -314,7 +323,10 @@ impl SupportAgent {
             .build()?;
 
         let response = client.chat().create(request).await?;
-        let summary = response.choices[0]
+        let summary = response
+            .choices
+            .first()
+            .ok_or_else(|| anyhow!("LLM returned no choices"))?
             .message
             .content
             .clone()
@@ -428,7 +440,7 @@ impl SupportAgent {
             log::info!(
                 "Processing request from {}: {}",
                 req.sender.conversation_key(),
-                &req.message[..req.message.len().min(100)]
+                truncate_chars(&req.message, 100)
             );
 
             let reply_ctx = req.channel_context.clone();
@@ -443,7 +455,7 @@ impl SupportAgent {
                 }
             };
 
-            log::info!("Response: {}", &response[..response.len().min(200)]);
+            log::info!("Response: {}", truncate_chars(&response, 200));
 
             if let Err(e) = channel
                 .send_reply(SupportReply {
@@ -463,6 +475,22 @@ impl SupportAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: truncating for logging must not panic on multi-byte UTF-8
+    /// input (byte-index slicing previously panicked mid-character).
+    #[test]
+    fn truncate_chars_handles_multibyte() {
+        // 100th byte lands inside a multi-byte char in the original bug.
+        let s = "é".repeat(200);
+        let out = truncate_chars(&s, 100);
+        assert_eq!(out.chars().count(), 100);
+        // Emoji (4-byte) input must also be safe.
+        let emoji = "🚀".repeat(50);
+        let out = truncate_chars(&emoji, 10);
+        assert_eq!(out.chars().count(), 10);
+        // Shorter-than-limit input is returned whole.
+        assert_eq!(truncate_chars("hi", 100), "hi");
+    }
 
     #[test]
     fn to_request_message_maps_roles() {

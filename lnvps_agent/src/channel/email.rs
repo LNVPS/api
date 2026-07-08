@@ -291,12 +291,16 @@ async fn fetch_and_process(
 
     let t = Duration::from_secs(15);
 
-    let unseen: Vec<String> = timeout(t, session.search("UNSEEN"))
+    // Use UID-based search/fetch/store throughout. Mixing sequence numbers
+    // (from `search`/`fetch`/`store`) with UIDs flags the wrong messages
+    // whenever UID != seq (any mailbox that has had messages expunged), causing
+    // processed mail to stay UNSEEN and be re-processed after every reconnect.
+    let unseen: Vec<String> = timeout(t, session.uid_search("UNSEEN"))
         .await
         .context("IMAP search timed out")?
         .context("IMAP search failed")?
         .into_iter()
-        .map(|seq: async_imap::types::Seq| seq.to_string())
+        .map(|uid: async_imap::types::Uid| uid.to_string())
         .collect();
 
     if unseen.is_empty() {
@@ -305,7 +309,7 @@ async fn fetch_and_process(
 
     log::info!("Found {} unseen messages", unseen.len());
     let fetch_range = unseen.join(",");
-    let fetch_stream = timeout(t, session.fetch(&fetch_range, "(FLAGS UID RFC822)"))
+    let fetch_stream = timeout(t, session.uid_fetch(&fetch_range, "(FLAGS UID RFC822)"))
         .await
         .context("IMAP fetch timed out")?
         .context("IMAP fetch failed")?;
@@ -340,7 +344,7 @@ async fn fetch_and_process(
 
         let Some(ref from_email) = from_email else {
             log::warn!("Message UID {} has no From address, skipping", uid);
-            session.store(uid_str, "+FLAGS (\\Seen)").await.ok();
+            session.uid_store(uid_str, "+FLAGS (\\Seen)").await.ok();
             continue;
         };
 
@@ -384,7 +388,7 @@ async fn fetch_and_process(
             return Ok(());
         }
 
-        session.store(uid_str, "+FLAGS (\\Seen)").await.ok();
+        session.uid_store(uid_str, "+FLAGS (\\Seen)").await.ok();
     }
 
     Ok(())

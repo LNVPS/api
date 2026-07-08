@@ -1951,11 +1951,19 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()> {
-        // Mark payment as paid with timestamp
+        // Mark payment as paid with timestamp. Idempotent: if the payment is already
+        // paid (or unknown), do nothing and skip the expiry extension below.
         let mut payments = self.subscription_payments.lock().await;
-        if let Some(p) = payments.iter_mut().find(|p| p.id == payment.id) {
-            p.is_paid = true;
-            p.paid_at = Some(Utc::now());
+        match payments.iter_mut().find(|p| p.id == payment.id) {
+            Some(p) if !p.is_paid => {
+                p.is_paid = true;
+                p.paid_at = Some(Utc::now());
+                p.external_data = payment.external_data.clone();
+            }
+            _ => {
+                drop(payments);
+                return Ok(());
+            }
         }
         drop(payments);
 
@@ -3571,6 +3579,70 @@ mod tests {
             (diff - 86400).abs() < 5,
             "Second payment should add ~86400s from first expiry, but diff was {}s",
             diff
+        );
+    }
+
+    /// Regression: vm_to_status must return an error (not panic) when a VM's IP
+    /// assignment references an IP range that cannot be loaded. Previously the
+    /// failed range lookup was silently dropped and then `.expect()` panicked.
+    #[tokio::test]
+    async fn test_vm_to_status_missing_ip_range_errors_not_panics() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{LNVpsDb, UserSshKey, VmIpAssignment};
+
+        let db = MockDb::default();
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // IP assignment pointing at a non-existent range id.
+        db.ip_assignments.lock().await.insert(
+            1,
+            VmIpAssignment {
+                id: 1,
+                vm_id: 1,
+                ip_range_id: 999,
+                ip: "10.0.0.5".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
+        let vm = db.get_vm(1).await.unwrap();
+        let res = vm_to_status(&db, vm, None).await;
+        assert!(res.is_err(), "expected error, not a panic");
+    }
+
+    /// Regression: paying the SAME payment twice (e.g. duplicate webhook / replayed
+    /// settle event) must extend the subscription only once. Before the idempotency
+    /// guard, the second call double-credited the subscription with free time.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_is_idempotent() {
+        let db = MockDb::default();
+        let payment = make_payment(1, Some(86400));
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        db.subscription_payment_paid(&payment).await.unwrap();
+        let expires_after_first = {
+            let subs = db.subscriptions.lock().await;
+            subs.get(&1).unwrap().expires.unwrap()
+        };
+
+        // Re-deliver the exact same (already paid) payment.
+        db.subscription_payment_paid(&payment).await.unwrap();
+        let expires_after_second = {
+            let subs = db.subscriptions.lock().await;
+            subs.get(&1).unwrap().expires.unwrap()
+        };
+
+        assert_eq!(
+            expires_after_first, expires_after_second,
+            "duplicate payment settlement must not extend the subscription again"
         );
     }
 

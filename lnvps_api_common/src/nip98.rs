@@ -30,10 +30,11 @@ impl Nip98Auth {
         // check url tag
         if let Some(url) = self.event.tags.iter().find_map(|t| {
             let vec = t.as_slice();
-            if vec[0] == "u" {
-                Some(vec[1].clone())
-            } else {
-                None
+            // Use get() to avoid panicking on a malformed single-element tag
+            // like ["u"] supplied in an attacker-controlled auth event.
+            match (vec.first(), vec.get(1)) {
+                (Some(k), Some(v)) if k == "u" => Some(v.clone()),
+                _ => None,
             }
         }) {
             // Simple path comparison - extract path from URL
@@ -51,10 +52,9 @@ impl Nip98Auth {
         // check method tag
         if let Some(t_method) = self.event.tags.iter().find_map(|t| {
             let vec = t.as_slice();
-            if vec[0] == "method" {
-                Some(vec[1].clone())
-            } else {
-                None
+            match (vec.first(), vec.get(1)) {
+                (Some(k), Some(v)) if k == "method" => Some(v.clone()),
+                _ => None,
             }
         }) {
             if method != t_method {
@@ -82,6 +82,58 @@ impl Nip98Auth {
         } else {
             bail!("Invalid auth string");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Tag};
+
+    fn signed_event(tags: Vec<Tag>) -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .custom_created_at(Timestamp::now())
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    /// Regression: a validly-signed auth event containing a malformed
+    /// single-element `["u"]` tag must NOT panic (previously `vec[1]` indexed
+    /// out of bounds). It should be treated as a missing url tag.
+    #[test]
+    fn malformed_single_element_u_tag_does_not_panic() {
+        let event = signed_event(vec![
+            Tag::parse(["u"]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+        ]);
+        let auth = Nip98Auth { event };
+        let res = auth.check("/api/v1/account", "GET");
+        assert!(res.is_err(), "expected error, not a panic");
+    }
+
+    /// Same for a malformed single-element `["method"]` tag.
+    #[test]
+    fn malformed_single_element_method_tag_does_not_panic() {
+        let event = signed_event(vec![
+            Tag::parse(["u", "https://example.com/api/v1/account"]).unwrap(),
+            Tag::parse(["method"]).unwrap(),
+        ]);
+        let auth = Nip98Auth { event };
+        let res = auth.check("/api/v1/account", "GET");
+        assert!(res.is_err(), "expected error, not a panic");
+    }
+
+    /// A well-formed auth event still validates successfully.
+    #[test]
+    fn well_formed_tags_pass() {
+        let event = signed_event(vec![
+            Tag::parse(["u", "https://example.com/api/v1/account"]).unwrap(),
+            Tag::parse(["method", "GET"]).unwrap(),
+        ]);
+        let auth = Nip98Auth { event };
+        assert!(auth.check("/api/v1/account", "GET").is_ok());
     }
 }
 
