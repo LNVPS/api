@@ -7,9 +7,13 @@ use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
-    PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4,
-    SLOT_SYN_PROXY_V6, syn_cookie_v4, syn_cookie_v6,
+    PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
+    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6, syn_cookie_v4, syn_cookie_v6,
 };
+
+/// GRE inner protocol type for IPv4 / IPv6 payloads (ethertypes).
+const ETH_P_IP: u16 = 0x0800;
+const ETH_P_IPV6: u16 = 0x86DD;
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
 use network_types::tcp::TcpHdr;
@@ -80,10 +84,44 @@ pub fn xdp_lnvps(ctx: XdpContext) -> u32 {
 fn try_handle(ctx: &XdpContext) -> Result<u32, ()> {
     let eth_hdr = ptr_at::<EthHdr>(ctx, 0)?;
     match eth_hdr.ether_type() {
-        Ok(EtherType::Ipv4) => handle_ipv4(ctx),
-        Ok(EtherType::Ipv6) => handle_ipv6(ctx),
+        Ok(EtherType::Ipv4) => handle_outer_ipv4(ctx),
+        Ok(EtherType::Ipv6) => handle_ipv6(ctx, EthHdr::LEN, true),
         _ => Ok(XDP_PASS),
     }
+}
+
+/// Outer IPv4 dispatch: if this is a GRE tunnel packet (proto 47) carrying an
+/// inner IP datagram, decapsulate and filter on the *inner* header (this is how
+/// a router protects VMs reached over BGP-in-GRE underlays, and sheds the flood
+/// before the kernel spends CPU decapsulating + routing it). Otherwise filter
+/// the packet directly. SYN-proxy is disabled on the decapsulated path (its
+/// tail-call program re-parses from fixed L2 offsets and cannot re-encapsulate
+/// a reply).
+#[inline(always)]
+fn handle_outer_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
+    let ip = ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
+    if ip.proto == PROTO_GRE && ip.ihl() as usize == Ipv4Hdr::LEN && ip.frag_offset() == 0 {
+        let gre_off = EthHdr::LEN + Ipv4Hdr::LEN;
+        let gre = ptr_at::<[u8; 4]>(ctx, gre_off)?;
+        let flags0 = gre[0];
+        let version = gre[1] & 0x07;
+        // Standard GRE (version 0), no deprecated Routing-Present field (whose
+        // variable SRE list we do not parse). C/K/S each add a 4-byte field.
+        if version == 0 && (flags0 & 0x40) == 0 {
+            let c = (flags0 & 0x80) != 0;
+            let k = (flags0 & 0x20) != 0;
+            let s = (flags0 & 0x10) != 0;
+            let gre_len = 4 + if c { 4 } else { 0 } + if k { 4 } else { 0 } + if s { 4 } else { 0 };
+            let ptype = ((gre[2] as u16) << 8) | gre[3] as u16;
+            let inner_off = gre_off + gre_len;
+            match ptype {
+                ETH_P_IP => return handle_ipv4(ctx, inner_off, false),
+                ETH_P_IPV6 => return handle_ipv6(ctx, inner_off, false),
+                _ => {}
+            }
+        }
+    }
+    handle_ipv4(ctx, EthHdr::LEN, true)
 }
 
 /// Parse the TCP/UDP destination port and SYN flag into `meta`, if the packet
@@ -103,9 +141,13 @@ fn fill_l4(ctx: &XdpContext, meta: &mut L4Meta, l4_off: usize) -> Result<(), ()>
     Ok(())
 }
 
+/// Filter an IPv4 datagram whose header starts at `ip_off` (0-based from the
+/// packet start). `ip_off` is `EthHdr::LEN` for a normal L2 frame, or the
+/// post-GRE offset for a decapsulated tunnel packet. `allow_syn_proxy` is false
+/// on the decapsulated path.
 #[inline(always)]
-fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
-    let ip = ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
+fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result<u32, ()> {
+    let ip = ptr_at::<Ipv4Hdr>(ctx, ip_off)?;
     let dst = ip.dst_addr;
 
     // Non-first fragments carry no L4 header; options-bearing headers would
@@ -114,7 +156,7 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
     let is_fragment = ip.frag_offset() != 0;
     let mut meta = L4Meta::new(ip.proto, is_fragment);
     if !is_fragment && ip.ihl() as usize == Ipv4Hdr::LEN {
-        fill_l4(ctx, &mut meta, EthHdr::LEN + Ipv4Hdr::LEN)?;
+        fill_l4(ctx, &mut meta, ip_off + Ipv4Hdr::LEN)?;
     }
 
     // Steady state is pass-all (just count + learn). Enforcement happens only
@@ -124,28 +166,28 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
     let mut verdict = XDP_PASS;
     let flags = dest_mode_v4(&dst);
     if flags != DEST_MODE_NORMAL {
-        verdict = mitigate_v4(ctx, &dst, &src, &meta, flags);
+        verdict = mitigate_v4(ctx, &dst, &src, &meta, flags, allow_syn_proxy);
     }
     account(ctx, counters, &meta, PROTO_ICMP, verdict);
     Ok(verdict)
 }
 
 #[inline(always)]
-fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
-    let ip = ptr_at::<Ipv6Hdr>(ctx, EthHdr::LEN)?;
+fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result<u32, ()> {
+    let ip = ptr_at::<Ipv6Hdr>(ctx, ip_off)?;
     let dst = ip.dst_addr;
 
     // NOTE: no extension-header walking; packets whose first next-header is
     // not directly TCP/UDP/ICMPv6 are counted but not L4-inspected (and are
     // dropped under mitigation as "not a learned service").
     let mut meta = L4Meta::new(ip.next_hdr, false);
-    fill_l4(ctx, &mut meta, EthHdr::LEN + Ipv6Hdr::LEN)?;
+    fill_l4(ctx, &mut meta, ip_off + Ipv6Hdr::LEN)?;
 
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
     let flags = dest_mode_v6(&dst);
     if flags != DEST_MODE_NORMAL {
-        verdict = mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags);
+        verdict = mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags, allow_syn_proxy);
     }
     account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
@@ -162,12 +204,20 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
 /// - PORT_FILTER: drop non-first fragments and traffic to non-learned ports
 ///   (ICMP passes); this sheds the bulk of reflection/carpet-bomb floods.
 #[inline(always)]
-fn mitigate_v4(ctx: &XdpContext, dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta, flags: u32) -> u32 {
+fn mitigate_v4(
+    ctx: &XdpContext,
+    dst: &[u8; 4],
+    src: &[u8; 4],
+    meta: &L4Meta,
+    flags: u32,
+    allow_syn_proxy: bool,
+) -> u32 {
     count_src_v4(src);
     if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v4(*src) {
         return XDP_DROP;
     }
-    if flags & DEST_MODE_SYN_PROXY != 0
+    if allow_syn_proxy
+        && flags & DEST_MODE_SYN_PROXY != 0
         && meta.proto == PROTO_TCP
         && meta.has_port
         && port_is_open_v4(*dst, meta.dst_port, PROTO_TCP)
@@ -202,12 +252,20 @@ fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
 }
 
 #[inline(always)]
-fn mitigate_v6(ctx: &XdpContext, dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta, flags: u32) -> u32 {
+fn mitigate_v6(
+    ctx: &XdpContext,
+    dst: &[u8; 16],
+    src: &[u8; 16],
+    meta: &L4Meta,
+    flags: u32,
+    allow_syn_proxy: bool,
+) -> u32 {
     count_src_v6(src);
     if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v6(*src) {
         return XDP_DROP;
     }
-    if flags & DEST_MODE_SYN_PROXY != 0
+    if allow_syn_proxy
+        && flags & DEST_MODE_SYN_PROXY != 0
         && meta.proto == PROTO_TCP
         && meta.has_port
         && port_is_open_v6(*dst, meta.dst_port, PROTO_TCP)

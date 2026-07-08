@@ -78,6 +78,10 @@ single-IP attacks.
 
 - XDP is ingress-only, so open-port **learning** uses a TC egress (clsact)
   program on the same uplink; both share pinned BPF maps loaded from one object.
+- On a **forwarding router**, roles split across NICs (see below): the XDP
+  filter attaches to the internet-facing NIC(s) and is **GRE-decap-aware** (it
+  filters on the inner header of BGP-over-GRE traffic), while learning runs on
+  the VM-facing NIC's ingress.
 - `xdp_syn_proxy` is a separate XDP program reached via `bpf_tail_call` (a
   `PROG_ARRAY`), so its packet-rewrite complexity is verified independently of
   the main program.
@@ -246,6 +250,37 @@ The pure userspace logic (detection state machine, CIDR aggregation, config,
 GC, SYN-cookie) is covered by ordinary `cargo test` unit tests.
 
 ---
+
+## Deployment: host vs router
+
+Each interface has a **role** (config `interfaces:`):
+
+- **host** (default; a bare interface name) — one NIC that carries the protected
+  IPs directly. XDP filter (ingress) + TC-egress port learning on that NIC.
+- **filter** — a forwarding router's internet-facing NIC(s). XDP ingress filter,
+  **GRE-decap-aware**: attack traffic to protected IPs is dropped even when it
+  arrives inside a BGP-over-GRE tunnel. Attach to the **underlay** NIC to shed
+  the flood *before* the kernel spends CPU decapsulating + routing it (protects
+  the router itself, not just the VMs).
+- **learn** — the router's VM-facing NIC. TC-ingress port learning (VM replies
+  enter here as plain L2). No filtering.
+
+```yaml
+# host (single NIC)
+interfaces: [eno2]
+
+# router (BGP-over-GRE underlays + VM NIC)
+interfaces:
+  - { name: ens19, role: filter }   # underlay: GRE-decap + filter
+  - { name: ens20, role: filter }
+  - { name: interix, role: filter } # direct L2 peering
+  - { name: ens21, role: learn }    # VM network: learn open ports
+```
+
+GRE decap parses the outer IP + GRE header (variable length via the C/K/S flag
+bits) and runs the normal per-dest/per-prefix logic on the inner IP. SYN-proxy
+is disabled on the decapsulated path (it can't re-encapsulate a reply); the
+port-filter, source-block, and rate/prefix mitigations all still apply.
 
 ## Control API & dashboard
 

@@ -314,6 +314,104 @@ fn build_udp_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> [u8; 28
 }
 
 /// Build a 40-byte IPv4 + TCP SYN packet.
+/// Send `count` GRE-encapsulated (proto 47) TCP SYNs: outer IP
+/// `outer_src`->`outer_dst`, GRE (IPv4 payload), inner IP `inner_src`->
+/// `inner_dst:inner_dport`. Models attack traffic arriving on a router underlay
+/// inside a BGP-over-GRE tunnel. Returns the number the kernel accepted.
+#[allow(clippy::too_many_arguments)]
+pub fn gre_flood_v4(
+    ns_path: &str,
+    outer_src: Ipv4Addr,
+    outer_dst: Ipv4Addr,
+    inner_src: Ipv4Addr,
+    inner_dst: Ipv4Addr,
+    inner_dport: u16,
+    count: u32,
+) -> io::Result<u32> {
+    in_netns(ns_path, move || {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(fd);
+        let one: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.0,
+                libc::IPPROTO_IP,
+                libc::IP_HDRINCL,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from_ne_bytes(outer_dst.octets());
+
+        let mut sent = 0u32;
+        for i in 0..count {
+            let sport = 1024u16.wrapping_add((i % 60000) as u16);
+            let pkt = build_gre_v4(
+                outer_src,
+                outer_dst,
+                inner_src,
+                inner_dst,
+                sport,
+                inner_dport,
+                0x2000_0000u32.wrapping_add(i),
+            );
+            let n = unsafe {
+                libc::sendto(
+                    fd.0,
+                    pkt.as_ptr() as *const libc::c_void,
+                    pkt.len(),
+                    0,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if n >= 0 {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    })?
+}
+
+/// Build an outer-IP + GRE + inner-IP/TCP-SYN packet (64 bytes).
+#[allow(clippy::too_many_arguments)]
+fn build_gre_v4(
+    outer_src: Ipv4Addr,
+    outer_dst: Ipv4Addr,
+    inner_src: Ipv4Addr,
+    inner_dst: Ipv4Addr,
+    inner_sport: u16,
+    inner_dport: u16,
+    seq: u32,
+) -> [u8; 64] {
+    let mut p = [0u8; 64];
+    // Outer IPv4 header (proto 47 = GRE).
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&64u16.to_be_bytes()); // total length
+    p[4..6].copy_from_slice(&((seq & 0xffff) as u16).to_be_bytes());
+    p[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    p[8] = 64; // ttl
+    p[9] = 47; // GRE
+    p[12..16].copy_from_slice(&outer_src.octets());
+    p[16..20].copy_from_slice(&outer_dst.octets());
+    let ip_csum = checksum(&p[0..20]);
+    p[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    // GRE header: no flags, version 0, protocol type = IPv4 (0x0800).
+    p[22..24].copy_from_slice(&0x0800u16.to_be_bytes());
+    // Inner IPv4 + TCP SYN.
+    let inner = build_syn_v4(inner_src, inner_dst, inner_sport, inner_dport, seq);
+    p[24..64].copy_from_slice(&inner);
+    p
+}
+
 fn build_syn_v4(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, seq: u32) -> [u8; 40] {
     let mut p = [0u8; 40];
     // --- IPv4 header (20 bytes) ---

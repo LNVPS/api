@@ -128,9 +128,15 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   40-byte header rewrite + pseudo-header TCP checksum): a real IPv6 client
   completes the cookie handshake and is verified.
 
+`tests/gre_decap.rs` (router underlay GRE decapsulation):
+- `gre_inner_closed_port_dropped` / `gre_inner_open_port_passed` — raw
+  GRE-encapsulated SYNs (outer IP proto 47 → GRE → inner IP) to a mitigating VM
+  are decapsulated in-XDP and filtered on the *inner* header (closed port
+  dropped, open port passed), verified via the per-dest counters.
+
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
 mitigation`, `--test escalation`, `--test carpet_bomb`, `--test syn_proxy`,
-`--test smoke`).
+`--test gre_decap`, `--test smoke`).
 
 ## Service configuration
 

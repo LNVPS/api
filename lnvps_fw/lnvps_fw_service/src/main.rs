@@ -17,7 +17,7 @@ use lnvps_fw_common::{
 };
 
 use lnvps_fw_service::api::{self, CidrKey, Mitigation, RuleSet, SharedState, parse_cidr};
-use lnvps_fw_service::config::Config;
+use lnvps_fw_service::config::{Config, IfaceRole};
 use lnvps_fw_service::detect::DestTracker;
 use lnvps_fw_service::gc;
 use lnvps_fw_service::publish::{MitInput, MitTracker};
@@ -94,37 +94,52 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
         "/lnvps_ebpf"
     )))?;
 
-    // XDP ingress protection.
-    let xdp: &mut Xdp = bpf
-        .program_mut("xdp_lnvps")
-        .context("xdp_lnvps program not found")?
-        .try_into()?;
-    xdp.load()?;
-    for iface in &cfg.interfaces {
-        match xdp.attach(iface, XdpMode::default()) {
-            Ok(_) => info!("XDP attached to {iface} (default mode)"),
-            Err(e) => {
-                warn!("XDP default attach failed on {iface} ({e}), trying SKB mode");
-                xdp.attach(iface, XdpMode::Skb)
-                    .with_context(|| format!("failed to attach XDP to {iface}"))?;
-                info!("XDP attached to {iface} (skb mode)");
+    // XDP ingress protection -- attached to host + filter roles. The program is
+    // GRE-decap-aware, so a `filter` interface on a router underlay drops
+    // attack traffic inside GRE tunnels too.
+    {
+        let xdp: &mut Xdp = bpf
+            .program_mut("xdp_lnvps")
+            .context("xdp_lnvps program not found")?
+            .try_into()?;
+        xdp.load()?;
+        for spec in &cfg.interfaces {
+            if matches!(spec.role(), IfaceRole::Host | IfaceRole::Filter) {
+                let iface = spec.name();
+                match xdp.attach(iface, XdpMode::default()) {
+                    Ok(_) => info!("XDP attached to {iface} ({:?}, default mode)", spec.role()),
+                    Err(e) => {
+                        warn!("XDP default attach failed on {iface} ({e}), trying SKB mode");
+                        xdp.attach(iface, XdpMode::Skb)
+                            .with_context(|| format!("failed to attach XDP to {iface}"))?;
+                        info!("XDP attached to {iface} ({:?}, skb mode)", spec.role());
+                    }
+                }
             }
         }
     }
 
-    // TC egress port learning.
-    let tc: &mut SchedClassifier = bpf
-        .program_mut("tc_lnvps_egress")
-        .context("tc_lnvps_egress program not found")?
-        .try_into()?;
-    tc.load()?;
-    for iface in &cfg.interfaces {
-        // On kernels < 6.6 the clsact qdisc must exist before attaching; on
-        // 6.6+ TCX is used and this is unnecessary. Best-effort either way.
-        let _ = qdisc_add_clsact(iface);
-        tc.attach(iface, TcAttachType::Egress)
-            .with_context(|| format!("failed to attach TC egress to {iface}"))?;
-        info!("TC egress attached to {iface}");
+    // TC port learning -- egress for host role (single NIC), ingress for the
+    // router `learn` role (VM replies enter the VM-facing NIC on ingress).
+    {
+        let tc: &mut SchedClassifier = bpf
+            .program_mut("tc_lnvps_egress")
+            .context("tc_lnvps_egress program not found")?
+            .try_into()?;
+        tc.load()?;
+        for spec in &cfg.interfaces {
+            let (iface, hook) = match spec.role() {
+                IfaceRole::Host => (spec.name(), TcAttachType::Egress),
+                IfaceRole::Learn => (spec.name(), TcAttachType::Ingress),
+                IfaceRole::Filter => continue,
+            };
+            // On kernels < 6.6 the clsact qdisc must exist before attaching; on
+            // 6.6+ TCX is used and this is unnecessary. Best-effort either way.
+            let _ = qdisc_add_clsact(iface);
+            tc.attach(iface, hook)
+                .with_context(|| format!("failed to attach TC {hook:?} to {iface}"))?;
+            info!("TC {hook:?} learning attached to {iface}");
+        }
     }
 
     // SYN-proxy tail-call programs (v4 + v6): load them (not attached to an
@@ -334,7 +349,7 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
     let state = SharedState::new(
         api_cfg.token.clone(),
         api_cfg.allow_ips.clone(),
-        cfg.interfaces.clone(),
+        cfg.interface_names(),
         initial,
         api_cfg.events_buffer,
     );

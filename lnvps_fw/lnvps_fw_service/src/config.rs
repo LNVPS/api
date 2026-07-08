@@ -19,8 +19,9 @@ pub type ProtectedV6 = Vec<(u32, [u8; 16])>;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
-    /// Uplink interfaces to attach the XDP ingress + TC egress programs to.
-    pub interfaces: Vec<String>,
+    /// Interfaces to attach to. Each entry is either a bare name (host role:
+    /// XDP filter + TC-egress learn on one NIC) or `{ name, role }`.
+    pub interfaces: Vec<InterfaceSpec>,
     /// Passive port-learning parameters.
     #[serde(default)]
     pub learning: LearningConfig,
@@ -40,6 +41,53 @@ pub struct Config {
     /// RESTful control API (increment 7). Absent = API disabled.
     #[serde(default)]
     pub api: Option<ApiConfig>,
+}
+
+/// Role of an attached interface, deciding which hooks are installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IfaceRole {
+    /// Single-NIC host: XDP filter (ingress) + TC-egress port learning. Default.
+    #[default]
+    Host,
+    /// Router upstream/underlay: XDP filter (ingress), GRE-decap-aware, no
+    /// learning. Attack traffic to protected IPs is dropped here (including
+    /// inside GRE tunnels).
+    Filter,
+    /// Router VM-facing NIC: TC-ingress port learning only (VM replies enter
+    /// here as plain L2). No filtering.
+    Learn,
+}
+
+/// An interface entry: a bare name (host role) or a `{ name, role }` object.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum InterfaceSpec {
+    Bare(String),
+    Full(InterfaceFull),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct InterfaceFull {
+    pub name: String,
+    #[serde(default)]
+    pub role: IfaceRole,
+}
+
+impl InterfaceSpec {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Bare(s) => s,
+            Self::Full(f) => &f.name,
+        }
+    }
+    pub fn role(&self) -> IfaceRole {
+        match self {
+            Self::Bare(_) => IfaceRole::Host,
+            Self::Full(f) => f.role,
+        }
+    }
 }
 
 /// RESTful control-API (HTTPS) configuration. HTTPS is mandatory: if no
@@ -269,6 +317,14 @@ impl Default for NetworkThresholds {
 }
 
 impl Config {
+    /// Interface names (for logging + the API status snapshot).
+    pub fn interface_names(&self) -> Vec<String> {
+        self.interfaces
+            .iter()
+            .map(|i| i.name().to_string())
+            .collect()
+    }
+
     /// Load and validate a config from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -283,7 +339,7 @@ impl Config {
     /// file is provided, and by tests).
     pub fn from_interfaces(interfaces: Vec<String>) -> Self {
         Self {
-            interfaces,
+            interfaces: interfaces.into_iter().map(InterfaceSpec::Bare).collect(),
             learning: LearningConfig::default(),
             thresholds: Thresholds::default(),
             escalation: Escalation::default(),
@@ -400,11 +456,24 @@ mod tests {
     #[test]
     fn parses_minimal_config() {
         let cfg: Config = serde_yaml_ng::from_str("interfaces: [eno1, eno2]\n").unwrap();
-        assert_eq!(cfg.interfaces, vec!["eno1", "eno2"]);
+        assert_eq!(cfg.interface_names(), vec!["eno1", "eno2"]);
+        assert_eq!(cfg.interfaces[0].role(), IfaceRole::Host);
         // Defaults applied.
         assert_eq!(cfg.learning.port_ttl_secs, 600);
         assert_eq!(cfg.learning.gc_interval_secs, 60);
         assert_eq!(cfg.thresholds.syn_pps, 10_000);
+    }
+
+    #[test]
+    fn parses_interface_roles() {
+        let cfg: Config = serde_yaml_ng::from_str(
+            "interfaces:\n  - ens18\n  - { name: ens19, role: filter }\n  - { name: ens21, role: learn }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.interface_names(), vec!["ens18", "ens19", "ens21"]);
+        assert_eq!(cfg.interfaces[0].role(), IfaceRole::Host);
+        assert_eq!(cfg.interfaces[1].role(), IfaceRole::Filter);
+        assert_eq!(cfg.interfaces[2].role(), IfaceRole::Learn);
     }
 
     #[test]
@@ -434,7 +503,7 @@ thresholds:
     #[test]
     fn from_interfaces_uses_defaults() {
         let cfg = Config::from_interfaces(vec!["eno2".to_string()]);
-        assert_eq!(cfg.interfaces, vec!["eno2"]);
+        assert_eq!(cfg.interface_names(), vec!["eno2"]);
         cfg.validate().unwrap();
     }
 

@@ -12,6 +12,8 @@
 pub const PROTO_ICMP: u8 = 1;
 /// IP protocol number for TCP.
 pub const PROTO_TCP: u8 = 6;
+/// IP protocol number for GRE (RFC 2784), used for tunnel decapsulation.
+pub const PROTO_GRE: u8 = 47;
 /// IP protocol number for UDP.
 pub const PROTO_UDP: u8 = 17;
 /// IP protocol number for ICMPv6.

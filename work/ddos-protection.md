@@ -372,6 +372,39 @@ increment only delivers the fw_service server side of that contract.
 - [ ] Load-test script (scripts/) using e.g. trafgen/hping3 notes to validate
       detection + mitigation end-to-end on a lab host
 
+### Increment 9 — Router mode: per-interface roles + GRE decap (L) ✅ DONE
+
+Motivation: deploying on a forwarding BGP router (Linux VM) whose transit is
+BGP-over-**L3 GRE** (`link/gre`, no inner eth). Attack traffic to the VM
+prefixes arrives GRE-encapsulated on the underlay NICs; the host-mode assumption
+(protected IPs on a plain-L2 uplink) doesn't hold. To protect the router *and*
+the VMs, drop at ingress on the underlay by decapsulating in-XDP.
+
+- [x] **Per-interface roles** (`config.rs` `IfaceRole` + untagged `InterfaceSpec`):
+      `host` (default, bare name = XDP filter + TC-egress learn), `filter`
+      (XDP ingress filter, no learn), `learn` (TC-ingress learn, no filter).
+      `interface_names()` for logging/API. Back-compatible (bare names still
+      work). Unit-tested (`parses_interface_roles`).
+- [x] **In-XDP GRE decap** (`main.rs`): `handle_outer_ipv4` detects proto 47,
+      parses the GRE header (version 0, no Routing bit; variable length from the
+      C/K/S flag bits, loop-free/bounds-checked), and runs the normal inner-IP
+      logic via a refactored `handle_ipv4/handle_ipv6(ctx, ip_off, allow_syn_proxy)`.
+      Direct (non-GRE) traffic unchanged. `PROTO_GRE` in common.
+- [x] **SYN-proxy gated off on the decap path** (`allow_syn_proxy=false`): the
+      tail-call program re-parses from fixed L2 offsets and can't re-encapsulate;
+      port-filter/source-block/rate/prefix mitigation all still drop.
+- [x] **Attach logic** (`main.rs`): XDP on host+filter roles (default→SKB
+      fallback); TC egress for host, TC **ingress** for learn (same `try_learn`,
+      keyed on source, hook-agnostic).
+- [x] **Harness** `tests/gre_decap.rs` (root): raw GRE-encapsulated SYNs
+      (`traffic::gre_flood_v4`) to a mitigating VM — closed inner port dropped,
+      open inner port passed — verified via per-dest counters. Proves the decap
+      parser passes the verifier and filters on the inner header.
+- Deferred: VXLAN/gretap decap (structure in place; live tunnels are L3 GRE);
+      outer-IPv6 GRE; the decapped byte-count includes outer+GRE (minor rate
+      over-count). SYN-proxy for tunneled TCP (needs re-encap).
+- VALIDATED as root: 18 harness (incl. 2 gre_decap) + full unit/api suite green.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

@@ -3,9 +3,29 @@
 # Run with:  lnvps_fw_service --config config.yaml
 # (or pass bare interface names:  lnvps_fw_service eno2 eno3)
 
-# Uplink interface(s) to attach the XDP ingress + TC egress programs to.
+# Interfaces to attach to. Two forms:
+#
+#   host   (default): a bare name -- single NIC that carries the protected IPs.
+#                      XDP filter (ingress) + TC-egress port learning.
+#
+#   router mode: split roles across a forwarding router's NICs --
+#     - role: filter  XDP ingress filter on the internet-facing NIC(s). It is
+#                     GRE-decap-aware, so attack traffic to protected IPs is
+#                     dropped even inside BGP-over-GRE tunnels (attach to the
+#                     *underlay* NIC to shed the flood before decap+routing).
+#     - role: learn   TC-ingress port learning on the VM-facing NIC (VM replies
+#                     enter here as plain L2). No filtering.
+#
+# Host example:
 interfaces:
   - eno2
+#
+# Router example (BGP-over-GRE underlays + a VM-facing NIC):
+# interfaces:
+#   - { name: ens19, role: filter }   # underlay (GRE-decapped + filtered)
+#   - { name: ens20, role: filter }
+#   - { name: interix, role: filter } # direct L2 peering
+#   - { name: ens21, role: learn }    # VM network (learn open ports)
 
 # Protected prefixes this host serves. Enables prefix-wide (carpet-bomb)
 # mitigation: if the aggregate rate across a whole prefix crosses the network
