@@ -2,8 +2,9 @@ use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LruHashMap, LruPerCpuHashMap};
 use lnvps_fw_common::{
-    Bucket, DEFAULT_SYN_RATE_BURST_LIMIT, DEFAULT_SYN_RATE_LIMIT, DestCounters, LastSeen,
-    PacketLimits, PortKeyV4, PortKeyV6,
+    Bucket, DEFAULT_ICMP_RATE_BURST_LIMIT, DEFAULT_ICMP_RATE_LIMIT, DEFAULT_SYN_RATE_BURST_LIMIT,
+    DEFAULT_SYN_RATE_LIMIT, DEST_MODE_NORMAL, DestCounters, DestState, LastSeen, PacketLimits,
+    PortKeyV4, PortKeyV6,
 };
 
 /// Max number of destination IPs to track (per address family)
@@ -51,10 +52,71 @@ pub static V4_SYN_RATE_LIMITS: HashMap<[u8; 4], PacketLimits> =
 pub static V6_SYN_RATE_LIMITS: HashMap<[u8; 16], PacketLimits> =
     HashMap::with_max_entries(MAX_DST_IPS, 0);
 
+/// Mitigation state per dest IPv4 (written by userspace detection loop)
+#[map]
+pub static V4_DEST_STATE: HashMap<[u8; 4], DestState> = HashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Mitigation state per dest IPv6
+#[map]
+pub static V6_DEST_STATE: HashMap<[u8; 16], DestState> = HashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// ICMP rate bucket per dest IPv4 (only consulted while mitigating)
+#[map]
+pub static V4_ICMP_RATE: LruHashMap<[u8; 4], Bucket> = LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// ICMP rate bucket per dest IPv6
+#[map]
+pub static V6_ICMP_RATE: LruHashMap<[u8; 16], Bucket> =
+    LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
 const DEFAULT_SYN_LIMITS: PacketLimits = PacketLimits {
     limit: DEFAULT_SYN_RATE_LIMIT,
     burst: DEFAULT_SYN_RATE_BURST_LIMIT,
 };
+
+const DEFAULT_ICMP_LIMITS: PacketLimits = PacketLimits {
+    limit: DEFAULT_ICMP_RATE_LIMIT,
+    burst: DEFAULT_ICMP_RATE_BURST_LIMIT,
+};
+
+/// Generate a dest-mode reader for one address family: returns the current
+/// mitigation mode (DEST_MODE_*) for `dst`, defaulting to NORMAL.
+macro_rules! dest_mode_for {
+    ($name:ident, $key:ty, $map:ident) => {
+        #[inline(always)]
+        pub fn $name(dst: &$key) -> u32 {
+            match unsafe { $map.get(dst) } {
+                Some(s) => s.mode,
+                None => DEST_MODE_NORMAL,
+            }
+        }
+    };
+}
+
+dest_mode_for!(dest_mode_v4, [u8; 4], V4_DEST_STATE);
+dest_mode_for!(dest_mode_v6, [u8; 16], V6_DEST_STATE);
+
+/// Generate an ICMP-rate gate for one address family (used under mitigation).
+macro_rules! icmp_gate {
+    ($name:ident, $key:ty, $rate_map:ident) => {
+        /// Rate-limit ICMP per dest; true if the packet should pass.
+        #[inline(always)]
+        pub fn $name(dst: &$key) -> bool {
+            let now = unsafe { bpf_ktime_get_ns() };
+            if let Some(b) = $rate_map.get_ptr_mut(dst) {
+                let bucket = unsafe { &mut *b };
+                bucket.try_consume(now, &DEFAULT_ICMP_LIMITS)
+            } else {
+                let new_bucket = Bucket::seeded(&DEFAULT_ICMP_LIMITS, now);
+                let _ = $rate_map.insert(dst, &new_bucket, 0);
+                true
+            }
+        }
+    };
+}
+
+icmp_gate!(icmp_allowed_v4, [u8; 4], V4_ICMP_RATE);
+icmp_gate!(icmp_allowed_v6, [u8; 16], V6_ICMP_RATE);
 
 /// Generate a SYN-gate function for one address family. The logic is
 /// identical; only the key width and backing maps differ, and BPF map
@@ -128,3 +190,19 @@ pub type OpenPortsMapAlias<K> = LruHashMap<K, LastSeen>;
 
 learn_port_for!(learn_port_v4, PortKeyV4);
 learn_port_for!(learn_port_v6, PortKeyV6);
+
+/// Generate an open-port lookup for one address family. `port` is host byte
+/// order (as learned by the egress program). Returns true if `(addr, port,
+/// proto)` is a currently-learned open service.
+macro_rules! port_open_for {
+    ($name:ident, $key:ty, $addr:ty, $map:ident) => {
+        #[inline(always)]
+        pub fn $name(addr: $addr, port: u16, proto: u8) -> bool {
+            let key = <$key>::new(addr, port, proto);
+            unsafe { $map.get(&key) }.is_some()
+        }
+    };
+}
+
+port_open_for!(port_is_open_v4, PortKeyV4, [u8; 4], OPEN_PORTS_V4);
+port_open_for!(port_is_open_v6, PortKeyV6, [u8; 16], OPEN_PORTS_V6);

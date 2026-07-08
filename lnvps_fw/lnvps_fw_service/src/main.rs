@@ -13,21 +13,7 @@ use lnvps_fw_common::{DestCounters, LastSeen, PortKeyV4, PortKeyV6};
 
 use lnvps_fw_service::config::Config;
 use lnvps_fw_service::gc;
-
-/// Sum per-CPU counter slots into one total.
-fn sum_counters<'a>(values: impl IntoIterator<Item = &'a DestCounters>) -> DestCounters {
-    let mut total = DestCounters::default();
-    for v in values {
-        total.packets += v.packets;
-        total.bytes += v.bytes;
-        total.syn_packets += v.syn_packets;
-        total.tcp_packets += v.tcp_packets;
-        total.udp_packets += v.udp_packets;
-        total.icmp_packets += v.icmp_packets;
-        total.dropped += v.dropped;
-    }
-    total
-}
+use lnvps_fw_service::runtime::{DetectionState, run_detection, sum_counters};
 
 fn format_counters(c: &DestCounters) -> String {
     format!(
@@ -150,6 +136,9 @@ async fn main() -> Result<()> {
     let mut bpf = attach_programs(&cfg)?;
 
     let ttl_ns = cfg.port_ttl().as_nanos() as u64;
+    let detection_cfg = cfg.detection_config();
+    let mut detection_state = DetectionState::default();
+    let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     let stats_secs = cfg.learning.stats_interval_secs;
     // A zero stats interval disables logging; use a long dummy period.
@@ -164,9 +153,25 @@ async fn main() -> Result<()> {
         cfg.learning.port_ttl_secs, cfg.learning.gc_interval_secs
     );
 
+    info!(
+        "Detection: sample every {}ms; thresholds pps={} syn_pps={} bps={} exit={}% cooldown={}s",
+        cfg.thresholds.sample_interval_ms,
+        cfg.thresholds.pps,
+        cfg.thresholds.syn_pps,
+        cfg.thresholds.bps,
+        cfg.thresholds.exit_pct,
+        cfg.thresholds.cooldown_secs
+    );
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = detect_timer.tick() => {
+                let now = gc::monotonic_now_ns();
+                if let Err(e) = run_detection(&mut bpf, &mut detection_state, &detection_cfg, now) {
+                    warn!("detection tick failed: {e}");
+                }
+            }
             _ = gc_timer.tick() => {
                 match gc_learned_ports(&mut bpf, ttl_ns) {
                     Ok(n) if n > 0 => info!("GC removed {n} expired learned port(s)"),

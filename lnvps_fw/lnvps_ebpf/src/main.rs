@@ -5,17 +5,20 @@ use aya_ebpf::bindings::TC_ACT_OK;
 use aya_ebpf::bindings::xdp_action::{XDP_DROP, XDP_PASS};
 use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
-use lnvps_fw_common::{PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6};
+use lnvps_fw_common::{
+    DEST_MODE_MITIGATE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
+};
 use network_types::eth::{EthHdr, EtherType};
-use network_types::ip::{IpProto, Ipv4Hdr, Ipv6Hdr};
+use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
 use network_types::tcp::TcpHdr;
 use network_types::udp::UdpHdr;
 
 mod maps;
 
 use maps::{
-    OPEN_PORTS_V4, OPEN_PORTS_V6, counters_v4, counters_v6, learn_port_v4, learn_port_v6,
-    syn_allowed_v4, syn_allowed_v6,
+    OPEN_PORTS_V4, OPEN_PORTS_V6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
+    icmp_allowed_v4, icmp_allowed_v6, learn_port_v4, learn_port_v6, port_is_open_v4,
+    port_is_open_v6, syn_allowed_v4, syn_allowed_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -25,6 +28,25 @@ struct L4Meta {
     proto: u8,
     /// True for a genuine connection-initiating SYN (SYN set, ACK clear)
     is_syn: bool,
+    /// True if this is a non-first IP fragment (no usable L4 header)
+    is_fragment: bool,
+    /// Destination port in host byte order (valid only when `has_port`)
+    dst_port: u16,
+    /// Whether a TCP/UDP destination port was parsed
+    has_port: bool,
+}
+
+impl L4Meta {
+    #[inline(always)]
+    fn new(proto: u8, is_fragment: bool) -> Self {
+        Self {
+            proto,
+            is_syn: false,
+            is_fragment,
+            dst_port: 0,
+            has_port: false,
+        }
+    }
 }
 
 #[inline(always)]
@@ -61,37 +83,46 @@ fn try_handle(ctx: &XdpContext) -> Result<u32, ()> {
     }
 }
 
+/// Parse the TCP/UDP destination port and SYN flag into `meta`, if the packet
+/// carries a TCP or UDP header at `l4_off`.
+#[inline(always)]
+fn fill_l4(ctx: &XdpContext, meta: &mut L4Meta, l4_off: usize) -> Result<(), ()> {
+    if meta.proto == PROTO_TCP {
+        let tcp = ptr_at::<TcpHdr>(ctx, l4_off)?;
+        meta.is_syn = tcp.syn() != 0 && tcp.ack() == 0;
+        meta.dst_port = u16::from_be_bytes(tcp.dest);
+        meta.has_port = true;
+    } else if meta.proto == PROTO_UDP {
+        let udp = ptr_at::<UdpHdr>(ctx, l4_off)?;
+        meta.dst_port = u16::from_be_bytes(udp.dst);
+        meta.has_port = true;
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
     let ip = ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
     let dst = ip.dst_addr;
 
-    // NOTE: assumes a 20-byte IPv4 header (no options). Packets with IP
-    // options are rare; their L4 fields would be misread, so skip L4
-    // inspection for them and just count the packet.
-    let ihl = ip.ihl() as usize;
-    let meta = if ihl == Ipv4Hdr::LEN {
-        let proto = ip.proto;
-        let is_syn = if proto == PROTO_TCP {
-            let tcp = ptr_at::<TcpHdr>(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            tcp.syn() != 0 && tcp.ack() == 0
-        } else {
-            false
-        };
-        L4Meta { proto, is_syn }
-    } else {
-        L4Meta {
-            proto: 255,
-            is_syn: false,
-        }
-    };
+    // Non-first fragments carry no L4 header; options-bearing headers would
+    // misplace L4 fields. Count them, but only inspect L4 for plain 20-byte,
+    // unfragmented headers.
+    let is_fragment = ip.frag_offset() != 0;
+    let mut meta = L4Meta::new(ip.proto, is_fragment);
+    if !is_fragment && ip.ihl() as usize == Ipv4Hdr::LEN {
+        fill_l4(ctx, &mut meta, EthHdr::LEN + Ipv4Hdr::LEN)?;
+    }
 
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
     if meta.is_syn && !syn_allowed_v4(&dst) {
         verdict = XDP_DROP;
     }
-    account(ctx, counters, &meta, IpProto::Icmp as u8, verdict);
+    if verdict == XDP_PASS && dest_mode_v4(&dst) == DEST_MODE_MITIGATE {
+        verdict = mitigate_v4(&dst, &meta);
+    }
+    account(ctx, counters, &meta, PROTO_ICMP, verdict);
     Ok(verdict)
 }
 
@@ -101,23 +132,68 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
     let dst = ip.dst_addr;
 
     // NOTE: no extension-header walking; packets whose first next-header is
-    // not directly TCP/UDP/ICMPv6 are counted but not L4-inspected.
-    let proto = ip.next_hdr;
-    let is_syn = if proto == PROTO_TCP {
-        let tcp = ptr_at::<TcpHdr>(ctx, EthHdr::LEN + Ipv6Hdr::LEN)?;
-        tcp.syn() != 0 && tcp.ack() == 0
-    } else {
-        false
-    };
-    let meta = L4Meta { proto, is_syn };
+    // not directly TCP/UDP/ICMPv6 are counted but not L4-inspected (and are
+    // dropped under mitigation as "not a learned service").
+    let mut meta = L4Meta::new(ip.next_hdr, false);
+    fill_l4(ctx, &mut meta, EthHdr::LEN + Ipv6Hdr::LEN)?;
 
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
     if meta.is_syn && !syn_allowed_v6(&dst) {
         verdict = XDP_DROP;
     }
-    account(ctx, counters, &meta, IpProto::Ipv6Icmp as u8, verdict);
+    if verdict == XDP_PASS && dest_mode_v6(&dst) == DEST_MODE_MITIGATE {
+        verdict = mitigate_v6(&dst, &meta);
+    }
+    account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
+}
+
+/// Phase-1 mitigation verdict for a destination in MITIGATE mode: pass only
+/// traffic to learned-open TCP/UDP ports, rate-limit ICMP, and drop everything
+/// else (including fragments and non-TCP/UDP/ICMP protocols).
+#[inline(always)]
+fn mitigate_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
+    if meta.is_fragment {
+        return XDP_DROP;
+    }
+    if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
+        if meta.has_port && port_is_open_v4(*dst, meta.dst_port, meta.proto) {
+            XDP_PASS
+        } else {
+            XDP_DROP
+        }
+    } else if meta.proto == PROTO_ICMP {
+        if icmp_allowed_v4(dst) {
+            XDP_PASS
+        } else {
+            XDP_DROP
+        }
+    } else {
+        XDP_DROP
+    }
+}
+
+#[inline(always)]
+fn mitigate_v6(dst: &[u8; 16], meta: &L4Meta) -> u32 {
+    if meta.is_fragment {
+        return XDP_DROP;
+    }
+    if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
+        if meta.has_port && port_is_open_v6(*dst, meta.dst_port, meta.proto) {
+            XDP_PASS
+        } else {
+            XDP_DROP
+        }
+    } else if meta.proto == PROTO_ICMPV6 {
+        if icmp_allowed_v6(dst) {
+            XDP_PASS
+        } else {
+            XDP_DROP
+        }
+    } else {
+        XDP_DROP
+    }
 }
 
 /// Update per-destination counters for one packet.

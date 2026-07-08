@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-08
-**Last updated:** 2026-07-08 (Increment 3 complete)
+**Last updated:** 2026-07-08 (Increment 4 complete)
 
 ## Goal
 
@@ -179,21 +179,36 @@ Key notes:
 - VALIDATED as root: 4 smoke + 3 learning harness tests green; 8 common + 11
       service unit tests green; clippy/fmt clean
 
-### Increment 4 — Attack detection + phase-1 enforcement (L)
-- [ ] fw_service detection loop: sample per-dest counters at interval
-      (e.g. 500ms), compute rates, state machine per dest IP:
-      Normal → Mitigate when pps/SYN/bytes thresholds exceeded;
-      Mitigate → Normal after cooldown below exit thresholds (hysteresis)
-- [ ] XDP enforcement when dest in Mitigate: drop inbound TCP/UDP to ports
-      not present in `OPEN_PORTS_*`; rate-limit ICMP; pass learned ports
-- [ ] Fragments: drop non-first fragments to mitigated dests (no L4 header)
-- [ ] Per-dest drop/pass counters for visibility
-- [ ] Structured mitigation event log from fw_service (start/stop, dest,
-      trigger metric, drop counts)
-- [ ] Unit tests for detection state machine (pure userspace logic)
-- [ ] Harness tests: flood dest from attacker netns → dest flips to Mitigate;
-      traffic to learned-open port still passes, closed port dropped;
-      flood stops → cooldown returns dest to Normal
+### Increment 4 — Attack detection + phase-1 enforcement (L) ✅ DONE
+- [x] Detection loop (`runtime::run_detection`, injected timestamp): samples
+      per-dest counters, computes rates, runs per-dest state machine writing
+      `V4/V6_DEST_STATE`. Normal→Mitigate on pps/SYN/bytes entry threshold;
+      Mitigate→Normal after cooldown below exit thresholds (hysteresis).
+      Sample interval configurable (default 500ms)
+- [x] XDP enforcement when dest in Mitigate (`mitigate_v4/v6`): pass only
+      learned-open TCP/UDP ports (`port_is_open_*` on OPEN_PORTS), rate-limit
+      ICMP (`icmp_allowed_*`, dedicated buckets), drop everything else
+      (incl. non-TCP/UDP/ICMP protos). SYN rate limiter still always-on
+- [x] Fragments: v4 non-first fragment (`frag_offset()!=0`) → dropped under
+      mitigation; v6 fragment/ext-header next_hdr falls into drop-all-else
+- [x] Per-dest drop counter already tracked (`account` on XDP_DROP);
+      DestState maps added (deferred from inc 1, now have a real reader)
+- [x] Structured mitigation events: `MITIGATION START/STOP` logs with dest,
+      trigger rates, peak rates, total drops
+- [x] Pure detection logic in `detect.rs` (compute_rates / evaluate /
+      process_sample) — 11 unit tests (entry, syn-only, hysteresis band,
+      cooldown, resurgence-resets, counter-reset, peak tracking)
+- [x] Harness tests (`tests/mitigation.rs`, root-gated): closed-port drop,
+      learned-port passes under mitigation, flood→Mitigate + cooldown→Normal
+      via the real run_detection with injected clock. All 3 pass
+- [x] Config: exit-pct / cooldown-secs / sample-interval-ms added to
+      thresholds; `detection_config()` builder; example yaml updated
+- Refactor: detection driver moved to `runtime.rs` (lib) with injectable
+      `now_ns` so the harness exercises the real code (like gc). main.rs
+      passes the monotonic clock
+- VALIDATED as root: 10 harness tests (4 smoke + 3 learning + 3 mitigation)
+      + 8 common + 22 service unit tests green; clippy/fmt clean
+- Note: PortKeyV4/V6 gained `::new()` (zeroes _pad) used by lookup + learn
 
 ### Increment 5 — Per-source rate limits + CIDR escalation (L)
 - [ ] For dests in Mitigate: per-src token buckets

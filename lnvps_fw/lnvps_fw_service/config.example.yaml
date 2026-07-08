@@ -16,9 +16,16 @@ learning:
   # How often per-destination stats are logged (0 disables logging).
   stats-interval-secs: 5
 
-# Attack-detection thresholds per destination IP.
-# (Parsed now; consumed by the detection state machine from increment 4.)
+# Attack-detection thresholds and hysteresis per destination IP.
 thresholds:
+  # Entry thresholds: exceeding any one flips the destination into mitigation.
   pps: 100000
   syn-pps: 10000
   bps: 1000000000
+  # Leave mitigation only once every rate falls below this percentage of its
+  # entry threshold (hysteresis)...
+  exit-pct: 50
+  # ...and stays there for this many seconds (cooldown).
+  cooldown-secs: 30
+  # How often the detection loop samples the per-destination counters.
+  sample-interval-ms: 500

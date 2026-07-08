@@ -8,15 +8,24 @@
 //! - the userspace `aya::Pod` impls (behind the `user` feature) are sound.
 #![cfg_attr(not(feature = "user"), no_std)]
 
+/// IP protocol number for ICMP (IPv4).
+pub const PROTO_ICMP: u8 = 1;
 /// IP protocol number for TCP.
 pub const PROTO_TCP: u8 = 6;
 /// IP protocol number for UDP.
 pub const PROTO_UDP: u8 = 17;
+/// IP protocol number for ICMPv6.
+pub const PROTO_ICMPV6: u8 = 58;
 
 /// Default SYN rate limit per destination (packets/second).
 pub const DEFAULT_SYN_RATE_LIMIT: u64 = 1_000;
 /// Default SYN burst limit per destination.
 pub const DEFAULT_SYN_RATE_BURST_LIMIT: u64 = 10_000;
+
+/// Default ICMP rate limit per destination while mitigating (packets/second).
+pub const DEFAULT_ICMP_RATE_LIMIT: u64 = 100;
+/// Default ICMP burst limit per destination while mitigating.
+pub const DEFAULT_ICMP_RATE_BURST_LIMIT: u64 = 200;
 
 /// Destination is not under attack; all traffic passes (learning continues).
 pub const DEST_MODE_NORMAL: u32 = 0;
@@ -94,7 +103,7 @@ pub struct PacketLimits {
 /// sampled by the userspace detection loop. Stored in per-CPU maps; userspace
 /// must sum across CPUs.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct DestCounters {
     /// Total packets seen
     pub packets: u64,
@@ -149,6 +158,20 @@ pub struct PortKeyV4 {
     pub _pad: u8,
 }
 
+impl PortKeyV4 {
+    /// Construct a key with the padding byte zeroed (required for correct
+    /// hashing of map keys).
+    #[inline(always)]
+    pub fn new(addr: [u8; 4], port: u16, proto: u8) -> Self {
+        Self {
+            addr,
+            port,
+            proto,
+            _pad: 0,
+        }
+    }
+}
+
 /// Key for the learned-open-ports maps (IPv6).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +184,20 @@ pub struct PortKeyV6 {
     /// PROTO_TCP or PROTO_UDP
     pub proto: u8,
     pub _pad: u8,
+}
+
+impl PortKeyV6 {
+    /// Construct a key with the padding byte zeroed (required for correct
+    /// hashing of map keys).
+    #[inline(always)]
+    pub fn new(addr: [u8; 16], port: u16, proto: u8) -> Self {
+        Self {
+            addr,
+            port,
+            proto,
+            _pad: 0,
+        }
+    }
 }
 
 #[cfg(feature = "user")]

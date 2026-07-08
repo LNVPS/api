@@ -3,4 +3,6 @@
 //! (config parsing, learned-port GC) unit-testable and reusable.
 
 pub mod config;
+pub mod detect;
 pub mod gc;
+pub mod runtime;

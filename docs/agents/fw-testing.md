@@ -91,7 +91,17 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
 - `ttl_expiry_removes_entry` — the shared userspace GC keeps fresh entries and
   removes them under a zero-TTL sweep.
 
-Run a single binary with `scripts/fw-e2e.sh --test learning`.
+`tests/mitigation.rs` (increment 4 detection + phase-1 enforcement):
+- `mitigation_drops_closed_ports` — under MITIGATE, UDP to an unlearned port is
+  dropped (drop counter rises).
+- `mitigation_allows_learned_ports` — under MITIGATE, a TCP handshake to a
+  learned-open port still completes.
+- `detection_flip_and_cooldown` — a flood flips the dest to MITIGATE (via the
+  real `runtime::run_detection` with injected timestamps) and the cooldown
+  returns it to NORMAL once the flood stops.
+
+Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
+mitigation`, `--test smoke`).
 
 ## Service configuration
 

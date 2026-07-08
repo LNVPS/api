@@ -19,10 +19,8 @@ pub struct Config {
     /// Passive port-learning parameters.
     #[serde(default)]
     pub learning: LearningConfig,
-    /// Detection thresholds (consumed by the detection loop from increment 4
-    /// onward; parsed now so operators can set them ahead of time).
+    /// Detection thresholds and hysteresis for the mitigation state machine.
     #[serde(default)]
-    #[allow(dead_code)]
     pub thresholds: Thresholds,
 }
 
@@ -42,11 +40,10 @@ pub struct LearningConfig {
     pub stats_interval_secs: u64,
 }
 
-/// Attack-detection thresholds (per destination IP). Not yet read by the
-/// datapath — wired into the detection state machine in increment 4.
+/// Attack-detection thresholds and hysteresis (per destination IP), consumed
+/// by the detection state machine.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct Thresholds {
     /// Packets/second into a destination that trips mitigation.
     #[serde(default = "default_pps")]
@@ -57,6 +54,16 @@ pub struct Thresholds {
     /// Bytes/second into a destination that trips mitigation.
     #[serde(default = "default_bps")]
     pub bps: u64,
+    /// Exit hysteresis: leave mitigation only once every rate falls below this
+    /// percentage of its entry threshold.
+    #[serde(default = "default_exit_pct")]
+    pub exit_pct: u64,
+    /// Sustained seconds below the exit thresholds before returning to normal.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// How often (milliseconds) the detection loop samples counters.
+    #[serde(default = "default_sample_interval_ms")]
+    pub sample_interval_ms: u64,
 }
 
 fn default_port_ttl_secs() -> u64 {
@@ -77,6 +84,15 @@ fn default_syn_pps() -> u64 {
 fn default_bps() -> u64 {
     1_000_000_000
 }
+fn default_exit_pct() -> u64 {
+    50
+}
+fn default_cooldown_secs() -> u64 {
+    30
+}
+fn default_sample_interval_ms() -> u64 {
+    500
+}
 
 impl Default for LearningConfig {
     fn default() -> Self {
@@ -94,6 +110,9 @@ impl Default for Thresholds {
             pps: default_pps(),
             syn_pps: default_syn_pps(),
             bps: default_bps(),
+            exit_pct: default_exit_pct(),
+            cooldown_secs: default_cooldown_secs(),
+            sample_interval_ms: default_sample_interval_ms(),
         }
     }
 }
@@ -128,6 +147,10 @@ impl Config {
             self.learning.gc_interval_secs > 0,
             "learning.gc-interval-secs must be > 0"
         );
+        anyhow::ensure!(
+            self.thresholds.sample_interval_ms > 0,
+            "thresholds.sample-interval-ms must be > 0"
+        );
         Ok(())
     }
 
@@ -139,6 +162,22 @@ impl Config {
     /// GC sweep interval as a `Duration`.
     pub fn gc_interval(&self) -> Duration {
         Duration::from_secs(self.learning.gc_interval_secs)
+    }
+
+    /// Detection loop sample interval as a `Duration`.
+    pub fn sample_interval(&self) -> Duration {
+        Duration::from_millis(self.thresholds.sample_interval_ms)
+    }
+
+    /// Build the pure detection config from the parsed thresholds.
+    pub fn detection_config(&self) -> crate::detect::DetectionConfig {
+        crate::detect::DetectionConfig {
+            pps: self.thresholds.pps,
+            syn_pps: self.thresholds.syn_pps,
+            bps: self.thresholds.bps,
+            exit_pct: self.thresholds.exit_pct,
+            cooldown_ns: self.thresholds.cooldown_secs * 1_000_000_000,
+        }
     }
 }
 

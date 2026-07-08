@@ -26,7 +26,12 @@ use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_c
 use aya::{Ebpf, EbpfLoader};
 use nix::sched::{CloneFlags, setns};
 
-use lnvps_fw_common::{Bucket, DestCounters, LastSeen, PacketLimits, PortKeyV4, PortKeyV6};
+use lnvps_fw_common::{
+    Bucket, DEST_MODE_MITIGATE, DestCounters, DestState, LastSeen, PacketLimits, PortKeyV4,
+    PortKeyV6,
+};
+use lnvps_fw_service::detect::DetectionConfig;
+use lnvps_fw_service::runtime::{DetectionState, run_detection};
 
 use netns::NetnsTopology;
 
@@ -164,6 +169,39 @@ impl Harness {
         let mut map: AyaHashMap<_, PortKeyV4, LastSeen> =
             AyaHashMap::try_from(self.bpf.map_mut("OPEN_PORTS_V4").unwrap())?;
         Ok(lnvps_fw_service::gc::gc_open_ports(&mut map, now, ttl_ns))
+    }
+
+    /// Force an IPv4 destination into MITIGATE mode (as the detection loop
+    /// would), for testing enforcement independently of detection.
+    pub fn set_mitigate_v4(&mut self, ip: Ipv4Addr) -> anyhow::Result<()> {
+        let mut map: AyaHashMap<_, [u8; 4], DestState> =
+            AyaHashMap::try_from(self.bpf.map_mut("V4_DEST_STATE").unwrap())?;
+        let st = DestState {
+            mode: DEST_MODE_MITIGATE,
+            _pad: 0,
+            entered_at: 0,
+        };
+        map.insert(ip.octets(), st, 0)?;
+        Ok(())
+    }
+
+    /// Read the current mitigation mode for an IPv4 destination (default
+    /// NORMAL = 0 if no entry).
+    pub fn dest_mode_v4(&self, ip: Ipv4Addr) -> anyhow::Result<u32> {
+        let map: AyaHashMap<_, [u8; 4], DestState> =
+            AyaHashMap::try_from(self.bpf.map("V4_DEST_STATE").unwrap())?;
+        Ok(map.get(&ip.octets(), 0).map(|s| s.mode).unwrap_or(0))
+    }
+
+    /// Run one real detection tick (using the daemon's `runtime::run_detection`)
+    /// at the injected `now_ns`, driving the shared `state` across calls.
+    pub fn run_detection_tick(
+        &mut self,
+        state: &mut DetectionState,
+        cfg: &DetectionConfig,
+        now_ns: u64,
+    ) -> anyhow::Result<()> {
+        run_detection(&mut self.bpf, state, cfg, now_ns)
     }
 
     /// Provide access to the raw v6 port key type for callers building keys.

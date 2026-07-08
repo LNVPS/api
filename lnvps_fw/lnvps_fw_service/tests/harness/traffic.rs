@@ -85,6 +85,56 @@ pub fn udp_send_from(
     })?
 }
 
+/// Send `count` UDP datagrams from `ns_path` to `dst` on a single socket
+/// (binding once), returning the number sent. Efficient bulk generator for
+/// rate/flood tests.
+pub fn udp_send_burst(ns_path: &str, dst: SocketAddr, count: u32) -> io::Result<u32> {
+    in_netns(ns_path, move || {
+        let bind: SocketAddr = match dst {
+            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+        };
+        let sock = UdpSocket::bind(bind)?;
+        let mut sent = 0;
+        for _ in 0..count {
+            if sock.send_to(b"flood", dst).is_ok() {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    })?
+}
+
+/// Bind a TCP listener in `ns_path` and accept up to `max` connections within
+/// `timeout`, returning the number accepted. Keeps the listener alive across
+/// connections (unlike [`tcp_listen_accept`]).
+pub fn tcp_accept_n(
+    ns_path: &str,
+    bind: SocketAddr,
+    max: u32,
+    timeout: Duration,
+) -> io::Result<u32> {
+    in_netns(ns_path, move || {
+        let listener = TcpListener::bind(bind)?;
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + timeout;
+        let mut accepted = 0;
+        while accepted < max && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    drop(stream);
+                    accepted += 1;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(accepted)
+    })?
+}
+
 /// Bind a TCP listener in `ns_path` and wait up to `timeout` to accept one
 /// connection. Returns `true` if a connection was accepted. The accepted
 /// stream is closed immediately; the point is to drive the SYN-ACK reply that
