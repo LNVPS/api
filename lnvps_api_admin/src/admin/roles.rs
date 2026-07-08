@@ -7,7 +7,7 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource};
 
 pub fn router() -> Router<RouterState> {
@@ -174,7 +174,7 @@ async fn admin_update_role(
 
     // Prevent updating system roles
     if role.is_system_role {
-        return ApiData::err("Cannot modify system roles");
+        return Err(ApiError::forbidden("Cannot modify system roles"));
     }
 
     // Update role fields
@@ -227,7 +227,7 @@ async fn admin_delete_role(
 
     // Prevent deleting system roles
     if role.is_system_role {
-        return ApiData::err("Cannot delete system roles");
+        return Err(ApiError::forbidden("Cannot delete system roles"));
     }
 
     // Check if any users are assigned to this role
@@ -355,7 +355,7 @@ async fn admin_revoke_user_role(
         for user_role_id in user_roles {
             let user_role = this.db.get_role(user_role_id).await?;
             if user_role.name == "super_admin" {
-                return ApiData::err("Super admins cannot revoke their own super_admin role");
+                return Err(ApiError::forbidden("Super admins cannot revoke their own super_admin role"));
             }
         }
     }

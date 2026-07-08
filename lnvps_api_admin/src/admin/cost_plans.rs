@@ -6,7 +6,7 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCostPlan};
 use std::sync::Arc;
 
@@ -114,7 +114,7 @@ async fn admin_update_cost_plan(
     // Update fields if provided
     if let Some(name) = req.name {
         if name.trim().is_empty() {
-            return Err(anyhow::anyhow!("Cost plan name cannot be empty").into());
+            return Err(ApiError::bad_request("Cost plan name cannot be empty"));
         }
         cost_plan.name = name.trim().to_string();
     }
@@ -123,13 +123,13 @@ async fn admin_update_cost_plan(
     }
     if let Some(currency) = req.currency {
         if currency.trim().is_empty() {
-            return Err(anyhow::anyhow!("Currency cannot be empty").into());
+            return Err(ApiError::bad_request("Currency cannot be empty"));
         }
         cost_plan.currency = currency.trim().to_uppercase();
     }
     if let Some(interval_amount) = req.interval_amount {
         if interval_amount == 0 {
-            return Err(anyhow::anyhow!("Interval amount cannot be zero").into());
+            return Err(ApiError::bad_request("Interval amount cannot be zero"));
         }
         cost_plan.interval_amount = interval_amount;
     }

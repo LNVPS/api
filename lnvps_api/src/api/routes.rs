@@ -145,7 +145,7 @@ async fn v1_patch_account(
                 let info = client
                     .get_info()
                     .await
-                    .map_err(|e| ApiError::new(format!("Failed to connect to NWC: {}", e)))?;
+                    .map_err(|e| ApiError::bad_request(format!("Failed to connect to NWC: {}", e)))?;
                 if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
                     return ApiData::err("NWC connection must allow pay_invoice");
                 }
@@ -160,7 +160,7 @@ async fn v1_patch_account(
         let result = vat_client
             .validate_vat_number(tax_id, None)
             .await
-            .map_err(|e| ApiError::new(format!("Failed to validate tax ID: {}", e)))?;
+            .map_err(|e| ApiError::bad_request(format!("Failed to validate tax ID: {}", e)))?;
         if !result.valid {
             return ApiData::err("Invalid tax ID");
         }
@@ -556,7 +556,7 @@ async fn v1_patch_vm(
     if let Some(k) = data.ssh_key_id {
         let ssh_key = this.db.get_user_ssh_key(k).await?;
         if ssh_key.user_id != uid {
-            return ApiData::err("SSH key doesnt belong to you");
+            return Err(ApiError::forbidden("SSH key doesnt belong to you"));
         }
         vm.ssh_key_id = ssh_key.id;
         vm_config = true;
@@ -731,7 +731,7 @@ async fn v1_create_custom_vm_order(
     // there's no way to send the verification email, so the requirement is
     // skipped to keep ordering usable on installs without email.
     if this.settings.smtp.is_some() && !user.email_verified {
-        return Err(ApiError::new(
+        return Err(ApiError::forbidden(
             "Email verification is required before creating a VM",
         ));
     }
@@ -781,7 +781,7 @@ async fn v1_add_ssh_key(
     let pk: PublicKey = req
         .key_data
         .parse()
-        .map_err(|_| ApiError::new("Invalid SSH public key format"))?;
+        .map_err(|_| ApiError::bad_request("Invalid SSH public key format"))?;
     let key_name = if !req.name.is_empty() {
         &req.name
     } else {
@@ -792,7 +792,7 @@ async fn v1_add_ssh_key(
         user_id: uid,
         key_data: pk
             .to_openssh()
-            .map_err(|_| ApiError::new("Failed to encode SSH key"))?
+            .map_err(|e| ApiError::internal(format!("Failed to encode SSH key: {}", e)))?
             .into(),
         ..Default::default()
     };
@@ -820,7 +820,7 @@ async fn v1_create_vm_order(
     // Email verification is only enforced when SMTP is configured (see
     // v1_create_custom_vm_order for rationale).
     if this.settings.smtp.is_some() && !user.email_verified {
-        return Err(ApiError::new(
+        return Err(ApiError::forbidden(
             "Email verification is required before creating a VM",
         ));
     }
@@ -930,7 +930,7 @@ async fn v1_lnurlp(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> Result<Json<PayResponse>, &'static str> {
-    let vm = this.db.get_vm(id).await.map_err(|_e| "VM not found")?;
+    let vm = this.db.get_vm(id).await.map_err(|_| "VM not found")?;
     if vm.deleted {
         return Err("VM not found");
     }
@@ -1025,6 +1025,22 @@ async fn v1_reinstall_vm(
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    // Reject re-install on an expired VM. The VM may already be stopped/removed
+    // on the host, so running the reinstall pipeline would fail with a 500.
+    // The expiry is authoritative on the VM's subscription.
+    let vm_expires = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await
+        .ok()
+        .and_then(|s| s.expires);
+    if is_vm_expired(vm_expires, Utc::now()) {
+        return Err(ApiError::payment_required(
+            "Cannot re-install an expired VM, please renew it first",
+        ));
+    }
+
     let old_image_id = vm.image_id;
     let host = this.db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &this.settings.provisioner)?;
@@ -1273,7 +1289,7 @@ async fn v1_get_payment(
         .get_vm_by_subscription(payment.subscription_id)
         .await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, vm.id)?)
@@ -1430,7 +1446,7 @@ async fn v1_payment_history(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     let payments = {
@@ -1459,7 +1475,7 @@ async fn v1_get_vm_history(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     let history = match (q.limit, q.offset) {
@@ -1487,7 +1503,7 @@ async fn v1_vm_upgrade_quote(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     // Create UpgradeConfig from request
@@ -1531,7 +1547,7 @@ async fn v1_vm_upgrade(
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
-        return ApiData::err("VM does not belong to you");
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
     // Create UpgradeConfig from request
@@ -1687,7 +1703,7 @@ async fn v1_patch_firewall_rule(
 
     let mut rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
-        return ApiData::err("Firewall rule does not belong to this VM");
+        return Err(ApiError::not_found("Firewall rule does not belong to this VM"));
     }
 
     if let Some(p) = req.priority {
@@ -1744,7 +1760,7 @@ async fn v1_delete_firewall_rule(
 
     let rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
-        return ApiData::err("Firewall rule does not belong to this VM");
+        return Err(ApiError::not_found("Firewall rule does not belong to this VM"));
     }
 
     this.db.delete_vm_firewall_rule(rule_id).await?;
@@ -1757,7 +1773,7 @@ async fn apply_firewall(this: &RouterState, vm_id: u64) -> Result<(), ApiError> 
     this.work_sender
         .send(WorkJob::ApplyVmFirewall { vm_id })
         .await
-        .map_err(|e| ApiError::new(&format!("Failed to queue firewall update: {}", e)))?;
+        .map_err(|e| ApiError::internal(format!("Failed to queue firewall update: {}", e)))?;
     Ok(())
 }
 
@@ -1766,12 +1782,20 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if uid != vm.user_id {
-        return Err(ApiError::new("VM does not belong to you"));
+        return Err(ApiError::forbidden("VM does not belong to you"));
     }
     if vm.deleted {
-        return Err(ApiError::new("VM not found"));
+        return Err(ApiError::not_found("VM not found"));
     }
     Ok((uid, vm))
+}
+
+/// Determine whether a VM is expired based on its subscription expiry.
+///
+/// A `None` expiry means the VM has never been paid for and is treated as
+/// expired. An expiry at or before `now` is also expired.
+fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    expires.map(|e| e <= now).unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -1999,5 +2023,31 @@ mod tests {
             result[0].currencies,
             vec![ApiCurrency::EUR, ApiCurrency::USD]
         );
+    }
+
+    // Regression test for issue #141: re-installing an expired VM must be
+    // rejected up-front (mapped to 402 PaymentRequired) instead of running the
+    // reinstall pipeline that fails with a 500.
+    #[test]
+    fn test_is_vm_expired() {
+        let now = Utc::now();
+
+        // Never paid (no subscription expiry) -> expired
+        assert!(is_vm_expired(None, now));
+
+        // Expired in the past -> expired
+        assert!(is_vm_expired(Some(now - chrono::Duration::hours(1)), now));
+
+        // Exactly now -> expired (boundary)
+        assert!(is_vm_expired(Some(now), now));
+
+        // Future expiry -> not expired
+        assert!(!is_vm_expired(Some(now + chrono::Duration::hours(1)), now));
+    }
+
+    #[test]
+    fn test_expired_vm_reinstall_error_is_payment_required() {
+        let err = ApiError::payment_required("Cannot re-install an expired VM");
+        assert_eq!(err.code, axum::http::StatusCode::PAYMENT_REQUIRED);
     }
 }

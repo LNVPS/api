@@ -9,7 +9,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
     UpgradeConfig, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
@@ -273,7 +273,7 @@ async fn admin_patch_vm(
     let mut vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
-        return ApiData::err("Cannot update a deleted VM");
+        return Err(ApiError::conflict("Cannot update a deleted VM"));
     }
 
     let mut needs_reconfigure = false;
@@ -330,7 +330,7 @@ async fn admin_start_vm(
     let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
-        return ApiData::err("Cannot start a deleted VM");
+        return Err(ApiError::conflict("Cannot start a deleted VM"));
     }
 
     // Send start job via Redis stream for distributed processing
@@ -364,7 +364,7 @@ async fn admin_stop_vm(
     let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
-        return ApiData::err("Cannot stop a deleted VM");
+        return Err(ApiError::conflict("Cannot stop a deleted VM"));
     }
 
     // Send stop job via Redis stream for distributed processing
@@ -419,7 +419,7 @@ async fn admin_delete_vm(
     let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
-        return ApiData::err("VM is already deleted");
+        return Err(ApiError::conflict("VM is already deleted"));
     }
 
     // Send delete job via Redis stream for distributed processing
@@ -455,7 +455,7 @@ async fn admin_extend_vm(
     let mut vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
-        return ApiData::err("Cannot extend a deleted VM");
+        return Err(ApiError::conflict("Cannot extend a deleted VM"));
     }
 
     // Validate days (reasonable limits)
@@ -575,7 +575,7 @@ async fn admin_get_vm_history(
 
     // Verify history entry belongs to this VM
     if history.vm_id != vm_id {
-        return ApiData::err("History entry does not belong to this VM");
+        return Err(ApiError::not_found("History entry does not belong to this VM"));
     }
 
     let admin_history_info =
@@ -641,7 +641,7 @@ async fn admin_get_vm_payment(
         .get_vm_by_subscription(payment.subscription_id)
         .await?;
     if payment_vm.id != vm.id {
-        return ApiData::err("Payment does not belong to this VM");
+        return Err(ApiError::not_found("Payment does not belong to this VM"));
     }
 
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
@@ -851,11 +851,11 @@ async fn admin_complete_vm_payment(
         .get_vm_by_subscription(payment.subscription_id)
         .await?;
     if payment_vm.id != vm.id {
-        return ApiData::err("Payment does not belong to this VM");
+        return Err(ApiError::not_found("Payment does not belong to this VM"));
     }
 
     if payment.is_paid {
-        return ApiData::err("Payment is already completed");
+        return Err(ApiError::conflict("Payment is already completed"));
     }
 
     // Mark as paid (atomically sets is_paid, paid_at, extends VM expiry via time_value)

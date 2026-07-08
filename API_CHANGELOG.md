@@ -118,7 +118,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `POST /api/admin/v1/vms/{id}/payments/{payment_id}/complete` — Mark a VM payment as paid, extend VM expiry, and dispatch provisioning (requires `payments::update`)
   - `POST /api/admin/v1/subscription_payments/{id}/complete` — Mark a subscription payment as paid, extend subscription by 30 days, and activate it (requires `subscription_payments::update`)
 
+### Fixed
+
+- **2026-07-06** - `PATCH /api/v1/vm/{id}/re-install` on an expired VM now returns `402 Payment Required` with a clear message instead of `500 Internal Server Error`. The expiry is checked up-front (before touching the host) so an expired VM can no longer trigger a failed reinstall pipeline. (#141)
+
 ### Changed
+
+- **2026-07-06** - More accurate HTTP status codes on error responses (full audit of the user and admin APIs). API errors previously almost always returned `500 Internal Server Error`; they now use appropriate codes:
+  - `400 Bad Request` — client/validation errors (e.g. invalid SSH key, invalid lightning address, empty/invalid fields on admin create/update, invalid date ranges on reports). Many admin validation errors previously returned `500`.
+  - `401 Unauthorized` — authentication failures.
+  - `403 Forbidden` — accessing a resource you don't own (VM/subscription/SSH key), ordering before email verification, modifying system roles, and **insufficient admin permissions** (previously `500`).
+  - `404 Not Found` — missing resources, including any database lookup that finds no matching row, and nested resources not under their parent (e.g. a firewall rule / payment / history entry that doesn't belong to the given VM).
+  - `409 Conflict` — state conflicts (e.g. already enrolled in referrals, acting on an already-deleted VM, a payment that is already completed, assigning an IP to a deleted/expired VM).
+  - `501 Not Implemented` — not-yet-implemented subscription types (ASN sponsoring, DNS hosting).
+  - Genuine internal failures continue to return `500`. Response bodies are unchanged (`{ "error": string }`).
+
 
 - **2026-06-25** - Subscription payments now include the payment data needed to pay
   - `ApiSubscriptionPayment` (returned by `GET /api/v1/subscriptions/{id}/renew`, `GET /api/v1/subscriptions/{id}/payments`, and the admin subscription-payment endpoints) gains a `data` field carrying the payment-method-specific data, e.g. `{ "lightning": "lnbc..." }` for Lightning. Previously the renew endpoint returned a payment record with no way to actually pay it.

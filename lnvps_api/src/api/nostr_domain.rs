@@ -70,7 +70,7 @@ async fn v1_list_nostr_domain_handles(
 
     let domain = this.db.get_domain(dom).await?;
     if domain.owner_id != uid {
-        return ApiData::err("Access denied");
+        return Err(ApiError::forbidden("Access denied"));
     }
 
     let handles = this.db.list_handles(domain.id).await?;
@@ -88,7 +88,7 @@ async fn v1_create_nostr_domain_handle(
 
     let domain = this.db.get_domain(dom).await?;
     if domain.owner_id != uid {
-        return ApiData::err("Access denied");
+        return Err(ApiError::forbidden("Access denied"));
     }
 
     let h_pubkey =
@@ -120,7 +120,7 @@ async fn v1_delete_nostr_domain_handle(
 
     let domain = this.db.get_domain(dom).await?;
     if domain.owner_id != uid {
-        return ApiData::err("Access denied");
+        return Err(ApiError::forbidden("Access denied"));
     }
     this.db.delete_handle(handle).await?;
     ApiData::ok(())

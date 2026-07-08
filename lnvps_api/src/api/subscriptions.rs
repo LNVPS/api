@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use chrono::Utc;
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
 };
 use lnvps_db::{IntervalType, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
 use std::str::FromStr;
@@ -71,7 +71,7 @@ pub async fn v1_get_subscription(
 
     // Verify ownership
     if subscription.user_id != uid {
-        return ApiData::err("Access denied: not your subscription");
+        return Err(ApiError::forbidden("Access denied: not your subscription"));
     }
 
     ApiData::ok(ApiSubscription::from_subscription(this.db.as_ref(), subscription).await?)
@@ -192,12 +192,12 @@ async fn v1_create_subscription(
             ApiCreateSubscriptionLineItemRequest::AsnSponsoring { asn: _ } => {
                 // TODO: Implement ASN sponsoring pricing lookup
                 // For now, return error
-                return ApiData::err("ASN sponsoring not yet implemented");
+                return Err(ApiError::not_implemented("ASN sponsoring not yet implemented"));
             }
             ApiCreateSubscriptionLineItemRequest::DnsHosting { domain: _ } => {
                 // TODO: Implement DNS hosting pricing lookup
                 // For now, return error
-                return ApiData::err("DNS hosting not yet implemented");
+                return Err(ApiError::not_implemented("DNS hosting not yet implemented"));
             }
         }
     }
@@ -277,7 +277,7 @@ async fn v1_renew_subscription(
     // Get and verify subscription ownership
     let subscription = this.db.get_subscription(id).await?;
     if subscription.user_id != uid {
-        return ApiData::err("Access denied: not your subscription");
+        return Err(ApiError::forbidden("Access denied: not your subscription"));
     }
 
     // Determine payment method

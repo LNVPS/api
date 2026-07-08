@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use serde::Deserialize;
@@ -241,7 +241,7 @@ async fn admin_update_subscription(
     // Update fields if provided
     if let Some(name) = request.name {
         if name.trim().is_empty() {
-            return Err(anyhow::anyhow!("Subscription name cannot be empty").into());
+            return Err(ApiError::bad_request("Subscription name cannot be empty"));
         }
         subscription.name = name.trim().to_string();
     }
@@ -256,7 +256,7 @@ async fn admin_update_subscription(
     }
     if let Some(currency) = request.currency {
         if currency.trim().is_empty() {
-            return Err(anyhow::anyhow!("Currency cannot be empty").into());
+            return Err(ApiError::bad_request("Currency cannot be empty"));
         }
         subscription.currency = currency.trim().to_uppercase();
     }
@@ -383,7 +383,7 @@ async fn admin_update_subscription_line_item(
     // changing the type would orphan that link.
     if let Some(name) = request.name {
         if name.trim().is_empty() {
-            return Err(anyhow::anyhow!("Line item name cannot be empty").into());
+            return Err(ApiError::bad_request("Line item name cannot be empty"));
         }
         line_item.name = name.trim().to_string();
     }
@@ -489,7 +489,7 @@ async fn admin_complete_subscription_payment(
     let payment = this.db.get_subscription_payment(&payment_id).await?;
 
     if payment.is_paid {
-        return ApiData::err("Payment is already completed");
+        return Err(ApiError::conflict("Payment is already completed"));
     }
 
     this.db.subscription_payment_paid(&payment).await?;

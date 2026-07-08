@@ -2,6 +2,9 @@
 name = "lnvps_api"
 version.workspace = true
 edition.workspace = true
+# Disambiguate `cargo run -p lnvps_api` (this package ships extra one-shot bins
+# like fix_lnurlp_topups); the e2e runner relies on this.
+default-run = "lnvps_api"
 
 [[bin]]
 name = "lnvps_api"

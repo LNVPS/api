@@ -163,7 +163,7 @@ async fn v1_generate_lir_agreement_from_subscription(
     // Get subscription
     let subscription = this.db.get_subscription(subscription_id).await?;
     if subscription.user_id != uid {
-        return ApiData::err("Subscription does not belong to you");
+        return Err(ApiError::forbidden("Subscription does not belong to you"));
     }
 
     // Get company for this subscription

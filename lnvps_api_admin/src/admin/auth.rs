@@ -1,12 +1,12 @@
 use crate::admin::RouterState;
 use crate::admin::model::Permission;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use axum::extract::FromRef;
 use axum::{
     extract::FromRequestParts,
     http::{StatusCode, request::Parts},
 };
-use lnvps_api_common::Nip98Auth;
+use lnvps_api_common::{ApiError, Nip98Auth};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -49,12 +49,19 @@ impl AdminAuth {
         self.permissions.contains(&Permission { resource, action })
     }
 
-    /// Require a specific permission, returning an error if not present
-    pub fn require_permission(&self, resource: AdminResource, action: AdminAction) -> Result<()> {
+    /// Require a specific permission, returning a 403 error if not present
+    pub fn require_permission(
+        &self,
+        resource: AdminResource,
+        action: AdminAction,
+    ) -> std::result::Result<(), ApiError> {
         if self.has_permission(resource, action) {
             Ok(())
         } else {
-            bail!("Insufficient permissions for {}::{}", resource, action)
+            Err(ApiError::forbidden(format!(
+                "Insufficient permissions for {}::{}",
+                resource, action
+            )))
         }
     }
 
@@ -65,8 +72,11 @@ impl AdminAuth {
             .any(|perm| self.permissions.contains(perm))
     }
 
-    /// Require any of the specified permissions
-    pub fn require_any_permission(&self, permissions: &[Permission]) -> anyhow::Result<()> {
+    /// Require any of the specified permissions, returning a 403 error if none present
+    pub fn require_any_permission(
+        &self,
+        permissions: &[Permission],
+    ) -> std::result::Result<(), ApiError> {
         if self.has_any_permission(permissions) {
             Ok(())
         } else {
@@ -74,10 +84,10 @@ impl AdminAuth {
                 .iter()
                 .map(|p| format!("{}::{}", p.resource, p.action))
                 .collect();
-            bail!(
+            Err(ApiError::forbidden(format!(
                 "Insufficient permissions, need one of: {}",
                 perm_strings.join(", ")
-            )
+            )))
         }
     }
 }
