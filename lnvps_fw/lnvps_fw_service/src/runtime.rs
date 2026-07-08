@@ -1,13 +1,19 @@
-//! BPF-facing control loop. Each tick:
-//! 1. sample per-destination counters and run the pure detection state machine
-//!    ([`crate::detect`]), writing modes into `*_DEST_STATE`;
-//! 2. sample the bounded per-source counters, compute per-source rates, pick
-//!    offenders, aggregate them into CIDR blocks ([`crate::cidr`]) and reconcile
-//!    the `*_CIDR_SRC` LPM tries (install new, decay stale).
+//! BPF-facing control loop implementing the mitigation escalation ladder.
 //!
-//! The eBPF side only counts and enforces; every rate/threshold decision is made
-//! here. The timestamp is injected (`now_ns`) so the datapath test harness can
-//! drive deterministic sample windows.
+//! Each tick, in efficacy order (cheapest/highest-efficacy/lowest-false-
+//! positive first):
+//! 1. sample the bounded per-source counters and decide, in userspace, whether
+//!    to do source blocking at all — only when offenders are *bounded* (a real
+//!    botnet). Under a spoofed flood the offender set explodes, so we skip it
+//!    (blocking spoofed /32s is pointless and raises false positives);
+//! 2. run the per-destination and per-protected-prefix detection state machine,
+//!    writing an escalation *level* into the dest-state LPM trie. Every attacked
+//!    dest/prefix enters at `PORT_FILTER` (the open-port allow-list drop, which
+//!    sheds the bulk of a flood); it is only escalated to `SOURCE_BLOCK` when
+//!    traffic keeps getting through (`pass_pps` stays high) *and* source
+//!    blocking is warranted.
+//!
+//! The eBPF side only counts and enforces; every threshold decision is here.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -19,7 +25,9 @@ use aya::maps::{MapData, PerCpuHashMap};
 use aya::{Ebpf, Pod};
 use log::{info, warn};
 
-use lnvps_fw_common::{DEST_MODE_MITIGATE, DestCounters, DestState};
+use lnvps_fw_common::{
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DestCounters, DestState,
+};
 
 use crate::cidr::{
     CidrV4, CidrV6, aggregate_v4, aggregate_v6, mask_v4, mask_v6, offenders, per_source_pps,
@@ -45,6 +53,13 @@ pub struct RuntimeConfig {
     pub fanout: usize,
     /// A CIDR block is lifted this many ns after it stops being refreshed.
     pub block_ttl_ns: u64,
+    /// Escalate a mitigating dest/prefix to `SOURCE_BLOCK` only if this many
+    /// packets/second are still getting through after the port filter.
+    pub escalate_pass_pps: u64,
+    /// Spoof gate: if more than this many distinct offenders are seen in a
+    /// window, treat the flood as spoofed and skip source blocking entirely
+    /// (rely on the port filter instead of chasing unblockable /32s).
+    pub max_real_sources: usize,
 }
 
 /// Per-address-family control state kept across sample windows.
@@ -80,6 +95,27 @@ pub fn sum_counters<'a>(values: impl IntoIterator<Item = &'a DestCounters>) -> D
     total
 }
 
+fn dest_state(level: u32, now_ns: u64) -> DestState {
+    DestState {
+        mode: level,
+        _pad: 0,
+        entered_at: now_ns,
+    }
+}
+
+/// Protection flags for a mitigating entity. The port filter is the always-on
+/// base; the SOURCE_BLOCK flag is added only when source blocking is warranted
+/// (bounded/real offenders present) and traffic is still getting through after
+/// the port filter. Other flags (SYN_PROXY, RATE_CAPS) are OR'd in here as they
+/// are implemented, so any subset can be active at once.
+fn enforced_flags(rates: &Rates, source_block_active: bool, escalate_pass_pps: u64) -> u32 {
+    let mut flags = DEST_MODE_PORT_FILTER;
+    if source_block_active && rates.pass_pps >= escalate_pass_pps {
+        flags |= DEST_MODE_SOURCE_BLOCK;
+    }
+    flags
+}
+
 fn log_event_start(ip: &str, rates: &Rates) {
     warn!(
         "MITIGATION START dest={ip} pps={} syn_pps={} bps={} drop_pps={} pass_pps={}",
@@ -94,16 +130,8 @@ fn log_event_stop(ip: &str, peak: &Rates, dropped_total: u64) {
     );
 }
 
-fn mitigate_state(now_ns: u64) -> DestState {
-    DestState {
-        mode: DEST_MODE_MITIGATE,
-        _pad: 0,
-        entered_at: now_ns,
-    }
-}
-
-/// Run the detection state machine for every sampled destination of one family,
-/// writing /32|/128 entries into the dest-state LPM trie on transitions.
+/// Per-destination detection for one family, writing the escalation level into
+/// the dest-state LPM trie on transitions and level changes.
 #[allow(clippy::too_many_arguments)]
 fn detect_family<K>(
     samples: &[(K, DestCounters)],
@@ -111,6 +139,8 @@ fn detect_family<K>(
     bits: u32,
     trackers: &mut HashMap<K, DestTracker>,
     cfg: &DetectionConfig,
+    source_block_active: bool,
+    escalate_pass_pps: u64,
     now_ns: u64,
     elapsed_ns: u64,
     fmt_ip: impl Fn(&K) -> String,
@@ -120,28 +150,32 @@ fn detect_family<K>(
     for (key, cur) in samples {
         let tracker = trackers.entry(*key).or_default();
         let (transition, rates) = process_sample(*cur, tracker, cfg, now_ns, elapsed_ns);
-        match transition {
-            Transition::Entered => {
-                if let Err(e) = trie.insert(&Key::new(bits, *key), mitigate_state(now_ns), 0) {
-                    warn!("failed to set mitigate state for {}: {e}", fmt_ip(key));
-                }
-                log_event_start(&fmt_ip(key), &rates);
-            }
-            Transition::Exited => {
-                let peak = tracker.peak;
+        if tracker.mode == DEST_MODE_NORMAL {
+            if transition == Transition::Exited {
                 let _ = trie.remove(&Key::new(bits, *key));
-                log_event_stop(&fmt_ip(key), &peak, cur.dropped);
+                log_event_stop(&fmt_ip(key), &tracker.peak, cur.dropped);
                 tracker.peak = Rates::default();
+                tracker.flags = DEST_MODE_NORMAL;
             }
-            Transition::None => {}
+            continue;
+        }
+        // Active: pick the enforcement level and (re)write it if changed.
+        let target = enforced_flags(&rates, source_block_active, escalate_pass_pps);
+        if transition == Transition::Entered {
+            let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
+            tracker.flags = target;
+            log_event_start(&fmt_ip(key), &rates);
+        } else if target != tracker.flags {
+            let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
+            info!("MITIGATION FLAGS dest={} flags={target:#06b}", fmt_ip(key));
+            tracker.flags = target;
         }
     }
 }
 
-/// Aggregate the sampled per-destination counters over one protected prefix and
-/// run the network-level state machine, writing a prefix-wide entry into the
-/// dest-state LPM trie on transition. This catches thin carpet-bomb floods that
-/// never trip any single destination.
+/// Aggregate per-destination counters over one protected prefix and run the
+/// network-level state machine, writing a prefix-wide level entry into the
+/// dest-state LPM trie. Catches thin carpet-bomb floods.
 #[allow(clippy::too_many_arguments)]
 fn detect_prefix<K>(
     samples: &[(K, DestCounters)],
@@ -151,6 +185,8 @@ fn detect_prefix<K>(
     mask: impl Fn(K, u32) -> K,
     trackers: &mut HashMap<(u32, K), DestTracker>,
     cfg: &DetectionConfig,
+    source_block_active: bool,
+    escalate_pass_pps: u64,
     now_ns: u64,
     elapsed_ns: u64,
     fmt: impl Fn(u32, &K) -> String,
@@ -171,28 +207,40 @@ fn detect_prefix<K>(
     }
     let tracker = trackers.entry((prefix_len, network)).or_default();
     let (transition, rates) = process_sample(agg, tracker, cfg, now_ns, elapsed_ns);
-    match transition {
-        Transition::Entered => {
-            if let Err(e) = trie.insert(&Key::new(prefix_len, network), mitigate_state(now_ns), 0) {
-                warn!(
-                    "failed to set prefix mitigate {}: {e}",
-                    fmt(prefix_len, &network)
-                );
-            }
-            warn!(
-                "PREFIX MITIGATION START net={} pps={} bps={} syn_pps={}",
-                fmt(prefix_len, &network),
-                rates.pps,
-                rates.bps,
-                rates.syn_pps
-            );
-        }
-        Transition::Exited => {
+    if tracker.mode == DEST_MODE_NORMAL {
+        if transition == Transition::Exited {
             let _ = trie.remove(&Key::new(prefix_len, network));
             info!("PREFIX MITIGATION STOP net={}", fmt(prefix_len, &network));
-            tracker.peak = Rates::default();
+            tracker.flags = DEST_MODE_NORMAL;
         }
-        Transition::None => {}
+        return;
+    }
+    let target = enforced_flags(&rates, source_block_active, escalate_pass_pps);
+    if transition == Transition::Entered {
+        let _ = trie.insert(
+            &Key::new(prefix_len, network),
+            dest_state(target, now_ns),
+            0,
+        );
+        tracker.flags = target;
+        warn!(
+            "PREFIX MITIGATION START net={} pps={} bps={} syn_pps={}",
+            fmt(prefix_len, &network),
+            rates.pps,
+            rates.bps,
+            rates.syn_pps
+        );
+    } else if target != tracker.flags {
+        let _ = trie.insert(
+            &Key::new(prefix_len, network),
+            dest_state(target, now_ns),
+            0,
+        );
+        info!(
+            "PREFIX MITIGATION FLAGS net={} flags={target:#06b}",
+            fmt(prefix_len, &network)
+        );
+        tracker.flags = target;
     }
 }
 
@@ -267,10 +315,81 @@ fn reconcile_blocks<K, C>(
     *prev_src = cur_src.into_iter().collect();
 }
 
-/// One control tick at the injected `now_ns`: detection + source control across
-/// both address families, sharing a single elapsed window. The first tick
-/// (`last_sample_ns == 0`) seeds snapshots with a zero elapsed so it never
-/// computes spurious rates.
+/// Source analysis for one family: compute per-source rates, apply the spoof
+/// gate, aggregate offenders into CIDR blocks, reconcile the trie. Returns
+/// whether any source block is active (drives escalation to `SOURCE_BLOCK`).
+#[allow(clippy::too_many_arguments)]
+fn source_control_v4(
+    bpf: &mut Ebpf,
+    state: &mut DetectionState,
+    cfg: &RuntimeConfig,
+    now_ns: u64,
+    elapsed_ns: u64,
+) -> Result<bool> {
+    let cur = read_src_counters::<[u8; 4]>(bpf, "V4_SRC_COUNTERS")?;
+    let off = offenders(
+        &per_source_pps(&state.prev_src_v4, &cur, elapsed_ns),
+        cfg.src_rate_pps,
+    );
+    // Spoof gate: an unbounded offender set means a spoofed flood — skip.
+    let desired = if off.len() <= cfg.max_real_sources {
+        aggregate_v4(&off, cfg.fanout)
+    } else {
+        Vec::new()
+    };
+    let mut trie: LpmTrie<_, [u8; 4], u8> =
+        LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
+    reconcile_blocks(
+        cur,
+        &mut state.prev_src_v4,
+        &mut state.blocks_v4,
+        &mut trie,
+        desired,
+        cfg.block_ttl_ns,
+        now_ns,
+        |c| Key::new(c.prefix_len, c.network),
+        |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
+    );
+    Ok(!state.blocks_v4.is_empty())
+}
+
+fn source_control_v6(
+    bpf: &mut Ebpf,
+    state: &mut DetectionState,
+    cfg: &RuntimeConfig,
+    now_ns: u64,
+    elapsed_ns: u64,
+) -> Result<bool> {
+    let cur = read_src_counters::<[u8; 16]>(bpf, "V6_SRC_COUNTERS")?;
+    let off = offenders(
+        &per_source_pps(&state.prev_src_v6, &cur, elapsed_ns),
+        cfg.src_rate_pps,
+    );
+    let desired = if off.len() <= cfg.max_real_sources {
+        aggregate_v6(&off, cfg.fanout)
+    } else {
+        Vec::new()
+    };
+    let mut trie: LpmTrie<_, [u8; 16], u8> =
+        LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
+    reconcile_blocks(
+        cur,
+        &mut state.prev_src_v6,
+        &mut state.blocks_v6,
+        &mut trie,
+        desired,
+        cfg.block_ttl_ns,
+        now_ns,
+        |c| Key::new(c.prefix_len, c.network),
+        |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
+    );
+    Ok(!state.blocks_v6.is_empty())
+}
+
+/// One control tick at the injected `now_ns`. Source analysis runs first (it
+/// gates escalation), then per-destination and per-prefix detection write the
+/// escalation level into the dest-state trie. The first tick
+/// (`last_sample_ns == 0`) seeds snapshots with zero elapsed.
 pub fn run_control(
     bpf: &mut Ebpf,
     state: &mut DetectionState,
@@ -284,6 +403,10 @@ pub fn run_control(
     };
     state.last_sample_ns = now_ns;
 
+    // --- Source control first (spoof-gated); result gates escalation ---
+    let sba4 = source_control_v4(bpf, state, cfg, now_ns, elapsed)?;
+    let sba6 = source_control_v6(bpf, state, cfg, now_ns, elapsed)?;
+
     // --- Per-destination + per-prefix detection (shared dest-state trie) ---
     let v4 = read_counters::<[u8; 4]>(bpf, "V4_DEST_COUNTERS")?;
     {
@@ -295,6 +418,8 @@ pub fn run_control(
             32,
             &mut state.v4,
             &cfg.detection,
+            sba4,
+            cfg.escalate_pass_pps,
             now_ns,
             elapsed,
             |k| Ipv4Addr::from(*k).to_string(),
@@ -308,6 +433,8 @@ pub fn run_control(
                 mask_v4,
                 &mut state.prefix_v4,
                 &cfg.network,
+                sba4,
+                cfg.escalate_pass_pps,
                 now_ns,
                 elapsed,
                 |l, n| format!("{}/{}", Ipv4Addr::from(*n), l),
@@ -324,6 +451,8 @@ pub fn run_control(
             128,
             &mut state.v6,
             &cfg.detection,
+            sba6,
+            cfg.escalate_pass_pps,
             now_ns,
             elapsed,
             |k| Ipv6Addr::from(*k).to_string(),
@@ -337,56 +466,13 @@ pub fn run_control(
                 mask_v6,
                 &mut state.prefix_v6,
                 &cfg.network,
+                sba6,
+                cfg.escalate_pass_pps,
                 now_ns,
                 elapsed,
                 |l, n| format!("{}/{}", Ipv6Addr::from(*n), l),
             );
         }
-    }
-
-    // --- Per-source control (rate -> CIDR blocks) ---
-    let s4 = read_src_counters::<[u8; 4]>(bpf, "V4_SRC_COUNTERS")?;
-    let off4 = offenders(
-        &per_source_pps(&state.prev_src_v4, &s4, elapsed),
-        cfg.src_rate_pps,
-    );
-    let desired4 = aggregate_v4(&off4, cfg.fanout);
-    {
-        let mut trie: LpmTrie<_, [u8; 4], u8> =
-            LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
-        reconcile_blocks(
-            s4,
-            &mut state.prev_src_v4,
-            &mut state.blocks_v4,
-            &mut trie,
-            desired4,
-            cfg.block_ttl_ns,
-            now_ns,
-            |c| Key::new(c.prefix_len, c.network),
-            |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
-        );
-    }
-
-    let s6 = read_src_counters::<[u8; 16]>(bpf, "V6_SRC_COUNTERS")?;
-    let off6 = offenders(
-        &per_source_pps(&state.prev_src_v6, &s6, elapsed),
-        cfg.src_rate_pps,
-    );
-    let desired6 = aggregate_v6(&off6, cfg.fanout);
-    {
-        let mut trie: LpmTrie<_, [u8; 16], u8> =
-            LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
-        reconcile_blocks(
-            s6,
-            &mut state.prev_src_v6,
-            &mut state.blocks_v6,
-            &mut trie,
-            desired6,
-            cfg.block_ttl_ns,
-            now_ns,
-            |c| Key::new(c.prefix_len, c.network),
-            |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
-        );
     }
     Ok(())
 }

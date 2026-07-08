@@ -6,7 +6,8 @@ use aya_ebpf::bindings::xdp_action::{XDP_DROP, XDP_PASS};
 use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
-    DEST_MODE_MITIGATE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, PROTO_ICMP, PROTO_ICMPV6,
+    PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
 };
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{Ipv4Hdr, Ipv6Hdr};
@@ -115,11 +116,12 @@ fn handle_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     // Steady state is pass-all (just count + learn). Enforcement happens only
-    // once userspace flips this destination into MITIGATE.
+    // once userspace sets one or more protection flags on this destination.
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
-    if dest_mode_v4(&dst) == DEST_MODE_MITIGATE {
-        verdict = mitigate_v4(&dst, &ip.src_addr, &meta);
+    let flags = dest_mode_v4(&dst);
+    if flags != DEST_MODE_NORMAL {
+        verdict = mitigate_v4(&dst, &ip.src_addr, &meta, flags);
     }
     account(ctx, counters, &meta, PROTO_ICMP, verdict);
     Ok(verdict)
@@ -138,33 +140,37 @@ fn handle_ipv6(ctx: &XdpContext) -> Result<u32, ()> {
 
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
-    if dest_mode_v6(&dst) == DEST_MODE_MITIGATE {
-        verdict = mitigate_v6(&dst, &ip.src_addr, &meta);
+    let flags = dest_mode_v6(&dst);
+    if flags != DEST_MODE_NORMAL {
+        verdict = mitigate_v6(&dst, &ip.src_addr, &meta, flags);
     }
     account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
 }
 
-/// Phase-1 mitigation verdict for a destination in MITIGATE mode. The eBPF
-/// side only counts and enforces userspace-decided policy:
-/// 1. count this source (bounded LRU) so userspace can compute per-source
-///    rates and decide blocks — pure counting, no decision here,
-/// 2. drop non-first fragments (no L4 header),
-/// 3. drop sources matching a blocked CIDR (the LPM trie is the single,
-///    bounded block structure written by userspace; individual /32s and
-///    aggregated prefixes both live here),
-/// 4. pass only learned-open TCP/UDP ports; pass ICMP (a flooding ICMP source
-///    is counted and blocked by userspace via the trie); drop the rest.
+/// Mitigation verdict for a destination whose protection `flags` bitmask is
+/// non-empty. The eBPF side only counts and enforces userspace-decided policy;
+/// each flag is applied independently:
+/// - always: count this source (bounded LRU) so userspace can compute
+///   per-source rates / cardinality and decide which flags to set — no decision
+///   here;
+/// - SOURCE_BLOCK: drop sources matching a blocked CIDR (the LPM trie userspace
+///   only populates for bounded/real offenders; last resort);
+/// - PORT_FILTER: drop non-first fragments and traffic to non-learned ports
+///   (ICMP passes); this sheds the bulk of reflection/carpet-bomb floods.
 #[inline(always)]
-fn mitigate_v4(dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta) -> u32 {
+fn mitigate_v4(dst: &[u8; 4], src: &[u8; 4], meta: &L4Meta, flags: u32) -> u32 {
     count_src_v4(src);
-    if meta.is_fragment {
+    if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v4(*src) {
         return XDP_DROP;
     }
-    if cidr_blocked_v4(*src) {
-        return XDP_DROP;
+    if flags & DEST_MODE_PORT_FILTER != 0 {
+        if meta.is_fragment {
+            return XDP_DROP;
+        }
+        return dest_policy_v4(dst, meta);
     }
-    dest_policy_v4(dst, meta)
+    XDP_PASS
 }
 
 /// Destination-port policy under mitigation (after source checks pass).
@@ -184,15 +190,18 @@ fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
 }
 
 #[inline(always)]
-fn mitigate_v6(dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta) -> u32 {
+fn mitigate_v6(dst: &[u8; 16], src: &[u8; 16], meta: &L4Meta, flags: u32) -> u32 {
     count_src_v6(src);
-    if meta.is_fragment {
+    if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v6(*src) {
         return XDP_DROP;
     }
-    if cidr_blocked_v6(*src) {
-        return XDP_DROP;
+    if flags & DEST_MODE_PORT_FILTER != 0 {
+        if meta.is_fragment {
+            return XDP_DROP;
+        }
+        return dest_policy_v6(dst, meta);
     }
-    dest_policy_v6(dst, meta)
+    XDP_PASS
 }
 
 #[inline(always)]

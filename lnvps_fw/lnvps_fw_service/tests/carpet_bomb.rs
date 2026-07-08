@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use harness::traffic;
 use harness::{Harness, require_root};
-use lnvps_fw_common::{DEST_MODE_MITIGATE, DEST_MODE_NORMAL};
+use lnvps_fw_common::{DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER};
 use lnvps_fw_service::detect::DetectionConfig;
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig};
 
@@ -46,6 +46,8 @@ fn thin_carpet_bomb_flips_whole_prefix() {
         src_rate_pps: u64::MAX,
         fanout: 4,
         block_ttl_ns: SECOND_NS,
+        escalate_pass_pps: u64::MAX,
+        max_real_sources: 10_000,
     };
     let mut state = DetectionState::default();
 
@@ -73,7 +75,7 @@ fn thin_carpet_bomb_flips_whole_prefix() {
     // the prefix-wide LPM entry, not per-dest).
     assert_eq!(
         h.dest_mode_v4(Ipv4Addr::new(10, 0, 1, 99)).unwrap(),
-        DEST_MODE_MITIGATE,
+        DEST_MODE_PORT_FILTER,
         "whole /24 should be mitigating"
     );
     // An address outside the protected prefix is unaffected.
@@ -88,7 +90,7 @@ fn thin_carpet_bomb_flips_whole_prefix() {
         .expect("t2");
     assert_eq!(
         h.dest_mode_v4(Ipv4Addr::new(10, 0, 1, 99)).unwrap(),
-        DEST_MODE_MITIGATE
+        DEST_MODE_PORT_FILTER
     );
     h.run_control_tick(&mut state, &cfg, 4 * SECOND_NS)
         .expect("t3");

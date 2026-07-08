@@ -91,14 +91,18 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
 - `ttl_expiry_removes_entry` — the shared userspace GC keeps fresh entries and
   removes them under a zero-TTL sweep.
 
-`tests/mitigation.rs` (increment 4 detection + phase-1 enforcement):
-- `mitigation_drops_closed_ports` — under MITIGATE, UDP to an unlearned port is
-  dropped (drop counter rises).
-- `mitigation_allows_learned_ports` — under MITIGATE, a TCP handshake to a
+`tests/mitigation.rs` (detection + escalation-ladder enforcement):
+- `mitigation_drops_closed_ports` — under mitigation, UDP to an unlearned port
+  is dropped (drop counter rises).
+- `mitigation_allows_learned_ports` — under mitigation, a TCP handshake to a
   learned-open port still completes.
-- `detection_flip_and_cooldown` — a flood flips the dest to MITIGATE (via the
-  real `runtime::run_detection` with injected timestamps) and the cooldown
+- `detection_flip_and_cooldown` — a flood flips the dest to mitigation (via the
+  real `runtime::run_control` with injected timestamps) and the cooldown
   returns it to NORMAL once the flood stops.
+- `source_block_only_when_flag_set` — a CIDR-blocked source to an *open* port is
+  passed with the PORT_FILTER flag alone but dropped once the SOURCE_BLOCK flag
+  is also set, proving protection flags are independent and source blocking is
+  gated to when userspace enables it.
 
 `tests/escalation.rs` (increment 5 per-source rate + CIDR escalation):
 - `cidr_escalation_blocks_offending_v24` — a spoofed-source flood across a /24

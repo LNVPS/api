@@ -2,11 +2,11 @@
 //!
 //! The daemon samples the per-destination counters at a fixed interval,
 //! converts the deltas into rates, and feeds them through [`evaluate`] to drive
-//! a per-destination [`DEST_MODE_NORMAL`] ↔ [`DEST_MODE_MITIGATE`] state
+//! a per-destination [`DEST_MODE_NORMAL`] ↔ [`DEST_MODE_PORT_FILTER`] state
 //! machine with entry thresholds, exit hysteresis, and a cooldown. Keeping this
 //! logic free of I/O and BPF handles makes it fully unit-testable.
 
-use lnvps_fw_common::{DEST_MODE_MITIGATE, DEST_MODE_NORMAL, DestCounters};
+use lnvps_fw_common::{DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DestCounters};
 
 /// Traffic rates for a single destination over the last sample window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,8 +55,13 @@ pub enum Transition {
 pub struct DestTracker {
     /// Previous counter snapshot (summed across CPUs).
     pub prev: DestCounters,
-    /// Current mitigation mode (`DEST_MODE_*`).
+    /// Whether mitigation is active: `DEST_MODE_NORMAL` or
+    /// `DEST_MODE_PORT_FILTER` (base active level). The *enforced* level may be
+    /// escalated further and is tracked separately in `level`.
     pub mode: u32,
+    /// Protection-flag bitmask currently written to the dest-state trie
+    /// (`DEST_MODE_*` flags OR'd together).
+    pub flags: u32,
     /// Monotonic timestamp when rates first dropped below the exit thresholds
     /// (used to enforce the cooldown); `None` while above them.
     pub below_since_ns: Option<u64>,
@@ -69,6 +74,7 @@ impl Default for DestTracker {
         Self {
             prev: DestCounters::default(),
             mode: DEST_MODE_NORMAL,
+            flags: DEST_MODE_NORMAL,
             below_since_ns: None,
             peak: Rates::default(),
         }
@@ -121,7 +127,7 @@ pub fn evaluate(
     if mode == DEST_MODE_NORMAL {
         if exceeds_entry(rates, cfg) {
             *below_since_ns = None;
-            return (DEST_MODE_MITIGATE, Transition::Entered);
+            return (DEST_MODE_PORT_FILTER, Transition::Entered);
         }
         return (DEST_MODE_NORMAL, Transition::None);
     }
@@ -137,7 +143,7 @@ pub fn evaluate(
         // Rates climbed back up; restart the cooldown clock.
         *below_since_ns = None;
     }
-    (DEST_MODE_MITIGATE, Transition::None)
+    (DEST_MODE_PORT_FILTER, Transition::None)
 }
 
 /// Element-wise maximum of two rate samples.
@@ -174,7 +180,7 @@ pub fn process_sample(
 
     match transition {
         Transition::Entered => tracker.peak = rates,
-        _ if mode == DEST_MODE_MITIGATE => tracker.peak = max_rates(tracker.peak, rates),
+        _ if mode == DEST_MODE_PORT_FILTER => tracker.peak = max_rates(tracker.peak, rates),
         _ => {}
     }
 
@@ -252,7 +258,7 @@ mod tests {
             ..Default::default()
         };
         let (mode, t) = evaluate(DEST_MODE_NORMAL, &r, &CFG, 0, &mut below);
-        assert_eq!(mode, DEST_MODE_MITIGATE);
+        assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(t, Transition::Entered);
     }
 
@@ -266,7 +272,7 @@ mod tests {
             ..Default::default()
         };
         let (mode, t) = evaluate(DEST_MODE_NORMAL, &r, &CFG, 0, &mut below);
-        assert_eq!(mode, DEST_MODE_MITIGATE);
+        assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(t, Transition::Entered);
     }
 
@@ -296,24 +302,24 @@ mod tests {
         let mut below = None;
 
         // First low sample starts the cooldown clock; still mitigating.
-        let (mode, t) = evaluate(DEST_MODE_MITIGATE, &low, &CFG, 1_000, &mut below);
-        assert_eq!(mode, DEST_MODE_MITIGATE);
+        let (mode, t) = evaluate(DEST_MODE_PORT_FILTER, &low, &CFG, 1_000, &mut below);
+        assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(t, Transition::None);
         assert_eq!(below, Some(1_000));
 
         // Before cooldown elapses: still mitigating.
         let (mode, _) = evaluate(
-            DEST_MODE_MITIGATE,
+            DEST_MODE_PORT_FILTER,
             &low,
             &CFG,
             1_000 + 1_000_000_000,
             &mut below,
         );
-        assert_eq!(mode, DEST_MODE_MITIGATE);
+        assert_eq!(mode, DEST_MODE_PORT_FILTER);
 
         // After cooldown: exit.
         let (mode, t) = evaluate(
-            DEST_MODE_MITIGATE,
+            DEST_MODE_PORT_FILTER,
             &low,
             &CFG,
             1_000 + 2_000_000_000,
@@ -340,11 +346,11 @@ mod tests {
         };
         let mut below = None;
 
-        evaluate(DEST_MODE_MITIGATE, &low, &CFG, 0, &mut below);
+        evaluate(DEST_MODE_PORT_FILTER, &low, &CFG, 0, &mut below);
         assert_eq!(below, Some(0));
         // A high sample clears the cooldown clock.
-        let (mode, _) = evaluate(DEST_MODE_MITIGATE, &high, &CFG, 500, &mut below);
-        assert_eq!(mode, DEST_MODE_MITIGATE);
+        let (mode, _) = evaluate(DEST_MODE_PORT_FILTER, &high, &CFG, 500, &mut below);
+        assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(below, None);
     }
 
@@ -355,7 +361,7 @@ mod tests {
         let (t, r) = process_sample(counters(2_000, 0, 0), &mut tr, &CFG, 0, 1_000_000_000);
         assert_eq!(t, Transition::Entered);
         assert_eq!(r.pps, 2_000);
-        assert_eq!(tr.mode, DEST_MODE_MITIGATE);
+        assert_eq!(tr.mode, DEST_MODE_PORT_FILTER);
         assert_eq!(tr.peak.pps, 2_000);
 
         // Second window: +3000 packets -> 3000 pps, peak rises.
@@ -373,7 +379,7 @@ mod tests {
     #[test]
     fn process_sample_exits_after_cooldown() {
         let mut tr = DestTracker {
-            mode: DEST_MODE_MITIGATE,
+            mode: DEST_MODE_PORT_FILTER,
             prev: counters(0, 0, 0),
             ..Default::default()
         };
@@ -403,8 +409,8 @@ mod tests {
             ..Default::default()
         };
         let mut below = None;
-        let (mode, t) = evaluate(DEST_MODE_MITIGATE, &mid, &CFG, 0, &mut below);
-        assert_eq!(mode, DEST_MODE_MITIGATE);
+        let (mode, t) = evaluate(DEST_MODE_PORT_FILTER, &mid, &CFG, 0, &mut below);
+        assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(t, Transition::None);
         assert_eq!(below, None);
     }

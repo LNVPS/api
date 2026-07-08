@@ -7,10 +7,12 @@ mod harness;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use harness::netns::VM_V4;
+use harness::netns::{ATTACKER_V4, VM_V4};
 use harness::traffic;
 use harness::{Harness, require_root};
-use lnvps_fw_common::{DEST_MODE_MITIGATE, DEST_MODE_NORMAL, PROTO_TCP};
+use lnvps_fw_common::{
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, PROTO_TCP, PROTO_UDP,
+};
 use lnvps_fw_service::detect::DetectionConfig;
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig};
 
@@ -120,6 +122,8 @@ fn detection_flip_and_cooldown() {
         src_rate_pps: u64::MAX, // don't block sources in this test
         fanout: 4,
         block_ttl_ns: SECOND_NS,
+        escalate_pass_pps: u64::MAX,
+        max_real_sources: 10_000,
     };
     let mut state = DetectionState::default();
 
@@ -137,20 +141,75 @@ fn detection_flip_and_cooldown() {
         .expect("tick t1");
     assert_eq!(
         h.dest_mode_v4(VM_V4).unwrap(),
-        DEST_MODE_MITIGATE,
+        DEST_MODE_PORT_FILTER,
         "flood should trigger mitigation"
     );
 
     // Flood stops. Sample at t2 (starts cooldown) and t3 (cooldown elapsed).
     h.run_control_tick(&mut state, &cfg, 3 * SECOND_NS)
         .expect("tick t2");
-    assert_eq!(h.dest_mode_v4(VM_V4).unwrap(), DEST_MODE_MITIGATE);
+    assert_eq!(h.dest_mode_v4(VM_V4).unwrap(), DEST_MODE_PORT_FILTER);
     h.run_control_tick(&mut state, &cfg, 4 * SECOND_NS)
         .expect("tick t3");
     assert_eq!(
         h.dest_mode_v4(VM_V4).unwrap(),
         DEST_MODE_NORMAL,
         "cooldown should return dest to normal"
+    );
+}
+
+/// A CIDR-blocked source is only dropped when the SOURCE_BLOCK flag is set, not
+/// with PORT_FILTER alone — protection flags are independent and source blocking
+/// is only enabled when userspace decides it's warranted.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn source_block_only_when_flag_set() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+
+    // Learn an open UDP port so the port filter would PASS this traffic; then
+    // any drop we observe is attributable to source blocking, not the port gate.
+    traffic::udp_send_from(
+        &vm_ns(&h),
+        7000,
+        SocketAddr::from((ATTACKER_V4, 9999)),
+        b"learn",
+    )
+    .expect("learn port");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(h.open_port_v4(VM_V4, 7000, PROTO_UDP).unwrap().is_some());
+
+    // Block the attacker's source and mitigate the dest with only PORT_FILTER.
+    h.block_cidr_v4(ATTACKER_V4, 32).expect("block cidr");
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER)
+        .expect("port filter only");
+
+    let open = SocketAddr::from((VM_V4, 7000));
+    let before = h
+        .dest_counters_v4(VM_V4)
+        .unwrap()
+        .map(|c| c.dropped)
+        .unwrap_or(0);
+    traffic::udp_send_burst(&attacker_ns(&h), open, 10).expect("send lvl1");
+    let mid = h.dest_counters_v4(VM_V4).unwrap().unwrap().dropped;
+    assert_eq!(
+        mid - before,
+        0,
+        "at PORT_FILTER a blocked source to an open port must pass"
+    );
+
+    // Add the SOURCE_BLOCK flag: now the blocked source is dropped even though
+    // the port filter would have passed it (flags are independent).
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER | DEST_MODE_SOURCE_BLOCK)
+        .expect("port filter + source block");
+    traffic::udp_send_burst(&attacker_ns(&h), open, 10).expect("send lvl4");
+    let after = h.dest_counters_v4(VM_V4).unwrap().unwrap().dropped;
+    assert!(
+        after - mid >= 10,
+        "at SOURCE_BLOCK the blocked source must be dropped (delta={})",
+        after - mid
     );
 }
 

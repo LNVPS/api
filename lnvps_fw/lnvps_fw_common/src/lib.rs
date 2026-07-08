@@ -17,12 +17,28 @@ pub const PROTO_UDP: u8 = 17;
 /// IP protocol number for ICMPv6.
 pub const PROTO_ICMPV6: u8 = 58;
 
-/// Destination is not under attack; all traffic passes (learning continues).
+// The mitigation mode of a destination (or protected prefix) is a set of
+// independent protection FLAGS, stored as a bitmask in `DestState.mode`. Each
+// flag is a self-contained filter the XDP datapath applies when set, so any
+// subset can be active simultaneously (e.g. SOURCE_BLOCK without SYN_PROXY).
+// Userspace *enables* flags in efficacy order — the open-port allow-list drop
+// (highest efficacy, lowest false-positive) is turned on first; source/CIDR
+// blocking (highest FP risk, useless vs spoofed floods) only when warranted —
+// but the datapath treats them as an orthogonal flag set, not an ordered ladder.
+
+/// Empty flag set: not under attack; all traffic passes (learning continues).
 pub const DEST_MODE_NORMAL: u32 = 0;
-/// Destination is under attack; only traffic to learned-open ports passes.
-pub const DEST_MODE_MITIGATE: u32 = 1;
-/// Destination is under a sustained SYN flood; SYN-proxy validation active.
-pub const DEST_MODE_SYN_PROXY: u32 = 2;
+/// Flag: drop non-first fragments and traffic to non-learned-open ports (the
+/// high-efficacy, low-false-positive heavy lifter).
+pub const DEST_MODE_PORT_FILTER: u32 = 1 << 0;
+/// Flag (reserved, increment 6): validate TCP handshakes to open ports with SYN
+/// cookies so spoofed SYN floods never reach the guest.
+pub const DEST_MODE_SYN_PROXY: u32 = 1 << 1;
+/// Flag (reserved): per-(dst,port) rate caps for open UDP/ICMP services.
+pub const DEST_MODE_RATE_CAPS: u32 = 1 << 2;
+/// Flag: drop sources matching a blocked CIDR (last resort; userspace only
+/// enables it for bounded/real offenders, never vs spoofed floods).
+pub const DEST_MODE_SOURCE_BLOCK: u32 = 1 << 3;
 
 /// Per-destination traffic counters, updated by the XDP ingress program and
 /// sampled by the userspace detection loop. Stored in per-CPU maps; userspace

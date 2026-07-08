@@ -321,6 +321,42 @@ mitigation + drop-to-non-open-ports (source-count-independent) and SYN-proxy
       into the shared dest-state trie.
 - VALIDATED as root: 12 harness tests + 32 service unit tests green.
 
+## Mitigation escalation ladder (2026-07-08, protection review)
+
+User directive: prioritise layers by efficacy (high illegit-drop, low false-
+positive) — the cheap open-port allow-list is phase 1; source blocking is last.
+`DEST_MODE` is a BITMASK of independent protection FLAGS (user refinement:
+not a strict ladder — any subset can be active at once). XDP applies each set
+flag independently:
+- NORMAL (0): pass + learn + count.
+- PORT_FILTER (1<<0): drop fragments + traffic to non-learned ports (ICMP
+      passes). The heavy lifter; set on any detection trip (per-dest OR prefix).
+- SYN_PROXY (1<<1, reserved inc 6): validate TCP handshakes to open ports.
+- RATE_CAPS (1<<2, reserved): per-(dst,port) caps for open UDP/ICMP.
+- SOURCE_BLOCK (1<<3): also consult the CIDR trie (drop blocked sources).
+Userspace enables flags in efficacy order (PORT_FILTER base, then OR in others
+as warranted); the datapath treats them as an orthogonal set.
+
+Escalation is residual-driven + spoof-gated (userspace, `runtime`):
+- source analysis runs FIRST each tick; offenders computed from bounded LRU
+      per-source counts. SPOOF GATE: if offender count > `max-real-sources`,
+      skip source blocking entirely (spoofed floods are unblockable; the port
+      filter carries them). Only bounded/real offenders get aggregated into the
+      CIDR trie.
+- a mitigating dest/prefix gets the SOURCE_BLOCK flag OR'd in only if `pass_pps`
+      (traffic still getting through after the port filter) stays >=
+      `escalate-pass-pps` AND a source block is active. Otherwise flags stay
+      PORT_FILTER only.
+- XDP gates the CIDR consult on the SOURCE_BLOCK flag, so source blocking never
+      fires until userspace sets it. Verified by
+      `tests/mitigation.rs::source_block_only_when_flag_set` (blocked source to
+      an open port passes with PORT_FILTER, dropped with +SOURCE_BLOCK).
+- Config: escalate-pass-pps, max-real-sources added to `escalation`.
+- VALIDATED as root: 13 harness + 32 unit tests green.
+- Deferred (user): phase-1 open-port FP hardening (config/firewall/API port
+      seeding) — own task. SYN-proxy (level 2) is inc 6; UDP per-(dst,port)
+      caps (level 3) later.
+
 ## Notes
 
 - Increment order is dependency-driven; 1→2→3→4 delivers the user's phase-1

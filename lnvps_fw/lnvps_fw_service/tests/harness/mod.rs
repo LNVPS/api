@@ -28,7 +28,7 @@ use aya::{Ebpf, EbpfLoader};
 use nix::sched::{CloneFlags, setns};
 
 use lnvps_fw_common::{
-    DEST_MODE_MITIGATE, DestCounters, DestState, LastSeen, PortKeyV4, PortKeyV6,
+    DEST_MODE_PORT_FILTER, DestCounters, DestState, LastSeen, PortKeyV4, PortKeyV6,
 };
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control};
 
@@ -162,16 +162,34 @@ impl Harness {
         self.set_mitigate_prefix_v4(ip, 32)
     }
 
-    /// Write a MITIGATE entry at an arbitrary prefix length.
+    /// Write a PORT_FILTER mitigation entry at an arbitrary prefix length.
     pub fn set_mitigate_prefix_v4(&mut self, net: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
+        self.set_dest_flags_v4(net, prefix_len, DEST_MODE_PORT_FILTER)
+    }
+
+    /// Write an arbitrary protection-flag bitmask into the dest-state trie.
+    pub fn set_dest_flags_v4(
+        &mut self,
+        net: Ipv4Addr,
+        prefix_len: u32,
+        flags: u32,
+    ) -> anyhow::Result<()> {
         let mut trie: LpmTrie<_, [u8; 4], DestState> =
             LpmTrie::try_from(self.bpf.map_mut("V4_DEST_STATE").unwrap())?;
         let st = DestState {
-            mode: DEST_MODE_MITIGATE,
+            mode: flags,
             _pad: 0,
             entered_at: 0,
         };
         trie.insert(&Key::new(prefix_len, net.octets()), st, 0)?;
+        Ok(())
+    }
+
+    /// Manually install a source CIDR block (as escalation would).
+    pub fn block_cidr_v4(&mut self, net: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
+        let mut trie: LpmTrie<_, [u8; 4], u8> =
+            LpmTrie::try_from(self.bpf.map_mut("V4_CIDR_SRC").unwrap())?;
+        trie.insert(&Key::new(prefix_len, net.octets()), 1u8, 0)?;
         Ok(())
     }
 

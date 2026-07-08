@@ -126,6 +126,12 @@ fn default_block_ttl_secs() -> u64 {
 fn default_src_rate_pps() -> u64 {
     500
 }
+fn default_escalate_pass_pps() -> u64 {
+    50_000
+}
+fn default_max_real_sources() -> usize {
+    10_000
+}
 
 impl Default for LearningConfig {
     fn default() -> Self {
@@ -168,6 +174,14 @@ pub struct Escalation {
     /// A CIDR block is lifted after this many seconds without being refreshed.
     #[serde(default = "default_block_ttl_secs")]
     pub block_ttl_secs: u64,
+    /// Escalate a mitigating dest/prefix to source blocking only if this many
+    /// packets/second are still getting through after the port-filter layer.
+    #[serde(default = "default_escalate_pass_pps")]
+    pub escalate_pass_pps: u64,
+    /// Spoof gate: if more than this many distinct offenders appear in a window
+    /// the flood is treated as spoofed and source blocking is skipped.
+    #[serde(default = "default_max_real_sources")]
+    pub max_real_sources: usize,
 }
 
 impl Default for Escalation {
@@ -176,6 +190,8 @@ impl Default for Escalation {
             src_rate_pps: default_src_rate_pps(),
             agg_fanout: default_agg_fanout(),
             block_ttl_secs: default_block_ttl_secs(),
+            escalate_pass_pps: default_escalate_pass_pps(),
+            max_real_sources: default_max_real_sources(),
         }
     }
 }
@@ -326,6 +342,8 @@ impl Config {
             src_rate_pps: self.escalation.src_rate_pps,
             fanout: self.escalation.agg_fanout,
             block_ttl_ns: self.escalation.block_ttl_secs * 1_000_000_000,
+            escalate_pass_pps: self.escalation.escalate_pass_pps,
+            max_real_sources: self.escalation.max_real_sources,
         })
     }
 }

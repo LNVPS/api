@@ -63,3 +63,10 @@ escalation:
   agg-fanout: 4
   # A CIDR block is lifted this many seconds after it stops being refreshed.
   block-ttl-secs: 300
+  # Escalate a mitigating dest/prefix to source blocking (level 4) only if this
+  # many packets/second are still getting through after the port-filter layer.
+  escalate-pass-pps: 50000
+  # Spoof gate: if more than this many distinct offenders appear in a window,
+  # treat the flood as spoofed and skip source blocking entirely (rely on the
+  # port filter). Source blocking only makes sense for bounded, real botnets.
+  max-real-sources: 10000
