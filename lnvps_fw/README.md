@@ -247,6 +247,30 @@ GC, SYN-cookie) is covered by ordinary `cargo test` unit tests.
 
 ---
 
+## Control API & dashboard
+
+The daemon exposes an optional **HTTPS** RESTful control API (token-authed) and
+an internal HTML dashboard. It is the *server*; the primary `lnvps_api` service
+is the *client* and source of truth. There is **no database** on the host:
+rules are pushed by `lnvps_api` and held in memory, and mitigation events go
+into a bounded in-memory ring buffer that `lnvps_api` polls (monotonic cursor)
+and persists. HTTPS is mandatory — a self-signed cert is auto-generated if none
+is configured. Endpoints cover status, rules (GET/PUT), manual overrides
+(POST/DELETE), active mitigations, and events. The dashboard at `/` renders
+status, active mitigations, rules, and a live event feed.
+
+Preview it without root:
+
+```sh
+cargo run -p lnvps_fw_service --example serve_api
+# then open https://127.0.0.1:8899/ (token: devtoken)
+```
+
+See [`docs/agents/fw-api.md`](../docs/agents/fw-api.md) for the full endpoint
+reference, auth, and the `lnvps_api` integration contract.
+
+---
+
 ## Status & roadmap
 
 Implemented and root-validated: passive port learning, per-destination and
@@ -257,10 +281,13 @@ datapath.
 The SYN-proxy covers both IPv4 and IPv6 (`xdp_syn_proxy` / `xdp_syn_proxy_v6`,
 tail-called at slots 0/1).
 
-Not yet done: `RATE_CAPS` (per-`(dst,port)` caps for open UDP),
-control-plane/API integration (host auth, prefixes/thresholds + mitigation
-events over the API), a Prometheus metrics endpoint, and systemd/Docker
-packaging.
+The control API (increment 7) is implemented on the fw_service side: HTTPS +
+token auth, in-memory rules pushed by `lnvps_api`, an event ring buffer, manual
+overrides, and the dashboard.
+
+Not yet done: `RATE_CAPS` (per-`(dst,port)` caps for open UDP); the `lnvps_api`
+side of the contract (rules-push client, event-poll-and-persist loop, DB +
+admin UI); a Prometheus metrics endpoint; and systemd/Docker packaging.
 
 See [`work/ddos-protection.md`](../work/ddos-protection.md) (repo root) for the
 detailed increment log, design decisions, and verifier notes.

@@ -37,6 +37,41 @@ pub struct Config {
     /// Aggregate per-prefix detection thresholds (carpet-bomb floods).
     #[serde(default)]
     pub network: NetworkThresholds,
+    /// RESTful control API (increment 7). Absent = API disabled.
+    #[serde(default)]
+    pub api: Option<ApiConfig>,
+}
+
+/// RESTful control-API (HTTPS) configuration. HTTPS is mandatory: if no
+/// cert/key is supplied a self-signed pair is generated at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ApiConfig {
+    /// Address to bind the HTTPS listener to.
+    #[serde(default = "default_api_listen")]
+    pub listen: std::net::SocketAddr,
+    /// Bearer token required on every API request.
+    pub token: String,
+    /// PEM certificate chain path (optional; self-signed if omitted).
+    #[serde(default)]
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key path (optional; self-signed if omitted).
+    #[serde(default)]
+    pub tls_key: Option<std::path::PathBuf>,
+    /// Optional source-IP allow-list (empty = allow any peer).
+    #[serde(default)]
+    pub allow_ips: Vec<std::net::IpAddr>,
+    /// Bounded in-memory event ring-buffer size.
+    #[serde(default = "default_events_buffer")]
+    pub events_buffer: usize,
+}
+
+fn default_api_listen() -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888)
+}
+fn default_events_buffer() -> usize {
+    1024
 }
 
 /// Port-learning / garbage-collection parameters.
@@ -254,6 +289,7 @@ impl Config {
             escalation: Escalation::default(),
             protected: Vec::new(),
             network: NetworkThresholds::default(),
+            api: None,
         }
     }
 

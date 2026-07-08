@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, HashMap as AyaHashMap, PerCpuHashMap, ProgramArray};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_clsact};
 use aya::util::KernelVersion;
@@ -10,13 +12,16 @@ use aya::{Ebpf, include_bytes_aligned};
 use log::{info, warn};
 
 use lnvps_fw_common::{
-    COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DestCounters, LastSeen, PortKeyV4, PortKeyV6,
-    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
+    COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
+    LastSeen, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
 };
 
+use lnvps_fw_service::api::{self, CidrKey, Mitigation, RuleSet, SharedState, parse_cidr};
 use lnvps_fw_service::config::Config;
+use lnvps_fw_service::detect::DestTracker;
 use lnvps_fw_service::gc;
-use lnvps_fw_service::runtime::{DetectionState, run_control, sum_counters};
+use lnvps_fw_service::publish::{MitInput, MitTracker};
+use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control, sum_counters};
 
 fn format_counters(c: &DestCounters) -> String {
     format!(
@@ -196,6 +201,162 @@ fn rotate_cookie_secret(bpf: &mut Ebpf, new: u32) -> Result<()> {
     Ok(())
 }
 
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Scrape the currently-active auto-detected mitigations out of the detection
+/// state (dest + prefix trackers, both families) for the API snapshot.
+fn collect_active(det: &DetectionState) -> Vec<MitInput> {
+    let mut out = Vec::new();
+    let mut push = |cidr: String, tr: &DestTracker| {
+        if tr.flags != DEST_MODE_NORMAL {
+            out.push(MitInput {
+                cidr,
+                flags: tr.flags,
+                pps: tr.peak.pps,
+                bps: tr.peak.bps,
+                syn_pps: tr.peak.syn_pps,
+            });
+        }
+    };
+    for (k, tr) in &det.v4 {
+        push(format!("{}/32", Ipv4Addr::from(*k)), tr);
+    }
+    for (k, tr) in &det.v6 {
+        push(format!("{}/128", Ipv6Addr::from(*k)), tr);
+    }
+    for ((len, net), tr) in &det.prefix_v4 {
+        push(format!("{}/{len}", Ipv4Addr::from(*net)), tr);
+    }
+    for ((len, net), tr) in &det.prefix_v6 {
+        push(format!("{}/{len}", Ipv6Addr::from(*net)), tr);
+    }
+    out
+}
+
+/// Write a manual protection-flag override into the dest-state trie.
+fn write_dest_state(bpf: &mut Ebpf, key: CidrKey, flags: u32, now_ns: u64) -> Result<()> {
+    let st = DestState {
+        mode: flags,
+        _pad: 0,
+        entered_at: now_ns,
+    };
+    match key {
+        CidrKey::V4 { bits, net } => {
+            let mut t: LpmTrie<_, [u8; 4], DestState> =
+                LpmTrie::try_from(bpf.map_mut("V4_DEST_STATE").context("v4 state missing")?)?;
+            t.insert(&Key::new(bits, net), st, 0)?;
+        }
+        CidrKey::V6 { bits, net } => {
+            let mut t: LpmTrie<_, [u8; 16], DestState> =
+                LpmTrie::try_from(bpf.map_mut("V6_DEST_STATE").context("v6 state missing")?)?;
+            t.insert(&Key::new(bits, net), st, 0)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a manual override from the dest-state trie.
+fn remove_dest_state(bpf: &mut Ebpf, key: CidrKey) -> Result<()> {
+    match key {
+        CidrKey::V4 { bits, net } => {
+            let mut t: LpmTrie<_, [u8; 4], DestState> =
+                LpmTrie::try_from(bpf.map_mut("V4_DEST_STATE").context("v4 state missing")?)?;
+            let _ = t.remove(&Key::new(bits, net));
+        }
+        CidrKey::V6 { bits, net } => {
+            let mut t: LpmTrie<_, [u8; 16], DestState> =
+                LpmTrie::try_from(bpf.map_mut("V6_DEST_STATE").context("v6 state missing")?)?;
+            let _ = t.remove(&Key::new(bits, net));
+        }
+    }
+    Ok(())
+}
+
+/// Apply a pushed ruleset: refresh the protected-prefix list used by prefix
+/// detection, and reconcile manual overrides into the dest-state trie.
+fn apply_rules(
+    bpf: &mut Ebpf,
+    rules: &RuleSet,
+    applied: &mut HashMap<String, CidrKey>,
+    rt: &mut RuntimeConfig,
+    now_ns: u64,
+) -> Result<()> {
+    let mut pv4 = Vec::new();
+    let mut pv6 = Vec::new();
+    for c in &rules.protected {
+        match parse_cidr(c) {
+            Some(CidrKey::V4 { bits, net }) => pv4.push((bits, net)),
+            Some(CidrKey::V6 { bits, net }) => pv6.push((bits, net)),
+            None => warn!("ignoring bad protected cidr {c}"),
+        }
+    }
+    rt.protected_v4 = pv4;
+    rt.protected_v6 = pv6;
+
+    let mut desired: HashMap<String, (CidrKey, u32)> = HashMap::new();
+    for o in &rules.overrides {
+        if let Some(k) = parse_cidr(&o.cidr) {
+            desired.insert(o.cidr.clone(), (k, o.flags));
+        }
+    }
+    let gone: Vec<String> = applied
+        .keys()
+        .filter(|c| !desired.contains_key(*c))
+        .cloned()
+        .collect();
+    for c in gone {
+        if let Some(k) = applied.remove(&c) {
+            remove_dest_state(bpf, k)?;
+        }
+    }
+    for (c, (k, flags)) in &desired {
+        write_dest_state(bpf, *k, *flags, now_ns)?;
+        applied.insert(c.clone(), *k);
+    }
+    Ok(())
+}
+
+/// Build the API shared state and spawn the HTTPS server; returns the shared
+/// handle the control loop publishes into.
+fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
+    let Some(api_cfg) = &cfg.api else {
+        return Ok(None);
+    };
+    let initial = RuleSet {
+        protected: cfg.protected.clone(),
+        overrides: Vec::new(),
+    };
+    let state = SharedState::new(
+        api_cfg.token.clone(),
+        api_cfg.allow_ips.clone(),
+        cfg.interfaces.clone(),
+        initial,
+        api_cfg.events_buffer,
+    );
+    let tls = api::load_or_generate_tls(
+        api_cfg.tls_cert.as_deref(),
+        api_cfg.tls_key.as_deref(),
+        api_cfg.listen.ip(),
+    )?;
+    if tls.self_signed {
+        info!("Control API: no cert configured, generated a self-signed cert");
+    }
+    let addr = api_cfg.listen;
+    let srv_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = api::serve(srv_state, addr, tls).await {
+            warn!("Control API server exited: {e}");
+        }
+    });
+    info!("Control API (HTTPS) listening on https://{addr}");
+    Ok(Some(state))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -210,8 +371,15 @@ async fn main() -> Result<()> {
     let mut bpf = attach_programs(&cfg)?;
 
     let ttl_ns = cfg.port_ttl().as_nanos() as u64;
-    let runtime_cfg = cfg.runtime_config()?;
+    let mut runtime_cfg = cfg.runtime_config()?;
     let mut detection_state = DetectionState::default();
+
+    // Control API (increment 7): HTTPS server + shared state the loop publishes
+    // into. Rules are pushed by lnvps_api and reconciled below on change.
+    let api_state = start_api(&cfg)?;
+    let mut rules_version = 0u64;
+    let mut applied_overrides: HashMap<String, CidrKey> = HashMap::new();
+    let mut mit_tracker = MitTracker::default();
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     let stats_secs = cfg.learning.stats_interval_secs;
@@ -246,8 +414,41 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
             _ = detect_timer.tick() => {
                 let now = gc::monotonic_now_ns();
+                // Reconcile any newly-pushed rules before detecting.
+                if let Some(st) = &api_state {
+                    let v = st.rules_version();
+                    if v != rules_version {
+                        rules_version = v;
+                        let rules = st.rules();
+                        if let Err(e) =
+                            apply_rules(&mut bpf, &rules, &mut applied_overrides, &mut runtime_cfg, now)
+                        {
+                            warn!("apply rules failed: {e}");
+                        }
+                    }
+                }
                 if let Err(e) = run_control(&mut bpf, &mut detection_state, &runtime_cfg, now) {
                     warn!("control tick failed: {e}");
+                }
+                // Publish the active snapshot + record transition events.
+                if let Some(st) = &api_state {
+                    let (mut active, events) =
+                        mit_tracker.step(collect_active(&detection_state), now_unix());
+                    for ev in events {
+                        st.record_event(ev.kind, ev.cidr, ev.flags, ev.pps, ev.bps, ev.syn_pps);
+                    }
+                    for o in st.rules().overrides {
+                        active.push(Mitigation {
+                            cidr: o.cidr,
+                            flags: o.flags,
+                            since_unix: now_unix(),
+                            manual: true,
+                            peak_pps: 0,
+                            peak_bps: 0,
+                            peak_syn_pps: 0,
+                        });
+                    }
+                    st.set_active(active);
                 }
             }
             _ = gc_timer.tick() => {

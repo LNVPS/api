@@ -282,7 +282,16 @@ field assignments lower to `memmove` on packet memory and explode verifier
 state — do byte-wise swaps. Use bounds-checked typed header pointers, not raw
 `usize` packet arithmetic.
 
-### Increment 7 — RESTful control API on fw_service (M)
+### Increment 7 — RESTful control API on fw_service (M) ✅ DONE (fw_service side)
+
+Implemented: `src/api.rs` (axum/rustls HTTPS server, token+IP auth, handlers,
+self-signed cert via rcgen, dashboard), `src/publish.rs` (tick→snapshot/event
+diff), config `api` section, `main.rs` wiring (spawn server; reconcile pushed
+rules into the maps; publish active snapshot + events each tick). Validated:
+6 `tests/api.rs` (tower oneshot) + unit tests (cidr parse, const-time eq, event
+ring, IP allow-list, self-signed gen, mit diff) + a live curl smoke
+(`examples/serve_api`) + a rendered dashboard screenshot. `lnvps_api` client
+side is deferred (see below).
 
 **Scope:** fw_service exposes a small, token-authenticated RESTful API and is
 the *server*; the primary service (`lnvps_api`) is the *client*. fw_service
@@ -300,13 +309,18 @@ DB.
       or `hyper`; NOT Rocket — keep the datapath deps minimal), bound to a
       configurable `api.listen` address (default loopback / management iface),
       running alongside the existing tokio control loop.
+- [ ] **HTTPS required** (no plaintext listener). TLS via rustls. Cert/key from
+      config (`api.tls-cert` / `api.tls-key`, PEM); if absent, **auto-generate a
+      self-signed cert** at startup (rcgen) so HTTPS always works out of the
+      box. `lnvps_api` pins/accepts the self-signed cert (fingerprint) over the
+      private management link.
 - [ ] **API-token auth**: a static bearer token from config (`api.token`, or an
       env var), checked on every request via `Authorization: Bearer <token>`
-      with a constant-time compare. Optional allow-list of source IPs. TLS is
-      out of scope (terminate at a reverse proxy / private link) — document it.
-- [ ] **Config**: new `api` section (`listen`, `token`, optional `allow-ips`,
-      `events-buffer` size). Local YAML still bootstraps interfaces/thresholds;
-      rules pushed over the API override/augment the local defaults in memory.
+      with a constant-time compare. Optional allow-list of source IPs.
+- [ ] **Config**: new `api` section (`listen`, `token`, `tls-cert`, `tls-key`,
+      optional `allow-ips`, `events-buffer` size). Local YAML still bootstraps
+      interfaces/thresholds; rules pushed over the API override/augment the
+      local defaults in memory.
 - [ ] **Rules endpoints** (in-memory ruleset behind an `Arc<RwLock<_>>`, applied
       to the BPF maps by the control loop):
   - `GET  /api/v1/rules` — current protected prefixes, per-prefix thresholds,

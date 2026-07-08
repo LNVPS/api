@@ -73,3 +73,20 @@ escalation:
   # Enable the SYN-proxy (SYN-cookie handshake validation) on a mitigating
   # dest/prefix once its SYN rate reaches this many SYNs/second.
   syn-proxy-syn-pps: 5000
+
+# RESTful control API (increment 7). Omit this whole section to disable it.
+# HTTPS is mandatory: if no cert/key is given a self-signed pair is generated
+# at startup. lnvps_api is the client -- it pushes rules and polls state/events;
+# this daemon keeps no database. An internal HTML dashboard is served at `/`.
+api:
+  # Address to bind the HTTPS listener to (keep it on a management interface).
+  listen: 127.0.0.1:8888
+  # Bearer token required on every request.
+  token: "change-me-to-a-long-random-secret"
+  # Optional PEM cert/key; self-signed if omitted.
+  # tls-cert: /etc/lnvps_fw/api.crt
+  # tls-key: /etc/lnvps_fw/api.key
+  # Optional source-IP allow-list (empty = any peer may connect).
+  allow-ips: []
+  # Bounded in-memory event ring-buffer size (lnvps_api persists history).
+  events-buffer: 1024
