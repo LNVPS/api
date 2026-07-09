@@ -48,6 +48,14 @@ pub struct RuntimeConfig {
     pub protected_v4: Vec<(u32, [u8; 4])>,
     /// Protected IPv6 prefixes.
     pub protected_v6: Vec<(u32, [u8; 16])>,
+    /// Operator-pushed manual override flags as (prefix_len, masked-network,
+    /// flags). These are a *floor*: per-destination / per-prefix auto-detection
+    /// ORs its computed flags on top and never drops them, and on
+    /// mitigation-exit restores the manual entry instead of removing it. Kept in
+    /// sync with the pushed ruleset by `apply_rules`; empty when none are set.
+    pub manual_v4: Vec<(u32, [u8; 4], u32)>,
+    /// Manual override flags (IPv6).
+    pub manual_v6: Vec<(u32, [u8; 16], u32)>,
     /// Per-source packets/second that marks a source as an offender.
     pub src_rate_pps: u64,
     /// Aggregation fan-out: this many child prefixes under a parent collapse to
@@ -81,6 +89,27 @@ pub struct RuntimeConfig {
     /// Enable the SYN_PROXY flag once a mitigating entity's SYN rate reaches
     /// this many SYNs/second.
     pub syn_proxy_pps: u64,
+}
+
+impl RuntimeConfig {
+    /// OR of the flags of every manual override whose CIDR covers `addr` (an
+    /// exact /32 entry or a wider prefix). Auto-detection uses this as a floor
+    /// so an operator-forced flag (e.g. SYN_PROXY) is never dropped when the
+    /// same destination also trips auto-mitigation.
+    pub fn manual_flags_v4(&self, addr: [u8; 4]) -> u32 {
+        self.manual_v4
+            .iter()
+            .filter(|(bits, net, _)| mask_v4(addr, *bits) == *net)
+            .fold(0, |a, (_, _, f)| a | f)
+    }
+
+    /// OR of the manual-override flags covering `addr` (IPv6).
+    pub fn manual_flags_v6(&self, addr: [u8; 16]) -> u32 {
+        self.manual_v6
+            .iter()
+            .filter(|(bits, net, _)| mask_v6(addr, *bits) == *net)
+            .fold(0, |a, (_, _, f)| a | f)
+    }
 }
 
 /// Per-address-family control state kept across sample windows.
@@ -187,29 +216,40 @@ fn detect_family<K>(
     syn_proxy_pps: u64,
     now_ns: u64,
     elapsed_ns: u64,
+    manual_flags: impl Fn(&K) -> u32,
     fmt_ip: impl Fn(&K) -> String,
 ) where
     K: Pod + Eq + Hash + Copy,
 {
     for (key, cur) in samples {
+        // Operator-forced flags for this destination; a floor auto-detection
+        // may add to but never drops (see RuntimeConfig::manual_flags_v4).
+        let manual = manual_flags(key);
         let tracker = trackers.entry(*key).or_default();
         let (transition, rates) = process_sample(*cur, tracker, cfg, now_ns, elapsed_ns);
         if tracker.mode == DEST_MODE_NORMAL {
             if transition == Transition::Exited {
-                let _ = trie.remove(&Key::new(bits, *key));
+                // Restore the manual floor rather than deleting the entry: an
+                // auto-mitigation exit must not wipe an operator override.
+                if manual != DEST_MODE_NORMAL {
+                    let _ = trie.insert(&Key::new(bits, *key), dest_state(manual, now_ns), 0);
+                } else {
+                    let _ = trie.remove(&Key::new(bits, *key));
+                }
                 log_event_stop(&fmt_ip(key), &tracker.peak, cur.dropped);
                 tracker.peak = Rates::default();
                 tracker.flags = DEST_MODE_NORMAL;
             }
             continue;
         }
-        // Active: pick the enforcement level and (re)write it if changed.
+        // Active: pick the enforcement level (never below the manual floor) and
+        // (re)write it if changed.
         let target = enforced_flags(
             &rates,
             source_block_active,
             escalate_pass_pps,
             syn_proxy_pps,
-        );
+        ) | manual;
         if transition == Transition::Entered {
             let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
             tracker.flags = target;
@@ -218,6 +258,12 @@ fn detect_family<K>(
             let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
             info!("MITIGATION FLAGS dest={} flags={target:#06b}", fmt_ip(key));
             tracker.flags = target;
+        } else if manual != DEST_MODE_NORMAL {
+            // Re-assert the floor unconditionally while a manual override is
+            // present: `apply_rules` may have just (re)written the trie entry
+            // with manual-only flags when the override was pushed mid-attack,
+            // which would otherwise persist until the next flag change.
+            let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
         }
     }
 }
@@ -239,6 +285,7 @@ fn detect_prefix<K>(
     syn_proxy_pps: u64,
     now_ns: u64,
     elapsed_ns: u64,
+    manual: u32,
     fmt: impl Fn(u32, &K) -> String,
 ) where
     K: Pod + Eq + Hash + Copy,
@@ -259,7 +306,16 @@ fn detect_prefix<K>(
     let (transition, rates) = process_sample(agg, tracker, cfg, now_ns, elapsed_ns);
     if tracker.mode == DEST_MODE_NORMAL {
         if transition == Transition::Exited {
-            let _ = trie.remove(&Key::new(prefix_len, network));
+            // Restore the manual floor rather than deleting the prefix entry.
+            if manual != DEST_MODE_NORMAL {
+                let _ = trie.insert(
+                    &Key::new(prefix_len, network),
+                    dest_state(manual, now_ns),
+                    0,
+                );
+            } else {
+                let _ = trie.remove(&Key::new(prefix_len, network));
+            }
             info!("PREFIX MITIGATION STOP net={}", fmt(prefix_len, &network));
             tracker.flags = DEST_MODE_NORMAL;
         }
@@ -270,7 +326,7 @@ fn detect_prefix<K>(
         source_block_active,
         escalate_pass_pps,
         syn_proxy_pps,
-    );
+    ) | manual;
     if transition == Transition::Entered {
         let _ = trie.insert(
             &Key::new(prefix_len, network),
@@ -296,6 +352,13 @@ fn detect_prefix<K>(
             fmt(prefix_len, &network)
         );
         tracker.flags = target;
+    } else if manual != DEST_MODE_NORMAL {
+        // Re-assert the floor (see detect_family for the rationale).
+        let _ = trie.insert(
+            &Key::new(prefix_len, network),
+            dest_state(target, now_ns),
+            0,
+        );
     }
 }
 
@@ -483,8 +546,9 @@ fn source_control_v4(
             |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
         );
     }
-    state.block_pps_v4 =
-        block_pps(&state.blocks_v4, &state.src_v4, |c, ip| mask_v4(*ip, c.prefix_len) == c.network);
+    state.block_pps_v4 = block_pps(&state.blocks_v4, &state.src_v4, |c, ip| {
+        mask_v4(*ip, c.prefix_len) == c.network
+    });
     Ok(!state.blocks_v4.is_empty())
 }
 
@@ -519,8 +583,9 @@ fn source_control_v6(
             |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
         );
     }
-    state.block_pps_v6 =
-        block_pps(&state.blocks_v6, &state.src_v6, |c, ip| mask_v6(*ip, c.prefix_len) == c.network);
+    state.block_pps_v6 = block_pps(&state.blocks_v6, &state.src_v6, |c, ip| {
+        mask_v6(*ip, c.prefix_len) == c.network
+    });
     Ok(!state.blocks_v6.is_empty())
 }
 
@@ -568,8 +633,20 @@ pub fn run_control(
     let sba6 = source_control_v6(bpf, state, cfg, now_ns, elapsed)?;
 
     // --- TX (egress) rates per local IP (display only; no mitigation) ---
-    compute_tx::<[u8; 4]>(bpf, "V4_TX_COUNTERS", &mut state.prev_tx_v4, &mut state.tx_v4, elapsed)?;
-    compute_tx::<[u8; 16]>(bpf, "V6_TX_COUNTERS", &mut state.prev_tx_v6, &mut state.tx_v6, elapsed)?;
+    compute_tx::<[u8; 4]>(
+        bpf,
+        "V4_TX_COUNTERS",
+        &mut state.prev_tx_v4,
+        &mut state.tx_v4,
+        elapsed,
+    )?;
+    compute_tx::<[u8; 16]>(
+        bpf,
+        "V6_TX_COUNTERS",
+        &mut state.prev_tx_v6,
+        &mut state.tx_v6,
+        elapsed,
+    )?;
 
     // --- Per-destination + per-prefix detection (shared dest-state trie) ---
     let v4 = read_counters::<[u8; 4]>(bpf, "V4_DEST_COUNTERS")?;
@@ -587,6 +664,7 @@ pub fn run_control(
             cfg.syn_proxy_pps,
             now_ns,
             elapsed,
+            |k| cfg.manual_flags_v4(*k),
             |k| Ipv4Addr::from(*k).to_string(),
         );
         for &(len, net) in &cfg.protected_v4 {
@@ -603,6 +681,7 @@ pub fn run_control(
                 cfg.syn_proxy_pps,
                 now_ns,
                 elapsed,
+                cfg.manual_flags_v4(net),
                 |l, n| format!("{}/{}", Ipv4Addr::from(*n), l),
             );
         }
@@ -622,6 +701,7 @@ pub fn run_control(
             cfg.syn_proxy_pps,
             now_ns,
             elapsed,
+            |k| cfg.manual_flags_v6(*k),
             |k| Ipv6Addr::from(*k).to_string(),
         );
         for &(len, net) in &cfg.protected_v6 {
@@ -638,9 +718,77 @@ pub fn run_control(
                 cfg.syn_proxy_pps,
                 now_ns,
                 elapsed,
+                cfg.manual_flags_v6(net),
                 |l, n| format!("{}/{}", Ipv6Addr::from(*n), l),
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod manual_floor_tests {
+    use super::*;
+    use lnvps_fw_common::{DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY};
+
+    /// Build a minimal RuntimeConfig from a trivial config, then inject the
+    /// manual overrides under test.
+    fn cfg_with_manual(
+        v4: Vec<(u32, [u8; 4], u32)>,
+        v6: Vec<(u32, [u8; 16], u32)>,
+    ) -> RuntimeConfig {
+        let cfg: crate::config::Config = serde_yaml_ng::from_str("interfaces: [eno1]\n").unwrap();
+        let mut rt = cfg.runtime_config().unwrap();
+        rt.manual_v4 = v4;
+        rt.manual_v6 = v6;
+        rt
+    }
+
+    #[test]
+    fn manual_flags_v4_ors_exact_and_wider_prefixes() {
+        let rt = cfg_with_manual(
+            vec![
+                (32, [10, 0, 0, 5], DEST_MODE_SYN_PROXY),
+                (24, [10, 0, 0, 0], DEST_MODE_PORT_FILTER),
+            ],
+            Vec::new(),
+        );
+        // Exact /32 override OR'd with the covering /24 override.
+        assert_eq!(
+            rt.manual_flags_v4([10, 0, 0, 5]),
+            DEST_MODE_SYN_PROXY | DEST_MODE_PORT_FILTER
+        );
+        // A different host inside the /24 gets only the /24 flags.
+        assert_eq!(rt.manual_flags_v4([10, 0, 0, 9]), DEST_MODE_PORT_FILTER);
+        // Outside every override -> no floor.
+        assert_eq!(rt.manual_flags_v4([10, 0, 1, 9]), 0);
+    }
+
+    #[test]
+    fn manual_flags_v6_ors_exact_and_wider_prefixes() {
+        let mut host = [0u8; 16];
+        host[0] = 0x20;
+        host[1] = 0x01;
+        host[15] = 0x01;
+        let mut net = [0u8; 16];
+        net[0] = 0x20;
+        net[1] = 0x01;
+        let rt = cfg_with_manual(
+            Vec::new(),
+            vec![
+                (128, host, DEST_MODE_SOURCE_BLOCK),
+                (32, net, DEST_MODE_PORT_FILTER),
+            ],
+        );
+        assert_eq!(
+            rt.manual_flags_v6(host),
+            DEST_MODE_SOURCE_BLOCK | DEST_MODE_PORT_FILTER
+        );
+        let mut other = net;
+        other[15] = 0x99; // same /32, different host
+        assert_eq!(rt.manual_flags_v6(other), DEST_MODE_PORT_FILTER);
+        let mut outside = [0u8; 16];
+        outside[0] = 0xfd;
+        assert_eq!(rt.manual_flags_v6(outside), 0);
+    }
 }

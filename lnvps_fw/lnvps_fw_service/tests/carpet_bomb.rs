@@ -43,6 +43,8 @@ fn thin_carpet_bomb_flips_whole_prefix() {
         },
         protected_v4: vec![(24, [10, 0, 1, 0])],
         protected_v6: Vec::new(),
+        manual_v4: Vec::new(),
+        manual_v6: Vec::new(),
         src_rate_pps: u64::MAX,
         fanout: 4,
         agg_max_prefix_v4: 24,

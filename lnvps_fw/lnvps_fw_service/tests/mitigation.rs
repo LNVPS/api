@@ -11,7 +11,8 @@ use harness::netns::{ATTACKER_V4, VM_V4};
 use harness::traffic;
 use harness::{Harness, require_root};
 use lnvps_fw_common::{
-    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, PROTO_TCP, PROTO_UDP,
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
+    PROTO_TCP, PROTO_UDP,
 };
 use lnvps_fw_service::detect::DetectionConfig;
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig};
@@ -119,6 +120,8 @@ fn detection_flip_and_cooldown() {
         },
         protected_v4: Vec::new(),
         protected_v6: Vec::new(),
+        manual_v4: Vec::new(),
+        manual_v6: Vec::new(),
         src_rate_pps: u64::MAX, // don't block sources in this test
         fanout: 4,
         agg_max_prefix_v4: 24,
@@ -161,6 +164,87 @@ fn detection_flip_and_cooldown() {
         h.dest_mode_v4(VM_V4).unwrap(),
         DEST_MODE_NORMAL,
         "cooldown should return dest to normal"
+    );
+}
+
+/// Regression: a manual operator override (e.g. force SYN_PROXY) must survive
+/// the auto-detection state machine. Both write the same dest-state LPM key;
+/// before the fix, an unrelated volumetric flood flipped the dest to
+/// PORT_FILTER and clobbered the operator's SYN_PROXY flag (the SYN-proxy then
+/// silently never engaged), and a mitigation-exit deleted the override outright.
+/// The manual flags must be a floor: OR'd into auto flags while mitigating and
+/// restored (not removed) on exit.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn manual_override_survives_auto_detection() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+
+    let det = DetectionConfig {
+        pps: 100,
+        syn_pps: u64::MAX, // a pure-pps flood; auto never adds SYN_PROXY itself
+        bps: u64::MAX,
+        exit_pct: 50,
+        cooldown_ns: SECOND_NS,
+    };
+    let cfg = RuntimeConfig {
+        detection: det,
+        network: DetectionConfig {
+            pps: u64::MAX,
+            syn_pps: u64::MAX,
+            bps: u64::MAX,
+            exit_pct: 50,
+            cooldown_ns: SECOND_NS,
+        },
+        protected_v4: Vec::new(),
+        protected_v6: Vec::new(),
+        // Operator forces SYN_PROXY on the VM's /32 (as POST /mitigations does).
+        manual_v4: vec![(32, VM_V4.octets(), DEST_MODE_SYN_PROXY)],
+        manual_v6: Vec::new(),
+        src_rate_pps: u64::MAX,
+        fanout: 4,
+        agg_max_prefix_v4: 24,
+        agg_max_prefix_v6: 48,
+        src_exit_pct: 50,
+        src_cooldown_ns: SECOND_NS,
+        max_source_blocks: 50_000,
+        block_ttl_ns: SECOND_NS,
+        escalate_pass_pps: u64::MAX,
+        max_real_sources: 10_000,
+        syn_proxy_pps: u64::MAX,
+    };
+    let mut state = DetectionState::default();
+
+    // t0: seed snapshots.
+    h.run_control_tick(&mut state, &cfg, SECOND_NS)
+        .expect("tick t0");
+
+    // A volumetric (non-SYN) flood trips per-dest detection.
+    let dst = SocketAddr::from((VM_V4, 9999));
+    let sent = traffic::udp_send_burst(&attacker_ns(&h), dst, 500).expect("flood");
+    assert!(sent >= 400, "sent only {sent}");
+    h.run_control_tick(&mut state, &cfg, 2 * SECOND_NS)
+        .expect("tick t1");
+    // Auto adds PORT_FILTER, but the manual SYN_PROXY floor must remain set.
+    let mode = h.dest_mode_v4(VM_V4).unwrap();
+    assert_eq!(
+        mode,
+        DEST_MODE_PORT_FILTER | DEST_MODE_SYN_PROXY,
+        "auto-detection must OR onto (not replace) the manual SYN_PROXY override"
+    );
+
+    // Flood stops: cooldown then exit. The manual floor must be restored, not
+    // wiped, when auto-mitigation clears.
+    h.run_control_tick(&mut state, &cfg, 3 * SECOND_NS)
+        .expect("tick t2");
+    h.run_control_tick(&mut state, &cfg, 4 * SECOND_NS)
+        .expect("tick t3");
+    assert_eq!(
+        h.dest_mode_v4(VM_V4).unwrap(),
+        DEST_MODE_SYN_PROXY,
+        "mitigation-exit must restore the manual override, not delete it"
     );
 }
 

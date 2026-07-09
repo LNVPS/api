@@ -43,6 +43,8 @@ fn per_source_blocks_slash32_and_releases_on_hysteresis() {
         network: quiet,
         protected_v4: Vec::new(),
         protected_v6: Vec::new(),
+        manual_v4: Vec::new(),
+        manual_v6: Vec::new(),
         src_rate_pps: 10, // a source sending >=10pps trips DROPPING
         fanout: 4,
         agg_max_prefix_v4: 24,

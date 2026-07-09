@@ -531,6 +531,8 @@ impl Config {
             network: self.network_config(),
             protected_v4,
             protected_v6,
+            manual_v4: Vec::new(),
+            manual_v6: Vec::new(),
             src_rate_pps: self.escalation.src_rate_pps,
             fanout: self.escalation.agg_fanout,
             agg_max_prefix_v4: self.escalation.agg_max_prefix_v4,

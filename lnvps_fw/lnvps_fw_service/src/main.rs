@@ -698,6 +698,13 @@ fn apply_rules(
     rt.protected_v4 = pv4;
     rt.protected_v6 = pv6;
 
+    // Publish the manual overrides as detection floors so the auto state machine
+    // ORs them in (and restores them on exit) instead of clobbering an
+    // operator-forced flag on the shared dest-state trie.
+    let manual = ManualOverrides::from_overrides(&rules.overrides);
+    rt.manual_v4 = manual.v4;
+    rt.manual_v6 = manual.v6;
+
     let mut desired: HashMap<String, (CidrKey, u32)> = HashMap::new();
     for o in &rules.overrides {
         if let Some(k) = parse_cidr(&o.cidr) {
