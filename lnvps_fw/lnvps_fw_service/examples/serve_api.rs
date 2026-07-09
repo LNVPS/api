@@ -8,7 +8,9 @@
 
 use std::net::SocketAddr;
 
-use lnvps_fw_service::api::{self, EventKind, Mitigation, Override, RuleSet, SharedState};
+use lnvps_fw_service::api::{
+    self, EventKind, LearnedPort, Mitigation, Override, RuleSet, SharedState, TrackedIp,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -51,6 +53,61 @@ async fn main() -> anyhow::Result<()> {
         3_000_000_000,
         40_000,
     );
+    state.set_tracked(vec![
+        TrackedIp {
+            ip: "203.0.113.7".into(),
+            pps: 250_000,
+            bps: 3_000_000_000,
+            syn_pps: 40_000,
+            drop_pps: 210_000,
+            mitigating: true,
+            flags: 0b0011,
+        },
+        TrackedIp {
+            ip: "203.0.113.42".into(),
+            pps: 32_500,
+            bps: 380_000_000,
+            syn_pps: 180,
+            drop_pps: 0,
+            mitigating: false,
+            flags: 0,
+        },
+        TrackedIp {
+            ip: "203.0.113.90".into(),
+            pps: 1_200,
+            bps: 9_800_000,
+            syn_pps: 5,
+            drop_pps: 0,
+            mitigating: false,
+            flags: 0,
+        },
+    ]);
+    state.set_ports(vec![
+        LearnedPort {
+            ip: "203.0.113.42".into(),
+            port: 443,
+            proto: "tcp".into(),
+            age_secs: 3,
+        },
+        LearnedPort {
+            ip: "203.0.113.42".into(),
+            port: 80,
+            proto: "tcp".into(),
+            age_secs: 3,
+        },
+        LearnedPort {
+            ip: "203.0.113.90".into(),
+            port: 51820,
+            proto: "udp".into(),
+            age_secs: 47,
+        },
+        LearnedPort {
+            ip: "203.0.113.7".into(),
+            port: 22,
+            proto: "tcp".into(),
+            age_secs: 120,
+        },
+    ]);
 
     let tls = api::load_or_generate_tls(None, None, addr.ip())?;
     println!("serving https://{addr}  (token: devtoken)");

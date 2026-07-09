@@ -13,10 +13,12 @@ use log::{info, warn};
 
 use lnvps_fw_common::{
     COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
-    LastSeen, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
+    LastSeen, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
 };
 
-use lnvps_fw_service::api::{self, CidrKey, Mitigation, RuleSet, SharedState, parse_cidr};
+use lnvps_fw_service::api::{
+    self, CidrKey, LearnedPort, Mitigation, RuleSet, SharedState, TrackedIp, parse_cidr,
+};
 use lnvps_fw_service::config::{Config, IfaceRole};
 use lnvps_fw_service::detect::DestTracker;
 use lnvps_fw_service::gc;
@@ -223,6 +225,34 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Snapshot live per-IP rates for every destination sampled this tick (the
+/// live dashboard view). Only trackers updated this tick are reported, so idle
+/// IPs drop off.
+fn collect_tracked(det: &DetectionState, now_ns: u64) -> Vec<TrackedIp> {
+    let mut out = Vec::new();
+    let mut push = |ip: String, tr: &DestTracker| {
+        if tr.last_ns == now_ns && (tr.last.pps > 0 || tr.flags != DEST_MODE_NORMAL) {
+            out.push(TrackedIp {
+                ip,
+                pps: tr.last.pps,
+                bps: tr.last.bps,
+                syn_pps: tr.last.syn_pps,
+                drop_pps: tr.last.drop_pps,
+                mitigating: tr.flags != DEST_MODE_NORMAL,
+                flags: tr.flags,
+            });
+        }
+    };
+    for (k, tr) in &det.v4 {
+        push(Ipv4Addr::from(*k).to_string(), tr);
+    }
+    for (k, tr) in &det.v6 {
+        push(Ipv6Addr::from(*k).to_string(), tr);
+    }
+    out.sort_by(|a, b| b.pps.cmp(&a.pps));
+    out
+}
+
 /// Scrape the currently-active auto-detected mitigations out of the detection
 /// state (dest + prefix trackers, both families) for the API snapshot.
 fn collect_active(det: &DetectionState) -> Vec<MitInput> {
@@ -334,6 +364,45 @@ fn apply_rules(
         applied.insert(c.clone(), *k);
     }
     Ok(())
+}
+
+/// Snapshot the learned open ports (both families) for the control API.
+fn collect_ports(bpf: &Ebpf) -> Vec<LearnedPort> {
+    let now = gc::monotonic_now_ns();
+    let proto_str = |p: u8| match p {
+        PROTO_TCP => "tcp".to_string(),
+        PROTO_UDP => "udp".to_string(),
+        other => format!("proto-{other}"),
+    };
+    let age = |last_seen: u64| now.saturating_sub(last_seen) / 1_000_000_000;
+    let mut out = Vec::new();
+    if let Some(m) = bpf.map("OPEN_PORTS_V4")
+        && let Ok(map) = AyaHashMap::<_, PortKeyV4, LastSeen>::try_from(m)
+    {
+        for k in map.keys().flatten() {
+            let age_secs = map.get(&k, 0).map(|ls| age(ls.last_seen)).unwrap_or(0);
+            out.push(LearnedPort {
+                ip: Ipv4Addr::from(k.addr).to_string(),
+                port: k.port,
+                proto: proto_str(k.proto),
+                age_secs,
+            });
+        }
+    }
+    if let Some(m) = bpf.map("OPEN_PORTS_V6")
+        && let Ok(map) = AyaHashMap::<_, PortKeyV6, LastSeen>::try_from(m)
+    {
+        for k in map.keys().flatten() {
+            let age_secs = map.get(&k, 0).map(|ls| age(ls.last_seen)).unwrap_or(0);
+            out.push(LearnedPort {
+                ip: Ipv6Addr::from(k.addr).to_string(),
+                port: k.port,
+                proto: proto_str(k.proto),
+                age_secs,
+            });
+        }
+    }
+    out
 }
 
 /// Reconcile the protected-prefix tries and the `scoped` flag from the current
@@ -539,6 +608,7 @@ async fn main() -> Result<()> {
                         });
                     }
                     st.set_active(active);
+                    st.set_tracked(collect_tracked(&detection_state, now));
                 }
             }
             _ = gc_timer.tick() => {
@@ -549,6 +619,10 @@ async fn main() -> Result<()> {
                 }
                 if let Err(e) = gc_verified(&mut bpf, verified_ttl_ns) {
                     warn!("verified GC failed: {e}");
+                }
+                // Refresh the learned-ports snapshot for the control API.
+                if let Some(st) = &api_state {
+                    st.set_ports(collect_ports(&bpf));
                 }
             }
             _ = cookie_timer.tick() => {

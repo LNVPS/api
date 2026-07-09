@@ -67,6 +67,10 @@ pub struct DestTracker {
     pub below_since_ns: Option<u64>,
     /// Peak rates observed during the current mitigation episode (for events).
     pub peak: Rates,
+    /// Most recent per-window rates (for the live per-IP dashboard).
+    pub last: Rates,
+    /// Injected timestamp when `last` was computed (0 = never sampled).
+    pub last_ns: u64,
 }
 
 impl Default for DestTracker {
@@ -77,6 +81,8 @@ impl Default for DestTracker {
             flags: DEST_MODE_NORMAL,
             below_since_ns: None,
             peak: Rates::default(),
+            last: Rates::default(),
+            last_ns: 0,
         }
     }
 }
@@ -186,6 +192,8 @@ pub fn process_sample(
 
     tracker.mode = mode;
     tracker.prev = cur;
+    tracker.last = rates;
+    tracker.last_ns = now_ns;
     (transition, rates)
 }
 

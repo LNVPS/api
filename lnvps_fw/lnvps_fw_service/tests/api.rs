@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
-    Event, EventKind, EventsResponse, Override, RuleSet, SharedState, Status, router,
+    Event, EventKind, EventsResponse, LearnedPort, Override, RuleSet, SharedState, Status, router,
 };
 use tower::ServiceExt;
 
@@ -177,6 +177,35 @@ async fn events_poll_incrementally() {
         .unwrap();
     let ev: EventsResponse = body_json(res).await;
     assert!(ev.events.is_empty());
+}
+
+#[tokio::test]
+async fn learned_ports_endpoint() {
+    let st = state();
+    let app = router(st.clone());
+    st.set_ports(vec![
+        LearnedPort {
+            ip: "185.18.221.87".into(),
+            port: 443,
+            proto: "tcp".into(),
+            age_secs: 5,
+        },
+        LearnedPort {
+            ip: "185.18.221.140".into(),
+            port: 51820,
+            proto: "udp".into(),
+            age_secs: 12,
+        },
+    ]);
+    let res = app
+        .oneshot(req("GET", "/api/v1/ports", Some("tok"), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ports: Vec<LearnedPort> = body_json(res).await;
+    assert_eq!(ports.len(), 2);
+    assert_eq!(ports[0].port, 443);
+    assert_eq!(ports[1].proto, "udp");
 }
 
 #[tokio::test]

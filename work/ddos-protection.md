@@ -430,6 +430,23 @@ doesn't own. Now `protected` is a hard scope.
       positives — NOT done; kept the open-port allow-list model.
 - VALIDATED as root: 20 harness (incl. 2 scoping) + full unit/api suite green.
 
+### Increment 11 — Observability: learned ports + live per-IP rates (S) ✅ DONE
+
+User ask (production dashboard): surface learned open ports and per-tracked-IP
+packet/data rates (for the dashboard now, and `lnvps_api`/admin later).
+
+- [x] `GET /api/v1/ports` — learned open ports `{ip, port, proto, age_secs}`
+      snapshotted from `OPEN_PORTS_V4/V6` on the GC tick (`collect_ports`).
+- [x] `GET /api/v1/tracked` — live per-destination rates `{ip, pps, bps,
+      syn_pps, drop_pps, mitigating, flags}` for every IP sampled this tick.
+      `DestTracker` now stores `last`/`last_ns`; `collect_tracked` reports only
+      trackers updated this tick (idle IPs drop off), sorted by pps.
+- [x] `Status` gains `learned_ports`; dashboard gains "Live tracked IPs" and
+      "Learned open ports" sections (sortable/filterable) with human-readable
+      pps/bps formatting.
+- [x] tests/api.rs `learned_ports_endpoint`; example seeds both for preview.
+- Validated: 49 unit/api tests green; clippy/fmt clean.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

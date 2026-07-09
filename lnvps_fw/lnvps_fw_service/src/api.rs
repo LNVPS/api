@@ -129,6 +129,29 @@ pub struct Event {
     pub syn_pps: u64,
 }
 
+/// Live per-destination rates for a currently-active tracked IP.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackedIp {
+    pub ip: String,
+    pub pps: u64,
+    pub bps: u64,
+    pub syn_pps: u64,
+    pub drop_pps: u64,
+    pub mitigating: bool,
+    pub flags: u32,
+}
+
+/// A learned open port on a protected IP (surfaced for `lnvps_api` / admin).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearnedPort {
+    pub ip: String,
+    pub port: u16,
+    /// `"tcp"` or `"udp"`.
+    pub proto: String,
+    /// Seconds since this port was last seen serving (0 if unknown).
+    pub age_secs: u64,
+}
+
 /// Daemon status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
@@ -137,6 +160,7 @@ pub struct Status {
     pub interfaces: Vec<String>,
     pub protected_prefixes: usize,
     pub active_mitigations: usize,
+    pub learned_ports: usize,
     pub events_cursor: u64,
 }
 
@@ -206,6 +230,8 @@ pub struct SharedState {
     interfaces: Vec<String>,
     rules: RwLock<RuleSet>,
     active: RwLock<Vec<Mitigation>>,
+    tracked: RwLock<Vec<TrackedIp>>,
+    ports: RwLock<Vec<LearnedPort>>,
     events: Mutex<EventRing>,
     /// Bumped whenever the ruleset changes so the control loop reloads it.
     rules_version: AtomicU64,
@@ -226,6 +252,8 @@ impl SharedState {
             interfaces,
             rules: RwLock::new(initial),
             active: RwLock::new(Vec::new()),
+            tracked: RwLock::new(Vec::new()),
+            ports: RwLock::new(Vec::new()),
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
         })
@@ -248,6 +276,16 @@ impl SharedState {
     /// Replace the active-mitigation snapshot (called by the control loop).
     pub fn set_active(&self, active: Vec<Mitigation>) {
         *self.active.write().unwrap() = active;
+    }
+
+    /// Replace the learned-open-ports snapshot (called by the control loop).
+    pub fn set_ports(&self, ports: Vec<LearnedPort>) {
+        *self.ports.write().unwrap() = ports;
+    }
+
+    /// Replace the live tracked-IP rate snapshot (called by the control loop).
+    pub fn set_tracked(&self, tracked: Vec<TrackedIp>) {
+        *self.tracked.write().unwrap() = tracked;
     }
 
     /// Record a mitigation event (called by the control loop).
@@ -315,6 +353,8 @@ pub fn router(state: Arc<SharedState>) -> Router {
                 .delete(delete_override),
         )
         .route("/api/v1/events", get(get_events))
+        .route("/api/v1/ports", get(get_ports))
+        .route("/api/v1/tracked", get(get_tracked))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
 
@@ -398,8 +438,17 @@ async fn get_status(State(state): State<Arc<SharedState>>) -> Json<Status> {
         interfaces: state.interfaces.clone(),
         protected_prefixes: rules.protected.len(),
         active_mitigations: active.len(),
+        learned_ports: state.ports.read().unwrap().len(),
         events_cursor: cursor,
     })
+}
+
+async fn get_ports(State(state): State<Arc<SharedState>>) -> Json<Vec<LearnedPort>> {
+    Json(state.ports.read().unwrap().clone())
+}
+
+async fn get_tracked(State(state): State<Arc<SharedState>>) -> Json<Vec<TrackedIp>> {
+    Json(state.tracked.read().unwrap().clone())
 }
 
 async fn get_rules(State(state): State<Arc<SharedState>>) -> Json<RuleSet> {
@@ -597,8 +646,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 <main>
   <section><h2>Status</h2><div id="status" class="kv"></div></section>
   <section style="grid-column: 1 / -1"><h2>Active mitigations</h2><div id="mit"></div></section>
+  <section style="grid-column: 1 / -1"><h2>Live tracked IPs <span id="trackcount" class="muted"></span></h2>
+    <div id="tracked" style="max-height: 340px; overflow: auto"></div></section>
   <section><h2>Protected prefixes</h2><div id="protected"></div></section>
   <section><h2>Manual overrides</h2><div id="overrides"></div></section>
+  <section style="grid-column: 1 / -1"><h2>Learned open ports <span id="portcount" class="muted"></span></h2>
+    <input id="portfilter" placeholder="filter ip/port/proto" size="22">
+    <div id="ports" style="max-height: 340px; overflow: auto"></div></section>
   <section style="grid-column: 1 / -1"><h2>Events</h2><div id="events"></div></section>
 </main>
 <script>
@@ -620,6 +674,8 @@ function table(cols, rows) {
   return '<table>'+h+b+'</table>';
 }
 function kv(obj) { return Object.entries(obj).map(([k,v])=>'<div>'+k+'</div><div>'+v+'</div>').join(''); }
+function fmtn(n){ return n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? (n/1e3).toFixed(1)+'k' : ''+n; }
+function fmtbps(b){ const bits=b*8; return bits>=1e9 ? (bits/1e9).toFixed(2)+' Gb/s' : bits>=1e6 ? (bits/1e6).toFixed(1)+' Mb/s' : bits>=1e3 ? (bits/1e3).toFixed(0)+' kb/s' : bits+' b/s'; }
 async function refresh() {
   try {
     const st = await api('/api/v1/status');
@@ -635,9 +691,21 @@ async function refresh() {
     $('#mit').innerHTML = table(['cidr','flags','since','manual','peak pps','peak bps','peak syn/s'],
       mit.map(m=>[m.cidr, '<span class=flag>'+flagStr(m.flags)+'</span>',
         new Date(m.since_unix*1000).toLocaleTimeString(), m.manual?'yes':'', m.peak_pps, m.peak_bps, m.peak_syn_pps]));
+    const tracked = await api('/api/v1/tracked');
+    $('#trackcount').textContent = '('+tracked.length+')';
+    $('#tracked').innerHTML = table(['ip','pps','bps','syn/s','drop/s','state'],
+      tracked.map(t=>[t.ip, fmtn(t.pps), fmtbps(t.bps), fmtn(t.syn_pps), fmtn(t.drop_pps),
+        t.mitigating ? '<span class=flag>'+flagStr(t.flags)+'</span>' : 'ok']));
     const rules = await api('/api/v1/rules');
     $('#protected').innerHTML = table(['prefix'], rules.protected.map(p=>[p]));
     $('#overrides').innerHTML = table(['cidr','flags'], rules.overrides.map(o=>[o.cidr,'<span class=flag>'+flagStr(o.flags)+'</span>']));
+    let ports = await api('/api/v1/ports');
+    const f = $('#portfilter').value.trim().toLowerCase();
+    if (f) ports = ports.filter(p => (p.ip+' '+p.port+' '+p.proto).toLowerCase().includes(f));
+    ports.sort((a,b)=> a.ip.localeCompare(b.ip) || a.port-b.port);
+    $('#portcount').textContent = '('+ports.length+')';
+    $('#ports').innerHTML = table(['ip','port','proto','age'],
+      ports.map(p=>[p.ip, p.port, p.proto, p.age_secs+'s']));
     const ev = await api('/api/v1/events?since=' + cursor);
     cursor = ev.cursor;
     if (ev.events.length) { evbuf = ev.events.concat(evbuf).slice(0, 200); }
