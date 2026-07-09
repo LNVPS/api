@@ -814,7 +814,24 @@ async fn get_limits(State(state): State<Arc<SharedState>>) -> Json<Limits> {
     Json(*state.limits.read().unwrap())
 }
 
-async fn get_upgrade(State(state): State<Arc<SharedState>>) -> Json<crate::upgrade::UpgradeStatus> {
+#[derive(Debug, Deserialize)]
+struct UpgradeQuery {
+    /// `?check=1` forces a fresh GitHub release check now (bypassing the cached
+    /// status, which otherwise refreshes on the 6h timer).
+    #[serde(default)]
+    check: bool,
+}
+
+async fn get_upgrade(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<UpgradeQuery>,
+) -> Json<crate::upgrade::UpgradeStatus> {
+    if q.check {
+        let repo = state.upgrade_repo().to_string();
+        let status = crate::upgrade::check(&repo, env!("CARGO_PKG_VERSION")).await;
+        state.set_upgrade(status.clone());
+        return Json(status);
+    }
     Json(state.upgrade.read().unwrap().clone())
 }
 

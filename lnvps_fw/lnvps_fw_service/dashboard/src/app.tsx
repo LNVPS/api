@@ -72,6 +72,15 @@ export function App() {
     refresh();
   };
   const disconnect = () => { localStorage.removeItem("fwtoken"); setToken(""); histRef.current = { rx: [], tx: [], drop: [] }; setD((x) => ({ ...x, status: null, err: "" })); };
+  // Force an immediate GitHub release check (bypasses the cached 6h status).
+  const checkUpdates = async () => {
+    setUpMsg("checking…");
+    try {
+      const u = await api<UpgradeStatus>("/api/v1/upgrade?check=true", token);
+      setD((x) => ({ ...x, upgrade: u }));
+      setUpMsg(u.available ? "" : u.error ? "check failed: " + u.error : "up to date (" + u.current + ")");
+    } catch (e) { setUpMsg("check error: " + (e as Error).message); }
+  };
   const doUpgrade = async () => {
     if (!d.upgrade || !confirm("Download & install " + d.upgrade.latest + " and restart the service?")) return;
     setUpMsg("upgrading… the service will restart shortly");
@@ -143,6 +152,7 @@ export function App() {
           : null}
         {upMsg ? <span class="muted">{upMsg}</span> : null}
         <span class="grow" />
+        <button class="ghost" title="Check for updates now" onClick={checkUpdates}>↻</button>
         <label class="muted"><input type="checkbox" checked={auto} onChange={(e) => setAuto((e.target as HTMLInputElement).checked)} /> auto</label>
         <button class="ghost" onClick={refresh}>refresh</button>
         <button class="ghost" onClick={disconnect}>disconnect</button>
