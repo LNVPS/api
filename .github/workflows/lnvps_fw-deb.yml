@@ -39,6 +39,18 @@ jobs:
             exit 1
           fi
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build dashboard (Vite single-file bundle)
+        # The daemon embeds dashboard/dist/index.html via include_str!, so the
+        # UI must be built before cargo compiles the service. Produces a single
+        # self-contained index.html (JS + CSS inlined).
+        working-directory: lnvps_fw/lnvps_fw_service/dashboard
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
       - name: Install system dependencies
         # bpf-linker needs LLVM; libelf is used by the aya-build eBPF pipeline.
         run: |
