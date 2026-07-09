@@ -134,9 +134,15 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   are decapsulated in-XDP and filtered on the *inner* header (closed port
   dropped, open port passed), verified via the per-dest counters.
 
+`tests/scoping.rs` (destination scoping to `protected`):
+- `unprotected_destination_is_passed_and_uncounted` / 
+  `protected_destination_is_still_mitigated` — with scoping on, a destination
+  outside the protected set is passed and never counted (even with a stale
+  mitigation flag), while an in-scope destination is still mitigated.
+
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
 mitigation`, `--test escalation`, `--test carpet_bomb`, `--test syn_proxy`,
-`--test gre_decap`, `--test smoke`).
+`--test gre_decap`, `--test scoping`, `--test smoke`).
 
 ## Service configuration
 

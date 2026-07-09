@@ -25,7 +25,7 @@ use maps::{
     OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cidr_blocked_v4, cidr_blocked_v6, cookie_secrets,
     count_src_v4, count_src_v6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
     learn_port_v4, learn_port_v6, mark_verified_v4, mark_verified_v6, port_is_open_v4,
-    port_is_open_v6, src_verified_v4, src_verified_v6,
+    port_is_open_v6, protected_v4, protected_v6, scoped, src_verified_v4, src_verified_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -150,6 +150,12 @@ fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let ip = ptr_at::<Ipv4Hdr>(ctx, ip_off)?;
     let dst = ip.dst_addr;
 
+    // Scope to protected destinations: pass anything we do not defend without
+    // counting or mitigating it (a router must never touch transit traffic).
+    if scoped() && !protected_v4(dst) {
+        return Ok(XDP_PASS);
+    }
+
     // Non-first fragments carry no L4 header; options-bearing headers would
     // misplace L4 fields. Count them, but only inspect L4 for plain 20-byte,
     // unfragmented headers.
@@ -176,6 +182,10 @@ fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
 fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result<u32, ()> {
     let ip = ptr_at::<Ipv6Hdr>(ctx, ip_off)?;
     let dst = ip.dst_addr;
+
+    if scoped() && !protected_v6(dst) {
+        return Ok(XDP_PASS);
+    }
 
     // NOTE: no extension-header walking; packets whose first next-header is
     // not directly TCP/UDP/ICMPv6 are counted but not L4-inspected (and are
@@ -402,6 +412,11 @@ fn learn_ipv4(ctx: &TcContext) -> Result<(), ()> {
     if ip.ihl() as usize != Ipv4Hdr::LEN {
         return Ok(());
     }
+    // Only learn ports for protected servers (keeps OPEN_PORTS clean on a
+    // router that forwards for many networks).
+    if scoped() && !protected_v4(ip.src_addr) {
+        return Ok(());
+    }
     if let Some(svc) = egress_service(ctx, ip.proto, EthHdr::LEN + Ipv4Hdr::LEN)? {
         let key = PortKeyV4 {
             addr: ip.src_addr,
@@ -417,6 +432,9 @@ fn learn_ipv4(ctx: &TcContext) -> Result<(), ()> {
 #[inline(always)]
 fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
     let ip = unsafe { &*tc_ptr_at::<Ipv6Hdr>(ctx, EthHdr::LEN)? };
+    if scoped() && !protected_v6(ip.src_addr) {
+        return Ok(());
+    }
     // Only inspect packets whose first next-header is directly TCP/UDP.
     if let Some(svc) = egress_service(ctx, ip.next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)? {
         let key = PortKeyV6 {

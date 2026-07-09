@@ -76,6 +76,28 @@ pub static V4_CIDR_SRC: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CID
 #[map]
 pub static V6_CIDR_SRC: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
 
+/// Protected destination prefixes (IPv4). When scoping is enabled, only traffic
+/// to a covered destination is counted/mitigated; everything else is passed
+/// untouched (so a forwarding router never touches transit traffic).
+#[map]
+pub static PROTECTED_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
+
+/// Protected destination prefixes (IPv6).
+#[map]
+pub static PROTECTED_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
+
+/// Global settings written by userspace. Index 0: `scoped` (1 = only
+/// count/mitigate protected destinations; 0 = protect every destination, the
+/// single-NIC host default).
+#[map]
+pub static SETTINGS: Array<u32> = Array::with_max_entries(1, 0);
+
+/// True if destination scoping is enabled (`protected` is non-empty).
+#[inline(always)]
+pub fn scoped() -> bool {
+    SETTINGS.get(0).copied().unwrap_or(0) != 0
+}
+
 /// Generate a dest-mode reader for one address family: a longest-prefix lookup
 /// returns the covering mitigation state (a /32|/128 exact entry or a wider
 /// protected-prefix entry), defaulting to NORMAL.
@@ -189,6 +211,8 @@ macro_rules! cidr_block_check {
 
 cidr_block_check!(cidr_blocked_v4, [u8; 4], 32, V4_CIDR_SRC);
 cidr_block_check!(cidr_blocked_v6, [u8; 16], 128, V6_CIDR_SRC);
+cidr_block_check!(protected_v4, [u8; 4], 32, PROTECTED_V4);
+cidr_block_check!(protected_v6, [u8; 16], 128, PROTECTED_V6);
 
 /// Verified (non-spoofed) IPv4 sources that completed a SYN-cookie handshake.
 #[map]

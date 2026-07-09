@@ -282,6 +282,21 @@ bits) and runs the normal per-dest/per-prefix logic on the inner IP. SYN-proxy
 is disabled on the decapsulated path (it can't re-encapsulate a reply); the
 port-filter, source-block, and rate/prefix mitigations all still apply.
 
+### Scope (`protected`)
+
+`protected` is the **scope** of the whole firewall, enforced in XDP:
+
+- **Set** — only traffic to a protected destination is counted/mitigated;
+  everything else is `XDP_PASS`ed untouched and never enters the counter maps.
+  Port-learning is likewise limited to protected IPs. **Required on a router**
+  so it never mitigates (or drops) third-party transit traffic it merely
+  forwards.
+- **Empty** — protect *every* destination (single-NIC host mode). Fine for a
+  host; dangerous on a router.
+
+Prefixes come from config or the control API and are synced into `PROTECTED_V4/
+V6` LPM tries plus a `scoped` flag the datapath checks per packet.
+
 ## Control API & dashboard
 
 The daemon exposes an optional **HTTPS** RESTful control API (token-authed) and

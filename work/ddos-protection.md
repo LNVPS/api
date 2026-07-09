@@ -405,6 +405,31 @@ the VMs, drop at ingress on the underlay by decapsulating in-XDP.
       over-count). SYN-proxy for tunneled TCP (needs re-encap).
 - VALIDATED as root: 18 harness (incl. 2 gre_decap) + full unit/api suite green.
 
+### Increment 10 — Scope to protected destinations (M) ✅ DONE
+
+Safety fix for router deployments: previously per-destination detection ran on
+*every* dest in the counter map (unscoped), so a forwarding router could
+mitigate — and drop, since no ports are learned — third-party transit traffic it
+doesn't own. Now `protected` is a hard scope.
+
+- [x] eBPF: `PROTECTED_V4/V6` LPM tries + `SETTINGS[0]` scoped flag +
+      `scoped()`/`protected_v4/v6()` helpers (maps.rs). `handle_ipv4/handle_ipv6`
+      return `XDP_PASS` before counting/mitigating when `scoped && !protected`.
+      Port-learning (`learn_ipv4/v6`) likewise skips non-protected sources.
+      Works on the GRE-decap inner path too (checks the inner dst).
+- [x] userspace: `sync_protected()` reconciles the tries + sets the scoped flag
+      from `runtime_cfg.protected_v4/v6` at startup and whenever pushed rules
+      change; warns when empty (protect-everything host mode).
+- [x] `scoped = 0` when `protected` empty => protect every destination (host
+      mode, unchanged) => no regression to existing suites.
+- [x] harness `tests/scoping.rs` (root): out-of-scope dest passed + uncounted
+      even with a stale mitigation flag; in-scope dest still mitigated.
+      Helpers `set_protected_v4` / `set_scoped`.
+- Note (user, deferred): confirmed-closed port detection (RST/ICMP-unreachable
+      or SYN-without-SYN-ACK-timeout) to reduce open-port-learning false
+      positives — NOT done; kept the open-port allow-list model.
+- VALIDATED as root: 20 harness (incl. 2 scoping) + full unit/api suite green.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

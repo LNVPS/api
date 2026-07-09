@@ -27,10 +27,18 @@ interfaces:
 #   - { name: interix, role: filter } # direct L2 peering
 #   - { name: ens21, role: learn }    # VM network (learn open ports)
 
-# Protected prefixes this host serves. Enables prefix-wide (carpet-bomb)
-# mitigation: if the aggregate rate across a whole prefix crosses the network
-# thresholds, the entire prefix flips to mitigation in one LPM entry, even if no
-# single IP trips its own threshold. (Populated from the API in a later step.)
+# Protected prefixes this host/router defends. This is the SCOPE of the whole
+# firewall:
+#   * If set, XDP only counts/mitigates traffic to these destinations and
+#     PASSES everything else untouched (essential on a forwarding router so it
+#     never touches third-party transit traffic), and port-learning is limited
+#     to these IPs.
+#   * If EMPTY, the firewall protects EVERY destination it sees (single-NIC
+#     host mode). Do NOT leave this empty on a router.
+# It also enables prefix-wide (carpet-bomb) mitigation: if the aggregate rate
+# across a whole prefix crosses the network thresholds, the entire prefix flips
+# to mitigation in one LPM entry even if no single IP trips its own threshold.
+# (Can also be pushed via the control API.)
 protected:
   - 203.0.113.0/24
   # - 2001:db8:1::/48

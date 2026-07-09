@@ -336,6 +336,50 @@ fn apply_rules(
     Ok(())
 }
 
+/// Reconcile the protected-prefix tries and the `scoped` flag from the current
+/// protected lists. When any prefix is set, XDP scopes counting/mitigation to
+/// those destinations (and passes everything else); an empty list means
+/// protect-everything (single-NIC host mode).
+fn sync_protected(
+    bpf: &mut Ebpf,
+    v4: &[(u32, [u8; 4])],
+    v6: &[(u32, [u8; 16])],
+    applied_v4: &mut Vec<(u32, [u8; 4])>,
+    applied_v6: &mut Vec<(u32, [u8; 16])>,
+) -> Result<()> {
+    {
+        let mut t: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(
+            bpf.map_mut("PROTECTED_V4")
+                .context("PROTECTED_V4 missing")?,
+        )?;
+        for (len, net) in applied_v4.drain(..) {
+            let _ = t.remove(&Key::new(len, net));
+        }
+        for &(len, net) in v4 {
+            t.insert(&Key::new(len, net), 1u8, 0)?;
+            applied_v4.push((len, net));
+        }
+    }
+    {
+        let mut t: LpmTrie<_, [u8; 16], u8> = LpmTrie::try_from(
+            bpf.map_mut("PROTECTED_V6")
+                .context("PROTECTED_V6 missing")?,
+        )?;
+        for (len, net) in applied_v6.drain(..) {
+            let _ = t.remove(&Key::new(len, net));
+        }
+        for &(len, net) in v6 {
+            t.insert(&Key::new(len, net), 1u8, 0)?;
+            applied_v6.push((len, net));
+        }
+    }
+    let scoped = u32::from(!(v4.is_empty() && v6.is_empty()));
+    let mut s: Array<_, u32> =
+        Array::try_from(bpf.map_mut("SETTINGS").context("SETTINGS missing")?)?;
+    s.set(0, scoped, 0)?;
+    Ok(())
+}
+
 /// Build the API shared state and spawn the HTTPS server; returns the shared
 /// handle the control loop publishes into.
 fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
@@ -394,7 +438,29 @@ async fn main() -> Result<()> {
     let api_state = start_api(&cfg)?;
     let mut rules_version = 0u64;
     let mut applied_overrides: HashMap<String, CidrKey> = HashMap::new();
+    let mut applied_protected_v4: Vec<(u32, [u8; 4])> = Vec::new();
+    let mut applied_protected_v6: Vec<(u32, [u8; 16])> = Vec::new();
     let mut mit_tracker = MitTracker::default();
+
+    // Scope XDP to the protected prefixes up front (empty => host mode).
+    sync_protected(
+        &mut bpf,
+        &runtime_cfg.protected_v4,
+        &runtime_cfg.protected_v6,
+        &mut applied_protected_v4,
+        &mut applied_protected_v6,
+    )?;
+    if runtime_cfg.protected_v4.is_empty() && runtime_cfg.protected_v6.is_empty() {
+        warn!(
+            "no protected prefixes configured: protecting ALL destinations \
+             (host mode). On a router, set `protected` to your ranges."
+        );
+    } else {
+        info!(
+            "Scoped to {} protected prefix(es)",
+            runtime_cfg.protected_v4.len() + runtime_cfg.protected_v6.len()
+        );
+    }
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     let stats_secs = cfg.learning.stats_interval_secs;
@@ -439,6 +505,15 @@ async fn main() -> Result<()> {
                             apply_rules(&mut bpf, &rules, &mut applied_overrides, &mut runtime_cfg, now)
                         {
                             warn!("apply rules failed: {e}");
+                        }
+                        if let Err(e) = sync_protected(
+                            &mut bpf,
+                            &runtime_cfg.protected_v4,
+                            &runtime_cfg.protected_v6,
+                            &mut applied_protected_v4,
+                            &mut applied_protected_v6,
+                        ) {
+                            warn!("sync protected failed: {e}");
                         }
                     }
                 }

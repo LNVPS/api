@@ -203,6 +203,21 @@ impl Harness {
         Ok(())
     }
 
+    /// Add a protected IPv4 prefix (destinations XDP will count/mitigate).
+    pub fn set_protected_v4(&mut self, net: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
+        let mut trie: LpmTrie<_, [u8; 4], u8> =
+            LpmTrie::try_from(self.bpf.map_mut("PROTECTED_V4").unwrap())?;
+        trie.insert(&Key::new(prefix_len, net.octets()), 1u8, 0)?;
+        Ok(())
+    }
+
+    /// Toggle destination scoping (index 0 of the SETTINGS array).
+    pub fn set_scoped(&mut self, on: bool) -> anyhow::Result<()> {
+        let mut s: Array<_, u32> = Array::try_from(self.bpf.map_mut("SETTINGS").unwrap())?;
+        s.set(0, u32::from(on), 0)?;
+        Ok(())
+    }
+
     /// Manually install a source CIDR block (as escalation would).
     pub fn block_cidr_v4(&mut self, net: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
         let mut trie: LpmTrie<_, [u8; 4], u8> =
