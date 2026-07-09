@@ -16,6 +16,7 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
   - [Mikrotik JSON-API](https://help.mikrotik.com/docs/display/ROS/REST+API) — static ARP for anti-spoofing
   - OVH Additional IP virtual MAC management
   - Cloudflare API — forward A/AAAA and reverse PTR records
+  - Route-server management — BGP session, tunnel (GRE/VXLAN/WireGuard) and default-route visibility/control across RouterOS and Linux (BIRD/Pathvector over SSH) routers
 - **Nostr integration**
   - NIP-17 direct-message notifications
   - NIP-05 identity server (`lnvps_nostr`)
@@ -25,7 +26,8 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
   - Handles customer support requests with an OpenAI-compatible LLM and API-calling tools
   - Email channel (IMAP IDLE inbox watching + SMTP replies) and Nostr kind-1 mention channel
 - **Security**
-  - XDP eBPF SYN-flood rate limiter (`lnvps_ebpf` + `lnvps_fw_service`)
+  - XDP eBPF SYN-flood rate limiter with self-upgrading `.deb` daemon (`lnvps_ebpf` + `lnvps_fw_service`)
+  - Per-VM firewall rules and default policy (applied on the host)
   - Database field-level AES-GCM encryption for sensitive columns
   - Cloudflare Turnstile captcha (optional)
 - **Observability**
@@ -56,7 +58,10 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
 | `lnvps_host_util` | — | Host-side helper utilities packaged for isolated Docker builds |
 | `lnvps_e2e` | — | End-to-end integration test suite (spins up API + worker against a real DB/LND) |
 | `lnvps_ebpf` | — | XDP eBPF SYN-flood rate limiter (kernel program) |
-| `lnvps_fw_service` | `lnvps_fw_service` | Userspace loader for the eBPF firewall |
+| `lnvps_fw_common` | — | Shared types between the eBPF datapath and the userspace loader |
+| `lnvps_fw_service` | `lnvps_fw_service` | Userspace loader + HTTP control API for the eBPF firewall, with self-upgrade from GitHub `.deb` releases |
+
+> The `lnvps_ebpf`, `lnvps_fw_common`, and `lnvps_fw_service` crates live in the separate `lnvps_fw/` workspace (excluded from the root one) because the eBPF datapath needs its own nightly `rust-src` + `bpf-linker` toolchain and target.
 
 ## Building
 
@@ -69,7 +74,7 @@ cargo build --release -p lnvps_operator
 cargo build --release -p lnvps_health
 ```
 
-The eBPF crates (`lnvps_ebpf`, `lnvps_fw_service`) are not part of the main workspace and require a nightly eBPF toolchain; build them separately.
+The eBPF crates (`lnvps_ebpf`, `lnvps_fw_common`, `lnvps_fw_service`) live in the separate `lnvps_fw/` workspace and require a nightly eBPF toolchain (`rust-src` + `bpf-linker`); build them separately. Tagging a `vX.Y.Z` release builds and attaches a `.deb` of `lnvps_fw_service` to the GitHub release, which running daemons install via their self-upgrade endpoint.
 
 ## Running
 

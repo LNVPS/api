@@ -56,6 +56,11 @@ When the user asks to create a release:
 
 1. **Update `API_CHANGELOG.md`** — Change `## [Unreleased]` to `## [vX.Y.Z] - YYYY-MM-DD` with the current date
 2. **Update `Cargo.toml` versions** — Bump the version in the root `Cargo.toml` under `[workspace.package]` (all crates inherit via `version.workspace = true`)
-3. **Commit the changes** — `git commit -m "chore: release vX.Y.Z"`
-4. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
-5. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`
+3. **Bump the `lnvps_fw` version** — `lnvps_fw` is a **separate workspace** (excluded from the root one) with its own `[workspace.package]` version in `lnvps_fw/Cargo.toml`. Bump it to the **same `X.Y.Z`** as the main workspace so the two stay in lockstep. This matters: the firewall daemon's self-upgrade (`lnvps_fw_service/src/upgrade.rs`) compares its compiled `CARGO_PKG_VERSION` against the newest `vX.Y.Z` GitHub release tag — if `lnvps_fw/Cargo.toml` lags behind the tag, every running daemon will report an upgrade is available on startup and every 6h.
+4. **Commit the changes** — `git commit -m "chore: release vX.Y.Z"`
+5. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+6. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`
+
+### `lnvps_fw` release artifact
+
+The `vX.Y.Z` tag is what drives the firewall release. Pushing it triggers the `.github/workflows/lnvps_fw-deb.yml` workflow, which builds the `lnvps_fw_service` daemon (including the eBPF datapath, via a nightly `rust-src` + `bpf-linker` toolchain) into a Debian package with `cargo deb` and attaches the `.deb` to the GitHub release. Running daemons then discover and install that `.deb` through the self-upgrade endpoint (`GET`/`POST /api/v1/upgrade`). There is **no separate `fw` tag** — the fw workspace shares the single `vX.Y.Z` tag, which is exactly why step 3's version bump must happen before tagging.
