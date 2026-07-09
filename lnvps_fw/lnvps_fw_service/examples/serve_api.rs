@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lnvps_fw_common::{DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY};
 use lnvps_fw_service::api::{
-    self, EventKind, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet, SharedState,
-    SourceBlock, Totals, TrackedIp,
+    self, EventKind, InterfaceInfo, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet,
+    SharedState, SourceBlock, Totals, TrackedIp,
 };
 
 // --- detection limits used by the simulator (mirrors the real defaults) ---
@@ -225,6 +225,11 @@ impl MitBook {
                 peak_pps: peak.0,
                 peak_bps: peak.1,
                 peak_syn_pps: peak.2,
+                // Demo: surface the peak values as the "live" rates too.
+                rx_pps: peak.0,
+                rx_bps: peak.1,
+                rx_syn_pps: peak.2,
+                ..Default::default()
             });
         }
         // Anything auto that vanished -> Stop.
@@ -236,9 +241,10 @@ impl MitBook {
             .collect();
         for c in gone {
             let flags = self.prev.remove(&c).unwrap_or(0);
-            state.record_event(EventKind::Stop, c.clone(), flags, 0, 0, 0);
+            // Report the episode's peak rates on Stop (matches the real loop).
+            let (pps, bps, syn) = self.peak.remove(&c).unwrap_or((0, 0, 0));
+            state.record_event(EventKind::Stop, c.clone(), flags, pps, bps, syn);
             self.since.remove(&c);
-            self.peak.remove(&c);
         }
         out
     }
@@ -490,12 +496,19 @@ async fn main() -> anyhow::Result<()> {
         None,
     );
     state.set_limits(LIM);
+    // Demo NIC so the dashboard shows the link-speed + bps-vs-line-rate hint
+    // (the 40 Gbit/s prefix bps limit exceeds this 10G link on purpose).
+    state.set_nics(vec![InterfaceInfo {
+        name: "demo0".into(),
+        speed_mbps: Some(10_000),
+        role: "host".into(),
+    }]);
     state.set_ports(learned_ports(0));
 
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim(sim_state).await });
 
-    let tls = api::load_or_generate_tls(None, None, addr.ip())?;
+    let tls = api::load_or_generate_tls(None, None, addr.ip(), None)?;
     println!("serving https://{addr}  (token: devtoken)  — simulated live traffic");
     api::serve(state, addr, tls).await
 }

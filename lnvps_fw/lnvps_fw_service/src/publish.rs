@@ -34,6 +34,9 @@ pub struct PendingEvent {
 pub struct MitTracker {
     prev_flags: HashMap<String, u32>,
     since: HashMap<String, u64>,
+    /// Last-seen peak rates per active cidr, so a Stop event can report the
+    /// peak of the episode instead of zeros.
+    peak: HashMap<String, (u64, u64, u64)>,
 }
 
 impl MitTracker {
@@ -51,6 +54,8 @@ impl MitTracker {
 
         for m in &cur {
             cur_flags.insert(m.cidr.clone(), m.flags);
+            // Remember the latest (peak) rates so the eventual Stop can report them.
+            self.peak.insert(m.cidr.clone(), (m.pps, m.bps, m.syn_pps));
             match self.prev_flags.get(&m.cidr) {
                 None => {
                     self.since.insert(m.cidr.clone(), now_unix);
@@ -82,19 +87,24 @@ impl MitTracker {
                 peak_pps: m.pps,
                 peak_bps: m.bps,
                 peak_syn_pps: m.syn_pps,
+                // Live rates are filled in by the control loop (which has the
+                // per-window tracker data), keyed by cidr.
+                ..Default::default()
             });
         }
 
         // Anything that was active last tick but isn't now -> Stop.
         for (cidr, &flags) in &self.prev_flags {
             if !cur_flags.contains_key(cidr) {
+                // Report the episode's peak rates on Stop (not zeros).
+                let (pps, bps, syn_pps) = self.peak.remove(cidr).unwrap_or((0, 0, 0));
                 events.push(PendingEvent {
                     kind: EventKind::Stop,
                     cidr: cidr.clone(),
                     flags,
-                    pps: 0,
-                    bps: 0,
-                    syn_pps: 0,
+                    pps,
+                    bps,
+                    syn_pps,
                 });
                 self.since.remove(cidr);
             }
@@ -142,11 +152,12 @@ mod tests {
         let (_active, ev) = t.step(vec![inp("a/32", 3)], 160);
         assert!(ev.is_empty());
 
-        // Tick 4: gone -> Stop.
+        // Tick 4: gone -> Stop, carrying the episode's peak rates (not zeros).
         let (active, ev) = t.step(vec![], 170);
         assert!(active.is_empty());
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, EventKind::Stop);
         assert_eq!(ev[0].flags, 3);
+        assert_eq!((ev[0].pps, ev[0].bps, ev[0].syn_pps), (10, 20, 5));
     }
 }

@@ -360,28 +360,20 @@ async fn dashboard_sets_strict_csp() {
 }
 
 #[tokio::test]
-async fn vendored_assets_served_same_origin_with_csp() {
-    for (path, needle) in [
-        ("/assets/app.js", "preact"),
-        ("/assets/preact.js", ""),
-        ("/assets/htm.js", ""),
-        ("/assets/app.css", "body"),
-    ] {
-        let res = router(state())
-            .oneshot(req("GET", path, None, None))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "{path}");
-        assert!(
-            res.headers().get("content-security-policy").is_some(),
-            "{path} missing CSP"
-        );
-        let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        assert!(!bytes.is_empty(), "{path} empty");
-        if !needle.is_empty() {
-            assert!(String::from_utf8_lossy(&bytes).contains(needle), "{path}");
-        }
-    }
+async fn dashboard_is_a_self_contained_single_file() {
+    // The Vite single-file build inlines all JS + CSS; the served page must not
+    // reference any external asset/CDN, so a token typed into it can't leak.
+    let res = router(state())
+        .oneshot(req("GET", "/", None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(!body.contains("esm.sh"), "no external CDN");
+    assert!(!body.contains("/assets/"), "no external asset references");
+    assert!(body.contains("id=\"app\""), "app root present");
+    assert!(body.contains("<script"), "inlined script present");
 }
 
 #[tokio::test]

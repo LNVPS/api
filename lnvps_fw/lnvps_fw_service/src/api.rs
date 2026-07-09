@@ -106,8 +106,11 @@ pub struct RuleSet {
     pub source_blocks: Vec<String>,
 }
 
-/// One currently-active mitigation, reported in the status snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One currently-active mitigation, reported in the status snapshot. Carries
+/// the same live per-window rates as a `TrackedIp` (so the dashboard can render
+/// mitigations with the identical row format), plus the mitigation-specific
+/// peak/since/manual metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mitigation {
     pub cidr: String,
     pub flags: u32,
@@ -116,6 +119,23 @@ pub struct Mitigation {
     pub peak_pps: u64,
     pub peak_bps: u64,
     pub peak_syn_pps: u64,
+    /// Live per-window rates (match `TrackedIp`); 0 if not sampled this tick.
+    #[serde(default)]
+    pub rx_pps: u64,
+    #[serde(default)]
+    pub rx_bps: u64,
+    #[serde(default)]
+    pub rx_syn_pps: u64,
+    #[serde(default)]
+    pub rx_drop_pps: u64,
+    #[serde(default)]
+    pub tx_pps: u64,
+    #[serde(default)]
+    pub tx_bps: u64,
+    #[serde(default)]
+    pub rx_drop_pct: u32,
+    #[serde(default)]
+    pub load_pct: u32,
 }
 
 /// Kind of mitigation event.
@@ -269,12 +289,29 @@ pub struct LearnedPort {
     pub age_secs: u64,
 }
 
+/// An attached interface and its link speed (for line-rate hints).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceInfo {
+    pub name: String,
+    /// Link speed in Mbit/s reported by the driver, if known (`None` when the
+    /// driver doesn't expose it, e.g. virtual NICs).
+    pub speed_mbps: Option<u64>,
+    /// Interface role: `"host"` / `"filter"` sit on the XDP ingress/filter path
+    /// (attack traffic enters + is filtered here, so they count toward the
+    /// line-rate ceiling); `"learn"` is the VM-facing NIC (internal, excluded).
+    #[serde(default)]
+    pub role: String,
+}
+
 /// Daemon status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub version: String,
     pub uptime_secs: u64,
     pub interfaces: Vec<String>,
+    /// Attached interfaces with link speeds (for bps-vs-line-rate hints).
+    #[serde(default)]
+    pub nics: Vec<InterfaceInfo>,
     pub protected_prefixes: usize,
     pub active_mitigations: usize,
     pub learned_ports: usize,
@@ -356,6 +393,8 @@ pub struct SharedState {
     totals: RwLock<Totals>,
     limits: RwLock<Limits>,
     upgrade: RwLock<crate::upgrade::UpgradeStatus>,
+    /// Attached interfaces + link speeds (published once at startup).
+    nics: RwLock<Vec<InterfaceInfo>>,
     /// GitHub owner/repo to check for self-upgrade releases.
     upgrade_repo: String,
     /// Whether `POST /upgrade` may install a release as root.
@@ -395,6 +434,7 @@ impl SharedState {
             totals: RwLock::new(Totals::default()),
             limits: RwLock::new(Limits::default()),
             upgrade: RwLock::new(crate::upgrade::UpgradeStatus::default()),
+            nics: RwLock::new(Vec::new()),
             upgrade_repo,
             allow_remote_upgrade,
             upgrade_pubkey,
@@ -451,6 +491,11 @@ impl SharedState {
     /// Publish the detection thresholds (called at startup).
     pub fn set_limits(&self, limits: Limits) {
         *self.limits.write().unwrap() = limits;
+    }
+
+    /// Publish the attached-interface list + link speeds (called at startup).
+    pub fn set_nics(&self, nics: Vec<InterfaceInfo>) {
+        *self.nics.write().unwrap() = nics;
     }
 
     /// GitHub owner/repo used for self-upgrade checks.
@@ -555,7 +600,6 @@ pub fn router(state: Arc<SharedState>) -> Router {
 
     let dashboard = Router::new()
         .route("/", get(dashboard))
-        .route("/assets/{file}", get(asset))
         .layer(middleware::from_fn_with_state(state.clone(), ip_gate))
         .with_state(state);
 
@@ -603,28 +647,6 @@ async fn dashboard() -> Response {
         .into_response()
 }
 
-/// Serve a vendored front-end asset by name (same-origin only). Unknown names
-/// 404. Every asset carries the strict dashboard CSP so an injected string
-/// still cannot reach an external origin.
-async fn asset(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
-    let (body, ctype): (&'static str, &str) = match file.as_str() {
-        "app.js" => (ASSET_APP_JS, "text/javascript; charset=utf-8"),
-        "preact.js" => (ASSET_PREACT_JS, "text/javascript; charset=utf-8"),
-        "hooks.js" => (ASSET_HOOKS_JS, "text/javascript; charset=utf-8"),
-        "htm.js" => (ASSET_HTM_JS, "text/javascript; charset=utf-8"),
-        "app.css" => (ASSET_APP_CSS, "text/css; charset=utf-8"),
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    (
-        [
-            (header::CONTENT_TYPE, ctype),
-            (header::CONTENT_SECURITY_POLICY, DASHBOARD_CSP),
-        ],
-        body,
-    )
-        .into_response()
-}
-
 /// Bearer-token + source-IP auth middleware.
 async fn auth(
     State(state): State<Arc<SharedState>>,
@@ -657,6 +679,7 @@ async fn get_status(State(state): State<Arc<SharedState>>) -> Json<Status> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: state.started.elapsed().as_secs(),
         interfaces: state.interfaces.clone(),
+        nics: state.nics.read().unwrap().clone(),
         protected_prefixes: rules.protected.len(),
         active_mitigations: active.len(),
         learned_ports: state.ports.read().unwrap().len(),
@@ -1001,6 +1024,7 @@ pub fn load_or_generate_tls(
     cert_path: Option<&std::path::Path>,
     key_path: Option<&std::path::Path>,
     listen_ip: IpAddr,
+    persist_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<TlsPem> {
     if let (Some(c), Some(k)) = (cert_path, key_path) {
         let cert_pem =
@@ -1013,18 +1037,84 @@ pub fn load_or_generate_tls(
             self_signed: false,
         });
     }
-    // Self-sign for localhost + the listen address.
+    // No cert configured: reuse a persisted self-signed pair if present, so the
+    // cert (and its fingerprint) stays stable across restarts — otherwise every
+    // restart would mint a new cert and break any client trust/pin. Only mint a
+    // fresh pair when none is persisted (or when no persist dir is given, e.g.
+    // in tests, where the pair stays ephemeral).
+    if let Some(dir) = persist_dir {
+        let cert_p = dir.join("self_signed.crt");
+        let key_p = dir.join("self_signed.key");
+        if let (Ok(cert_pem), Ok(key_pem)) = (std::fs::read(&cert_p), std::fs::read(&key_p))
+            && !cert_pem.is_empty()
+            && !key_pem.is_empty()
+        {
+            return Ok(TlsPem {
+                cert_pem,
+                key_pem,
+                // Reused persisted self-signed pair (stable across restarts).
+                self_signed: false,
+            });
+        }
+        let (cert_pem, key_pem) = generate_self_signed(listen_ip)?;
+        persist_self_signed(dir, &cert_p, &key_p, &cert_pem, &key_pem)?;
+        return Ok(TlsPem {
+            cert_pem,
+            key_pem,
+            self_signed: true,
+        });
+    }
+    let (cert_pem, key_pem) = generate_self_signed(listen_ip)?;
+    Ok(TlsPem {
+        cert_pem,
+        key_pem,
+        self_signed: true,
+    })
+}
+
+/// Generate a self-signed cert/key (PEM) covering `localhost` + the listen IP.
+fn generate_self_signed(listen_ip: IpAddr) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut sans = vec!["localhost".to_string()];
     if !listen_ip.is_unspecified() {
         sans.push(listen_ip.to_string());
     }
     let cert = rcgen::generate_simple_self_signed(sans)
         .map_err(|e| anyhow::anyhow!("self-signed cert generation failed: {e}"))?;
-    Ok(TlsPem {
-        cert_pem: cert.cert.pem().into_bytes(),
-        key_pem: cert.key_pair.serialize_pem().into_bytes(),
-        self_signed: true,
-    })
+    Ok((
+        cert.cert.pem().into_bytes(),
+        cert.key_pair.serialize_pem().into_bytes(),
+    ))
+}
+
+/// Persist a generated self-signed pair: the private key is written `0600` in a
+/// `0700` root-only directory so it is never world-readable.
+fn persist_self_signed(
+    dir: &std::path::Path,
+    cert_p: &std::path::Path,
+    key_p: &std::path::Path,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating tls state dir {}", dir.display()))?;
+    std::fs::write(cert_p, cert_pem)
+        .with_context(|| format!("writing {}", cert_p.display()))?;
+    let mut kf = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(key_p)
+        .with_context(|| format!("writing {}", key_p.display()))?;
+    kf.write_all(key_pem)
+        .with_context(|| format!("writing {}", key_p.display()))?;
+    Ok(())
 }
 
 /// Install the process-wide rustls crypto provider (ring) once. Idempotent.
@@ -1032,40 +1122,16 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Self-contained internal dashboard: plain HTML + vanilla JS, no external
-/// assets. Prompts once for the API token (kept in localStorage) and polls the
-/// JSON API to render status, active mitigations, rules, and the event stream.
-const DASHBOARD_HTML: &str = r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lnvps_fw dashboard</title>
-<link rel="stylesheet" href="/assets/app.css">
-<script type="importmap">
-{"imports":{"preact":"/assets/preact.js","preact/hooks":"/assets/hooks.js","htm":"/assets/htm.js"}}
-</script>
-</head>
-<body>
-<div id="app"></div>
-<script type="module" src="/assets/app.js"></script>
-</body>
-</html>
-"##;
+/// The internal dashboard: a Vite + TypeScript + Preact app built into a single
+/// self-contained `index.html` (JS + CSS inlined, no external requests). Built
+/// from `dashboard/` with `bun run build`; the committed `dist/index.html` is
+/// embedded here so a plain `cargo build` needs no Node toolchain.
+const DASHBOARD_HTML: &str = include_str!("../dashboard/dist/index.html");
 
-/// Vendored front-end assets, embedded at build time and served same-origin so
-/// the token-entry dashboard never loads code from a third-party CDN. A strict
-/// CSP (see `dashboard`/`asset` handlers) forbids any external origin.
-const ASSET_APP_JS: &str = include_str!("../assets/app.js");
-const ASSET_APP_CSS: &str = include_str!("../assets/app.css");
-const ASSET_PREACT_JS: &str = include_str!("../assets/preact.js");
-const ASSET_HOOKS_JS: &str = include_str!("../assets/hooks.js");
-const ASSET_HTM_JS: &str = include_str!("../assets/htm.js");
-
-/// Content-Security-Policy for the dashboard + assets: everything must come
-/// from this origin; no external script/style/connect is permitted, so a token
-/// typed into the page cannot be exfiltrated to an outside host even if one of
-/// the vendored libraries were somehow malicious.
+/// Content-Security-Policy for the dashboard: everything is same-origin and
+/// inlined, so no external script/style/connect is permitted — a token typed
+/// into the page can never be exfiltrated to an outside host. `unsafe-inline`
+/// is required because the single-file bundle inlines its script and style.
 const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; \
 style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; \
 base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -1143,7 +1209,8 @@ mod tests {
     #[test]
     fn tls_self_signed_generates_pem() {
         let tls =
-            load_or_generate_tls(None, None, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).unwrap();
+            load_or_generate_tls(None, None, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), None)
+                .unwrap();
         assert!(tls.self_signed);
         assert!(
             String::from_utf8_lossy(&tls.cert_pem).contains("BEGIN CERTIFICATE"),

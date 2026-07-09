@@ -13,6 +13,13 @@ RestartSec=5
 # run as root for broad kernel compatibility.
 User=root
 LimitMEMLOCK=infinity
+# /var/lib/lnvps_fw holds the persisted self-signed API cert (stable fingerprint
+# across restarts); /run/lnvps_fw is the root-only staging dir for self-upgrade
+# .deb downloads. systemd creates both 0700, root-owned, and cleans /run on stop.
+StateDirectory=lnvps_fw
+StateDirectoryMode=0700
+RuntimeDirectory=lnvps_fw
+RuntimeDirectoryMode=0700
 # Light hardening that does not interfere with the eBPF datapath.
 ProtectHome=true
 NoNewPrivileges=false

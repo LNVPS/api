@@ -17,8 +17,8 @@ use lnvps_fw_common::{
 };
 
 use lnvps_fw_service::api::{
-    self, CidrKey, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet, SharedState,
-    SourceBlock, Totals, TrackedIp, parse_cidr,
+    self, CidrKey, InterfaceInfo, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet,
+    SharedState, SourceBlock, Totals, TrackedIp, parse_cidr,
 };
 use lnvps_fw_service::cidr::{mask_v4, mask_v6};
 use lnvps_fw_service::config::{Config, IfaceRole};
@@ -215,6 +215,16 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Read an interface's link speed (Mbit/s) from sysfs. Returns `None` when the
+/// driver doesn't report it (virtual NICs report -1 / error).
+fn read_link_speed(name: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(format!("/sys/class/net/{name}/speed")).ok()?;
+    match raw.trim().parse::<i64>() {
+        Ok(mbps) if mbps > 0 => Some(mbps as u64),
+        _ => None,
+    }
 }
 
 /// Percentage of packets being dropped (drop_pps as a share of pps), clamped
@@ -517,6 +527,116 @@ fn live_rates_by_cidr(det: &DetectionState, now_ns: u64) -> HashMap<String, Rate
     out
 }
 
+/// Live per-window rates for a mitigation row, matching the tracked-IP columns.
+#[derive(Default, Clone, Copy)]
+struct MitLive {
+    rx_pps: u64,
+    rx_bps: u64,
+    rx_syn_pps: u64,
+    rx_drop_pps: u64,
+    tx_pps: u64,
+    tx_bps: u64,
+    rx_drop_pct: u32,
+    load_pct: u32,
+}
+
+/// Full live per-window rows keyed by canonical CIDR, for every dest/prefix
+/// sampled this tick — used to give each active mitigation the same live rate
+/// columns as the tracked-IP view (rx/tx pps+bps, syn/s, drop/s, drop%, load).
+fn live_rows_by_cidr(
+    det: &DetectionState,
+    now_ns: u64,
+    det_cfg: &DetectionConfig,
+    net_cfg: &DetectionConfig,
+) -> HashMap<String, MitLive> {
+    let mut out = HashMap::new();
+    for (k, tr) in &det.v4 {
+        if tr.last_ns != now_ns {
+            continue;
+        }
+        let tx = det.tx_v4.get(k).copied().unwrap_or_default();
+        out.insert(
+            format!("{}/32", Ipv4Addr::from(*k)),
+            MitLive {
+                rx_pps: tr.last.pps,
+                rx_bps: tr.last.bps,
+                rx_syn_pps: tr.last.syn_pps,
+                rx_drop_pps: tr.last.drop_pps,
+                tx_pps: tx.pps,
+                tx_bps: tx.bps,
+                rx_drop_pct: drop_pct(tr.last.drop_pps, tr.last.pps),
+                load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, det_cfg),
+            },
+        );
+    }
+    for (k, tr) in &det.v6 {
+        if tr.last_ns != now_ns {
+            continue;
+        }
+        let tx = det.tx_v6.get(k).copied().unwrap_or_default();
+        out.insert(
+            format!("{}/128", Ipv6Addr::from(*k)),
+            MitLive {
+                rx_pps: tr.last.pps,
+                rx_bps: tr.last.bps,
+                rx_syn_pps: tr.last.syn_pps,
+                rx_drop_pps: tr.last.drop_pps,
+                tx_pps: tx.pps,
+                tx_bps: tx.bps,
+                rx_drop_pct: drop_pct(tr.last.drop_pps, tr.last.pps),
+                load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, det_cfg),
+            },
+        );
+    }
+    for ((len, net), tr) in &det.prefix_v4 {
+        if tr.last_ns != now_ns {
+            continue;
+        }
+        let tx = det
+            .tx_v4
+            .iter()
+            .filter(|(ip, _)| mask_v4(**ip, *len) == *net)
+            .fold((0u64, 0u64), |a, (_, r)| (a.0 + r.pps, a.1 + r.bps));
+        out.insert(
+            format!("{}/{len}", Ipv4Addr::from(*net)),
+            MitLive {
+                rx_pps: tr.last.pps,
+                rx_bps: tr.last.bps,
+                rx_syn_pps: tr.last.syn_pps,
+                rx_drop_pps: tr.last.drop_pps,
+                tx_pps: tx.0,
+                tx_bps: tx.1,
+                rx_drop_pct: drop_pct(tr.last.drop_pps, tr.last.pps),
+                load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, net_cfg),
+            },
+        );
+    }
+    for ((len, net), tr) in &det.prefix_v6 {
+        if tr.last_ns != now_ns {
+            continue;
+        }
+        let tx = det
+            .tx_v6
+            .iter()
+            .filter(|(ip, _)| mask_v6(**ip, *len) == *net)
+            .fold((0u64, 0u64), |a, (_, r)| (a.0 + r.pps, a.1 + r.bps));
+        out.insert(
+            format!("{}/{len}", Ipv6Addr::from(*net)),
+            MitLive {
+                rx_pps: tr.last.pps,
+                rx_bps: tr.last.bps,
+                rx_syn_pps: tr.last.syn_pps,
+                rx_drop_pps: tr.last.drop_pps,
+                tx_pps: tx.0,
+                tx_bps: tx.1,
+                rx_drop_pct: drop_pct(tr.last.drop_pps, tr.last.pps),
+                load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, net_cfg),
+            },
+        );
+    }
+    out
+}
+
 /// Write a manual protection-flag override into the dest-state trie.
 fn write_dest_state(bpf: &mut Ebpf, key: CidrKey, flags: u32, now_ns: u64) -> Result<()> {
     let st = DestState {
@@ -772,13 +892,20 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
             }
         });
     }
+    // Persist an auto-generated self-signed pair here so its fingerprint is
+    // stable across restarts (systemd creates this via StateDirectory=).
+    let tls_state_dir = std::path::Path::new("/var/lib/lnvps_fw");
     let tls = api::load_or_generate_tls(
         api_cfg.tls_cert.as_deref(),
         api_cfg.tls_key.as_deref(),
         api_cfg.listen.ip(),
+        Some(tls_state_dir),
     )?;
     if tls.self_signed {
-        info!("Control API: no cert configured, generated a self-signed cert");
+        info!(
+            "Control API: no cert configured, generated a self-signed cert (persisted in {})",
+            tls_state_dir.display()
+        );
     }
     let addr = api_cfg.listen;
     let srv_state = state.clone();
@@ -787,6 +914,28 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
             warn!("Control API server exited: {e}");
         }
     });
+    // Publish the attached interfaces + their link speeds and roles (for
+    // line-rate hints; only ingress/filter NICs count toward the ceiling).
+    state.set_nics(
+        cfg.interfaces
+            .iter()
+            .map(|spec| {
+                let name = spec.name().to_string();
+                let speed_mbps = read_link_speed(&name);
+                let role = match spec.role() {
+                    IfaceRole::Host => "host",
+                    IfaceRole::Filter => "filter",
+                    IfaceRole::Learn => "learn",
+                }
+                .to_string();
+                InterfaceInfo {
+                    name,
+                    speed_mbps,
+                    role,
+                }
+            })
+            .collect(),
+    );
     info!("Control API (HTTPS) listening on https://{addr}");
     Ok(Some(state))
 }
@@ -961,10 +1110,34 @@ async fn main() -> Result<()> {
                             peak_pps: peak.pps,
                             peak_bps: peak.bps,
                             peak_syn_pps: peak.syn_pps,
+                            ..Default::default()
                         });
                     }
                     // Drop bookkeeping for overrides that no longer exist.
                     manual_state.retain(|c, _| seen.contains(c));
+                    // Enrich every mitigation (auto + manual) with the same live
+                    // per-window rates as the tracked-IP view, keyed by cidr.
+                    let live_rows = live_rows_by_cidr(
+                        &detection_state,
+                        now,
+                        &runtime_cfg.detection,
+                        &runtime_cfg.network,
+                    );
+                    for m in &mut active {
+                        let key = parse_cidr(&m.cidr)
+                            .map(|k| k.to_cidr_string())
+                            .unwrap_or_else(|| m.cidr.clone());
+                        if let Some(lr) = live_rows.get(&key) {
+                            m.rx_pps = lr.rx_pps;
+                            m.rx_bps = lr.rx_bps;
+                            m.rx_syn_pps = lr.rx_syn_pps;
+                            m.rx_drop_pps = lr.rx_drop_pps;
+                            m.tx_pps = lr.tx_pps;
+                            m.tx_bps = lr.tx_bps;
+                            m.rx_drop_pct = lr.rx_drop_pct;
+                            m.load_pct = lr.load_pct;
+                        }
+                    }
                     st.set_active(active);
                     st.set_tracked(collect_tracked(
                         &detection_state,
