@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use lnvps_fw_service::api::{
     self, EventKind, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet, SharedState,
-    TrackedIp,
+    SourceBlock, TrackedIp,
 };
 
 #[tokio::main]
@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
                 cidr: "192.0.2.9/32".into(),
                 flags: 3,
             }],
+            source_blocks: vec!["45.134.26.0/24".into()],
         },
         128,
     );
@@ -114,6 +115,20 @@ async fn main() -> anyhow::Result<()> {
             mitigating: false,
             flags: 0,
             load_pct: 2,
+        },
+    ]);
+    state.set_blocks(vec![
+        SourceBlock {
+            cidr: "91.219.236.0/24".into(),
+            age_secs: 21,
+            pps: 0,
+            manual: false,
+        },
+        SourceBlock {
+            cidr: "193.32.162.7/32".into(),
+            age_secs: 3,
+            pps: 0,
+            manual: false,
         },
     ]);
     state.set_ports(vec![

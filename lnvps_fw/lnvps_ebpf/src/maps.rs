@@ -86,6 +86,16 @@ pub static PROTECTED_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CI
 #[map]
 pub static PROTECTED_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
 
+/// Operator-pushed manual source-CIDR blocks. Unlike the auto `V*_CIDR_SRC`
+/// blocks (which only drop when the destination is escalated to SOURCE_BLOCK),
+/// these drop unconditionally for any traffic to a protected destination.
+#[map]
+pub static MANUAL_BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
+
+/// Manual source-CIDR blocks (IPv6).
+#[map]
+pub static MANUAL_BLOCK_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
+
 /// Global settings written by userspace. Index 0: `scoped` (1 = only
 /// count/mitigate protected destinations; 0 = protect every destination, the
 /// single-NIC host default).
@@ -213,6 +223,8 @@ cidr_block_check!(cidr_blocked_v4, [u8; 4], 32, V4_CIDR_SRC);
 cidr_block_check!(cidr_blocked_v6, [u8; 16], 128, V6_CIDR_SRC);
 cidr_block_check!(protected_v4, [u8; 4], 32, PROTECTED_V4);
 cidr_block_check!(protected_v6, [u8; 16], 128, PROTECTED_V6);
+cidr_block_check!(manual_blocked_v4, [u8; 4], 32, MANUAL_BLOCK_V4);
+cidr_block_check!(manual_blocked_v6, [u8; 16], 128, MANUAL_BLOCK_V6);
 
 /// Verified (non-spoofed) IPv4 sources that completed a SYN-cookie handshake.
 #[map]

@@ -9,7 +9,7 @@ use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
     Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage, RuleSet,
-    SharedState, Status, router,
+    SharedState, SourceBlock, Status, router,
 };
 use tower::ServiceExt;
 
@@ -86,6 +86,7 @@ async fn rules_round_trip_and_bad_cidr_rejected() {
             cidr: "10.0.0.5/32".into(),
             flags: 1,
         }],
+        source_blocks: vec![],
     })
     .unwrap();
     let res = app
@@ -265,6 +266,57 @@ async fn limits_put_get_roundtrip_and_validation() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn blocks_endpoint() {
+    let st = state();
+    let app = router(st.clone());
+    st.set_blocks(vec![SourceBlock {
+        cidr: "203.0.113.0/24".into(),
+        age_secs: 12,
+        pps: 5000,
+        manual: false,
+    }]);
+    // Add a manual block via the API.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/blocks",
+            Some("tok"),
+            Some(r#"{"cidr":"45.0.0.0/8"}"#.into()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/blocks", Some("tok"), None))
+        .await
+        .unwrap();
+    let blocks: Vec<SourceBlock> = body_json(res).await;
+    // Manual (from ruleset) first, then the auto block.
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks.iter().any(|b| b.cidr == "45.0.0.0/8" && b.manual));
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b.cidr == "203.0.113.0/24" && !b.manual)
+    );
+
+    // Delete the manual block.
+    let res = app
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/blocks?cidr=45.0.0.0/8",
+            Some("tok"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

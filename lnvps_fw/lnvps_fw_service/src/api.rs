@@ -90,8 +90,10 @@ pub struct Override {
 pub struct RuleSet {
     /// Protected prefixes (CIDR strings) for prefix-wide (carpet-bomb) defence.
     pub protected: Vec<String>,
-    /// Manual mitigation overrides.
+    /// Manual mitigation overrides (force-mitigate a destination).
     pub overrides: Vec<Override>,
+    /// Manual source-CIDR blocks (drop an attacker range).
+    pub source_blocks: Vec<String>,
 }
 
 /// One currently-active mitigation, reported in the status snapshot.
@@ -173,6 +175,22 @@ pub struct Limits {
     /// Exit hysteresis (% of entry) and cooldown.
     pub exit_pct: u64,
     pub cooldown_secs: u64,
+}
+
+/// An active blocked source CIDR (from SOURCE_BLOCK escalation of a real,
+/// bounded botnet).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceBlock {
+    pub cidr: String,
+    /// Seconds since this block was last refreshed (it decays after the TTL).
+    /// Ignored for manual blocks (they are permanent).
+    pub age_secs: u64,
+    /// Current aggregate packets/second from sources under this CIDR (0 for
+    /// manual blocks — their traffic is dropped before per-source counting).
+    pub pps: u64,
+    /// True = operator-pushed manual block (permanent); false = auto-aggregated
+    /// from escalation (decays).
+    pub manual: bool,
 }
 
 /// A learned open port on a protected IP (surfaced for `lnvps_api` / admin).
@@ -266,6 +284,7 @@ pub struct SharedState {
     active: RwLock<Vec<Mitigation>>,
     tracked: RwLock<Vec<TrackedIp>>,
     prefixes: RwLock<Vec<PrefixLoad>>,
+    blocks: RwLock<Vec<SourceBlock>>,
     ports: RwLock<Vec<LearnedPort>>,
     limits: RwLock<Limits>,
     events: Mutex<EventRing>,
@@ -292,6 +311,7 @@ impl SharedState {
             active: RwLock::new(Vec::new()),
             tracked: RwLock::new(Vec::new()),
             prefixes: RwLock::new(Vec::new()),
+            blocks: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
             limits: RwLock::new(Limits::default()),
             events: Mutex::new(EventRing::new(events_cap)),
@@ -332,6 +352,11 @@ impl SharedState {
     /// Replace the per-prefix (carpet-bomb) load snapshot.
     pub fn set_prefixes(&self, prefixes: Vec<PrefixLoad>) {
         *self.prefixes.write().unwrap() = prefixes;
+    }
+
+    /// Replace the active source-block snapshot.
+    pub fn set_blocks(&self, blocks: Vec<SourceBlock>) {
+        *self.blocks.write().unwrap() = blocks;
     }
 
     /// Publish the detection thresholds (called at startup).
@@ -417,6 +442,10 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/ports", get(get_ports))
         .route("/api/v1/tracked", get(get_tracked))
         .route("/api/v1/prefixes", get(get_prefixes))
+        .route(
+            "/api/v1/blocks",
+            get(get_blocks).post(post_block).delete(delete_block),
+        )
         .route("/api/v1/limits", get(get_limits).put(put_limits))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
@@ -541,6 +570,61 @@ async fn get_tracked(State(state): State<Arc<SharedState>>) -> Json<Vec<TrackedI
 
 async fn get_prefixes(State(state): State<Arc<SharedState>>) -> Json<Vec<PrefixLoad>> {
     Json(state.prefixes.read().unwrap().clone())
+}
+
+async fn get_blocks(State(state): State<Arc<SharedState>>) -> Json<Vec<SourceBlock>> {
+    // Manual blocks (from the pushed ruleset) first, then auto-aggregated ones.
+    let mut out: Vec<SourceBlock> = state
+        .rules
+        .read()
+        .unwrap()
+        .source_blocks
+        .iter()
+        .map(|c| SourceBlock {
+            cidr: c.clone(),
+            age_secs: 0,
+            pps: 0,
+            manual: true,
+        })
+        .collect();
+    out.extend(state.blocks.read().unwrap().iter().cloned());
+    Json(out)
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockReq {
+    cidr: String,
+}
+
+async fn post_block(State(state): State<Arc<SharedState>>, Json(b): Json<BlockReq>) -> Response {
+    if parse_cidr(&b.cidr).is_none() {
+        return (StatusCode::BAD_REQUEST, format!("bad cidr: {}", b.cidr)).into_response();
+    }
+    {
+        let mut rules = state.rules.write().unwrap();
+        rules.source_blocks.retain(|c| c != &b.cidr);
+        rules.source_blocks.push(b.cidr);
+    }
+    state.bump_rules();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_block(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<CidrQuery>,
+) -> Response {
+    let removed = {
+        let mut rules = state.rules.write().unwrap();
+        let before = rules.source_blocks.len();
+        rules.source_blocks.retain(|c| c != &q.cidr);
+        before != rules.source_blocks.len()
+    };
+    if removed {
+        state.bump_rules();
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
 }
 
 async fn get_limits(State(state): State<Arc<SharedState>>) -> Json<Limits> {
@@ -762,6 +846,14 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   .err { color: #ff6b6b; }
   .pager { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; }
   .scroll { max-height: 420px; overflow: auto; }
+  .binbtn { background: none; color: #ff6b6b; border: 0; cursor: pointer; padding: 0 .3rem; font-size: 1rem; }
+  .binbtn:hover { color: #ff9a9a; }
+  .tag { font-size: .72em; padding: 0 .35rem; border-radius: 8px; background: #21262d; color: #8b949e; }
+  .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 10; }
+  .modal { background: #161b22; border: 1px solid #2b3138; border-radius: 8px; padding: 1rem 1.2rem; min-width: 320px; display: grid; gap: .7rem; }
+  .modal h3 { margin: 0; font-size: .9rem; color: #7fd1ff; }
+  .modal .chk { display: inline-flex; gap: .3rem; align-items: center; margin-right: .8rem; color: #d6deeb; font-size: .85rem; }
+  .modal .act { display: flex; gap: .5rem; align-items: center; margin-top: .3rem; }
   .limits { display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: flex-end; }
   .limits label { display: inline-flex; flex-direction: column; font-size: .72rem; color: #8b949e; gap: .2rem; }
   .limits input { width: 7.5rem; }
@@ -858,6 +950,62 @@ function LimitsCard({ token }) {
   </div>`;
 }
 
+// Small modal helper (backdrop-dismissable).
+function Modal({ title, onClose, children }) {
+  return html`<div class="modal-bg" onClick=${e => e.target.className === 'modal-bg' && onClose()}>
+    <div class="modal"><h3>${title}</h3>${children}</div></div>`;
+}
+
+// Active mitigations table + add/delete of manual dest overrides (force-mitigate
+// a destination). Auto-detected rows are read-only; manual rows get a delete.
+function MitigationsCard({ token, mitigations, onChange }) {
+  const [show, setShow] = useState(false), [cidr, setCidr] = useState(''), [flags, setFlags] = useState(1), [msg, setMsg] = useState('');
+  const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+  const add = async () => { setMsg('saving…'); try {
+      const r = await fetch('/api/v1/mitigations', { method: 'POST', headers: hdr, body: JSON.stringify({ cidr, flags }) });
+      if (r.ok) { setShow(false); setCidr(''); setFlags(1); setMsg(''); onChange && onChange(); } else setMsg('error ' + r.status + ': ' + (await r.text()));
+    } catch (e) { setMsg(e.message); } };
+  const del = async c => { try { await fetch('/api/v1/mitigations?cidr=' + encodeURIComponent(c), { method: 'DELETE', headers: hdr }); onChange && onChange(); } catch (e) {} };
+  const bin = c => html`<button class="binbtn" title="remove override" onClick=${() => del(c)}>🗑</button>`;
+  const rows = mitigations.map(m => [m.cidr, flagCell(m.flags), time(m.since_unix), m.manual ? html`<span class="tag">manual</span>` : '',
+    fmtn(m.peak_pps), fmtbps(m.peak_bps), fmtn(m.peak_syn_pps), m.manual ? bin(m.cidr) : '']);
+  return html`<div>
+    <div style="margin-bottom:.5rem"><button onClick=${() => { setShow(true); setMsg(''); }}>+ add override</button></div>
+    <${PagedTable} cols=${['cidr','flags','since','manual','peak pps','peak bps','peak syn/s','']} rows=${rows} />
+    ${show && html`<${Modal} title="Force-mitigate a destination" onClose=${() => setShow(false)}>
+      <label>CIDR<input value=${cidr} placeholder="203.0.113.7/32" onInput=${e => setCidr(e.target.value)} /></label>
+      <div>${FLAGS.map(([b, n]) => html`<label class="chk"><input type="checkbox" checked=${(flags & b) !== 0}
+        onChange=${e => setFlags(e.target.checked ? flags | b : flags & ~b)} />${n}</label>`)}</div>
+      <div class="act"><button onClick=${add} disabled=${!cidr}>add</button>
+        <button class="ghost" onClick=${() => setShow(false)}>cancel</button><span class="muted err">${msg}</span></div>
+    </${Modal}>`}
+  </div>`;
+}
+
+// Source-block table: auto-aggregated blocks (read-only, decaying) + manual
+// blocks (add via modal, delete per row) that drop an attacker CIDR outright.
+function BlocksCard({ token, blocks, onChange }) {
+  const [show, setShow] = useState(false), [cidr, setCidr] = useState(''), [msg, setMsg] = useState('');
+  const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
+  const add = async () => { setMsg('saving…'); try {
+      const r = await fetch('/api/v1/blocks', { method: 'POST', headers: hdr, body: JSON.stringify({ cidr }) });
+      if (r.ok) { setShow(false); setCidr(''); setMsg(''); onChange && onChange(); } else setMsg('error ' + r.status + ': ' + (await r.text()));
+    } catch (e) { setMsg(e.message); } };
+  const del = async c => { try { await fetch('/api/v1/blocks?cidr=' + encodeURIComponent(c), { method: 'DELETE', headers: hdr }); onChange && onChange(); } catch (e) {} };
+  const bin = c => html`<button class="binbtn" title="remove block" onClick=${() => del(c)}>🗑</button>`;
+  const rows = blocks.map(b => [b.cidr, html`<span class="tag">${b.manual ? 'manual' : 'auto'}</span>`,
+    b.manual ? '—' : fmtn(b.pps), b.manual ? '—' : b.age_secs + 's', b.manual ? bin(b.cidr) : '']);
+  return html`<div>
+    <div style="margin-bottom:.5rem"><button onClick=${() => { setShow(true); setMsg(''); }}>+ block source</button></div>
+    <${PagedTable} cols=${['cidr','kind','pps','age','']} rows=${rows} />
+    ${show && html`<${Modal} title="Block a source CIDR" onClose=${() => setShow(false)}>
+      <label>CIDR<input value=${cidr} placeholder="45.134.26.0/24" onInput=${e => setCidr(e.target.value)} /></label>
+      <div class="act"><button onClick=${add} disabled=${!cidr}>block</button>
+        <button class="ghost" onClick=${() => setShow(false)}>cancel</button><span class="muted err">${msg}</span></div>
+    </${Modal}>`}
+  </div>`;
+}
+
 // Server-side paginated + filtered learned-ports table.
 function PortsCard({ token }) {
   const PAGE = 50;
@@ -885,7 +1033,7 @@ function PortsCard({ token }) {
 function App() {
   const [token, setTokenState] = useState(localStorage.getItem('fwtoken') || '');
   const [auto, setAuto] = useState(true);
-  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], mitigations: [], rules: { protected: [], overrides: [] }, err: '' });
+  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], blocks: [], mitigations: [], rules: { protected: [], overrides: [] }, err: '' });
   const [events, setEvents] = useState([]);
   const cursor = useRef(0);
   const tokenRef = useRef(token);
@@ -894,13 +1042,13 @@ function App() {
   const refresh = useCallback(async () => {
     const t = tokenRef.current;
     try {
-      const [status, tracked, prefixes, mitigations, rules] = await Promise.all([
+      const [status, tracked, prefixes, blocks, mitigations, rules] = await Promise.all([
         api('/api/v1/status', t), api('/api/v1/tracked', t), api('/api/v1/prefixes', t),
-        api('/api/v1/mitigations', t), api('/api/v1/rules', t),
+        api('/api/v1/blocks', t), api('/api/v1/mitigations', t), api('/api/v1/rules', t),
       ]);
       const ev = await api('/api/v1/events?since=' + cursor.current, t);
       if (ev.events.length) { cursor.current = ev.cursor; setEvents(e => [...ev.events.slice().reverse(), ...e].slice(0, 500)); }
-      setD({ status, tracked, prefixes, mitigations, rules, err: '' });
+      setD({ status, tracked, prefixes, blocks, mitigations, rules, err: '' });
     } catch (e) { setD(x => ({ ...x, err: e.message })); }
   }, []);
 
@@ -921,8 +1069,6 @@ function App() {
     html`<${LoadBar} pct=${t.load_pct} />`, t.mitigating ? flagCell(t.flags) : 'ok']);
   const prefixRows = d.prefixes.map(p => [p.cidr, fmtn(p.pps), fmtbps(p.bps), fmtn(p.syn_pps),
     html`<${LoadBar} pct=${p.load_pct} />`, p.mitigating ? flagCell(p.flags) : 'ok']);
-  const mitRows = d.mitigations.map(m => [m.cidr, flagCell(m.flags), time(m.since_unix), m.manual?'yes':'',
-    fmtn(m.peak_pps), fmtbps(m.peak_bps), fmtn(m.peak_syn_pps)]);
   const evRows = events.map(e => [e.seq, time(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtn(e.syn_pps)]);
 
   return html`
@@ -935,21 +1081,11 @@ function App() {
       <button class="ghost" onClick=${refresh}>refresh</button>
     </header>
     <main>
-      <${Section} title="Status">
-        ${s ? html`<div class="kv">
-          <div>version</div><div>${s.version}</div>
-          <div>uptime</div><div>${s.uptime_secs}s</div>
-          <div>interfaces</div><div>${s.interfaces.join(', ')||'—'}</div>
-          <div>protected prefixes</div><div>${s.protected_prefixes}</div>
-          <div>active mitigations</div><div>${s.active_mitigations}</div>
-          <div>learned ports</div><div>${s.learned_ports}</div>
-        </div>` : html`<div class="muted">enter token and connect</div>`}
-      </${Section}>
       <${Section} wide=true title="Detection limits">
         <${LimitsCard} token=${token} />
       </${Section}>
       <${Section} wide=true title="Active mitigations" extra=${'('+d.mitigations.length+')'}>
-        <${PagedTable} cols=${['cidr','flags','since','manual','peak pps','peak bps','peak syn/s']} rows=${mitRows} />
+        <${MitigationsCard} token=${token} mitigations=${d.mitigations} onChange=${refresh} />
       </${Section}>
       <${Section} wide=true title="Live tracked IPs" extra=${'('+d.tracked.length+')'}>
         <${PagedTable} cols=${['ip','pps','bps','syn/s','drop/s','load','state']} rows=${trackedRows} />
@@ -957,8 +1093,8 @@ function App() {
       <${Section} wide=true title="Protected prefixes" extra=${'('+d.prefixes.length+')'}>
         <${PagedTable} cols=${['prefix','pps','bps','syn/s','load','state']} rows=${prefixRows} />
       </${Section}>
-      <${Section} title="Manual overrides">
-        <${Table} cols=${['cidr','flags']} rows=${d.rules.overrides.map(o=>[o.cidr, flagCell(o.flags)])} />
+      <${Section} wide=true title="Source blocks" extra=${'('+d.blocks.length+')'}>
+        <${BlocksCard} token=${token} blocks=${d.blocks} onChange=${refresh} />
       </${Section}>
       <${PortsCard} token=${token} />
       <${Section} wide=true title="Events" extra=${'('+events.length+')'}>

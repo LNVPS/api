@@ -5,51 +5,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use aya::maps::lpm_trie::{Key, LpmTrie};
-use aya::maps::{Array, HashMap as AyaHashMap, PerCpuHashMap, ProgramArray};
+use aya::maps::{Array, HashMap as AyaHashMap, ProgramArray};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_clsact};
 use aya::util::KernelVersion;
 use aya::{Ebpf, include_bytes_aligned};
 use log::{info, warn};
 
 use lnvps_fw_common::{
-    COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
-    LastSeen, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
+    COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestState, LastSeen,
+    PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6, SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
 };
 
 use lnvps_fw_service::api::{
-    self, CidrKey, LearnedPort, Limits, Mitigation, PrefixLoad, RuleSet, SharedState, TrackedIp,
-    parse_cidr,
+    self, CidrKey, LearnedPort, Limits, Mitigation, PrefixLoad, RuleSet, SharedState, SourceBlock,
+    TrackedIp, parse_cidr,
 };
 use lnvps_fw_service::config::{Config, IfaceRole};
 use lnvps_fw_service::detect::{DestTracker, DetectionConfig};
 use lnvps_fw_service::gc;
 use lnvps_fw_service::publish::{MitInput, MitTracker};
-use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control, sum_counters};
-
-fn format_counters(c: &DestCounters) -> String {
-    format!(
-        "pkts={} bytes={} syn={} tcp={} udp={} icmp={} dropped={}",
-        c.packets, c.bytes, c.syn_packets, c.tcp_packets, c.udp_packets, c.icmp_packets, c.dropped
-    )
-}
-
-fn log_stats(bpf: &Ebpf) -> Result<()> {
-    let v4: PerCpuHashMap<_, [u8; 4], DestCounters> =
-        PerCpuHashMap::try_from(bpf.map("V4_DEST_COUNTERS").context("v4 counters missing")?)?;
-    for entry in v4.iter() {
-        let (dst, values) = entry?;
-        let total = sum_counters(values.iter());
-        info!("{}: {}", Ipv4Addr::from(dst), format_counters(&total));
-    }
-    let v6: PerCpuHashMap<_, [u8; 16], DestCounters> =
-        PerCpuHashMap::try_from(bpf.map("V6_DEST_COUNTERS").context("v6 counters missing")?)?;
-    for entry in v6.iter() {
-        let (dst, values) = entry?;
-        let total = sum_counters(values.iter());
-        info!("{}: {}", Ipv6Addr::from(dst), format_counters(&total));
-    }
-    Ok(())
-}
+use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control};
 
 /// Sweep both learned-ports maps, returning the total number of entries
 /// removed. TTL is compared against the monotonic clock (matching
@@ -255,6 +230,29 @@ fn collect_tracked(det: &DetectionState, now_ns: u64, cfg: &DetectionConfig) -> 
     out
 }
 
+/// Snapshot the active blocked source CIDRs (from SOURCE_BLOCK escalation).
+fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
+    let age = |ts: u64| now_ns.saturating_sub(ts) / 1_000_000_000;
+    let mut out: Vec<SourceBlock> = det
+        .blocks_v4
+        .iter()
+        .map(|(c, &ts)| SourceBlock {
+            cidr: format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
+            age_secs: age(ts),
+            pps: det.block_pps_v4.get(c).copied().unwrap_or(0),
+            manual: false,
+        })
+        .chain(det.blocks_v6.iter().map(|(c, &ts)| SourceBlock {
+            cidr: format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
+            age_secs: age(ts),
+            pps: det.block_pps_v6.get(c).copied().unwrap_or(0),
+            manual: false,
+        }))
+        .collect();
+    out.sort_by(|a, b| a.cidr.cmp(&b.cidr));
+    out
+}
+
 /// Apply live-edited thresholds from the control API into the runtime config
 /// (applied to both the per-destination and per-prefix detectors).
 fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
@@ -388,6 +386,7 @@ fn apply_rules(
     bpf: &mut Ebpf,
     rules: &RuleSet,
     applied: &mut HashMap<String, CidrKey>,
+    applied_blocks: &mut HashMap<String, CidrKey>,
     rt: &mut RuntimeConfig,
     now_ns: u64,
 ) -> Result<()> {
@@ -422,6 +421,60 @@ fn apply_rules(
     for (c, (k, flags)) in &desired {
         write_dest_state(bpf, *k, *flags, now_ns)?;
         applied.insert(c.clone(), *k);
+    }
+
+    // Manual source blocks -> MANUAL_BLOCK tries (unconditional drops).
+    let mut want: HashMap<String, CidrKey> = HashMap::new();
+    for c in &rules.source_blocks {
+        match parse_cidr(c) {
+            Some(k) => {
+                want.insert(c.clone(), k);
+            }
+            None => warn!("ignoring bad source-block cidr {c}"),
+        }
+    }
+    let gone_blocks: Vec<String> = applied_blocks
+        .keys()
+        .filter(|c| !want.contains_key(*c))
+        .cloned()
+        .collect();
+    for c in gone_blocks {
+        if let Some(k) = applied_blocks.remove(&c) {
+            manual_block(bpf, k, false)?;
+        }
+    }
+    for (c, k) in &want {
+        manual_block(bpf, *k, true)?;
+        applied_blocks.insert(c.clone(), *k);
+    }
+    Ok(())
+}
+
+/// Add (`set`) or remove a manual source-CIDR block in the MANUAL_BLOCK tries.
+fn manual_block(bpf: &mut Ebpf, key: CidrKey, set: bool) -> Result<()> {
+    match key {
+        CidrKey::V4 { bits, net } => {
+            let mut t: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(
+                bpf.map_mut("MANUAL_BLOCK_V4")
+                    .context("manual v4 missing")?,
+            )?;
+            if set {
+                t.insert(&Key::new(bits, net), 1u8, 0)?;
+            } else {
+                let _ = t.remove(&Key::new(bits, net));
+            }
+        }
+        CidrKey::V6 { bits, net } => {
+            let mut t: LpmTrie<_, [u8; 16], u8> = LpmTrie::try_from(
+                bpf.map_mut("MANUAL_BLOCK_V6")
+                    .context("manual v6 missing")?,
+            )?;
+            if set {
+                t.insert(&Key::new(bits, net), 1u8, 0)?;
+            } else {
+                let _ = t.remove(&Key::new(bits, net));
+            }
+        }
     }
     Ok(())
 }
@@ -518,6 +571,7 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
     let initial = RuleSet {
         protected: cfg.protected.clone(),
         overrides: Vec::new(),
+        source_blocks: Vec::new(),
     };
     let state = SharedState::new(
         api_cfg.token.clone(),
@@ -569,6 +623,7 @@ async fn main() -> Result<()> {
     let mut rules_version = 0u64;
     let mut limits_version = 0u64;
     let mut applied_overrides: HashMap<String, CidrKey> = HashMap::new();
+    let mut applied_blocks: HashMap<String, CidrKey> = HashMap::new();
     let mut applied_protected_v4: Vec<(u32, [u8; 4])> = Vec::new();
     let mut applied_protected_v6: Vec<(u32, [u8; 16])> = Vec::new();
     let mut mit_tracker = MitTracker::default();
@@ -610,13 +665,6 @@ async fn main() -> Result<()> {
     }
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
-    let stats_secs = cfg.learning.stats_interval_secs;
-    // A zero stats interval disables logging; use a long dummy period.
-    let mut stats_timer = tokio::time::interval(Duration::from_secs(if stats_secs == 0 {
-        3600
-    } else {
-        stats_secs
-    }));
     // Rotate the SYN-cookie secret periodically; cookies issued in the previous
     // window still validate against the prev slot.
     let mut cookie_timer = tokio::time::interval(Duration::from_secs(120));
@@ -648,9 +696,14 @@ async fn main() -> Result<()> {
                     if v != rules_version {
                         rules_version = v;
                         let rules = st.rules();
-                        if let Err(e) =
-                            apply_rules(&mut bpf, &rules, &mut applied_overrides, &mut runtime_cfg, now)
-                        {
+                        if let Err(e) = apply_rules(
+                            &mut bpf,
+                            &rules,
+                            &mut applied_overrides,
+                            &mut applied_blocks,
+                            &mut runtime_cfg,
+                            now,
+                        ) {
                             warn!("apply rules failed: {e}");
                         }
                         if let Err(e) = sync_protected(
@@ -701,6 +754,7 @@ async fn main() -> Result<()> {
                         now,
                         &runtime_cfg.network,
                     ));
+                    st.set_blocks(collect_blocks(&detection_state, now));
                 }
             }
             _ = gc_timer.tick() => {
@@ -721,11 +775,6 @@ async fn main() -> Result<()> {
                 let new = gc::monotonic_now_ns() as u32 | 1;
                 if let Err(e) = rotate_cookie_secret(&mut bpf, new) {
                     warn!("cookie rotation failed: {e}");
-                }
-            }
-            _ = stats_timer.tick(), if stats_secs > 0 => {
-                if let Err(e) = log_stats(&bpf) {
-                    warn!("Failed to read stats: {e}");
                 }
             }
         }

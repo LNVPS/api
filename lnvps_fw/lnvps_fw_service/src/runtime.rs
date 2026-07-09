@@ -82,6 +82,9 @@ pub struct DetectionState {
     /// Active CIDR blocks -> timestamp last refreshed (for TTL decay).
     pub blocks_v4: HashMap<CidrV4, u64>,
     pub blocks_v6: HashMap<CidrV6, u64>,
+    /// Active CIDR blocks -> current aggregate pps from sources under them.
+    pub block_pps_v4: HashMap<CidrV4, u64>,
+    pub block_pps_v6: HashMap<CidrV6, u64>,
 }
 
 /// Sum per-CPU `DestCounters` slots into one total.
@@ -353,10 +356,8 @@ fn source_control_v4(
     elapsed_ns: u64,
 ) -> Result<bool> {
     let cur = read_src_counters::<[u8; 4]>(bpf, "V4_SRC_COUNTERS")?;
-    let off = offenders(
-        &per_source_pps(&state.prev_src_v4, &cur, elapsed_ns),
-        cfg.src_rate_pps,
-    );
+    let rates = per_source_pps(&state.prev_src_v4, &cur, elapsed_ns);
+    let off = offenders(&rates, cfg.src_rate_pps);
     // Spoof gate: an unbounded offender set means a spoofed flood — skip.
     let desired = if off.len() <= cfg.max_real_sources {
         aggregate_v4(&off, cfg.fanout)
@@ -376,6 +377,19 @@ fn source_control_v4(
         |c| Key::new(c.prefix_len, c.network),
         |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
     );
+    // Current aggregate pps from the sources under each active block.
+    let active: Vec<CidrV4> = state.blocks_v4.keys().copied().collect();
+    state.block_pps_v4 = active
+        .into_iter()
+        .map(|c| {
+            let sum = rates
+                .iter()
+                .filter(|(ip, _)| mask_v4(*ip, c.prefix_len) == c.network)
+                .map(|(_, p)| *p)
+                .sum();
+            (c, sum)
+        })
+        .collect();
     Ok(!state.blocks_v4.is_empty())
 }
 
@@ -387,10 +401,8 @@ fn source_control_v6(
     elapsed_ns: u64,
 ) -> Result<bool> {
     let cur = read_src_counters::<[u8; 16]>(bpf, "V6_SRC_COUNTERS")?;
-    let off = offenders(
-        &per_source_pps(&state.prev_src_v6, &cur, elapsed_ns),
-        cfg.src_rate_pps,
-    );
+    let rates = per_source_pps(&state.prev_src_v6, &cur, elapsed_ns);
+    let off = offenders(&rates, cfg.src_rate_pps);
     let desired = if off.len() <= cfg.max_real_sources {
         aggregate_v6(&off, cfg.fanout)
     } else {
@@ -409,6 +421,18 @@ fn source_control_v6(
         |c| Key::new(c.prefix_len, c.network),
         |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
     );
+    let active: Vec<CidrV6> = state.blocks_v6.keys().copied().collect();
+    state.block_pps_v6 = active
+        .into_iter()
+        .map(|c| {
+            let sum = rates
+                .iter()
+                .filter(|(ip, _)| mask_v6(*ip, c.prefix_len) == c.network)
+                .map(|(_, p)| *p)
+                .sum();
+            (c, sum)
+        })
+        .collect();
     Ok(!state.blocks_v6.is_empty())
 }
 

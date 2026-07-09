@@ -496,6 +496,28 @@ mitigation.
       cooldown) + save/reset; seeds once so the 2s poll doesn't clobber edits.
 - [x] test `limits_put_get_roundtrip_and_validation`.
 
+### Increment 15 — Manual controls + source-block visibility (M) ✅ DONE
+
+- [x] **Source blocks surfaced**: `GET /api/v1/blocks` returns auto-aggregated
+      blocks (from escalation) + manual blocks, each with `cidr`, `pps`
+      (current aggregate rate from member sources, tracked in
+      `DetectionState.block_pps_v4/v6`), `age_secs`, `manual`. Dashboard
+      "Source blocks" widget shows kind / pps / age.
+- [x] **Manual source blocks**: new `MANUAL_BLOCK_V4/V6` LPM tries checked in
+      XDP *unconditionally* (drop any source hitting a protected dest,
+      independent of that dest's mitigation state — unlike the escalation-gated
+      auto blocks). `POST/DELETE /api/v1/blocks {cidr}` + `rules.source_blocks`;
+      `apply_rules` reconciles them into the tries.
+- [x] **Manual dest overrides** moved into the Active-mitigations widget with an
+      add-modal (cidr + flag checkboxes) + per-row delete on manual rows
+      (existing `POST/DELETE /api/v1/mitigations`). Un-merged from the source
+      blocks (they are victim-side vs attacker-side).
+- [x] Removed the noisy per-dest **stats logging** (log_stats/stats_timer) — the
+      dashboard replaces it — and the redundant **Status widget** (header
+      summary keeps uptime/active/ports).
+- Validated: 9 api + full unit suite green; harness (smoke/mitigation/scoping)
+      green (MANUAL_BLOCK maps + XDP check pass the verifier); clippy/fmt clean.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

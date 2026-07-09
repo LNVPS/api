@@ -24,8 +24,9 @@ mod maps;
 use maps::{
     OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cidr_blocked_v4, cidr_blocked_v6, cookie_secrets,
     count_src_v4, count_src_v6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
-    learn_port_v4, learn_port_v6, mark_verified_v4, mark_verified_v6, port_is_open_v4,
-    port_is_open_v6, protected_v4, protected_v6, scoped, src_verified_v4, src_verified_v6,
+    learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6, mark_verified_v4,
+    mark_verified_v6, port_is_open_v4, port_is_open_v6, protected_v4, protected_v6, scoped,
+    src_verified_v4, src_verified_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -170,9 +171,14 @@ fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let src = ip.src_addr;
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
-    let flags = dest_mode_v4(&dst);
-    if flags != DEST_MODE_NORMAL {
-        verdict = mitigate_v4(ctx, &dst, &src, &meta, flags, allow_syn_proxy);
+    // Manual source blocks drop unconditionally (independent of dest mitigation).
+    if manual_blocked_v4(src) {
+        verdict = XDP_DROP;
+    } else {
+        let flags = dest_mode_v4(&dst);
+        if flags != DEST_MODE_NORMAL {
+            verdict = mitigate_v4(ctx, &dst, &src, &meta, flags, allow_syn_proxy);
+        }
     }
     account(ctx, counters, &meta, PROTO_ICMP, verdict);
     Ok(verdict)
@@ -195,9 +201,13 @@ fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
 
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
-    let flags = dest_mode_v6(&dst);
-    if flags != DEST_MODE_NORMAL {
-        verdict = mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags, allow_syn_proxy);
+    if manual_blocked_v6(ip.src_addr) {
+        verdict = XDP_DROP;
+    } else {
+        let flags = dest_mode_v6(&dst);
+        if flags != DEST_MODE_NORMAL {
+            verdict = mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags, allow_syn_proxy);
+        }
     }
     account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
     Ok(verdict)
