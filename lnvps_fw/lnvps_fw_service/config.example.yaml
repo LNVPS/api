@@ -122,3 +122,6 @@ api:
   allow-ips: []
   # Bounded in-memory event ring-buffer size (lnvps_api persists history).
   events-buffer: 1024
+  # GitHub owner/repo checked for self-upgrade releases (the dashboard shows an
+  # upgrade button when a newer release with a .deb asset exists).
+  github-repo: LNVPS/api

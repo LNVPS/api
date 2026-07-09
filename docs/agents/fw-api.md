@@ -34,6 +34,19 @@ section to disable the API entirely.
 | POST | `/mitigations` | add/replace a manual override `{cidr, flags}` |
 | DELETE | `/mitigations?cidr=<cidr>` | clear a manual override (`404` if absent) |
 | GET | `/events?since=<cursor>` | events with `seq > cursor`, plus the next `cursor` |
+| GET | `/upgrade` | cached self-upgrade status: `current`, `latest`, `available`, `deb_url` |
+| POST | `/upgrade` | download the latest release `.deb` and install + restart (202) |
+
+### Self-upgrade
+
+The daemon checks the GitHub releases API (`api.github-repo`, default
+`LNVPS/api`) at startup and every 6h, caching the result. `GET /upgrade` returns
+it; the dashboard shows an **upgrade** button when a newer release with a `.deb`
+asset exists. `POST /upgrade` downloads that `.deb`, verifies it, and runs
+`dpkg -i` + `systemctl restart lnvps_fw` in a **detached transient systemd
+unit** (`systemd-run`) so the install completes across the service restart.
+Requires releases to exist — tag `vX.Y.Z` so the `lnvps_fw-deb.yml` workflow
+builds and attaches the package.
 
 `flags` is the `DEST_MODE_*` protection bitmask: `PORT_FILTER=1`, `SYN_PROXY=2`,
 `RATE_CAPS=4`, `SOURCE_BLOCK=8`.

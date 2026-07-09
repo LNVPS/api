@@ -579,7 +579,21 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
         cfg.interface_names(),
         initial,
         api_cfg.events_buffer,
+        api_cfg.github_repo.clone(),
     );
+    // Periodic self-upgrade check (immediately, then every 6h).
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let repo = st.upgrade_repo().to_string();
+            let current = env!("CARGO_PKG_VERSION").to_string();
+            let mut timer = tokio::time::interval(Duration::from_secs(6 * 3600));
+            loop {
+                timer.tick().await;
+                st.set_upgrade(lnvps_fw_service::upgrade::check(&repo, &current).await);
+            }
+        });
+    }
     let tls = api::load_or_generate_tls(
         api_cfg.tls_cert.as_deref(),
         api_cfg.tls_key.as_deref(),

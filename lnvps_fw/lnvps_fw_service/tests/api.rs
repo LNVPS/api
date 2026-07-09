@@ -20,6 +20,7 @@ fn state() -> Arc<SharedState> {
         vec!["eth0".into()],
         RuleSet::default(),
         16,
+        "LNVPS/api".into(),
     )
 }
 

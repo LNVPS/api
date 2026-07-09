@@ -518,6 +518,22 @@ mitigation.
 - Validated: 9 api + full unit suite green; harness (smoke/mitigation/scoping)
       green (MANUAL_BLOCK maps + XDP check pass the verifier); clippy/fmt clean.
 
+### Increment 16 — Self-upgrade from GitHub releases (M) ✅ DONE
+
+- [x] `upgrade.rs`: query the GitHub releases API (reqwest, rustls), semver
+      compare (`is_newer`), download + `.deb` magic-byte validation, and
+      `install_and_restart` via `systemd-run --collect` (detached transient unit
+      so the install survives the service restart).
+- [x] `GET /api/v1/upgrade` (cached status: current/latest/available/deb_url) +
+      `POST /api/v1/upgrade` (download+install+restart, 202). Daemon checks at
+      startup + every 6h; `api.github-repo` config (default `LNVPS/api`).
+- [x] Dashboard: green **upgrade** button in the header when available; confirm
+      dialog then POST.
+- [x] `is_newer` unit test + `live_latest_release` ignored network test.
+- Note: `LNVPS/api` has no GitHub *releases* yet (the live check returns 404),
+      so `available=false` until a `vX.Y.Z` tag triggers the `.deb` workflow.
+- Validated: 9 api + full unit suite green; clippy/fmt clean.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

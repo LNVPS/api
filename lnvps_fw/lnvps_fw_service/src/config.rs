@@ -112,6 +112,13 @@ pub struct ApiConfig {
     /// Bounded in-memory event ring-buffer size.
     #[serde(default = "default_events_buffer")]
     pub events_buffer: usize,
+    /// GitHub `owner/repo` to check for self-upgrade releases.
+    #[serde(default = "default_github_repo")]
+    pub github_repo: String,
+}
+
+fn default_github_repo() -> String {
+    "LNVPS/api".to_string()
 }
 
 fn default_api_listen() -> std::net::SocketAddr {

@@ -287,6 +287,9 @@ pub struct SharedState {
     blocks: RwLock<Vec<SourceBlock>>,
     ports: RwLock<Vec<LearnedPort>>,
     limits: RwLock<Limits>,
+    upgrade: RwLock<crate::upgrade::UpgradeStatus>,
+    /// GitHub owner/repo to check for self-upgrade releases.
+    upgrade_repo: String,
     events: Mutex<EventRing>,
     /// Bumped whenever the ruleset changes so the control loop reloads it.
     rules_version: AtomicU64,
@@ -295,12 +298,14 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: String,
         allow_ips: Vec<IpAddr>,
         interfaces: Vec<String>,
         initial: RuleSet,
         events_cap: usize,
+        upgrade_repo: String,
     ) -> Arc<Self> {
         Arc::new(Self {
             token,
@@ -314,6 +319,8 @@ impl SharedState {
             blocks: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
             limits: RwLock::new(Limits::default()),
+            upgrade: RwLock::new(crate::upgrade::UpgradeStatus::default()),
+            upgrade_repo,
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
             limits_version: AtomicU64::new(1),
@@ -362,6 +369,16 @@ impl SharedState {
     /// Publish the detection thresholds (called at startup).
     pub fn set_limits(&self, limits: Limits) {
         *self.limits.write().unwrap() = limits;
+    }
+
+    /// GitHub owner/repo used for self-upgrade checks.
+    pub fn upgrade_repo(&self) -> &str {
+        &self.upgrade_repo
+    }
+
+    /// Publish the cached upgrade status (called by the periodic check task).
+    pub fn set_upgrade(&self, status: crate::upgrade::UpgradeStatus) {
+        *self.upgrade.write().unwrap() = status;
     }
 
     /// Current limits (clone) — read by the control loop on version change.
@@ -447,6 +464,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
             get(get_blocks).post(post_block).delete(delete_block),
         )
         .route("/api/v1/limits", get(get_limits).put(put_limits))
+        .route("/api/v1/upgrade", get(get_upgrade).post(post_upgrade))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
 
@@ -629,6 +647,32 @@ async fn delete_block(
 
 async fn get_limits(State(state): State<Arc<SharedState>>) -> Json<Limits> {
     Json(*state.limits.read().unwrap())
+}
+
+async fn get_upgrade(State(state): State<Arc<SharedState>>) -> Json<crate::upgrade::UpgradeStatus> {
+    Json(state.upgrade.read().unwrap().clone())
+}
+
+/// Trigger a self-upgrade: download the latest release `.deb` and install +
+/// restart in a detached transient unit. Returns 202 immediately; the service
+/// will restart shortly.
+async fn post_upgrade(State(state): State<Arc<SharedState>>) -> Response {
+    let url = state.upgrade.read().unwrap().deb_url.clone();
+    let Some(url) = url else {
+        return (StatusCode::BAD_REQUEST, "no upgrade available").into_response();
+    };
+    tokio::spawn(async move {
+        let dest = std::path::Path::new("/tmp/lnvps-fw-upgrade.deb");
+        if let Err(e) = crate::upgrade::download(&url, dest).await {
+            log::warn!("upgrade download failed: {e}");
+            return;
+        }
+        log::warn!("upgrade: installing {url} and restarting");
+        if let Err(e) = crate::upgrade::install_and_restart(dest, "lnvps_fw") {
+            log::warn!("upgrade install failed: {e}");
+        }
+    });
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// Live-edit the detection thresholds. Held in memory (not persisted); the
@@ -1033,7 +1077,8 @@ function PortsCard({ token }) {
 function App() {
   const [token, setTokenState] = useState(localStorage.getItem('fwtoken') || '');
   const [auto, setAuto] = useState(true);
-  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], blocks: [], mitigations: [], rules: { protected: [], overrides: [] }, err: '' });
+  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], blocks: [], mitigations: [], rules: { protected: [], overrides: [] }, upgrade: null, err: '' });
+  const [upMsg, setUpMsg] = useState('');
   const [events, setEvents] = useState([]);
   const cursor = useRef(0);
   const tokenRef = useRef(token);
@@ -1042,13 +1087,14 @@ function App() {
   const refresh = useCallback(async () => {
     const t = tokenRef.current;
     try {
-      const [status, tracked, prefixes, blocks, mitigations, rules] = await Promise.all([
+      const [status, tracked, prefixes, blocks, mitigations, rules, upgrade] = await Promise.all([
         api('/api/v1/status', t), api('/api/v1/tracked', t), api('/api/v1/prefixes', t),
         api('/api/v1/blocks', t), api('/api/v1/mitigations', t), api('/api/v1/rules', t),
+        api('/api/v1/upgrade', t),
       ]);
       const ev = await api('/api/v1/events?since=' + cursor.current, t);
       if (ev.events.length) { cursor.current = ev.cursor; setEvents(e => [...ev.events.slice().reverse(), ...e].slice(0, 500)); }
-      setD({ status, tracked, prefixes, blocks, mitigations, rules, err: '' });
+      setD({ status, tracked, prefixes, blocks, mitigations, rules, upgrade, err: '' });
     } catch (e) { setD(x => ({ ...x, err: e.message })); }
   }, []);
 
@@ -1060,6 +1106,14 @@ function App() {
   }, [auto, token, refresh]);
 
   const save = () => { localStorage.setItem('fwtoken', token); cursor.current = 0; setEvents([]); refresh(); };
+  const doUpgrade = async () => {
+    if (!confirm('Download & install ' + d.upgrade.latest + ' and restart the service?')) return;
+    setUpMsg('upgrading… the service will restart shortly');
+    try {
+      const r = await fetch('/api/v1/upgrade', { method: 'POST', headers: { Authorization: 'Bearer ' + token } });
+      if (!r.ok) setUpMsg('upgrade failed: ' + r.status + ' ' + (await r.text()));
+    } catch (e) { setUpMsg('upgrade error: ' + e.message); }
+  };
   const s = d.status;
   const summary = d.err ? html`<span class="err">${d.err}</span>`
     : s ? html`<span class="muted">up ${s.uptime_secs}s · ${s.active_mitigations} active · ${s.learned_ports} ports</span>`
@@ -1073,7 +1127,11 @@ function App() {
 
   return html`
     <header>
-      <h1>lnvps_fw</h1>${summary}<span class="grow"></span>
+      <h1>lnvps_fw</h1>${summary}
+      ${d.upgrade && d.upgrade.available ? html`<button style="background:#3fb950" title="download & install ${d.upgrade.latest}, then restart"
+        onClick=${doUpgrade}>⬆ upgrade ${d.upgrade.latest}</button>` : null}
+      ${upMsg ? html`<span class="muted">${upMsg}</span>` : null}
+      <span class="grow"></span>
       <input type="password" placeholder="API token" size="26" value=${token}
         onInput=${e => setTokenState(e.target.value)} onKeyDown=${e => e.key==='Enter' && save()} />
       <button onClick=${save}>connect</button>
@@ -1179,7 +1237,14 @@ mod tests {
 
     #[test]
     fn ip_allow_list_semantics() {
-        let open = SharedState::new("t".into(), vec![], vec![], RuleSet::default(), 8);
+        let open = SharedState::new(
+            "t".into(),
+            vec![],
+            vec![],
+            RuleSet::default(),
+            8,
+            "r".into(),
+        );
         assert!(open.ip_allowed(None), "empty allow-list permits all");
         let restricted = SharedState::new(
             "t".into(),
@@ -1187,6 +1252,7 @@ mod tests {
             vec![],
             RuleSet::default(),
             8,
+            "r".into(),
         );
         assert!(restricted.ip_allowed(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)))));
         assert!(!restricted.ip_allowed(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)))));

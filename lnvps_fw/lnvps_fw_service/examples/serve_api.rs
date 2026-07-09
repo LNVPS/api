@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
             source_blocks: vec!["45.134.26.0/24".into()],
         },
         128,
+        "LNVPS/api".into(),
     );
     state.set_active(vec![Mitigation {
         cidr: "203.0.113.7/32".into(),
