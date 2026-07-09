@@ -232,7 +232,12 @@ pub async fn download_verify_install(
     std::fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
     log::warn!("upgrade: installing {url} and restarting");
     let r = install_and_restart(&dest, "lnvps_fw");
-    let _ = std::fs::remove_file(&dest);
+    // Only clean up here if the detached install unit never started. On success
+    // the unit runs `dpkg` asynchronously (systemd-run returns immediately), so
+    // the parent must NOT delete the .deb — the unit removes it after dpkg.
+    if r.is_err() {
+        let _ = std::fs::remove_file(&dest);
+    }
     r
 }
 
@@ -281,7 +286,13 @@ async fn verify_minisign(key: &str, deb_url: &str, sig_url: &str, bytes: &[u8]) 
 /// Install `deb` and restart `unit` in a detached transient systemd unit, so the
 /// install completes even though restarting the service kills this process.
 pub fn install_and_restart(deb: &Path, unit: &str) -> Result<()> {
-    let script = format!("dpkg -i '{}' && systemctl restart {}", deb.display(), unit);
+    // The .deb is removed inside this detached unit *after* dpkg installs it
+    // (systemd-run is fire-and-forget, so cleaning it up in the parent would
+    // race the dpkg here and delete the archive before it is read).
+    let script = format!(
+        "dpkg -i '{deb}' && rm -f '{deb}' && systemctl restart {unit}",
+        deb = deb.display(),
+    );
     let status = std::process::Command::new("systemd-run")
         .args([
             "--collect",
