@@ -447,6 +447,26 @@ packet/data rates (for the dashboard now, and `lnvps_api`/admin later).
 - [x] tests/api.rs `learned_ports_endpoint`; example seeds both for preview.
 - Validated: 49 unit/api tests green; clippy/fmt clean.
 
+### Increment 12 — Dashboard scale + UDP-learn TTL (M) ✅ DONE
+
+Production feedback: one chatty VM produced 33k learned "ports" (UDP ephemeral
+source ports), and dumping that JSON into the dashboard HTML froze the browser.
+
+- [x] **Shorter UDP TTL** (`learning.udp-port-ttl-secs`, default 120 vs 600 for
+      TCP): `gc_open_ports` now selects the TTL per entry by proto, so ephemeral
+      UDP source ports expire fast while real UDP services stay refreshed.
+- [x] **Server-paginated learned ports**: `GET /api/v1/ports?offset&limit&q`
+      returns `PortsPage { total, offset, limit, items }` with substring filter
+      — payload bounded regardless of total.
+- [x] **Dashboard rewritten as HTM + Preact** (`docs/dashboard.png`): component
+      tree with vDOM diffing (no more whole-table innerHTML rebuilds); every
+      table paginated (client-side for bounded sets, server-side for ports);
+      live rates/ports/mitigations/events all responsive at 33k+ rows.
+- Note (deferred, user-agreed): UDP `RATE_CAPS` as the proper UDP defense (vs
+      the unreliable source-port allow-list) — roadmap.
+- Validated: 49 unit/api tests green; clippy/fmt clean; dashboard rendered at
+      33,333 ports (paginated 50/page, 667 pages) without freezing.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

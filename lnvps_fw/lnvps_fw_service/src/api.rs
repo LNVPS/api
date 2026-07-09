@@ -443,8 +443,33 @@ async fn get_status(State(state): State<Arc<SharedState>>) -> Json<Status> {
     })
 }
 
-async fn get_ports(State(state): State<Arc<SharedState>>) -> Json<Vec<LearnedPort>> {
-    Json(state.ports.read().unwrap().clone())
+async fn get_ports(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<PortsQuery>,
+) -> Json<PortsPage> {
+    let all = state.ports.read().unwrap();
+    let needle = q.q.trim().to_lowercase();
+    let matches = |p: &LearnedPort| {
+        needle.is_empty()
+            || format!("{} {} {}", p.ip, p.port, p.proto)
+                .to_lowercase()
+                .contains(&needle)
+    };
+    let total = all.iter().filter(|p| matches(p)).count();
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let items: Vec<LearnedPort> = all
+        .iter()
+        .filter(|p| matches(p))
+        .skip(q.offset)
+        .take(limit)
+        .cloned()
+        .collect();
+    Json(PortsPage {
+        total,
+        offset: q.offset,
+        limit,
+        items,
+    })
 }
 
 async fn get_tracked(State(state): State<Arc<SharedState>>) -> Json<Vec<TrackedIp>> {
@@ -546,6 +571,26 @@ pub struct EventsResponse {
     pub cursor: u64,
 }
 
+/// A page of learned ports: `total` is the full (filtered) count, `items` is the
+/// requested slice. Keeps the payload bounded even with tens of thousands of
+/// learned ports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortsPage {
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub items: Vec<LearnedPort>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PortsQuery {
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+    #[serde(default)]
+    q: String,
+}
+
 /// TLS material for the HTTPS listener: PEM cert chain + private key.
 pub struct TlsPem {
     pub cert_pem: Vec<u8>,
@@ -594,7 +639,7 @@ pub fn install_crypto_provider() {
 /// Self-contained internal dashboard: plain HTML + vanilla JS, no external
 /// assets. Prompts once for the API token (kept in localStorage) and polls the
 /// JSON API to render status, active mitigations, rules, and the event stream.
-const DASHBOARD_HTML: &str = r#"<!doctype html>
+const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -607,124 +652,193 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   header { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap;
            padding: .75rem 1rem; background: #161b22; border-bottom: 1px solid #2b3138; }
   header h1 { font-size: 1rem; margin: 0; font-weight: 600; color: #7fd1ff; }
-  header .grow { flex: 1; }
+  .grow { flex: 1; }
   input { background: #0e1116; color: #d6deeb; border: 1px solid #2b3138;
           border-radius: 4px; padding: .35rem .5rem; font: inherit; }
   button { background: #1f6feb; color: #fff; border: 0; border-radius: 4px;
-           padding: .35rem .7rem; font: inherit; cursor: pointer; }
+           padding: .3rem .6rem; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
   button.ghost { background: #21262d; }
   main { padding: 1rem; display: grid; gap: 1rem;
          grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
   section { background: #161b22; border: 1px solid #2b3138; border-radius: 8px;
-            padding: .75rem 1rem; }
+            padding: .75rem 1rem; min-width: 0; }
+  .wide { grid-column: 1 / -1; }
   section h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
-               margin: 0 0 .6rem; color: #8b949e; }
+               margin: 0 0 .6rem; color: #8b949e; display: flex; gap: .5rem; align-items: center; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #21262d;
-           white-space: nowrap; }
+  th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #21262d; white-space: nowrap; }
   th { color: #8b949e; font-weight: 600; }
   .kv { display: grid; grid-template-columns: max-content 1fr; gap: .2rem .75rem; }
   .kv div:nth-child(odd) { color: #8b949e; }
-  .pill { display: inline-block; padding: 0 .4rem; border-radius: 10px; font-size: .8em;
-          background: #21262d; }
   .flag { color: #f0b429; }
-  .err { color: #ff6b6b; }
   .muted { color: #6b7684; }
-  #events td:first-child { color: #6b7684; }
+  .err { color: #ff6b6b; }
+  .pager { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; }
+  .scroll { max-height: 420px; overflow: auto; }
 </style>
 </head>
 <body>
-<header>
-  <h1>lnvps_fw</h1>
-  <span id="summary" class="muted">disconnected</span>
-  <span class="grow"></span>
-  <input id="token" type="password" placeholder="API token" size="28">
-  <button id="save">connect</button>
-  <label class="muted"><input id="auto" type="checkbox" checked> auto</label>
-  <button id="refresh" class="ghost">refresh</button>
-</header>
-<main>
-  <section><h2>Status</h2><div id="status" class="kv"></div></section>
-  <section style="grid-column: 1 / -1"><h2>Active mitigations</h2><div id="mit"></div></section>
-  <section style="grid-column: 1 / -1"><h2>Live tracked IPs <span id="trackcount" class="muted"></span></h2>
-    <div id="tracked" style="max-height: 340px; overflow: auto"></div></section>
-  <section><h2>Protected prefixes</h2><div id="protected"></div></section>
-  <section><h2>Manual overrides</h2><div id="overrides"></div></section>
-  <section style="grid-column: 1 / -1"><h2>Learned open ports <span id="portcount" class="muted"></span></h2>
-    <input id="portfilter" placeholder="filter ip/port/proto" size="22">
-    <div id="ports" style="max-height: 340px; overflow: auto"></div></section>
-  <section style="grid-column: 1 / -1"><h2>Events</h2><div id="events"></div></section>
-</main>
-<script>
-const $ = s => document.querySelector(s);
-let cursor = 0, evbuf = [], timer = null;
+<div id="app"></div>
+<script type="module">
+import { h, render } from 'https://esm.sh/preact@10.24.3';
+import { useState, useEffect, useRef, useCallback } from 'https://esm.sh/preact@10.24.3/hooks';
+import htm from 'https://esm.sh/htm@3.1.1';
+const html = htm.bind(h);
+
 const FLAGS = [[1,'PORT_FILTER'],[2,'SYN_PROXY'],[4,'RATE_CAPS'],[8,'SOURCE_BLOCK']];
 const flagStr = f => { const o = FLAGS.filter(([b])=>f&b).map(([,n])=>n); return o.length?o.join('|'):'none'; };
-$('#token').value = localStorage.getItem('fwtoken') || '';
-async function api(path) {
-  const t = $('#token').value.trim();
-  const r = await fetch(path, { headers: t ? { Authorization: 'Bearer ' + t } : {} });
-  if (!r.ok) throw new Error(path + ' -> ' + r.status);
+const fmtn = n => n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? (n/1e3).toFixed(1)+'k' : ''+n;
+const fmtbps = b => { const x=b*8; return x>=1e9?(x/1e9).toFixed(2)+' Gb/s':x>=1e6?(x/1e6).toFixed(1)+' Mb/s':x>=1e3?(x/1e3).toFixed(0)+' kb/s':x+' b/s'; };
+const flagCell = f => html`<span class="flag">${flagStr(f)}</span>`;
+const time = t => new Date(t*1000).toLocaleTimeString();
+
+async function api(path, token) {
+  const r = await fetch(path, { headers: token ? { Authorization: 'Bearer ' + token } : {} });
+  if (!r.ok) throw new Error(path.split('?')[0] + ' -> ' + r.status);
   return r.status === 204 ? null : r.json();
 }
-function table(cols, rows) {
-  if (!rows.length) return '<div class="muted">none</div>';
-  const h = '<tr>' + cols.map(c=>'<th>'+c+'</th>').join('') + '</tr>';
-  const b = rows.map(r=>'<tr>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('');
-  return '<table>'+h+b+'</table>';
+
+function Table({ cols, rows }) {
+  if (!rows.length) return html`<div class="muted">none</div>`;
+  return html`<table>
+    <thead><tr>${cols.map(c => html`<th>${c}</th>`)}</tr></thead>
+    <tbody>${rows.map(r => html`<tr>${r.map(c => html`<td>${c}</td>`)}</tr>`)}</tbody>
+  </table>`;
 }
-function kv(obj) { return Object.entries(obj).map(([k,v])=>'<div>'+k+'</div><div>'+v+'</div>').join(''); }
-function fmtn(n){ return n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? (n/1e3).toFixed(1)+'k' : ''+n; }
-function fmtbps(b){ const bits=b*8; return bits>=1e9 ? (bits/1e9).toFixed(2)+' Gb/s' : bits>=1e6 ? (bits/1e6).toFixed(1)+' Mb/s' : bits>=1e3 ? (bits/1e3).toFixed(0)+' kb/s' : bits+' b/s'; }
-async function refresh() {
-  try {
-    const st = await api('/api/v1/status');
-    $('#status').innerHTML = kv({
-      version: st.version, uptime: st.uptime_secs + 's',
-      interfaces: st.interfaces.join(', ') || '—',
-      'protected prefixes': st.protected_prefixes,
-      'active mitigations': st.active_mitigations,
-      'events cursor': st.events_cursor });
-    $('#summary').textContent = 'up ' + st.uptime_secs + 's · ' + st.active_mitigations + ' active';
-    $('#summary').className = '';
-    const mit = await api('/api/v1/mitigations');
-    $('#mit').innerHTML = table(['cidr','flags','since','manual','peak pps','peak bps','peak syn/s'],
-      mit.map(m=>[m.cidr, '<span class=flag>'+flagStr(m.flags)+'</span>',
-        new Date(m.since_unix*1000).toLocaleTimeString(), m.manual?'yes':'', m.peak_pps, m.peak_bps, m.peak_syn_pps]));
-    const tracked = await api('/api/v1/tracked');
-    $('#trackcount').textContent = '('+tracked.length+')';
-    $('#tracked').innerHTML = table(['ip','pps','bps','syn/s','drop/s','state'],
-      tracked.map(t=>[t.ip, fmtn(t.pps), fmtbps(t.bps), fmtn(t.syn_pps), fmtn(t.drop_pps),
-        t.mitigating ? '<span class=flag>'+flagStr(t.flags)+'</span>' : 'ok']));
-    const rules = await api('/api/v1/rules');
-    $('#protected').innerHTML = table(['prefix'], rules.protected.map(p=>[p]));
-    $('#overrides').innerHTML = table(['cidr','flags'], rules.overrides.map(o=>[o.cidr,'<span class=flag>'+flagStr(o.flags)+'</span>']));
-    let ports = await api('/api/v1/ports');
-    const f = $('#portfilter').value.trim().toLowerCase();
-    if (f) ports = ports.filter(p => (p.ip+' '+p.port+' '+p.proto).toLowerCase().includes(f));
-    ports.sort((a,b)=> a.ip.localeCompare(b.ip) || a.port-b.port);
-    $('#portcount').textContent = '('+ports.length+')';
-    $('#ports').innerHTML = table(['ip','port','proto','age'],
-      ports.map(p=>[p.ip, p.port, p.proto, p.age_secs+'s']));
-    const ev = await api('/api/v1/events?since=' + cursor);
-    cursor = ev.cursor;
-    if (ev.events.length) { evbuf = ev.events.concat(evbuf).slice(0, 200); }
-    $('#events').innerHTML = table(['seq','time','kind','cidr','flags','pps','syn/s'],
-      evbuf.map(e=>[e.seq, new Date(e.ts_unix*1000).toLocaleTimeString(), e.kind, e.cidr,
-        '<span class=flag>'+flagStr(e.flags)+'</span>', e.pps, e.syn_pps]));
-  } catch (e) {
-    $('#summary').textContent = e.message; $('#summary').className = 'err';
-  }
+
+function Pager({ page, pages, total, onPage }) {
+  return html`<div class="pager">
+    <button class="ghost" disabled=${page<=0} onClick=${()=>onPage(page-1)}>‹ prev</button>
+    <span class="muted">page ${page+1}/${pages} · ${total} rows</span>
+    <button class="ghost" disabled=${page>=pages-1} onClick=${()=>onPage(page+1)}>next ›</button>
+  </div>`;
 }
-function schedule() { clearInterval(timer); if ($('#auto').checked) timer = setInterval(refresh, 2000); }
-$('#save').onclick = () => { localStorage.setItem('fwtoken', $('#token').value.trim()); cursor=0; evbuf=[]; refresh(); };
-$('#refresh').onclick = refresh;
-$('#auto').onchange = schedule;
-refresh(); schedule();
+
+// Client-side paginated table (for bounded datasets).
+function PagedTable({ cols, rows, pageSize = 50 }) {
+  const [page, setPage] = useState(0);
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const p = Math.min(page, pages - 1);
+  const slice = rows.slice(p * pageSize, p * pageSize + pageSize);
+  return html`<div class="scroll"><${Table} cols=${cols} rows=${slice} /></div>
+    ${rows.length > pageSize && html`<${Pager} page=${p} pages=${pages} total=${rows.length} onPage=${setPage} />`}`;
+}
+
+function Section({ title, extra, children, wide }) {
+  return html`<section class=${wide?'wide':''}>
+    <h2>${title}${extra?html`<span class="muted">${extra}</span>`:null}</h2>${children}</section>`;
+}
+
+// Server-side paginated + filtered learned-ports table.
+function PortsCard({ token }) {
+  const PAGE = 50;
+  const [q, setQ] = useState('');
+  const [page, setPage] = useState(0);
+  const [data, setData] = useState({ total: 0, items: [] });
+  const load = useCallback(async () => {
+    try {
+      const params = new URLSearchParams({ offset: page*PAGE, limit: PAGE, q });
+      const d = await api('/api/v1/ports?' + params, token);
+      setData(d);
+    } catch (e) { /* surfaced by the main poller */ }
+  }, [token, q, page]);
+  useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [load]);
+  const pages = Math.max(1, Math.ceil(data.total / PAGE));
+  const rows = data.items.map(p => [p.ip, p.port, p.proto, p.age_secs + 's']);
+  return html`<${Section} wide=true title="Learned open ports" extra=${'(' + data.total + ')'}>
+    <input placeholder="filter ip/port/proto" value=${q}
+      onInput=${e => { setPage(0); setQ(e.target.value); }} style="margin-bottom:.5rem" />
+    <div class="scroll"><${Table} cols=${['ip','port','proto','age']} rows=${rows} /></div>
+    ${data.total > PAGE && html`<${Pager} page=${Math.min(page,pages-1)} pages=${pages} total=${data.total} onPage=${setPage} />`}
+  </${Section}>`;
+}
+
+function App() {
+  const [token, setTokenState] = useState(localStorage.getItem('fwtoken') || '');
+  const [auto, setAuto] = useState(true);
+  const [d, setD] = useState({ status: null, tracked: [], mitigations: [], rules: { protected: [], overrides: [] }, err: '' });
+  const [events, setEvents] = useState([]);
+  const cursor = useRef(0);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+
+  const refresh = useCallback(async () => {
+    const t = tokenRef.current;
+    try {
+      const [status, tracked, mitigations, rules] = await Promise.all([
+        api('/api/v1/status', t), api('/api/v1/tracked', t),
+        api('/api/v1/mitigations', t), api('/api/v1/rules', t),
+      ]);
+      const ev = await api('/api/v1/events?since=' + cursor.current, t);
+      if (ev.events.length) { cursor.current = ev.cursor; setEvents(e => [...ev.events.slice().reverse(), ...e].slice(0, 500)); }
+      setD({ status, tracked, mitigations, rules, err: '' });
+    } catch (e) { setD(x => ({ ...x, err: e.message })); }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    if (!auto) return;
+    const id = setInterval(refresh, 2000);
+    return () => clearInterval(id);
+  }, [auto, token, refresh]);
+
+  const save = () => { localStorage.setItem('fwtoken', token); cursor.current = 0; setEvents([]); refresh(); };
+  const s = d.status;
+  const summary = d.err ? html`<span class="err">${d.err}</span>`
+    : s ? html`<span class="muted">up ${s.uptime_secs}s · ${s.active_mitigations} active · ${s.learned_ports} ports</span>`
+    : html`<span class="muted">disconnected</span>`;
+
+  const trackedRows = d.tracked.map(t => [t.ip, fmtn(t.pps), fmtbps(t.bps), fmtn(t.syn_pps), fmtn(t.drop_pps),
+    t.mitigating ? flagCell(t.flags) : 'ok']);
+  const mitRows = d.mitigations.map(m => [m.cidr, flagCell(m.flags), time(m.since_unix), m.manual?'yes':'',
+    fmtn(m.peak_pps), fmtbps(m.peak_bps), fmtn(m.peak_syn_pps)]);
+  const evRows = events.map(e => [e.seq, time(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtn(e.syn_pps)]);
+
+  return html`
+    <header>
+      <h1>lnvps_fw</h1>${summary}<span class="grow"></span>
+      <input type="password" placeholder="API token" size="26" value=${token}
+        onInput=${e => setTokenState(e.target.value)} onKeyDown=${e => e.key==='Enter' && save()} />
+      <button onClick=${save}>connect</button>
+      <label class="muted"><input type="checkbox" checked=${auto} onChange=${e => setAuto(e.target.checked)} /> auto</label>
+      <button class="ghost" onClick=${refresh}>refresh</button>
+    </header>
+    <main>
+      <${Section} title="Status">
+        ${s ? html`<div class="kv">
+          <div>version</div><div>${s.version}</div>
+          <div>uptime</div><div>${s.uptime_secs}s</div>
+          <div>interfaces</div><div>${s.interfaces.join(', ')||'—'}</div>
+          <div>protected prefixes</div><div>${s.protected_prefixes}</div>
+          <div>active mitigations</div><div>${s.active_mitigations}</div>
+          <div>learned ports</div><div>${s.learned_ports}</div>
+        </div>` : html`<div class="muted">enter token and connect</div>`}
+      </${Section}>
+      <${Section} wide=true title="Active mitigations" extra=${'('+d.mitigations.length+')'}>
+        <${PagedTable} cols=${['cidr','flags','since','manual','peak pps','peak bps','peak syn/s']} rows=${mitRows} />
+      </${Section}>
+      <${Section} wide=true title="Live tracked IPs" extra=${'('+d.tracked.length+')'}>
+        <${PagedTable} cols=${['ip','pps','bps','syn/s','drop/s','state']} rows=${trackedRows} />
+      </${Section}>
+      <${Section} title="Protected prefixes">
+        <${Table} cols=${['prefix']} rows=${d.rules.protected.map(p=>[p])} />
+      </${Section}>
+      <${Section} title="Manual overrides">
+        <${Table} cols=${['cidr','flags']} rows=${d.rules.overrides.map(o=>[o.cidr, flagCell(o.flags)])} />
+      </${Section}>
+      <${PortsCard} token=${token} />
+      <${Section} wide=true title="Events" extra=${'('+events.length+')'}>
+        <${PagedTable} cols=${['seq','time','kind','cidr','flags','pps','syn/s']} rows=${evRows} />
+      </${Section}>
+    </main>`;
+}
+
+render(html`<${App} />`, document.getElementById('app'));
 </script>
 </body>
 </html>
-"#;
+"##;
 
 #[cfg(test)]
 mod tests {

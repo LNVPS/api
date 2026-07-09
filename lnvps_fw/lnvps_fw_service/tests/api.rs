@@ -8,7 +8,8 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
-    Event, EventKind, EventsResponse, LearnedPort, Override, RuleSet, SharedState, Status, router,
+    Event, EventKind, EventsResponse, LearnedPort, Override, PortsPage, RuleSet, SharedState,
+    Status, router,
 };
 use tower::ServiceExt;
 
@@ -197,15 +198,31 @@ async fn learned_ports_endpoint() {
             age_secs: 12,
         },
     ]);
+    // Paginated: limit=1 returns 1 of 2, with total.
     let res = app
-        .oneshot(req("GET", "/api/v1/ports", Some("tok"), None))
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/api/v1/ports?offset=0&limit=1",
+            Some("tok"),
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let ports: Vec<LearnedPort> = body_json(res).await;
-    assert_eq!(ports.len(), 2);
-    assert_eq!(ports[0].port, 443);
-    assert_eq!(ports[1].proto, "udp");
+    let page: PortsPage = body_json(res).await;
+    assert_eq!(page.total, 2);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].port, 443);
+
+    // Filter by proto.
+    let res = app
+        .oneshot(req("GET", "/api/v1/ports?q=udp", Some("tok"), None))
+        .await
+        .unwrap();
+    let page: PortsPage = body_json(res).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].proto, "udp");
 }
 
 #[tokio::test]

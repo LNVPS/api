@@ -170,7 +170,13 @@ impl Harness {
         let now = lnvps_fw_service::gc::monotonic_now_ns();
         let mut map: AyaHashMap<_, PortKeyV4, LastSeen> =
             AyaHashMap::try_from(self.bpf.map_mut("OPEN_PORTS_V4").unwrap())?;
-        Ok(lnvps_fw_service::gc::gc_open_ports(&mut map, now, ttl_ns))
+        Ok(lnvps_fw_service::gc::gc_open_ports(
+            &mut map,
+            now,
+            ttl_ns,
+            ttl_ns,
+            |k| k.proto,
+        ))
     }
 
     /// Force an IPv4 destination (or prefix) into MITIGATE mode by writing the

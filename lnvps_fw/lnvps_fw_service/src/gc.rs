@@ -36,7 +36,9 @@ pub fn is_expired(last_seen_ns: u64, now_ns: u64, ttl_ns: u64) -> bool {
 pub fn gc_open_ports<K>(
     map: &mut HashMap<&mut MapData, K, LastSeen>,
     now_ns: u64,
-    ttl_ns: u64,
+    tcp_ttl_ns: u64,
+    udp_ttl_ns: u64,
+    proto_of: impl Fn(&K) -> u8,
 ) -> usize
 where
     K: Pod,
@@ -46,6 +48,11 @@ where
     let keys: Vec<K> = map.keys().flatten().collect();
     let mut removed = 0;
     for k in keys {
+        let ttl_ns = if proto_of(&k) == lnvps_fw_common::PROTO_UDP {
+            udp_ttl_ns
+        } else {
+            tcp_ttl_ns
+        };
         if let Ok(v) = map.get(&k, 0)
             && is_expired(v.last_seen, now_ns, ttl_ns)
             && map.remove(&k).is_ok()

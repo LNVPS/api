@@ -53,7 +53,7 @@ fn log_stats(bpf: &Ebpf) -> Result<()> {
 /// Sweep both learned-ports maps, returning the total number of entries
 /// removed. TTL is compared against the monotonic clock (matching
 /// `bpf_ktime_get_ns`).
-fn gc_learned_ports(bpf: &mut Ebpf, ttl_ns: u64) -> Result<usize> {
+fn gc_learned_ports(bpf: &mut Ebpf, tcp_ttl_ns: u64, udp_ttl_ns: u64) -> Result<usize> {
     let now = gc::monotonic_now_ns();
     let mut removed = 0;
     {
@@ -61,14 +61,14 @@ fn gc_learned_ports(bpf: &mut Ebpf, ttl_ns: u64) -> Result<usize> {
             bpf.map_mut("OPEN_PORTS_V4")
                 .context("open ports v4 missing")?,
         )?;
-        removed += gc::gc_open_ports(&mut v4, now, ttl_ns);
+        removed += gc::gc_open_ports(&mut v4, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
     }
     {
         let mut v6: AyaHashMap<_, PortKeyV6, LastSeen> = AyaHashMap::try_from(
             bpf.map_mut("OPEN_PORTS_V6")
                 .context("open ports v6 missing")?,
         )?;
-        removed += gc::gc_open_ports(&mut v6, now, ttl_ns);
+        removed += gc::gc_open_ports(&mut v6, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
     }
     Ok(removed)
 }
@@ -499,6 +499,7 @@ async fn main() -> Result<()> {
     let mut bpf = attach_programs(&cfg)?;
 
     let ttl_ns = cfg.port_ttl().as_nanos() as u64;
+    let udp_ttl_ns = cfg.udp_port_ttl().as_nanos() as u64;
     let mut runtime_cfg = cfg.runtime_config()?;
     let mut detection_state = DetectionState::default();
 
@@ -612,7 +613,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = gc_timer.tick() => {
-                match gc_learned_ports(&mut bpf, ttl_ns) {
+                match gc_learned_ports(&mut bpf, ttl_ns, udp_ttl_ns) {
                     Ok(n) if n > 0 => info!("GC removed {n} expired learned port(s)"),
                     Ok(_) => {}
                     Err(e) => warn!("GC failed: {e}"),

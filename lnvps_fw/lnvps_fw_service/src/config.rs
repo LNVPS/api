@@ -127,9 +127,14 @@ fn default_events_buffer() -> usize {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct LearningConfig {
     /// Learned open ports are forgotten after this many seconds without any
-    /// matching egress traffic refreshing them.
+    /// matching egress traffic refreshing them (applies to TCP).
     #[serde(default = "default_port_ttl_secs")]
     pub port_ttl_secs: u64,
+    /// Shorter TTL for learned UDP ports. UDP has no handshake, so learning
+    /// captures ephemeral client source ports too; a short TTL sheds that
+    /// pollution quickly while real UDP services keep getting refreshed.
+    #[serde(default = "default_udp_port_ttl_secs")]
+    pub udp_port_ttl_secs: u64,
     /// How often the userspace GC sweeps expired learned ports.
     #[serde(default = "default_gc_interval_secs")]
     pub gc_interval_secs: u64,
@@ -164,6 +169,9 @@ pub struct Thresholds {
     pub sample_interval_ms: u64,
 }
 
+fn default_udp_port_ttl_secs() -> u64 {
+    120
+}
 fn default_port_ttl_secs() -> u64 {
     600
 }
@@ -223,6 +231,7 @@ impl Default for LearningConfig {
     fn default() -> Self {
         Self {
             port_ttl_secs: default_port_ttl_secs(),
+            udp_port_ttl_secs: default_udp_port_ttl_secs(),
             gc_interval_secs: default_gc_interval_secs(),
             stats_interval_secs: default_stats_interval_secs(),
         }
@@ -368,6 +377,11 @@ impl Config {
     /// Learned-port TTL as a `Duration`.
     pub fn port_ttl(&self) -> Duration {
         Duration::from_secs(self.learning.port_ttl_secs)
+    }
+
+    /// TTL for learned UDP ports (shorter than TCP).
+    pub fn udp_port_ttl(&self) -> Duration {
+        Duration::from_secs(self.learning.udp_port_ttl_secs)
     }
 
     /// GC sweep interval as a `Duration`.

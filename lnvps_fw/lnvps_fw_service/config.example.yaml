@@ -56,6 +56,10 @@ network:
 learning:
   # Forget a learned open port after this long without matching egress traffic.
   port-ttl-secs: 600
+  # Shorter TTL for learned UDP ports: UDP has no handshake so learning also
+  # captures ephemeral client source ports; a short TTL sheds that pollution
+  # while real UDP services keep getting refreshed.
+  udp-port-ttl-secs: 120
   # How often the userspace GC sweeps expired learned ports.
   gc-interval-secs: 60
   # How often per-destination stats are logged (0 disables logging).

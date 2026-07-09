@@ -17,6 +17,8 @@ It is designed around a real threat model: **spoofed carpet-bomb / reflection
 floods from millions of source IPs across a whole prefix**, not just targeted
 single-IP attacks.
 
+![lnvps_fw dashboard](docs/dashboard.png)
+
 > This is a standalone Cargo sub-workspace, **excluded** from the root
 > `lnvps_api` workspace, because the eBPF crate must build for the
 > `bpfel-unknown-none` target with its own toolchain.
@@ -300,14 +302,20 @@ V6` LPM tries plus a `scoped` flag the datapath checks per packet.
 ## Control API & dashboard
 
 The daemon exposes an optional **HTTPS** RESTful control API (token-authed) and
-an internal HTML dashboard. It is the *server*; the primary `lnvps_api` service
-is the *client* and source of truth. There is **no database** on the host:
-rules are pushed by `lnvps_api` and held in memory, and mitigation events go
-into a bounded in-memory ring buffer that `lnvps_api` polls (monotonic cursor)
-and persists. HTTPS is mandatory — a self-signed cert is auto-generated if none
-is configured. Endpoints cover status, rules (GET/PUT), manual overrides
-(POST/DELETE), active mitigations, and events. The dashboard at `/` renders
-status, active mitigations, rules, and a live event feed.
+an internal HTML dashboard ([screenshot](docs/dashboard.png)). It is the
+*server*; the primary `lnvps_api` service is the *client* and source of truth.
+There is **no database** on the host: rules are pushed by `lnvps_api` and held
+in memory, and mitigation events go into a bounded in-memory ring buffer that
+`lnvps_api` polls (monotonic cursor) and persists. HTTPS is mandatory — a
+self-signed cert is auto-generated if none is configured. Endpoints cover status,
+rules (GET/PUT), manual overrides (POST/DELETE), active mitigations, learned
+ports (`/ports`, server-paginated + filtered), live per-IP rates (`/tracked`),
+and events.
+
+The dashboard at `/` is a self-contained **HTM + Preact** app: live per-IP
+rates, learned open ports, active mitigations, rules, and an event feed — every
+table paginated so it stays responsive even with tens of thousands of learned
+ports.
 
 Preview it without root:
 
