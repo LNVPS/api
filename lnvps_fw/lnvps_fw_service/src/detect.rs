@@ -197,9 +197,88 @@ pub fn process_sample(
     (transition, rates)
 }
 
+// --- Per-source rate state machine ---------------------------------------
+//
+// A blocked source is not a sticky list entry: it has its own NORMAL <->
+// DROPPING state driven by its *current* packet rate, with the same entry
+// threshold / exit hysteresis / cooldown shape as a destination. A source is
+// only in DROPPING (and thus in the CIDR block trie) while it is actually over
+// the rate limit; once it falls back below the exit threshold for the cooldown
+// it returns to NORMAL and is unblocked — so legitimate low-rate traffic from
+// an address that had one burst is not dropped for the whole TTL.
+
+/// Detection parameters for the per-source state machine.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceDetectionConfig {
+    /// Enter DROPPING at or above this packets/second.
+    pub rate_pps: u64,
+    /// Exit hysteresis: leave DROPPING only once the rate falls below this
+    /// percentage of `rate_pps`.
+    pub exit_pct: u64,
+    /// Sustained time below the exit threshold before returning to NORMAL.
+    pub cooldown_ns: u64,
+}
+
+/// Per-source userspace bookkeeping across sample windows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SourceTracker {
+    /// Previous cumulative packet count (for the rate delta).
+    pub prev: u64,
+    /// True while this source is being dropped (in the CIDR block trie).
+    pub dropping: bool,
+    /// Monotonic timestamp when the rate first fell below the exit threshold
+    /// (cooldown progress); `None` while above it.
+    pub below_since_ns: Option<u64>,
+    /// Most recent per-window rate (for display + block pps).
+    pub last_pps: u64,
+    /// Injected timestamp when `last_pps` was computed.
+    pub last_ns: u64,
+}
+
+/// Advance one source's state machine from its fresh cumulative packet count.
+/// Returns `(is_dropping, pps)` for this window. A counter that appears to have
+/// decreased (LRU eviction / reset) yields a zero-rate window (never a spike).
+pub fn advance_source(
+    tracker: &mut SourceTracker,
+    cur_count: u64,
+    cfg: &SourceDetectionConfig,
+    now_ns: u64,
+    elapsed_ns: u64,
+) -> (bool, u64) {
+    let pps = if elapsed_ns == 0 {
+        0
+    } else {
+        let delta = cur_count.saturating_sub(tracker.prev);
+        ((delta as u128 * 1_000_000_000u128) / elapsed_ns as u128) as u64
+    };
+    tracker.prev = cur_count;
+    tracker.last_pps = pps;
+    tracker.last_ns = now_ns;
+
+    let exit = cfg.rate_pps.saturating_mul(cfg.exit_pct) / 100;
+    if !tracker.dropping {
+        if pps >= cfg.rate_pps {
+            tracker.dropping = true;
+            tracker.below_since_ns = None;
+        }
+    } else if pps < exit {
+        let since = *tracker.below_since_ns.get_or_insert(now_ns);
+        if now_ns.saturating_sub(since) >= cfg.cooldown_ns {
+            tracker.dropping = false;
+            tracker.below_since_ns = None;
+        }
+    } else {
+        // Rate climbed back up; restart the cooldown clock.
+        tracker.below_since_ns = None;
+    }
+    (tracker.dropping, pps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SEC: u64 = 1_000_000_000;
 
     const CFG: DetectionConfig = DetectionConfig {
         pps: 1_000,
@@ -421,5 +500,65 @@ mod tests {
         assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(t, Transition::None);
         assert_eq!(below, None);
+    }
+
+    const SCFG: SourceDetectionConfig = SourceDetectionConfig {
+        rate_pps: 500,
+        exit_pct: 50, // exit below 250pps
+        cooldown_ns: 2_000_000_000,
+    };
+
+    #[test]
+    fn source_enters_dropping_over_rate() {
+        let mut t = SourceTracker::default();
+        // 600 pkts in 1s => 600pps >= 500 => DROPPING.
+        let (dropping, pps) = advance_source(&mut t, 600, &SCFG, SEC, SEC);
+        assert!(dropping);
+        assert_eq!(pps, 600);
+    }
+
+    #[test]
+    fn source_stays_normal_below_rate() {
+        let mut t = SourceTracker::default();
+        let (dropping, pps) = advance_source(&mut t, 100, &SCFG, SEC, SEC);
+        assert!(!dropping);
+        assert_eq!(pps, 100);
+    }
+
+    #[test]
+    fn source_releases_after_cooldown_below_exit() {
+        let mut t = SourceTracker::default();
+        // Enter DROPPING at 600pps.
+        advance_source(&mut t, 600, &SCFG, SEC, SEC);
+        assert!(t.dropping);
+        // Next window: no new packets (delta 0 => 0pps < 250 exit). Records
+        // "below since", still dropping (cooldown not elapsed).
+        let (d1, _) = advance_source(&mut t, 600, &SCFG, 2 * SEC, SEC);
+        assert!(d1, "still dropping during cooldown");
+        // A full cooldown later: returns to NORMAL.
+        let (d2, _) = advance_source(&mut t, 600, &SCFG, 4 * SEC, SEC);
+        assert!(!d2, "released once below exit for the cooldown");
+    }
+
+    #[test]
+    fn source_resurgence_resets_cooldown() {
+        let mut t = SourceTracker::default();
+        advance_source(&mut t, 600, &SCFG, SEC, SEC);
+        // Drop below exit (records below_since).
+        advance_source(&mut t, 600, &SCFG, 2 * SEC, SEC);
+        assert!(t.below_since_ns.is_some());
+        // Rate climbs back over the entry threshold: cooldown clock clears.
+        let (d, _) = advance_source(&mut t, 1200, &SCFG, 3 * SEC, SEC);
+        assert!(d);
+        assert_eq!(t.below_since_ns, None);
+    }
+
+    #[test]
+    fn source_counter_reset_is_zero_rate() {
+        let mut t = SourceTracker::default();
+        advance_source(&mut t, 1000, &SCFG, SEC, SEC);
+        // Counter appears to decrease (LRU eviction/reset): zero rate, not a spike.
+        let (_, pps) = advance_source(&mut t, 10, &SCFG, 2 * SEC, SEC);
+        assert_eq!(pps, 0);
     }
 }

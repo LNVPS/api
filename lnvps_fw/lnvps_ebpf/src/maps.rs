@@ -248,9 +248,9 @@ pub static VERIFIED_V4: LruHashMap<[u8; 4], u64> = LruHashMap::with_max_entries(
 #[map]
 pub static VERIFIED_V6: LruHashMap<[u8; 16], u64> = LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
 
-/// Rotating SYN-cookie secret: slot 0 current, slot 1 previous.
+/// Rotating SYN-cookie secret: slot 0 current, slot 1 previous. 64-bit keys.
 #[map]
-pub static COOKIE_SECRET: Array<u32> = Array::with_max_entries(2, 0);
+pub static COOKIE_SECRET: Array<u64> = Array::with_max_entries(2, 0);
 
 /// Tail-call jump table for the SYN-proxy sub-programs (slot 0 = IPv4, slot 1 =
 /// IPv6).
@@ -259,7 +259,7 @@ pub static SYN_PROXY_JUMP: ProgramArray = ProgramArray::with_max_entries(4, 0);
 
 /// Current and previous SYN-cookie secrets (0 if unset).
 #[inline(always)]
-pub fn cookie_secrets() -> (u32, u32) {
+pub fn cookie_secrets() -> (u64, u64) {
     let cur = COOKIE_SECRET
         .get(COOKIE_SECRET_CURRENT)
         .copied()

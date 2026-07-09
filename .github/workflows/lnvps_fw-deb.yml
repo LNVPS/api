@@ -23,6 +23,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Assert Cargo.toml version matches the release tag
+        # The lnvps_fw workspace version drives the daemon self-upgrade check
+        # (it compares its compiled CARGO_PKG_VERSION against the newest vX.Y.Z
+        # release tag). If it lags the tag, every running daemon reports an
+        # upgrade is available on startup and every 6h — so fail the build
+        # rather than ship a mismatched .deb.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(awk '/^\[workspace.package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/,"");print;exit}' lnvps_fw/Cargo.toml)
+          echo "tag=$TAG  lnvps_fw/Cargo.toml=$VER"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::lnvps_fw/Cargo.toml version ($VER) != release tag ($TAG). Bump it (in lockstep with the main workspace) before tagging."
+            exit 1
+          fi
+
       - name: Install system dependencies
         # bpf-linker needs LLVM; libelf is used by the aya-build eBPF pipeline.
         run: |

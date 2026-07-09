@@ -93,7 +93,27 @@ escalation:
   # collapse into one wider block (/32->/24->/16->/8), keeping the LPM trie
   # bounded under distributed floods.
   agg-fanout: 4
-  # A CIDR block is lifted this many seconds after it stops being refreshed.
+  # Widest block aggregation may ever produce (smallest prefix length). The
+  # default /24 (v4) / /48 (v6) stops a scatter of offenders — e.g. legitimate
+  # CDN edge IPs — from ever collapsing into an allocation-crossing /16 or /8
+  # and blackholing huge swaths of the internet. Only widen these if you fully
+  # understand the collateral risk.
+  agg-max-prefix-v4: 24
+  agg-max-prefix-v6: 48
+  # Per-source block hysteresis: a source is DROPPING (in the block trie) only
+  # while its rate is high. It is released once its rate falls below
+  # src-exit-pct% of src-rate-pps for src-cooldown-secs — so a source that had
+  # one burst and returned to legitimate low-rate traffic is unblocked quickly,
+  # not held for the full TTL.
+  src-exit-pct: 50
+  src-cooldown-secs: 10
+  # Block offending sources as individual /32s (/128s) up to this many entries;
+  # only merge them into wider prefixes when the trie would exceed this budget
+  # ("merge only when running out of space"). Keeps blocks precise in the common
+  # case and avoids catching innocent neighbours in an aggregated prefix.
+  max-source-blocks: 50000
+  # Safety upper-bound: a block is force-lifted this many seconds after it stops
+  # being refreshed (the per-source state machine above is the primary release).
   block-ttl-secs: 300
   # Escalate a mitigating dest/prefix to source blocking (level 4) only if this
   # many packets/second are still getting through after the port-filter layer.
@@ -125,3 +145,11 @@ api:
   # GitHub owner/repo checked for self-upgrade releases (the dashboard shows an
   # upgrade button when a newer release with a .deb asset exists).
   github-repo: LNVPS/api
+  # Allow POST /api/v1/upgrade to install a new release as root and restart.
+  # OFF by default: a network-triggered root package install is a powerful
+  # primitive. Enable only if you want remote/dashboard-driven upgrades.
+  allow-remote-upgrade: false
+  # Optional minisign public key. When set, a downloaded .deb is installed only
+  # if a matching `.deb.minisig` release asset verifies against this key
+  # (fail-closed). Leave unset to rely on the GitHub-reported SHA-256 digest.
+  # upgrade-pubkey: "RWQ...base64..."

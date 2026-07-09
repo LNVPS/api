@@ -82,70 +82,92 @@ pub struct DestState {
 /// a handshake (i.e. its source address is not spoofed). Userspace rotates
 /// `secret` so old cookies expire.
 ///
-/// This is a fast non-cryptographic mix (FNV-1a style). It does not need to be
-/// cryptographically strong: a spoofed source never receives the SYN-ACK, so it
-/// cannot learn the cookie regardless. Ports/addresses are passed as raw header
-/// bytes so both the generate and verify sides agree without endianness care.
+/// This is a keyed, non-cryptographic hash: a 64-bit FNV-1a mix over the secret
+/// and the 4-tuple, followed by a splitmix64 finalizer for avalanche, truncated
+/// to the 32-bit TCP sequence field. It does not need to be cryptographically
+/// strong: a *spoofed* source never receives the SYN-ACK, so it cannot learn
+/// the cookie regardless.
+///
+/// Limitation: an *on-path* attacker who can observe valid SYN-ACKs is not
+/// defended against by this construction (nor by stateless SYN cookies in
+/// general) — such an attacker can also complete a real handshake. The 64-bit
+/// key (CSPRNG-seeded, rotated) and non-linear finalizer make offline key
+/// recovery from observed cookies impractical for this threat model. Ports and
+/// addresses are passed as raw header bytes so the generate and verify sides
+/// agree without endianness care.
+#[inline(always)]
+fn mix64(mut h: u64, b: u8) -> u64 {
+    h ^= b as u64;
+    h.wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// splitmix64 finalizer, then fold to 32 bits.
+#[inline(always)]
+fn finalize32(mut h: u64) -> u32 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    (h ^ (h >> 32)) as u32
+}
+
 #[inline(always)]
 pub fn syn_cookie_v4(
-    secret: u32,
+    secret: u64,
     saddr: [u8; 4],
     daddr: [u8; 4],
     sport: [u8; 2],
     dport: [u8; 2],
 ) -> u32 {
-    let mut h: u32 = 2_166_136_261u32 ^ secret;
-    let mut mix = |b: u8| {
-        h ^= b as u32;
-        h = h.wrapping_mul(16_777_619);
-    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325u64 ^ secret;
     for b in saddr {
-        mix(b);
+        h = mix64(h, b);
     }
     for b in daddr {
-        mix(b);
+        h = mix64(h, b);
     }
     for b in sport {
-        mix(b);
+        h = mix64(h, b);
     }
     for b in dport {
-        mix(b);
+        h = mix64(h, b);
     }
-    h
+    // Re-bind the key so it influences the output non-linearly.
+    h ^= secret;
+    finalize32(h)
 }
 
-/// IPv6 SYN cookie — identical mix to [`syn_cookie_v4`] over the 128-bit
+/// IPv6 SYN cookie — identical keyed mix to [`syn_cookie_v4`] over the 128-bit
 /// address 4-tuple.
 #[inline(always)]
 pub fn syn_cookie_v6(
-    secret: u32,
+    secret: u64,
     saddr: [u8; 16],
     daddr: [u8; 16],
     sport: [u8; 2],
     dport: [u8; 2],
 ) -> u32 {
-    let mut h: u32 = 2_166_136_261u32 ^ secret;
-    let mut mix = |b: u8| {
-        h ^= b as u32;
-        h = h.wrapping_mul(16_777_619);
-    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325u64 ^ secret;
     for b in saddr {
-        mix(b);
+        h = mix64(h, b);
     }
     for b in daddr {
-        mix(b);
+        h = mix64(h, b);
     }
     for b in sport {
-        mix(b);
+        h = mix64(h, b);
     }
     for b in dport {
-        mix(b);
+        h = mix64(h, b);
     }
-    h
+    h ^= secret;
+    finalize32(h)
 }
 
 /// Config-map keys for the two-slot rotating SYN-cookie secret (current +
-/// previous, so cookies issued just before a rotation still validate).
+/// previous, so cookies issued just before a rotation still validate). Each
+/// slot holds a full 64-bit key.
 pub const COOKIE_SECRET_CURRENT: u32 = 0;
 pub const COOKIE_SECRET_PREVIOUS: u32 = 1;
 

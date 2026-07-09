@@ -171,16 +171,23 @@ fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let src = ip.src_addr;
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
+    let mut accounted = false;
     // Manual source blocks drop unconditionally (independent of dest mitigation).
     if manual_blocked_v4(src) {
         verdict = XDP_DROP;
     } else {
         let flags = dest_mode_v4(&dst);
         if flags != DEST_MODE_NORMAL {
-            verdict = mitigate_v4(ctx, &dst, &src, &meta, flags, allow_syn_proxy);
+            let (v, a) = mitigate_v4(ctx, &dst, &src, &meta, flags, allow_syn_proxy, counters);
+            verdict = v;
+            accounted = a;
         }
     }
-    account(ctx, counters, &meta, PROTO_ICMP, verdict);
+    // The SYN-proxy path accounts before its tail-call (which never returns
+    // here), so only account now if it didn't.
+    if !accounted {
+        account(ctx, counters, &meta, PROTO_ICMP, verdict);
+    }
     Ok(verdict)
 }
 
@@ -201,15 +208,21 @@ fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
 
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
+    let mut accounted = false;
     if manual_blocked_v6(ip.src_addr) {
         verdict = XDP_DROP;
     } else {
         let flags = dest_mode_v6(&dst);
         if flags != DEST_MODE_NORMAL {
-            verdict = mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags, allow_syn_proxy);
+            let (v, a) =
+                mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags, allow_syn_proxy, counters);
+            verdict = v;
+            accounted = a;
         }
     }
-    account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
+    if !accounted {
+        account(ctx, counters, &meta, PROTO_ICMPV6, verdict);
+    }
     Ok(verdict)
 }
 
@@ -223,6 +236,9 @@ fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
 ///   only populates for bounded/real offenders; last resort);
 /// - PORT_FILTER: drop non-first fragments and traffic to non-learned ports
 ///   (ICMP passes); this sheds the bulk of reflection/carpet-bomb floods.
+/// Returns `(verdict, accounted)`. `accounted` is true only when this function
+/// already updated the destination counters (the SYN-proxy tail-call path,
+/// which does not return to the caller), so the caller must not double-count.
 #[inline(always)]
 fn mitigate_v4(
     ctx: &XdpContext,
@@ -231,10 +247,11 @@ fn mitigate_v4(
     meta: &L4Meta,
     flags: u32,
     allow_syn_proxy: bool,
-) -> u32 {
+    counters: Option<*mut lnvps_fw_common::DestCounters>,
+) -> (u32, bool) {
     count_src_v4(src);
     if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v4(*src) {
-        return XDP_DROP;
+        return (XDP_DROP, false);
     }
     if allow_syn_proxy
         && flags & DEST_MODE_SYN_PROXY != 0
@@ -243,16 +260,21 @@ fn mitigate_v4(
         && port_is_open_v4(*dst, meta.dst_port, PROTO_TCP)
         && !src_verified_v4(src)
     {
+        // Account this packet as a dropped SYN *before* the tail-call, which
+        // replaces this program and never returns here.
+        account(ctx, counters, meta, PROTO_ICMP, XDP_DROP);
         unsafe { SYN_PROXY_JUMP.tail_call(ctx, SLOT_SYN_PROXY_V4) };
-        return XDP_DROP;
+        // Only reached if the tail-call failed (jump slot unset): the packet is
+        // already accounted, so report accounted=true to avoid double-counting.
+        return (XDP_DROP, true);
     }
     if flags & DEST_MODE_PORT_FILTER != 0 {
         if meta.is_fragment {
-            return XDP_DROP;
+            return (XDP_DROP, false);
         }
-        return dest_policy_v4(dst, meta);
+        return (dest_policy_v4(dst, meta), false);
     }
-    XDP_PASS
+    (XDP_PASS, false)
 }
 
 /// Destination-port policy under mitigation (after source checks pass).
@@ -271,6 +293,7 @@ fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
     }
 }
 
+/// See [`mitigate_v4`] for the `(verdict, accounted)` contract.
 #[inline(always)]
 fn mitigate_v6(
     ctx: &XdpContext,
@@ -279,10 +302,11 @@ fn mitigate_v6(
     meta: &L4Meta,
     flags: u32,
     allow_syn_proxy: bool,
-) -> u32 {
+    counters: Option<*mut lnvps_fw_common::DestCounters>,
+) -> (u32, bool) {
     count_src_v6(src);
     if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v6(*src) {
-        return XDP_DROP;
+        return (XDP_DROP, false);
     }
     if allow_syn_proxy
         && flags & DEST_MODE_SYN_PROXY != 0
@@ -291,16 +315,17 @@ fn mitigate_v6(
         && port_is_open_v6(*dst, meta.dst_port, PROTO_TCP)
         && !src_verified_v6(src)
     {
+        account(ctx, counters, meta, PROTO_ICMPV6, XDP_DROP);
         unsafe { SYN_PROXY_JUMP.tail_call(ctx, SLOT_SYN_PROXY_V6) };
-        return XDP_DROP;
+        return (XDP_DROP, true);
     }
     if flags & DEST_MODE_PORT_FILTER != 0 {
         if meta.is_fragment {
-            return XDP_DROP;
+            return (XDP_DROP, false);
         }
-        return dest_policy_v6(dst, meta);
+        return (dest_policy_v6(dst, meta), false);
     }
-    XDP_PASS
+    (XDP_PASS, false)
 }
 
 #[inline(always)]

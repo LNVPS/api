@@ -16,12 +16,14 @@ use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig};
 
 const SECOND_NS: u64 = 1_000_000_000;
 
-/// A distributed flood from many sources in one /24 aggregates to a single /24
-/// block; a low-rate unrelated source is not blocked; the block decays after
-/// its TTL once the flood stops. Uses the real `runtime::run_control`.
+/// Per-source state machine: offending sources are blocked as individual /32s
+/// (NOT aggregated into a /24 while there is trie space), a low-rate neighbour
+/// in the same /24 is never caught, and a blocked source is RELEASED once its
+/// rate falls below the exit threshold for the cooldown — not held for a blind
+/// TTL. Uses the real `runtime::run_control`.
 #[test]
 #[ignore = "requires root / CAP_NET_ADMIN"]
-fn cidr_escalation_aggregates_offending_v24() {
+fn per_source_blocks_slash32_and_releases_on_hysteresis() {
     if !require_root() {
         return;
     }
@@ -41,12 +43,17 @@ fn cidr_escalation_aggregates_offending_v24() {
         network: quiet,
         protected_v4: Vec::new(),
         protected_v6: Vec::new(),
-        src_rate_pps: 10, // a source sending >=10pps is an offender
-        fanout: 4,        // 4 sources in a /24 collapse to the /24
+        src_rate_pps: 10, // a source sending >=10pps trips DROPPING
+        fanout: 4,
+        agg_max_prefix_v4: 24,
+        agg_max_prefix_v6: 48,
+        src_exit_pct: 50, // exit below 5pps
+        src_cooldown_ns: SECOND_NS,
+        max_source_blocks: 50_000, // ample space -> /32s, no aggregation
         block_ttl_ns: SECOND_NS,
-        escalate_pass_pps: 0, // (unused here; trie is checked directly)
+        escalate_pass_pps: 0,
         max_real_sources: 10_000,
-        syn_proxy_pps: u64::MAX, // 4 offenders are well under the spoof gate
+        syn_proxy_pps: u64::MAX,
     };
     let mut state = DetectionState::default();
 
@@ -65,31 +72,45 @@ fn cidr_escalation_aggregates_offending_v24() {
         "per-source packets should be counted"
     );
 
-    // t1: one control tick installs the aggregated /24 block.
+    // t1: one control tick moves the offenders into DROPPING and blocks each /32.
     h.run_control_tick(&mut state, &cfg, 2 * SECOND_NS)
         .expect("t1");
 
+    for o in &offenders {
+        assert!(
+            h.cidr_blocked_v4(*o).unwrap(),
+            "offending source {o} should be blocked as a /32"
+        );
+    }
+    // Crucially: a non-offending neighbour in the SAME /24 must NOT be blocked
+    // (no eager aggregation while there is trie space).
     assert!(
-        h.cidr_blocked_v4(Ipv4Addr::new(10, 0, 9, 1)).unwrap(),
-        "offending source should be blocked"
-    );
-    assert!(
-        h.cidr_blocked_v4(Ipv4Addr::new(10, 0, 9, 200)).unwrap(),
-        "the whole /24 should be covered (aggregation)"
+        !h.cidr_blocked_v4(Ipv4Addr::new(10, 0, 9, 200)).unwrap(),
+        "a low-rate neighbour in the same /24 must not be caught by aggregation"
     );
     assert!(
         !h.cidr_blocked_v4(unrelated).unwrap(),
         "low-rate unrelated source must not be blocked"
     );
 
-    // Flood stops: no new per-source deltas, so the block is not refreshed and
-    // decays once its TTL (1s) elapses.
-    h.run_control_tick(&mut state, &cfg, 4 * SECOND_NS)
-        .expect("decay");
+    // Flood stops. The source rate drops to 0; the state machine needs one tick
+    // to record "below exit" and then the cooldown (1s) to elapse before it
+    // returns to NORMAL and is unblocked.
+    h.run_control_tick(&mut state, &cfg, 3 * SECOND_NS)
+        .expect("cooldown-start");
     assert!(
-        !h.cidr_blocked_v4(Ipv4Addr::new(10, 0, 9, 1)).unwrap(),
-        "block should decay after TTL without refresh"
+        h.cidr_blocked_v4(Ipv4Addr::new(10, 0, 9, 1)).unwrap(),
+        "still blocked during the cooldown window"
     );
+    // A second tick a full cooldown later releases the block.
+    h.run_control_tick(&mut state, &cfg, 5 * SECOND_NS)
+        .expect("release");
+    for o in &offenders {
+        assert!(
+            !h.cidr_blocked_v4(*o).unwrap(),
+            "source {o} released once its rate fell below exit for the cooldown"
+        );
+    }
 }
 
 fn attacker_ns(h: &Harness) -> String {

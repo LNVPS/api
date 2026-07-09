@@ -15,7 +15,7 @@
 //!
 //! The eBPF side only counts and enforces; every threshold decision is here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -30,10 +30,11 @@ use lnvps_fw_common::{
     DestCounters, DestState,
 };
 
-use crate::cidr::{
-    CidrV4, CidrV6, aggregate_v4, aggregate_v6, mask_v4, mask_v6, offenders, per_source_pps,
+use crate::cidr::{CidrV4, CidrV6, mask_v4, mask_v6, plan_blocks_v4, plan_blocks_v6};
+use crate::detect::{
+    DestTracker, DetectionConfig, Rates, SourceDetectionConfig, SourceTracker, Transition,
+    advance_source, compute_rates, process_sample,
 };
-use crate::detect::{DestTracker, DetectionConfig, Rates, Transition, compute_rates, process_sample};
 
 /// Runtime configuration for one control tick.
 #[derive(Debug, Clone)]
@@ -52,7 +53,23 @@ pub struct RuntimeConfig {
     /// Aggregation fan-out: this many child prefixes under a parent collapse to
     /// the parent (/32->/24->/16->/8, /128->/64->/48->/32).
     pub fanout: usize,
-    /// A CIDR block is lifted this many ns after it stops being refreshed.
+    /// Widest IPv4 source block aggregation may ever produce (smallest prefix
+    /// length, e.g. 24 = never wider than a /24). Prevents a scatter of
+    /// offenders from collapsing into a huge allocation-crossing block.
+    pub agg_max_prefix_v4: u32,
+    /// Widest IPv6 source block aggregation may ever produce.
+    pub agg_max_prefix_v6: u32,
+    /// A DROPPING source's exit hysteresis (% of `src_rate_pps`).
+    pub src_exit_pct: u64,
+    /// Sustained time below the source exit threshold before a source returns
+    /// to NORMAL and is unblocked.
+    pub src_cooldown_ns: u64,
+    /// Trie-space budget: block sources as individual /32s (v4) / /128s (v6)
+    /// until this many entries, only aggregating under pressure beyond it.
+    pub max_source_blocks: usize,
+    /// A CIDR block is lifted this many ns after it stops being refreshed
+    /// (safety upper-bound for sources evicted from the per-source counter LRU;
+    /// the per-source state machine is the primary release mechanism).
     pub block_ttl_ns: u64,
     /// Escalate a mitigating dest/prefix to `SOURCE_BLOCK` only if this many
     /// packets/second are still getting through after the port filter.
@@ -76,9 +93,12 @@ pub struct DetectionState {
     /// Per-protected-prefix detection trackers, keyed by (prefix_len, network).
     pub prefix_v4: HashMap<(u32, [u8; 4]), DestTracker>,
     pub prefix_v6: HashMap<(u32, [u8; 16]), DestTracker>,
-    /// Previous cumulative per-source counter snapshots (for rate deltas).
-    pub prev_src_v4: HashMap<[u8; 4], u64>,
-    pub prev_src_v6: HashMap<[u8; 16], u64>,
+    /// Per-source rate state machines (NORMAL/DROPPING with hysteresis), keyed
+    /// by source address. A source is in the block trie only while its tracker
+    /// is DROPPING; it is released as soon as its rate falls back (hysteresis),
+    /// not held for a blind TTL.
+    pub src_v4: HashMap<[u8; 4], SourceTracker>,
+    pub src_v6: HashMap<[u8; 16], SourceTracker>,
     /// Active CIDR blocks -> timestamp last refreshed (for TTL decay).
     pub blocks_v4: HashMap<CidrV4, u64>,
     pub blocks_v6: HashMap<CidrV6, u64>,
@@ -309,51 +329,127 @@ where
     Ok(out)
 }
 
-/// Reconcile one family's CIDR block trie with the freshly-computed `desired`
-/// block set: install/refresh desired blocks, then decay any not refreshed
-/// within the TTL. Updates `prev_src` for the next window's deltas.
-#[allow(clippy::too_many_arguments)]
-fn reconcile_blocks<K, C>(
-    cur_src: Vec<(K, u64)>,
-    prev_src: &mut HashMap<K, u64>,
+/// Advance every source's rate state machine for one family and return the set
+/// of addresses currently in DROPPING. Sources not sampled this window (evicted
+/// from the counter LRU, or gone quiet) are driven toward NORMAL with a
+/// zero-rate window and dropped from the tracker map once they return to
+/// NORMAL, so the map stays bounded.
+fn step_sources<K>(
+    cur: &[(K, u64)],
+    trackers: &mut HashMap<K, SourceTracker>,
+    scfg: &SourceDetectionConfig,
+    now_ns: u64,
+    elapsed_ns: u64,
+) -> Vec<K>
+where
+    K: Eq + Hash + Copy,
+{
+    let cur_map: HashMap<K, u64> = cur.iter().copied().collect();
+    let mut dropping = Vec::new();
+    for (k, c) in cur {
+        let t = trackers.entry(*k).or_default();
+        let (drop, _) = advance_source(t, *c, scfg, now_ns, elapsed_ns);
+        if drop {
+            dropping.push(*k);
+        }
+    }
+    // Sources absent from this window's sample: no new packets, so advance them
+    // with a zero-rate window (delta 0). Once a source returns to NORMAL it is
+    // removed; while still cooling down in DROPPING it stays blocked.
+    let stale: Vec<K> = trackers
+        .keys()
+        .filter(|k| !cur_map.contains_key(*k))
+        .copied()
+        .collect();
+    for k in stale {
+        let t = trackers.get_mut(&k).expect("stale key present");
+        let prev = t.prev;
+        let (drop, _) = advance_source(t, prev, scfg, now_ns, elapsed_ns);
+        if drop {
+            dropping.push(k);
+        } else {
+            trackers.remove(&k);
+        }
+    }
+    dropping
+}
+
+/// Reconcile one family's CIDR block trie to exactly the `desired` set: install
+/// entries that are newly desired, remove entries no longer desired. Unlike the
+/// old TTL scheme this is a pure set-diff against the per-source state machine's
+/// current DROPPING set — a source is unblocked the moment its tracker leaves
+/// DROPPING, not after a blind TTL.
+fn reconcile_block_set<K, C>(
     blocks: &mut HashMap<C, u64>,
     trie: &mut LpmTrie<&mut MapData, K, u8>,
-    desired: Vec<C>,
-    block_ttl_ns: u64,
+    desired: &[C],
     now_ns: u64,
     key_of: impl Fn(&C) -> Key<K>,
     fmt_cidr: impl Fn(&C) -> String,
 ) where
-    K: Pod + Eq + Hash + Copy,
+    K: Pod,
     C: Eq + Hash + Copy,
 {
-    for cidr in desired {
-        if blocks.insert(cidr, now_ns).is_none() {
-            if let Err(e) = trie.insert(&key_of(&cidr), 1, 0) {
-                warn!("failed to install CIDR block {}: {e}", fmt_cidr(&cidr));
-                blocks.remove(&cidr);
+    let want: HashSet<C> = desired.iter().copied().collect();
+    for c in desired {
+        if !blocks.contains_key(c) {
+            if let Err(e) = trie.insert(&key_of(c), 1, 0) {
+                warn!("failed to install CIDR block {}: {e}", fmt_cidr(c));
                 continue;
             }
-            warn!("CIDR BLOCK {}", fmt_cidr(&cidr));
+            blocks.insert(*c, now_ns);
+            warn!("CIDR BLOCK {}", fmt_cidr(c));
         }
     }
-    let expired: Vec<C> = blocks
-        .iter()
-        .filter(|(_, ts)| now_ns.saturating_sub(**ts) > block_ttl_ns)
-        .map(|(c, _)| *c)
+    let gone: Vec<C> = blocks
+        .keys()
+        .filter(|c| !want.contains(c))
+        .copied()
         .collect();
-    for cidr in expired {
-        let _ = trie.remove(&key_of(&cidr));
-        blocks.remove(&cidr);
-        info!("CIDR UNBLOCK {}", fmt_cidr(&cidr));
+    for c in gone {
+        let _ = trie.remove(&key_of(&c));
+        blocks.remove(&c);
+        info!("CIDR UNBLOCK {}", fmt_cidr(&c));
     }
-    *prev_src = cur_src.into_iter().collect();
 }
 
-/// Source analysis for one family: compute per-source rates, apply the spoof
-/// gate, aggregate offenders into CIDR blocks, reconcile the trie. Returns
-/// whether any source block is active (drives escalation to `SOURCE_BLOCK`).
-#[allow(clippy::too_many_arguments)]
+/// Aggregate per-block current pps from the per-source trackers under each
+/// active block (for the API/dashboard view).
+fn block_pps<K, C>(
+    blocks: &HashMap<C, u64>,
+    trackers: &HashMap<K, SourceTracker>,
+    covers: impl Fn(&C, &K) -> bool,
+) -> HashMap<C, u64>
+where
+    K: Eq + Hash + Copy,
+    C: Eq + Hash + Copy,
+{
+    blocks
+        .keys()
+        .map(|c| {
+            let sum = trackers
+                .iter()
+                .filter(|(ip, _)| covers(c, ip))
+                .map(|(_, t)| t.last_pps)
+                // (covers takes &C, &K; ip is &&K via match ergonomics)
+                .sum();
+            (*c, sum)
+        })
+        .collect::<HashMap<C, u64>>()
+}
+
+fn src_cfg(cfg: &RuntimeConfig) -> SourceDetectionConfig {
+    SourceDetectionConfig {
+        rate_pps: cfg.src_rate_pps,
+        exit_pct: cfg.src_exit_pct,
+        cooldown_ns: cfg.src_cooldown_ns,
+    }
+}
+
+/// Source analysis for one family: advance the per-source state machines, apply
+/// the spoof gate, plan the block set (/32-first, aggregating only under trie
+/// pressure), and reconcile the trie. Returns whether any block is active
+/// (drives escalation to `SOURCE_BLOCK`).
 fn source_control_v4(
     bpf: &mut Ebpf,
     state: &mut DetectionState,
@@ -362,40 +458,33 @@ fn source_control_v4(
     elapsed_ns: u64,
 ) -> Result<bool> {
     let cur = read_src_counters::<[u8; 4]>(bpf, "V4_SRC_COUNTERS")?;
-    let rates = per_source_pps(&state.prev_src_v4, &cur, elapsed_ns);
-    let off = offenders(&rates, cfg.src_rate_pps);
-    // Spoof gate: an unbounded offender set means a spoofed flood — skip.
-    let desired = if off.len() <= cfg.max_real_sources {
-        aggregate_v4(&off, cfg.fanout)
-    } else {
+    let dropping = step_sources(&cur, &mut state.src_v4, &src_cfg(cfg), now_ns, elapsed_ns);
+    // Spoof gate: an unbounded DROPPING set means a spoofed flood — skip source
+    // blocking (chasing spoofed /32s is pointless; rely on the port filter).
+    let desired = if dropping.len() > cfg.max_real_sources {
         Vec::new()
+    } else {
+        plan_blocks_v4(
+            &dropping,
+            cfg.fanout,
+            cfg.max_source_blocks,
+            cfg.agg_max_prefix_v4,
+        )
     };
-    let mut trie: LpmTrie<_, [u8; 4], u8> =
-        LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
-    reconcile_blocks(
-        cur,
-        &mut state.prev_src_v4,
-        &mut state.blocks_v4,
-        &mut trie,
-        desired,
-        cfg.block_ttl_ns,
-        now_ns,
-        |c| Key::new(c.prefix_len, c.network),
-        |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
-    );
-    // Current aggregate pps from the sources under each active block.
-    let active: Vec<CidrV4> = state.blocks_v4.keys().copied().collect();
-    state.block_pps_v4 = active
-        .into_iter()
-        .map(|c| {
-            let sum = rates
-                .iter()
-                .filter(|(ip, _)| mask_v4(*ip, c.prefix_len) == c.network)
-                .map(|(_, p)| *p)
-                .sum();
-            (c, sum)
-        })
-        .collect();
+    {
+        let mut trie: LpmTrie<_, [u8; 4], u8> =
+            LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
+        reconcile_block_set(
+            &mut state.blocks_v4,
+            &mut trie,
+            &desired,
+            now_ns,
+            |c| Key::new(c.prefix_len, c.network),
+            |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
+        );
+    }
+    state.block_pps_v4 =
+        block_pps(&state.blocks_v4, &state.src_v4, |c, ip| mask_v4(*ip, c.prefix_len) == c.network);
     Ok(!state.blocks_v4.is_empty())
 }
 
@@ -407,38 +496,31 @@ fn source_control_v6(
     elapsed_ns: u64,
 ) -> Result<bool> {
     let cur = read_src_counters::<[u8; 16]>(bpf, "V6_SRC_COUNTERS")?;
-    let rates = per_source_pps(&state.prev_src_v6, &cur, elapsed_ns);
-    let off = offenders(&rates, cfg.src_rate_pps);
-    let desired = if off.len() <= cfg.max_real_sources {
-        aggregate_v6(&off, cfg.fanout)
-    } else {
+    let dropping = step_sources(&cur, &mut state.src_v6, &src_cfg(cfg), now_ns, elapsed_ns);
+    let desired = if dropping.len() > cfg.max_real_sources {
         Vec::new()
+    } else {
+        plan_blocks_v6(
+            &dropping,
+            cfg.fanout,
+            cfg.max_source_blocks,
+            cfg.agg_max_prefix_v6,
+        )
     };
-    let mut trie: LpmTrie<_, [u8; 16], u8> =
-        LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
-    reconcile_blocks(
-        cur,
-        &mut state.prev_src_v6,
-        &mut state.blocks_v6,
-        &mut trie,
-        desired,
-        cfg.block_ttl_ns,
-        now_ns,
-        |c| Key::new(c.prefix_len, c.network),
-        |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
-    );
-    let active: Vec<CidrV6> = state.blocks_v6.keys().copied().collect();
-    state.block_pps_v6 = active
-        .into_iter()
-        .map(|c| {
-            let sum = rates
-                .iter()
-                .filter(|(ip, _)| mask_v6(*ip, c.prefix_len) == c.network)
-                .map(|(_, p)| *p)
-                .sum();
-            (c, sum)
-        })
-        .collect();
+    {
+        let mut trie: LpmTrie<_, [u8; 16], u8> =
+            LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
+        reconcile_block_set(
+            &mut state.blocks_v6,
+            &mut trie,
+            &desired,
+            now_ns,
+            |c| Key::new(c.prefix_len, c.network),
+            |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
+        );
+    }
+    state.block_pps_v6 =
+        block_pps(&state.blocks_v6, &state.src_v6, |c, ip| mask_v6(*ip, c.prefix_len) == c.network);
     Ok(!state.blocks_v6.is_empty())
 }
 

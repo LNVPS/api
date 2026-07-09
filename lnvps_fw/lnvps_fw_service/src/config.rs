@@ -10,6 +10,26 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Warn (do not fail) if the config file is readable by group or others. It
+/// holds the API bearer token and possibly TLS key paths, so it should be
+/// `0600`/`0640` root-owned. A warning keeps existing deployments working while
+/// nudging operators to tighten permissions.
+fn warn_if_permissive(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(md) = std::fs::metadata(path) {
+        let mode = md.mode() & 0o077;
+        if mode != 0 {
+            log::warn!(
+                "config {} is group/other-accessible (mode {:o}); it contains the API token \
+                 — run: chmod 600 {}",
+                path.display(),
+                md.mode() & 0o777,
+                path.display()
+            );
+        }
+    }
+}
+
 /// Protected IPv4 prefixes as (prefix_len, network-bytes).
 pub type ProtectedV4 = Vec<(u32, [u8; 4])>;
 /// Protected IPv6 prefixes as (prefix_len, network-bytes).
@@ -115,6 +135,16 @@ pub struct ApiConfig {
     /// GitHub `owner/repo` to check for self-upgrade releases.
     #[serde(default = "default_github_repo")]
     pub github_repo: String,
+    /// Allow `POST /api/v1/upgrade` to install a new release as root. Off by
+    /// default: a network-triggered root package install is a powerful
+    /// primitive, so it must be explicitly opted into.
+    #[serde(default)]
+    pub allow_remote_upgrade: bool,
+    /// Optional minisign public key (the raw base64 line, or full key file
+    /// contents). When set, a downloaded `.deb` is only installed if a matching
+    /// `.deb.minisig` release asset verifies against this key.
+    #[serde(default)]
+    pub upgrade_pubkey: Option<String>,
 }
 
 fn default_github_repo() -> String {
@@ -209,6 +239,12 @@ fn default_sample_interval_ms() -> u64 {
 fn default_agg_fanout() -> usize {
     4
 }
+fn default_agg_max_prefix_v4() -> u32 {
+    crate::cidr::DEFAULT_AGG_MAX_PREFIX_V4
+}
+fn default_agg_max_prefix_v6() -> u32 {
+    crate::cidr::DEFAULT_AGG_MAX_PREFIX_V6
+}
 fn default_net_pps() -> u64 {
     500_000
 }
@@ -220,6 +256,12 @@ fn default_net_bps() -> u64 {
 }
 fn default_block_ttl_secs() -> u64 {
     300
+}
+fn default_src_cooldown_secs() -> u64 {
+    10
+}
+fn default_max_source_blocks() -> usize {
+    50_000
 }
 fn default_src_rate_pps() -> u64 {
     500
@@ -273,7 +315,30 @@ pub struct Escalation {
     /// bounded under distributed floods.
     #[serde(default = "default_agg_fanout")]
     pub agg_fanout: usize,
-    /// A CIDR block is lifted after this many seconds without being refreshed.
+    /// Widest IPv4 source block aggregation may ever produce (smallest prefix
+    /// length). Default /24 so a scatter of offenders (e.g. CDN edge IPs) can
+    /// never collapse into an allocation-crossing /16 or /8.
+    #[serde(default = "default_agg_max_prefix_v4")]
+    pub agg_max_prefix_v4: u32,
+    /// Widest IPv6 source block aggregation may ever produce. Default /48.
+    #[serde(default = "default_agg_max_prefix_v6")]
+    pub agg_max_prefix_v6: u32,
+    /// A DROPPING source's exit hysteresis: it returns to NORMAL (unblocked)
+    /// once its rate falls below this percentage of `src_rate_pps`.
+    #[serde(default = "default_exit_pct")]
+    pub src_exit_pct: u64,
+    /// Sustained seconds below the source exit threshold before a source is
+    /// unblocked (hysteresis, mirrors the destination cooldown).
+    #[serde(default = "default_src_cooldown_secs")]
+    pub src_cooldown_secs: u64,
+    /// Block sources as individual /32s (/128s) up to this many entries per
+    /// family; only aggregate into wider prefixes when the trie would exceed
+    /// this budget ("merge only when running out of space").
+    #[serde(default = "default_max_source_blocks")]
+    pub max_source_blocks: usize,
+    /// A CIDR block is lifted after this many seconds without being refreshed
+    /// (safety upper-bound; the per-source state machine is the primary
+    /// release path).
     #[serde(default = "default_block_ttl_secs")]
     pub block_ttl_secs: u64,
     /// Escalate a mitigating dest/prefix to source blocking only if this many
@@ -295,6 +360,11 @@ impl Default for Escalation {
         Self {
             src_rate_pps: default_src_rate_pps(),
             agg_fanout: default_agg_fanout(),
+            agg_max_prefix_v4: default_agg_max_prefix_v4(),
+            agg_max_prefix_v6: default_agg_max_prefix_v6(),
+            src_exit_pct: default_exit_pct(),
+            src_cooldown_secs: default_src_cooldown_secs(),
+            max_source_blocks: default_max_source_blocks(),
             block_ttl_secs: default_block_ttl_secs(),
             escalate_pass_pps: default_escalate_pass_pps(),
             max_real_sources: default_max_real_sources(),
@@ -345,6 +415,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        warn_if_permissive(path);
         let cfg: Config = serde_yaml_ng::from_str(&text)
             .with_context(|| format!("parsing config {}", path.display()))?;
         cfg.validate()?;
@@ -462,6 +533,11 @@ impl Config {
             protected_v6,
             src_rate_pps: self.escalation.src_rate_pps,
             fanout: self.escalation.agg_fanout,
+            agg_max_prefix_v4: self.escalation.agg_max_prefix_v4,
+            agg_max_prefix_v6: self.escalation.agg_max_prefix_v6,
+            src_exit_pct: self.escalation.src_exit_pct,
+            src_cooldown_ns: self.escalation.src_cooldown_secs * 1_000_000_000,
+            max_source_blocks: self.escalation.max_source_blocks,
             block_ttl_ns: self.escalation.block_ttl_secs * 1_000_000_000,
             escalate_pass_pps: self.escalation.escalate_pass_pps,
             max_real_sources: self.escalation.max_real_sources,

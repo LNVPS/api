@@ -284,9 +284,9 @@ impl Harness {
         Ok(())
     }
 
-    /// Set the current SYN-cookie secret (slot 0).
-    pub fn set_cookie_secret(&mut self, secret: u32) -> anyhow::Result<()> {
-        let mut map: Array<_, u32> = Array::try_from(self.bpf.map_mut("COOKIE_SECRET").unwrap())?;
+    /// Set the current SYN-cookie secret (slot 0). 64-bit key.
+    pub fn set_cookie_secret(&mut self, secret: u64) -> anyhow::Result<()> {
+        let mut map: Array<_, u64> = Array::try_from(self.bpf.map_mut("COOKIE_SECRET").unwrap())?;
         map.set(0, secret, 0)?;
         Ok(())
     }

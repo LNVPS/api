@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
-    Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage, RuleSet,
+    BlocksPage, Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage, RuleSet,
     SharedState, SourceBlock, Status, router,
 };
 use tower::ServiceExt;
@@ -21,6 +21,8 @@ fn state() -> Arc<SharedState> {
         RuleSet::default(),
         16,
         "LNVPS/api".into(),
+        false,
+        None,
     )
 }
 
@@ -278,6 +280,7 @@ async fn blocks_endpoint() {
         age_secs: 12,
         pps: 5000,
         manual: false,
+        cooling: false,
     }]);
     // Add a manual block via the API.
     let res = app
@@ -297,12 +300,12 @@ async fn blocks_endpoint() {
         .oneshot(req("GET", "/api/v1/blocks", Some("tok"), None))
         .await
         .unwrap();
-    let blocks: Vec<SourceBlock> = body_json(res).await;
-    // Manual (from ruleset) first, then the auto block.
-    assert_eq!(blocks.len(), 2);
-    assert!(blocks.iter().any(|b| b.cidr == "45.0.0.0/8" && b.manual));
+    let page: BlocksPage = body_json(res).await;
+    // Paginated: total counts both, items holds the (bounded) slice.
+    assert_eq!(page.total, 2);
+    assert!(page.items.iter().any(|b| b.cidr == "45.0.0.0/8" && b.manual));
     assert!(
-        blocks
+        page.items
             .iter()
             .any(|b| b.cidr == "203.0.113.0/24" && !b.manual)
     );
@@ -337,4 +340,96 @@ async fn dashboard_served_without_token() {
     assert!(ct.starts_with("text/html"));
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert!(String::from_utf8_lossy(&bytes).contains("lnvps_fw dashboard"));
+}
+
+#[tokio::test]
+async fn dashboard_sets_strict_csp() {
+    let res = router(state())
+        .oneshot(req("GET", "/", None, None))
+        .await
+        .unwrap();
+    let csp = res
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    // No external origins may be contacted from the token-entry page.
+    assert!(csp.contains("default-src 'none'"));
+    assert!(csp.contains("connect-src 'self'"));
+}
+
+#[tokio::test]
+async fn vendored_assets_served_same_origin_with_csp() {
+    for (path, needle) in [
+        ("/assets/app.js", "preact"),
+        ("/assets/preact.js", ""),
+        ("/assets/htm.js", ""),
+        ("/assets/app.css", "body"),
+    ] {
+        let res = router(state())
+            .oneshot(req("GET", path, None, None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        assert!(
+            res.headers().get("content-security-policy").is_some(),
+            "{path} missing CSP"
+        );
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(!bytes.is_empty(), "{path} empty");
+        if !needle.is_empty() {
+            assert!(String::from_utf8_lossy(&bytes).contains(needle), "{path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn blocks_paginated_sorted_by_pps_and_filtered() {
+    let st = state();
+    let app = router(st.clone());
+    st.set_blocks(vec![
+        SourceBlock { cidr: "10.0.0.1/32".into(), age_secs: 1, pps: 100, manual: false, cooling: false },
+        SourceBlock { cidr: "10.0.0.2/32".into(), age_secs: 1, pps: 9000, manual: false, cooling: false },
+        SourceBlock { cidr: "10.0.0.3/32".into(), age_secs: 1, pps: 500, manual: false, cooling: true },
+    ]);
+    // First page, limit 2: highest pps first.
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/blocks?limit=2", Some("tok"), None))
+        .await
+        .unwrap();
+    let page: BlocksPage = body_json(res).await;
+    assert_eq!(page.total, 3);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].cidr, "10.0.0.2/32"); // 9000 pps
+    assert_eq!(page.items[1].cidr, "10.0.0.3/32"); // 500 pps
+    assert!(page.items[1].cooling);
+    // Filter narrows to one.
+    let res = app
+        .oneshot(req("GET", "/api/v1/blocks?q=0.0.1", Some("tok"), None))
+        .await
+        .unwrap();
+    let page: BlocksPage = body_json(res).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].cidr, "10.0.0.1/32");
+}
+
+#[tokio::test]
+async fn unknown_asset_404() {
+    let res = router(state())
+        .oneshot(req("GET", "/assets/evil.js", None, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn upgrade_forbidden_when_disabled() {
+    // state() constructs with allow_remote_upgrade = false.
+    let res = router(state())
+        .oneshot(req("POST", "/api/v1/upgrade", Some("tok"), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }

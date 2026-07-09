@@ -423,12 +423,14 @@ async fn run_sim(state: Arc<SharedState>) {
                     age_secs: now.saturating_sub(started),
                     pps: rng.jitter(48_000, 20),
                     manual: false,
+                    cooling: false,
                 },
                 SourceBlock {
                     cidr: "193.32.162.7/32".into(),
                     age_secs: now.saturating_sub(started),
                     pps: rng.jitter(9_000, 25),
                     manual: false,
+                    cooling: true,
                 },
             ],
             _ => {
@@ -484,6 +486,8 @@ async fn main() -> anyhow::Result<()> {
         },
         1024,
         "LNVPS/api".into(),
+        false,
+        None,
     );
     state.set_limits(LIM);
     state.set_ports(learned_ports(0));

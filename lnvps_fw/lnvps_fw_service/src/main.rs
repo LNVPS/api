@@ -143,8 +143,8 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
         jt.set(SLOT_SYN_PROXY_V6, &v6_fd, 0)?;
         info!("SYN-proxy programs (v4+v6) loaded into jump table");
     }
-    // Seed an initial SYN-cookie secret.
-    rotate_cookie_secret(&mut bpf, gc::monotonic_now_ns() as u32 | 1)?;
+    // Seed an initial SYN-cookie secret from the CSPRNG.
+    rotate_cookie_secret(&mut bpf, fresh_cookie_secret())?;
 
     Ok(bpf)
 }
@@ -184,8 +184,8 @@ where
 }
 
 /// Rotate the SYN-cookie secret: previous <- current, current <- `new`.
-fn rotate_cookie_secret(bpf: &mut Ebpf, new: u32) -> Result<()> {
-    let mut secret: Array<_, u32> = Array::try_from(
+fn rotate_cookie_secret(bpf: &mut Ebpf, new: u64) -> Result<()> {
+    let mut secret: Array<_, u64> = Array::try_from(
         bpf.map_mut("COOKIE_SECRET")
             .context("COOKIE_SECRET missing")?,
     )?;
@@ -193,6 +193,21 @@ fn rotate_cookie_secret(bpf: &mut Ebpf, new: u32) -> Result<()> {
     secret.set(COOKIE_SECRET_PREVIOUS, cur, 0)?;
     secret.set(COOKIE_SECRET_CURRENT, new, 0)?;
     Ok(())
+}
+
+/// A fresh 64-bit SYN-cookie key from the OS CSPRNG (never 0). Falls back to a
+/// monotonic-clock mix only if `getrandom` somehow fails, so a key is always
+/// present.
+fn fresh_cookie_secret() -> u64 {
+    let mut buf = [0u8; 8];
+    match getrandom::getrandom(&mut buf) {
+        Ok(()) => u64::from_ne_bytes(buf) | 1,
+        Err(e) => {
+            warn!("getrandom failed ({e}); using clock-derived cookie secret");
+            let t = gc::monotonic_now_ns();
+            (t.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1
+        }
+    }
 }
 
 fn now_unix() -> u64 {
@@ -332,6 +347,18 @@ fn collect_tracked(
 /// Snapshot the active blocked source CIDRs (from SOURCE_BLOCK escalation).
 fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
     let age = |ts: u64| now_ns.saturating_sub(ts) / 1_000_000_000;
+    // A block is "cooling" if none of its covered sources is still actively
+    // over-rate (all have entered the exit-hysteresis countdown).
+    let cooling_v4 = |c: &lnvps_fw_service::cidr::CidrV4| {
+        !det.src_v4.iter().any(|(ip, t)| {
+            t.dropping && t.below_since_ns.is_none() && mask_v4(*ip, c.prefix_len) == c.network
+        })
+    };
+    let cooling_v6 = |c: &lnvps_fw_service::cidr::CidrV6| {
+        !det.src_v6.iter().any(|(ip, t)| {
+            t.dropping && t.below_since_ns.is_none() && mask_v6(*ip, c.prefix_len) == c.network
+        })
+    };
     let mut out: Vec<SourceBlock> = det
         .blocks_v4
         .iter()
@@ -340,15 +367,18 @@ fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
             age_secs: age(ts),
             pps: det.block_pps_v4.get(c).copied().unwrap_or(0),
             manual: false,
+            cooling: cooling_v4(c),
         })
         .chain(det.blocks_v6.iter().map(|(c, &ts)| SourceBlock {
             cidr: format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
             age_secs: age(ts),
             pps: det.block_pps_v6.get(c).copied().unwrap_or(0),
             manual: false,
+            cooling: cooling_v6(c),
         }))
         .collect();
-    out.sort_by(|a, b| a.cidr.cmp(&b.cidr));
+    // Most active first (the API re-sorts the merged manual+auto set too).
+    out.sort_by(|a, b| b.pps.cmp(&a.pps).then_with(|| a.cidr.cmp(&b.cidr)));
     out
 }
 
@@ -726,6 +756,8 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
         initial,
         api_cfg.events_buffer,
         api_cfg.github_repo.clone(),
+        api_cfg.allow_remote_upgrade,
+        api_cfg.upgrade_pubkey.clone(),
     );
     // Periodic self-upgrade check (immediately, then every 6h).
     {
@@ -965,7 +997,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = cookie_timer.tick() => {
-                let new = gc::monotonic_now_ns() as u32 | 1;
+                let new = fresh_cookie_secret();
                 if let Err(e) = rotate_cookie_secret(&mut bpf, new) {
                     warn!("cookie rotation failed: {e}");
                 }

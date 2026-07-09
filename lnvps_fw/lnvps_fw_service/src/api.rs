@@ -20,9 +20,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
+
+/// Maximum number of entries accepted in any one list of a pushed ruleset.
+pub const MAX_RULESET_ENTRIES: usize = 100_000;
+
+/// Maximum accepted request body size (bytes). Comfortably fits a full ruleset
+/// of `MAX_RULESET_ENTRIES` CIDR strings while rejecting absurd payloads.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// A CIDR parsed into an address family + network bytes, for applying to the
 /// BPF longest-prefix-match maps.
@@ -45,9 +53,11 @@ pub fn parse_cidr(s: &str) -> Option<CidrKey> {
             if bits > 32 {
                 return None;
             }
+            // Mask host bits so the key is canonical: `203.0.113.5/24` and
+            // `203.0.113.0/24` parse to the same key (stable dedup/removal).
             Some(CidrKey::V4 {
                 bits,
-                net: v4.octets(),
+                net: crate::cidr::mask_v4(v4.octets(), bits),
             })
         }
         IpAddr::V6(v6) => {
@@ -57,7 +67,7 @@ pub fn parse_cidr(s: &str) -> Option<CidrKey> {
             }
             Some(CidrKey::V6 {
                 bits,
-                net: v6.octets(),
+                net: crate::cidr::mask_v6(v6.octets(), bits),
             })
         }
     }
@@ -220,9 +230,32 @@ pub struct SourceBlock {
     /// Current aggregate packets/second from sources under this CIDR (0 for
     /// manual blocks — their traffic is dropped before per-source counting).
     pub pps: u64,
-    /// True = operator-pushed manual block (permanent); false = auto-aggregated
-    /// from escalation (decays).
+    /// True = operator-pushed manual block (permanent); false = auto from the
+    /// per-source state machine (released on hysteresis).
     pub manual: bool,
+    /// For auto blocks: true if the block's sources have fallen below the exit
+    /// threshold and are cooling down toward release (vs actively over-rate).
+    /// Always false for manual blocks.
+    #[serde(default)]
+    pub cooling: bool,
+}
+
+/// A page of source blocks (bounded payload even with very large block sets).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlocksPage {
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub items: Vec<SourceBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlocksQuery {
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+    #[serde(default)]
+    q: String,
 }
 
 /// A learned open port on a protected IP (surfaced for `lnvps_api` / admin).
@@ -325,6 +358,10 @@ pub struct SharedState {
     upgrade: RwLock<crate::upgrade::UpgradeStatus>,
     /// GitHub owner/repo to check for self-upgrade releases.
     upgrade_repo: String,
+    /// Whether `POST /upgrade` may install a release as root.
+    allow_remote_upgrade: bool,
+    /// Optional minisign public key gating upgrade signature verification.
+    upgrade_pubkey: Option<String>,
     events: Mutex<EventRing>,
     /// Bumped whenever the ruleset changes so the control loop reloads it.
     rules_version: AtomicU64,
@@ -341,6 +378,8 @@ impl SharedState {
         initial: RuleSet,
         events_cap: usize,
         upgrade_repo: String,
+        allow_remote_upgrade: bool,
+        upgrade_pubkey: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             token,
@@ -357,6 +396,8 @@ impl SharedState {
             limits: RwLock::new(Limits::default()),
             upgrade: RwLock::new(crate::upgrade::UpgradeStatus::default()),
             upgrade_repo,
+            allow_remote_upgrade,
+            upgrade_pubkey,
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
             limits_version: AtomicU64::new(1),
@@ -506,11 +547,15 @@ pub fn router(state: Arc<SharedState>) -> Router {
         )
         .route("/api/v1/limits", get(get_limits).put(put_limits))
         .route("/api/v1/upgrade", get(get_upgrade).post(post_upgrade))
+        // Cap request bodies: the largest legitimate payload is a full ruleset
+        // push, which is bounded by MAX_RULESET_ENTRIES short CIDR strings.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
 
     let dashboard = Router::new()
         .route("/", get(dashboard))
+        .route("/assets/{file}", get(asset))
         .layer(middleware::from_fn_with_state(state.clone(), ip_gate))
         .with_state(state);
 
@@ -549,8 +594,33 @@ async fn ip_gate(
 
 async fn dashboard() -> Response {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, DASHBOARD_CSP),
+        ],
         DASHBOARD_HTML,
+    )
+        .into_response()
+}
+
+/// Serve a vendored front-end asset by name (same-origin only). Unknown names
+/// 404. Every asset carries the strict dashboard CSP so an injected string
+/// still cannot reach an external origin.
+async fn asset(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
+    let (body, ctype): (&'static str, &str) = match file.as_str() {
+        "app.js" => (ASSET_APP_JS, "text/javascript; charset=utf-8"),
+        "preact.js" => (ASSET_PREACT_JS, "text/javascript; charset=utf-8"),
+        "hooks.js" => (ASSET_HOOKS_JS, "text/javascript; charset=utf-8"),
+        "htm.js" => (ASSET_HTM_JS, "text/javascript; charset=utf-8"),
+        "app.css" => (ASSET_APP_CSS, "text/css; charset=utf-8"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, ctype),
+            (header::CONTENT_SECURITY_POLICY, DASHBOARD_CSP),
+        ],
+        body,
     )
         .into_response()
 }
@@ -632,9 +702,14 @@ async fn get_prefixes(State(state): State<Arc<SharedState>>) -> Json<Vec<PrefixL
     Json(state.prefixes.read().unwrap().clone())
 }
 
-async fn get_blocks(State(state): State<Arc<SharedState>>) -> Json<Vec<SourceBlock>> {
-    // Manual blocks (from the pushed ruleset) first, then auto-aggregated ones.
-    let mut out: Vec<SourceBlock> = state
+async fn get_blocks(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<BlocksQuery>,
+) -> Json<BlocksPage> {
+    // Manual blocks (from the pushed ruleset) + auto blocks (from the state
+    // machine), filtered, sorted by pps (most active first), then paginated so
+    // the payload stays bounded even with a very large block set.
+    let mut all: Vec<SourceBlock> = state
         .rules
         .read()
         .unwrap()
@@ -645,10 +720,32 @@ async fn get_blocks(State(state): State<Arc<SharedState>>) -> Json<Vec<SourceBlo
             age_secs: 0,
             pps: 0,
             manual: true,
+            cooling: false,
         })
         .collect();
-    out.extend(state.blocks.read().unwrap().iter().cloned());
-    Json(out)
+    all.extend(state.blocks.read().unwrap().iter().cloned());
+
+    let needle = q.q.trim().to_lowercase();
+    if !needle.is_empty() {
+        all.retain(|b| b.cidr.to_lowercase().contains(&needle));
+    }
+    // Manual (permanent operator) blocks always pinned to the top; auto blocks
+    // below, sorted by pps descending; stable cidr tiebreak.
+    all.sort_by(|a, b| {
+        b.manual
+            .cmp(&a.manual)
+            .then_with(|| b.pps.cmp(&a.pps))
+            .then_with(|| a.cidr.cmp(&b.cidr))
+    });
+    let total = all.len();
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let items: Vec<SourceBlock> = all.into_iter().skip(q.offset).take(limit).collect();
+    Json(BlocksPage {
+        total,
+        offset: q.offset,
+        limit,
+        items,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -657,13 +754,14 @@ struct BlockReq {
 }
 
 async fn post_block(State(state): State<Arc<SharedState>>, Json(b): Json<BlockReq>) -> Response {
-    if parse_cidr(&b.cidr).is_none() {
+    let Some(key) = parse_cidr(&b.cidr) else {
         return (StatusCode::BAD_REQUEST, format!("bad cidr: {}", b.cidr)).into_response();
-    }
+    };
+    let cidr = key.to_cidr_string();
     {
         let mut rules = state.rules.write().unwrap();
-        rules.source_blocks.retain(|c| c != &b.cidr);
-        rules.source_blocks.push(b.cidr);
+        rules.source_blocks.retain(|c| c != &cidr);
+        rules.source_blocks.push(cidr);
     }
     state.bump_rules();
     StatusCode::NO_CONTENT.into_response()
@@ -673,10 +771,12 @@ async fn delete_block(
     State(state): State<Arc<SharedState>>,
     Query(q): Query<CidrQuery>,
 ) -> Response {
+    // Canonicalize so a bare/non-masked query still matches the stored form.
+    let cidr = parse_cidr(&q.cidr).map_or(q.cidr, |k| k.to_cidr_string());
     let removed = {
         let mut rules = state.rules.write().unwrap();
         let before = rules.source_blocks.len();
-        rules.source_blocks.retain(|c| c != &q.cidr);
+        rules.source_blocks.retain(|c| c != &cidr);
         before != rules.source_blocks.len()
     };
     if removed {
@@ -699,19 +799,28 @@ async fn get_upgrade(State(state): State<Arc<SharedState>>) -> Json<crate::upgra
 /// restart in a detached transient unit. Returns 202 immediately; the service
 /// will restart shortly.
 async fn post_upgrade(State(state): State<Arc<SharedState>>) -> Response {
-    let url = state.upgrade.read().unwrap().deb_url.clone();
+    // Remote-triggered root install is opt-in only.
+    if !state.allow_remote_upgrade {
+        return (
+            StatusCode::FORBIDDEN,
+            "remote upgrade disabled (set api.allow-remote-upgrade)",
+        )
+            .into_response();
+    }
+    let (url, sha256, sig_url) = {
+        let u = state.upgrade.read().unwrap();
+        (u.deb_url.clone(), u.deb_sha256.clone(), u.deb_sig_url.clone())
+    };
     let Some(url) = url else {
         return (StatusCode::BAD_REQUEST, "no upgrade available").into_response();
     };
+    let repo = state.upgrade_repo.to_string();
+    let pubkey = state.upgrade_pubkey.clone();
     tokio::spawn(async move {
-        let dest = std::path::Path::new("/tmp/lnvps-fw-upgrade.deb");
-        if let Err(e) = crate::upgrade::download(&url, dest).await {
-            log::warn!("upgrade download failed: {e}");
-            return;
-        }
-        log::warn!("upgrade: installing {url} and restarting");
-        if let Err(e) = crate::upgrade::install_and_restart(dest, "lnvps_fw") {
-            log::warn!("upgrade install failed: {e}");
+        if let Err(e) =
+            crate::upgrade::download_verify_install(&repo, &url, sha256, sig_url, pubkey).await
+        {
+            log::warn!("upgrade failed: {e}");
         }
     });
     StatusCode::ACCEPTED.into_response()
@@ -738,21 +847,50 @@ async fn get_rules(State(state): State<Arc<SharedState>>) -> Json<RuleSet> {
 
 async fn put_rules(
     State(state): State<Arc<SharedState>>,
-    Json(new_rules): Json<RuleSet>,
+    Json(mut new_rules): Json<RuleSet>,
 ) -> Response {
-    // Reject malformed CIDRs up front so a bad push can't silently no-op.
-    for c in &new_rules.protected {
-        if parse_cidr(c).is_none() {
-            return (StatusCode::BAD_REQUEST, format!("bad protected cidr: {c}")).into_response();
+    // Bound each list so a single push can't exhaust memory / spin the control
+    // loop's per-tick reconciliation.
+    if new_rules.protected.len() > MAX_RULESET_ENTRIES
+        || new_rules.overrides.len() > MAX_RULESET_ENTRIES
+        || new_rules.source_blocks.len() > MAX_RULESET_ENTRIES
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("too many entries (max {MAX_RULESET_ENTRIES} per list)"),
+        )
+            .into_response();
+    }
+    // Reject malformed CIDRs up front so a bad push can't silently no-op, and
+    // canonicalize (mask host bits) so dedup/removal by string is stable.
+    for c in &mut new_rules.protected {
+        match parse_cidr(c) {
+            Some(k) => *c = k.to_cidr_string(),
+            None => {
+                return (StatusCode::BAD_REQUEST, format!("bad protected cidr: {c}"))
+                    .into_response();
+            }
         }
     }
-    for o in &new_rules.overrides {
-        if parse_cidr(&o.cidr).is_none() {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("bad override cidr: {}", o.cidr),
-            )
-                .into_response();
+    for o in &mut new_rules.overrides {
+        match parse_cidr(&o.cidr) {
+            Some(k) => o.cidr = k.to_cidr_string(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("bad override cidr: {}", o.cidr),
+                )
+                    .into_response();
+            }
+        }
+    }
+    for c in &mut new_rules.source_blocks {
+        match parse_cidr(c) {
+            Some(k) => *c = k.to_cidr_string(),
+            None => {
+                return (StatusCode::BAD_REQUEST, format!("bad source-block cidr: {c}"))
+                    .into_response();
+            }
         }
     }
     *state.rules.write().unwrap() = new_rules;
@@ -766,10 +904,11 @@ async fn get_mitigations(State(state): State<Arc<SharedState>>) -> Json<Vec<Miti
 
 async fn post_override(
     State(state): State<Arc<SharedState>>,
-    Json(ov): Json<Override>,
+    Json(mut ov): Json<Override>,
 ) -> Response {
-    if parse_cidr(&ov.cidr).is_none() {
-        return (StatusCode::BAD_REQUEST, format!("bad cidr: {}", ov.cidr)).into_response();
+    match parse_cidr(&ov.cidr) {
+        Some(k) => ov.cidr = k.to_cidr_string(),
+        None => return (StatusCode::BAD_REQUEST, format!("bad cidr: {}", ov.cidr)).into_response(),
     }
     {
         let mut rules = state.rules.write().unwrap();
@@ -789,10 +928,11 @@ async fn delete_override(
     State(state): State<Arc<SharedState>>,
     Query(q): Query<CidrQuery>,
 ) -> Response {
+    let cidr = parse_cidr(&q.cidr).map_or(q.cidr, |k| k.to_cidr_string());
     let removed = {
         let mut rules = state.rules.write().unwrap();
         let before = rules.overrides.len();
-        rules.overrides.retain(|o| o.cidr != q.cidr);
+        rules.overrides.retain(|o| o.cidr != cidr);
         before != rules.overrides.len()
     };
     if removed {
@@ -901,320 +1041,34 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lnvps_fw dashboard</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-         margin: 0; background: #0e1116; color: #d6deeb; }
-  header { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap;
-           padding: .75rem 1rem; background: #161b22; border-bottom: 1px solid #2b3138; }
-  header h1 { font-size: 1rem; margin: 0; font-weight: 600; color: #7fd1ff; }
-  .grow { flex: 1; }
-  input { background: #0e1116; color: #d6deeb; border: 1px solid #2b3138;
-          border-radius: 4px; padding: .35rem .5rem; font: inherit; }
-  button { background: #1f6feb; color: #fff; border: 0; border-radius: 4px;
-           padding: .3rem .6rem; font: inherit; cursor: pointer; }
-  button:disabled { opacity: .4; cursor: default; }
-  button.ghost { background: #21262d; }
-  main { padding: 1rem; display: grid; gap: 1rem;
-         grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
-  section { background: #161b22; border: 1px solid #2b3138; border-radius: 8px;
-            padding: .75rem 1rem; min-width: 0; }
-  .wide { grid-column: 1 / -1; }
-  section h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em;
-               margin: 0 0 .6rem; color: #8b949e; display: flex; gap: .5rem; align-items: center; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #21262d; white-space: nowrap; }
-  th { color: #8b949e; font-weight: 600; }
-  .kv { display: grid; grid-template-columns: max-content 1fr; gap: .2rem .75rem; }
-  .kv div:nth-child(odd) { color: #8b949e; }
-  .flag { color: #f0b429; }
-  .muted { color: #6b7684; }
-  .err { color: #ff6b6b; }
-  .pager { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; }
-  .scroll { max-height: 420px; overflow: auto; }
-  .binbtn { background: none; color: #ff6b6b; border: 0; cursor: pointer; padding: 0 .3rem; font-size: 1rem; }
-  .binbtn:hover { color: #ff9a9a; }
-  .tag { font-size: .72em; padding: 0 .35rem; border-radius: 8px; background: #21262d; color: #8b949e; }
-  .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 10; }
-  .modal { background: #161b22; border: 1px solid #2b3138; border-radius: 8px; padding: 1rem 1.2rem; min-width: 320px; display: grid; gap: .7rem; }
-  .modal h3 { margin: 0; font-size: .9rem; color: #7fd1ff; }
-  .modal .chk { display: inline-flex; gap: .3rem; align-items: center; margin-right: .8rem; color: #d6deeb; font-size: .85rem; }
-  .modal .act { display: flex; gap: .5rem; align-items: center; margin-top: .3rem; }
-  .limits { display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: flex-end; }
-  .limits label { display: inline-flex; flex-direction: column; font-size: .72rem; color: #8b949e; gap: .2rem; }
-  .limits input { width: 7.5rem; }
-  .limits .act { display: flex; gap: .5rem; align-items: center; width: 100%; margin-top: .2rem; }
-  .totals { color: #8b949e; font-size: .82rem; }
-  .totals b { color: #d6deeb; font-weight: 600; }
-  .barwrap { display: inline-flex; align-items: center; gap: .4rem; }
-  .bar { background: #21262d; border-radius: 4px; height: 10px; width: 120px; overflow: hidden; display: inline-block; }
-  .bar .fill { display: block; height: 100%; }
-</style>
+<link rel="stylesheet" href="/assets/app.css">
+<script type="importmap">
+{"imports":{"preact":"/assets/preact.js","preact/hooks":"/assets/hooks.js","htm":"/assets/htm.js"}}
+</script>
 </head>
 <body>
 <div id="app"></div>
-<script type="module">
-import { h, render } from 'https://esm.sh/preact@10.24.3';
-import { useState, useEffect, useRef, useCallback } from 'https://esm.sh/preact@10.24.3/hooks';
-import htm from 'https://esm.sh/htm@3.1.1';
-const html = htm.bind(h);
-
-const FLAGS = [[1,'PORT_FILTER'],[2,'SYN_PROXY'],[4,'RATE_CAPS'],[8,'SOURCE_BLOCK']];
-const flagStr = f => { const o = FLAGS.filter(([b])=>f&b).map(([,n])=>n); return o.length?o.join('|'):'none'; };
-const fmtn = n => n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? (n/1e3).toFixed(1)+'k' : ''+n;
-const fmtbps = b => { const x=b*8; return x>=1e9?(x/1e9).toFixed(2)+' Gb/s':x>=1e6?(x/1e6).toFixed(1)+' Mb/s':x>=1e3?(x/1e3).toFixed(0)+' kb/s':x+' b/s'; };
-const flagCell = f => html`<span class="flag">${flagStr(f)}</span>`;
-const time = t => new Date(t*1000).toLocaleTimeString();
-const loadColor = p => p>=100?'#ff6b6b':p>=80?'#f0b429':p>=50?'#7fd1ff':'#3fb950';
-function LoadBar({ pct }) {
-  const p = Math.min(pct, 100), c = loadColor(pct);
-  return html`<span class="barwrap">
-    <span class="bar"><span class="fill" style=${'width:'+p+'%;background:'+c}></span></span>
-    <span style=${'color:'+c+';font-weight:600'}>${pct}%</span></span>`;
-}
-
-
-async function api(path, token) {
-  const r = await fetch(path, { headers: token ? { Authorization: 'Bearer ' + token } : {} });
-  if (!r.ok) throw new Error(path.split('?')[0] + ' -> ' + r.status);
-  return r.status === 204 ? null : r.json();
-}
-
-function Table({ cols, rows }) {
-  if (!rows.length) return html`<div class="muted">none</div>`;
-  return html`<table>
-    <thead><tr>${cols.map(c => html`<th>${c}</th>`)}</tr></thead>
-    <tbody>${rows.map(r => html`<tr>${r.map(c => html`<td>${c}</td>`)}</tr>`)}</tbody>
-  </table>`;
-}
-
-function Pager({ page, pages, total, onPage }) {
-  return html`<div class="pager">
-    <button class="ghost" disabled=${page<=0} onClick=${()=>onPage(page-1)}>‹ prev</button>
-    <span class="muted">page ${page+1}/${pages} · ${total} rows</span>
-    <button class="ghost" disabled=${page>=pages-1} onClick=${()=>onPage(page+1)}>next ›</button>
-  </div>`;
-}
-
-// Client-side paginated table (for bounded datasets).
-function PagedTable({ cols, rows, pageSize = 50 }) {
-  const [page, setPage] = useState(0);
-  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
-  const p = Math.min(page, pages - 1);
-  const slice = rows.slice(p * pageSize, p * pageSize + pageSize);
-  return html`<div class="scroll"><${Table} cols=${cols} rows=${slice} /></div>
-    ${rows.length > pageSize && html`<${Pager} page=${p} pages=${pages} total=${rows.length} onPage=${setPage} />`}`;
-}
-
-function Section({ title, extra, children, wide }) {
-  return html`<section class=${wide?'wide':''}>
-    <h2>${title}${extra?html`<span class="muted">${extra}</span>`:null}</h2>${children}</section>`;
-}
-
-// Live-editable detection thresholds. Seeds from GET /limits once so the 2s
-// poll doesn't clobber edits; PUT on save.
-function LimitsCard({ token }) {
-  const [f, setF] = useState(null);
-  const [msg, setMsg] = useState('');
-  useEffect(() => { (async () => { try { setF(await api('/api/v1/limits', token)); } catch (e) {} })(); }, [token]);
-  if (!f) return html`<div class="muted">…</div>`;
-  const num = k => e => setF({ ...f, [k]: Math.max(0, Math.floor(+e.target.value || 0)) });
-  const fld = (k, label) => html`<label>${label}<input type="number" min="1" value=${f[k]} onInput=${num(k)} /></label>`;
-  const save = async () => {
-    setMsg('saving…');
-    try {
-      const r = await fetch('/api/v1/limits', { method: 'PUT',
-        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(f) });
-      setMsg(r.ok ? 'saved ✓' : 'error ' + r.status + ': ' + (await r.text()));
-    } catch (e) { setMsg(e.message); }
-  };
-  const reload = async () => { setMsg(''); try { setF(await api('/api/v1/limits', token)); } catch (e) {} };
-  return html`<div class="limits">
-    ${fld('pps','IP pps')}${fld('syn_pps','IP syn/s')}${fld('bps','IP bytes/s')}
-    ${fld('net_pps','prefix pps')}${fld('net_syn_pps','prefix syn/s')}${fld('net_bps','prefix bytes/s')}
-    ${fld('exit_pct','exit %')}${fld('cooldown_secs','cooldown s')}
-    <div class="act"><button onClick=${save}>save</button><button class="ghost" onClick=${reload}>reset</button>
-      <span class="muted">${msg}</span></div>
-  </div>`;
-}
-
-// Small modal helper (backdrop-dismissable).
-function Modal({ title, onClose, children }) {
-  return html`<div class="modal-bg" onClick=${e => e.target.className === 'modal-bg' && onClose()}>
-    <div class="modal"><h3>${title}</h3>${children}</div></div>`;
-}
-
-// Active mitigations table + add/delete of manual dest overrides (force-mitigate
-// a destination). Auto-detected rows are read-only; manual rows get a delete.
-function MitigationsCard({ token, mitigations, onChange }) {
-  const [show, setShow] = useState(false), [cidr, setCidr] = useState(''), [flags, setFlags] = useState(1), [msg, setMsg] = useState('');
-  const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
-  const add = async () => { setMsg('saving…'); try {
-      const r = await fetch('/api/v1/mitigations', { method: 'POST', headers: hdr, body: JSON.stringify({ cidr, flags }) });
-      if (r.ok) { setShow(false); setCidr(''); setFlags(1); setMsg(''); onChange && onChange(); } else setMsg('error ' + r.status + ': ' + (await r.text()));
-    } catch (e) { setMsg(e.message); } };
-  const del = async c => { try { await fetch('/api/v1/mitigations?cidr=' + encodeURIComponent(c), { method: 'DELETE', headers: hdr }); onChange && onChange(); } catch (e) {} };
-  const bin = c => html`<button class="binbtn" title="remove override" onClick=${() => del(c)}>🗑</button>`;
-  const rows = mitigations.map(m => [m.cidr, flagCell(m.flags), time(m.since_unix), m.manual ? html`<span class="tag">manual</span>` : '',
-    fmtn(m.peak_pps), fmtbps(m.peak_bps), fmtn(m.peak_syn_pps), m.manual ? bin(m.cidr) : '']);
-  return html`<div>
-    <div style="margin-bottom:.5rem"><button onClick=${() => { setShow(true); setMsg(''); }}>+ add override</button></div>
-    <${PagedTable} cols=${['cidr','flags','since','manual','peak pps','peak bps','peak syn/s','']} rows=${rows} />
-    ${show && html`<${Modal} title="Force-mitigate a destination" onClose=${() => setShow(false)}>
-      <label>CIDR<input value=${cidr} placeholder="203.0.113.7/32" onInput=${e => setCidr(e.target.value)} /></label>
-      <div>${FLAGS.map(([b, n]) => html`<label class="chk"><input type="checkbox" checked=${(flags & b) !== 0}
-        onChange=${e => setFlags(e.target.checked ? flags | b : flags & ~b)} />${n}</label>`)}</div>
-      <div class="act"><button onClick=${add} disabled=${!cidr}>add</button>
-        <button class="ghost" onClick=${() => setShow(false)}>cancel</button><span class="muted err">${msg}</span></div>
-    </${Modal}>`}
-  </div>`;
-}
-
-// Source-block table: auto-aggregated blocks (read-only, decaying) + manual
-// blocks (add via modal, delete per row) that drop an attacker CIDR outright.
-function BlocksCard({ token, blocks, onChange }) {
-  const [show, setShow] = useState(false), [cidr, setCidr] = useState(''), [msg, setMsg] = useState('');
-  const hdr = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
-  const add = async () => { setMsg('saving…'); try {
-      const r = await fetch('/api/v1/blocks', { method: 'POST', headers: hdr, body: JSON.stringify({ cidr }) });
-      if (r.ok) { setShow(false); setCidr(''); setMsg(''); onChange && onChange(); } else setMsg('error ' + r.status + ': ' + (await r.text()));
-    } catch (e) { setMsg(e.message); } };
-  const del = async c => { try { await fetch('/api/v1/blocks?cidr=' + encodeURIComponent(c), { method: 'DELETE', headers: hdr }); onChange && onChange(); } catch (e) {} };
-  const bin = c => html`<button class="binbtn" title="remove block" onClick=${() => del(c)}>🗑</button>`;
-  const rows = blocks.map(b => [b.cidr, html`<span class="tag">${b.manual ? 'manual' : 'auto'}</span>`,
-    b.manual ? '—' : fmtn(b.pps), b.manual ? '—' : b.age_secs + 's', b.manual ? bin(b.cidr) : '']);
-  return html`<div>
-    <div style="margin-bottom:.5rem"><button onClick=${() => { setShow(true); setMsg(''); }}>+ block source</button></div>
-    <${PagedTable} cols=${['cidr','kind','pps','age','']} rows=${rows} />
-    ${show && html`<${Modal} title="Block a source CIDR" onClose=${() => setShow(false)}>
-      <label>CIDR<input value=${cidr} placeholder="45.134.26.0/24" onInput=${e => setCidr(e.target.value)} /></label>
-      <div class="act"><button onClick=${add} disabled=${!cidr}>block</button>
-        <button class="ghost" onClick=${() => setShow(false)}>cancel</button><span class="muted err">${msg}</span></div>
-    </${Modal}>`}
-  </div>`;
-}
-
-// Server-side paginated + filtered learned-ports table.
-function PortsCard({ token }) {
-  const PAGE = 50;
-  const [q, setQ] = useState('');
-  const [page, setPage] = useState(0);
-  const [data, setData] = useState({ total: 0, items: [] });
-  const load = useCallback(async () => {
-    try {
-      const params = new URLSearchParams({ offset: page*PAGE, limit: PAGE, q });
-      const d = await api('/api/v1/ports?' + params, token);
-      setData(d);
-    } catch (e) { /* surfaced by the main poller */ }
-  }, [token, q, page]);
-  useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [load]);
-  const pages = Math.max(1, Math.ceil(data.total / PAGE));
-  const rows = data.items.map(p => [p.ip, p.port, p.proto, p.age_secs + 's']);
-  return html`<${Section} wide=true title="Learned open ports" extra=${'(' + data.total + ')'}>
-    <input placeholder="filter ip/port/proto" value=${q}
-      onInput=${e => { setPage(0); setQ(e.target.value); }} style="margin-bottom:.5rem" />
-    <div class="scroll"><${Table} cols=${['ip','port','proto','age']} rows=${rows} /></div>
-    ${data.total > PAGE && html`<${Pager} page=${Math.min(page,pages-1)} pages=${pages} total=${data.total} onPage=${setPage} />`}
-  </${Section}>`;
-}
-
-function App() {
-  const [token, setTokenState] = useState(localStorage.getItem('fwtoken') || '');
-  const [auto, setAuto] = useState(true);
-  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], blocks: [], mitigations: [], rules: { protected: [], overrides: [] }, upgrade: null, err: '' });
-  const [upMsg, setUpMsg] = useState('');
-  const [events, setEvents] = useState([]);
-  const cursor = useRef(0);
-  const tokenRef = useRef(token);
-  tokenRef.current = token;
-
-  const refresh = useCallback(async () => {
-    const t = tokenRef.current;
-    try {
-      const [status, tracked, prefixes, blocks, mitigations, rules, upgrade] = await Promise.all([
-        api('/api/v1/status', t), api('/api/v1/tracked', t), api('/api/v1/prefixes', t),
-        api('/api/v1/blocks', t), api('/api/v1/mitigations', t), api('/api/v1/rules', t),
-        api('/api/v1/upgrade', t),
-      ]);
-      const ev = await api('/api/v1/events?since=' + cursor.current, t);
-      if (ev.events.length) { cursor.current = ev.cursor; setEvents(e => [...ev.events.slice().reverse(), ...e].slice(0, 500)); }
-      setD({ status, tracked, prefixes, blocks, mitigations, rules, upgrade, err: '' });
-    } catch (e) { setD(x => ({ ...x, err: e.message })); }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    if (!auto) return;
-    const id = setInterval(refresh, 2000);
-    return () => clearInterval(id);
-  }, [auto, token, refresh]);
-
-  const save = () => { localStorage.setItem('fwtoken', token); cursor.current = 0; setEvents([]); refresh(); };
-  const doUpgrade = async () => {
-    if (!confirm('Download & install ' + d.upgrade.latest + ' and restart the service?')) return;
-    setUpMsg('upgrading… the service will restart shortly');
-    try {
-      const r = await fetch('/api/v1/upgrade', { method: 'POST', headers: { Authorization: 'Bearer ' + token } });
-      if (!r.ok) setUpMsg('upgrade failed: ' + r.status + ' ' + (await r.text()));
-    } catch (e) { setUpMsg('upgrade error: ' + e.message); }
-  };
-  const s = d.status;
-  const t0 = s && s.totals;
-  const summary = d.err ? html`<span class="err">${d.err}</span>`
-    : s ? html`<span class="muted">up ${s.uptime_secs}s · ${s.active_mitigations} active · ${s.learned_ports} ports</span>`
-    : html`<span class="muted">disconnected</span>`;
-  const dropCell = pct => html`<span style=${'color:'+loadColor(pct)+';font-weight:600'}>${pct}%</span>`;
-
-  const trackedRows = d.tracked.map(t => [t.ip, fmtn(t.rx_pps), fmtbps(t.rx_bps), fmtn(t.tx_pps), fmtbps(t.tx_bps),
-    fmtn(t.rx_syn_pps), fmtn(t.rx_drop_pps), dropCell(t.rx_drop_pct), html`<${LoadBar} pct=${t.load_pct} />`,
-    t.mitigating ? flagCell(t.flags) : 'ok']);
-  const prefixRows = d.prefixes.map(p => [p.cidr, fmtn(p.rx_pps), fmtbps(p.rx_bps), fmtn(p.tx_pps), fmtbps(p.tx_bps),
-    fmtn(p.rx_syn_pps), fmtn(p.rx_drop_pps), dropCell(p.rx_drop_pct), html`<${LoadBar} pct=${p.load_pct} />`,
-    p.mitigating ? flagCell(p.flags) : 'ok']);
-  const evRows = events.map(e => [e.seq, time(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtn(e.syn_pps)]);
-
-  return html`
-    <header>
-      <h1>lnvps_fw</h1>${summary}
-      ${t0 ? html`<span class="totals">↓rx <b>${fmtn(t0.rx_pps)}</b> pps · <b>${fmtbps(t0.rx_bps)}</b> · ↑tx <b>${fmtn(t0.tx_pps)}</b> pps · <b>${fmtbps(t0.tx_bps)}</b> · <b>${fmtn(t0.rx_syn_pps)}</b> syn/s · drop <b style=${'color:'+loadColor(t0.rx_drop_pct)}>${t0.rx_drop_pct}%</b> (${fmtn(t0.rx_drop_pps)} pps)</span>` : null}
-      ${d.upgrade && d.upgrade.available ? html`<button style="background:#3fb950" title="download & install ${d.upgrade.latest}, then restart"
-        onClick=${doUpgrade}>⬆ upgrade ${d.upgrade.latest}</button>` : null}
-      ${upMsg ? html`<span class="muted">${upMsg}</span>` : null}
-      <span class="grow"></span>
-      <input type="password" placeholder="API token" size="26" value=${token}
-        onInput=${e => setTokenState(e.target.value)} onKeyDown=${e => e.key==='Enter' && save()} />
-      <button onClick=${save}>connect</button>
-      <label class="muted"><input type="checkbox" checked=${auto} onChange=${e => setAuto(e.target.checked)} /> auto</label>
-      <button class="ghost" onClick=${refresh}>refresh</button>
-    </header>
-    <main>
-      <${Section} wide=true title="Detection limits">
-        <${LimitsCard} token=${token} />
-      </${Section}>
-      <${Section} wide=true title="Active mitigations" extra=${'('+d.mitigations.length+')'}>
-        <${MitigationsCard} token=${token} mitigations=${d.mitigations} onChange=${refresh} />
-      </${Section}>
-      <${Section} wide=true title="Live tracked IPs" extra=${'('+d.tracked.length+')'}>
-        <${PagedTable} cols=${['ip','rx pps','rx bps','tx pps','tx bps','syn/s','drop/s','drop%','load','state']} rows=${trackedRows} />
-      </${Section}>
-      <${Section} wide=true title="Protected prefixes" extra=${'('+d.prefixes.length+')'}>
-        <${PagedTable} cols=${['prefix','rx pps','rx bps','tx pps','tx bps','syn/s','drop/s','drop%','load','state']} rows=${prefixRows} />
-      </${Section}>
-      <${Section} wide=true title="Source blocks" extra=${'('+d.blocks.length+')'}>
-        <${BlocksCard} token=${token} blocks=${d.blocks} onChange=${refresh} />
-      </${Section}>
-      <${PortsCard} token=${token} />
-      <${Section} wide=true title="Events" extra=${'('+events.length+')'}>
-        <${PagedTable} cols=${['seq','time','kind','cidr','flags','pps','syn/s']} rows=${evRows} />
-      </${Section}>
-    </main>`;
-}
-
-render(html`<${App} />`, document.getElementById('app'));
-</script>
+<script type="module" src="/assets/app.js"></script>
 </body>
 </html>
 "##;
+
+/// Vendored front-end assets, embedded at build time and served same-origin so
+/// the token-entry dashboard never loads code from a third-party CDN. A strict
+/// CSP (see `dashboard`/`asset` handlers) forbids any external origin.
+const ASSET_APP_JS: &str = include_str!("../assets/app.js");
+const ASSET_APP_CSS: &str = include_str!("../assets/app.css");
+const ASSET_PREACT_JS: &str = include_str!("../assets/preact.js");
+const ASSET_HOOKS_JS: &str = include_str!("../assets/hooks.js");
+const ASSET_HTM_JS: &str = include_str!("../assets/htm.js");
+
+/// Content-Security-Policy for the dashboard + assets: everything must come
+/// from this origin; no external script/style/connect is permitted, so a token
+/// typed into the page cannot be exfiltrated to an outside host even if one of
+/// the vendored libraries were somehow malicious.
+const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; \
+style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; \
+base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 #[cfg(test)]
 mod tests {
@@ -1243,6 +1097,23 @@ mod tests {
         );
         assert!(parse_cidr("not-an-ip").is_none());
         assert!(parse_cidr("10.0.0.0/40").is_none());
+    }
+
+    #[test]
+    fn parse_cidr_masks_host_bits_for_canonical_dedup() {
+        // Host bits are zeroed so non-canonical input collapses to one key.
+        assert_eq!(
+            parse_cidr("203.0.113.5/24"),
+            parse_cidr("203.0.113.0/24"),
+        );
+        assert_eq!(
+            parse_cidr("203.0.113.5/24").unwrap().to_cidr_string(),
+            "203.0.113.0/24"
+        );
+        assert_eq!(
+            parse_cidr("2001:db8::1/48").unwrap().to_cidr_string(),
+            "2001:db8::/48"
+        );
     }
 
     #[test]
@@ -1293,6 +1164,8 @@ mod tests {
             RuleSet::default(),
             8,
             "r".into(),
+            false,
+            None,
         );
         assert!(open.ip_allowed(None), "empty allow-list permits all");
         let restricted = SharedState::new(
@@ -1302,6 +1175,8 @@ mod tests {
             RuleSet::default(),
             8,
             "r".into(),
+            false,
+            None,
         );
         assert!(restricted.ip_allowed(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)))));
         assert!(!restricted.ip_allowed(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)))));
