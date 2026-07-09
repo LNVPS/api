@@ -26,7 +26,7 @@ use maps::{
     count_src_v4, count_src_v6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
     learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6, mark_verified_v4,
     mark_verified_v6, port_is_open_v4, port_is_open_v6, protected_v4, protected_v6, scoped,
-    src_verified_v4, src_verified_v6,
+    src_verified_v4, src_verified_v6, tx_counters_v4, tx_counters_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -415,16 +415,40 @@ fn egress_service(ctx: &TcContext, proto: u8, l4_off: usize) -> Result<Option<Eg
     }
 }
 
+/// Account one outbound packet against the local source IP's TX counters.
+/// Proto breakdown is derived from the IP header alone (no L4 parse), so it is
+/// cheap and works for fragments/options too. `icmp_proto` distinguishes ICMP
+/// (v4) from ICMPv6.
+#[inline(always)]
+fn tx_account(c: *mut lnvps_fw_common::DestCounters, pkt_len: u64, proto: u8, icmp_proto: u8) {
+    let c = unsafe { &mut *c };
+    c.packets += 1;
+    c.bytes += pkt_len;
+    if proto == PROTO_TCP {
+        c.tcp_packets += 1;
+    } else if proto == PROTO_UDP {
+        c.udp_packets += 1;
+    } else if proto == icmp_proto {
+        c.icmp_packets += 1;
+    }
+}
+
 #[inline(always)]
 fn learn_ipv4(ctx: &TcContext) -> Result<(), ()> {
     let ip = unsafe { &*tc_ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)? };
-    // Options-bearing headers are skipped (rare); L4 offset would be wrong.
-    if ip.ihl() as usize != Ipv4Hdr::LEN {
+    // Only account/learn for protected servers (keeps state clean on a router
+    // that forwards for many networks).
+    if scoped() && !protected_v4(ip.src_addr) {
         return Ok(());
     }
-    // Only learn ports for protected servers (keeps OPEN_PORTS clean on a
-    // router that forwards for many networks).
-    if scoped() && !protected_v4(ip.src_addr) {
+    // TX accounting for every outbound packet from this source (before the
+    // options-header early-out below, which only affects L4 port learning).
+    if let Some(c) = tx_counters_v4(&ip.src_addr) {
+        let pkt_len = (ctx.data_end() - ctx.data()) as u64;
+        tx_account(c, pkt_len, ip.proto, PROTO_ICMP);
+    }
+    // Options-bearing headers are skipped (rare); L4 offset would be wrong.
+    if ip.ihl() as usize != Ipv4Hdr::LEN {
         return Ok(());
     }
     if let Some(svc) = egress_service(ctx, ip.proto, EthHdr::LEN + Ipv4Hdr::LEN)? {
@@ -444,6 +468,11 @@ fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
     let ip = unsafe { &*tc_ptr_at::<Ipv6Hdr>(ctx, EthHdr::LEN)? };
     if scoped() && !protected_v6(ip.src_addr) {
         return Ok(());
+    }
+    // TX accounting for every outbound packet from this source.
+    if let Some(c) = tx_counters_v6(&ip.src_addr) {
+        let pkt_len = (ctx.data_end() - ctx.data()) as u64;
+        tx_account(c, pkt_len, ip.next_hdr, PROTO_ICMPV6);
     }
     // Only inspect packets whose first next-header is directly TCP/UDP.
     if let Some(svc) = egress_service(ctx, ip.next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)? {

@@ -33,6 +33,18 @@ pub static V4_DEST_COUNTERS: LruPerCpuHashMap<[u8; 4], DestCounters> =
 pub static V6_DEST_COUNTERS: LruPerCpuHashMap<[u8; 16], DestCounters> =
     LruPerCpuHashMap::with_max_entries(MAX_DST_IPS, 0);
 
+/// Per-local-IP TX (egress) traffic counters (IPv4), updated by the TC program
+/// for every outbound packet from a protected/local source. Sampled by
+/// userspace for the tx-rate view (the `dropped`/`syn_packets` fields stay 0).
+#[map]
+pub static V4_TX_COUNTERS: LruPerCpuHashMap<[u8; 4], DestCounters> =
+    LruPerCpuHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Per-local-IP TX (egress) traffic counters (IPv6).
+#[map]
+pub static V6_TX_COUNTERS: LruPerCpuHashMap<[u8; 16], DestCounters> =
+    LruPerCpuHashMap::with_max_entries(MAX_DST_IPS, 0);
+
 /// Per-source packet counters (IPv4), incremented only while the destination
 /// is mitigating. Sampled by userspace to compute per-source rates and drive
 /// CIDR escalation. LRU + per-CPU: bounded memory, summed across CPUs.
@@ -145,6 +157,8 @@ macro_rules! counters_for {
 
 counters_for!(counters_v4, [u8; 4], V4_DEST_COUNTERS);
 counters_for!(counters_v6, [u8; 16], V6_DEST_COUNTERS);
+counters_for!(tx_counters_v4, [u8; 4], V4_TX_COUNTERS);
+counters_for!(tx_counters_v6, [u8; 16], V6_TX_COUNTERS);
 
 /// Generate a per-source packet-count incrementer for one address family
 /// (called under mitigation). Pure counting — no policy decision.

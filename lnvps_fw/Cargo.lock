@@ -974,7 +974,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "lnvps_ebpf"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",
@@ -985,14 +985,14 @@ dependencies = [
 
 [[package]]
 name = "lnvps_fw_common"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "lnvps_fw_service"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,11 +17,12 @@ use lnvps_fw_common::{
 };
 
 use lnvps_fw_service::api::{
-    self, CidrKey, LearnedPort, Limits, Mitigation, PrefixLoad, RuleSet, SharedState, SourceBlock,
-    TrackedIp, parse_cidr,
+    self, CidrKey, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet, SharedState,
+    SourceBlock, Totals, TrackedIp, parse_cidr,
 };
+use lnvps_fw_service::cidr::{mask_v4, mask_v6};
 use lnvps_fw_service::config::{Config, IfaceRole};
-use lnvps_fw_service::detect::{DestTracker, DetectionConfig};
+use lnvps_fw_service::detect::{DestTracker, DetectionConfig, Rates};
 use lnvps_fw_service::gc;
 use lnvps_fw_service::publish::{MitInput, MitTracker};
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control};
@@ -201,30 +202,128 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Percentage of packets being dropped (drop_pps as a share of pps), clamped
+/// to 0..=100.
+fn drop_pct(drop_pps: u64, pps: u64) -> u32 {
+    if pps == 0 {
+        0
+    } else {
+        (drop_pps.saturating_mul(100) / pps).min(100) as u32
+    }
+}
+
+/// Manual mitigation overrides parsed for fast per-destination coverage tests,
+/// so the live views can reflect a manually-dropped IP/prefix (which the
+/// auto-detection trackers never flag).
+#[derive(Default)]
+struct ManualOverrides {
+    /// (prefix_len, masked-network, flags)
+    v4: Vec<(u32, [u8; 4], u32)>,
+    v6: Vec<(u32, [u8; 16], u32)>,
+}
+
+impl ManualOverrides {
+    fn from_overrides(overrides: &[Override]) -> Self {
+        let mut m = Self::default();
+        for o in overrides {
+            match parse_cidr(&o.cidr) {
+                Some(CidrKey::V4 { bits, net }) => m.v4.push((bits, mask_v4(net, bits), o.flags)),
+                Some(CidrKey::V6 { bits, net }) => m.v6.push((bits, mask_v6(net, bits), o.flags)),
+                None => {}
+            }
+        }
+        m
+    }
+
+    /// OR of the flags of every override whose CIDR covers `ip`.
+    fn flags_v4(&self, ip: [u8; 4]) -> u32 {
+        self.v4
+            .iter()
+            .filter(|(bits, net, _)| mask_v4(ip, *bits) == *net)
+            .fold(0, |a, (_, _, f)| a | f)
+    }
+
+    fn flags_v6(&self, ip: [u8; 16]) -> u32 {
+        self.v6
+            .iter()
+            .filter(|(bits, net, _)| mask_v6(ip, *bits) == *net)
+            .fold(0, |a, (_, _, f)| a | f)
+    }
+}
+
+/// Aggregate live traffic across every per-destination tracker sampled this
+/// tick (per-IP only; prefixes aggregate the same dests and would double-count).
+fn collect_totals(det: &DetectionState, now_ns: u64) -> Totals {
+    let (mut pps, mut bps, mut syn_pps, mut drop_pps) = (0u64, 0u64, 0u64, 0u64);
+    let mut acc = |tr: &DestTracker| {
+        if tr.last_ns == now_ns {
+            pps += tr.last.pps;
+            bps += tr.last.bps;
+            syn_pps += tr.last.syn_pps;
+            drop_pps += tr.last.drop_pps;
+        }
+    };
+    for tr in det.v4.values() {
+        acc(tr);
+    }
+    for tr in det.v6.values() {
+        acc(tr);
+    }
+    let (mut tx_pps, mut tx_bps) = (0u64, 0u64);
+    for r in det.tx_v4.values().chain(det.tx_v6.values()) {
+        tx_pps += r.pps;
+        tx_bps += r.bps;
+    }
+    Totals {
+        rx_pps: pps,
+        rx_bps: bps,
+        rx_syn_pps: syn_pps,
+        rx_drop_pps: drop_pps,
+        rx_drop_pct: drop_pct(drop_pps, pps),
+        tx_pps,
+        tx_bps,
+    }
+}
+
 /// Snapshot live per-IP rates for every destination sampled this tick (the
 /// live dashboard view). Only trackers updated this tick are reported, so idle
-/// IPs drop off.
-fn collect_tracked(det: &DetectionState, now_ns: u64, cfg: &DetectionConfig) -> Vec<TrackedIp> {
+/// IPs drop off. Manual overrides are folded into the reported flags so a
+/// manually-dropped IP shows as mitigating even though auto-detection never
+/// flagged it.
+fn collect_tracked(
+    det: &DetectionState,
+    now_ns: u64,
+    cfg: &DetectionConfig,
+    manual: &ManualOverrides,
+) -> Vec<TrackedIp> {
     let mut out = Vec::new();
-    let mut push = |ip: String, tr: &DestTracker| {
-        if tr.last_ns == now_ns && (tr.last.pps > 0 || tr.flags != DEST_MODE_NORMAL) {
+    let mut push = |ip: String, tr: &DestTracker, mflags: u32, tx: Rates| {
+        let flags = tr.flags | mflags;
+        let mitigating = flags != DEST_MODE_NORMAL;
+        // Show a row if there's any RX or TX activity this tick, or it's mitigating.
+        if tr.last_ns == now_ns && (tr.last.pps > 0 || tx.pps > 0 || mitigating) {
             out.push(TrackedIp {
                 ip,
-                pps: tr.last.pps,
-                bps: tr.last.bps,
-                syn_pps: tr.last.syn_pps,
-                drop_pps: tr.last.drop_pps,
-                mitigating: tr.flags != DEST_MODE_NORMAL,
-                flags: tr.flags,
+                rx_pps: tr.last.pps,
+                rx_bps: tr.last.bps,
+                rx_syn_pps: tr.last.syn_pps,
+                rx_drop_pps: tr.last.drop_pps,
+                tx_pps: tx.pps,
+                tx_bps: tx.bps,
+                rx_drop_pct: drop_pct(tr.last.drop_pps, tr.last.pps),
+                mitigating,
+                flags,
                 load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, cfg),
             });
         }
     };
     for (k, tr) in &det.v4 {
-        push(Ipv4Addr::from(*k).to_string(), tr);
+        let tx = det.tx_v4.get(k).copied().unwrap_or_default();
+        push(Ipv4Addr::from(*k).to_string(), tr, manual.flags_v4(*k), tx);
     }
     for (k, tr) in &det.v6 {
-        push(Ipv6Addr::from(*k).to_string(), tr);
+        let tx = det.tx_v6.get(k).copied().unwrap_or_default();
+        push(Ipv6Addr::from(*k).to_string(), tr, manual.flags_v6(*k), tx);
     }
     out.sort_by(|a, b| b.load_pct.cmp(&a.load_pct));
     out
@@ -286,26 +385,46 @@ fn load_pct(pps: u64, syn_pps: u64, bps: u64, cfg: &DetectionConfig) -> u32 {
 
 /// Snapshot per-protected-prefix aggregate load (the carpet-bomb gauge). Every
 /// protected prefix is reported each tick, including at 0% load.
-fn collect_prefixes(det: &DetectionState, now_ns: u64, cfg: &DetectionConfig) -> Vec<PrefixLoad> {
+fn collect_prefixes(
+    det: &DetectionState,
+    now_ns: u64,
+    cfg: &DetectionConfig,
+    manual: &ManualOverrides,
+) -> Vec<PrefixLoad> {
     let mut out = Vec::new();
-    let mut push = |cidr: String, tr: &DestTracker| {
+    let mut push = |cidr: String, tr: &DestTracker, mflags: u32, tx: (u64, u64)| {
         if tr.last_ns == now_ns {
+            let flags = tr.flags | mflags;
             out.push(PrefixLoad {
                 cidr,
-                pps: tr.last.pps,
-                bps: tr.last.bps,
-                syn_pps: tr.last.syn_pps,
-                mitigating: tr.flags != DEST_MODE_NORMAL,
-                flags: tr.flags,
+                rx_pps: tr.last.pps,
+                rx_bps: tr.last.bps,
+                rx_syn_pps: tr.last.syn_pps,
+                rx_drop_pps: tr.last.drop_pps,
+                tx_pps: tx.0,
+                tx_bps: tx.1,
+                rx_drop_pct: drop_pct(tr.last.drop_pps, tr.last.pps),
+                mitigating: flags != DEST_MODE_NORMAL,
+                flags,
                 load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, cfg),
             });
         }
     };
     for ((len, net), tr) in &det.prefix_v4 {
-        push(format!("{}/{len}", Ipv4Addr::from(*net)), tr);
+        let tx = det
+            .tx_v4
+            .iter()
+            .filter(|(ip, _)| mask_v4(**ip, *len) == *net)
+            .fold((0u64, 0u64), |a, (_, r)| (a.0 + r.pps, a.1 + r.bps));
+        push(format!("{}/{len}", Ipv4Addr::from(*net)), tr, manual.flags_v4(*net), tx);
     }
     for ((len, net), tr) in &det.prefix_v6 {
-        push(format!("{}/{len}", Ipv6Addr::from(*net)), tr);
+        let tx = det
+            .tx_v6
+            .iter()
+            .filter(|(ip, _)| mask_v6(**ip, *len) == *net)
+            .fold((0u64, 0u64), |a, (_, r)| (a.0 + r.pps, a.1 + r.bps));
+        push(format!("{}/{len}", Ipv6Addr::from(*net)), tr, manual.flags_v6(*net), tx);
     }
     out.sort_by(|a, b| b.load_pct.cmp(&a.load_pct));
     out
@@ -324,6 +443,33 @@ fn collect_active(det: &DetectionState) -> Vec<MitInput> {
                 bps: tr.peak.bps,
                 syn_pps: tr.peak.syn_pps,
             });
+        }
+    };
+    for (k, tr) in &det.v4 {
+        push(format!("{}/32", Ipv4Addr::from(*k)), tr);
+    }
+    for (k, tr) in &det.v6 {
+        push(format!("{}/128", Ipv6Addr::from(*k)), tr);
+    }
+    for ((len, net), tr) in &det.prefix_v4 {
+        push(format!("{}/{len}", Ipv4Addr::from(*net)), tr);
+    }
+    for ((len, net), tr) in &det.prefix_v6 {
+        push(format!("{}/{len}", Ipv6Addr::from(*net)), tr);
+    }
+    out
+}
+
+/// Live per-window rates keyed by canonical CIDR string, for every tracked
+/// dest/prefix sampled this tick. Used to enrich manual overrides: a manually
+/// mitigated destination is counted + dropped by XDP, but never enters the
+/// auto-detection flag state, so `collect_active` would otherwise report it
+/// with zero rates.
+fn live_rates_by_cidr(det: &DetectionState, now_ns: u64) -> HashMap<String, Rates> {
+    let mut out = HashMap::new();
+    let mut push = |cidr: String, tr: &DestTracker| {
+        if tr.last_ns == now_ns {
+            out.insert(cidr, tr.last);
         }
     };
     for (k, tr) in &det.v4 {
@@ -641,6 +787,11 @@ async fn main() -> Result<()> {
     let mut applied_protected_v4: Vec<(u32, [u8; 4])> = Vec::new();
     let mut applied_protected_v6: Vec<(u32, [u8; 16])> = Vec::new();
     let mut mit_tracker = MitTracker::default();
+    // Per-manual-override bookkeeping: stable `since` timestamp + running peak
+    // rates, keyed by the raw override CIDR string (manual mitigations are not
+    // driven by the auto-detection trackers, so we accumulate their live rates
+    // here instead of reporting zeros).
+    let mut manual_state: HashMap<String, (u64, Rates)> = HashMap::new();
 
     // Scope XDP to the protected prefixes up front (empty => host mode).
     sync_protected(
@@ -750,25 +901,53 @@ async fn main() -> Result<()> {
                     for ev in events {
                         st.record_event(ev.kind, ev.cidr, ev.flags, ev.pps, ev.bps, ev.syn_pps);
                     }
-                    for o in st.rules().overrides {
+                    let live = live_rates_by_cidr(&detection_state, now);
+                    let overrides = st.rules().overrides;
+                    let manual = ManualOverrides::from_overrides(&overrides);
+                    let mut seen: HashSet<String> = HashSet::new();
+                    for o in overrides {
+                        seen.insert(o.cidr.clone());
+                        // Match live rates against the canonical CIDR form so a
+                        // bare address (`1.2.3.4`) still lines up with the
+                        // tracker key (`1.2.3.4/32`).
+                        let key = parse_cidr(&o.cidr)
+                            .map(|k| k.to_cidr_string())
+                            .unwrap_or_else(|| o.cidr.clone());
+                        let r = live.get(&key).copied().unwrap_or_default();
+                        let entry = manual_state
+                            .entry(o.cidr.clone())
+                            .or_insert_with(|| (now_unix(), Rates::default()));
+                        entry.1.pps = entry.1.pps.max(r.pps);
+                        entry.1.bps = entry.1.bps.max(r.bps);
+                        entry.1.syn_pps = entry.1.syn_pps.max(r.syn_pps);
+                        let (since, peak) = *entry;
                         active.push(Mitigation {
                             cidr: o.cidr,
                             flags: o.flags,
-                            since_unix: now_unix(),
+                            since_unix: since,
                             manual: true,
-                            peak_pps: 0,
-                            peak_bps: 0,
-                            peak_syn_pps: 0,
+                            peak_pps: peak.pps,
+                            peak_bps: peak.bps,
+                            peak_syn_pps: peak.syn_pps,
                         });
                     }
+                    // Drop bookkeeping for overrides that no longer exist.
+                    manual_state.retain(|c, _| seen.contains(c));
                     st.set_active(active);
-                    st.set_tracked(collect_tracked(&detection_state, now, &runtime_cfg.detection));
+                    st.set_tracked(collect_tracked(
+                        &detection_state,
+                        now,
+                        &runtime_cfg.detection,
+                        &manual,
+                    ));
                     st.set_prefixes(collect_prefixes(
                         &detection_state,
                         now,
                         &runtime_cfg.network,
+                        &manual,
                     ));
                     st.set_blocks(collect_blocks(&detection_state, now));
+                    st.set_totals(collect_totals(&detection_state, now));
                 }
             }
             _ = gc_timer.tick() => {

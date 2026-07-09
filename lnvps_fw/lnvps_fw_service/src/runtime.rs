@@ -33,7 +33,7 @@ use lnvps_fw_common::{
 use crate::cidr::{
     CidrV4, CidrV6, aggregate_v4, aggregate_v6, mask_v4, mask_v6, offenders, per_source_pps,
 };
-use crate::detect::{DestTracker, DetectionConfig, Rates, Transition, process_sample};
+use crate::detect::{DestTracker, DetectionConfig, Rates, Transition, compute_rates, process_sample};
 
 /// Runtime configuration for one control tick.
 #[derive(Debug, Clone)]
@@ -85,6 +85,12 @@ pub struct DetectionState {
     /// Active CIDR blocks -> current aggregate pps from sources under them.
     pub block_pps_v4: HashMap<CidrV4, u64>,
     pub block_pps_v6: HashMap<CidrV6, u64>,
+    /// Previous cumulative TX (egress) counter snapshots, keyed by local IP.
+    pub prev_tx_v4: HashMap<[u8; 4], DestCounters>,
+    pub prev_tx_v6: HashMap<[u8; 16], DestCounters>,
+    /// Latest per-local-IP TX rates (for the tx/rx dashboard view).
+    pub tx_v4: HashMap<[u8; 4], Rates>,
+    pub tx_v6: HashMap<[u8; 16], Rates>,
 }
 
 /// Sum per-CPU `DestCounters` slots into one total.
@@ -436,6 +442,28 @@ fn source_control_v6(
     Ok(!state.blocks_v6.is_empty())
 }
 
+/// Sample one TX-counter map, compute per-local-IP egress rates against the
+/// previous snapshot, and refresh both the rate map and the prev snapshot.
+fn compute_tx<K>(
+    bpf: &Ebpf,
+    name: &str,
+    prev: &mut HashMap<K, DestCounters>,
+    out: &mut HashMap<K, Rates>,
+    elapsed_ns: u64,
+) -> Result<()>
+where
+    K: Pod + Eq + Hash + Copy,
+{
+    let cur = read_counters::<K>(bpf, name)?;
+    out.clear();
+    for (k, c) in &cur {
+        let p = prev.get(k).copied().unwrap_or_default();
+        out.insert(*k, compute_rates(&p, c, elapsed_ns));
+    }
+    *prev = cur.into_iter().collect();
+    Ok(())
+}
+
 /// One control tick at the injected `now_ns`. Source analysis runs first (it
 /// gates escalation), then per-destination and per-prefix detection write the
 /// escalation level into the dest-state trie. The first tick
@@ -456,6 +484,10 @@ pub fn run_control(
     // --- Source control first (spoof-gated); result gates escalation ---
     let sba4 = source_control_v4(bpf, state, cfg, now_ns, elapsed)?;
     let sba6 = source_control_v6(bpf, state, cfg, now_ns, elapsed)?;
+
+    // --- TX (egress) rates per local IP (display only; no mitigation) ---
+    compute_tx::<[u8; 4]>(bpf, "V4_TX_COUNTERS", &mut state.prev_tx_v4, &mut state.tx_v4, elapsed)?;
+    compute_tx::<[u8; 16]>(bpf, "V6_TX_COUNTERS", &mut state.prev_tx_v6, &mut state.tx_v6, elapsed)?;
 
     // --- Per-destination + per-prefix detection (shared dest-state trie) ---
     let v4 = read_counters::<[u8; 4]>(bpf, "V4_DEST_COUNTERS")?;

@@ -135,10 +135,20 @@ pub struct Event {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrackedIp {
     pub ip: String,
-    pub pps: u64,
-    pub bps: u64,
-    pub syn_pps: u64,
-    pub drop_pps: u64,
+    /// RX (ingress) packets/second into this IP.
+    pub rx_pps: u64,
+    /// RX (ingress) bytes/second into this IP.
+    pub rx_bps: u64,
+    /// RX (ingress) TCP SYNs/second into this IP.
+    pub rx_syn_pps: u64,
+    /// RX (ingress) packets/second dropped by protection.
+    pub rx_drop_pps: u64,
+    /// TX (egress) packets/second out of this IP (from the TC program).
+    pub tx_pps: u64,
+    /// TX (egress) bytes/second out of this IP.
+    pub tx_bps: u64,
+    /// Percentage of this IP's RX packets currently being dropped.
+    pub rx_drop_pct: u32,
     pub mitigating: bool,
     pub flags: u32,
     /// How close this IP is to tripping mitigation: the max of its pps/syn/bps
@@ -150,14 +160,36 @@ pub struct TrackedIp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrefixLoad {
     pub cidr: String,
-    pub pps: u64,
-    pub bps: u64,
-    pub syn_pps: u64,
+    /// RX (ingress) aggregate rates for this prefix.
+    pub rx_pps: u64,
+    pub rx_bps: u64,
+    pub rx_syn_pps: u64,
+    pub rx_drop_pps: u64,
+    /// Aggregate TX (egress) rates for this prefix.
+    pub tx_pps: u64,
+    pub tx_bps: u64,
+    /// Percentage of this prefix's RX packets currently being dropped.
+    pub rx_drop_pct: u32,
     pub mitigating: bool,
     pub flags: u32,
     /// Aggregate load as a percentage of the network thresholds (>=100 =
     /// carpet-bomb mitigation trips for the whole prefix).
     pub load_pct: u32,
+}
+
+/// Top-level aggregate traffic across every tracked destination this tick.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Totals {
+    /// RX (ingress) aggregate.
+    pub rx_pps: u64,
+    pub rx_bps: u64,
+    pub rx_syn_pps: u64,
+    pub rx_drop_pps: u64,
+    /// Percentage of all RX packets currently being dropped.
+    pub rx_drop_pct: u32,
+    /// TX (egress) aggregate.
+    pub tx_pps: u64,
+    pub tx_bps: u64,
 }
 
 /// The detection thresholds, exposed so operators can see how much headroom
@@ -214,6 +246,8 @@ pub struct Status {
     pub active_mitigations: usize,
     pub learned_ports: usize,
     pub events_cursor: u64,
+    /// Aggregate live traffic across all tracked destinations.
+    pub totals: Totals,
 }
 
 /// Bounded ring buffer of events with a monotonic cursor.
@@ -286,6 +320,7 @@ pub struct SharedState {
     prefixes: RwLock<Vec<PrefixLoad>>,
     blocks: RwLock<Vec<SourceBlock>>,
     ports: RwLock<Vec<LearnedPort>>,
+    totals: RwLock<Totals>,
     limits: RwLock<Limits>,
     upgrade: RwLock<crate::upgrade::UpgradeStatus>,
     /// GitHub owner/repo to check for self-upgrade releases.
@@ -318,6 +353,7 @@ impl SharedState {
             prefixes: RwLock::new(Vec::new()),
             blocks: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
+            totals: RwLock::new(Totals::default()),
             limits: RwLock::new(Limits::default()),
             upgrade: RwLock::new(crate::upgrade::UpgradeStatus::default()),
             upgrade_repo,
@@ -364,6 +400,11 @@ impl SharedState {
     /// Replace the active source-block snapshot.
     pub fn set_blocks(&self, blocks: Vec<SourceBlock>) {
         *self.blocks.write().unwrap() = blocks;
+    }
+
+    /// Replace the top-level aggregate traffic totals.
+    pub fn set_totals(&self, totals: Totals) {
+        *self.totals.write().unwrap() = totals;
     }
 
     /// Publish the detection thresholds (called at startup).
@@ -550,6 +591,7 @@ async fn get_status(State(state): State<Arc<SharedState>>) -> Json<Status> {
         active_mitigations: active.len(),
         learned_ports: state.ports.read().unwrap().len(),
         events_cursor: cursor,
+        totals: *state.totals.read().unwrap(),
     })
 }
 
@@ -902,6 +944,8 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   .limits label { display: inline-flex; flex-direction: column; font-size: .72rem; color: #8b949e; gap: .2rem; }
   .limits input { width: 7.5rem; }
   .limits .act { display: flex; gap: .5rem; align-items: center; width: 100%; margin-top: .2rem; }
+  .totals { color: #8b949e; font-size: .82rem; }
+  .totals b { color: #d6deeb; font-weight: 600; }
   .barwrap { display: inline-flex; align-items: center; gap: .4rem; }
   .bar { background: #21262d; border-radius: 4px; height: 10px; width: 120px; overflow: hidden; display: inline-block; }
   .bar .fill { display: block; height: 100%; }
@@ -1115,19 +1159,24 @@ function App() {
     } catch (e) { setUpMsg('upgrade error: ' + e.message); }
   };
   const s = d.status;
+  const t0 = s && s.totals;
   const summary = d.err ? html`<span class="err">${d.err}</span>`
     : s ? html`<span class="muted">up ${s.uptime_secs}s · ${s.active_mitigations} active · ${s.learned_ports} ports</span>`
     : html`<span class="muted">disconnected</span>`;
+  const dropCell = pct => html`<span style=${'color:'+loadColor(pct)+';font-weight:600'}>${pct}%</span>`;
 
-  const trackedRows = d.tracked.map(t => [t.ip, fmtn(t.pps), fmtbps(t.bps), fmtn(t.syn_pps), fmtn(t.drop_pps),
-    html`<${LoadBar} pct=${t.load_pct} />`, t.mitigating ? flagCell(t.flags) : 'ok']);
-  const prefixRows = d.prefixes.map(p => [p.cidr, fmtn(p.pps), fmtbps(p.bps), fmtn(p.syn_pps),
-    html`<${LoadBar} pct=${p.load_pct} />`, p.mitigating ? flagCell(p.flags) : 'ok']);
+  const trackedRows = d.tracked.map(t => [t.ip, fmtn(t.rx_pps), fmtbps(t.rx_bps), fmtn(t.tx_pps), fmtbps(t.tx_bps),
+    fmtn(t.rx_syn_pps), fmtn(t.rx_drop_pps), dropCell(t.rx_drop_pct), html`<${LoadBar} pct=${t.load_pct} />`,
+    t.mitigating ? flagCell(t.flags) : 'ok']);
+  const prefixRows = d.prefixes.map(p => [p.cidr, fmtn(p.rx_pps), fmtbps(p.rx_bps), fmtn(p.tx_pps), fmtbps(p.tx_bps),
+    fmtn(p.rx_syn_pps), fmtn(p.rx_drop_pps), dropCell(p.rx_drop_pct), html`<${LoadBar} pct=${p.load_pct} />`,
+    p.mitigating ? flagCell(p.flags) : 'ok']);
   const evRows = events.map(e => [e.seq, time(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtn(e.syn_pps)]);
 
   return html`
     <header>
       <h1>lnvps_fw</h1>${summary}
+      ${t0 ? html`<span class="totals">↓rx <b>${fmtn(t0.rx_pps)}</b> pps · <b>${fmtbps(t0.rx_bps)}</b> · ↑tx <b>${fmtn(t0.tx_pps)}</b> pps · <b>${fmtbps(t0.tx_bps)}</b> · <b>${fmtn(t0.rx_syn_pps)}</b> syn/s · drop <b style=${'color:'+loadColor(t0.rx_drop_pct)}>${t0.rx_drop_pct}%</b> (${fmtn(t0.rx_drop_pps)} pps)</span>` : null}
       ${d.upgrade && d.upgrade.available ? html`<button style="background:#3fb950" title="download & install ${d.upgrade.latest}, then restart"
         onClick=${doUpgrade}>⬆ upgrade ${d.upgrade.latest}</button>` : null}
       ${upMsg ? html`<span class="muted">${upMsg}</span>` : null}
@@ -1146,10 +1195,10 @@ function App() {
         <${MitigationsCard} token=${token} mitigations=${d.mitigations} onChange=${refresh} />
       </${Section}>
       <${Section} wide=true title="Live tracked IPs" extra=${'('+d.tracked.length+')'}>
-        <${PagedTable} cols=${['ip','pps','bps','syn/s','drop/s','load','state']} rows=${trackedRows} />
+        <${PagedTable} cols=${['ip','rx pps','rx bps','tx pps','tx bps','syn/s','drop/s','drop%','load','state']} rows=${trackedRows} />
       </${Section}>
       <${Section} wide=true title="Protected prefixes" extra=${'('+d.prefixes.length+')'}>
-        <${PagedTable} cols=${['prefix','pps','bps','syn/s','load','state']} rows=${prefixRows} />
+        <${PagedTable} cols=${['prefix','rx pps','rx bps','tx pps','tx bps','syn/s','drop/s','drop%','load','state']} rows=${prefixRows} />
       </${Section}>
       <${Section} wide=true title="Source blocks" extra=${'('+d.blocks.length+')'}>
         <${BlocksCard} token=${token} blocks=${d.blocks} onChange=${refresh} />
