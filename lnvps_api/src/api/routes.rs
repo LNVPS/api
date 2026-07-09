@@ -704,6 +704,9 @@ async fn v1_custom_template_calc(
     // create a fake template from the request to generate the price
     let template: VmCustomTemplate = req.into();
 
+    // Reject out-of-range specs so the order form surfaces the error early.
+    PricingEngine::validate_custom_vm_spec(&this.db, &template).await?;
+
     let price = PricingEngine::get_custom_vm_cost_amount(&this.db, 0, &template).await?;
     let amount = CurrencyAmount::from_u64(price.currency, price.total());
     ApiData::ok(ApiPrice {

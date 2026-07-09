@@ -329,8 +329,57 @@ impl PricingEngine {
             bail!("No disk price found")
         };
 
-        // Validate the requested spec against the plan's configured limits so a
-        // user cannot order out-of-range (or sub-GB, effectively free) resources.
+        // NOTE: spec range validation deliberately lives in `validate_custom_vm_spec`,
+        // which is only invoked at order/upgrade entry points. This function must
+        // remain able to price ANY existing VM's spec — including grandfathered VMs
+        // whose specs predate the current plan limits — so renewals and the startup
+        // subscription backfill don't break for out-of-range legacy VMs.
+
+        // All costs are in smallest currency units (cents/millisats). Round GB
+        // counts UP so sub-GB fractions are billed rather than truncated to 0.
+        let disk_size_gb = template.disk_size.div_ceil(crate::GB);
+        let memory_gb = template.memory.div_ceil(crate::GB);
+
+        let disk_cost = disk_size_gb * disk_pricing.cost;
+        let cpu_cost = pricing.cpu_cost * template.cpu as u64;
+        let memory_cost = pricing.memory_cost * memory_gb;
+        let ip4_cost = pricing.ip4_cost * v4s as u64;
+        let ip6_cost = pricing.ip6_cost * v6s as u64;
+
+        let currency: Currency = if let Ok(p) = pricing.currency.parse() {
+            p
+        } else {
+            bail!("Invalid currency")
+        };
+        Ok(PricingData {
+            currency,
+            cpu_cost,
+            memory_cost,
+            ip6_cost,
+            ip4_cost,
+            disk_cost,
+        })
+    }
+
+    /// Validate a requested custom VM spec against its plan's configured min/max
+    /// limits so a user cannot ORDER (or upgrade to) out-of-range — or sub-GB,
+    /// effectively free — resources.
+    ///
+    /// This is intentionally separate from `get_custom_vm_cost_amount`: pricing
+    /// must always succeed for existing VMs (renewals, subscription backfill),
+    /// including grandfathered VMs whose specs predate the current plan limits.
+    /// Only genuine order/upgrade entry points call this.
+    pub async fn validate_custom_vm_spec(
+        db: &Arc<dyn LNVpsDb>,
+        template: &VmCustomTemplate,
+    ) -> Result<()> {
+        let pricing = db.get_custom_pricing(template.pricing_id).await?;
+        let pricing_disk = db.list_custom_pricing_disk(pricing.id).await?;
+        let disk_pricing = pricing_disk
+            .iter()
+            .find(|p| p.kind == template.disk_type && p.interface == template.disk_interface)
+            .ok_or_else(|| anyhow!("No disk price found"))?;
+
         if template.cpu < pricing.min_cpu || template.cpu > pricing.max_cpu {
             bail!(
                 "CPU count {} out of range ({}-{})",
@@ -357,31 +406,7 @@ impl PricingEngine {
                 disk_pricing.max_disk_size
             );
         }
-
-        // All costs are in smallest currency units (cents/millisats). Round GB
-        // counts UP so sub-GB fractions are billed rather than truncated to 0.
-        let disk_size_gb = template.disk_size.div_ceil(crate::GB);
-        let memory_gb = template.memory.div_ceil(crate::GB);
-
-        let disk_cost = disk_size_gb * disk_pricing.cost;
-        let cpu_cost = pricing.cpu_cost * template.cpu as u64;
-        let memory_cost = pricing.memory_cost * memory_gb;
-        let ip4_cost = pricing.ip4_cost * v4s as u64;
-        let ip6_cost = pricing.ip6_cost * v6s as u64;
-
-        let currency: Currency = if let Ok(p) = pricing.currency.parse() {
-            p
-        } else {
-            bail!("Invalid currency")
-        };
-        Ok(PricingData {
-            currency,
-            cpu_cost,
-            memory_cost,
-            ip6_cost,
-            ip4_cost,
-            disk_cost,
-        })
+        Ok(())
     }
 
     /// Get the renewal cost of a custom VM
@@ -773,6 +798,10 @@ impl PricingEngine {
 
         // create the custom template which represents this upgrade request
         let new_custom_template = self.create_upgrade_template(vm_id, cfg).await?;
+
+        // Upgrades are a spec change chosen by the user, so enforce the plan's
+        // min/max limits (unlike plain renewals of existing specs).
+        Self::validate_custom_vm_spec(&self.db, &new_custom_template).await?;
 
         // Get the cost of renewal
         let new_price =
@@ -1171,7 +1200,8 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: requests outside the plan's min/max limits must be rejected.
+    /// Regression: requests outside the plan's min/max limits must be rejected
+    /// at order/upgrade time via `validate_custom_vm_spec`.
     #[tokio::test]
     async fn custom_pricing_rejects_out_of_range() -> Result<()> {
         let db = MockDb::default();
@@ -1183,8 +1213,15 @@ mod tests {
         }
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let template = db.get_custom_vm_template(1).await?;
-        let res = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        let res = PricingEngine::validate_custom_vm_spec(&db, &template).await;
         assert!(res.is_err(), "cpu=0 must be rejected (below min_cpu)");
+        // But pricing itself must still succeed — grandfathered/out-of-range VMs
+        // must remain renewable and migratable.
+        let priced = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        assert!(
+            priced.is_ok(),
+            "pricing must succeed for out-of-range specs (renewal/backfill)"
+        );
         Ok(())
     }
 

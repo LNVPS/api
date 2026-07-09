@@ -218,6 +218,10 @@ impl VmProvisioner {
             bail!("Cant create VM from disabled os image");
         }
 
+        // Reject out-of-range specs at order time (pricing itself no longer
+        // validates, so existing/grandfathered VMs can still be priced/renewed).
+        PricingEngine::validate_custom_vm_spec(&self.db, &template).await?;
+
         // Copy resource limits from the pricing plan into the template
         template.disk_iops_read = pricing.disk_iops_read;
         template.disk_iops_write = pricing.disk_iops_write;
