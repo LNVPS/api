@@ -255,6 +255,22 @@ fn collect_tracked(det: &DetectionState, now_ns: u64, cfg: &DetectionConfig) -> 
     out
 }
 
+/// Apply live-edited thresholds from the control API into the runtime config
+/// (applied to both the per-destination and per-prefix detectors).
+fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
+    let cooldown_ns = l.cooldown_secs.saturating_mul(1_000_000_000);
+    rt.detection.pps = l.pps;
+    rt.detection.syn_pps = l.syn_pps;
+    rt.detection.bps = l.bps;
+    rt.detection.exit_pct = l.exit_pct;
+    rt.detection.cooldown_ns = cooldown_ns;
+    rt.network.pps = l.net_pps;
+    rt.network.syn_pps = l.net_syn_pps;
+    rt.network.bps = l.net_bps;
+    rt.network.exit_pct = l.exit_pct;
+    rt.network.cooldown_ns = cooldown_ns;
+}
+
 /// How close a set of rates is to tripping mitigation: the max of the three
 /// axes as a percentage of their entry thresholds (>=100 = tripping).
 fn load_pct(pps: u64, syn_pps: u64, bps: u64, cfg: &DetectionConfig) -> u32 {
@@ -551,6 +567,7 @@ async fn main() -> Result<()> {
     // into. Rules are pushed by lnvps_api and reconciled below on change.
     let api_state = start_api(&cfg)?;
     let mut rules_version = 0u64;
+    let mut limits_version = 0u64;
     let mut applied_overrides: HashMap<String, CidrKey> = HashMap::new();
     let mut applied_protected_v4: Vec<(u32, [u8; 4])> = Vec::new();
     let mut applied_protected_v6: Vec<(u32, [u8; 16])> = Vec::new();
@@ -645,6 +662,15 @@ async fn main() -> Result<()> {
                         ) {
                             warn!("sync protected failed: {e}");
                         }
+                    }
+                }
+                // Reload live-edited detection thresholds.
+                if let Some(st) = &api_state {
+                    let v = st.limits_version();
+                    if v != limits_version {
+                        limits_version = v;
+                        apply_limits(&mut runtime_cfg, &st.limits());
+                        info!("detection limits updated via API");
                     }
                 }
                 if let Err(e) = run_control(&mut bpf, &mut detection_state, &runtime_cfg, now) {

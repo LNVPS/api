@@ -271,6 +271,8 @@ pub struct SharedState {
     events: Mutex<EventRing>,
     /// Bumped whenever the ruleset changes so the control loop reloads it.
     rules_version: AtomicU64,
+    /// Bumped whenever the limits are edited so the control loop reloads them.
+    limits_version: AtomicU64,
 }
 
 impl SharedState {
@@ -294,6 +296,7 @@ impl SharedState {
             limits: RwLock::new(Limits::default()),
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
+            limits_version: AtomicU64::new(1),
         })
     }
 
@@ -334,6 +337,16 @@ impl SharedState {
     /// Publish the detection thresholds (called at startup).
     pub fn set_limits(&self, limits: Limits) {
         *self.limits.write().unwrap() = limits;
+    }
+
+    /// Current limits (clone) — read by the control loop on version change.
+    pub fn limits(&self) -> Limits {
+        *self.limits.read().unwrap()
+    }
+
+    /// Monotonic limits version; changes on every live edit.
+    pub fn limits_version(&self) -> u64 {
+        self.limits_version.load(Ordering::Relaxed)
     }
 
     /// Record a mitigation event (called by the control loop).
@@ -404,7 +417,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/ports", get(get_ports))
         .route("/api/v1/tracked", get(get_tracked))
         .route("/api/v1/prefixes", get(get_prefixes))
-        .route("/api/v1/limits", get(get_limits))
+        .route("/api/v1/limits", get(get_limits).put(put_limits))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
 
@@ -532,6 +545,21 @@ async fn get_prefixes(State(state): State<Arc<SharedState>>) -> Json<Vec<PrefixL
 
 async fn get_limits(State(state): State<Arc<SharedState>>) -> Json<Limits> {
     Json(*state.limits.read().unwrap())
+}
+
+/// Live-edit the detection thresholds. Held in memory (not persisted); the
+/// control loop reloads them on the next tick.
+async fn put_limits(State(state): State<Arc<SharedState>>, Json(l): Json<Limits>) -> Response {
+    let thresholds = [l.pps, l.syn_pps, l.bps, l.net_pps, l.net_syn_pps, l.net_bps];
+    if thresholds.contains(&0) {
+        return (StatusCode::BAD_REQUEST, "all thresholds must be > 0").into_response();
+    }
+    if l.exit_pct == 0 || l.exit_pct >= 100 {
+        return (StatusCode::BAD_REQUEST, "exit_pct must be 1..99").into_response();
+    }
+    *state.limits.write().unwrap() = l;
+    state.limits_version.fetch_add(1, Ordering::Relaxed);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn get_rules(State(state): State<Arc<SharedState>>) -> Json<RuleSet> {
@@ -734,6 +762,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   .err { color: #ff6b6b; }
   .pager { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; }
   .scroll { max-height: 420px; overflow: auto; }
+  .limits { display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: flex-end; }
+  .limits label { display: inline-flex; flex-direction: column; font-size: .72rem; color: #8b949e; gap: .2rem; }
+  .limits input { width: 7.5rem; }
+  .limits .act { display: flex; gap: .5rem; align-items: center; width: 100%; margin-top: .2rem; }
   .barwrap { display: inline-flex; align-items: center; gap: .4rem; }
   .bar { background: #21262d; border-radius: 4px; height: 10px; width: 120px; overflow: hidden; display: inline-block; }
   .bar .fill { display: block; height: 100%; }
@@ -799,6 +831,33 @@ function Section({ title, extra, children, wide }) {
     <h2>${title}${extra?html`<span class="muted">${extra}</span>`:null}</h2>${children}</section>`;
 }
 
+// Live-editable detection thresholds. Seeds from GET /limits once so the 2s
+// poll doesn't clobber edits; PUT on save.
+function LimitsCard({ token }) {
+  const [f, setF] = useState(null);
+  const [msg, setMsg] = useState('');
+  useEffect(() => { (async () => { try { setF(await api('/api/v1/limits', token)); } catch (e) {} })(); }, [token]);
+  if (!f) return html`<div class="muted">…</div>`;
+  const num = k => e => setF({ ...f, [k]: Math.max(0, Math.floor(+e.target.value || 0)) });
+  const fld = (k, label) => html`<label>${label}<input type="number" min="1" value=${f[k]} onInput=${num(k)} /></label>`;
+  const save = async () => {
+    setMsg('saving…');
+    try {
+      const r = await fetch('/api/v1/limits', { method: 'PUT',
+        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify(f) });
+      setMsg(r.ok ? 'saved ✓' : 'error ' + r.status + ': ' + (await r.text()));
+    } catch (e) { setMsg(e.message); }
+  };
+  const reload = async () => { setMsg(''); try { setF(await api('/api/v1/limits', token)); } catch (e) {} };
+  return html`<div class="limits">
+    ${fld('pps','IP pps')}${fld('syn_pps','IP syn/s')}${fld('bps','IP bytes/s')}
+    ${fld('net_pps','prefix pps')}${fld('net_syn_pps','prefix syn/s')}${fld('net_bps','prefix bytes/s')}
+    ${fld('exit_pct','exit %')}${fld('cooldown_secs','cooldown s')}
+    <div class="act"><button onClick=${save}>save</button><button class="ghost" onClick=${reload}>reset</button>
+      <span class="muted">${msg}</span></div>
+  </div>`;
+}
+
 // Server-side paginated + filtered learned-ports table.
 function PortsCard({ token }) {
   const PAGE = 50;
@@ -826,7 +885,7 @@ function PortsCard({ token }) {
 function App() {
   const [token, setTokenState] = useState(localStorage.getItem('fwtoken') || '');
   const [auto, setAuto] = useState(true);
-  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], mitigations: [], limits: null, rules: { protected: [], overrides: [] }, err: '' });
+  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], mitigations: [], rules: { protected: [], overrides: [] }, err: '' });
   const [events, setEvents] = useState([]);
   const cursor = useRef(0);
   const tokenRef = useRef(token);
@@ -835,13 +894,13 @@ function App() {
   const refresh = useCallback(async () => {
     const t = tokenRef.current;
     try {
-      const [status, tracked, prefixes, mitigations, rules, limits] = await Promise.all([
+      const [status, tracked, prefixes, mitigations, rules] = await Promise.all([
         api('/api/v1/status', t), api('/api/v1/tracked', t), api('/api/v1/prefixes', t),
-        api('/api/v1/mitigations', t), api('/api/v1/rules', t), api('/api/v1/limits', t),
+        api('/api/v1/mitigations', t), api('/api/v1/rules', t),
       ]);
       const ev = await api('/api/v1/events?since=' + cursor.current, t);
       if (ev.events.length) { cursor.current = ev.cursor; setEvents(e => [...ev.events.slice().reverse(), ...e].slice(0, 500)); }
-      setD({ status, tracked, prefixes, mitigations, rules, limits, err: '' });
+      setD({ status, tracked, prefixes, mitigations, rules, err: '' });
     } catch (e) { setD(x => ({ ...x, err: e.message })); }
   }, []);
 
@@ -862,7 +921,6 @@ function App() {
     html`<${LoadBar} pct=${t.load_pct} />`, t.mitigating ? flagCell(t.flags) : 'ok']);
   const prefixRows = d.prefixes.map(p => [p.cidr, fmtn(p.pps), fmtbps(p.bps), fmtn(p.syn_pps),
     html`<${LoadBar} pct=${p.load_pct} />`, p.mitigating ? flagCell(p.flags) : 'ok']);
-  const L = d.limits;
   const mitRows = d.mitigations.map(m => [m.cidr, flagCell(m.flags), time(m.since_unix), m.manual?'yes':'',
     fmtn(m.peak_pps), fmtbps(m.peak_bps), fmtn(m.peak_syn_pps)]);
   const evRows = events.map(e => [e.seq, time(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtn(e.syn_pps)]);
@@ -885,9 +943,10 @@ function App() {
           <div>protected prefixes</div><div>${s.protected_prefixes}</div>
           <div>active mitigations</div><div>${s.active_mitigations}</div>
           <div>learned ports</div><div>${s.learned_ports}</div>
-          ${L ? html`<div>per-IP limits</div><div>${fmtn(L.pps)} pps · ${fmtn(L.syn_pps)} syn/s · ${fmtbps(L.bps)}</div>
-          <div>prefix limits</div><div>${fmtn(L.net_pps)} pps · ${fmtn(L.net_syn_pps)} syn/s · ${fmtbps(L.net_bps)}</div>` : null}
         </div>` : html`<div class="muted">enter token and connect</div>`}
+      </${Section}>
+      <${Section} wide=true title="Detection limits">
+        <${LimitsCard} token=${token} />
       </${Section}>
       <${Section} wide=true title="Active mitigations" extra=${'('+d.mitigations.length+')'}>
         <${PagedTable} cols=${['cidr','flags','since','manual','peak pps','peak bps','peak syn/s']} rows=${mitRows} />

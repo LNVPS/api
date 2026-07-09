@@ -485,6 +485,17 @@ mitigation.
 - Validated: 49 unit/api tests green; clippy/fmt clean; rendered
       (`docs/dashboard.png`).
 
+### Increment 14 — Live-editable detection limits widget (S) ✅ DONE
+
+- [x] `PUT /api/v1/limits` (validated: thresholds > 0, exit_pct 1..99) updates
+      the in-memory limits + bumps `limits_version`; the control loop reloads
+      them into `runtime_cfg.detection`/`network` on the next tick
+      (`apply_limits`). In-memory only (not persisted; restart restores config).
+- [x] Dashboard: dedicated full-width "Detection limits" widget with editable
+      inputs for all 8 thresholds (per-IP + per-prefix pps/syn/bytes, exit %,
+      cooldown) + save/reset; seeds once so the 2s poll doesn't clobber edits.
+- [x] test `limits_put_get_roundtrip_and_validation`.
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

@@ -8,8 +8,8 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
-    Event, EventKind, EventsResponse, LearnedPort, Override, PortsPage, RuleSet, SharedState,
-    Status, router,
+    Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage, RuleSet,
+    SharedState, Status, router,
 };
 use tower::ServiceExt;
 
@@ -223,6 +223,48 @@ async fn learned_ports_endpoint() {
     let page: PortsPage = body_json(res).await;
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].proto, "udp");
+}
+
+#[tokio::test]
+async fn limits_put_get_roundtrip_and_validation() {
+    let st = state();
+    let app = router(st.clone());
+    let good = serde_json::to_string(&Limits {
+        pps: 50_000,
+        syn_pps: 5_000,
+        bps: 500_000_000,
+        net_pps: 400_000,
+        net_syn_pps: 40_000,
+        net_bps: 4_000_000_000,
+        exit_pct: 60,
+        cooldown_secs: 45,
+    })
+    .unwrap();
+    let res = app
+        .clone()
+        .oneshot(req("PUT", "/api/v1/limits", Some("tok"), Some(good)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(st.limits_version() > 1);
+    assert_eq!(st.limits().pps, 50_000);
+
+    // GET reflects it.
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/limits", Some("tok"), None))
+        .await
+        .unwrap();
+    let got: Limits = body_json(res).await;
+    assert_eq!(got.exit_pct, 60);
+
+    // Zero threshold rejected.
+    let bad = r#"{"pps":0,"syn_pps":1,"bps":1,"net_pps":1,"net_syn_pps":1,"net_bps":1,"exit_pct":50,"cooldown_secs":30}"#.to_string();
+    let res = app
+        .oneshot(req("PUT", "/api/v1/limits", Some("tok"), Some(bad)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
