@@ -139,6 +139,40 @@ pub struct TrackedIp {
     pub drop_pps: u64,
     pub mitigating: bool,
     pub flags: u32,
+    /// How close this IP is to tripping mitigation: the max of its pps/syn/bps
+    /// rates as a percentage of their entry thresholds (>=100 = tripping).
+    pub load_pct: u32,
+}
+
+/// Live aggregate rates for one protected prefix vs the carpet-bomb thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefixLoad {
+    pub cidr: String,
+    pub pps: u64,
+    pub bps: u64,
+    pub syn_pps: u64,
+    pub mitigating: bool,
+    pub flags: u32,
+    /// Aggregate load as a percentage of the network thresholds (>=100 =
+    /// carpet-bomb mitigation trips for the whole prefix).
+    pub load_pct: u32,
+}
+
+/// The detection thresholds, exposed so operators can see how much headroom
+/// remains before mitigation engages.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct Limits {
+    /// Per-destination entry thresholds.
+    pub pps: u64,
+    pub syn_pps: u64,
+    pub bps: u64,
+    /// Per-protected-prefix (carpet-bomb) aggregate thresholds.
+    pub net_pps: u64,
+    pub net_syn_pps: u64,
+    pub net_bps: u64,
+    /// Exit hysteresis (% of entry) and cooldown.
+    pub exit_pct: u64,
+    pub cooldown_secs: u64,
 }
 
 /// A learned open port on a protected IP (surfaced for `lnvps_api` / admin).
@@ -231,7 +265,9 @@ pub struct SharedState {
     rules: RwLock<RuleSet>,
     active: RwLock<Vec<Mitigation>>,
     tracked: RwLock<Vec<TrackedIp>>,
+    prefixes: RwLock<Vec<PrefixLoad>>,
     ports: RwLock<Vec<LearnedPort>>,
+    limits: RwLock<Limits>,
     events: Mutex<EventRing>,
     /// Bumped whenever the ruleset changes so the control loop reloads it.
     rules_version: AtomicU64,
@@ -253,7 +289,9 @@ impl SharedState {
             rules: RwLock::new(initial),
             active: RwLock::new(Vec::new()),
             tracked: RwLock::new(Vec::new()),
+            prefixes: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
+            limits: RwLock::new(Limits::default()),
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
         })
@@ -286,6 +324,16 @@ impl SharedState {
     /// Replace the live tracked-IP rate snapshot (called by the control loop).
     pub fn set_tracked(&self, tracked: Vec<TrackedIp>) {
         *self.tracked.write().unwrap() = tracked;
+    }
+
+    /// Replace the per-prefix (carpet-bomb) load snapshot.
+    pub fn set_prefixes(&self, prefixes: Vec<PrefixLoad>) {
+        *self.prefixes.write().unwrap() = prefixes;
+    }
+
+    /// Publish the detection thresholds (called at startup).
+    pub fn set_limits(&self, limits: Limits) {
+        *self.limits.write().unwrap() = limits;
     }
 
     /// Record a mitigation event (called by the control loop).
@@ -355,6 +403,8 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/ports", get(get_ports))
         .route("/api/v1/tracked", get(get_tracked))
+        .route("/api/v1/prefixes", get(get_prefixes))
+        .route("/api/v1/limits", get(get_limits))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
 
@@ -474,6 +524,14 @@ async fn get_ports(
 
 async fn get_tracked(State(state): State<Arc<SharedState>>) -> Json<Vec<TrackedIp>> {
     Json(state.tracked.read().unwrap().clone())
+}
+
+async fn get_prefixes(State(state): State<Arc<SharedState>>) -> Json<Vec<PrefixLoad>> {
+    Json(state.prefixes.read().unwrap().clone())
+}
+
+async fn get_limits(State(state): State<Arc<SharedState>>) -> Json<Limits> {
+    Json(*state.limits.read().unwrap())
 }
 
 async fn get_rules(State(state): State<Arc<SharedState>>) -> Json<RuleSet> {
@@ -676,6 +734,9 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   .err { color: #ff6b6b; }
   .pager { display: flex; gap: .5rem; align-items: center; margin-top: .5rem; }
   .scroll { max-height: 420px; overflow: auto; }
+  .barwrap { display: inline-flex; align-items: center; gap: .4rem; }
+  .bar { background: #21262d; border-radius: 4px; height: 10px; width: 120px; overflow: hidden; display: inline-block; }
+  .bar .fill { display: block; height: 100%; }
 </style>
 </head>
 <body>
@@ -692,6 +753,14 @@ const fmtn = n => n>=1e6 ? (n/1e6).toFixed(1)+'M' : n>=1e3 ? (n/1e3).toFixed(1)+
 const fmtbps = b => { const x=b*8; return x>=1e9?(x/1e9).toFixed(2)+' Gb/s':x>=1e6?(x/1e6).toFixed(1)+' Mb/s':x>=1e3?(x/1e3).toFixed(0)+' kb/s':x+' b/s'; };
 const flagCell = f => html`<span class="flag">${flagStr(f)}</span>`;
 const time = t => new Date(t*1000).toLocaleTimeString();
+const loadColor = p => p>=100?'#ff6b6b':p>=80?'#f0b429':p>=50?'#7fd1ff':'#3fb950';
+function LoadBar({ pct }) {
+  const p = Math.min(pct, 100), c = loadColor(pct);
+  return html`<span class="barwrap">
+    <span class="bar"><span class="fill" style=${'width:'+p+'%;background:'+c}></span></span>
+    <span style=${'color:'+c+';font-weight:600'}>${pct}%</span></span>`;
+}
+
 
 async function api(path, token) {
   const r = await fetch(path, { headers: token ? { Authorization: 'Bearer ' + token } : {} });
@@ -757,7 +826,7 @@ function PortsCard({ token }) {
 function App() {
   const [token, setTokenState] = useState(localStorage.getItem('fwtoken') || '');
   const [auto, setAuto] = useState(true);
-  const [d, setD] = useState({ status: null, tracked: [], mitigations: [], rules: { protected: [], overrides: [] }, err: '' });
+  const [d, setD] = useState({ status: null, tracked: [], prefixes: [], mitigations: [], limits: null, rules: { protected: [], overrides: [] }, err: '' });
   const [events, setEvents] = useState([]);
   const cursor = useRef(0);
   const tokenRef = useRef(token);
@@ -766,13 +835,13 @@ function App() {
   const refresh = useCallback(async () => {
     const t = tokenRef.current;
     try {
-      const [status, tracked, mitigations, rules] = await Promise.all([
-        api('/api/v1/status', t), api('/api/v1/tracked', t),
-        api('/api/v1/mitigations', t), api('/api/v1/rules', t),
+      const [status, tracked, prefixes, mitigations, rules, limits] = await Promise.all([
+        api('/api/v1/status', t), api('/api/v1/tracked', t), api('/api/v1/prefixes', t),
+        api('/api/v1/mitigations', t), api('/api/v1/rules', t), api('/api/v1/limits', t),
       ]);
       const ev = await api('/api/v1/events?since=' + cursor.current, t);
       if (ev.events.length) { cursor.current = ev.cursor; setEvents(e => [...ev.events.slice().reverse(), ...e].slice(0, 500)); }
-      setD({ status, tracked, mitigations, rules, err: '' });
+      setD({ status, tracked, prefixes, mitigations, rules, limits, err: '' });
     } catch (e) { setD(x => ({ ...x, err: e.message })); }
   }, []);
 
@@ -790,7 +859,10 @@ function App() {
     : html`<span class="muted">disconnected</span>`;
 
   const trackedRows = d.tracked.map(t => [t.ip, fmtn(t.pps), fmtbps(t.bps), fmtn(t.syn_pps), fmtn(t.drop_pps),
-    t.mitigating ? flagCell(t.flags) : 'ok']);
+    html`<${LoadBar} pct=${t.load_pct} />`, t.mitigating ? flagCell(t.flags) : 'ok']);
+  const prefixRows = d.prefixes.map(p => [p.cidr, fmtn(p.pps), fmtbps(p.bps), fmtn(p.syn_pps),
+    html`<${LoadBar} pct=${p.load_pct} />`, p.mitigating ? flagCell(p.flags) : 'ok']);
+  const L = d.limits;
   const mitRows = d.mitigations.map(m => [m.cidr, flagCell(m.flags), time(m.since_unix), m.manual?'yes':'',
     fmtn(m.peak_pps), fmtbps(m.peak_bps), fmtn(m.peak_syn_pps)]);
   const evRows = events.map(e => [e.seq, time(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtn(e.syn_pps)]);
@@ -813,16 +885,18 @@ function App() {
           <div>protected prefixes</div><div>${s.protected_prefixes}</div>
           <div>active mitigations</div><div>${s.active_mitigations}</div>
           <div>learned ports</div><div>${s.learned_ports}</div>
+          ${L ? html`<div>per-IP limits</div><div>${fmtn(L.pps)} pps · ${fmtn(L.syn_pps)} syn/s · ${fmtbps(L.bps)}</div>
+          <div>prefix limits</div><div>${fmtn(L.net_pps)} pps · ${fmtn(L.net_syn_pps)} syn/s · ${fmtbps(L.net_bps)}</div>` : null}
         </div>` : html`<div class="muted">enter token and connect</div>`}
       </${Section}>
       <${Section} wide=true title="Active mitigations" extra=${'('+d.mitigations.length+')'}>
         <${PagedTable} cols=${['cidr','flags','since','manual','peak pps','peak bps','peak syn/s']} rows=${mitRows} />
       </${Section}>
       <${Section} wide=true title="Live tracked IPs" extra=${'('+d.tracked.length+')'}>
-        <${PagedTable} cols=${['ip','pps','bps','syn/s','drop/s','state']} rows=${trackedRows} />
+        <${PagedTable} cols=${['ip','pps','bps','syn/s','drop/s','load','state']} rows=${trackedRows} />
       </${Section}>
-      <${Section} title="Protected prefixes">
-        <${Table} cols=${['prefix']} rows=${d.rules.protected.map(p=>[p])} />
+      <${Section} wide=true title="Protected prefixes" extra=${'('+d.prefixes.length+')'}>
+        <${PagedTable} cols=${['prefix','pps','bps','syn/s','load','state']} rows=${prefixRows} />
       </${Section}>
       <${Section} title="Manual overrides">
         <${Table} cols=${['cidr','flags']} rows=${d.rules.overrides.map(o=>[o.cidr, flagCell(o.flags)])} />

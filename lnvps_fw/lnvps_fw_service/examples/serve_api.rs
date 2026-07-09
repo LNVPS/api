@@ -9,7 +9,8 @@
 use std::net::SocketAddr;
 
 use lnvps_fw_service::api::{
-    self, EventKind, LearnedPort, Mitigation, Override, RuleSet, SharedState, TrackedIp,
+    self, EventKind, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet, SharedState,
+    TrackedIp,
 };
 
 #[tokio::main]
@@ -53,6 +54,16 @@ async fn main() -> anyhow::Result<()> {
         3_000_000_000,
         40_000,
     );
+    state.set_limits(Limits {
+        pps: 100_000,
+        syn_pps: 10_000,
+        bps: 1_000_000_000,
+        net_pps: 500_000,
+        net_syn_pps: 50_000,
+        net_bps: 5_000_000_000,
+        exit_pct: 50,
+        cooldown_secs: 30,
+    });
     state.set_tracked(vec![
         TrackedIp {
             ip: "203.0.113.7".into(),
@@ -62,15 +73,17 @@ async fn main() -> anyhow::Result<()> {
             drop_pps: 210_000,
             mitigating: true,
             flags: 0b0011,
+            load_pct: 250,
         },
         TrackedIp {
             ip: "203.0.113.42".into(),
-            pps: 32_500,
+            pps: 82_500,
             bps: 380_000_000,
             syn_pps: 180,
             drop_pps: 0,
             mitigating: false,
             flags: 0,
+            load_pct: 82,
         },
         TrackedIp {
             ip: "203.0.113.90".into(),
@@ -80,6 +93,27 @@ async fn main() -> anyhow::Result<()> {
             drop_pps: 0,
             mitigating: false,
             flags: 0,
+            load_pct: 1,
+        },
+    ]);
+    state.set_prefixes(vec![
+        PrefixLoad {
+            cidr: "203.0.113.0/24".into(),
+            pps: 335_000,
+            bps: 3_400_000_000,
+            syn_pps: 41_000,
+            mitigating: false,
+            flags: 0,
+            load_pct: 82,
+        },
+        PrefixLoad {
+            cidr: "2001:db8:1::/48".into(),
+            pps: 12_000,
+            bps: 90_000_000,
+            syn_pps: 30,
+            mitigating: false,
+            flags: 0,
+            load_pct: 2,
         },
     ]);
     state.set_ports(vec![

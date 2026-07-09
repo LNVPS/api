@@ -467,6 +467,24 @@ source ports), and dumping that JSON into the dashboard HTML froze the browser.
 - Validated: 49 unit/api tests green; clippy/fmt clean; dashboard rendered at
       33,333 ports (paginated 50/page, 667 pages) without freezing.
 
+### Increment 13 — Limits + load headroom on the dashboard (S) ✅ DONE
+
+User ask: see how close each tracked IP / protected prefix is to tripping
+mitigation.
+
+- [x] `GET /api/v1/limits` exposes the per-dest + per-prefix (network)
+      thresholds; published at startup.
+- [x] `TrackedIp.load_pct` (per-IP) + `GET /api/v1/prefixes` (`PrefixLoad` per
+      protected prefix, reported every tick) with `load_pct` = max of the three
+      rate axes as a % of their entry thresholds (>=100 = tripping). Uses the
+      `DestTracker.last` rates.
+- [x] Dashboard: per-IP `load` column + a merged "Protected prefixes" section
+      showing each prefix's live aggregate rate + load bar (dropped the
+      redundant prefix list and the "carpet-bomb" naming); thresholds shown in
+      Status. Colored load bars (green/blue/amber/red).
+- Validated: 49 unit/api tests green; clippy/fmt clean; rendered
+      (`docs/dashboard.png`).
+
 ## Architecture refactor (2026-07-08, user directive)
 
 **eBPF = count + enforce only; userspace = all decisions.** Removed all

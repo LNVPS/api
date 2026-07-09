@@ -17,10 +17,11 @@ use lnvps_fw_common::{
 };
 
 use lnvps_fw_service::api::{
-    self, CidrKey, LearnedPort, Mitigation, RuleSet, SharedState, TrackedIp, parse_cidr,
+    self, CidrKey, LearnedPort, Limits, Mitigation, PrefixLoad, RuleSet, SharedState, TrackedIp,
+    parse_cidr,
 };
 use lnvps_fw_service::config::{Config, IfaceRole};
-use lnvps_fw_service::detect::DestTracker;
+use lnvps_fw_service::detect::{DestTracker, DetectionConfig};
 use lnvps_fw_service::gc;
 use lnvps_fw_service::publish::{MitInput, MitTracker};
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control, sum_counters};
@@ -228,7 +229,7 @@ fn now_unix() -> u64 {
 /// Snapshot live per-IP rates for every destination sampled this tick (the
 /// live dashboard view). Only trackers updated this tick are reported, so idle
 /// IPs drop off.
-fn collect_tracked(det: &DetectionState, now_ns: u64) -> Vec<TrackedIp> {
+fn collect_tracked(det: &DetectionState, now_ns: u64, cfg: &DetectionConfig) -> Vec<TrackedIp> {
     let mut out = Vec::new();
     let mut push = |ip: String, tr: &DestTracker| {
         if tr.last_ns == now_ns && (tr.last.pps > 0 || tr.flags != DEST_MODE_NORMAL) {
@@ -240,6 +241,7 @@ fn collect_tracked(det: &DetectionState, now_ns: u64) -> Vec<TrackedIp> {
                 drop_pps: tr.last.drop_pps,
                 mitigating: tr.flags != DEST_MODE_NORMAL,
                 flags: tr.flags,
+                load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, cfg),
             });
         }
     };
@@ -249,7 +251,49 @@ fn collect_tracked(det: &DetectionState, now_ns: u64) -> Vec<TrackedIp> {
     for (k, tr) in &det.v6 {
         push(Ipv6Addr::from(*k).to_string(), tr);
     }
-    out.sort_by(|a, b| b.pps.cmp(&a.pps));
+    out.sort_by(|a, b| b.load_pct.cmp(&a.load_pct));
+    out
+}
+
+/// How close a set of rates is to tripping mitigation: the max of the three
+/// axes as a percentage of their entry thresholds (>=100 = tripping).
+fn load_pct(pps: u64, syn_pps: u64, bps: u64, cfg: &DetectionConfig) -> u32 {
+    let r = |v: u64, th: u64| {
+        if th == 0 {
+            0
+        } else {
+            (v.saturating_mul(100) / th) as u32
+        }
+    };
+    r(pps, cfg.pps)
+        .max(r(syn_pps, cfg.syn_pps))
+        .max(r(bps, cfg.bps))
+}
+
+/// Snapshot per-protected-prefix aggregate load (the carpet-bomb gauge). Every
+/// protected prefix is reported each tick, including at 0% load.
+fn collect_prefixes(det: &DetectionState, now_ns: u64, cfg: &DetectionConfig) -> Vec<PrefixLoad> {
+    let mut out = Vec::new();
+    let mut push = |cidr: String, tr: &DestTracker| {
+        if tr.last_ns == now_ns {
+            out.push(PrefixLoad {
+                cidr,
+                pps: tr.last.pps,
+                bps: tr.last.bps,
+                syn_pps: tr.last.syn_pps,
+                mitigating: tr.flags != DEST_MODE_NORMAL,
+                flags: tr.flags,
+                load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, cfg),
+            });
+        }
+    };
+    for ((len, net), tr) in &det.prefix_v4 {
+        push(format!("{}/{len}", Ipv4Addr::from(*net)), tr);
+    }
+    for ((len, net), tr) in &det.prefix_v6 {
+        push(format!("{}/{len}", Ipv6Addr::from(*net)), tr);
+    }
+    out.sort_by(|a, b| b.load_pct.cmp(&a.load_pct));
     out
 }
 
@@ -531,6 +575,22 @@ async fn main() -> Result<()> {
             runtime_cfg.protected_v4.len() + runtime_cfg.protected_v6.len()
         );
     }
+
+    // Publish the detection thresholds so the dashboard/API can show headroom.
+    if let Some(st) = &api_state {
+        let det = &runtime_cfg.detection;
+        let net = &runtime_cfg.network;
+        st.set_limits(Limits {
+            pps: det.pps,
+            syn_pps: det.syn_pps,
+            bps: det.bps,
+            net_pps: net.pps,
+            net_syn_pps: net.syn_pps,
+            net_bps: net.bps,
+            exit_pct: det.exit_pct,
+            cooldown_secs: det.cooldown_ns / 1_000_000_000,
+        });
+    }
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     let stats_secs = cfg.learning.stats_interval_secs;
@@ -609,7 +669,12 @@ async fn main() -> Result<()> {
                         });
                     }
                     st.set_active(active);
-                    st.set_tracked(collect_tracked(&detection_state, now));
+                    st.set_tracked(collect_tracked(&detection_state, now, &runtime_cfg.detection));
+                    st.set_prefixes(collect_prefixes(
+                        &detection_state,
+                        now,
+                        &runtime_cfg.network,
+                    ));
                 }
             }
             _ = gc_timer.tick() => {
