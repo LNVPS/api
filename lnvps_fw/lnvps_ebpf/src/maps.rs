@@ -7,8 +7,11 @@ use lnvps_fw_common::{
     LastSeen, PortKeyV4, PortKeyV6,
 };
 
-/// Max number of destination IPs to track (per address family)
-pub const MAX_DST_IPS: u32 = 256 * 1024;
+/// Max number of destination IPs to track (per address family). Sized to a
+/// bounded protected footprint rather than the whole internet: these back the
+/// preallocated per-CPU counter maps, so this directly sets their locked-memory
+/// cost (entries × value × num_possible_cpus).
+pub const MAX_DST_IPS: u32 = 16 * 1024;
 
 /// Max number of learned (ip, port, proto) tuples to track (per family)
 pub const MAX_OPEN_PORTS: u32 = 1024 * 1024;

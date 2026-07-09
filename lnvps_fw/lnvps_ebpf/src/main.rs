@@ -3,6 +3,7 @@
 
 use aya_ebpf::bindings::TC_ACT_OK;
 use aya_ebpf::bindings::xdp_action::{XDP_DROP, XDP_PASS, XDP_TX};
+use aya_ebpf::helpers::bpf_xdp_get_buff_len;
 use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
@@ -71,7 +72,14 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<&T, ()> {
     unsafe { Ok(&*ptr) }
 }
 
-#[xdp]
+// `frags` marks the program multi-buffer aware (section `xdp.frags`,
+// BPF_F_XDP_HAS_FRAGS). Without it the kernel refuses a *native* attach on a
+// jumbo-MTU NIC (mlx5: "MTU > 3498, too big for an XDP program not aware of
+// multi buffer") and silently falls back to the slow generic/SKB path. All
+// header parsing reads the linear head (bounds-checked against data_end, which
+// in frags mode is the end of the linear segment) and fails open if a header
+// somehow spans a fragment, so this is safe.
+#[xdp(frags)]
 pub fn xdp_lnvps(ctx: XdpContext) -> u32 {
     match try_handle(&ctx) {
         Ok(r) => r,
@@ -353,7 +361,9 @@ fn account(
     verdict: u32,
 ) {
     let Some(c) = counters else { return };
-    let pkt_len = (ctx.data_end() - ctx.data()) as u64;
+    // Full on-wire length including any non-linear fragments (multi-buffer XDP);
+    // `data_end - data` would only cover the linear head on a jumbo packet.
+    let pkt_len = unsafe { bpf_xdp_get_buff_len(ctx.ctx) };
     let c = unsafe { &mut *c };
     c.packets += 1;
     c.bytes += pkt_len;
@@ -469,8 +479,7 @@ fn learn_ipv4(ctx: &TcContext) -> Result<(), ()> {
     // TX accounting for every outbound packet from this source (before the
     // options-header early-out below, which only affects L4 port learning).
     if let Some(c) = tx_counters_v4(&ip.src_addr) {
-        let pkt_len = (ctx.data_end() - ctx.data()) as u64;
-        tx_account(c, pkt_len, ip.proto, PROTO_ICMP);
+        tx_account(c, ctx.len() as u64, ip.proto, PROTO_ICMP);
     }
     // Options-bearing headers are skipped (rare); L4 offset would be wrong.
     if ip.ihl() as usize != Ipv4Hdr::LEN {
@@ -496,8 +505,7 @@ fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
     }
     // TX accounting for every outbound packet from this source.
     if let Some(c) = tx_counters_v6(&ip.src_addr) {
-        let pkt_len = (ctx.data_end() - ctx.data()) as u64;
-        tx_account(c, pkt_len, ip.next_hdr, PROTO_ICMPV6);
+        tx_account(c, ctx.len() as u64, ip.next_hdr, PROTO_ICMPV6);
     }
     // Only inspect packets whose first next-header is directly TCP/UDP.
     if let Some(svc) = egress_service(ctx, ip.next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)? {
@@ -515,7 +523,9 @@ fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
 // --- SYN-proxy tail-call program (IPv4) ---
 const TCP_OFF: usize = EthHdr::LEN + Ipv4Hdr::LEN;
 
-#[xdp]
+// Must match the caller's frags flag: tail-call targets in the same program
+// array must agree on multi-buffer awareness.
+#[xdp(frags)]
 pub fn xdp_syn_proxy(ctx: XdpContext) -> u32 {
     match try_syn_proxy(&ctx) {
         Ok(v) => v,
@@ -725,7 +735,7 @@ fn tx_synack_v4(ctx: &XdpContext, cookie: u32) -> u32 {
 // --- SYN-proxy tail-call program (IPv6) ---
 const TCP_OFF_V6: usize = EthHdr::LEN + Ipv6Hdr::LEN;
 
-#[xdp]
+#[xdp(frags)]
 pub fn xdp_syn_proxy_v6(ctx: XdpContext) -> u32 {
     match try_syn_proxy_v6(&ctx) {
         Ok(v) => v,
