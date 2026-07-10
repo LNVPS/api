@@ -414,6 +414,34 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List all routers
     async fn list_routers(&self) -> DbResult<Vec<Router>>;
 
+    /// Get DNS server config
+    async fn get_dns_server(&self, dns_server_id: u64) -> DbResult<DnsServer>;
+
+    /// List all DNS servers
+    async fn list_dns_servers(&self) -> DbResult<Vec<DnsServer>>;
+
+    /// List DNS servers with pagination, returning (rows, total_count)
+    async fn list_dns_servers_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<DnsServer>, u64)>;
+
+    /// Insert a new DNS server, returning its id
+    async fn insert_dns_server(&self, dns_server: &DnsServer) -> DbResult<u64>;
+
+    /// Update an existing DNS server
+    async fn update_dns_server(&self, dns_server: &DnsServer) -> DbResult<()>;
+
+    /// Delete a DNS server (only if not referenced by any IP ranges)
+    async fn delete_dns_server(&self, dns_server_id: u64) -> DbResult<()>;
+
+    /// Count IP ranges referencing a DNS server (forward or reverse)
+    async fn count_dns_server_ip_ranges(&self, dns_server_id: u64) -> DbResult<u64>;
+
+    /// Update only the DNS server references + zone ids for an IP range
+    async fn update_ip_range_dns(&self, range: &IpRange) -> DbResult<()>;
+
     /// List cached tunnels for a router
     async fn list_router_tunnels(&self, router_id: u64) -> DbResult<Vec<RouterTunnel>>;
 

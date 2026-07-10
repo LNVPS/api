@@ -4,6 +4,23 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **2026-07-10** - Database-configured DNS providers + OVH reverse DNS (admin)
+  - DNS providers are now configured in the database (`dns_server` table) instead of the static `dns` block in `config.yaml`. Each provider has `kind` (`"cloudflare"` or `"ovh"`), `url`, and an encrypted `token`.
+  - `GET /api/admin/v1/dns_servers` — paginated list (`id`, `name`, `enabled`, `kind`, `url`, `ip_range_count`; token never returned). Requires `dns_server::view`.
+  - `GET /api/admin/v1/dns_servers/{id}` — get one. Requires `dns_server::view`.
+  - `POST /api/admin/v1/dns_servers` — create. Body: `{ name, enabled?, kind, url?, token }`. Cloudflare token is the bearer token; OVH token is `"application_key:application_secret:consumer_key"`. Requires `dns_server::create`.
+  - `PATCH /api/admin/v1/dns_servers/{id}` — update (all fields optional). Requires `dns_server::update`.
+  - `DELETE /api/admin/v1/dns_servers/{id}` — delete (blocked while referenced by any IP range). Requires `dns_server::delete`.
+  - IP ranges gained `forward_dns_server_id`, `reverse_dns_server_id`, and `forward_zone_id` fields (in addition to the existing `reverse_zone_id`) on the create/update/list admin endpoints, selecting which DNS provider + zone manages forward (A/AAAA) and reverse (PTR) records for the range.
+  - New `ovh` DNS provider implements reverse DNS (PTR) via OVH's `POST/DELETE /ip/{ip}/reverse` (reverse only; forward records must use another provider). Closes #78.
+  - New `dns_server` admin permission resource.
+  - `POST /api/admin/v1/ip_ranges/{id}/patch_dns` — queue a `PatchIpRangeDns` job that re-applies forward + reverse DNS for every IP assignment in a range, reconciling them to the range's current DNS server config (e.g. after switching reverse DNS to OVH). Returns a `JobResponse`. Requires `ip_range::update`.
+  - Migration: the legacy `config.yaml` `dns` block is migrated into a `dns_server` row on startup, and existing IP ranges are pointed at it automatically. OVH additional-IP routers are also imported as `Ovh` DNS servers (reusing their `url` + token), with reverse DNS auto-mapped onto the ranges they route. Existing OVH-routed IPs that still carry a stale Cloudflare reverse record are force-refreshed to a real OVH PTR (idempotent — keyed on the IP; working Cloudflare reverse records are left untouched). (The OVH consumer key may need `/ip/*/reverse` permissions granted for reverse DNS calls to succeed.) Record backfill/refresh is best-effort and never blocks startup.
+
 ## [0.3.0] - 2026-07-09
 
 ### Added

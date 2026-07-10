@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::dns::{BasicRecord, DnsServer, RecordType};
+    use crate::dns::{BasicRecord, DnsRef, DnsServer, RecordType};
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::router::{ArpEntry, Router};
     use crate::settings::mock_settings;
@@ -53,7 +53,7 @@ mod tests {
 
     #[async_trait]
     impl DnsServer for FailingDnsServer {
-        async fn add_record(&self, zone: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
+        async fn add_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
             let fails = self.add_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.add_record_fail_count.fetch_sub(1, Ordering::SeqCst);
@@ -62,10 +62,10 @@ mod tests {
                     fails - 1
                 )));
             }
-            self.inner.add_record(zone, record).await
+            self.inner.add_record(record).await
         }
 
-        async fn update_record(&self, zone: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
+        async fn update_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
             let fails = self.update_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.update_record_fail_count.fetch_sub(1, Ordering::SeqCst);
@@ -74,10 +74,10 @@ mod tests {
                     fails - 1
                 )));
             }
-            self.inner.update_record(zone, record).await
+            self.inner.update_record(record).await
         }
 
-        async fn delete_record(&self, zone: &str, record: &BasicRecord) -> OpResult<()> {
+        async fn delete_record(&self, record: &BasicRecord) -> OpResult<()> {
             let fails = self.delete_record_fail_count.load(Ordering::SeqCst);
             if fails > 0 {
                 self.delete_record_fail_count.fetch_sub(1, Ordering::SeqCst);
@@ -86,7 +86,7 @@ mod tests {
                     fails - 1
                 )));
             }
-            self.inner.delete_record(zone, record).await
+            self.inner.delete_record(record).await
         }
     }
 
@@ -226,45 +226,42 @@ mod tests {
 
         // First attempt should fail
         let result = failing_dns
-            .add_record(
-                "test-zone",
-                &BasicRecord {
-                    id: None,
-                    name: "test1.example.com".to_string(),
-                    value: "10.0.0.100".to_string(),
-                    kind: RecordType::A,
-                },
-            )
+            .add_record(&BasicRecord {
+                id: None,
+                name: "test1.example.com".to_string(),
+                value: "10.0.0.100".to_string(),
+                kind: RecordType::A,
+                ip: "10.0.0.100".to_string(),
+                zone: DnsRef::Id("test-zone".to_string()),
+            })
             .await;
         assert!(result.is_err(), "First attempt should fail");
         assert_eq!(failing_dns.add_failures_remaining(), 1);
 
         // Second attempt should fail
         let result = failing_dns
-            .add_record(
-                "test-zone",
-                &BasicRecord {
-                    id: None,
-                    name: "test2.example.com".to_string(),
-                    value: "10.0.0.101".to_string(),
-                    kind: RecordType::A,
-                },
-            )
+            .add_record(&BasicRecord {
+                id: None,
+                name: "test2.example.com".to_string(),
+                value: "10.0.0.101".to_string(),
+                kind: RecordType::A,
+                ip: "10.0.0.101".to_string(),
+                zone: DnsRef::Id("test-zone".to_string()),
+            })
             .await;
         assert!(result.is_err(), "Second attempt should fail");
         assert_eq!(failing_dns.add_failures_remaining(), 0);
 
         // Third attempt should succeed (different record name to avoid duplicates)
         let result = failing_dns
-            .add_record(
-                "test-zone",
-                &BasicRecord {
-                    id: None,
-                    name: "test3.example.com".to_string(),
-                    value: "10.0.0.102".to_string(),
-                    kind: RecordType::A,
-                },
-            )
+            .add_record(&BasicRecord {
+                id: None,
+                name: "test3.example.com".to_string(),
+                value: "10.0.0.102".to_string(),
+                kind: RecordType::A,
+                ip: "10.0.0.102".to_string(),
+                zone: DnsRef::Id("test-zone".to_string()),
+            })
             .await;
         assert!(result.is_ok(), "Third attempt should succeed");
         assert_eq!(failing_dns.add_failures_remaining(), 0);
@@ -282,15 +279,14 @@ mod tests {
         // All 3 retry attempts should fail
         for i in 0..3 {
             let result = failing_dns
-                .add_record(
-                    "test-zone",
-                    &BasicRecord {
-                        id: None,
-                        name: "test.example.com".to_string(),
-                        value: "10.0.0.100".to_string(),
-                        kind: RecordType::A,
-                    },
-                )
+                .add_record(&BasicRecord {
+                    id: None,
+                    name: "test.example.com".to_string(),
+                    value: "10.0.0.100".to_string(),
+                    kind: RecordType::A,
+                    ip: "10.0.0.100".to_string(),
+                    zone: DnsRef::Id("test-zone".to_string()),
+                })
                 .await;
             assert!(result.is_err(), "Attempt {} should fail", i + 1);
             assert_eq!(failing_dns.add_failures_remaining(), 5 - i - 1);
@@ -384,22 +380,21 @@ mod tests {
 
         // Add a record first (use unique name)
         let record = failing_dns
-            .add_record(
-                "test-zone",
-                &BasicRecord {
-                    id: None,
-                    name: "test-delete.example.com".to_string(),
-                    value: "10.0.0.100".to_string(),
-                    kind: RecordType::A,
-                },
-            )
+            .add_record(&BasicRecord {
+                id: None,
+                name: "test-delete.example.com".to_string(),
+                value: "10.0.0.100".to_string(),
+                kind: RecordType::A,
+                ip: "10.0.0.100".to_string(),
+                zone: DnsRef::Id("test-zone".to_string()),
+            })
             .await?;
 
         assert_eq!(failing_dns.delete_failures_remaining(), 10);
 
         // Delete will fail 3 times (retry limit)
         for i in 0..3 {
-            let result = failing_dns.delete_record("test-zone", &record).await;
+            let result = failing_dns.delete_record(&record).await;
             assert!(result.is_err(), "Delete attempt {} should fail", i + 1);
         }
 
@@ -416,15 +411,14 @@ mod tests {
 
         // Add a record first (use unique name to avoid conflicts with other tests)
         let record = failing_dns
-            .add_record(
-                "test-zone",
-                &BasicRecord {
-                    id: None,
-                    name: "test-update.example.com".to_string(),
-                    value: "10.0.0.100".to_string(),
-                    kind: RecordType::A,
-                },
-            )
+            .add_record(&BasicRecord {
+                id: None,
+                name: "test-update.example.com".to_string(),
+                value: "10.0.0.100".to_string(),
+                kind: RecordType::A,
+                ip: "10.0.0.100".to_string(),
+                zone: DnsRef::Id("test-zone".to_string()),
+            })
             .await?;
 
         assert_eq!(failing_dns.update_failures_remaining(), 1);
@@ -432,16 +426,12 @@ mod tests {
         // First update should fail
         let mut updated_record = record.clone();
         updated_record.value = "10.0.0.101".to_string();
-        let result = failing_dns
-            .update_record("test-zone", &updated_record)
-            .await;
+        let result = failing_dns.update_record(&updated_record).await;
         assert!(result.is_err());
         assert_eq!(failing_dns.update_failures_remaining(), 0);
 
         // Second update should succeed
-        let result = failing_dns
-            .update_record("test-zone", &updated_record)
-            .await;
+        let result = failing_dns.update_record(&updated_record).await;
         assert!(result.is_ok());
 
         Ok(())

@@ -1,4 +1,3 @@
-use crate::dns::DnsServer;
 use anyhow::Result;
 use isocountry::CountryCode;
 use lnvps_api_common::RedisConfig;
@@ -36,7 +35,9 @@ pub struct Settings {
     /// SMTP settings for sending emails
     pub smtp: Option<SmtpConfig>,
 
-    /// DNS configurations for PTR records
+    /// Legacy DNS configuration. Runtime DNS config now lives in the `dns_server`
+    /// DB table (referenced per IP range). This field is only consumed once, by
+    /// `DnsDataMigration`, to bootstrap those DB rows for existing deployments.
     pub dns: Option<DnsServerConfig>,
 
     /// Nostr config for sending DMs
@@ -133,6 +134,7 @@ pub struct WhatsAppConfig {
     pub verify_template_lang: String,
 }
 
+/// Legacy DNS configuration, migrated into the `dns_server` DB table on startup.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DnsServerConfig {
@@ -148,6 +150,19 @@ pub enum DnsServerApi {
 
     #[cfg(test)]
     Mock,
+}
+
+impl DnsServerConfig {
+    /// Map the legacy config to a database `dns_server` row kind + credential token.
+    pub fn to_db_kind_token(&self) -> (lnvps_db::DnsServerKind, String) {
+        match &self.api {
+            DnsServerApi::Cloudflare { token } => {
+                (lnvps_db::DnsServerKind::Cloudflare, token.clone())
+            }
+            #[cfg(test)]
+            DnsServerApi::Mock => (lnvps_db::DnsServerKind::MockDns, "mock-token".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -253,20 +268,6 @@ pub struct EncryptionConfig {
 }
 
 impl Settings {
-    pub fn get_dns(&self) -> Option<Arc<dyn DnsServer>> {
-        match &self.dns {
-            None => None,
-            Some(c) => match &c.api {
-                #[cfg(feature = "cloudflare")]
-                DnsServerApi::Cloudflare { token } => {
-                    Some(Arc::new(crate::dns::Cloudflare::new(token)))
-                }
-                #[cfg(test)]
-                DnsServerApi::Mock => Some(Arc::new(crate::mocks::MockDnsServer::new())),
-            },
-        }
-    }
-
     pub fn get_revolut(&self) -> Result<Option<Arc<dyn FiatPaymentService>>> {
         match &self.revolut {
             #[cfg(feature = "revolut")]
@@ -344,5 +345,31 @@ pub fn mock_settings() -> Settings {
         redis: None,
         encryption: None,
         captcha: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lnvps_db::DnsServerKind;
+
+    #[test]
+    fn test_dns_config_to_db_kind_token() {
+        let cfg = DnsServerConfig {
+            forward_zone_id: "z".to_string(),
+            api: DnsServerApi::Cloudflare {
+                token: "cf-token".to_string(),
+            },
+        };
+        let (kind, token) = cfg.to_db_kind_token();
+        assert!(matches!(kind, DnsServerKind::Cloudflare));
+        assert_eq!(token, "cf-token");
+
+        let mock = DnsServerConfig {
+            forward_zone_id: "z".to_string(),
+            api: DnsServerApi::Mock,
+        };
+        let (kind, _) = mock.to_db_kind_token();
+        assert!(matches!(kind, DnsServerKind::MockDns));
     }
 }

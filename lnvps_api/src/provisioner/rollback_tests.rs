@@ -54,13 +54,33 @@ mod tests {
         );
         drop(p);
 
+        let mut d = db.dns_servers.lock().await;
+        d.insert(
+            1,
+            lnvps_db::DnsServer {
+                id: 1,
+                name: "mock-dns".to_string(),
+                enabled: true,
+                kind: lnvps_db::DnsServerKind::MockDns,
+                url: "https://localhost".to_string(),
+                token: "mock-token".into(),
+            },
+        );
+        drop(d);
+
         let mut i = db.ip_range.lock().await;
         if let Some(range) = i.get_mut(&1) {
             range.access_policy_id = Some(1);
             range.reverse_zone_id = Some("mock-rev-zone-id".to_string());
+            range.forward_dns_server_id = Some(1);
+            range.reverse_dns_server_id = Some(1);
+            range.forward_zone_id = Some("mock-forward-zone-id".to_string());
         }
         if let Some(range) = i.get_mut(&2) {
             range.reverse_zone_id = Some("mock-v6-rev-zone-id".to_string());
+            range.forward_dns_server_id = Some(1);
+            range.reverse_dns_server_id = Some(1);
+            range.forward_zone_id = Some("mock-forward-zone-id".to_string());
         }
         drop(i);
 
@@ -91,7 +111,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -149,7 +169,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -302,7 +322,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -401,7 +421,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -449,7 +469,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -524,16 +544,12 @@ mod tests {
         use try_procedure::RetryPolicy;
 
         let db = Arc::new(MockDb::default());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
 
         setup_db_with_static_arp(&db).await?;
 
-        let network = VmNetworkProvisioner::new(
-            db.clone(),
-            Some(dns.clone()),
-            Some("mock-forward-zone-id".to_string()),
-            RetryPolicy::default().with_max_retries(0),
-        );
+        let network =
+            VmNetworkProvisioner::new(db.clone(), RetryPolicy::default().with_max_retries(0));
 
         // Create a VM
         let (user, ssh_key) = add_user(&db).await?;
@@ -627,7 +643,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 
@@ -676,7 +692,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
-        let dns = Arc::new(MockDnsServer::new());
+        let _dns = Arc::new(MockDnsServer::new());
         const MOCK_RATE: f32 = 69_420.0;
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
 

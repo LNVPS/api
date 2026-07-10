@@ -10,6 +10,7 @@ mod bulk_message;
 mod companies;
 mod cost_plans;
 mod custom_pricing;
+mod dns_servers;
 mod docs;
 mod hosts;
 mod ip_ranges;
@@ -61,6 +62,7 @@ pub fn admin_router(
         .merge(ip_space::router())
         .merge(access_policies::router())
         .merge(routers::router())
+        .merge(dns_servers::router())
         .merge(vm_ip_assignments::router())
         .merge(subscriptions::router())
         .merge(reports::router())

@@ -2,13 +2,14 @@ use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminIpRangeAllocationMode, AdminIpRangeInfo, AdminIpRangeRouter, CreateIpRangeRequest,
-    UpdateIpRangeRequest,
+    JobResponse, UpdateIpRangeRequest,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, parse_gateway,
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkJob,
+    parse_gateway,
 };
 use lnvps_db::{AdminAction, AdminResource, IpRangeAllocationMode};
 use serde::Deserialize;
@@ -29,6 +30,32 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/ip_ranges/{id}/free_ips",
             get(admin_list_free_ips),
         )
+        .route(
+            "/api/admin/v1/ip_ranges/{id}/patch_dns",
+            post(admin_patch_ip_range_dns),
+        )
+}
+
+/// Queue a job to re-apply forward + reverse DNS for every IP assignment in a range.
+/// Useful after changing the range's DNS server configuration. Returns a `JobResponse`.
+async fn admin_patch_ip_range_dns(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::IpRange, AdminAction::Update)?;
+
+    // Verify the range exists
+    let _range = this.db.admin_get_ip_range(id).await?;
+
+    let job_id = this
+        .work_commander
+        .send(WorkJob::PatchIpRangeDns {
+            ip_range_id: id,
+            admin_user_id: Some(auth.user_id),
+        })
+        .await?;
+    ApiData::ok(JobResponse { job_id })
 }
 
 /// Resolve the routers that route a given IP range via its access policy.
@@ -218,6 +245,18 @@ async fn admin_create_ip_range(
         return ApiData::err("Specified access policy does not exist");
     }
 
+    // Validate DNS servers if provided
+    if let Some(dns_id) = req.forward_dns_server_id
+        && this.db.get_dns_server(dns_id).await.is_err()
+    {
+        return ApiData::err("Specified forward DNS server does not exist");
+    }
+    if let Some(dns_id) = req.reverse_dns_server_id
+        && this.db.get_dns_server(dns_id).await.is_err()
+    {
+        return ApiData::err("Specified reverse DNS server does not exist");
+    }
+
     // Create IP range object with normalized gateway
     let mut ip_range = req.to_ip_range()?;
     ip_range.gateway = normalized_gateway;
@@ -332,6 +371,31 @@ async fn admin_update_ip_range(
 
     if let Some(use_full_range) = req.use_full_range {
         ip_range.use_full_range = use_full_range;
+    }
+
+    if let Some(forward_dns_server_id) = &req.forward_dns_server_id {
+        if let Some(dns_id) = forward_dns_server_id
+            && this.db.get_dns_server(*dns_id).await.is_err()
+        {
+            return ApiData::err("Specified forward DNS server does not exist");
+        }
+        ip_range.forward_dns_server_id = *forward_dns_server_id;
+    }
+
+    if let Some(reverse_dns_server_id) = &req.reverse_dns_server_id {
+        if let Some(dns_id) = reverse_dns_server_id
+            && this.db.get_dns_server(*dns_id).await.is_err()
+        {
+            return ApiData::err("Specified reverse DNS server does not exist");
+        }
+        ip_range.reverse_dns_server_id = *reverse_dns_server_id;
+    }
+
+    if let Some(forward_zone_id) = &req.forward_zone_id {
+        ip_range.forward_zone_id = forward_zone_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
     }
 
     // Update IP range in database

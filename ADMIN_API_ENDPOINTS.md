@@ -2072,13 +2072,19 @@ Body:
   "region_id": number,
   // Required - Region ID
   "reverse_zone_id": "string | null",
-  // Optional - Reverse DNS zone ID
+  // Optional - Reverse DNS zone ID (provider specific, e.g. Cloudflare reverse zone id)
   "access_policy_id": "number | null",
   // Optional - Access policy ID
   "allocation_mode": "sequential",
   // IpRangeAllocationMode enum: "random", "sequential", or "slaac_eui64", default: "sequential"
-  "use_full_range": boolean
+  "use_full_range": boolean,
   // Optional - Use first and last IPs in range, default: false
+  "forward_dns_server_id": "number | null",
+  // Optional - dns_server id used for forward (A/AAAA) records
+  "reverse_dns_server_id": "number | null",
+  // Optional - dns_server id used for reverse (PTR) records
+  "forward_zone_id": "string | null"
+  // Optional - Forward DNS zone id (provider specific, e.g. Cloudflare forward zone id)
 }
 ```
 
@@ -2108,8 +2114,14 @@ Body (all optional):
   // Access policy ID (null to clear)
   "allocation_mode": "sequential",
   // IpRangeAllocationMode enum: "random", "sequential", or "slaac_eui64"
-  "use_full_range": boolean
+  "use_full_range": boolean,
   // Use first and last IPs in range
+  "forward_dns_server_id": "number | null",
+  // dns_server id for forward (A/AAAA) records (null to clear)
+  "reverse_dns_server_id": "number | null",
+  // dns_server id for reverse (PTR) records (null to clear)
+  "forward_zone_id": "string | null"
+  // Forward DNS zone id (null to clear)
 }
 ```
 
@@ -2150,6 +2162,20 @@ Response:
   ]
 }
 ```
+
+#### Patch DNS for Range
+
+```
+POST /api/admin/v1/ip_ranges/{id}/patch_dns
+```
+
+Required Permission: `ip_range::update`
+
+Queues a background job (`PatchIpRangeDns`) that re-applies forward + reverse DNS records for every
+(non-deleted) IP assignment in the range, reconciling them to the range's current DNS server
+configuration. Useful after changing a range's `forward_dns_server_id` / `reverse_dns_server_id`
+(e.g. switching reverse DNS to OVH). Per-assignment DNS failures are logged and skipped so one bad
+record can't abort the batch. Returns a `JobResponse` (`{ "job_id": string }`).
 
 ### Access Policy Management
 
@@ -2494,6 +2520,83 @@ Required Permission: `router::update`
 
 Remove the router's static default route(s). Idempotent — succeeds even when no default route is configured. Returns a
 `JobResponse`.
+
+### DNS Server Management
+
+DNS providers are configured in the database (`dns_server` table) and referenced per IP range via
+`forward_dns_server_id` / `reverse_dns_server_id` (see IP Range Management). This replaces the old static
+`dns` block in `config.yaml`.
+
+#### List DNS Servers
+
+```
+GET /api/admin/v1/dns_servers
+```
+
+Query Parameters:
+
+- `limit`: number (optional) - Items per page (max 100, default 50)
+- `offset`: number (optional) - Pagination offset
+
+Required Permission: `dns_server::view`
+
+Returns a paginated list of DNS servers. Each entry includes `id`, `name`, `enabled`, `kind`, `url`, and
+`ip_range_count` (number of IP ranges referencing it for forward or reverse DNS). The `token` is never returned.
+
+#### Get DNS Server Details
+
+```
+GET /api/admin/v1/dns_servers/{dns_server_id}
+```
+
+Required Permission: `dns_server::view`
+
+#### Create DNS Server
+
+```
+POST /api/admin/v1/dns_servers
+```
+
+Required Permission: `dns_server::create`
+
+Body:
+
+```json
+{
+  "name": "string",
+  // Required - Display name
+  "enabled": boolean,
+  // Optional - Default: true
+  "kind": "cloudflare",
+  // DnsServerKind enum: "cloudflare" (forward + reverse) or "ovh" (reverse only)
+  "url": "string",
+  // Optional - API base url (required for OVH, e.g. https://eu.api.ovh.com)
+  "token": "string"
+  // Required - Credential token. Cloudflare: bearer token.
+  //            OVH: "application_key:application_secret:consumer_key"
+}
+```
+
+#### Update DNS Server
+
+```
+PATCH /api/admin/v1/dns_servers/{dns_server_id}
+```
+
+Required Permission: `dns_server::update`
+
+Body (all optional): `name`, `enabled`, `kind`, `url`, `token`.
+
+#### Delete DNS Server
+
+```
+DELETE /api/admin/v1/dns_servers/{dns_server_id}
+```
+
+Required Permission: `dns_server::delete`
+
+Note: DNS servers referenced by any IP range (forward or reverse) cannot be deleted. Remove the reference from all IP
+ranges first.
 
 ### VM IP Assignment Management
 
@@ -3018,6 +3121,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `company` - Company/organization management
 - `ip_range` - IP address range management
 - `router` - Network router configuration
+- `dns_server` - DNS provider configuration
 - `vm_custom_pricing` - Custom VM pricing models
 - `host_region` - Host region configuration
 - `vm_os_image` - VM operating system images

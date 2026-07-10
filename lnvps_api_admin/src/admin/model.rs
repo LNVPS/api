@@ -128,6 +128,89 @@ impl From<AdminRouterKind> for RouterKind {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AdminDnsServerKind {
+    Cloudflare,
+    Ovh,
+}
+
+impl From<lnvps_db::DnsServerKind> for AdminDnsServerKind {
+    fn from(kind: lnvps_db::DnsServerKind) -> Self {
+        match kind {
+            lnvps_db::DnsServerKind::Cloudflare => AdminDnsServerKind::Cloudflare,
+            lnvps_db::DnsServerKind::Ovh => AdminDnsServerKind::Ovh,
+            // MockDns is a test-only variant; map to Cloudflare as a safe fallback.
+            lnvps_db::DnsServerKind::MockDns => AdminDnsServerKind::Cloudflare,
+        }
+    }
+}
+
+impl From<AdminDnsServerKind> for lnvps_db::DnsServerKind {
+    fn from(kind: AdminDnsServerKind) -> Self {
+        match kind {
+            AdminDnsServerKind::Cloudflare => lnvps_db::DnsServerKind::Cloudflare,
+            AdminDnsServerKind::Ovh => lnvps_db::DnsServerKind::Ovh,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct AdminDnsServerDetail {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: AdminDnsServerKind,
+    pub url: String,
+    /// Number of IP ranges referencing this DNS server (forward or reverse)
+    pub ip_range_count: u64,
+}
+
+impl From<lnvps_db::DnsServer> for AdminDnsServerDetail {
+    fn from(dns: lnvps_db::DnsServer) -> Self {
+        Self {
+            id: dns.id,
+            name: dns.name,
+            enabled: dns.enabled,
+            kind: AdminDnsServerKind::from(dns.kind),
+            url: dns.url,
+            ip_range_count: 0, // Will be filled by handler
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateDnsServerRequest {
+    pub name: String,
+    pub enabled: Option<bool>, // Default: true
+    pub kind: AdminDnsServerKind,
+    #[serde(default)]
+    pub url: String,
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateDnsServerRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub kind: Option<AdminDnsServerKind>,
+    pub url: Option<String>,
+    pub token: Option<String>,
+}
+
+impl CreateDnsServerRequest {
+    pub fn to_dns_server(&self) -> lnvps_db::DnsServer {
+        lnvps_db::DnsServer {
+            id: 0, // Will be set by database
+            name: self.name.trim().to_string(),
+            enabled: self.enabled.unwrap_or(true),
+            kind: lnvps_db::DnsServerKind::from(self.kind),
+            url: self.url.trim().to_string(),
+            token: self.token.as_str().into(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AdminUserStatus {
     Active,
     Suspended,
@@ -1634,6 +1717,9 @@ pub struct AdminIpRangeInfo {
     pub access_policy_name: Option<String>, // Populated with access policy name
     pub allocation_mode: AdminIpRangeAllocationMode,
     pub use_full_range: bool,
+    pub forward_dns_server_id: Option<u64>,
+    pub reverse_dns_server_id: Option<u64>,
+    pub forward_zone_id: Option<String>,
     pub assignment_count: u64, // Number of active IP assignments in this range
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_ips: Option<u64>, // Number of available IPs (only for IPv4 ranges)
@@ -1659,6 +1745,9 @@ pub struct CreateIpRangeRequest {
     pub access_policy_id: Option<u64>,
     pub allocation_mode: Option<AdminIpRangeAllocationMode>, // default: "sequential"
     pub use_full_range: Option<bool>,                        // Default: false
+    pub forward_dns_server_id: Option<u64>,
+    pub reverse_dns_server_id: Option<u64>,
+    pub forward_zone_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1679,6 +1768,21 @@ pub struct UpdateIpRangeRequest {
     pub access_policy_id: Option<Option<u64>>,
     pub allocation_mode: Option<AdminIpRangeAllocationMode>,
     pub use_full_range: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub forward_dns_server_id: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub reverse_dns_server_id: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub forward_zone_id: Option<Option<String>>,
 }
 
 // Access Policy Models for IP range management
@@ -1705,6 +1809,9 @@ impl From<lnvps_db::IpRange> for AdminIpRangeInfo {
             access_policy_name: None, // Will be filled by handler
             allocation_mode: AdminIpRangeAllocationMode::from(ip_range.allocation_mode),
             use_full_range: ip_range.use_full_range,
+            forward_dns_server_id: ip_range.forward_dns_server_id,
+            reverse_dns_server_id: ip_range.reverse_dns_server_id,
+            forward_zone_id: ip_range.forward_zone_id,
             assignment_count: 0, // Will be filled by handler
             available_ips: None, // Will be filled by handler for IPv4 ranges
             routers: Vec::new(), // Will be filled by handler
@@ -1745,6 +1852,13 @@ impl CreateIpRangeRequest {
             access_policy_id: self.access_policy_id,
             allocation_mode: db_allocation_mode,
             use_full_range: self.use_full_range.unwrap_or(false),
+            forward_dns_server_id: self.forward_dns_server_id,
+            reverse_dns_server_id: self.reverse_dns_server_id,
+            forward_zone_id: self
+                .forward_zone_id
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
     }
 }

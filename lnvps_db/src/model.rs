@@ -705,6 +705,32 @@ pub enum RouterKind {
     MockRouter = u16::MAX,
 }
 
+/// An external DNS provider used to manage forward (A/AAAA) and/or reverse (PTR)
+/// records for IP assignments. Configured per-row in the database and referenced
+/// from `ip_range` (see `forward_dns_server_id` / `reverse_dns_server_id`).
+#[derive(FromRow, Clone, Debug)]
+pub struct DnsServer {
+    pub id: u64,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: DnsServerKind,
+    /// API base url (provider specific). May be empty for providers with a fixed endpoint.
+    pub url: String,
+    /// Encrypted credential token (Cloudflare: bearer token; OVH: app_key:app_secret:consumer_key)
+    pub token: EncryptedString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[repr(u16)]
+pub enum DnsServerKind {
+    /// Cloudflare DNS (zone + record based, forward & reverse)
+    Cloudflare = 0,
+    /// OVH reverse DNS (per-IP PTR records, reverse only)
+    Ovh = 1,
+    /// Mock DNS server for tests
+    MockDns = u16::MAX,
+}
+
 /// Cached tunnel inventory discovered on a router (GRE/VXLAN/WireGuard)
 #[derive(FromRow, Clone, Debug)]
 pub struct RouterTunnel {
@@ -793,6 +819,12 @@ pub struct IpRange {
     pub allocation_mode: IpRangeAllocationMode,
     /// Use all IPs in the range, including first and last
     pub use_full_range: bool,
+    /// DNS server used to manage forward (A/AAAA) records for IPs in this range
+    pub forward_dns_server_id: Option<u64>,
+    /// DNS server used to manage reverse (PTR) records for IPs in this range
+    pub reverse_dns_server_id: Option<u64>,
+    /// Forward zone id (provider specific, e.g. Cloudflare zone id) for forward records
+    pub forward_zone_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, sqlx::Type, Default)]
@@ -1510,6 +1542,7 @@ pub enum AdminResource {
     SubscriptionPayments = 19,
     IpSpace = 20,
     PaymentMethodConfig = 21,
+    DnsServer = 22,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1547,6 +1580,7 @@ impl Display for AdminResource {
             AdminResource::SubscriptionPayments => write!(f, "subscription_payments"),
             AdminResource::IpSpace => write!(f, "ip_space"),
             AdminResource::PaymentMethodConfig => write!(f, "payment_method_config"),
+            AdminResource::DnsServer => write!(f, "dns_server"),
         }
     }
 }
@@ -1578,6 +1612,7 @@ impl FromStr for AdminResource {
             "subscription_payments" => Ok(AdminResource::SubscriptionPayments),
             "ip_space" => Ok(AdminResource::IpSpace),
             "payment_method_config" => Ok(AdminResource::PaymentMethodConfig),
+            "dns_server" => Ok(AdminResource::DnsServer),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1610,6 +1645,7 @@ impl TryFrom<u16> for AdminResource {
             19 => Ok(AdminResource::SubscriptionPayments),
             20 => Ok(AdminResource::IpSpace),
             21 => Ok(AdminResource::PaymentMethodConfig),
+            22 => Ok(AdminResource::DnsServer),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1641,6 +1677,7 @@ impl AdminResource {
             AdminResource::SubscriptionPayments,
             AdminResource::IpSpace,
             AdminResource::PaymentMethodConfig,
+            AdminResource::DnsServer,
         ]
     }
 }
@@ -1923,6 +1960,20 @@ mod tests {
         assert_eq!(InternetRegistry::APNIC.min_ipv6_prefix_size(), 48);
         assert_eq!(InternetRegistry::LACNIC.min_ipv6_prefix_size(), 48);
         assert_eq!(InternetRegistry::AFRINIC.min_ipv6_prefix_size(), 48);
+    }
+
+    #[test]
+    fn test_admin_resource_dns_server_roundtrip() {
+        assert_eq!(
+            "dns_server".parse::<AdminResource>().unwrap(),
+            AdminResource::DnsServer
+        );
+        assert_eq!(AdminResource::DnsServer.to_string(), "dns_server");
+        assert_eq!(
+            AdminResource::try_from(22u16).unwrap(),
+            AdminResource::DnsServer
+        );
+        assert!(AdminResource::all().contains(&AdminResource::DnsServer));
     }
 
     #[test]

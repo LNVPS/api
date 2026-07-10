@@ -4,14 +4,14 @@ use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
-    DiskType, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment,
-    VmTemplate,
+    DiskType, DnsServer, DnsServerKind, IntervalType, IpRange, IpRangeAllocationMode,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain, NostrDomainHandle,
+    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
+    ReferralPayout, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
+    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -40,6 +40,7 @@ pub struct MockDb {
     pub custom_template: Arc<Mutex<HashMap<u64, VmCustomTemplate>>>,
     pub payments: Arc<Mutex<Vec<VmPayment>>>,
     pub router: Arc<Mutex<HashMap<u64, Router>>>,
+    pub dns_servers: Arc<Mutex<HashMap<u64, DnsServer>>>,
     pub access_policy: Arc<Mutex<HashMap<u64, AccessPolicy>>>,
     pub companies: Arc<Mutex<HashMap<u64, Company>>>,
     pub vm_history: Arc<Mutex<HashMap<u64, VmHistory>>>,
@@ -137,6 +138,19 @@ impl Default for MockDb {
                 company_id: 1, // Link to default company
             },
         );
+        // Default mock DNS server (forward records via the shared MockDnsServer).
+        let mut dns_servers = HashMap::new();
+        dns_servers.insert(
+            1,
+            DnsServer {
+                id: 1,
+                name: "mock-dns".to_string(),
+                enabled: true,
+                kind: DnsServerKind::MockDns,
+                url: "https://localhost".to_string(),
+                token: "mock-token".into(),
+            },
+        );
         let mut ip_ranges = HashMap::new();
         ip_ranges.insert(
             1,
@@ -147,6 +161,8 @@ impl Default for MockDb {
                 enabled: true,
                 region_id: 1,
                 allocation_mode: IpRangeAllocationMode::Random, // use random due to race conditions
+                forward_dns_server_id: Some(1),
+                forward_zone_id: Some("mock-forward-zone-id".to_string()),
                 ..Default::default()
             },
         );
@@ -159,6 +175,8 @@ impl Default for MockDb {
                 enabled: true,
                 region_id: 1,
                 allocation_mode: IpRangeAllocationMode::SlaacEui64,
+                forward_dns_server_id: Some(1),
+                forward_zone_id: Some("mock-forward-zone-id".to_string()),
                 ..Default::default()
             },
         );
@@ -237,6 +255,7 @@ impl Default for MockDb {
             custom_template: Arc::new(Default::default()),
             payments: Arc::new(Default::default()),
             router: Arc::new(Default::default()),
+            dns_servers: Arc::new(Mutex::new(dns_servers)),
             access_policy: Arc::new(Default::default()),
             companies: Arc::new(Mutex::new({
                 let mut companies = HashMap::new();
@@ -1198,6 +1217,70 @@ impl LNVpsDbBase for MockDb {
     async fn list_routers(&self) -> DbResult<Vec<Router>> {
         let routers = self.router.lock().await;
         Ok(routers.values().cloned().collect())
+    }
+
+    async fn get_dns_server(&self, dns_server_id: u64) -> DbResult<DnsServer> {
+        let d = self.dns_servers.lock().await;
+        Ok(d.get(&dns_server_id).cloned().context("no dns server")?)
+    }
+
+    async fn list_dns_servers(&self) -> DbResult<Vec<DnsServer>> {
+        let d = self.dns_servers.lock().await;
+        Ok(d.values().cloned().collect())
+    }
+
+    async fn list_dns_servers_paginated(
+        &self,
+        _limit: u64,
+        _offset: u64,
+    ) -> DbResult<(Vec<DnsServer>, u64)> {
+        let d = self.dns_servers.lock().await;
+        let all: Vec<DnsServer> = d.values().cloned().collect();
+        let total = all.len() as u64;
+        Ok((all, total))
+    }
+
+    async fn insert_dns_server(&self, dns_server: &DnsServer) -> DbResult<u64> {
+        let mut d = self.dns_servers.lock().await;
+        let id = d.keys().max().copied().unwrap_or(0) + 1;
+        let mut new = dns_server.clone();
+        new.id = id;
+        d.insert(id, new);
+        Ok(id)
+    }
+
+    async fn update_dns_server(&self, dns_server: &DnsServer) -> DbResult<()> {
+        let mut d = self.dns_servers.lock().await;
+        d.insert(dns_server.id, dns_server.clone());
+        Ok(())
+    }
+
+    async fn delete_dns_server(&self, dns_server_id: u64) -> DbResult<()> {
+        let mut d = self.dns_servers.lock().await;
+        d.remove(&dns_server_id);
+        Ok(())
+    }
+
+    async fn count_dns_server_ip_ranges(&self, dns_server_id: u64) -> DbResult<u64> {
+        let ranges = self.ip_range.lock().await;
+        Ok(ranges
+            .values()
+            .filter(|r| {
+                r.forward_dns_server_id == Some(dns_server_id)
+                    || r.reverse_dns_server_id == Some(dns_server_id)
+            })
+            .count() as u64)
+    }
+
+    async fn update_ip_range_dns(&self, range: &IpRange) -> DbResult<()> {
+        let mut ranges = self.ip_range.lock().await;
+        if let Some(existing) = ranges.get_mut(&range.id) {
+            existing.forward_dns_server_id = range.forward_dns_server_id;
+            existing.reverse_dns_server_id = range.reverse_dns_server_id;
+            existing.forward_zone_id = range.forward_zone_id.clone();
+            existing.reverse_zone_id = range.reverse_zone_id.clone();
+        }
+        Ok(())
     }
 
     async fn list_router_tunnels(&self, router_id: u64) -> DbResult<Vec<RouterTunnel>> {
