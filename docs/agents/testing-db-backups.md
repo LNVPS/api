@@ -10,8 +10,13 @@ The golden rules:
    throwaway database.
 2. **Sanitise before running anything**: swap all hosts to the mock (`Dummy`) kind,
    wipe user contact preferences, and neutralise encrypted secrets.
-3. Point every external integration (DNS providers, routers, lightning) at
-   something local/inert so no real API is ever called.
+3. **Repoint every external integration (routers) to an inert endpoint.** This is
+   **mandatory, not optional**. `read-only` mode only blocks VM *spawning* — it does
+   **not** stop startup data migrations and the worker from calling real router/DNS
+   APIs (OVH reverse DNS, Mikrotik, ARP). A restored backup is full of long-expired
+   VMs, and the worker will try to **delete** them and remove their DNS/ARP records.
+   With real credentials that would mutate production. (In testing this was only
+   saved by the router token being a dummy, so OVH returned `403 INVALID_KEY`.)
 
 ## Prerequisites
 
@@ -64,8 +69,12 @@ UPDATE user_ssh_key  SET key_data = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampl
 UPDATE vm_payment    SET external_data = '' WHERE external_data LIKE 'ENC:%';
 -- If present in your dump, also blank any other ENC: columns (e.g. payment_method_config.config).
 
--- 2d) Point external integrations at inert endpoints so any stray call fails instantly
---     (connection refused) instead of hitting real OVH/Cloudflare/Mikrotik APIs.
+-- 2d) MANDATORY: point every router at an inert endpoint so all outbound calls fail
+--     instantly (connection refused) instead of hitting real OVH/Mikrotik APIs.
+--     Startup data migrations (DNS reverse backfill, arp_ref_fixer) and the worker
+--     (expired-VM cleanup, router state sync) WILL call these URLs — read-only does
+--     not prevent it. The dns_server rows the DNS migration creates inherit the
+--     router url, so repointing the routers also neutralises DNS calls.
 UPDATE router SET url = 'http://127.0.0.1:1';
 ```
 
@@ -141,26 +150,62 @@ JOIN router rt ON ap.router_id = rt.id
 WHERE rt.kind = 1;
 ```
 
-## Step 5 — (Optional) Run the full app against the backup
+## Step 5 — Run the full API against the backup
 
-Running the real binary also exercises the **data migrations** and worker. It
-additionally needs redis and a lightning node — point them at your local dev
-instances. Copy `lnvps_api/config.yaml`, then set `db:` to the restored database:
+Running the real binary exercises the **whole system**: schema migrations, the
+startup `vm_subscription` backfill, the 7 data migrations (including the DNS one),
+re-encryption of secrets with your local key, the worker, and the HTTP server. It
+additionally needs redis and a lightning node.
+
+1. Start redis: `docker compose up -d redis`.
+2. Start a local lightning node. The dev `lnvps_api/config.yaml` points at a Polar
+   regtest LND; bring that network up
+   (`docker compose -f ~/.polar/networks/<n>/docker-compose.yml up -d`) and note the
+   LND host gRPC port (Polar `alice` maps `10009` → host `10001`).
+3. Create an override config `config.backup-test.yaml` (do **not** commit it):
 
 ```yaml
 db: "mysql://root:root@localhost:3376/lnvps_restore"
-read-only: true          # extra safety: avoids provisioning side effects
-# lightning/redis: point at local regtest / local redis
-# encryption: auto-generate a local key (works because step 2c removed ENC: values)
+read-only: true          # blocks VM spawning (but NOT external DNS/ARP calls — see step 2d)
+lightning:
+  lnd:
+    url: "https://127.0.0.1:10001"
+    cert: "/home/<you>/.polar/networks/<n>/volumes/lnd/alice/tls.cert"
+    macaroon: "/home/<you>/.polar/networks/<n>/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
 ```
 
-With steps 2–3 done, this is side-effect-free: hosts are `Dummy`, users are
-un-notifiable, external URLs are inert (calls fail fast and are handled
-best-effort), and VMs report `running`. Data migrations that make outbound calls
-(e.g. DNS record backfill) will log warnings on the inert URLs and continue.
+4. Run it, layering the override on top of the dev config (later files win):
 
-> Note: data migrations that read encrypted columns require step 2c (or the real
-> key). Some (e.g. the vm_payment → subscription backfill) decode `external_data`;
+```bash
+cargo build -p lnvps_api --bin lnvps_api
+RUST_LOG=info,sqlx=warn ./target/debug/lnvps_api \
+  --config lnvps_api/config.yaml \
+  --config config.backup-test.yaml 2>&1 | tee /tmp/lnvps_run.log
+```
+
+A healthy run ends with `Listening on 0.0.0.0:8000`; then
+`curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/v1/vm/templates`
+returns `200`.
+
+### What to expect (verified against a real 1577-VM snapshot)
+
+- `vm_subscription` backfill runs first (Phase 1 creates a subscription per VM,
+  Phase 2 copies `vm_payment` → `subscription_payment`). On a Feb-2026-era backup
+  this created 1577 subscriptions + 3429 payments with **0 errors**.
+- The encryption migration **re-encrypts** the now-plaintext secrets with your local
+  key — expected and harmless.
+- The DNS data migration imports OVH routers into `dns_server` rows and wires
+  reverse DNS onto the OVH-routed ranges. Its record backfill and `arp_ref_fixer`
+  make **real router/DNS API calls** — these fail fast on the inert URLs from step
+  2d (or return `403` with dummy tokens) and are logged best-effort.
+- The worker reconciles VMs. Because the backup's VMs are long-expired, it attempts
+  **expired-VM cleanup** (removing DNS/ARP) — another reason step 2d is mandatory.
+  `Cant spawn VM's in read-only mode` errors are expected and harmless.
+- `Failed to get VMxxx state: VM not found` warnings occur for VMs not seeded into
+  the Dummy host state file (step 3) — harmless.
+
+> Encryption note: data migrations that read encrypted columns require step 2c (or
+> the real key). The vm_payment → subscription backfill decodes `external_data`;
 > blanking it to `''` keeps startup moving for a test.
 
 ## Step 6 — Clean up
