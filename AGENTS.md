@@ -33,6 +33,7 @@ These docs apply to all projects using this agent structure:
 | [docs/agents/bug-fixes.md](docs/agents/bug-fixes.md) | Resolving bugs — LNVPS-specific additions |
 | [docs/agents/coverage.md](docs/agents/coverage.md) | Function coverage — LNVPS-specific additions |
 | [docs/agents/e2e-tests.md](docs/agents/e2e-tests.md) | Writing or running E2E integration tests (`lnvps_e2e` crate) |
+| [docs/agents/testing-db-backups.md](docs/agents/testing-db-backups.md) | Testing branch changes (migrations, startup) against a restored production DB backup safely (mock hosts, no user notifications) |
 | [docs/agents/fw-testing.md](docs/agents/fw-testing.md) | Running or extending the firewall XDP netns test harness (`lnvps_fw`) |
 
 ## Pull Request Procedure
