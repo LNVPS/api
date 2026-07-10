@@ -229,11 +229,13 @@ impl JsonApi {
                     op_fatal!("Failed to parse JSON from {}: {} {}", path, text, e);
                 }
             }
-        } else if is_retryable_status(status) {
+        } else if is_retryable_status(status) && !is_missing_resource_body(&text) {
             op_transient!("{} {}: {}: {}", method, path, status, &text);
         } else {
             // Definitive client errors (404/401/403/400 ...) must not be retried:
             // e.g. a 404 means the resource really is gone, not a transient outage.
+            // Proxmox reports a missing config as a 5xx with a "does not exist"
+            // body — that is definitive too, so treat it as fatal (not-found).
             op_fatal!("{} {}: {}: {}", method, path, status, &text);
         }
     }
@@ -286,7 +288,7 @@ impl JsonApi {
         debug!("<< {}", text);
         if status.is_success() {
             Ok(status.as_u16())
-        } else if is_retryable_status(status) {
+        } else if is_retryable_status(status) && !is_missing_resource_body(&text) {
             op_transient!("{} {}: {}: {}", method, path, status, &text);
         } else {
             op_fatal!("{} {}: {}: {}", method, path, status, &text);
@@ -305,12 +307,25 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 
 /// Detect whether a fatal request error was caused by a 404 Not Found response.
 fn is_not_found_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("404 Not Found")
+    let s = err.to_string();
+    s.contains("404 Not Found") || is_missing_resource_body(&s)
+}
+
+/// Proxmox returns a 500 (not a 404) with a body like
+/// `Configuration file 'nodes/pve/qemu-server/1852.conf' does not exist`
+/// when a VM/config is absent. Treat that as a definitive "not found" so it is
+/// not retried as a transient 5xx and callers using `get_opt` (e.g.
+/// `destroy_vm`) see `Ok(None)` and skip cleanly instead of failing.
+fn is_missing_resource_body(text: &str) -> bool {
+    text.contains("Configuration file") && text.contains("does not exist")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_not_found_error, is_retryable_status, is_stale_connection_message};
+    use super::{
+        is_missing_resource_body, is_not_found_error, is_retryable_status,
+        is_stale_connection_message,
+    };
     use reqwest::StatusCode;
 
     #[test]
@@ -335,6 +350,22 @@ mod tests {
         assert!(is_not_found_error(&err));
         let other = anyhow::anyhow!("GET /api2/json/nodes/n/qemu/100: 500 Internal Server Error: ");
         assert!(!is_not_found_error(&other));
+    }
+
+    #[test]
+    fn proxmox_missing_config_500_is_treated_as_not_found() {
+        // Proxmox reports an absent VM config as a 500, not a 404. This must be
+        // recognised as "not found" so destroy_vm skips instead of failing when
+        // deleting an unpaid VM that was never spawned on the host.
+        let body = "Configuration file 'nodes/pve/qemu-server/1852.conf' does not exist\n";
+        assert!(is_missing_resource_body(body));
+        let err = anyhow::anyhow!(
+            "GET /api2/json/nodes/pve/qemu/1852/status/current: 500 Internal Server Error: {{\"data\":null,\"message\":\"{}\"}}",
+            body
+        );
+        assert!(is_not_found_error(&err));
+        // Unrelated 5xx bodies must remain retryable / not-found-negative.
+        assert!(!is_missing_resource_body("internal error, try again"));
     }
 
     #[test]
