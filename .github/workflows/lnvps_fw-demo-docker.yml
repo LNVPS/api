@@ -2,18 +2,19 @@ name: Build lnvps_fw demo image
 
 # Builds the standalone lnvps_fw demo API (the serve_api example: control API +
 # dashboard fed by a simulated traffic generator, no eBPF datapath needed at
-# runtime) into a container image and pushes it to GHCR. Manual dispatch only —
-# it exists purely to deploy the firewall dashboard for demonstration.
+# runtime) into a container image and pushes it to Docker Hub. Manual dispatch
+# only — it exists purely to deploy the firewall dashboard for demonstration.
+#
+# Requires two repo secrets for the Docker Hub push:
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (an access token with write scope).
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/lnvps-fw-demo
+  IMAGE_NAME: voidic/lnvps-fw-demo
 
 jobs:
   build-image:
@@ -26,19 +27,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # metadata-action lowercases the image name for GHCR automatically.
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
             type=sha,format=long
