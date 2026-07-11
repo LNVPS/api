@@ -21,8 +21,14 @@ const EMPTY: Data = {
   rules: { protected: [], overrides: [], source_blocks: [] }, upgrade: null, err: "",
 };
 
+// Baked in only for the demo image build (`VITE_DEMO_TOKEN=... bun run build`).
+// When set, the dashboard seeds this token and auto-connects on load so the
+// public demo needs no manual login. Empty in normal release builds, so the
+// connect screen behaves as usual.
+const DEMO_TOKEN = (import.meta.env.VITE_DEMO_TOKEN as string | undefined) || "";
+
 export function App() {
-  const [token, setToken] = useState(localStorage.getItem("fwtoken") || "");
+  const [token, setToken] = useState(localStorage.getItem("fwtoken") || DEMO_TOKEN);
   const [auto, setAuto] = useState(true);
   const [d, setD] = useState<Data>(EMPTY);
   const [upMsg, setUpMsg] = useState("");
