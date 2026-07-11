@@ -222,6 +222,12 @@ pub struct SourceDetectionConfig {
 /// Per-source userspace bookkeeping across sample windows.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SourceTracker {
+    /// False until the first observation has seeded `prev`. The eBPF source
+    /// counter is monotonic-cumulative and is not reset between mitigation
+    /// episodes, so a fresh tracker's first sample must establish the baseline
+    /// rather than treat the entire historical count as one window's traffic
+    /// (which would spike a benign source straight into DROPPING).
+    pub seeded: bool,
     /// Previous cumulative packet count (for the rate delta).
     pub prev: u64,
     /// True while this source is being dropped (in the CIDR block trie).
@@ -245,6 +251,16 @@ pub fn advance_source(
     now_ns: u64,
     elapsed_ns: u64,
 ) -> (bool, u64) {
+    // First observation: seed the baseline and report a zero-rate window. A
+    // single cumulative snapshot carries no rate information, and the counter
+    // may already hold a large historical total (see `seeded`).
+    if !tracker.seeded {
+        tracker.seeded = true;
+        tracker.prev = cur_count;
+        tracker.last_pps = 0;
+        tracker.last_ns = now_ns;
+        return (false, 0);
+    }
     let pps = if elapsed_ns == 0 {
         0
     } else {
@@ -508,10 +524,21 @@ mod tests {
         cooldown_ns: 2_000_000_000,
     };
 
+    /// Seed a fresh tracker's baseline at `base` cumulative packets (the first
+    /// observation always reports zero rate), so the following windows exercise
+    /// real deltas.
+    fn seeded_at(base: u64) -> SourceTracker {
+        let mut t = SourceTracker::default();
+        let (dropping, pps) = advance_source(&mut t, base, &SCFG, 0, SEC);
+        assert!(!dropping);
+        assert_eq!(pps, 0, "first observation seeds, never spikes");
+        t
+    }
+
     #[test]
     fn source_enters_dropping_over_rate() {
-        let mut t = SourceTracker::default();
-        // 600 pkts in 1s => 600pps >= 500 => DROPPING.
+        let mut t = seeded_at(0);
+        // 600 pkts in the next 1s => 600pps >= 500 => DROPPING.
         let (dropping, pps) = advance_source(&mut t, 600, &SCFG, SEC, SEC);
         assert!(dropping);
         assert_eq!(pps, 600);
@@ -519,7 +546,7 @@ mod tests {
 
     #[test]
     fn source_stays_normal_below_rate() {
-        let mut t = SourceTracker::default();
+        let mut t = seeded_at(0);
         let (dropping, pps) = advance_source(&mut t, 100, &SCFG, SEC, SEC);
         assert!(!dropping);
         assert_eq!(pps, 100);
@@ -527,7 +554,7 @@ mod tests {
 
     #[test]
     fn source_releases_after_cooldown_below_exit() {
-        let mut t = SourceTracker::default();
+        let mut t = seeded_at(0);
         // Enter DROPPING at 600pps.
         advance_source(&mut t, 600, &SCFG, SEC, SEC);
         assert!(t.dropping);
@@ -542,7 +569,7 @@ mod tests {
 
     #[test]
     fn source_resurgence_resets_cooldown() {
-        let mut t = SourceTracker::default();
+        let mut t = seeded_at(0);
         advance_source(&mut t, 600, &SCFG, SEC, SEC);
         // Drop below exit (records below_since).
         advance_source(&mut t, 600, &SCFG, 2 * SEC, SEC);
@@ -555,10 +582,45 @@ mod tests {
 
     #[test]
     fn source_counter_reset_is_zero_rate() {
-        let mut t = SourceTracker::default();
+        let mut t = seeded_at(0);
         advance_source(&mut t, 1000, &SCFG, SEC, SEC);
         // Counter appears to decrease (LRU eviction/reset): zero rate, not a spike.
         let (_, pps) = advance_source(&mut t, 10, &SCFG, 2 * SEC, SEC);
         assert_eq!(pps, 0);
+    }
+
+    // Regression: the eBPF `V*_SRC_COUNTERS` map is monotonic-cumulative and is
+    // NOT reset between mitigation episodes (LRU eviction is the only way an
+    // entry disappears). A source's userspace `SourceTracker`, however, is
+    // recreated fresh (`prev = 0`) each time it is first observed in a sample.
+    //
+    // So when mitigation (re)activates over a source whose counter already holds
+    // a large accumulated total from earlier counting, the very first window
+    // computes `delta = cur_count - 0 = cur_count` — the entire historical count
+    // attributed to a single window. A slow, benign source is then reported at a
+    // huge bogus pps and shoved straight into DROPPING even though its real rate
+    // is far below the limit. This is exactly the "manual activation puts IPs
+    // straight into dropping" symptom.
+    //
+    // Desired behaviour: the first observation must SEED the baseline, not emit a
+    // rate. This test asserts that and currently FAILS, demonstrating the bug.
+    #[test]
+    fn source_first_observation_of_large_counter_is_not_a_spike() {
+        let mut t = SourceTracker::default();
+        // Counter already sits at 100_000 packets accumulated before this tracker
+        // ever existed (prior mitigation episode / pre-first-sample counting).
+        // The source is actually slow: it will add only ~5 pkts/s from here.
+        let (dropping, pps) = advance_source(&mut t, 100_000, &SCFG, 0, SEC);
+        assert!(
+            !dropping,
+            "benign source wrongly entered DROPPING on its first observation \
+             (reported {pps} pps from a cumulative counter, limit {} pps)",
+            SCFG.rate_pps
+        );
+
+        // And its true rate (5 pkts over the next second) stays well under limit.
+        let (dropping2, pps2) = advance_source(&mut t, 100_005, &SCFG, 2 * SEC, SEC);
+        assert!(!dropping2, "slow source must stay NORMAL");
+        assert_eq!(pps2, 5);
     }
 }
