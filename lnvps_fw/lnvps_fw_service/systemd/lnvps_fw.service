@@ -14,8 +14,10 @@ RestartSec=5
 User=root
 LimitMEMLOCK=infinity
 # /var/lib/lnvps_fw holds the persisted self-signed API cert (stable fingerprint
-# across restarts); /run/lnvps_fw is the root-only staging dir for self-upgrade
-# .deb downloads. systemd creates both 0700, root-owned, and cleans /run on stop.
+# across restarts) AND the root-only staging dir for self-upgrade .deb downloads
+# — staging must NOT live in the RuntimeDirectory, because systemd wipes /run/
+# lnvps_fw when dpkg stops the old service mid-install, deleting the archive
+# out from under dpkg. systemd creates both 0700, root-owned.
 StateDirectory=lnvps_fw
 StateDirectoryMode=0700
 RuntimeDirectory=lnvps_fw

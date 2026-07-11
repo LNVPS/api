@@ -167,14 +167,32 @@ fn hex(bytes: &[u8]) -> String {
 /// unpredictable path within it for the downloaded artifact. Avoids the
 /// world-writable `/tmp` TOCTOU: an unprivileged local user cannot pre-create
 /// or swap the file.
+///
+/// MUST be the unit's `StateDirectory` (`/var/lib/lnvps_fw`), NOT its
+/// `RuntimeDirectory` (`/run/lnvps_fw`): `dpkg -i` stops the old service
+/// mid-install (prerm), and systemd removes the RuntimeDirectory on service
+/// stop (`RuntimeDirectoryPreserve=no` default) — deleting the staged archive
+/// out from under dpkg (`cannot access archive`). The StateDirectory persists
+/// across stops/restarts.
 fn staging_path() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = Path::new("/run/lnvps_fw");
+    let dir = Path::new("/var/lib/lnvps_fw");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("creating {}", dir.display()))?;
+    // Staged archives now persist across restarts: sweep leftovers from any
+    // earlier failed/aborted upgrade before claiming a new name.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("upgrade-") && name.ends_with(".deb") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     // Randomized filename + O_EXCL so we never open an attacker-planted file.
     let mut rnd = [0u8; 16];
     getrandom::getrandom(&mut rnd).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
@@ -280,8 +298,6 @@ async fn verify_minisign(key: &str, deb_url: &str, sig_url: &str, bytes: &[u8]) 
     pk.verify(bytes, &sig, false)
         .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))
 }
-
-
 
 /// Install `deb` and restart `unit` in a detached transient systemd unit, so the
 /// install completes even though restarting the service kills this process.
