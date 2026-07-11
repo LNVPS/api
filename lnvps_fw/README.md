@@ -173,7 +173,87 @@ the previous slot keeps in-flight cookies valid across a rotation.
 
 ---
 
+## Install (Debian/Ubuntu, from GitHub Releases)
+
+Each tagged release ships a prebuilt `.deb` (built by
+[`.github/workflows/lnvps_fw-deb.yml`](../.github/workflows/lnvps_fw-deb.yml)
+via `cargo-deb`) attached to the corresponding
+[GitHub release](https://github.com/LNVPS/api/releases). The package includes
+the daemon binary, the `lnvps_fw.service` systemd unit, and the example config —
+you do **not** need a Rust or eBPF toolchain to install it (the eBPF object is
+compiled into the binary at release-build time).
+
+1. **Download the latest `.deb`.** Grab it from the
+   [releases page](https://github.com/LNVPS/api/releases/latest), or from the
+   shell:
+
+   ```sh
+   # picks the newest release and its lnvps-fw .deb asset (amd64)
+   URL=$(curl -fsSL https://api.github.com/repos/LNVPS/api/releases/latest \
+     | grep -o 'https://[^"]*lnvps-fw_[^"]*_amd64\.deb')
+   curl -fLO "$URL"
+   ```
+
+2. **Install it.** `apt` pulls in the auto-detected shared-library deps:
+
+   ```sh
+   sudo apt install ./lnvps-fw_*_amd64.deb
+   ```
+
+   This installs:
+
+   | Path | What |
+   |---|---|
+   | `/usr/bin/lnvps_fw_service` | the daemon binary |
+   | `/lib/systemd/system/lnvps_fw.service` | systemd unit (runs as root; needs `CAP_NET_ADMIN`+`CAP_BPF`) |
+   | `/etc/lnvps_fw/config.example.yaml` | fully-commented example config |
+
+   The post-install script reminds you that no `config.yaml` exists yet and
+   does **not** auto-start the service.
+
+3. **Configure.** Copy the example and set at least your uplink NIC(s):
+
+   ```sh
+   sudo cp /etc/lnvps_fw/config.example.yaml /etc/lnvps_fw/config.yaml
+   sudo editor /etc/lnvps_fw/config.yaml   # set `interfaces:` (and `protected:` on a router)
+   ```
+
+   The unit runs `lnvps_fw_service --config /etc/lnvps_fw/config.yaml`. See the
+   [Running](#running) and [Deployment: host vs router](#deployment-host-vs-router)
+   sections below for what to put in it.
+
+4. **Enable and start:**
+
+   ```sh
+   sudo systemctl enable --now lnvps_fw
+   sudo systemctl status lnvps_fw
+   sudo journalctl -u lnvps_fw -f
+   ```
+
+### Kernel requirements
+
+A reasonably recent kernel with XDP + BPF LRU maps (Debian 12/Ubuntu 22.04 or
+newer is comfortable). The unit sets `LimitMEMLOCK=infinity` for the BPF maps
+and runs as root because loading XDP/eBPF programs needs full privileges.
+
+### Staying up to date (self-upgrade)
+
+Once it has an API configured, the daemon checks the GitHub
+[`releases/latest`](https://api.github.com/repos/LNVPS/api/releases/latest) API
+on startup and every ~6h, and can install a newer signed `.deb` for you via the
+`GET`/`POST /api/v1/upgrade` control endpoints — so you generally only install
+the `.deb` by hand once. Because that check compares the running binary's
+compiled version against the newest `vX.Y.Z` tag, always install the `.deb` from
+a **tagged release** (not an ad-hoc `workflow_dispatch` build) to avoid a
+perpetual "upgrade available" state.
+
+---
+
 ## Building
+
+> Building from source is only needed for development or to run on an
+> architecture without a prebuilt `.deb`. To just deploy the daemon, use the
+> [release `.deb`](#install-debianubuntu-from-github-releases) above.
 
 The host crates build normally; the eBPF object is compiled automatically by
 `lnvps_fw_service/build.rs` (via `aya-build`) for the `bpfel-unknown-none`
