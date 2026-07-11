@@ -62,12 +62,26 @@ impl Rng {
 }
 
 fn load_pct(pps: u64, syn: u64, bps: u64) -> u32 {
-    let r = |v: u64, t: u64| if t == 0 { 0 } else { (v.saturating_mul(100) / t) as u32 };
-    r(pps, LIM.pps).max(r(syn, LIM.syn_pps)).max(r(bps, LIM.bps))
+    let r = |v: u64, t: u64| {
+        if t == 0 {
+            0
+        } else {
+            (v.saturating_mul(100) / t) as u32
+        }
+    };
+    r(pps, LIM.pps)
+        .max(r(syn, LIM.syn_pps))
+        .max(r(bps, LIM.bps))
 }
 
 fn net_load_pct(pps: u64, syn: u64, bps: u64) -> u32 {
-    let r = |v: u64, t: u64| if t == 0 { 0 } else { (v.saturating_mul(100) / t) as u32 };
+    let r = |v: u64, t: u64| {
+        if t == 0 {
+            0
+        } else {
+            (v.saturating_mul(100) / t) as u32
+        }
+    };
     r(pps, LIM.net_pps)
         .max(r(syn, LIM.net_syn_pps))
         .max(r(bps, LIM.net_bps))
@@ -103,22 +117,39 @@ struct Sample {
     flags: u32,
 }
 
-/// Attack intensity in [0.0, 1.0] on tick `t`, as a triangle over a 45s cycle
-/// (rise 5..15, hold-ish peak, fall 15..25, quiet otherwise).
+/// Attack intensity in [0.0, 1.0] on tick `t`, as a triangle over a 90s cycle
+/// (rise 10..30, hold-ish peak, fall 30..50, quiet otherwise). The longer,
+/// less frequent window reads more like a real incident than a constant flap.
 fn attack_intensity(t: u64) -> f64 {
-    let w = t % 45;
-    if (5..25).contains(&w) {
-        let x = w - 5; // 0..20
-        if x < 10 { x as f64 / 10.0 } else { (20 - x) as f64 / 10.0 }
+    let w = t % 90;
+    if (10..50).contains(&w) {
+        let x = w - 10; // 0..40
+        if x < 20 {
+            x as f64 / 20.0
+        } else {
+            (40 - x) as f64 / 20.0
+        }
     } else {
         0.0
     }
 }
 
-fn sample_host(h: &Host, t: u64, rng: &mut Rng) -> Sample {
-    let mut pps = rng.jitter(h.base_pps, 15);
-    let mut bps = rng.jitter(h.base_bps, 15);
-    let mut syn = rng.jitter(h.base_syn, 25);
+/// Slow "day/night" breathing applied to every host's baseline so the numbers
+/// drift over minutes instead of only jittering tick-to-tick. ~3min period,
+/// swinging between ~0.55x (quiet hours) and ~1.25x (peak).
+fn diurnal(t: u64) -> f64 {
+    let phase = (t % 180) as f64 / 180.0 * std::f64::consts::TAU;
+    0.9 + 0.35 * phase.cos()
+}
+
+fn sample_host(h: &Host, t: u64, day: f64, rng: &mut Rng) -> Sample {
+    // Effective baseline for this tick, after the diurnal drift.
+    let base_pps = (h.base_pps as f64 * day) as u64;
+    let base_bps = (h.base_bps as f64 * day) as u64;
+    let base_syn = (h.base_syn as f64 * day) as u64;
+    let mut pps = rng.jitter(base_pps, 15);
+    let mut bps = rng.jitter(base_bps, 15);
+    let mut syn = rng.jitter(base_syn, 25);
     let mut drop_pps = 0;
     let mut flags = 0;
 
@@ -144,15 +175,15 @@ fn sample_host(h: &Host, t: u64, rng: &mut Rng) -> Sample {
             // Under the port filter, the attack traffic (everything above the
             // legit baseline) is dropped.
             if flags & DEST_MODE_PORT_FILTER != 0 {
-                drop_pps = pps.saturating_sub(h.base_pps);
+                drop_pps = pps.saturating_sub(base_pps);
             }
         }
     }
     // TX (egress) is the host serving legit replies: roughly proportional to
     // its baseline RX (not the attack flood, which generates no real replies),
     // with larger response packets.
-    let tx_pps = rng.jitter(h.base_pps * 7 / 10 + 1, 20);
-    let tx_bps = rng.jitter(h.base_bps * 3 + 1, 20);
+    let tx_pps = rng.jitter(base_pps * 7 / 10 + 1, 20);
+    let tx_bps = rng.jitter(base_bps * 3 + 1, 20);
     Sample {
         pps,
         bps,
@@ -251,50 +282,111 @@ impl MitBook {
 }
 
 fn learned_ports(t: u64) -> Vec<LearnedPort> {
-    // Ages advance with the tick; one port flaps in/out to show churn.
+    // The open ports the daemon has passively learned per protected IP — one
+    // per real service on each host. Ages advance with the tick; a couple of
+    // ports flap in/out to show churn.
+    let p = |ip: &str, port: u16, proto: &str, age: u64| LearnedPort {
+        ip: ip.into(),
+        port,
+        proto: proto.into(),
+        age_secs: age,
+    };
     let mut v = vec![
-        LearnedPort {
-            ip: "203.0.113.42".into(),
-            port: 443,
-            proto: "tcp".into(),
-            age_secs: t % 300,
-        },
-        LearnedPort {
-            ip: "203.0.113.42".into(),
-            port: 80,
-            proto: "tcp".into(),
-            age_secs: t % 300,
-        },
-        LearnedPort {
-            ip: "203.0.113.90".into(),
-            port: 51820,
-            proto: "udp".into(),
-            age_secs: t % 120,
-        },
-        LearnedPort {
-            ip: "203.0.113.7".into(),
-            port: 22,
-            proto: "tcp".into(),
-            age_secs: t % 600,
-        },
+        // Web edge.
+        p("203.0.113.10", 443, "tcp", t % 300),
+        p("203.0.113.10", 80, "tcp", t % 300),
+        // Authoritative DNS (UDP + TCP fallback).
+        p("203.0.113.20", 53, "udp", t % 240),
+        p("203.0.113.20", 53, "tcp", t % 240),
+        // Game server.
+        p("203.0.113.53", 27015, "udp", t % 180),
+        // Mail: SMTP, submission, IMAPS.
+        p("203.0.113.30", 25, "tcp", t % 600),
+        p("203.0.113.30", 587, "tcp", t % 600),
+        p("203.0.113.30", 993, "tcp", t % 600),
+        // WireGuard VPN.
+        p("203.0.113.90", 51820, "udp", t % 120),
+        // SSH bastion.
+        p("203.0.113.7", 22, "tcp", t % 600),
+        // Dual-stack web host.
+        p("2001:db8:1::10", 443, "tcp", t % 300),
     ];
-    if (t / 7) % 2 == 0 {
-        v.push(LearnedPort {
-            ip: "203.0.113.42".into(),
-            port: 8443,
-            proto: "tcp".into(),
-            age_secs: t % 30,
-        });
+    // A short-lived HTTPS alt port on the web edge that flaps to show churn.
+    if (t / 11) % 2 == 0 {
+        v.push(p("203.0.113.10", 8443, "tcp", t % 30));
     }
     v
 }
 
 async fn run_sim(state: Arc<SharedState>) {
+    // A realistic tenant mix behind the protected /24: a public web edge
+    // (the DDoS target), an authoritative DNS box, a mail server, a game
+    // server, a WireGuard VPN gateway and an SSH bastion, plus a dual-stack
+    // web host on the protected /48.
     let hosts = [
-        Host { ip: "203.0.113.7", v6: false, base_pps: 1_200, base_bps: 9_800_000, base_syn: 5, target: true },
-        Host { ip: "203.0.113.42", v6: false, base_pps: 82_500, base_bps: 380_000_000, base_syn: 180, target: false },
-        Host { ip: "203.0.113.90", v6: false, base_pps: 1_200, base_bps: 9_800_000, base_syn: 5, target: false },
-        Host { ip: "2001:db8:1::7", v6: true, base_pps: 12_000, base_bps: 90_000_000, base_syn: 30, target: false },
+        // Public web/CDN edge — busy, and the target of the periodic flood.
+        Host {
+            ip: "203.0.113.10",
+            v6: false,
+            base_pps: 84_000,
+            base_bps: 390_000_000,
+            base_syn: 210,
+            target: true,
+        },
+        // Authoritative DNS — small UDP packets, high pps, negligible SYNs.
+        Host {
+            ip: "203.0.113.20",
+            v6: false,
+            base_pps: 26_000,
+            base_bps: 42_000_000,
+            base_syn: 4,
+            target: false,
+        },
+        // Game server — chatty UDP, medium pps.
+        Host {
+            ip: "203.0.113.53",
+            v6: false,
+            base_pps: 38_000,
+            base_bps: 210_000_000,
+            base_syn: 20,
+            target: false,
+        },
+        // Mail server (SMTP/submission/IMAPS) — modest, bursty SYNs.
+        Host {
+            ip: "203.0.113.30",
+            v6: false,
+            base_pps: 3_400,
+            base_bps: 24_000_000,
+            base_syn: 45,
+            target: false,
+        },
+        // WireGuard VPN gateway — steady UDP tunnel.
+        Host {
+            ip: "203.0.113.90",
+            v6: false,
+            base_pps: 1_500,
+            base_bps: 11_000_000,
+            base_syn: 2,
+            target: false,
+        },
+        // SSH bastion — tiny, mostly idle.
+        Host {
+            ip: "203.0.113.7",
+            v6: false,
+            base_pps: 180,
+            base_bps: 900_000,
+            base_syn: 6,
+            target: false,
+        },
+        // Dual-stack web host on the protected /48.
+        Host {
+            ip: "2001:db8:1::10",
+            v6: true,
+            base_pps: 14_500,
+            base_bps: 105_000_000,
+            base_syn: 40,
+            target: false,
+        },
     ];
 
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ now_unix().wrapping_mul(2_654_435_761));
@@ -316,8 +408,9 @@ async fn run_sim(state: Arc<SharedState>) {
         let (mut tot_tx_pps, mut tot_tx_bps) = (0u64, 0u64);
         let mut source_block_active = false;
 
+        let day = diurnal(t);
         for h in &hosts {
-            let s = sample_host(h, t, &mut rng);
+            let s = sample_host(h, t, day, &mut rng);
             let agg = if h.v6 { &mut a6 } else { &mut a4 };
             agg.pps += s.pps;
             agg.bps += s.bps;
@@ -477,9 +570,15 @@ struct Sample4 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let addr: SocketAddr = "127.0.0.1:8899".parse().unwrap();
+    // Bind address and API token are overridable via env so the same demo can
+    // run locally (default 127.0.0.1) or inside a container (BIND_ADDR=0.0.0.0:8899).
+    let addr: SocketAddr = std::env::var("BIND_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "127.0.0.1:8899".parse().unwrap());
+    let token = std::env::var("API_TOKEN").unwrap_or_else(|_| "devtoken".into());
     let state = SharedState::new(
-        "devtoken".into(),
+        token.clone(),
         vec![],
         vec!["demo0".into()],
         RuleSet {
@@ -509,6 +608,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { run_sim(sim_state).await });
 
     let tls = api::load_or_generate_tls(None, None, addr.ip(), None)?;
-    println!("serving https://{addr}  (token: devtoken)  — simulated live traffic");
+    println!("serving https://{addr}  (token: {token})  — simulated live traffic");
     api::serve(state, addr, tls).await
 }
