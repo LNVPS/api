@@ -87,8 +87,11 @@ thresholds:
 # drop-to-non-open-ports policy, not by source blocking.
 escalation:
   # A source is an offender once its per-window rate reaches this many pps
-  # toward a mitigated destination.
-  src-rate-pps: 500
+  # toward a mitigated destination. Keep this well above what shared
+  # infrastructure (CDN/reverse-proxy edges, CGNAT, corporate NAT) legitimately
+  # sends to one origin — a busy CDN edge easily sustains hundreds–thousands of
+  # pps. Also runtime-editable via PUT /api/v1/limits (src_rate_pps).
+  src-rate-pps: 10000
   # Aggregation fan-out: this many child prefixes under a common parent
   # collapse into one wider block (/32->/24->/16->/8), keeping the LPM trie
   # bounded under distributed floods.

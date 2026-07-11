@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lnvps_fw_common::{DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY};
 use lnvps_fw_service::api::{
     self, EventKind, InterfaceInfo, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet,
-    SharedState, SourceBlock, Totals, TrackedIp,
+    SharedState, SourceBlock, Totals, TrackedIp, TrackedSource,
 };
 
 // --- detection limits used by the simulator (mirrors the real defaults) ---
@@ -30,6 +30,9 @@ const LIM: Limits = Limits {
     net_bps: 5_000_000_000,
     exit_pct: 50,
     cooldown_secs: 30,
+    src_rate_pps: 10_000,
+    src_exit_pct: 50,
+    src_cooldown_secs: 10,
 };
 const SYN_PROXY_PPS: u64 = 5_000;
 
@@ -550,7 +553,30 @@ async fn run_sim(state: Arc<SharedState>) {
             tx_bps: tot_tx_bps,
         });
         state.set_active(book.step(&state, actives, now));
+        // Unified source list the dashboard now reads: the auto blocks as
+        // dropping/cooling rows, plus a couple of NORMAL tracked sources so the
+        // preview shows every state at once.
+        let mut sources: Vec<TrackedSource> = blocks
+            .iter()
+            .map(|b| TrackedSource {
+                ip: b.cidr.trim_end_matches("/32").to_string(),
+                pps: b.pps,
+                state: if b.cooling { "cooling" } else { "dropping" }.to_string(),
+                manual: false,
+                age_secs: b.age_secs,
+            })
+            .collect();
+        if block_started.is_some() {
+            sources.push(TrackedSource {
+                ip: "91.198.174.192".into(),
+                pps: rng.jitter(120, 30),
+                state: "normal".into(),
+                manual: false,
+                age_secs: 0,
+            });
+        }
         state.set_blocks(blocks);
+        state.set_sources(sources);
         if t % 5 == 1 {
             state.set_ports(learned_ports(t));
         }

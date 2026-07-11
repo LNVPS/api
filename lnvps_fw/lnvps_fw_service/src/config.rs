@@ -264,7 +264,7 @@ fn default_max_source_blocks() -> usize {
     50_000
 }
 fn default_src_rate_pps() -> u64 {
-    500
+    10_000
 }
 fn default_escalate_pass_pps() -> u64 {
     50_000
@@ -307,7 +307,10 @@ impl Default for Thresholds {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Escalation {
     /// A source is an offender once its per-window rate reaches this many
-    /// packets/second toward a mitigated destination.
+    /// packets/second toward a mitigated destination. Default 10_000: high
+    /// enough that shared infrastructure (CDN/reverse-proxy edges, CGNAT,
+    /// corporate NAT) is not blackholed — a CDN edge proxying a busy site
+    /// legitimately pushes hundreds–thousands of pps at a single origin.
     #[serde(default = "default_src_rate_pps")]
     pub src_rate_pps: u64,
     /// Aggregation fan-out: this many child prefixes under a common parent

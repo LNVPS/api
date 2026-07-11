@@ -25,6 +25,8 @@ export interface Mitigation {
   tx_pps: number; tx_bps: number; rx_drop_pct: number; load_pct: number;
 }
 export interface SourceBlock { cidr: string; age_secs: number; pps: number; manual: boolean; cooling: boolean }
+/** A row in the unified source list: tracked sources (any state) + manual blocks. */
+export interface TrackedSource { ip: string; pps: number; state: "normal" | "dropping" | "cooling"; manual: boolean; age_secs: number }
 export interface LearnedPort { ip: string; port: number; proto: string; age_secs: number }
 export interface FwEvent {
   seq: number; kind: string; cidr: string; flags: number; ts_unix: number;
@@ -33,6 +35,7 @@ export interface FwEvent {
 export interface Limits {
   pps: number; syn_pps: number; bps: number; net_pps: number; net_syn_pps: number;
   net_bps: number; exit_pct: number; cooldown_secs: number;
+  src_rate_pps: number; src_exit_pct: number; src_cooldown_secs: number;
 }
 export interface UpgradeStatus {
   current: string; latest: string | null; available: boolean;
@@ -41,6 +44,7 @@ export interface UpgradeStatus {
 export interface Override { cidr: string; flags: number }
 export interface RuleSet { protected: string[]; overrides: Override[]; source_blocks: string[] }
 export interface BlocksPage { total: number; offset: number; limit: number; items: SourceBlock[] }
+export interface SourcesPage { total: number; offset: number; limit: number; items: TrackedSource[] }
 export interface PortsPage { total: number; offset: number; limit: number; items: LearnedPort[] }
 export interface EventsResponse { events: FwEvent[]; cursor: number }
 

@@ -8,8 +8,8 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
-    BlocksPage, Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage, RuleSet,
-    SharedState, SourceBlock, Status, router,
+    BlocksPage, Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage,
+    RuleSet, SharedState, SourceBlock, SourcesPage, Status, TrackedSource, router,
 };
 use tower::ServiceExt;
 
@@ -242,6 +242,9 @@ async fn limits_put_get_roundtrip_and_validation() {
         net_bps: 4_000_000_000,
         exit_pct: 60,
         cooldown_secs: 45,
+        src_rate_pps: 20_000,
+        src_exit_pct: 40,
+        src_cooldown_secs: 15,
     })
     .unwrap();
     let res = app
@@ -261,14 +264,35 @@ async fn limits_put_get_roundtrip_and_validation() {
         .unwrap();
     let got: Limits = body_json(res).await;
     assert_eq!(got.exit_pct, 60);
+    assert_eq!(got.src_rate_pps, 20_000);
+    assert_eq!(got.src_exit_pct, 40);
+    assert_eq!(got.src_cooldown_secs, 15);
 
     // Zero threshold rejected.
     let bad = r#"{"pps":0,"syn_pps":1,"bps":1,"net_pps":1,"net_syn_pps":1,"net_bps":1,"exit_pct":50,"cooldown_secs":30}"#.to_string();
     let res = app
+        .clone()
         .oneshot(req("PUT", "/api/v1/limits", Some("tok"), Some(bad)))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Zero src_rate_pps rejected; omitted source fields fall back to defaults
+    // (backward compat with pre-src-limit clients).
+    let bad_src = r#"{"pps":1,"syn_pps":1,"bps":1,"net_pps":1,"net_syn_pps":1,"net_bps":1,"exit_pct":50,"cooldown_secs":30,"src_rate_pps":0}"#.to_string();
+    let res = app
+        .clone()
+        .oneshot(req("PUT", "/api/v1/limits", Some("tok"), Some(bad_src)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let legacy = r#"{"pps":1,"syn_pps":1,"bps":1,"net_pps":1,"net_syn_pps":1,"net_bps":1,"exit_pct":50,"cooldown_secs":30}"#.to_string();
+    let res = app
+        .oneshot(req("PUT", "/api/v1/limits", Some("tok"), Some(legacy)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(st.limits().src_rate_pps, 10_000, "serde default applied");
 }
 
 #[tokio::test]
@@ -303,7 +327,11 @@ async fn blocks_endpoint() {
     let page: BlocksPage = body_json(res).await;
     // Paginated: total counts both, items holds the (bounded) slice.
     assert_eq!(page.total, 2);
-    assert!(page.items.iter().any(|b| b.cidr == "45.0.0.0/8" && b.manual));
+    assert!(
+        page.items
+            .iter()
+            .any(|b| b.cidr == "45.0.0.0/8" && b.manual)
+    );
     assert!(
         page.items
             .iter()
@@ -381,9 +409,27 @@ async fn blocks_paginated_sorted_by_pps_and_filtered() {
     let st = state();
     let app = router(st.clone());
     st.set_blocks(vec![
-        SourceBlock { cidr: "10.0.0.1/32".into(), age_secs: 1, pps: 100, manual: false, cooling: false },
-        SourceBlock { cidr: "10.0.0.2/32".into(), age_secs: 1, pps: 9000, manual: false, cooling: false },
-        SourceBlock { cidr: "10.0.0.3/32".into(), age_secs: 1, pps: 500, manual: false, cooling: true },
+        SourceBlock {
+            cidr: "10.0.0.1/32".into(),
+            age_secs: 1,
+            pps: 100,
+            manual: false,
+            cooling: false,
+        },
+        SourceBlock {
+            cidr: "10.0.0.2/32".into(),
+            age_secs: 1,
+            pps: 9000,
+            manual: false,
+            cooling: false,
+        },
+        SourceBlock {
+            cidr: "10.0.0.3/32".into(),
+            age_secs: 1,
+            pps: 500,
+            manual: false,
+            cooling: true,
+        },
     ]);
     // First page, limit 2: highest pps first.
     let res = app
@@ -405,6 +451,71 @@ async fn blocks_paginated_sorted_by_pps_and_filtered() {
     let page: BlocksPage = body_json(res).await;
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].cidr, "10.0.0.1/32");
+}
+
+#[tokio::test]
+async fn sources_unified_list_manual_pinned_then_by_pps() {
+    let st = state();
+    let app = router(st.clone());
+    // A manual block, added via the public block API (updates the ruleset).
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/blocks",
+            Some("tok"),
+            Some("{\"cidr\":\"45.0.0.0/24\"}".into()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // Auto-tracked sources in every state.
+    st.set_sources(vec![
+        TrackedSource {
+            ip: "10.0.0.1".into(),
+            pps: 100,
+            state: "normal".into(),
+            manual: false,
+            age_secs: 0,
+        },
+        TrackedSource {
+            ip: "10.0.0.2".into(),
+            pps: 9000,
+            state: "dropping".into(),
+            manual: false,
+            age_secs: 1,
+        },
+        TrackedSource {
+            ip: "10.0.0.3".into(),
+            pps: 200,
+            state: "cooling".into(),
+            manual: false,
+            age_secs: 2,
+        },
+    ]);
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/sources", Some("tok"), None))
+        .await
+        .unwrap();
+    let page: SourcesPage = body_json(res).await;
+    // Manual block pinned first; then auto sources most-active first.
+    assert_eq!(page.total, 4);
+    assert_eq!(page.items[0].ip, "45.0.0.0/24");
+    assert!(page.items[0].manual);
+    assert_eq!(page.items[1].ip, "10.0.0.2"); // 9000 pps, dropping
+    assert_eq!(page.items[1].state, "dropping");
+    assert_eq!(page.items[2].ip, "10.0.0.3"); // 200 pps, cooling
+    assert_eq!(page.items[3].ip, "10.0.0.1"); // 100 pps, normal (still in the list)
+    assert_eq!(page.items[3].state, "normal");
+    // Filtering narrows to the auto sources only.
+    let res = app
+        .oneshot(req("GET", "/api/v1/sources?q=10.0.0.1", Some("tok"), None))
+        .await
+        .unwrap();
+    let page: SourcesPage = body_json(res).await;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].ip, "10.0.0.1");
 }
 
 #[tokio::test]

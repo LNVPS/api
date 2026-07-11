@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
@@ -237,6 +237,28 @@ pub struct Limits {
     /// Exit hysteresis (% of entry) and cooldown.
     pub exit_pct: u64,
     pub cooldown_secs: u64,
+    /// Per-source auto-block threshold: once a destination is mitigating, any
+    /// single source at/over this pps is blocked (`escalation.src_rate_pps`).
+    /// This is a much lower bar than the per-destination `pps` above — keep
+    /// them side by side so neither hides.
+    #[serde(default = "default_limit_src_rate_pps")]
+    pub src_rate_pps: u64,
+    /// Source exit hysteresis (% of `src_rate_pps`).
+    #[serde(default = "default_limit_src_exit_pct")]
+    pub src_exit_pct: u64,
+    /// Sustained seconds below the source exit threshold before unblocking.
+    #[serde(default = "default_limit_src_cooldown_secs")]
+    pub src_cooldown_secs: u64,
+}
+
+fn default_limit_src_rate_pps() -> u64 {
+    10_000
+}
+fn default_limit_src_exit_pct() -> u64 {
+    50
+}
+fn default_limit_src_cooldown_secs() -> u64 {
+    10
 }
 
 /// An active blocked source CIDR (from SOURCE_BLOCK escalation of a real,
@@ -276,6 +298,41 @@ struct BlocksQuery {
     limit: Option<usize>,
     #[serde(default)]
     q: String,
+}
+
+/// A source IP in the unified source list. This is the single list the UI
+/// shows: every source being rate-tracked while its destination is under
+/// mitigation (in any state — not just the blocked ones), plus permanent
+/// operator-pushed manual blocks. Auto "blocks" are simply the entries whose
+/// `state` is `dropping`/`cooling`, so there is no separate block list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrackedSource {
+    /// Source address or CIDR (`a.b.c.d` / `a.b.c.0/24` / IPv6 text form).
+    /// Manual blocks may be a CIDR; auto-tracked sources are always a single IP.
+    pub ip: String,
+    /// Current per-source packets/second (last sample window; 0 for manual
+    /// blocks, whose traffic is dropped before per-source counting).
+    pub pps: u64,
+    /// Rate-machine state: `"normal"` (under the limit, not blocked),
+    /// `"dropping"` (at/over the per-source limit, blocked), or `"cooling"`
+    /// (blocked but below the exit threshold, counting down before release).
+    /// Manual blocks report `"dropping"` (permanently enforced).
+    pub state: String,
+    /// True = operator-pushed manual block (permanent). False = auto entry from
+    /// the per-source rate state machine (released on hysteresis).
+    #[serde(default)]
+    pub manual: bool,
+    /// Seconds since this source was last sampled (0 for manual blocks).
+    pub age_secs: u64,
+}
+
+/// A page of tracked sources (bounded payload even under a large flood).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourcesPage {
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub items: Vec<TrackedSource>,
 }
 
 /// A learned open port on a protected IP (surfaced for `lnvps_api` / admin).
@@ -389,6 +446,7 @@ pub struct SharedState {
     tracked: RwLock<Vec<TrackedIp>>,
     prefixes: RwLock<Vec<PrefixLoad>>,
     blocks: RwLock<Vec<SourceBlock>>,
+    sources: RwLock<Vec<TrackedSource>>,
     ports: RwLock<Vec<LearnedPort>>,
     totals: RwLock<Totals>,
     limits: RwLock<Limits>,
@@ -430,6 +488,7 @@ impl SharedState {
             tracked: RwLock::new(Vec::new()),
             prefixes: RwLock::new(Vec::new()),
             blocks: RwLock::new(Vec::new()),
+            sources: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
             totals: RwLock::new(Totals::default()),
             limits: RwLock::new(Limits::default()),
@@ -481,6 +540,12 @@ impl SharedState {
     /// Replace the active source-block snapshot.
     pub fn set_blocks(&self, blocks: Vec<SourceBlock>) {
         *self.blocks.write().unwrap() = blocks;
+    }
+
+    /// Replace the tracked-source snapshot (all rate-tracked sources, every
+    /// state — not just the blocked subset).
+    pub fn set_sources(&self, sources: Vec<TrackedSource>) {
+        *self.sources.write().unwrap() = sources;
     }
 
     /// Replace the top-level aggregate traffic totals.
@@ -590,6 +655,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
             "/api/v1/blocks",
             get(get_blocks).post(post_block).delete(delete_block),
         )
+        .route("/api/v1/sources", get(get_sources))
         .route("/api/v1/limits", get(get_limits).put(put_limits))
         .route("/api/v1/upgrade", get(get_upgrade).post(post_upgrade))
         // Cap request bodies: the largest legitimate payload is a full ruleset
@@ -771,6 +837,55 @@ async fn get_blocks(
     })
 }
 
+/// List every rate-tracked source (all states), most active first, paginated.
+/// This is the full per-source view the UI shows — NORMAL sources included — as
+/// opposed to `/blocks`, which is only the dropping/cooling subset.
+async fn get_sources(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<BlocksQuery>,
+) -> Json<SourcesPage> {
+    // Manual (operator-pushed, permanent) blocks first — they are dropped before
+    // per-source counting so they never appear in the auto-tracked snapshot.
+    let mut all: Vec<TrackedSource> = state
+        .rules
+        .read()
+        .unwrap()
+        .source_blocks
+        .iter()
+        .map(|c| TrackedSource {
+            ip: c.clone(),
+            pps: 0,
+            state: "dropping".to_string(),
+            manual: true,
+            age_secs: 0,
+        })
+        .collect();
+    all.extend(state.sources.read().unwrap().iter().cloned());
+
+    let needle = q.q.trim().to_lowercase();
+    if !needle.is_empty() {
+        all.retain(|s| s.ip.to_lowercase().contains(&needle));
+    }
+    // Manual blocks pinned on top; then most active first; then dropping/cooling
+    // above normal on a pps tie; stable ip tiebreak so pagination is stable.
+    all.sort_by(|a, b| {
+        b.manual
+            .cmp(&a.manual)
+            .then_with(|| b.pps.cmp(&a.pps))
+            .then_with(|| a.state.cmp(&b.state))
+            .then_with(|| a.ip.cmp(&b.ip))
+    });
+    let total = all.len();
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let items: Vec<TrackedSource> = all.into_iter().skip(q.offset).take(limit).collect();
+    Json(SourcesPage {
+        total,
+        offset: q.offset,
+        limit,
+        items,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct BlockReq {
     cidr: String,
@@ -849,7 +964,11 @@ async fn post_upgrade(State(state): State<Arc<SharedState>>) -> Response {
     }
     let (url, sha256, sig_url) = {
         let u = state.upgrade.read().unwrap();
-        (u.deb_url.clone(), u.deb_sha256.clone(), u.deb_sig_url.clone())
+        (
+            u.deb_url.clone(),
+            u.deb_sha256.clone(),
+            u.deb_sig_url.clone(),
+        )
     };
     let Some(url) = url else {
         return (StatusCode::BAD_REQUEST, "no upgrade available").into_response();
@@ -869,12 +988,23 @@ async fn post_upgrade(State(state): State<Arc<SharedState>>) -> Response {
 /// Live-edit the detection thresholds. Held in memory (not persisted); the
 /// control loop reloads them on the next tick.
 async fn put_limits(State(state): State<Arc<SharedState>>, Json(l): Json<Limits>) -> Response {
-    let thresholds = [l.pps, l.syn_pps, l.bps, l.net_pps, l.net_syn_pps, l.net_bps];
+    let thresholds = [
+        l.pps,
+        l.syn_pps,
+        l.bps,
+        l.net_pps,
+        l.net_syn_pps,
+        l.net_bps,
+        l.src_rate_pps,
+    ];
     if thresholds.contains(&0) {
         return (StatusCode::BAD_REQUEST, "all thresholds must be > 0").into_response();
     }
     if l.exit_pct == 0 || l.exit_pct >= 100 {
         return (StatusCode::BAD_REQUEST, "exit_pct must be 1..99").into_response();
+    }
+    if l.src_exit_pct == 0 || l.src_exit_pct >= 100 {
+        return (StatusCode::BAD_REQUEST, "src_exit_pct must be 1..99").into_response();
     }
     *state.limits.write().unwrap() = l;
     state.limits_version.fetch_add(1, Ordering::Relaxed);
@@ -928,7 +1058,10 @@ async fn put_rules(
         match parse_cidr(c) {
             Some(k) => *c = k.to_cidr_string(),
             None => {
-                return (StatusCode::BAD_REQUEST, format!("bad source-block cidr: {c}"))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("bad source-block cidr: {c}"),
+                )
                     .into_response();
             }
         }
@@ -1120,8 +1253,7 @@ fn persist_self_signed(
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("creating tls state dir {}", dir.display()))?;
-    std::fs::write(cert_p, cert_pem)
-        .with_context(|| format!("writing {}", cert_p.display()))?;
+    std::fs::write(cert_p, cert_pem).with_context(|| format!("writing {}", cert_p.display()))?;
     let mut kf = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1185,10 +1317,7 @@ mod tests {
     #[test]
     fn parse_cidr_masks_host_bits_for_canonical_dedup() {
         // Host bits are zeroed so non-canonical input collapses to one key.
-        assert_eq!(
-            parse_cidr("203.0.113.5/24"),
-            parse_cidr("203.0.113.0/24"),
-        );
+        assert_eq!(parse_cidr("203.0.113.5/24"), parse_cidr("203.0.113.0/24"),);
         assert_eq!(
             parse_cidr("203.0.113.5/24").unwrap().to_cidr_string(),
             "203.0.113.0/24"
@@ -1225,9 +1354,8 @@ mod tests {
 
     #[test]
     fn tls_self_signed_generates_pem() {
-        let tls =
-            load_or_generate_tls(None, None, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), None)
-                .unwrap();
+        let tls = load_or_generate_tls(None, None, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), None)
+            .unwrap();
         assert!(tls.self_signed);
         assert!(
             String::from_utf8_lossy(&tls.cert_pem).contains("BEGIN CERTIFICATE"),

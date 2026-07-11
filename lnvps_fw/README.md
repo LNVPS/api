@@ -390,7 +390,8 @@ in memory, and mitigation events go into a bounded in-memory ring buffer that
 self-signed cert is auto-generated if none is configured. Endpoints cover status,
 rules (GET/PUT), manual overrides (POST/DELETE), active mitigations, learned
 ports (`/ports`, server-paginated + filtered), live per-IP rates (`/tracked`),
-and events.
+the source-block set (`/blocks`), the full rate-tracked source list with
+normal/dropping/cooling state (`/sources`), and events.
 
 The dashboard at `/` is a self-contained **HTM + Preact** app: live per-IP
 rates, learned open ports, active mitigations, rules, and an event feed — every

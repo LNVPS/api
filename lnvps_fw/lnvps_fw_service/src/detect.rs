@@ -623,4 +623,41 @@ mod tests {
         assert!(!dropping2, "slow source must stay NORMAL");
         assert_eq!(pps2, 5);
     }
+
+    // DEMONSTRATION (documents current behaviour, not yet the desired one):
+    // the per-source rate is evaluated over a single ~500ms sample window and a
+    // source is blocked on the FIRST window that reaches `rate_pps` — there is
+    // no entry hysteresis. So a source whose SUSTAINED rate is far below the
+    // limit is blocked by one short traffic burst (a CDN/reverse-proxy edge
+    // routinely bursts: connection storms, HTTP/2 multiplexing, retries).
+    //
+    // This test PASSES against the current code, proving the mechanism that
+    // puts low-average-rate Cloudflare edges into DROPPING even though they
+    // never exceeded the limit on a sustained basis.
+    #[test]
+    fn source_blocked_by_single_burst_window_despite_low_average() {
+        const HALF: u64 = SEC / 2; // 500ms sample window
+        let mut t = seeded_at(0);
+
+        // Window 1 (500ms): a burst of 300 packets. Over a 500ms window that
+        // scales to 600pps, which is >= the 500pps limit.
+        let (dropping, pps) = advance_source(&mut t, 300, &SCFG, HALF, HALF);
+        assert_eq!(pps, 600, "a 300-packet burst in 500ms measures as 600pps");
+        assert!(
+            dropping,
+            "current code blocks on the FIRST over-rate window (no entry hysteresis)"
+        );
+
+        // Yet the source's SUSTAINED average is well under the limit: over the
+        // full second (300 packets total, then quiet) it is only ~300pps, and
+        // over longer it trends toward its true low rate. It never sustained
+        // 500pps — a single half-second burst was enough to blackhole it.
+        let sustained_pps_over_1s = 300 * 1_000_000_000 / SEC; // 300 packets / 1s
+        assert!(
+            sustained_pps_over_1s < SCFG.rate_pps,
+            "sustained rate ({sustained_pps_over_1s}pps) is below the {}pps limit, \
+             yet the source was blocked by one burst window",
+            SCFG.rate_pps
+        );
+    }
 }

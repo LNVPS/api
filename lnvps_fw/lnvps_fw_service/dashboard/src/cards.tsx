@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { api, authHeaders } from "./api";
-import type { InterfaceInfo, Limits, Mitigation, SourceBlock, BlocksPage, PortsPage } from "./api";
+import type { InterfaceInfo, Limits, Mitigation, TrackedSource, SourcesPage, PortsPage } from "./api";
 import { fmtn, fmtbps, fmtUnit, parseUnit, timeStr, dropColor } from "./format";
 import { LoadBar, Table, Pager, PagedTable, Section, Modal, flagCell } from "./ui";
 
@@ -84,6 +84,7 @@ export function LimitsCard({ token, nics }: { token: string; nics?: InterfaceInf
       {rateFld("pps", "IP pps")}{rateFld("syn_pps", "IP syn/s")}{bpsFld("bps", "IP bit/s")}
       {rateFld("net_pps", "prefix pps")}{rateFld("net_syn_pps", "prefix syn/s")}{bpsFld("net_bps", "prefix bit/s")}
       {fld("exit_pct", "exit %")}{fld("cooldown_secs", "cooldown s")}
+      {rateFld("src_rate_pps", "src block pps")}{fld("src_exit_pct", "src exit %")}{fld("src_cooldown_secs", "src cooldown s")}
       <div class="act">
         <button onClick={save} disabled={anyInvalid}>save</button>
         <button class="ghost" onClick={reload}>reset</button>
@@ -151,20 +152,22 @@ export function MitigationsCard({ token, mitigations, onChange }: {
   );
 }
 
-// --- Source blocks: server-paginated + filtered ---
-export function BlocksCard({ token }: { token: string }) {
+// --- Sources: unified list of rate-tracked sources (normal/dropping/cooling)
+// + manual blocks. Server-paginated + filtered. Auto "blocks" are just the
+// dropping/cooling rows here — there is no separate block list. ---
+export function SourcesCard({ token }: { token: string }) {
   const PAGE = 50;
   const [show, setShow] = useState(false);
   const [cidr, setCidr] = useState("");
   const [msg, setMsg] = useState("");
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
-  const [data, setData] = useState<BlocksPage>({ total: 0, offset: 0, limit: PAGE, items: [] });
+  const [data, setData] = useState<SourcesPage>({ total: 0, offset: 0, limit: PAGE, items: [] });
   const hdr = authHeaders(token);
   const load = useCallback(async () => {
     try {
       const params = new URLSearchParams({ offset: String(page * PAGE), limit: String(PAGE), q });
-      setData(await api<BlocksPage>("/api/v1/blocks?" + params, token));
+      setData(await api<SourcesPage>("/api/v1/sources?" + params, token));
     } catch { /* surfaced by the main poller */ }
   }, [token, q, page]);
   useEffect(() => { load(); const id = setInterval(load, 3000); return () => clearInterval(id); }, [load]);
@@ -177,21 +180,23 @@ export function BlocksCard({ token }: { token: string }) {
   };
   const del = async (c: string) => { try { await fetch("/api/v1/blocks?cidr=" + encodeURIComponent(c), { method: "DELETE", headers: hdr }); load(); } catch { /* */ } };
   const bin = (c: string) => <button class="binbtn" title="remove block" onClick={() => del(c)}>🗑</button>;
-  const stateCell = (b: SourceBlock) => b.manual
+  const stateCell = (s: TrackedSource) => s.manual
     ? <span class="tag">pinned</span>
-    : b.cooling ? <span style={{ color: "#f5b13d" }}>cooling</span> : <span style={{ color: "#ff5d6c" }}>dropping</span>;
+    : s.state === "cooling" ? <span style={{ color: "#f5b13d" }}>cooling</span>
+      : s.state === "dropping" ? <span style={{ color: "#ff5d6c" }}>dropping</span>
+        : <span style={{ color: "#6fcf7f" }}>normal</span>;
   const pages = Math.max(1, Math.ceil(data.total / PAGE));
-  const rows = data.items.map((b) => [
-    b.cidr, <span class="tag">{b.manual ? "manual" : "auto"}</span>, stateCell(b),
-    b.manual ? "—" : fmtn(b.pps), b.manual ? "—" : b.age_secs + "s", b.manual ? bin(b.cidr) : "",
+  const rows = data.items.map((s) => [
+    s.ip, <span class="tag">{s.manual ? "manual" : "auto"}</span>, stateCell(s),
+    s.manual ? "—" : fmtn(s.pps), s.manual ? "—" : s.age_secs + "s", s.manual ? bin(s.ip) : "",
   ]);
   return (
     <div>
       <div style={{ marginBottom: ".5rem", display: "flex", gap: ".5rem", alignItems: "center" }}>
         <button onClick={() => { setShow(true); setMsg(""); }}>+ block source</button>
-        <input placeholder="filter cidr" value={q} onInput={(e) => { setPage(0); setQ((e.target as HTMLInputElement).value); }} />
+        <input placeholder="filter ip" value={q} onInput={(e) => { setPage(0); setQ((e.target as HTMLInputElement).value); }} />
       </div>
-      <div class="scroll"><Table cols={["cidr", "kind", "state", "pps", "age", ""]} rows={rows} /></div>
+      <div class="scroll"><Table cols={["source", "kind", "state", "pps", "age", ""]} rows={rows} /></div>
       {data.total > PAGE && <Pager page={Math.min(page, pages - 1)} pages={pages} total={data.total} onPage={setPage} />}
       {show && (
         <Modal title="Block a source CIDR" onClose={() => setShow(false)}>

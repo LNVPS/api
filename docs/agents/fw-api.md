@@ -34,6 +34,14 @@ section to disable the API entirely.
 | POST | `/mitigations` | add/replace a manual override `{cidr, flags}` |
 | DELETE | `/mitigations?cidr=<cidr>` | clear a manual override (`404` if absent) |
 | GET | `/events?since=<cursor>` | events with `seq > cursor`, plus the next `cursor` |
+| GET | `/limits` | live detection thresholds (destination, prefix **and per-source**) |
+| PUT | `/limits` | live-edit the thresholds (in-memory; control loop reloads next tick) |
+| GET | `/tracked` | live per-destination RX/TX rates (paginated + filtered) |
+| GET | `/ports` | learned open ports per protected IP (paginated + filtered) |
+| GET | `/sources` | **the** unified source list: every rate-tracked source (3-state + live pps) plus manual blocks, paginated + filtered |
+| GET | `/blocks` | legacy: the enforced block trie only (manual + auto dropping/cooling, CIDR-aggregated), paginated |
+| POST | `/blocks` | add a permanent manual source block `{cidr}` (updates the ruleset) |
+| DELETE | `/blocks?cidr=<cidr>` | remove a manual source block |
 | GET | `/upgrade` | cached self-upgrade status: `current`, `latest`, `available`, `deb_url` |
 | POST | `/upgrade` | download the latest release `.deb` and install + restart (202) |
 
@@ -50,6 +58,48 @@ builds and attaches the package.
 
 `flags` is the `DEST_MODE_*` protection bitmask: `PORT_FILTER=1`, `SYN_PROXY=2`,
 `RATE_CAPS=4`, `SOURCE_BLOCK=8`.
+
+### Limits (`/limits`)
+
+There are **two independent pps thresholds** and both are exposed here so
+neither can hide:
+
+- `pps`/`syn_pps`/`bps` (+ `net_*` prefix aggregates) — *destination* entry
+  thresholds: “is this dest under attack?”
+- `src_rate_pps` (+ `src_exit_pct`, `src_cooldown_secs`) — the *per-source*
+  auto-block threshold: once a dest is mitigating, any single source at/over
+  this rate is blocked. Necessarily much lower than the dest threshold, but
+  keep it well above shared-infrastructure rates (CDN/reverse-proxy edges,
+  CGNAT) — default 10 000 pps. Mirrors `escalation.src-rate-pps` in the config
+  file; the API value wins after a PUT.
+
+Omitting the `src_*` fields in a PUT (older clients) falls back to their
+defaults rather than zeroing them.
+
+### Source list (`/sources`)
+
+While a destination is under mitigation the datapath counts every source IP and
+userspace runs a per-source rate state machine. `GET /sources` is the **single**
+source list the UI shows: it surfaces that full set in every state, **plus**
+operator-pushed manual blocks. There is no separate “blocks list” — an auto block
+is simply an entry whose `state` is `dropping`/`cooling`.
+
+Each item is `{ ip, pps, state, manual, age_secs }` where `state` is one of:
+
+- `normal` — under the per-source limit (`src-rate-pps`); tracked but **not** blocked.
+- `dropping` — at/over the limit; installed in the CIDR block trie (packets dropped).
+- `cooling` — still blocked, but the rate fell below the exit threshold
+  (`src-exit-pct` of the limit) and is counting down `src-cooldown-secs` before
+  release. A new at/over-rate window flips it back to `dropping`.
+
+`manual: true` rows are permanent operator blocks (from `POST /blocks`); they are
+dropped before per-source counting so they always report `pps: 0` and are pinned
+to the top. `?q=` substring-filters on the IP, `?offset=`/`?limit=` paginate
+(limit clamps to `1..=1000`, default 100), otherwise most-active-first.
+
+`GET /blocks` remains for the raw enforced-trie view (manual + auto, CIDR blocks
+possibly aggregated to /24 etc), but the dashboard now uses the unified
+`/sources` list. Manual blocks are still managed via `POST`/`DELETE /blocks`.
 
 ### Rules / overrides model
 

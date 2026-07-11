@@ -18,7 +18,7 @@ use lnvps_fw_common::{
 
 use lnvps_fw_service::api::{
     self, CidrKey, InterfaceInfo, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet,
-    SharedState, SourceBlock, Totals, TrackedIp, parse_cidr,
+    SharedState, SourceBlock, Totals, TrackedIp, TrackedSource, parse_cidr,
 };
 use lnvps_fw_service::cidr::{mask_v4, mask_v6};
 use lnvps_fw_service::config::{Config, IfaceRole};
@@ -392,6 +392,47 @@ fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
     out
 }
 
+/// Snapshot every rate-tracked source (all states) for the `/sources` view.
+/// While a destination is mitigating the eBPF counts each source and the
+/// per-source state machine lives in `det.src_v4`/`src_v6`; this exposes the
+/// whole set with its 3-state label so the UI can show NORMAL sources too, not
+/// just the blocked (dropping/cooling) subset that `/blocks` carries.
+fn collect_sources(det: &DetectionState, now_ns: u64) -> Vec<TrackedSource> {
+    let age = |ns: u64| now_ns.saturating_sub(ns) / 1_000_000_000;
+    // NORMAL = not dropping; DROPPING = at/over rate (no cooldown clock yet);
+    // COOLING = still dropping but below the exit threshold, counting down.
+    let state = |t: &lnvps_fw_service::detect::SourceTracker| {
+        if !t.dropping {
+            "normal"
+        } else if t.below_since_ns.is_none() {
+            "dropping"
+        } else {
+            "cooling"
+        }
+    };
+    let mut out: Vec<TrackedSource> = det
+        .src_v4
+        .iter()
+        .map(|(ip, t)| TrackedSource {
+            ip: Ipv4Addr::from(*ip).to_string(),
+            pps: t.last_pps,
+            state: state(t).to_string(),
+            manual: false,
+            age_secs: age(t.last_ns),
+        })
+        .chain(det.src_v6.iter().map(|(ip, t)| TrackedSource {
+            ip: Ipv6Addr::from(*ip).to_string(),
+            pps: t.last_pps,
+            state: state(t).to_string(),
+            manual: false,
+            age_secs: age(t.last_ns),
+        }))
+        .collect();
+    // Most active first (the API re-sorts + paginates too).
+    out.sort_by(|a, b| b.pps.cmp(&a.pps).then_with(|| a.ip.cmp(&b.ip)));
+    out
+}
+
 /// Apply live-edited thresholds from the control API into the runtime config
 /// (applied to both the per-destination and per-prefix detectors).
 fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
@@ -406,6 +447,9 @@ fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
     rt.network.bps = l.net_bps;
     rt.network.exit_pct = l.exit_pct;
     rt.network.cooldown_ns = cooldown_ns;
+    rt.src_rate_pps = l.src_rate_pps;
+    rt.src_exit_pct = l.src_exit_pct;
+    rt.src_cooldown_ns = l.src_cooldown_secs.saturating_mul(1_000_000_000);
 }
 
 /// How close a set of rates is to tripping mitigation: the max of the three
@@ -456,7 +500,12 @@ fn collect_prefixes(
             .iter()
             .filter(|(ip, _)| mask_v4(**ip, *len) == *net)
             .fold((0u64, 0u64), |a, (_, r)| (a.0 + r.pps, a.1 + r.bps));
-        push(format!("{}/{len}", Ipv4Addr::from(*net)), tr, manual.flags_v4(*net), tx);
+        push(
+            format!("{}/{len}", Ipv4Addr::from(*net)),
+            tr,
+            manual.flags_v4(*net),
+            tx,
+        );
     }
     for ((len, net), tr) in &det.prefix_v6 {
         let tx = det
@@ -464,7 +513,12 @@ fn collect_prefixes(
             .iter()
             .filter(|(ip, _)| mask_v6(**ip, *len) == *net)
             .fold((0u64, 0u64), |a, (_, r)| (a.0 + r.pps, a.1 + r.bps));
-        push(format!("{}/{len}", Ipv6Addr::from(*net)), tr, manual.flags_v6(*net), tx);
+        push(
+            format!("{}/{len}", Ipv6Addr::from(*net)),
+            tr,
+            manual.flags_v6(*net),
+            tx,
+        );
     }
     out.sort_by(|a, b| b.load_pct.cmp(&a.load_pct));
     out
@@ -1014,6 +1068,9 @@ async fn main() -> Result<()> {
             net_bps: net.bps,
             exit_pct: det.exit_pct,
             cooldown_secs: det.cooldown_ns / 1_000_000_000,
+            src_rate_pps: runtime_cfg.src_rate_pps,
+            src_exit_pct: runtime_cfg.src_exit_pct,
+            src_cooldown_secs: runtime_cfg.src_cooldown_ns / 1_000_000_000,
         });
     }
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
@@ -1159,6 +1216,7 @@ async fn main() -> Result<()> {
                         &manual,
                     ));
                     st.set_blocks(collect_blocks(&detection_state, now));
+                    st.set_sources(collect_sources(&detection_state, now));
                     st.set_totals(collect_totals(&detection_state, now));
                 }
             }

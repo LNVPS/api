@@ -4,7 +4,7 @@ import { api } from "./api";
 import type { Status, TrackedIp, PrefixLoad, Mitigation, FwEvent, RuleSet, UpgradeStatus } from "./api";
 import { fmtn, fmtbps, timeStr, loadColor, dropColor } from "./format";
 import { LoadBar, Sparkline, PagedTable, Section, flagCell } from "./ui";
-import { Login, LimitsCard, MitigationsCard, BlocksCard, PortsCard } from "./cards";
+import { Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard } from "./cards";
 
 interface Data {
   status: Status | null;
@@ -184,7 +184,7 @@ export function App() {
         <Section wide title="Protected prefixes" extra={"(" + d.prefixes.length + ")"}>
           <PagedTable cols={["prefix", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={prefixRows} />
         </Section>
-        <Section wide title="Source blocks"><BlocksCard token={token} /></Section>
+        <Section wide title="Sources"><SourcesCard token={token} /></Section>
         <PortsCard token={token} />
         <Section wide title="Events" extra={"(" + events.length + ")"}>
           <PagedTable cols={evCols} rows={evRows} />
