@@ -79,52 +79,28 @@ thresholds:
   # How often the detection loop samples the per-destination counters.
   sample-interval-ms: 500
 
-# Per-source detection + CIDR aggregation while a destination is mitigating.
-# NOTE: the eBPF datapath only COUNTS per source (bounded LRU) and enforces the
-# CIDR block trie; all rate math and block decisions are made here in userspace.
-# This is a secondary defence aimed at real (unspoofed) botnets; spoofed
-# carpet-bomb floods are handled by per-destination mitigation + the
-# drop-to-non-open-ports policy, not by source blocking.
+# Per-source rate limiting while a destination is mitigating.
+# The rate machine lives IN the XDP datapath: the kernel counts each source
+# over a fixed 1s window and blocks over-rate sources in-line (drops engage
+# once the destination escalates to SOURCE_BLOCK). Userspace only writes this
+# config into the datapath and reads the state for display — it is not in the
+# decision path. This is a defence against real (unspoofed) botnets; spoofed
+# floods never trip a per-source limit and are handled by the port-filter /
+# SYN-proxy layers.
 escalation:
-  # A source is an offender once its per-window rate reaches this many pps
-  # toward a mitigated destination. Keep this well above what shared
+  # A source is blocked once it sends more than this many packets within one
+  # 1s window toward a mitigated destination. Keep this well above what shared
   # infrastructure (CDN/reverse-proxy edges, CGNAT, corporate NAT) legitimately
   # sends to one origin — a busy CDN edge easily sustains hundreds–thousands of
   # pps. Also runtime-editable via PUT /api/v1/limits (src_rate_pps).
   src-rate-pps: 10000
-  # Aggregation fan-out: this many child prefixes under a common parent
-  # collapse into one wider block (/32->/24->/16->/8), keeping the LPM trie
-  # bounded under distributed floods.
-  agg-fanout: 4
-  # Widest block aggregation may ever produce (smallest prefix length). The
-  # default /24 (v4) / /48 (v6) stops a scatter of offenders — e.g. legitimate
-  # CDN edge IPs — from ever collapsing into an allocation-crossing /16 or /8
-  # and blackholing huge swaths of the internet. Only widen these if you fully
-  # understand the collateral risk.
-  agg-max-prefix-v4: 24
-  agg-max-prefix-v6: 48
-  # Per-source block hysteresis: a source is DROPPING (in the block trie) only
-  # while its rate is high. It is released once its rate falls below
-  # src-exit-pct% of src-rate-pps for src-cooldown-secs — so a source that had
-  # one burst and returned to legitimate low-rate traffic is unblocked quickly,
-  # not held for the full TTL.
-  src-exit-pct: 50
+  # How long a tripped source stays blocked before re-evaluation. A source
+  # still over-rate re-extends its block every window, so the block outlives
+  # the flood by exactly one cooldown.
   src-cooldown-secs: 10
-  # Block offending sources as individual /32s (/128s) up to this many entries;
-  # only merge them into wider prefixes when the trie would exceed this budget
-  # ("merge only when running out of space"). Keeps blocks precise in the common
-  # case and avoids catching innocent neighbours in an aggregated prefix.
-  max-source-blocks: 50000
-  # Safety upper-bound: a block is force-lifted this many seconds after it stops
-  # being refreshed (the per-source state machine above is the primary release).
-  block-ttl-secs: 300
-  # Escalate a mitigating dest/prefix to source blocking (level 4) only if this
-  # many packets/second are still getting through after the port-filter layer.
+  # Escalate a mitigating dest/prefix to source blocking only if this many
+  # packets/second are still getting through after the port-filter layer.
   escalate-pass-pps: 50000
-  # Spoof gate: if more than this many distinct offenders appear in a window,
-  # treat the flood as spoofed and skip source blocking entirely (rely on the
-  # port filter). Source blocking only makes sense for bounded, real botnets.
-  max-real-sources: 10000
   # Enable the SYN-proxy (SYN-cookie handshake validation) on a mitigating
   # dest/prefix once its SYN rate reaches this many SYNs/second.
   syn-proxy-syn-pps: 5000

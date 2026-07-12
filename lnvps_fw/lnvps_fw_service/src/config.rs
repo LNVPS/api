@@ -313,43 +313,36 @@ pub struct Escalation {
     /// legitimately pushes hundreds–thousands of pps at a single origin.
     #[serde(default = "default_src_rate_pps")]
     pub src_rate_pps: u64,
-    /// Aggregation fan-out: this many child prefixes under a common parent
-    /// collapse into one wider block (/32->/24->/16->/8), keeping the LPM trie
-    /// bounded under distributed floods.
-    #[serde(default = "default_agg_fanout")]
-    pub agg_fanout: usize,
-    /// Widest IPv4 source block aggregation may ever produce (smallest prefix
-    /// length). Default /24 so a scatter of offenders (e.g. CDN edge IPs) can
-    /// never collapse into an allocation-crossing /16 or /8.
-    #[serde(default = "default_agg_max_prefix_v4")]
-    pub agg_max_prefix_v4: u32,
-    /// Widest IPv6 source block aggregation may ever produce. Default /48.
-    #[serde(default = "default_agg_max_prefix_v6")]
-    pub agg_max_prefix_v6: u32,
-    /// A DROPPING source's exit hysteresis: it returns to NORMAL (unblocked)
-    /// once its rate falls below this percentage of `src_rate_pps`.
-    #[serde(default = "default_exit_pct")]
-    pub src_exit_pct: u64,
-    /// Sustained seconds below the source exit threshold before a source is
-    /// unblocked (hysteresis, mirrors the destination cooldown).
+    /// How long the kernel rate machine blocks a tripped source before it is
+    /// re-evaluated (re-extended each window it stays over-rate).
     #[serde(default = "default_src_cooldown_secs")]
     pub src_cooldown_secs: u64,
-    /// Block sources as individual /32s (/128s) up to this many entries per
-    /// family; only aggregate into wider prefixes when the trie would exceed
-    /// this budget ("merge only when running out of space").
+    /// DEPRECATED, ignored: the per-source rate machine moved into the XDP
+    /// datapath, which blocks exact /32s|/128s in its state map — there is no
+    /// CIDR aggregation, spoof gate, or exit-hysteresis percentage anymore.
+    /// Kept parseable so existing config files keep loading across upgrades.
+    #[serde(default = "default_agg_fanout")]
+    pub agg_fanout: usize,
+    /// DEPRECATED, ignored (see `agg_fanout`).
+    #[serde(default = "default_agg_max_prefix_v4")]
+    pub agg_max_prefix_v4: u32,
+    /// DEPRECATED, ignored (see `agg_fanout`).
+    #[serde(default = "default_agg_max_prefix_v6")]
+    pub agg_max_prefix_v6: u32,
+    /// DEPRECATED, ignored (see `agg_fanout`).
+    #[serde(default = "default_exit_pct")]
+    pub src_exit_pct: u64,
+    /// DEPRECATED, ignored (see `agg_fanout`).
     #[serde(default = "default_max_source_blocks")]
     pub max_source_blocks: usize,
-    /// A CIDR block is lifted after this many seconds without being refreshed
-    /// (safety upper-bound; the per-source state machine is the primary
-    /// release path).
+    /// DEPRECATED, ignored (see `agg_fanout`).
     #[serde(default = "default_block_ttl_secs")]
     pub block_ttl_secs: u64,
     /// Escalate a mitigating dest/prefix to source blocking only if this many
     /// packets/second are still getting through after the port-filter layer.
     #[serde(default = "default_escalate_pass_pps")]
     pub escalate_pass_pps: u64,
-    /// Spoof gate: if more than this many distinct offenders appear in a window
-    /// the flood is treated as spoofed and source blocking is skipped.
+    /// DEPRECATED, ignored (see `agg_fanout`).
     #[serde(default = "default_max_real_sources")]
     pub max_real_sources: usize,
     /// Enable the SYN_PROXY flag on a mitigating dest/prefix once its SYN rate
@@ -537,15 +530,8 @@ impl Config {
             manual_v4: Vec::new(),
             manual_v6: Vec::new(),
             src_rate_pps: self.escalation.src_rate_pps,
-            fanout: self.escalation.agg_fanout,
-            agg_max_prefix_v4: self.escalation.agg_max_prefix_v4,
-            agg_max_prefix_v6: self.escalation.agg_max_prefix_v6,
-            src_exit_pct: self.escalation.src_exit_pct,
             src_cooldown_ns: self.escalation.src_cooldown_secs * 1_000_000_000,
-            max_source_blocks: self.escalation.max_source_blocks,
-            block_ttl_ns: self.escalation.block_ttl_secs * 1_000_000_000,
             escalate_pass_pps: self.escalation.escalate_pass_pps,
-            max_real_sources: self.escalation.max_real_sources,
             syn_proxy_pps: self.escalation.syn_proxy_syn_pps,
         })
     }
@@ -554,6 +540,26 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Config files written for the pre-in-kernel rate machine (with the
+    /// now-deprecated aggregation/spoof-gate/exit-hysteresis keys) MUST keep
+    /// parsing: a failed parse after a self-upgrade restart would take the
+    /// firewall down. The deprecated values are simply ignored.
+    #[test]
+    fn parses_legacy_escalation_keys() {
+        let cfg: Config = serde_yaml_ng::from_str(
+            "interfaces: [eno1]\nescalation:\n  src-rate-pps: 500\n  agg-fanout: 4\n  \
+             agg-max-prefix-v4: 24\n  agg-max-prefix-v6: 48\n  src-exit-pct: 50\n  \
+             src-cooldown-secs: 10\n  max-source-blocks: 50000\n  block-ttl-secs: 300\n  \
+             escalate-pass-pps: 50000\n  max-real-sources: 10000\n  syn-proxy-syn-pps: 5000\n",
+        )
+        .unwrap();
+        let rt = cfg.runtime_config().unwrap();
+        assert_eq!(rt.src_rate_pps, 500);
+        assert_eq!(rt.src_cooldown_ns, 10_000_000_000);
+        assert_eq!(rt.escalate_pass_pps, 50_000);
+        assert_eq!(rt.syn_proxy_pps, 5_000);
+    }
 
     #[test]
     fn parses_minimal_config() {

@@ -4,7 +4,7 @@ use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, ProgramArray};
 use lnvps_fw_common::{
     COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
-    LastSeen, PortKeyV4, PortKeyV6,
+    LastSeen, PortKeyV4, PortKeyV6, SrcRateConfig, SrcState,
 };
 
 /// Max number of destination IPs to track (per address family). Sized to a
@@ -48,17 +48,28 @@ pub static V4_TX_COUNTERS: LruPerCpuHashMap<[u8; 4], DestCounters> =
 pub static V6_TX_COUNTERS: LruPerCpuHashMap<[u8; 16], DestCounters> =
     LruPerCpuHashMap::with_max_entries(MAX_DST_IPS, 0);
 
-/// Per-source packet counters (IPv4), incremented only while the destination
-/// is mitigating. Sampled by userspace to compute per-source rates and drive
-/// CIDR escalation. LRU + per-CPU: bounded memory, summed across CPUs.
+/// Per-source fixed-window rate state (IPv4), owned by the XDP datapath: the
+/// rate calculation AND the blocking decision happen in-kernel, in-line, for
+/// packets already in hand — userspace never polls this for detection, it only
+/// reads it (batched) for the `/sources` display. LRU: bounded memory; a
+/// spoofed high-cardinality flood churns entries without ever tripping the
+/// per-source limit (the port-filter layer is the defense there, as before).
+/// Shared (not per-CPU): counting races undercount slightly, which is
+/// acceptable — the decision uses the same state the packets update.
 #[map]
-pub static V4_SRC_COUNTERS: LruPerCpuHashMap<[u8; 4], u64> =
-    LruPerCpuHashMap::with_max_entries(MAX_SRC_IPS, 0);
+pub static V4_SRC_STATE: LruHashMap<[u8; 4], SrcState> =
+    LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
 
-/// Per-source packet counters (IPv6).
+/// Per-source rate state (IPv6).
 #[map]
-pub static V6_SRC_COUNTERS: LruPerCpuHashMap<[u8; 16], u64> =
-    LruPerCpuHashMap::with_max_entries(MAX_SRC_IPS, 0);
+pub static V6_SRC_STATE: LruHashMap<[u8; 16], SrcState> =
+    LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
+
+/// Per-source rate-machine config (single entry), written by userspace at
+/// startup and on live `PUT /limits` edits. `max_per_window == 0` disables
+/// per-source blocking.
+#[map]
+pub static SRC_RATE_CFG: Array<SrcRateConfig> = Array::with_max_entries(1, 0);
 
 /// Mitigation state per destination (IPv4), an LPM trie written by userspace.
 /// Using a trie lets userspace mitigate a single IP (a /32 entry) or a whole
@@ -81,16 +92,6 @@ pub static OPEN_PORTS_V4: LruHashMap<PortKeyV4, LastSeen> =
 pub static OPEN_PORTS_V6: LruHashMap<PortKeyV6, LastSeen> =
     LruHashMap::with_max_entries(MAX_OPEN_PORTS, 0);
 
-/// Blocked source CIDRs (IPv4), an LPM trie of network-order address bytes.
-/// Written by userspace escalation; any source matching a prefix is dropped.
-/// Holds both individual /32 offenders and aggregated wider prefixes.
-#[map]
-pub static V4_CIDR_SRC: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
-
-/// Blocked source CIDRs (IPv6).
-#[map]
-pub static V6_CIDR_SRC: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
-
 /// Protected destination prefixes (IPv4). When scoping is enabled, only traffic
 /// to a covered destination is counted/mitigated; everything else is passed
 /// untouched (so a forwarding router never touches transit traffic).
@@ -101,9 +102,10 @@ pub static PROTECTED_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CI
 #[map]
 pub static PROTECTED_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
 
-/// Operator-pushed manual source-CIDR blocks. Unlike the auto `V*_CIDR_SRC`
-/// blocks (which only drop when the destination is escalated to SOURCE_BLOCK),
-/// these drop unconditionally for any traffic to a protected destination.
+/// Operator-pushed manual source-CIDR blocks. Unlike the automatic per-source
+/// rate gate (whose drops engage only when the destination is escalated to
+/// SOURCE_BLOCK), these drop unconditionally for any traffic to a protected
+/// destination.
 #[map]
 pub static MANUAL_BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
 
@@ -163,24 +165,64 @@ counters_for!(counters_v6, [u8; 16], V6_DEST_COUNTERS);
 counters_for!(tx_counters_v4, [u8; 4], V4_TX_COUNTERS);
 counters_for!(tx_counters_v6, [u8; 16], V6_TX_COUNTERS);
 
-/// Generate a per-source packet-count incrementer for one address family
-/// (called under mitigation). Pure counting — no policy decision.
-macro_rules! count_src_for {
+/// Generate the per-source fixed-window rate gate for one address family.
+/// Called for every packet to a mitigating destination. Counts the packet
+/// against the source's current window and returns `true` (drop) when
+/// `enforce` is set and the source is blocked.
+///
+/// The machine, entirely in-kernel:
+/// - window rolled (`now - window_start >= window_ns`): reset the count;
+/// - count the packet; crossing `max_per_window` sets/extends
+///   `blocked_until = now + cooldown` (a still-flooding source re-extends its
+///   block every window, so the block naturally outlives the flood by exactly
+///   one cooldown — that is the hysteresis);
+/// - blocked sources keep being *counted* (the rate is measured pre-drop) so
+///   expiry re-evaluates against live behaviour, not silence.
+///
+/// Counting is deliberately non-atomic (same as the counters this replaces):
+/// cross-CPU races undercount a few packets, which only ever errs toward NOT
+/// blocking.
+macro_rules! src_gate_for {
     ($name:ident, $key:ty, $map:ident) => {
         #[inline(always)]
-        pub fn $name(src: &$key) {
-            if let Some(c) = $map.get_ptr_mut(src) {
-                unsafe { *c += 1 };
-            } else {
-                let one: u64 = 1;
-                let _ = $map.insert(src, &one, 0);
+        pub fn $name(src: &$key, enforce: bool) -> bool {
+            let cfg = match SRC_RATE_CFG.get(0) {
+                Some(c) => c,
+                None => return false,
+            };
+            if cfg.max_per_window == 0 || cfg.window_ns == 0 {
+                return false;
+            }
+            let now = unsafe { bpf_ktime_get_ns() };
+            match $map.get_ptr_mut(src) {
+                Some(st) => {
+                    let st = unsafe { &mut *st };
+                    if now.wrapping_sub(st.window_start_ns) >= cfg.window_ns {
+                        st.window_start_ns = now;
+                        st.count = 0;
+                    }
+                    st.count += 1;
+                    if st.count > cfg.max_per_window {
+                        st.blocked_until_ns = now + cfg.cooldown_ns;
+                    }
+                    enforce && now < st.blocked_until_ns
+                }
+                None => {
+                    let st = SrcState {
+                        window_start_ns: now,
+                        count: 1,
+                        blocked_until_ns: 0,
+                    };
+                    let _ = $map.insert(src, &st, 0);
+                    false
+                }
             }
         }
     };
 }
 
-count_src_for!(count_src_v4, [u8; 4], V4_SRC_COUNTERS);
-count_src_for!(count_src_v6, [u8; 16], V6_SRC_COUNTERS);
+src_gate_for!(src_gate_v4, [u8; 4], V4_SRC_STATE);
+src_gate_for!(src_gate_v6, [u8; 16], V6_SRC_STATE);
 
 /// Generate a learn-open-port function for one address family. Called from the
 /// TC egress program with the local (source) address/port of an outbound
@@ -236,8 +278,6 @@ macro_rules! cidr_block_check {
     };
 }
 
-cidr_block_check!(cidr_blocked_v4, [u8; 4], 32, V4_CIDR_SRC);
-cidr_block_check!(cidr_blocked_v6, [u8; 16], 128, V6_CIDR_SRC);
 cidr_block_check!(protected_v4, [u8; 4], 32, PROTECTED_V4);
 cidr_block_check!(protected_v6, [u8; 16], 128, PROTECTED_V6);
 cidr_block_check!(manual_blocked_v4, [u8; 4], 32, MANUAL_BLOCK_V4);

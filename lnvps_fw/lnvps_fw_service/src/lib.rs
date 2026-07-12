@@ -3,6 +3,7 @@
 //! (config parsing, learned-port GC) unit-testable and reusable.
 
 pub mod api;
+pub mod batch;
 pub mod cidr;
 pub mod config;
 pub mod detect;

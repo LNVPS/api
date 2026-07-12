@@ -25,7 +25,11 @@ use lnvps_fw_service::config::{Config, IfaceRole};
 use lnvps_fw_service::detect::{DestTracker, DetectionConfig, Rates};
 use lnvps_fw_service::gc;
 use lnvps_fw_service::publish::{MitInput, MitTracker};
-use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control};
+use lnvps_fw_service::runtime::{self, DetectionState, RuntimeConfig, run_control, scan_plain};
+
+/// A NORMAL (unblocked) source state idle for this long is swept from the
+/// kernel state maps by the GC timer.
+const SRC_STATE_IDLE_TTL_NS: u64 = 60 * 1_000_000_000;
 
 /// Sweep both learned-ports maps, returning the total number of entries
 /// removed. TTL is compared against the monotonic clock (matching
@@ -34,18 +38,24 @@ fn gc_learned_ports(bpf: &mut Ebpf, tcp_ttl_ns: u64, udp_ttl_ns: u64) -> Result<
     let now = gc::monotonic_now_ns();
     let mut removed = 0;
     {
+        // Batched scan first (one syscall per ~4k entries), then remove the
+        // expired keys through the typed handle.
+        let entries: Vec<(PortKeyV4, LastSeen)> = scan_plain(&*bpf, "OPEN_PORTS_V4")?;
+        let expired = gc::expired_ports(&entries, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
         let mut v4: AyaHashMap<_, PortKeyV4, LastSeen> = AyaHashMap::try_from(
             bpf.map_mut("OPEN_PORTS_V4")
                 .context("open ports v4 missing")?,
         )?;
-        removed += gc::gc_open_ports(&mut v4, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
+        removed += gc::remove_keys(&mut v4, &expired);
     }
     {
+        let entries: Vec<(PortKeyV6, LastSeen)> = scan_plain(&*bpf, "OPEN_PORTS_V6")?;
+        let expired = gc::expired_ports(&entries, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
         let mut v6: AyaHashMap<_, PortKeyV6, LastSeen> = AyaHashMap::try_from(
             bpf.map_mut("OPEN_PORTS_V6")
                 .context("open ports v6 missing")?,
         )?;
-        removed += gc::gc_open_ports(&mut v6, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
+        removed += gc::remove_keys(&mut v6, &expired);
     }
     Ok(removed)
 }
@@ -162,18 +172,17 @@ where
     K: aya::Pod + Eq + std::hash::Hash,
 {
     let now = gc::monotonic_now_ns();
+    // Batched scan (one syscall per ~4k entries), then targeted removals.
+    let entries: Vec<(K, u64)> = scan_plain(&*bpf, name)?;
+    let expired: Vec<K> = entries
+        .iter()
+        .filter(|(_, ts)| gc::is_expired(*ts, now, ttl_ns))
+        .map(|(k, _)| *k)
+        .collect();
     let mut map: AyaHashMap<_, K, u64> = AyaHashMap::try_from(
         bpf.map_mut(name)
             .with_context(|| format!("{name} missing"))?,
     )?;
-    let expired: Vec<K> = map
-        .keys()
-        .flatten()
-        .filter(|k| match map.get(k, 0) {
-            Ok(ts) => gc::is_expired(ts, now, ttl_ns),
-            Err(_) => false,
-        })
-        .collect();
     let mut removed = 0;
     for k in &expired {
         if map.remove(k).is_ok() {
@@ -354,79 +363,76 @@ fn collect_tracked(
     out
 }
 
-/// Snapshot the active blocked source CIDRs (from SOURCE_BLOCK escalation).
+/// Estimate a source's live pps from its kernel window state: packets counted
+/// this window over the window's elapsed time. An idle source's stale window
+/// decays toward zero naturally (elapsed keeps growing while count doesn't).
+/// Elapsed is floored at 100ms so a freshly-rolled window can't inflate.
+fn src_pps_estimate(st: &lnvps_fw_common::SrcState, now_ns: u64) -> u64 {
+    let elapsed = now_ns.saturating_sub(st.window_start_ns).max(100_000_000);
+    ((st.count as u128 * 1_000_000_000u128) / elapsed as u128) as u64
+}
+
+/// Snapshot the currently-blocked sources (kernel `blocked_until` in the
+/// future) as /32|/128 "blocks" for the legacy `/blocks` view. The block list
+/// IS the per-source state map now — there is no CIDR aggregation; `age_secs`
+/// reports seconds until the block expires (re-extended while still over-rate)
+/// and `cooling` is always false (the exit-hysteresis display state is gone).
 fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
-    let age = |ts: u64| now_ns.saturating_sub(ts) / 1_000_000_000;
-    // A block is "cooling" if none of its covered sources is still actively
-    // over-rate (all have entered the exit-hysteresis countdown).
-    let cooling_v4 = |c: &lnvps_fw_service::cidr::CidrV4| {
-        !det.src_v4.iter().any(|(ip, t)| {
-            t.dropping && t.below_since_ns.is_none() && mask_v4(*ip, c.prefix_len) == c.network
-        })
-    };
-    let cooling_v6 = |c: &lnvps_fw_service::cidr::CidrV6| {
-        !det.src_v6.iter().any(|(ip, t)| {
-            t.dropping && t.below_since_ns.is_none() && mask_v6(*ip, c.prefix_len) == c.network
-        })
-    };
+    let remaining = |until: u64| until.saturating_sub(now_ns) / 1_000_000_000;
     let mut out: Vec<SourceBlock> = det
-        .blocks_v4
+        .src_v4
         .iter()
-        .map(|(c, &ts)| SourceBlock {
-            cidr: format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
-            age_secs: age(ts),
-            pps: det.block_pps_v4.get(c).copied().unwrap_or(0),
+        .filter(|(_, st)| st.blocked_until_ns > now_ns)
+        .map(|(ip, st)| SourceBlock {
+            cidr: format!("{}/32", Ipv4Addr::from(*ip)),
+            age_secs: remaining(st.blocked_until_ns),
+            pps: src_pps_estimate(st, now_ns),
             manual: false,
-            cooling: cooling_v4(c),
+            cooling: false,
         })
-        .chain(det.blocks_v6.iter().map(|(c, &ts)| SourceBlock {
-            cidr: format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
-            age_secs: age(ts),
-            pps: det.block_pps_v6.get(c).copied().unwrap_or(0),
-            manual: false,
-            cooling: cooling_v6(c),
-        }))
+        .chain(
+            det.src_v6
+                .iter()
+                .filter(|(_, st)| st.blocked_until_ns > now_ns)
+                .map(|(ip, st)| SourceBlock {
+                    cidr: format!("{}/128", Ipv6Addr::from(*ip)),
+                    age_secs: remaining(st.blocked_until_ns),
+                    pps: src_pps_estimate(st, now_ns),
+                    manual: false,
+                    cooling: false,
+                }),
+        )
         .collect();
     // Most active first (the API re-sorts the merged manual+auto set too).
     out.sort_by(|a, b| b.pps.cmp(&a.pps).then_with(|| a.cidr.cmp(&b.cidr)));
     out
 }
 
-/// Snapshot every rate-tracked source (all states) for the `/sources` view.
-/// While a destination is mitigating the eBPF counts each source and the
-/// per-source state machine lives in `det.src_v4`/`src_v6`; this exposes the
-/// whole set with its 3-state label so the UI can show NORMAL sources too, not
-/// just the blocked (dropping/cooling) subset that `/blocks` carries.
+/// Snapshot every kernel-tracked source for the `/sources` view. The rate
+/// machine (and the blocking decision) lives in XDP; this only relabels its
+/// state for display: blocked → `dropping`, otherwise `normal`.
 fn collect_sources(det: &DetectionState, now_ns: u64) -> Vec<TrackedSource> {
-    let age = |ns: u64| now_ns.saturating_sub(ns) / 1_000_000_000;
-    // NORMAL = not dropping; DROPPING = at/over rate (no cooldown clock yet);
-    // COOLING = still dropping but below the exit threshold, counting down.
-    let state = |t: &lnvps_fw_service::detect::SourceTracker| {
-        if !t.dropping {
-            "normal"
-        } else if t.below_since_ns.is_none() {
+    let row = |ip: String, st: &lnvps_fw_common::SrcState| TrackedSource {
+        ip,
+        pps: src_pps_estimate(st, now_ns),
+        state: if st.blocked_until_ns > now_ns {
             "dropping"
         } else {
-            "cooling"
+            "normal"
         }
+        .to_string(),
+        manual: false,
+        age_secs: now_ns.saturating_sub(st.window_start_ns) / 1_000_000_000,
     };
     let mut out: Vec<TrackedSource> = det
         .src_v4
         .iter()
-        .map(|(ip, t)| TrackedSource {
-            ip: Ipv4Addr::from(*ip).to_string(),
-            pps: t.last_pps,
-            state: state(t).to_string(),
-            manual: false,
-            age_secs: age(t.last_ns),
-        })
-        .chain(det.src_v6.iter().map(|(ip, t)| TrackedSource {
-            ip: Ipv6Addr::from(*ip).to_string(),
-            pps: t.last_pps,
-            state: state(t).to_string(),
-            manual: false,
-            age_secs: age(t.last_ns),
-        }))
+        .map(|(ip, st)| row(Ipv4Addr::from(*ip).to_string(), st))
+        .chain(
+            det.src_v6
+                .iter()
+                .map(|(ip, st)| row(Ipv6Addr::from(*ip).to_string(), st)),
+        )
         .collect();
     // Most active first (the API re-sorts + paginates too).
     out.sort_by(|a, b| b.pps.cmp(&a.pps).then_with(|| a.ip.cmp(&b.ip)));
@@ -448,7 +454,6 @@ fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
     rt.network.exit_pct = l.exit_pct;
     rt.network.cooldown_ns = cooldown_ns;
     rt.src_rate_pps = l.src_rate_pps;
-    rt.src_exit_pct = l.src_exit_pct;
     rt.src_cooldown_ns = l.src_cooldown_secs.saturating_mul(1_000_000_000);
 }
 
@@ -1069,10 +1074,11 @@ async fn main() -> Result<()> {
             exit_pct: det.exit_pct,
             cooldown_secs: det.cooldown_ns / 1_000_000_000,
             src_rate_pps: runtime_cfg.src_rate_pps,
-            src_exit_pct: runtime_cfg.src_exit_pct,
             src_cooldown_secs: runtime_cfg.src_cooldown_ns / 1_000_000_000,
         });
     }
+    // Arm the in-kernel per-source rate machine before traffic decisions.
+    runtime::write_src_rate_cfg(&mut bpf, &runtime_cfg)?;
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     // Rotate the SYN-cookie secret periodically; cookies issued in the previous
@@ -1133,6 +1139,11 @@ async fn main() -> Result<()> {
                     if v != limits_version {
                         limits_version = v;
                         apply_limits(&mut runtime_cfg, &st.limits());
+                        // Push the per-source limits into the kernel rate
+                        // machine (it owns per-source blocking now).
+                        if let Err(e) = runtime::write_src_rate_cfg(&mut bpf, &runtime_cfg) {
+                            warn!("writing src rate config failed: {e}");
+                        }
                         info!("detection limits updated via API");
                     }
                 }
@@ -1229,6 +1240,14 @@ async fn main() -> Result<()> {
                 if let Err(e) = gc_verified(&mut bpf, verified_ttl_ns) {
                     warn!("verified GC failed: {e}");
                 }
+                // Sweep idle per-source rate states (the kernel machine never
+                // self-cleans; without this the state maps and the /sources
+                // view would hold every source ever seen under mitigation).
+                match runtime::gc_src_states(&mut bpf, SRC_STATE_IDLE_TTL_NS) {
+                    Ok(n) if n > 0 => info!("GC removed {n} idle source state(s)"),
+                    Ok(_) => {}
+                    Err(e) => warn!("source-state GC failed: {e}"),
+                }
                 // Refresh the learned-ports snapshot for the control API.
                 if let Some(st) = &api_state {
                     st.set_ports(collect_ports(&bpf));
@@ -1244,4 +1263,37 @@ async fn main() -> Result<()> {
     }
     info!("Shutdown complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lnvps_fw_common::SrcState;
+
+    const SEC: u64 = 1_000_000_000;
+
+    #[test]
+    fn src_pps_estimate_scales_count_over_window_elapsed() {
+        let st = SrcState {
+            window_start_ns: 0,
+            count: 500,
+            blocked_until_ns: 0,
+        };
+        // Half a second into the window, 500 packets => 1000 pps.
+        assert_eq!(src_pps_estimate(&st, SEC / 2), 1000);
+        // A stale window decays naturally: same 500 packets over 10s => 50.
+        assert_eq!(src_pps_estimate(&st, 10 * SEC), 50);
+    }
+
+    #[test]
+    fn src_pps_estimate_floors_tiny_elapsed() {
+        let st = SrcState {
+            window_start_ns: 0,
+            count: 10,
+            blocked_until_ns: 0,
+        };
+        // 1ms into a fresh window: elapsed floored at 100ms so the estimate is
+        // 100 pps, not 10_000 (no burst inflation from a just-rolled window).
+        assert_eq!(src_pps_estimate(&st, 1_000_000), 100);
+    }
 }

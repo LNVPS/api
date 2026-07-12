@@ -15,7 +15,7 @@
 //!
 //! The eBPF side only counts and enforces; every threshold decision is here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -27,13 +27,12 @@ use log::{info, warn};
 
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
-    DestCounters, DestState,
+    DestCounters, DestState, SrcRateConfig, SrcState,
 };
 
-use crate::cidr::{CidrV4, CidrV6, mask_v4, mask_v6, plan_blocks_v4, plan_blocks_v6};
+use crate::cidr::{mask_v4, mask_v6};
 use crate::detect::{
-    DestTracker, DetectionConfig, Rates, SourceDetectionConfig, SourceTracker, Transition,
-    advance_source, compute_rates, process_sample,
+    DestTracker, DetectionConfig, Rates, Transition, compute_rates, process_sample,
 };
 
 /// Runtime configuration for one control tick.
@@ -56,36 +55,15 @@ pub struct RuntimeConfig {
     pub manual_v4: Vec<(u32, [u8; 4], u32)>,
     /// Manual override flags (IPv6).
     pub manual_v6: Vec<(u32, [u8; 16], u32)>,
-    /// Per-source packets/second that marks a source as an offender.
+    /// Per-source packets/second limit for the in-kernel rate machine
+    /// (written to `SRC_RATE_CFG` as `max_per_window` over a 1s window).
     pub src_rate_pps: u64,
-    /// Aggregation fan-out: this many child prefixes under a parent collapse to
-    /// the parent (/32->/24->/16->/8, /128->/64->/48->/32).
-    pub fanout: usize,
-    /// Widest IPv4 source block aggregation may ever produce (smallest prefix
-    /// length, e.g. 24 = never wider than a /24). Prevents a scatter of
-    /// offenders from collapsing into a huge allocation-crossing block.
-    pub agg_max_prefix_v4: u32,
-    /// Widest IPv6 source block aggregation may ever produce.
-    pub agg_max_prefix_v6: u32,
-    /// A DROPPING source's exit hysteresis (% of `src_rate_pps`).
-    pub src_exit_pct: u64,
-    /// Sustained time below the source exit threshold before a source returns
-    /// to NORMAL and is unblocked.
+    /// How long the kernel machine blocks a tripped source before it is
+    /// re-evaluated (re-extended each window it is still over-rate).
     pub src_cooldown_ns: u64,
-    /// Trie-space budget: block sources as individual /32s (v4) / /128s (v6)
-    /// until this many entries, only aggregating under pressure beyond it.
-    pub max_source_blocks: usize,
-    /// A CIDR block is lifted this many ns after it stops being refreshed
-    /// (safety upper-bound for sources evicted from the per-source counter LRU;
-    /// the per-source state machine is the primary release mechanism).
-    pub block_ttl_ns: u64,
     /// Escalate a mitigating dest/prefix to `SOURCE_BLOCK` only if this many
     /// packets/second are still getting through after the port filter.
     pub escalate_pass_pps: u64,
-    /// Spoof gate: if more than this many distinct offenders are seen in a
-    /// window, treat the flood as spoofed and skip source blocking entirely
-    /// (rely on the port filter instead of chasing unblockable /32s).
-    pub max_real_sources: usize,
     /// Enable the SYN_PROXY flag once a mitigating entity's SYN rate reaches
     /// this many SYNs/second.
     pub syn_proxy_pps: u64,
@@ -122,18 +100,13 @@ pub struct DetectionState {
     /// Per-protected-prefix detection trackers, keyed by (prefix_len, network).
     pub prefix_v4: HashMap<(u32, [u8; 4]), DestTracker>,
     pub prefix_v6: HashMap<(u32, [u8; 16]), DestTracker>,
-    /// Per-source rate state machines (NORMAL/DROPPING with hysteresis), keyed
-    /// by source address. A source is in the block trie only while its tracker
-    /// is DROPPING; it is released as soon as its rate falls back (hysteresis),
-    /// not held for a blind TTL.
-    pub src_v4: HashMap<[u8; 4], SourceTracker>,
-    pub src_v6: HashMap<[u8; 16], SourceTracker>,
-    /// Active CIDR blocks -> timestamp last refreshed (for TTL decay).
-    pub blocks_v4: HashMap<CidrV4, u64>,
-    pub blocks_v6: HashMap<CidrV6, u64>,
-    /// Active CIDR blocks -> current aggregate pps from sources under them.
-    pub block_pps_v4: HashMap<CidrV4, u64>,
-    pub block_pps_v6: HashMap<CidrV6, u64>,
+    /// Latest batched snapshot of the kernel-owned per-source rate states
+    /// (display only — the rate machine and blocking decision live in XDP).
+    pub src_v4: Vec<([u8; 4], SrcState)>,
+    pub src_v6: Vec<([u8; 16], SrcState)>,
+    /// `bpf_ktime_get_ns`-domain timestamp of the snapshot (SrcState fields
+    /// are kernel-monotonic; compare against this, not userspace clocks).
+    pub src_sampled_ns: u64,
     /// Previous cumulative TX (egress) counter snapshots, keyed by local IP.
     pub prev_tx_v4: HashMap<[u8; 4], DestCounters>,
     pub prev_tx_v6: HashMap<[u8; 16], DestCounters>,
@@ -146,15 +119,77 @@ pub struct DetectionState {
 pub fn sum_counters<'a>(values: impl IntoIterator<Item = &'a DestCounters>) -> DestCounters {
     let mut total = DestCounters::default();
     for v in values {
-        total.packets += v.packets;
-        total.bytes += v.bytes;
-        total.syn_packets += v.syn_packets;
-        total.tcp_packets += v.tcp_packets;
-        total.udp_packets += v.udp_packets;
-        total.icmp_packets += v.icmp_packets;
-        total.dropped += v.dropped;
+        add_counters(&mut total, v);
     }
     total
+}
+
+/// Add one per-CPU `DestCounters` slot into an accumulator (batch-read fold).
+fn add_counters(acc: &mut DestCounters, v: &DestCounters) {
+    acc.packets += v.packets;
+    acc.bytes += v.bytes;
+    acc.syn_packets += v.syn_packets;
+    acc.tcp_packets += v.tcp_packets;
+    acc.udp_packets += v.udp_packets;
+    acc.icmp_packets += v.icmp_packets;
+    acc.dropped += v.dropped;
+}
+
+/// Cached count of possible CPUs (the per-CPU map value stride).
+fn possible_cpus() -> Result<usize> {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(n) = N.get() {
+        return Ok(*n);
+    }
+    let n = aya::util::nr_cpus().map_err(|(what, e)| anyhow::anyhow!("{what}: {e}"))?;
+    Ok(*N.get_or_init(|| n))
+}
+
+/// The map's fd if its type takes the hash-family `BPF_MAP_LOOKUP_BATCH` path.
+fn batch_fd(map: &aya::maps::Map) -> Option<std::os::fd::BorrowedFd<'_>> {
+    use std::os::fd::AsFd;
+    match map {
+        aya::maps::Map::HashMap(d)
+        | aya::maps::Map::LruHashMap(d)
+        | aya::maps::Map::PerCpuHashMap(d)
+        | aya::maps::Map::PerCpuLruHashMap(d) => Some(d.fd().as_fd()),
+        _ => None,
+    }
+}
+
+/// Handle a batch-read failure: permanent unsupport logs once and returns
+/// `Ok(())` so the caller falls through to per-entry iteration; anything else
+/// propagates.
+fn batch_fallback(name: &str, e: std::io::Error) -> Result<()> {
+    if crate::batch::note_failure(&e) {
+        warn!("batched read of {name} unsupported ({e}); using per-entry iteration");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("batched read of {name} failed: {e}"))
+    }
+}
+
+/// Batched read of a **plain** hash map with per-entry fallback (GC scans).
+pub fn scan_plain<K, V>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, V)>>
+where
+    K: Pod,
+    V: Pod + Copy,
+{
+    let map = bpf.map(name).with_context(|| format!("{name} missing"))?;
+    if crate::batch::supported()
+        && let Some(fd) = batch_fd(map)
+    {
+        match crate::batch::read_plain::<K, V>(fd) {
+            Ok(v) => return Ok(v),
+            Err(e) => batch_fallback(name, e)?,
+        }
+    }
+    let map: aya::maps::HashMap<_, K, V> = aya::maps::HashMap::try_from(map)?;
+    let mut out = Vec::new();
+    for entry in map.iter() {
+        out.push(entry?);
+    }
+    Ok(out)
 }
 
 fn dest_state(level: u32, now_ns: u64) -> DestState {
@@ -170,19 +205,17 @@ fn dest_state(level: u32, now_ns: u64) -> DestState {
 /// (bounded/real offenders present) and traffic is still getting through after
 /// the port filter. Other flags (SYN_PROXY, RATE_CAPS) are OR'd in here as they
 /// are implemented, so any subset can be active at once.
-fn enforced_flags(
-    rates: &Rates,
-    source_block_active: bool,
-    escalate_pass_pps: u64,
-    syn_proxy_pps: u64,
-) -> u32 {
+fn enforced_flags(rates: &Rates, escalate_pass_pps: u64, syn_proxy_pps: u64) -> u32 {
     let mut flags = DEST_MODE_PORT_FILTER;
     // A sustained SYN flood engages the SYN-proxy (validate handshakes to open
     // TCP ports with cookies). High efficacy vs spoofed SYN floods, low FP.
     if rates.syn_pps >= syn_proxy_pps {
         flags |= DEST_MODE_SYN_PROXY;
     }
-    if source_block_active && rates.pass_pps >= escalate_pass_pps {
+    // Escalate on residual pass-rate alone: the in-kernel gate only ever
+    // blocks sources genuinely over the per-source limit, so a spoofed flood
+    // (which never trips it) makes the flag harmless rather than dangerous.
+    if rates.pass_pps >= escalate_pass_pps {
         flags |= DEST_MODE_SOURCE_BLOCK;
     }
     flags
@@ -211,7 +244,6 @@ fn detect_family<K>(
     bits: u32,
     trackers: &mut HashMap<K, DestTracker>,
     cfg: &DetectionConfig,
-    source_block_active: bool,
     escalate_pass_pps: u64,
     syn_proxy_pps: u64,
     now_ns: u64,
@@ -244,12 +276,7 @@ fn detect_family<K>(
         }
         // Active: pick the enforcement level (never below the manual floor) and
         // (re)write it if changed.
-        let target = enforced_flags(
-            &rates,
-            source_block_active,
-            escalate_pass_pps,
-            syn_proxy_pps,
-        ) | manual;
+        let target = enforced_flags(&rates, escalate_pass_pps, syn_proxy_pps) | manual;
         if transition == Transition::Entered {
             let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
             tracker.flags = target;
@@ -280,7 +307,6 @@ fn detect_prefix<K>(
     mask: impl Fn(K, u32) -> K,
     trackers: &mut HashMap<(u32, K), DestTracker>,
     cfg: &DetectionConfig,
-    source_block_active: bool,
     escalate_pass_pps: u64,
     syn_proxy_pps: u64,
     now_ns: u64,
@@ -321,12 +347,7 @@ fn detect_prefix<K>(
         }
         return;
     }
-    let target = enforced_flags(
-        &rates,
-        source_block_active,
-        escalate_pass_pps,
-        syn_proxy_pps,
-    ) | manual;
+    let target = enforced_flags(&rates, escalate_pass_pps, syn_proxy_pps) | manual;
     if transition == Transition::Entered {
         let _ = trie.insert(
             &Key::new(prefix_len, network),
@@ -362,13 +383,27 @@ fn detect_prefix<K>(
     }
 }
 
-/// Read + per-CPU-sum a `DestCounters` map into an owned vec.
+/// Read + per-CPU-sum a `DestCounters` map into an owned vec. Uses one
+/// `BPF_MAP_LOOKUP_BATCH` syscall per ~4k entries, falling back to aya's
+/// per-entry iteration (2 syscalls/entry) on kernels without batch support.
 fn read_counters<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, DestCounters)>>
 where
     K: Pod,
 {
-    let map: PerCpuHashMap<_, K, DestCounters> =
-        PerCpuHashMap::try_from(bpf.map(name).with_context(|| format!("{name} missing"))?)?;
+    let map = bpf.map(name).with_context(|| format!("{name} missing"))?;
+    if crate::batch::supported()
+        && let Some(fd) = batch_fd(map)
+    {
+        match crate::batch::read_percpu_folded::<K, DestCounters, DestCounters>(
+            fd,
+            possible_cpus()?,
+            add_counters,
+        ) {
+            Ok(v) => return Ok(v),
+            Err(e) => batch_fallback(name, e)?,
+        }
+    }
+    let map: PerCpuHashMap<_, K, DestCounters> = PerCpuHashMap::try_from(map)?;
     let mut out = Vec::new();
     for entry in map.iter() {
         let (k, values) = entry?;
@@ -377,216 +412,59 @@ where
     Ok(out)
 }
 
-/// Read + per-CPU-sum a per-source `u64` counter map into an owned vec.
-fn read_src_counters<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, u64)>>
-where
-    K: Pod,
-{
-    let map: PerCpuHashMap<_, K, u64> =
-        PerCpuHashMap::try_from(bpf.map(name).with_context(|| format!("{name} missing"))?)?;
-    let mut out = Vec::new();
-    for entry in map.iter() {
-        let (k, values) = entry?;
-        out.push((k, values.iter().copied().sum()));
-    }
-    Ok(out)
-}
+/// Fixed per-source counting window for the in-kernel rate machine. One
+/// second: `src_rate_pps` is then literally "packets per second", exact, not
+/// a delta over a variable sample interval.
+pub const SRC_WINDOW_NS: u64 = 1_000_000_000;
 
-/// Advance every source's rate state machine for one family and return the set
-/// of addresses currently in DROPPING. Sources not sampled this window (evicted
-/// from the counter LRU, or gone quiet) are driven toward NORMAL with a
-/// zero-rate window and dropped from the tracker map once they return to
-/// NORMAL, so the map stays bounded.
-fn step_sources<K>(
-    cur: &[(K, u64)],
-    trackers: &mut HashMap<K, SourceTracker>,
-    scfg: &SourceDetectionConfig,
-    now_ns: u64,
-    elapsed_ns: u64,
-) -> Vec<K>
-where
-    K: Eq + Hash + Copy,
-{
-    let cur_map: HashMap<K, u64> = cur.iter().copied().collect();
-    let mut dropping = Vec::new();
-    for (k, c) in cur {
-        let t = trackers.entry(*k).or_default();
-        let (drop, _) = advance_source(t, *c, scfg, now_ns, elapsed_ns);
-        if drop {
-            dropping.push(*k);
-        }
-    }
-    // Sources absent from this window's sample: no new packets, so advance them
-    // with a zero-rate window (delta 0). Once a source returns to NORMAL it is
-    // removed; while still cooling down in DROPPING it stays blocked.
-    let stale: Vec<K> = trackers
-        .keys()
-        .filter(|k| !cur_map.contains_key(*k))
-        .copied()
-        .collect();
-    for k in stale {
-        let t = trackers.get_mut(&k).expect("stale key present");
-        let prev = t.prev;
-        let (drop, _) = advance_source(t, prev, scfg, now_ns, elapsed_ns);
-        if drop {
-            dropping.push(k);
-        } else {
-            trackers.remove(&k);
-        }
-    }
-    dropping
-}
-
-/// Reconcile one family's CIDR block trie to exactly the `desired` set: install
-/// entries that are newly desired, remove entries no longer desired. Unlike the
-/// old TTL scheme this is a pure set-diff against the per-source state machine's
-/// current DROPPING set — a source is unblocked the moment its tracker leaves
-/// DROPPING, not after a blind TTL.
-fn reconcile_block_set<K, C>(
-    blocks: &mut HashMap<C, u64>,
-    trie: &mut LpmTrie<&mut MapData, K, u8>,
-    desired: &[C],
-    now_ns: u64,
-    key_of: impl Fn(&C) -> Key<K>,
-    fmt_cidr: impl Fn(&C) -> String,
-) where
-    K: Pod,
-    C: Eq + Hash + Copy,
-{
-    let want: HashSet<C> = desired.iter().copied().collect();
-    for c in desired {
-        if !blocks.contains_key(c) {
-            if let Err(e) = trie.insert(&key_of(c), 1, 0) {
-                warn!("failed to install CIDR block {}: {e}", fmt_cidr(c));
-                continue;
-            }
-            blocks.insert(*c, now_ns);
-            warn!("CIDR BLOCK {}", fmt_cidr(c));
-        }
-    }
-    let gone: Vec<C> = blocks
-        .keys()
-        .filter(|c| !want.contains(c))
-        .copied()
-        .collect();
-    for c in gone {
-        let _ = trie.remove(&key_of(&c));
-        blocks.remove(&c);
-        info!("CIDR UNBLOCK {}", fmt_cidr(&c));
-    }
-}
-
-/// Aggregate per-block current pps from the per-source trackers under each
-/// active block (for the API/dashboard view).
-fn block_pps<K, C>(
-    blocks: &HashMap<C, u64>,
-    trackers: &HashMap<K, SourceTracker>,
-    covers: impl Fn(&C, &K) -> bool,
-) -> HashMap<C, u64>
-where
-    K: Eq + Hash + Copy,
-    C: Eq + Hash + Copy,
-{
-    blocks
-        .keys()
-        .map(|c| {
-            let sum = trackers
-                .iter()
-                .filter(|(ip, _)| covers(c, ip))
-                .map(|(_, t)| t.last_pps)
-                // (covers takes &C, &K; ip is &&K via match ergonomics)
-                .sum();
-            (*c, sum)
-        })
-        .collect::<HashMap<C, u64>>()
-}
-
-fn src_cfg(cfg: &RuntimeConfig) -> SourceDetectionConfig {
-    SourceDetectionConfig {
-        rate_pps: cfg.src_rate_pps,
-        exit_pct: cfg.src_exit_pct,
+/// Write the kernel per-source rate-machine config (`SRC_RATE_CFG[0]`).
+/// Called at startup and whenever the limits change (`PUT /limits`).
+/// `max_per_window` is precomputed so the datapath never divides.
+pub fn write_src_rate_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
+    let mut arr: aya::maps::Array<_, SrcRateConfig> = aya::maps::Array::try_from(
+        bpf.map_mut("SRC_RATE_CFG")
+            .context("SRC_RATE_CFG missing")?,
+    )?;
+    let c = SrcRateConfig {
+        max_per_window: cfg.src_rate_pps.saturating_mul(SRC_WINDOW_NS) / 1_000_000_000,
+        window_ns: SRC_WINDOW_NS,
         cooldown_ns: cfg.src_cooldown_ns,
-    }
+    };
+    arr.set(0, c, 0).context("writing SRC_RATE_CFG")?;
+    Ok(())
 }
 
-/// Source analysis for one family: advance the per-source state machines, apply
-/// the spoof gate, plan the block set (/32-first, aggregating only under trie
-/// pressure), and reconcile the trie. Returns whether any block is active
-/// (drives escalation to `SOURCE_BLOCK`).
-fn source_control_v4(
-    bpf: &mut Ebpf,
-    state: &mut DetectionState,
-    cfg: &RuntimeConfig,
-    now_ns: u64,
-    elapsed_ns: u64,
-) -> Result<bool> {
-    let cur = read_src_counters::<[u8; 4]>(bpf, "V4_SRC_COUNTERS")?;
-    let dropping = step_sources(&cur, &mut state.src_v4, &src_cfg(cfg), now_ns, elapsed_ns);
-    // Spoof gate: an unbounded DROPPING set means a spoofed flood — skip source
-    // blocking (chasing spoofed /32s is pointless; rely on the port filter).
-    let desired = if dropping.len() > cfg.max_real_sources {
-        Vec::new()
-    } else {
-        plan_blocks_v4(
-            &dropping,
-            cfg.fanout,
-            cfg.max_source_blocks,
-            cfg.agg_max_prefix_v4,
-        )
-    };
-    {
-        let mut trie: LpmTrie<_, [u8; 4], u8> =
-            LpmTrie::try_from(bpf.map_mut("V4_CIDR_SRC").context("v4 cidr trie missing")?)?;
-        reconcile_block_set(
-            &mut state.blocks_v4,
-            &mut trie,
-            &desired,
-            now_ns,
-            |c| Key::new(c.prefix_len, c.network),
-            |c| format!("{}/{}", Ipv4Addr::from(c.network), c.prefix_len),
-        );
-    }
-    state.block_pps_v4 = block_pps(&state.blocks_v4, &state.src_v4, |c, ip| {
-        mask_v4(*ip, c.prefix_len) == c.network
-    });
-    Ok(!state.blocks_v4.is_empty())
+/// Remove idle per-source state entries: the kernel machine never self-cleans,
+/// so without this sweep the state maps (and the `/sources` view) would hold
+/// every source ever seen under mitigation. An entry is stale once it is not
+/// blocked and its window anchor is older than `idle_ttl_ns`. Runs on the slow
+/// GC timer — steady-state cost is proportional to live sources, not history.
+pub fn gc_src_states(bpf: &mut Ebpf, idle_ttl_ns: u64) -> Result<usize> {
+    let now = crate::gc::monotonic_now_ns();
+    let mut removed = 0;
+    removed += gc_src_state_map::<[u8; 4]>(bpf, "V4_SRC_STATE", now, idle_ttl_ns)?;
+    removed += gc_src_state_map::<[u8; 16]>(bpf, "V6_SRC_STATE", now, idle_ttl_ns)?;
+    Ok(removed)
 }
 
-fn source_control_v6(
-    bpf: &mut Ebpf,
-    state: &mut DetectionState,
-    cfg: &RuntimeConfig,
-    now_ns: u64,
-    elapsed_ns: u64,
-) -> Result<bool> {
-    let cur = read_src_counters::<[u8; 16]>(bpf, "V6_SRC_COUNTERS")?;
-    let dropping = step_sources(&cur, &mut state.src_v6, &src_cfg(cfg), now_ns, elapsed_ns);
-    let desired = if dropping.len() > cfg.max_real_sources {
-        Vec::new()
-    } else {
-        plan_blocks_v6(
-            &dropping,
-            cfg.fanout,
-            cfg.max_source_blocks,
-            cfg.agg_max_prefix_v6,
-        )
-    };
-    {
-        let mut trie: LpmTrie<_, [u8; 16], u8> =
-            LpmTrie::try_from(bpf.map_mut("V6_CIDR_SRC").context("v6 cidr trie missing")?)?;
-        reconcile_block_set(
-            &mut state.blocks_v6,
-            &mut trie,
-            &desired,
-            now_ns,
-            |c| Key::new(c.prefix_len, c.network),
-            |c| format!("{}/{}", Ipv6Addr::from(c.network), c.prefix_len),
-        );
-    }
-    state.block_pps_v6 = block_pps(&state.blocks_v6, &state.src_v6, |c, ip| {
-        mask_v6(*ip, c.prefix_len) == c.network
-    });
-    Ok(!state.blocks_v6.is_empty())
+fn gc_src_state_map<K>(bpf: &mut Ebpf, name: &str, now_ns: u64, idle_ttl_ns: u64) -> Result<usize>
+where
+    K: Pod + Eq + Hash,
+{
+    let entries: Vec<(K, SrcState)> = scan_plain(&*bpf, name)?;
+    let stale: Vec<K> = entries
+        .iter()
+        .filter(|(_, st)| {
+            st.blocked_until_ns <= now_ns
+                && now_ns.saturating_sub(st.window_start_ns) >= idle_ttl_ns
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    let mut map: aya::maps::HashMap<_, K, SrcState> = aya::maps::HashMap::try_from(
+        bpf.map_mut(name)
+            .with_context(|| format!("{name} missing"))?,
+    )?;
+    Ok(stale.iter().filter(|k| map.remove(k).is_ok()).count())
 }
 
 /// Sample one TX-counter map, compute per-local-IP egress rates against the
@@ -628,9 +506,11 @@ pub fn run_control(
     };
     state.last_sample_ns = now_ns;
 
-    // --- Source control first (spoof-gated); result gates escalation ---
-    let sba4 = source_control_v4(bpf, state, cfg, now_ns, elapsed)?;
-    let sba6 = source_control_v6(bpf, state, cfg, now_ns, elapsed)?;
+    // --- Per-source rate machine lives in XDP; snapshot its state maps for
+    // the display views only (batched: ~1 syscall per 4k entries) ---
+    state.src_v4 = scan_plain::<[u8; 4], SrcState>(bpf, "V4_SRC_STATE")?;
+    state.src_v6 = scan_plain::<[u8; 16], SrcState>(bpf, "V6_SRC_STATE")?;
+    state.src_sampled_ns = crate::gc::monotonic_now_ns();
 
     // --- TX (egress) rates per local IP (display only; no mitigation) ---
     compute_tx::<[u8; 4]>(
@@ -659,7 +539,6 @@ pub fn run_control(
             32,
             &mut state.v4,
             &cfg.detection,
-            sba4,
             cfg.escalate_pass_pps,
             cfg.syn_proxy_pps,
             now_ns,
@@ -676,7 +555,6 @@ pub fn run_control(
                 mask_v4,
                 &mut state.prefix_v4,
                 &cfg.network,
-                sba4,
                 cfg.escalate_pass_pps,
                 cfg.syn_proxy_pps,
                 now_ns,
@@ -696,7 +574,6 @@ pub fn run_control(
             128,
             &mut state.v6,
             &cfg.detection,
-            sba6,
             cfg.escalate_pass_pps,
             cfg.syn_proxy_pps,
             now_ns,
@@ -713,7 +590,6 @@ pub fn run_control(
                 mask_v6,
                 &mut state.prefix_v6,
                 &cfg.network,
-                sba6,
                 cfg.escalate_pass_pps,
                 cfg.syn_proxy_pps,
                 now_ns,

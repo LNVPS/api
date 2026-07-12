@@ -31,7 +31,6 @@ const LIM: Limits = Limits {
     exit_pct: 50,
     cooldown_secs: 30,
     src_rate_pps: 10_000,
-    src_exit_pct: 50,
     src_cooldown_secs: 10,
 };
 const SYN_PROXY_PPS: u64 = 5_000;

@@ -84,7 +84,7 @@ export function LimitsCard({ token, nics }: { token: string; nics?: InterfaceInf
       {rateFld("pps", "IP pps")}{rateFld("syn_pps", "IP syn/s")}{bpsFld("bps", "IP bit/s")}
       {rateFld("net_pps", "prefix pps")}{rateFld("net_syn_pps", "prefix syn/s")}{bpsFld("net_bps", "prefix bit/s")}
       {fld("exit_pct", "exit %")}{fld("cooldown_secs", "cooldown s")}
-      {rateFld("src_rate_pps", "src block pps")}{fld("src_exit_pct", "src exit %")}{fld("src_cooldown_secs", "src cooldown s")}
+      {rateFld("src_rate_pps", "src block pps")}{fld("src_cooldown_secs", "src cooldown s")}
       <div class="act">
         <button onClick={save} disabled={anyInvalid}>save</button>
         <button class="ghost" onClick={reload}>reset</button>
@@ -152,7 +152,7 @@ export function MitigationsCard({ token, mitigations, onChange }: {
   );
 }
 
-// --- Sources: unified list of rate-tracked sources (normal/dropping/cooling)
+// --- Sources: unified list of rate-tracked sources (normal/dropping)
 // + manual blocks. Server-paginated + filtered. Auto "blocks" are just the
 // dropping/cooling rows here — there is no separate block list. ---
 export function SourcesCard({ token }: { token: string }) {
@@ -182,7 +182,6 @@ export function SourcesCard({ token }: { token: string }) {
   const bin = (c: string) => <button class="binbtn" title="remove block" onClick={() => del(c)}>🗑</button>;
   const stateCell = (s: TrackedSource) => s.manual
     ? <span class="tag">pinned</span>
-    : s.state === "cooling" ? <span style={{ color: "#f5b13d" }}>cooling</span>
       : s.state === "dropping" ? <span style={{ color: "#ff5d6c" }}>dropping</span>
         : <span style={{ color: "#6fcf7f" }}>normal</span>;
   const pages = Math.max(1, Math.ceil(data.total / PAGE));

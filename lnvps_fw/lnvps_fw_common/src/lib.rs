@@ -64,6 +64,37 @@ pub struct DestCounters {
     pub dropped: u64,
 }
 
+/// Per-source fixed-window rate state, owned entirely by the XDP datapath.
+/// The kernel computes the rate and the blocking decision in-line for packets
+/// it is already touching; userspace only reads this for display.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SrcState {
+    /// Monotonic (`bpf_ktime_get_ns`) anchor of the current counting window.
+    pub window_start_ns: u64,
+    /// Packets counted in the current window (atomic add across CPUs).
+    pub count: u64,
+    /// Drop packets from this source until this timestamp (0 = not blocked).
+    /// Re-trips (extends) if the source is still over-rate when it expires.
+    pub blocked_until_ns: u64,
+}
+
+/// Per-source rate-machine configuration, written by userspace (startup +
+/// live `PUT /limits`), read by XDP per packet under mitigation. One entry in
+/// an `Array` map.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SrcRateConfig {
+    /// A source exceeding this many packets within one window is blocked.
+    /// Precomputed by userspace as `rate_pps × window_secs` so the datapath
+    /// never divides. 0 disables per-source blocking entirely.
+    pub max_per_window: u64,
+    /// Fixed counting-window length.
+    pub window_ns: u64,
+    /// How long a tripped source stays blocked before re-evaluation.
+    pub cooldown_ns: u64,
+}
+
 /// Mitigation state for a destination IP. Written by userspace (detection
 /// state machine), read by the XDP ingress program.
 #[repr(C)]
@@ -253,6 +284,8 @@ mod user {
 
     unsafe impl aya::Pod for DestCounters {}
     unsafe impl aya::Pod for DestState {}
+    unsafe impl aya::Pod for SrcState {}
+    unsafe impl aya::Pod for SrcRateConfig {}
     unsafe impl aya::Pod for LastSeen {}
     unsafe impl aya::Pod for PortKeyV4 {}
     unsafe impl aya::Pod for PortKeyV6 {}
