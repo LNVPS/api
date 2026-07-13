@@ -1,7 +1,5 @@
 use crate::host::{FullVmInfo, get_host_client};
-use crate::notifications::{
-    Notification, NotificationChannel, build_channels, send_email,
-};
+use crate::notifications::{Notification, NotificationChannel, build_channels, send_email};
 use crate::provisioner::VmProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig, WhatsAppConfig};
 use crate::ssh_client::SshClient;
@@ -380,7 +378,6 @@ impl Worker {
 
         Ok(())
     }
-
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -410,7 +407,6 @@ pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_
 }
 
 impl Worker {
-
     /// Grace period (in days) for a subscription, tiered by subscription age.
     /// Newer subscriptions get shorter grace windows so resources aren't held open
     /// for days after a brand-new VM expires.
@@ -2315,8 +2311,48 @@ impl Worker {
             WorkJob::DownloadOsImages { image_id } => {
                 self.download_os_images(*image_id).await?;
             }
+            WorkJob::PatchIpRangeDns {
+                ip_range_id,
+                admin_user_id: _,
+            } => {
+                let n = self.patch_ip_range_dns(*ip_range_id).await?;
+                return Ok(Some(format!(
+                    "Patched DNS for {} IP assignment(s) in range {}",
+                    n, ip_range_id
+                )));
+            }
         }
         Ok(None)
+    }
+
+    /// Re-apply forward + reverse DNS records for every (non-deleted) IP assignment
+    /// in a range, reconciling them to the range's current DNS server configuration.
+    /// Per-assignment DNS failures are logged and skipped so one bad record can't
+    /// abort the whole batch; only the DB save is treated as fatal.
+    async fn patch_ip_range_dns(&self, ip_range_id: u64) -> Result<usize> {
+        // Validate the range exists
+        let _range = self.db.get_ip_range(ip_range_id).await?;
+        let provisioner = self.subscription_handler.vm_provisioner();
+        let network = &provisioner.network;
+
+        let mut assignments = self.db.list_vm_ip_assignments_in_range(ip_range_id).await?;
+        info!(
+            "Patching DNS for {} IP assignment(s) in range {}",
+            assignments.len(),
+            ip_range_id
+        );
+        let mut count = 0usize;
+        for a in &mut assignments {
+            if let Err(e) = network.update_forward_ip_dns(a).await {
+                warn!("[patch-dns] forward failed for {}: {}", a.ip, e);
+            }
+            if let Err(e) = network.update_reverse_ip_dns(a).await {
+                warn!("[patch-dns] reverse failed for {}: {}", a.ip, e);
+            }
+            self.db.update_vm_ip_assignment(a).await?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     async fn download_os_images(&self, image_id: Option<u64>) -> Result<()> {

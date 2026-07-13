@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsServer};
+use crate::dns::{BasicRecord, DnsRef, DnsServer};
 use crate::json_api::JsonApi;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -44,7 +44,11 @@ impl Cloudflare {
 
 #[async_trait]
 impl DnsServer for Cloudflare {
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
+    async fn add_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .context("zone id required for Cloudflare records")?;
         info!(
             "Adding record: [{}] {} => {}",
             record.kind, record.name, record.value
@@ -65,13 +69,23 @@ impl DnsServer for Cloudflare {
         Ok(BasicRecord {
             name: id_response.result.name,
             value: id_response.result.content,
-            id: id_response.result.id,
+            id: id_response.result.id.map(DnsRef::Id),
             kind: record.kind.clone(),
+            ip: record.ip.clone(),
+            zone: record.zone.clone(),
         })
     }
 
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()> {
-        let record_id = record.id.as_ref().context("record id missing")?;
+    async fn delete_record(&self, record: &BasicRecord) -> OpResult<()> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .context("zone id required for Cloudflare records")?;
+        let record_id = record
+            .id
+            .as_ref()
+            .and_then(DnsRef::as_id)
+            .context("record id missing")?;
         info!(
             "Deleting record: [{}] {} => {}",
             record.kind, record.name, record.value
@@ -93,12 +107,20 @@ impl DnsServer for Cloudflare {
         Ok(())
     }
 
-    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
+    async fn update_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .context("zone id required for Cloudflare records")?;
         info!(
             "Updating record: [{}] {} => {}",
             record.kind, record.name, record.value
         );
-        let record_id = record.id.as_ref().context("record id missing")?;
+        let record_id = record
+            .id
+            .as_ref()
+            .and_then(DnsRef::as_id)
+            .context("record id missing")?;
         let id_response: CfResult<CfRecord> = self
             .api
             .req(
@@ -116,8 +138,10 @@ impl DnsServer for Cloudflare {
         Ok(BasicRecord {
             name: id_response.result.name,
             value: id_response.result.content,
-            id: id_response.result.id,
+            id: id_response.result.id.map(DnsRef::Id),
             kind: record.kind.clone(),
+            ip: record.ip.clone(),
+            zone: record.zone.clone(),
         })
     }
 }

@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsServer};
+use crate::dns::{BasicRecord, DnsRef, get_dns_server};
 use crate::router::{ArpEntry, get_router};
 use anyhow::{Context, anyhow};
 use ipnetwork::IpNetwork;
@@ -15,27 +15,13 @@ use try_procedure::{OpError, RetryPolicy, retry_async};
 #[derive(Clone)]
 pub struct VmNetworkProvisioner {
     db: Arc<dyn LNVpsDb>,
-    /// DNS server to add entries to
-    dns: Option<Arc<dyn DnsServer>>,
-    /// Forward zone to add ip dns
-    forward_zone_id: Option<String>,
     /// Retry policy to use when calling external services
     retry_policy: RetryPolicy,
 }
 
 impl VmNetworkProvisioner {
-    pub fn new(
-        db: Arc<dyn LNVpsDb>,
-        dns: Option<Arc<dyn DnsServer>>,
-        forward_zone_id: Option<String>,
-        retry_policy: RetryPolicy,
-    ) -> Self {
-        Self {
-            db,
-            dns,
-            forward_zone_id,
-            retry_policy,
-        }
+    pub fn new(db: Arc<dyn LNVpsDb>, retry_policy: RetryPolicy) -> Self {
+        Self { db, retry_policy }
     }
 
     /// Create or Update access policy for a given ip assignment, does not save to database!
@@ -117,83 +103,96 @@ impl VmNetworkProvisioner {
 
     /// Delete DNS on the dns server, does not save to database!
     pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
-        // Delete forward/reverse dns
-        if let Some(dns) = &self.dns {
-            let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
 
-            if let (Some(z), Some(_ref)) = (&range.reverse_zone_id, &assignment.dns_reverse_ref) {
-                let rev = BasicRecord::reverse(assignment)?;
+        // Delete reverse dns
+        if let (Some(dns_id), Some(_ref)) =
+            (range.reverse_dns_server_id, &assignment.dns_reverse_ref)
+        {
+            let dns = get_dns_server(&self.db, dns_id).await?;
+            let rev =
+                BasicRecord::reverse(assignment, DnsRef::from_opt(range.reverse_zone_id.clone()))?;
 
-                if let Err(e) = retry_async(self.retry_policy.clone(), || async {
-                    dns.delete_record(z, &rev).await
-                })
-                .await
-                {
-                    warn!("Failed to delete reverse record after retries: {}", e);
-                }
-                assignment.dns_reverse_ref = None;
-                assignment.dns_reverse = None;
+            if let Err(e) = retry_async(self.retry_policy.clone(), || async {
+                dns.delete_record(&rev).await
+            })
+            .await
+            {
+                warn!("Failed to delete reverse record after retries: {}", e);
             }
-            if let (Some(z), Some(_ref)) = (&self.forward_zone_id, &assignment.dns_forward_ref) {
-                let fwd = BasicRecord::forward(assignment)?;
+            assignment.dns_reverse_ref = None;
+            assignment.dns_reverse = None;
+        }
 
-                if let Err(e) = retry_async(self.retry_policy.clone(), || async {
-                    dns.delete_record(z, &fwd).await
-                })
-                .await
-                {
-                    warn!("Failed to delete forward record after retries: {}", e);
-                }
-                assignment.dns_forward_ref = None;
-                assignment.dns_forward = None;
+        // Delete forward dns
+        if let (Some(dns_id), Some(_ref)) =
+            (range.forward_dns_server_id, &assignment.dns_forward_ref)
+        {
+            let dns = get_dns_server(&self.db, dns_id).await?;
+            let fwd =
+                BasicRecord::forward(assignment, DnsRef::from_opt(range.forward_zone_id.clone()))?;
+
+            if let Err(e) = retry_async(self.retry_policy.clone(), || async {
+                dns.delete_record(&fwd).await
+            })
+            .await
+            {
+                warn!("Failed to delete forward record after retries: {}", e);
             }
+            assignment.dns_forward_ref = None;
+            assignment.dns_forward = None;
         }
         Ok(())
     }
 
     /// Update DNS on the dns server, does not save to database!
     pub async fn update_forward_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
-        if let (Some(z), Some(dns)) = (&self.forward_zone_id, &self.dns) {
-            let fwd = BasicRecord::forward(assignment)?;
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+        if let Some(dns_id) = range.forward_dns_server_id {
+            let dns = get_dns_server(&self.db, dns_id).await?;
+            let fwd =
+                BasicRecord::forward(assignment, DnsRef::from_opt(range.forward_zone_id.clone()))?;
             let ret_fwd = retry_async(self.retry_policy.clone(), || async {
                 if fwd.id.is_some() {
-                    dns.update_record(z, &fwd).await
+                    dns.update_record(&fwd).await
                 } else {
-                    dns.add_record(z, &fwd).await
+                    dns.add_record(&fwd).await
                 }
             })
             .await?;
 
-            assignment.dns_forward = Some(ret_fwd.name);
-            assignment.dns_forward_ref = Some(ret_fwd.id.context("Record id is missing")?);
+            assignment.dns_forward = Some(ret_fwd.name.clone());
+            assignment.dns_forward_ref =
+                Some(ret_fwd.stored_ref().context("Record id is missing")?);
         }
         Ok(())
     }
 
     /// Update DNS on the dns server, does not save to database!
     pub async fn update_reverse_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
-        if let Some(dns) = &self.dns {
-            let range = self.db.get_ip_range(assignment.ip_range_id).await?;
-            if let Some(z) = &range.reverse_zone_id {
-                let has_ref = assignment.dns_reverse_ref.is_some();
-                let rev_record = if has_ref {
-                    BasicRecord::reverse(assignment)?
+        let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+        if let Some(dns_id) = range.reverse_dns_server_id {
+            let dns = get_dns_server(&self.db, dns_id).await?;
+            let has_ref = assignment.dns_reverse_ref.is_some();
+            let zone = DnsRef::from_opt(range.reverse_zone_id.clone());
+            let rev_record = if has_ref {
+                BasicRecord::reverse(assignment, zone)?
+            } else {
+                BasicRecord::reverse_to_fwd(assignment, zone)?
+            };
+
+            let ret_rev = retry_async(self.retry_policy.clone(), || async {
+                if has_ref {
+                    dns.update_record(&rev_record).await
                 } else {
-                    BasicRecord::reverse_to_fwd(assignment)?
-                };
+                    dns.add_record(&rev_record).await
+                }
+            })
+            .await?;
 
-                let ret_rev = retry_async(self.retry_policy.clone(), || async {
-                    if has_ref {
-                        dns.update_record(z, &rev_record).await
-                    } else {
-                        dns.add_record(z, &rev_record).await
-                    }
-                })
-                .await?;
-
-                assignment.dns_reverse = Some(ret_rev.value);
-                assignment.dns_reverse_ref = Some(ret_rev.id.context("Record id is missing")?);
-            }
+            assignment.dns_reverse = Some(ret_rev.value.clone());
+            assignment.dns_reverse_ref =
+                Some(ret_rev.stored_ref().context("Record id is missing")?);
         }
         Ok(())
     }

@@ -1,5 +1,5 @@
 #![allow(unused)]
-use crate::dns::{BasicRecord, DnsServer, RecordType};
+use crate::dns::{BasicRecord, DnsRef, DnsServer, RecordType};
 use crate::host::dummy_host::DummyVmHost;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
@@ -432,13 +432,18 @@ impl MockDnsServer {
 
 #[async_trait]
 impl DnsServer for MockDnsServer {
-    async fn add_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
+    async fn add_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| record.ip.clone());
         let mut zones = self.zones.lock().await;
-        let table = if let Some(t) = zones.get_mut(zone_id) {
+        let table = if let Some(t) = zones.get_mut(&zone_id) {
             t
         } else {
-            zones.insert(zone_id.to_string(), HashMap::new());
-            zones.get_mut(zone_id).unwrap()
+            zones.insert(zone_id.clone(), HashMap::new());
+            zones.get_mut(&zone_id).unwrap()
         };
 
         if table
@@ -467,38 +472,54 @@ impl DnsServer for MockDnsServer {
                 _ => format!("{}.lnvps.mock", record.name),
             },
             value: record.value.clone(),
-            id: Some(id),
+            id: Some(DnsRef::Id(id)),
             kind: record.kind.clone(),
+            ip: record.ip.clone(),
+            zone: record.zone.clone(),
         })
     }
 
-    async fn delete_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<()> {
+    async fn delete_record(&self, record: &BasicRecord) -> OpResult<()> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| record.ip.clone());
         let mut zones = self.zones.lock().await;
-        let table = if let Some(t) = zones.get_mut(zone_id) {
+        let table = if let Some(t) = zones.get_mut(&zone_id) {
             t
         } else {
-            zones.insert(zone_id.to_string(), HashMap::new());
-            zones.get_mut(zone_id).unwrap()
+            zones.insert(zone_id.clone(), HashMap::new());
+            zones.get_mut(&zone_id).unwrap()
         };
-        if record.id.is_none() {
-            return Err(OpError::Fatal(anyhow::anyhow!("Id is missing")));
-        }
-        table.remove(record.id.as_ref().unwrap());
+        let record_id = record
+            .id
+            .as_ref()
+            .and_then(DnsRef::as_id)
+            .ok_or_else(|| OpError::Fatal(anyhow::anyhow!("Id is missing")))?;
+        table.remove(record_id);
         Ok(())
     }
 
-    async fn update_record(&self, zone_id: &str, record: &BasicRecord) -> OpResult<BasicRecord> {
+    async fn update_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| record.ip.clone());
         let mut zones = self.zones.lock().await;
-        let table = if let Some(t) = zones.get_mut(zone_id) {
+        let table = if let Some(t) = zones.get_mut(&zone_id) {
             t
         } else {
-            zones.insert(zone_id.to_string(), HashMap::new());
-            zones.get_mut(zone_id).unwrap()
+            zones.insert(zone_id.clone(), HashMap::new());
+            zones.get_mut(&zone_id).unwrap()
         };
-        if record.id.is_none() {
-            return Err(OpError::Fatal(anyhow::anyhow!("Id is missing")));
-        }
-        if let Some(mut r) = table.get_mut(record.id.as_ref().unwrap()) {
+        let record_id = record
+            .id
+            .as_ref()
+            .and_then(DnsRef::as_id)
+            .ok_or_else(|| OpError::Fatal(anyhow::anyhow!("Id is missing")))?;
+        if let Some(mut r) = table.get_mut(record_id) {
             r.name = record.name.clone();
             r.value = record.value.clone();
             r.kind = record.kind.to_string();

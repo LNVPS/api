@@ -986,11 +986,13 @@ mod tests {
             .and_then(|c| c["id"].as_u64())
             .unwrap_or(1);
 
+        // min_prefix_size is the smallest subdivision (largest prefix number) and
+        // must be >= max_prefix_size; for a /24 RIPE block that is min=/32, max=/24.
         let create_body = serde_json::json!({
             "company_id": company_id,
             "cidr": "203.0.113.0/24",
-            "min_prefix_size": 24,
-            "max_prefix_size": 32,
+            "min_prefix_size": 32,
+            "max_prefix_size": 24,
             "registry": 1
         });
         let resp = client

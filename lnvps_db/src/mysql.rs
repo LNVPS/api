@@ -1,5 +1,5 @@
 use crate::{
-    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, IntervalType, IpRange,
+    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType, IpRange,
     IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
     PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
@@ -1342,6 +1342,117 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as("select * from router")
             .fetch_all(&self.db)
             .await?)
+    }
+
+    async fn get_dns_server(&self, dns_server_id: u64) -> DbResult<DnsServer> {
+        Ok(sqlx::query_as("select * from dns_server where id=?")
+            .bind(dns_server_id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_dns_servers(&self) -> DbResult<Vec<DnsServer>> {
+        Ok(sqlx::query_as("select * from dns_server")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn list_dns_servers_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<DnsServer>, u64)> {
+        let servers = sqlx::query_as::<_, DnsServer>(
+            "SELECT * FROM dns_server ORDER BY name LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dns_server")
+            .fetch_one(&self.db)
+            .await?;
+
+        Ok((servers, total.0 as u64))
+    }
+
+    async fn insert_dns_server(&self, dns_server: &DnsServer) -> DbResult<u64> {
+        let result = sqlx::query(
+            "INSERT INTO dns_server (name, enabled, kind, url, token) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&dns_server.name)
+        .bind(dns_server.enabled)
+        .bind(dns_server.kind)
+        .bind(&dns_server.url)
+        .bind(&dns_server.token)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn update_dns_server(&self, dns_server: &DnsServer) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE dns_server SET name = ?, enabled = ?, kind = ?, url = ?, token = ? WHERE id = ?",
+        )
+        .bind(&dns_server.name)
+        .bind(dns_server.enabled)
+        .bind(dns_server.kind)
+        .bind(&dns_server.url)
+        .bind(&dns_server.token)
+        .bind(dns_server.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_dns_server(&self, dns_server_id: u64) -> DbResult<()> {
+        let count = self.count_dns_server_ip_ranges(dns_server_id).await?;
+        if count > 0 {
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete DNS server: {} IP ranges are using this DNS server",
+                    count
+                )
+                .into_boxed_dyn_error(),
+            ));
+        }
+
+        sqlx::query("DELETE FROM dns_server WHERE id = ?")
+            .bind(dns_server_id)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn count_dns_server_ip_ranges(&self, dns_server_id: u64) -> DbResult<u64> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM ip_range WHERE forward_dns_server_id = ? OR reverse_dns_server_id = ?",
+        )
+        .bind(dns_server_id)
+        .bind(dns_server_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok(count.0 as u64)
+    }
+
+    async fn update_ip_range_dns(&self, range: &IpRange) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_range SET forward_dns_server_id = ?, reverse_dns_server_id = ?, forward_zone_id = ?, reverse_zone_id = ? WHERE id = ?",
+        )
+        .bind(range.forward_dns_server_id)
+        .bind(range.reverse_dns_server_id)
+        .bind(&range.forward_zone_id)
+        .bind(&range.reverse_zone_id)
+        .bind(range.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
     }
 
     async fn list_router_tunnels(&self, router_id: u64) -> DbResult<Vec<RouterTunnel>> {
@@ -4512,8 +4623,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_ip_range(&self, ip_range: &IpRange) -> DbResult<u64> {
         let result = sqlx::query(
-            r#"INSERT INTO ip_range (cidr, gateway, enabled, region_id, reverse_zone_id, access_policy_id, allocation_mode, use_full_range)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO ip_range (cidr, gateway, enabled, region_id, reverse_zone_id, access_policy_id, allocation_mode, use_full_range, forward_dns_server_id, reverse_dns_server_id, forward_zone_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&ip_range.cidr)
         .bind(&ip_range.gateway)
@@ -4523,6 +4634,9 @@ impl AdminDb for LNVpsDbMysql {
         .bind(ip_range.access_policy_id)
         .bind(ip_range.allocation_mode as u16)
         .bind(ip_range.use_full_range)
+        .bind(ip_range.forward_dns_server_id)
+        .bind(ip_range.reverse_dns_server_id)
+        .bind(&ip_range.forward_zone_id)
         .execute(&self.db)
         .await?;
 
@@ -4533,7 +4647,8 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"UPDATE ip_range SET 
                cidr = ?, gateway = ?, enabled = ?, region_id = ?, 
-               reverse_zone_id = ?, access_policy_id = ?, allocation_mode = ?, use_full_range = ?
+               reverse_zone_id = ?, access_policy_id = ?, allocation_mode = ?, use_full_range = ?,
+               forward_dns_server_id = ?, reverse_dns_server_id = ?, forward_zone_id = ?
                WHERE id = ?"#,
         )
         .bind(&ip_range.cidr)
@@ -4544,6 +4659,9 @@ impl AdminDb for LNVpsDbMysql {
         .bind(ip_range.access_policy_id)
         .bind(ip_range.allocation_mode as u16)
         .bind(ip_range.use_full_range)
+        .bind(ip_range.forward_dns_server_id)
+        .bind(ip_range.reverse_dns_server_id)
+        .bind(&ip_range.forward_zone_id)
         .bind(ip_range.id)
         .execute(&self.db)
         .await?;

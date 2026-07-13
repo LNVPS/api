@@ -46,12 +46,7 @@ impl VmProvisioner {
 
     pub fn new(settings: Settings, db: Arc<dyn LNVpsDb>) -> Self {
         Self {
-            network: VmNetworkProvisioner::new(
-                db.clone(),
-                settings.get_dns(),
-                settings.dns.as_ref().map(|z| z.forward_zone_id.to_string()),
-                Self::retry_policy(),
-            ),
+            network: VmNetworkProvisioner::new(db.clone(), Self::retry_policy()),
             provisioner_config: settings.provisioner,
             read_only: settings.read_only,
             delete_after: settings.delete_after,
@@ -893,8 +888,10 @@ mod tests {
             let r = i.get_mut(&1).unwrap();
             r.access_policy_id = Some(1);
             r.reverse_zone_id = Some("mock-rev-zone-id".to_string());
+            r.reverse_dns_server_id = Some(1);
             let r = i.get_mut(&2).unwrap();
             r.reverse_zone_id = Some("mock-v6-rev-zone-id".to_string());
+            r.reverse_dns_server_id = Some(1);
         }
 
         let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());

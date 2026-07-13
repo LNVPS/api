@@ -150,6 +150,14 @@ pub enum WorkJob {
         name: String,
         enabled: bool,
     },
+    /// Re-apply forward + reverse DNS records for every IP assignment in a range.
+    ///
+    /// Used after changing a range's DNS server configuration (e.g. switching
+    /// reverse DNS to OVH) to reconcile existing assignments to the current config.
+    PatchIpRangeDns {
+        ip_range_id: u64,
+        admin_user_id: Option<u64>,
+    },
 }
 
 impl WorkJob {
@@ -197,6 +205,7 @@ impl fmt::Display for WorkJob {
             WorkJob::SetRouterDefaultRoute { .. } => write!(f, "SetRouterDefaultRoute"),
             WorkJob::ClearRouterDefaultRoute { .. } => write!(f, "ClearRouterDefaultRoute"),
             WorkJob::ToggleTunnel { .. } => write!(f, "ToggleTunnel"),
+            WorkJob::PatchIpRangeDns { .. } => write!(f, "PatchIpRangeDns"),
         }
     }
 }
@@ -227,6 +236,14 @@ mod tests {
             }
             .to_string(),
             "ToggleTunnel"
+        );
+        assert_eq!(
+            WorkJob::PatchIpRangeDns {
+                ip_range_id: 3,
+                admin_user_id: Some(1),
+            }
+            .to_string(),
+            "PatchIpRangeDns"
         );
     }
 }

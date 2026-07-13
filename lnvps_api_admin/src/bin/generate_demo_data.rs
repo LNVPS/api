@@ -255,6 +255,9 @@ async fn create_ip_ranges(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result
             access_policy_id: None,
             allocation_mode: IpRangeAllocationMode::Random,
             use_full_range: false,
+            forward_dns_server_id: None,
+            reverse_dns_server_id: None,
+            forward_zone_id: None,
         };
 
         let id = db.admin_create_ip_range(&ip_range).await?;
