@@ -4,7 +4,7 @@ import { api } from "./api";
 import type { Status, TrackedIp, PrefixLoad, Mitigation, FwEvent, RuleSet, UpgradeStatus } from "./api";
 import { fmtn, fmtbps, timeStr, loadColor, dropColor } from "./format";
 import { LoadBar, Sparkline, PagedTable, Section, flagCell } from "./ui";
-import { Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard } from "./cards";
+import { Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard, geoCell } from "./cards";
 
 interface Data {
   status: Status | null;
@@ -128,12 +128,12 @@ export function App() {
 
   const dropCell = (pct: number) => <LoadBar pct={pct} color={dropColor} />;
   const trackedRows = d.tracked.map((t) => [
-    t.ip, fmtn(t.rx_pps), fmtbps(t.rx_bps), fmtn(t.tx_pps), fmtbps(t.tx_bps),
+    t.ip, geoCell(t), fmtn(t.rx_pps), fmtbps(t.rx_bps), fmtn(t.tx_pps), fmtbps(t.tx_bps),
     fmtn(t.rx_syn_pps), fmtn(t.rx_drop_pps), dropCell(t.rx_drop_pct), <LoadBar pct={t.load_pct} />,
     t.mitigating ? flagCell(t.flags) : "ok",
   ]);
   const prefixRows = d.prefixes.map((p) => [
-    p.cidr, fmtn(p.rx_pps), fmtbps(p.rx_bps), fmtn(p.tx_pps), fmtbps(p.tx_bps),
+    p.cidr, geoCell(p), fmtn(p.rx_pps), fmtbps(p.rx_bps), fmtn(p.tx_pps), fmtbps(p.tx_bps),
     fmtn(p.rx_syn_pps), fmtn(p.rx_drop_pps), dropCell(p.rx_drop_pct), <LoadBar pct={p.load_pct} />,
     p.mitigating ? flagCell(p.flags) : "ok",
   ]);
@@ -179,10 +179,10 @@ export function App() {
           <MitigationsCard token={token} mitigations={d.mitigations} onChange={refresh} />
         </Section>
         <Section wide title="Live tracked IPs" extra={"(" + d.tracked.length + ")"}>
-          <PagedTable cols={["ip", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={trackedRows} />
+          <PagedTable cols={["ip", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={trackedRows} />
         </Section>
         <Section wide title="Protected prefixes" extra={"(" + d.prefixes.length + ")"}>
-          <PagedTable cols={["prefix", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={prefixRows} />
+          <PagedTable cols={["prefix", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={prefixRows} />
         </Section>
         <Section wide title="Sources"><SourcesCard token={token} /></Section>
         <PortsCard token={token} />

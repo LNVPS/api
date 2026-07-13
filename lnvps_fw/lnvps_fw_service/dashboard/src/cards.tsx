@@ -127,14 +127,14 @@ export function MitigationsCard({ token, mitigations, onChange }: {
   const bin = (c: string) => <button class="binbtn" title="remove override" onClick={() => del(c)}>🗑</button>;
   const meta = (m: Mitigation) => m.manual ? <span><span class="tag">manual</span> {timeStr(m.since_unix)}</span> : timeStr(m.since_unix);
   const rows = mitigations.map((m) => [
-    m.cidr, fmtn(m.rx_pps), fmtbps(m.rx_bps), fmtn(m.tx_pps), fmtbps(m.tx_bps),
+    m.cidr, geoCell(m), fmtn(m.rx_pps), fmtbps(m.rx_bps), fmtn(m.tx_pps), fmtbps(m.tx_bps),
     fmtn(m.rx_syn_pps), fmtn(m.rx_drop_pps), <LoadBar pct={m.rx_drop_pct} color={dropColor} />,
     <LoadBar pct={m.load_pct} />, flagCell(m.flags), meta(m), m.manual ? bin(m.cidr) : "",
   ]);
   return (
     <div>
       <div style={{ marginBottom: ".5rem" }}><button onClick={() => { setShow(true); setMsg(""); }}>+ add override</button></div>
-      <PagedTable cols={["cidr", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "flags", "since", ""]} rows={rows} />
+      <PagedTable cols={["cidr", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "flags", "since", ""]} rows={rows} />
       {show && (
         <Modal title="Force-mitigate a destination" onClose={() => setShow(false)}>
           <label>CIDR<input value={cidr} placeholder="203.0.113.7/32" onInput={(e) => setCidr((e.target as HTMLInputElement).value)} /></label>
@@ -155,7 +155,7 @@ export function MitigationsCard({ token, mitigations, onChange }: {
 
 // GeoIP enrichment cell: "<CC> AS<n>" with the org name in the tooltip. Shows
 // a dash when no MaxMind DB is configured (all fields absent).
-function geoCell(g: { asn?: number; org?: string; country?: string }) {
+export function geoCell(g: { asn?: number; org?: string; country?: string }) {
   if (!g.country && !g.asn && !g.org) return <span class="muted">—</span>;
   const head = [g.country, g.asn ? "AS" + g.asn : ""].filter(Boolean).join(" ");
   return <span class="muted" title={[g.org, head].filter(Boolean).join(" · ")}>{head || g.org}</span>;
