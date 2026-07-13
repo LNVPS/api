@@ -1015,31 +1015,52 @@ mod tests {
     #[tokio::test]
     async fn test_admin_get_ip_space_with_pricing_and_subscriptions() {
         let client = setup().await;
-        let resp = client.get_auth("/api/admin/v1/ip_space").await.unwrap();
+
+        // Create a dedicated IP space and query THAT id, rather than picking
+        // `spaces.first()` off the shared list: other tests create/delete IP
+        // spaces concurrently, so the first-listed id could be deleted between
+        // the sub-calls (a TOCTOU that made this test flaky under parallel
+        // load). A self-owned space with a unique CIDR is deterministic.
+        let resp = client.get_auth("/api/admin/v1/companies").await.unwrap();
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        if let Some(spaces) = body["data"].as_array() {
-            if let Some(s) = spaces.first() {
-                let s_id = s["id"].as_u64().unwrap();
+        let company_id = body["data"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|c| c["id"].as_u64())
+            .unwrap_or(1);
 
-                let resp = client
-                    .get_auth(&format!("/api/admin/v1/ip_space/{s_id}"))
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
+        let create_body = serde_json::json!({
+            "company_id": company_id,
+            "cidr": "198.51.100.0/24",
+            "min_prefix_size": 32,
+            "max_prefix_size": 24,
+            "registry": 1
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/ip_space", &create_body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "create IP space");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let s_id = body["data"]["id"].as_u64().expect("created IP space id");
 
-                let resp = client
-                    .get_auth(&format!("/api/admin/v1/ip_space/{s_id}/pricing"))
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/ip_space/{s_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
-                let resp = client
-                    .get_auth(&format!("/api/admin/v1/ip_space/{s_id}/subscriptions"))
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-            }
-        }
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/ip_space/{s_id}/pricing"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/ip_space/{s_id}/subscriptions"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ========================================================================

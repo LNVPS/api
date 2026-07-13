@@ -2788,13 +2788,20 @@ impl LNVpsDbBase for LNVpsDbMysql {
             extra.push_str(" AND ips.is_active = ?");
         }
 
-        let base = "SELECT ips.* FROM ip_range_subscription ips \
+        // Shared FROM/JOIN/WHERE; the count selects COUNT(*) (NOT `ips.*`) so
+        // `fetch_one` always returns exactly one row — selecting `ips.*` and
+        // fetching one scalar yields `RowNotFound` (a spurious 404) whenever a
+        // space has zero subscriptions, and a wrong count otherwise.
+        let from = "FROM ip_range_subscription ips \
                     INNER JOIN subscription_line_item sli ON ips.subscription_line_item_id = sli.id \
                     INNER JOIN subscription s ON sli.subscription_id = s.id \
                     WHERE 1=1";
 
-        let count_sql = format!("{} {}", base, extra);
-        let data_sql = format!("{} {} ORDER BY ips.id DESC LIMIT ? OFFSET ?", base, extra);
+        let count_sql = format!("SELECT COUNT(*) {} {}", from, extra);
+        let data_sql = format!(
+            "SELECT ips.* {} {} ORDER BY ips.id DESC LIMIT ? OFFSET ?",
+            from, extra
+        );
 
         let mut count_q = sqlx::query_scalar(&count_sql).bind(available_ip_space_id);
         if let Some(u) = user_id {
