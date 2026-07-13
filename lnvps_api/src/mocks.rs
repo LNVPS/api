@@ -39,7 +39,7 @@ use ssh2::HashType::Sha256;
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -59,24 +59,31 @@ impl Default for MockRouter {
 
 impl MockRouter {
     pub fn new() -> Self {
-        static LAZY_ARP: LazyLock<Arc<Mutex<HashMap<u64, ArpEntry>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-        static LAZY_TUNNELS: LazyLock<Arc<Mutex<HashMap<String, Tunnel>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-        static LAZY_SESSIONS: LazyLock<Arc<Mutex<HashMap<String, BgpSession>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
-        static LAZY_DEFAULT_ROUTE: LazyLock<Arc<Mutex<Option<BgpRoute>>>> = LazyLock::new(|| {
-            Arc::new(Mutex::new(Some(BgpRoute {
-                prefix: "0.0.0.0/0".to_string(),
-                next_hop: Some("192.0.2.1".to_string()),
-            })))
-        });
+        // Per-test-thread state (NOT a process-global): every `MockRouter`
+        // built on the same thread — the test's own handle and the one the
+        // code-under-test gets from `get_router()` — shares one state, while
+        // tests running in parallel on different libtest threads stay isolated.
+        // `#[tokio::test]` uses a current-thread runtime, so all of a test's
+        // async work (and thus every `MockRouter::new()`) runs on its thread.
+        thread_local! {
+            static TL_ARP: Arc<Mutex<HashMap<u64, ArpEntry>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            static TL_TUNNELS: Arc<Mutex<HashMap<String, Tunnel>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            static TL_SESSIONS: Arc<Mutex<HashMap<String, BgpSession>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            static TL_DEFAULT_ROUTE: Arc<Mutex<Option<BgpRoute>>> =
+                Arc::new(Mutex::new(Some(BgpRoute {
+                    prefix: "0.0.0.0/0".to_string(),
+                    next_hop: Some("192.0.2.1".to_string()),
+                })));
+        }
 
         Self {
-            arp: LAZY_ARP.clone(),
-            tunnels: LAZY_TUNNELS.clone(),
-            sessions: LAZY_SESSIONS.clone(),
-            default_route: LAZY_DEFAULT_ROUTE.clone(),
+            arp: TL_ARP.with(|a| a.clone()),
+            tunnels: TL_TUNNELS.with(|t| t.clone()),
+            sessions: TL_SESSIONS.with(|s| s.clone()),
+            default_route: TL_DEFAULT_ROUTE.with(|d| d.clone()),
         }
     }
 
@@ -343,10 +350,14 @@ pub struct MockInvoice {
 
 impl MockNode {
     pub fn new() -> Self {
-        static LAZY_INVOICES: LazyLock<Arc<Mutex<HashMap<String, MockInvoice>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        // Per-test-thread state (see `MockRouter::new`): isolates parallel
+        // tests while sharing within a single test.
+        thread_local! {
+            static TL_INVOICES: Arc<Mutex<HashMap<String, MockInvoice>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+        }
         Self {
-            invoices: LAZY_INVOICES.clone(),
+            invoices: TL_INVOICES.with(|i| i.clone()),
         }
     }
 }
@@ -418,10 +429,14 @@ impl Default for MockDnsServer {
 
 impl MockDnsServer {
     pub fn new() -> Self {
-        static LAZY_ZONES: LazyLock<Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>> =
-            LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+        // Per-test-thread state (see `MockRouter::new`): isolates parallel
+        // tests while sharing within a single test.
+        thread_local! {
+            static TL_ZONES: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+        }
         Self {
-            zones: LAZY_ZONES.clone(),
+            zones: TL_ZONES.with(|z| z.clone()),
         }
     }
 
