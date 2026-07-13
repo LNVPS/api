@@ -23,8 +23,8 @@ use network_types::udp::UdpHdr;
 mod maps;
 
 use maps::{
-    OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cidr_blocked_v4, cidr_blocked_v6, cookie_secrets,
-    count_src_v4, count_src_v6, counters_v4, counters_v6, dest_mode_v4, dest_mode_v6,
+    OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cookie_secrets, counters_v4, counters_v6,
+    dest_mode_v4, dest_mode_v6, src_gate_v4, src_gate_v6,
     learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6, mark_verified_v4,
     mark_verified_v6, port_is_open_v4, port_is_open_v6, protected_v4, protected_v6, scoped,
     src_verified_v4, src_verified_v6, tx_counters_v4, tx_counters_v6,
@@ -257,8 +257,10 @@ fn mitigate_v4(
     allow_syn_proxy: bool,
     counters: Option<*mut lnvps_fw_common::DestCounters>,
 ) -> (u32, bool) {
-    count_src_v4(src);
-    if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v4(*src) {
+    // In-kernel per-source rate machine: counts this packet against the
+    // source's window and drops while the source is blocked (enforcement is
+    // gated on the dest's SOURCE_BLOCK escalation, counting is not).
+    if src_gate_v4(src, flags & DEST_MODE_SOURCE_BLOCK != 0) {
         return (XDP_DROP, false);
     }
     if allow_syn_proxy
@@ -312,8 +314,7 @@ fn mitigate_v6(
     allow_syn_proxy: bool,
     counters: Option<*mut lnvps_fw_common::DestCounters>,
 ) -> (u32, bool) {
-    count_src_v6(src);
-    if flags & DEST_MODE_SOURCE_BLOCK != 0 && cidr_blocked_v6(*src) {
+    if src_gate_v6(src, flags & DEST_MODE_SOURCE_BLOCK != 0) {
         return (XDP_DROP, false);
     }
     if allow_syn_proxy

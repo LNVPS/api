@@ -39,9 +39,10 @@ single-IP attacks.
    high-efficacy open-port drop does the heavy lifting first; source/CIDR
    blocking (highest false-positive risk, useless against spoofed floods) is a
    last resort, and is gated so it never fires against spoofed traffic.
-4. **Everything is bounded.** Per-source counters are LRU-bounded; the CIDR block
-   structure is an LPM trie kept small by aggregation. The datapath never tries
-   to track "every /32".
+4. **Everything is bounded.** Per-source rate state is LRU-bounded and lives in
+   the datapath itself; a spoofed high-cardinality flood churns entries without
+   ever tripping a per-source limit. The daemon never scans unbounded state on
+   its hot path (reads are batched and display-only).
 
 ---
 
@@ -71,8 +72,9 @@ single-IP attacks.
         ┌── lnvps_fw_service (userspace daemon) ───────────────────────┐
         │  • samples per-dest + per-prefix counters, runs detection    │
         │    state machine, writes protection flags into DEST_STATE    │
-        │  • samples per-source counters, aggregates offenders into    │
-        │    CIDR blocks (spoof-gated), decays them                    │
+        │  • arms the in-kernel per-source rate machine (which counts  │
+        │    and blocks over-rate sources in XDP on its own) and       │
+        │    snapshots its state for the API views                     │
         │  • learned-port TTL GC, cookie-secret rotation, verified GC  │
         │  • loads config (interfaces, thresholds, protected prefixes) │
         └──────────────────────────────────────────────────────────────┘
@@ -94,7 +96,7 @@ single-IP attacks.
 |---|---|---|
 | `lnvps_ebpf` | `bpfel-unknown-none` | The XDP + TC eBPF programs and maps. Not a default workspace member. |
 | `lnvps_fw_common` | host + eBPF (`#![no_std]`) | Types shared across the map boundary (counters, keys, `DestState`), the SYN-cookie function, and constants. `aya::Pod` impls behind the `user` feature. |
-| `lnvps_fw_service` | host | The userspace daemon: config, detection state machine, CIDR aggregation, GC, and the control loop that programs the maps. Also exposes a library used by the test harness. |
+| `lnvps_fw_service` | host | The userspace daemon: config, per-destination detection state machine, GC, control API, and the control loop that programs the maps (the per-source rate machine runs in the eBPF datapath). Also exposes a library used by the test harness. |
 
 ---
 
@@ -133,8 +135,9 @@ cheaper layers have not already shed the attack:
 - **Spoofed SYN flood to an open TCP port**: `SYN_PROXY` answers with a
   SYN-cookie SYN-ACK; spoofed sources can't complete the handshake, so they
   never reach the protected host; real clients complete it and are allow-listed.
-- **Real botnet hammering open services**: bounded real sources are aggregated
-  into CIDR blocks (`SOURCE_BLOCK`).
+- **Real botnet hammering open services**: the in-kernel per-source rate
+  machine blocks each over-rate source the moment it crosses the limit
+  (`SOURCE_BLOCK` gates the drops; spoofed floods never trip it).
 
 ---
 
@@ -166,7 +169,8 @@ the previous slot keeps in-flight cookies valid across a rotation.
 | `V4/V6_SRC_COUNTERS` | LRU per-CPU hash | XDP (under mitigation) | daemon (source control) |
 | `V4/V6_DEST_STATE` | LPM trie → `DestState` | daemon | XDP (mode lookup) |
 | `OPEN_PORTS_V4/V6` | LRU hash → `LastSeen` | TC egress (learning) | XDP; daemon (TTL GC) |
-| `V4/V6_CIDR_SRC` | LPM trie | daemon (escalation) | XDP (`SOURCE_BLOCK`) |
+| `V4/V6_SRC_STATE` | LRU hash | XDP (rate machine) | XDP (`SOURCE_BLOCK`) + daemon (display/GC) |
+| `SRC_RATE_CFG` | array | daemon (limits) | XDP (rate machine) |
 | `VERIFIED_V4/V6` | LRU hash | XDP (`xdp_syn_proxy`/`_v6`) | XDP; daemon (TTL GC) |
 | `COOKIE_SECRET` | array[2] | daemon (rotation) | XDP |
 | `SYN_PROXY_JUMP` | prog array | daemon (setup) | XDP (`tail_call`) |
@@ -292,8 +296,9 @@ keys, matching the rest of the LNVPS API config style. Key sections:
 - `thresholds` — per-destination entry thresholds + hysteresis/cooldown.
 - `network` — aggregate per-prefix thresholds (network scale).
 - `learning` — port-learning TTL and GC cadence.
-- `escalation` — per-source rate, CIDR aggregation fan-out, spoof gate, and the
-  SYN-proxy trigger.
+- `escalation` — per-source rate limit + cooldown (written into the in-kernel
+  rate machine), the SOURCE_BLOCK escalation gate, and the SYN-proxy trigger.
+  (Legacy aggregation/spoof-gate keys are still parsed but ignored.)
 
 > The `protected` prefixes and thresholds will be sourced from the LNVPS API in
 > a later increment; the local config is the bootstrap today.
@@ -321,7 +326,7 @@ Test binaries (`lnvps_fw_service/tests/`):
 | `smoke` | program attach, per-dest counters, forwarding, SYN counting |
 | `learning` | TC egress learns open TCP/UDP ports; TTL GC |
 | `mitigation` | port-filter drops, learned-port pass, detect→cooldown, flag gating |
-| `escalation` | per-source rate → aggregated CIDR block + decay |
+| `escalation` | per-source rate limit for the in-kernel gate + SOURCE_BLOCK escalation |
 | `carpet_bomb` | thin prefix-wide flood flips the whole prefix |
 | `syn_proxy` | real client completes the cookie handshake + is verified; spoofed never verify |
 

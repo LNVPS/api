@@ -243,7 +243,6 @@ async fn limits_put_get_roundtrip_and_validation() {
         exit_pct: 60,
         cooldown_secs: 45,
         src_rate_pps: 20_000,
-        src_exit_pct: 40,
         src_cooldown_secs: 15,
     })
     .unwrap();
@@ -265,7 +264,6 @@ async fn limits_put_get_roundtrip_and_validation() {
     let got: Limits = body_json(res).await;
     assert_eq!(got.exit_pct, 60);
     assert_eq!(got.src_rate_pps, 20_000);
-    assert_eq!(got.src_exit_pct, 40);
     assert_eq!(got.src_cooldown_secs, 15);
 
     // Zero threshold rejected.

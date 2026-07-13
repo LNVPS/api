@@ -29,9 +29,35 @@ use nix::sched::{CloneFlags, setns};
 
 use lnvps_fw_common::{
     DEST_MODE_PORT_FILTER, DestCounters, DestState, LastSeen, PortKeyV4, PortKeyV6,
-    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6,
+    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6, SrcState,
 };
+use lnvps_fw_service::detect::DetectionConfig;
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig, run_control};
+
+/// A `RuntimeConfig` with every dest/prefix detector quiet (thresholds at
+/// `u64::MAX`) so harness tests can drive DEST_STATE and the per-source
+/// machine explicitly without auto-detection interfering.
+pub fn test_runtime_config() -> RuntimeConfig {
+    let quiet = DetectionConfig {
+        pps: u64::MAX,
+        syn_pps: u64::MAX,
+        bps: u64::MAX,
+        exit_pct: 50,
+        cooldown_ns: 1_000_000_000,
+    };
+    RuntimeConfig {
+        detection: quiet,
+        network: quiet,
+        protected_v4: Vec::new(),
+        protected_v6: Vec::new(),
+        manual_v4: Vec::new(),
+        manual_v6: Vec::new(),
+        src_rate_pps: u64::MAX,
+        src_cooldown_ns: 1_000_000_000,
+        escalate_pass_pps: 0,
+        syn_proxy_pps: u64::MAX,
+    }
+}
 
 use netns::NetnsTopology;
 
@@ -168,15 +194,13 @@ impl Harness {
     /// the shared `gc` logic so the harness test exercises real code.
     pub fn gc_open_ports_v4(&mut self, ttl_ns: u64) -> anyhow::Result<usize> {
         let now = lnvps_fw_service::gc::monotonic_now_ns();
+        let entries: Vec<(PortKeyV4, LastSeen)> =
+            lnvps_fw_service::runtime::scan_plain(&self.bpf, "OPEN_PORTS_V4")?;
+        let expired =
+            lnvps_fw_service::gc::expired_ports(&entries, now, ttl_ns, ttl_ns, |k| k.proto);
         let mut map: AyaHashMap<_, PortKeyV4, LastSeen> =
             AyaHashMap::try_from(self.bpf.map_mut("OPEN_PORTS_V4").unwrap())?;
-        Ok(lnvps_fw_service::gc::gc_open_ports(
-            &mut map,
-            now,
-            ttl_ns,
-            ttl_ns,
-            |k| k.proto,
-        ))
+        Ok(lnvps_fw_service::gc::remove_keys(&mut map, &expired))
     }
 
     /// Force an IPv4 destination (or prefix) into MITIGATE mode by writing the
@@ -224,14 +248,6 @@ impl Harness {
         Ok(())
     }
 
-    /// Manually install a source CIDR block (as escalation would).
-    pub fn block_cidr_v4(&mut self, net: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
-        let mut trie: LpmTrie<_, [u8; 4], u8> =
-            LpmTrie::try_from(self.bpf.map_mut("V4_CIDR_SRC").unwrap())?;
-        trie.insert(&Key::new(prefix_len, net.octets()), 1u8, 0)?;
-        Ok(())
-    }
-
     /// Read the effective mitigation mode covering an IPv4 destination via a
     /// longest-prefix lookup (default NORMAL = 0 if no covering entry).
     pub fn dest_mode_v4(&self, ip: Ipv4Addr) -> anyhow::Result<u32> {
@@ -255,21 +271,36 @@ impl Harness {
         run_control(&mut self.bpf, state, cfg, now_ns)
     }
 
-    /// True if `ip` is covered by a blocked source CIDR in `V4_CIDR_SRC`.
-    pub fn cidr_blocked_v4(&self, ip: Ipv4Addr) -> anyhow::Result<bool> {
-        let trie: LpmTrie<_, [u8; 4], u8> =
-            LpmTrie::try_from(self.bpf.map("V4_CIDR_SRC").unwrap())?;
-        Ok(trie.get(&Key::new(32, ip.octets()), 0).is_ok())
+    /// The kernel rate machine's state for a source (None if never counted).
+    pub fn src_state_v4(&self, ip: Ipv4Addr) -> anyhow::Result<Option<SrcState>> {
+        let map: AyaHashMap<_, [u8; 4], SrcState> =
+            AyaHashMap::try_from(self.bpf.map("V4_SRC_STATE").unwrap())?;
+        Ok(map.get(&ip.octets(), 0).ok())
     }
 
-    /// Summed per-CPU per-source packet count for `ip` (0 if absent).
+    /// True while the kernel machine is blocking `ip` (`blocked_until` in the
+    /// future of the shared CLOCK_MONOTONIC / bpf_ktime domain).
+    pub fn src_blocked_v4(&self, ip: Ipv4Addr) -> anyhow::Result<bool> {
+        let now = lnvps_fw_service::gc::monotonic_now_ns();
+        Ok(self
+            .src_state_v4(ip)?
+            .is_some_and(|st| st.blocked_until_ns > now))
+    }
+
+    /// Packets the kernel counted for `ip` in its current window.
     pub fn src_packets_v4(&self, ip: Ipv4Addr) -> anyhow::Result<u64> {
-        let map: PerCpuHashMap<_, [u8; 4], u64> =
-            PerCpuHashMap::try_from(self.bpf.map("V4_SRC_COUNTERS").unwrap())?;
-        match map.get(&ip.octets(), 0) {
-            Ok(values) => Ok(values.iter().copied().sum()),
-            Err(_) => Ok(0),
-        }
+        Ok(self.src_state_v4(ip)?.map(|st| st.count).unwrap_or(0))
+    }
+
+    /// Arm the in-kernel per-source rate machine (as the daemon does at
+    /// startup and on limit edits).
+    pub fn set_src_rate(&mut self, rate_pps: u64, cooldown_ns: u64) -> anyhow::Result<()> {
+        let cfg = RuntimeConfig {
+            src_rate_pps: rate_pps,
+            src_cooldown_ns: cooldown_ns,
+            ..test_runtime_config()
+        };
+        lnvps_fw_service::runtime::write_src_rate_cfg(&mut self.bpf, &cfg)
     }
 
     /// Seed a learned-open IPv4 port directly (as passive learning would).

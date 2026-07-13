@@ -39,7 +39,7 @@ section to disable the API entirely.
 | GET | `/tracked` | live per-destination RX/TX rates (paginated + filtered) |
 | GET | `/ports` | learned open ports per protected IP (paginated + filtered) |
 | GET | `/sources` | **the** unified source list: every rate-tracked source (3-state + live pps) plus manual blocks, paginated + filtered |
-| GET | `/blocks` | legacy: the enforced block trie only (manual + auto dropping/cooling, CIDR-aggregated), paginated |
+| GET | `/blocks` | legacy: currently-blocked sources only (manual CIDRs + kernel-blocked /32s|/128s), paginated |
 | POST | `/blocks` | add a permanent manual source block `{cidr}` (updates the ruleset) |
 | DELETE | `/blocks?cidr=<cidr>` | remove a manual source block |
 | GET | `/upgrade` | cached self-upgrade status: `current`, `latest`, `available`, `deb_url` |
@@ -66,31 +66,38 @@ neither can hide:
 
 - `pps`/`syn_pps`/`bps` (+ `net_*` prefix aggregates) — *destination* entry
   thresholds: “is this dest under attack?”
-- `src_rate_pps` (+ `src_exit_pct`, `src_cooldown_secs`) — the *per-source*
-  auto-block threshold: once a dest is mitigating, any single source at/over
-  this rate is blocked. Necessarily much lower than the dest threshold, but
-  keep it well above shared-infrastructure rates (CDN/reverse-proxy edges,
-  CGNAT) — default 10 000 pps. Mirrors `escalation.src-rate-pps` in the config
-  file; the API value wins after a PUT.
+- `src_rate_pps` (+ `src_cooldown_secs`) — the *per-source* auto-block
+  threshold, enforced by the in-kernel rate machine over an exact 1s window:
+  once a dest is mitigating, any single source over this rate is blocked for
+  the cooldown. Necessarily much lower than the dest threshold, but keep it
+  well above shared-infrastructure rates (CDN/reverse-proxy edges, CGNAT) —
+  default 10 000 pps. Mirrors `escalation.src-rate-pps` in the config file;
+  the API value wins after a PUT (userspace re-writes the kernel config map).
 
 Omitting the `src_*` fields in a PUT (older clients) falls back to their
 defaults rather than zeroing them.
 
 ### Source list (`/sources`)
 
-While a destination is under mitigation the datapath counts every source IP and
-userspace runs a per-source rate state machine. `GET /sources` is the **single**
-source list the UI shows: it surfaces that full set in every state, **plus**
-operator-pushed manual blocks. There is no separate “blocks list” — an auto block
-is simply an entry whose `state` is `dropping`/`cooling`.
+While a destination is under mitigation, the **XDP datapath itself** runs a
+fixed-window rate machine per source IP: it counts each source over a 1s
+window and blocks over-rate sources in-line (`blocked_until` in its state
+map), with drops engaging once the destination escalates to `SOURCE_BLOCK`.
+Userspace is not in the decision path — it snapshots the kernel state map
+(batched) purely for this view. `GET /sources` is the **single** source list
+the UI shows, plus operator-pushed manual blocks. An auto block is simply an
+entry whose `state` is `dropping`.
 
 Each item is `{ ip, pps, state, manual, age_secs }` where `state` is one of:
 
-- `normal` — under the per-source limit (`src-rate-pps`); tracked but **not** blocked.
-- `dropping` — at/over the limit; installed in the CIDR block trie (packets dropped).
-- `cooling` — still blocked, but the rate fell below the exit threshold
-  (`src-exit-pct` of the limit) and is counting down `src-cooldown-secs` before
-  release. A new at/over-rate window flips it back to `dropping`.
+- `normal` — under the per-source limit (`src-rate-pps`); counted but **not**
+  blocked.
+- `dropping` — tripped the limit; the kernel drops its packets until the
+  cooldown expires (re-extended every window it stays over-rate).
+
+`pps` is estimated from the current kernel window (count over elapsed); an
+idle source's rate decays toward zero naturally. A `normal` source idle for
+60s is swept from the kernel state map by the daemon's GC timer.
 
 `manual: true` rows are permanent operator blocks (from `POST /blocks`); they are
 dropped before per-source counting so they always report `pps: 0` and are pinned

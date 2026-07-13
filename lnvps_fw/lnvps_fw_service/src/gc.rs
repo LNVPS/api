@@ -31,36 +31,40 @@ pub fn is_expired(last_seen_ns: u64, now_ns: u64, ttl_ns: u64) -> bool {
     now_ns.saturating_sub(last_seen_ns) > ttl_ns
 }
 
-/// Sweep one learned-ports map, removing entries older than `ttl_ns`. Returns
-/// the number of entries removed.
-pub fn gc_open_ports<K>(
-    map: &mut HashMap<&mut MapData, K, LastSeen>,
+/// Select the expired keys from a pre-scanned learned-ports snapshot (pure —
+/// the scan itself is done batched by the caller, so the sweep costs one
+/// syscall per ~4k entries instead of two per entry).
+pub fn expired_ports<K>(
+    entries: &[(K, LastSeen)],
     now_ns: u64,
     tcp_ttl_ns: u64,
     udp_ttl_ns: u64,
     proto_of: impl Fn(&K) -> u8,
-) -> usize
+) -> Vec<K>
 where
     K: Pod,
 {
-    // Collect keys first so the immutable iterator borrow is released before
-    // the mutable removals.
-    let keys: Vec<K> = map.keys().flatten().collect();
-    let mut removed = 0;
-    for k in keys {
-        let ttl_ns = if proto_of(&k) == lnvps_fw_common::PROTO_UDP {
-            udp_ttl_ns
-        } else {
-            tcp_ttl_ns
-        };
-        if let Ok(v) = map.get(&k, 0)
-            && is_expired(v.last_seen, now_ns, ttl_ns)
-            && map.remove(&k).is_ok()
-        {
-            removed += 1;
-        }
-    }
-    removed
+    entries
+        .iter()
+        .filter(|(k, v)| {
+            let ttl_ns = if proto_of(k) == lnvps_fw_common::PROTO_UDP {
+                udp_ttl_ns
+            } else {
+                tcp_ttl_ns
+            };
+            is_expired(v.last_seen, now_ns, ttl_ns)
+        })
+        .map(|(k, _)| *k)
+        .collect()
+}
+
+/// Remove a set of keys from a map, returning how many were actually removed
+/// (an entry may have been LRU-evicted between the scan and the removal).
+pub fn remove_keys<K>(map: &mut HashMap<&mut MapData, K, LastSeen>, keys: &[K]) -> usize
+where
+    K: Pod,
+{
+    keys.iter().filter(|k| map.remove(k).is_ok()).count()
 }
 
 #[cfg(test)]

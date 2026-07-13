@@ -46,15 +46,8 @@ fn thin_carpet_bomb_flips_whole_prefix() {
         manual_v4: Vec::new(),
         manual_v6: Vec::new(),
         src_rate_pps: u64::MAX,
-        fanout: 4,
-        agg_max_prefix_v4: 24,
-        agg_max_prefix_v6: 48,
-        src_exit_pct: 50,
         src_cooldown_ns: SECOND_NS,
-        max_source_blocks: 50_000,
-        block_ttl_ns: SECOND_NS,
         escalate_pass_pps: u64::MAX,
-        max_real_sources: 10_000,
         syn_proxy_pps: u64::MAX,
     };
     let mut state = DetectionState::default();

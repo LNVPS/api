@@ -238,24 +238,19 @@ pub struct Limits {
     pub exit_pct: u64,
     pub cooldown_secs: u64,
     /// Per-source auto-block threshold: once a destination is mitigating, any
-    /// single source at/over this pps is blocked (`escalation.src_rate_pps`).
-    /// This is a much lower bar than the per-destination `pps` above — keep
-    /// them side by side so neither hides.
+    /// single source at/over this pps (exact, over the kernel rate machine's
+    /// 1s window) is blocked. This is a much lower bar than the
+    /// per-destination `pps` above — kept side by side so neither hides.
     #[serde(default = "default_limit_src_rate_pps")]
     pub src_rate_pps: u64,
-    /// Source exit hysteresis (% of `src_rate_pps`).
-    #[serde(default = "default_limit_src_exit_pct")]
-    pub src_exit_pct: u64,
-    /// Sustained seconds below the source exit threshold before unblocking.
+    /// How long a tripped source stays blocked before re-evaluation (the
+    /// kernel re-extends the block each window the source is still over-rate).
     #[serde(default = "default_limit_src_cooldown_secs")]
     pub src_cooldown_secs: u64,
 }
 
 fn default_limit_src_rate_pps() -> u64 {
     10_000
-}
-fn default_limit_src_exit_pct() -> u64 {
-    50
 }
 fn default_limit_src_cooldown_secs() -> u64 {
     10
@@ -1002,9 +997,6 @@ async fn put_limits(State(state): State<Arc<SharedState>>, Json(l): Json<Limits>
     }
     if l.exit_pct == 0 || l.exit_pct >= 100 {
         return (StatusCode::BAD_REQUEST, "exit_pct must be 1..99").into_response();
-    }
-    if l.src_exit_pct == 0 || l.src_exit_pct >= 100 {
-        return (StatusCode::BAD_REQUEST, "src_exit_pct must be 1..99").into_response();
     }
     *state.limits.write().unwrap() = l;
     state.limits_version.fetch_add(1, Ordering::Relaxed);
