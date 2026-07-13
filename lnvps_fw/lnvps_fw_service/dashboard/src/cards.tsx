@@ -85,6 +85,7 @@ export function LimitsCard({ token, nics }: { token: string; nics?: InterfaceInf
       {rateFld("net_pps", "prefix pps")}{rateFld("net_syn_pps", "prefix syn/s")}{bpsFld("net_bps", "prefix bit/s")}
       {fld("exit_pct", "exit %")}{fld("cooldown_secs", "cooldown s")}
       {rateFld("src_rate_pps", "src block pps")}{fld("src_cooldown_secs", "src cooldown s")}
+      {rateFld("syn_proxy_pps", "syn-proxy syn/s (0=off)")}{rateFld("learn_leak_pps", "learn leak syn/s")}
       <div class="act">
         <button onClick={save} disabled={anyInvalid}>save</button>
         <button class="ghost" onClick={reload}>reset</button>

@@ -56,6 +56,7 @@ pub fn test_runtime_config() -> RuntimeConfig {
         src_cooldown_ns: 1_000_000_000,
         escalate_pass_pps: 0,
         syn_proxy_pps: u64::MAX,
+        learn_leak_pps: 0,
     }
 }
 
@@ -301,6 +302,17 @@ impl Harness {
             ..test_runtime_config()
         };
         lnvps_fw_service::runtime::write_src_rate_cfg(&mut self.bpf, &cfg)
+    }
+
+    /// Set the per-destination learning-leak budget (SYNs/sec to unlearned
+    /// ports the port filter leaks through so open ports can be learned while
+    /// mitigating). 0 disables the leak.
+    pub fn set_learn_leak(&mut self, pps: u64) -> anyhow::Result<()> {
+        let cfg = RuntimeConfig {
+            learn_leak_pps: pps,
+            ..test_runtime_config()
+        };
+        lnvps_fw_service::runtime::write_learn_leak_cfg(&mut self.bpf, &cfg)
     }
 
     /// Seed a learned-open IPv4 port directly (as passive learning would).

@@ -247,6 +247,19 @@ pub struct Limits {
     /// kernel re-extends the block each window the source is still over-rate).
     #[serde(default = "default_limit_src_cooldown_secs")]
     pub src_cooldown_secs: u64,
+    /// Engage the SYN-proxy once a mitigating entity's SYN rate reaches this
+    /// many SYNs/second. **0 disables the SYN-proxy** — set 0 on tunneled or
+    /// asymmetric-routed routers (GRE-backed VMs, non-GRE tunnels, reply on a
+    /// different NIC) where the XDP_TX cookie reply cannot reach the client.
+    #[serde(default = "default_limit_syn_proxy_pps")]
+    pub syn_proxy_pps: u64,
+    /// Per-destination budget of NEW distinct-port probes/second the port
+    /// filter leaks through while mitigating (first-touch), so a genuinely-open
+    /// TCP port not learned before the flood can still answer and be learned.
+    /// 0 disables the leak (drop-all — black-holes any open port not learned
+    /// before the flood started).
+    #[serde(default = "default_limit_learn_leak_pps")]
+    pub learn_leak_pps: u64,
 }
 
 fn default_limit_src_rate_pps() -> u64 {
@@ -254,6 +267,12 @@ fn default_limit_src_rate_pps() -> u64 {
 }
 fn default_limit_src_cooldown_secs() -> u64 {
     10
+}
+fn default_limit_syn_proxy_pps() -> u64 {
+    5_000
+}
+fn default_limit_learn_leak_pps() -> u64 {
+    100
 }
 
 /// An active blocked source CIDR (from SOURCE_BLOCK escalation of a real,

@@ -455,6 +455,8 @@ fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
     rt.network.cooldown_ns = cooldown_ns;
     rt.src_rate_pps = l.src_rate_pps;
     rt.src_cooldown_ns = l.src_cooldown_secs.saturating_mul(1_000_000_000);
+    rt.syn_proxy_pps = l.syn_proxy_pps;
+    rt.learn_leak_pps = l.learn_leak_pps;
 }
 
 /// How close a set of rates is to tripping mitigation: the max of the three
@@ -1075,10 +1077,13 @@ async fn main() -> Result<()> {
             cooldown_secs: det.cooldown_ns / 1_000_000_000,
             src_rate_pps: runtime_cfg.src_rate_pps,
             src_cooldown_secs: runtime_cfg.src_cooldown_ns / 1_000_000_000,
+            syn_proxy_pps: runtime_cfg.syn_proxy_pps,
+            learn_leak_pps: runtime_cfg.learn_leak_pps,
         });
     }
     // Arm the in-kernel per-source rate machine before traffic decisions.
     runtime::write_src_rate_cfg(&mut bpf, &runtime_cfg)?;
+    runtime::write_learn_leak_cfg(&mut bpf, &runtime_cfg)?;
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     // Rotate the SYN-cookie secret periodically; cookies issued in the previous
@@ -1143,6 +1148,9 @@ async fn main() -> Result<()> {
                         // machine (it owns per-source blocking now).
                         if let Err(e) = runtime::write_src_rate_cfg(&mut bpf, &runtime_cfg) {
                             warn!("writing src rate config failed: {e}");
+                        }
+                        if let Err(e) = runtime::write_learn_leak_cfg(&mut bpf, &runtime_cfg) {
+                            warn!("writing learn-leak config failed: {e}");
                         }
                         info!("detection limits updated via API");
                     }

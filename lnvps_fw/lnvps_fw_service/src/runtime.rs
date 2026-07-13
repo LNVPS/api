@@ -67,6 +67,10 @@ pub struct RuntimeConfig {
     /// Enable the SYN_PROXY flag once a mitigating entity's SYN rate reaches
     /// this many SYNs/second.
     pub syn_proxy_pps: u64,
+    /// Per-destination budget of SYNs/second to unlearned TCP ports leaked
+    /// through the port filter so open ports can still be learned while
+    /// mitigating. 0 disables the leak. Written to `LEARN_LEAK_CFG`.
+    pub learn_leak_pps: u64,
 }
 
 impl RuntimeConfig {
@@ -208,8 +212,12 @@ fn dest_state(level: u32, now_ns: u64) -> DestState {
 fn enforced_flags(rates: &Rates, escalate_pass_pps: u64, syn_proxy_pps: u64) -> u32 {
     let mut flags = DEST_MODE_PORT_FILTER;
     // A sustained SYN flood engages the SYN-proxy (validate handshakes to open
-    // TCP ports with cookies). High efficacy vs spoofed SYN floods, low FP.
-    if rates.syn_pps >= syn_proxy_pps {
+    // TCP ports with cookies). `syn_proxy_pps == 0` disables it entirely —
+    // required for tunneled/asymmetric-routed deployments (GRE-backed VMs,
+    // non-GRE tunnels, or return traffic on a different NIC) where the
+    // XDP_TX'd cookie reply can neither be re-encapsulated nor sent out the
+    // correct egress NIC, so the proxy would black-hole real services.
+    if syn_proxy_pps != 0 && rates.syn_pps >= syn_proxy_pps {
         flags |= DEST_MODE_SYN_PROXY;
     }
     // Escalate on residual pass-rate alone: the in-kernel gate only ever
@@ -431,6 +439,19 @@ pub fn write_src_rate_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
         cooldown_ns: cfg.src_cooldown_ns,
     };
     arr.set(0, c, 0).context("writing SRC_RATE_CFG")?;
+    Ok(())
+}
+
+/// Write the per-destination learning-leak budget (`LEARN_LEAK_CFG[0]`), the
+/// max SYNs/second to unlearned ports the port filter leaks per destination.
+/// Called at startup and on live `PUT /limits`.
+pub fn write_learn_leak_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
+    let mut arr: aya::maps::Array<_, u32> = aya::maps::Array::try_from(
+        bpf.map_mut("LEARN_LEAK_CFG")
+            .context("LEARN_LEAK_CFG missing")?,
+    )?;
+    arr.set(0, cfg.learn_leak_pps.min(u32::MAX as u64) as u32, 0)
+        .context("writing LEARN_LEAK_CFG")?;
     Ok(())
 }
 
@@ -666,5 +687,41 @@ mod manual_floor_tests {
         let mut outside = [0u8; 16];
         outside[0] = 0xfd;
         assert_eq!(rt.manual_flags_v6(outside), 0);
+    }
+}
+
+#[cfg(test)]
+mod enforced_flags_tests {
+    use super::*;
+
+    fn rates(syn_pps: u64, pass_pps: u64) -> Rates {
+        Rates {
+            syn_pps,
+            pass_pps,
+            ..Default::default()
+        }
+    }
+
+    // syn_proxy_pps == 0 disables the SYN-proxy entirely (the switch that lets
+    // tunneled/asymmetric-routed deployments turn it off), even at an extreme
+    // SYN rate. PORT_FILTER remains the always-on base.
+    #[test]
+    fn syn_proxy_disabled_when_threshold_zero() {
+        let f = enforced_flags(&rates(1_000_000, 0), u64::MAX, 0);
+        assert_eq!(f & DEST_MODE_SYN_PROXY, 0, "must be off at threshold 0");
+        assert_ne!(f & DEST_MODE_PORT_FILTER, 0, "port filter still on");
+    }
+
+    // A non-zero threshold engages only at/over the rate (unchanged behaviour).
+    #[test]
+    fn syn_proxy_engages_only_at_or_over_threshold() {
+        assert_ne!(
+            enforced_flags(&rates(6_000, 0), u64::MAX, 5_000) & DEST_MODE_SYN_PROXY,
+            0
+        );
+        assert_eq!(
+            enforced_flags(&rates(4_000, 0), u64::MAX, 5_000) & DEST_MODE_SYN_PROXY,
+            0
+        );
     }
 }

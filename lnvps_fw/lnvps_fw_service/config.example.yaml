@@ -103,7 +103,23 @@ escalation:
   escalate-pass-pps: 50000
   # Enable the SYN-proxy (SYN-cookie handshake validation) on a mitigating
   # dest/prefix once its SYN rate reaches this many SYNs/second.
+  # 0 DISABLES the SYN-proxy entirely -- set 0 on tunneled / asymmetric-routed
+  # routers (GRE-backed VMs, non-GRE tunnels, or reply traffic on a different
+  # NIC): the SYN-proxy XDP_TX's a cookie SYN-ACK out the ingress NIC and
+  # cannot re-encapsulate it or steer it to another egress, so it would
+  # black-hole real services rather than protect them.
   syn-proxy-syn-pps: 5000
+  # Per-destination budget of NEW distinct-port probes/second the port filter
+  # leaks through while mitigating, so a genuinely-open TCP or UDP port that was
+  # not learned before the flood can still answer and be learned. Each unknown
+  # port is probed once (first-touch): leaked for a short grace window, then —
+  # if still unlearned — assumed closed and suppressed, re-probed periodically
+  # in case it opens later. Amplification-safe (probe key is (dest,port), so a
+  # spoofed UDP amp flood to one port leaks ~1 packet/cycle). WireGuard
+  # handshake-init packets are fast-pathed so tunnels re-establish even under a
+  # garbage flood to their port. Without this the port filter black-holes any
+  # open port missing from the learned set for the whole flood. 0 disables it.
+  learn-leak-pps: 100
 
 # RESTful control API (increment 7). Omit this whole section to disable it.
 # HTTPS is mandatory: if no cert/key is given a self-signed pair is generated

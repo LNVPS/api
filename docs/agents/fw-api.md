@@ -71,11 +71,30 @@ neither can hide:
   once a dest is mitigating, any single source over this rate is blocked for
   the cooldown. Necessarily much lower than the dest threshold, but keep it
   well above shared-infrastructure rates (CDN/reverse-proxy edges, CGNAT) —
-  default 10 000 pps. Mirrors `escalation.src-rate-pps` in the config file;
+  default 10 000 pps. Mirrors `escalation.src-rate-pps` in the config file;
   the API value wins after a PUT (userspace re-writes the kernel config map).
+- `syn_proxy_pps` — engage the SYN-proxy once a mitigating entity's SYN rate
+  reaches this many SYNs/second. **`0` disables the SYN-proxy** (live-toggle
+  it off here without a restart). The SYN-proxy `XDP_TX`s a cookie SYN-ACK out
+  the *ingress* NIC and cannot re-encapsulate it or steer it to another
+  egress, so it only works on symmetric, directly-reachable, single-hook
+  topologies — set `0` on tunneled / GRE-backed / asymmetric-routed routers or
+  it black-holes real services.
+- `learn_leak_pps` — per-destination budget of **new distinct-port probes/sec**
+  the port filter leaks through while mitigating (first-touch: each unknown TCP
+  or UDP port is probed once, given a grace window for the reply, then assumed
+  closed and suppressed — re-probed periodically), so a genuinely-open port can
+  still answer and be passively learned. `0` = drop-all (black-holes any open
+  port not learned before the flood). Default 100. Amplification-safe: the
+  probe key is `(dest,port)`, so a spoofed UDP amp flood to one port leaks only
+  ~1 packet/cycle. **WireGuard** handshake-initiation packets (type 1, 148
+  bytes) are fast-pathed — leaked (rate-capped, bypassing suppression) so a
+  tunnel re-establishes even under a garbage flood to its port. Learned ports
+  are also refreshed from ingress traffic, so a long-lived connection active in
+  either direction won't age out mid-flight under mitigation.
 
-Omitting the `src_*` fields in a PUT (older clients) falls back to their
-defaults rather than zeroing them.
+Omitting any of these fields in a PUT (older clients) falls back to its default
+rather than zeroing it.
 
 ### Source list (`/sources`)
 

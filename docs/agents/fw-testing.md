@@ -99,10 +99,24 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
 - `detection_flip_and_cooldown` — a flood flips the dest to mitigation (via the
   real `runtime::run_control` with injected timestamps) and the cooldown
   returns it to NORMAL once the flood stops.
-- `source_block_only_when_flag_set` — a CIDR-blocked source to an *open* port is
-  passed with the PORT_FILTER flag alone but dropped once the SOURCE_BLOCK flag
-  is also set, proving protection flags are independent and source blocking is
-  gated to when userspace enables it.
+- `learn_leak_discovers_open_port_under_mitigation` — an open port not learned
+  before mitigation began is normally black-holed (the passive learner only
+  sees ports via the VM's outbound SYN-ACK); with a leak budget a bounded
+  first-touch SYN is passed, the VM answers, and the port self-heals into the
+  learned set.
+- `no_leak_black_holes_unlearned_open_port` — with the leak disabled (budget 0)
+  the same unlearned-but-open port stays black-holed, proving the deadlock the
+  leak fixes.
+- `wg_handshake_init_leaked_under_mitigation` — a WireGuard handshake-init
+  packet (type 1, 148 bytes) to an unlearned UDP port is leaked through
+  PORT_FILTER (WG fast-path) so a tunnel can re-establish while mitigating.
+- `udp_first_touch_leaked_under_mitigation` — an ordinary UDP packet to an
+  unlearned port is first-touch leaked so a request/response service can answer
+  and be learned.
+- `ingress_traffic_refreshes_learned_port` — an inbound packet to a learned
+  port refreshes its `last_seen` from the XDP ingress side, so a long-lived
+  connection active in either direction won't age out mid-flight (the passive
+  learner alone refreshes only on the VM's outbound packets).
 
 `tests/escalation.rs` (increment 5 per-source rate + CIDR escalation):
 - `cidr_escalation_blocks_offending_v24` — a spoofed-source flood across a /24

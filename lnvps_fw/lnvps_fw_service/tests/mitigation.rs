@@ -10,7 +10,9 @@ use std::time::Duration;
 use harness::netns::VM_V4;
 use harness::traffic;
 use harness::{Harness, require_root};
-use lnvps_fw_common::{DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SYN_PROXY, PROTO_TCP};
+use lnvps_fw_common::{
+    DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SYN_PROXY, PROTO_TCP, PROTO_UDP,
+};
 use lnvps_fw_service::detect::DetectionConfig;
 use lnvps_fw_service::runtime::{DetectionState, RuntimeConfig};
 
@@ -123,6 +125,7 @@ fn detection_flip_and_cooldown() {
         src_cooldown_ns: SECOND_NS,
         escalate_pass_pps: u64::MAX,
         syn_proxy_pps: u64::MAX,
+        learn_leak_pps: 0,
     };
     let mut state = DetectionState::default();
 
@@ -197,6 +200,7 @@ fn manual_override_survives_auto_detection() {
         src_cooldown_ns: SECOND_NS,
         escalate_pass_pps: u64::MAX,
         syn_proxy_pps: u64::MAX,
+        learn_leak_pps: 0,
     };
     let mut state = DetectionState::default();
 
@@ -228,6 +232,190 @@ fn manual_override_survives_auto_detection() {
         h.dest_mode_v4(VM_V4).unwrap(),
         DEST_MODE_SYN_PROXY,
         "mitigation-exit must restore the manual override, not delete it"
+    );
+}
+
+/// The learning-leak breaks the port-learning deadlock: a genuinely-open port
+/// that was NOT learned before mitigation began is normally black-holed (the
+/// passive learner only sees ports via the VM's outbound SYN-ACK, which never
+/// happens if we drop the inbound SYN). With a leak budget, a bounded rate of
+/// SYNs to unlearned ports is passed, so the VM answers, the handshake
+/// completes, and the port self-heals into the learned-open set.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn learn_leak_discovers_open_port_under_mitigation() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+    // Mitigate BEFORE the port is ever learned, and enable the leak.
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER)
+        .expect("mitigate");
+    h.set_learn_leak(100).expect("leak budget");
+
+    let vm_ns = vm_ns(&h);
+    let listen: SocketAddr = SocketAddr::from((VM_V4, 8080));
+    let acceptor = std::thread::spawn(move || {
+        traffic::tcp_listen_accept(&vm_ns, listen, Duration::from_secs(5))
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(
+        h.open_port_v4(VM_V4, 8080, PROTO_TCP).unwrap().is_none(),
+        "port must be unlearned at the start"
+    );
+
+    let ok = traffic::tcp_connect(&attacker_ns(&h), listen, Duration::from_secs(2))
+        .expect("connect call");
+    assert!(
+        ok,
+        "a SYN to an unlearned OPEN port must be leaked so the client can connect"
+    );
+    assert!(
+        acceptor.join().unwrap().unwrap(),
+        "the VM listener accepted the leaked connection"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.open_port_v4(VM_V4, 8080, PROTO_TCP).unwrap().is_some(),
+        "the leaked handshake's SYN-ACK should have taught the port"
+    );
+}
+
+/// Negative: with the leak disabled (budget 0, the old behaviour), an
+/// unlearned-but-open port stays black-holed under mitigation.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn no_leak_black_holes_unlearned_open_port() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER)
+        .expect("mitigate");
+    h.set_learn_leak(0).expect("leak disabled");
+
+    let vm_ns = vm_ns(&h);
+    let listen: SocketAddr = SocketAddr::from((VM_V4, 8081));
+    let acceptor = std::thread::spawn(move || {
+        traffic::tcp_listen_accept(&vm_ns, listen, Duration::from_secs(3))
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    let ok = traffic::tcp_connect(&attacker_ns(&h), listen, Duration::from_secs(2))
+        .expect("connect call");
+    assert!(
+        !ok,
+        "with the leak disabled, a SYN to an unlearned port must be dropped"
+    );
+    let _ = acceptor.join();
+}
+
+/// WireGuard fast-path: a handshake-initiation packet (type 1, 148 bytes) to
+/// an unlearned UDP port is leaked through PORT_FILTER so the tunnel can
+/// re-establish while mitigating — even though the port was never learned.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn wg_handshake_init_leaked_under_mitigation() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER)
+        .expect("mitigate");
+    h.set_learn_leak(100).expect("leak budget");
+
+    let vm_ns = vm_ns(&h);
+    let bind = SocketAddr::from((VM_V4, 51820));
+    let rx =
+        std::thread::spawn(move || traffic::udp_recv_once(&vm_ns, bind, Duration::from_secs(3)));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.open_port_v4(VM_V4, 51820, PROTO_UDP).unwrap().is_none(),
+        "WG port must be unlearned at the start"
+    );
+
+    // WireGuard handshake initiation: 148-byte payload, first byte = msg type 1.
+    let mut wg = vec![0u8; 148];
+    wg[0] = 0x01;
+    traffic::udp_send(&attacker_ns(&h), bind, &wg).expect("send WG init");
+
+    let got = rx.join().unwrap().unwrap();
+    assert!(
+        got.is_some(),
+        "WG handshake-init must be leaked to the VM under mitigation"
+    );
+    assert_eq!(
+        got.unwrap().len(),
+        148,
+        "the full WG init payload is delivered"
+    );
+}
+
+/// General UDP first-touch: an ordinary UDP packet to an unlearned port is
+/// probed (leaked once) so a request/response service can answer and be
+/// learned while mitigating.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn udp_first_touch_leaked_under_mitigation() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER)
+        .expect("mitigate");
+    h.set_learn_leak(100).expect("leak budget");
+
+    let vm_ns = vm_ns(&h);
+    let bind = SocketAddr::from((VM_V4, 5353));
+    let rx =
+        std::thread::spawn(move || traffic::udp_recv_once(&vm_ns, bind, Duration::from_secs(3)));
+    std::thread::sleep(Duration::from_millis(200));
+
+    traffic::udp_send(&attacker_ns(&h), bind, b"probe").expect("send udp");
+
+    assert!(
+        rx.join().unwrap().unwrap().is_some(),
+        "a UDP packet to an unlearned port must be first-touch leaked"
+    );
+}
+
+/// A learned port must be kept alive by traffic in EITHER direction. The
+/// passive learner only refreshes on the VM's *outbound* packets, so an
+/// inbound-heavy or idle long-lived connection could age out mid-flight and
+/// then be dropped under mitigation. The XDP ingress path refreshes a learned
+/// port's `last_seen` when it passes a packet to it — verified here by an
+/// inbound packet bumping a stale timestamp.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn ingress_traffic_refreshes_learned_port() {
+    if !require_root() {
+        return;
+    }
+    let mut h = Harness::new().expect("harness setup");
+    h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER)
+        .expect("mitigate");
+    // Seed a learned UDP port with a stale last_seen (the accessor writes 1).
+    h.set_open_port_v4(VM_V4, 9000, PROTO_UDP)
+        .expect("seed learned port");
+    let before = h
+        .open_port_v4(VM_V4, 9000, PROTO_UDP)
+        .unwrap()
+        .unwrap()
+        .last_seen;
+
+    // One inbound packet to the learned port under mitigation must refresh it.
+    traffic::udp_send_burst(&attacker_ns(&h), SocketAddr::from((VM_V4, 9000)), 1).expect("send");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let after = h
+        .open_port_v4(VM_V4, 9000, PROTO_UDP)
+        .unwrap()
+        .unwrap()
+        .last_seen;
+    assert!(
+        after > before,
+        "ingress packet to a learned port must refresh last_seen ({before} -> {after})"
     );
 }
 

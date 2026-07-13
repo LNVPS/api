@@ -36,6 +36,7 @@ export interface Limits {
   pps: number; syn_pps: number; bps: number; net_pps: number; net_syn_pps: number;
   net_bps: number; exit_pct: number; cooldown_secs: number;
   src_rate_pps: number; src_cooldown_secs: number;
+  syn_proxy_pps: number; learn_leak_pps: number;
 }
 export interface UpgradeStatus {
   current: string; latest: string | null; available: boolean;

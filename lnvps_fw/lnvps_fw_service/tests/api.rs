@@ -244,6 +244,8 @@ async fn limits_put_get_roundtrip_and_validation() {
         cooldown_secs: 45,
         src_rate_pps: 20_000,
         src_cooldown_secs: 15,
+        syn_proxy_pps: 5_000,
+        learn_leak_pps: 100,
     })
     .unwrap();
     let res = app
@@ -265,6 +267,25 @@ async fn limits_put_get_roundtrip_and_validation() {
     assert_eq!(got.exit_pct, 60);
     assert_eq!(got.src_rate_pps, 20_000);
     assert_eq!(got.src_cooldown_secs, 15);
+    assert_eq!(got.syn_proxy_pps, 5_000);
+    assert_eq!(got.learn_leak_pps, 100);
+
+    // syn_proxy_pps=0 (disable proxy) and learn_leak_pps=0 (disable leak) are
+    // valid, not rejected.
+    let off = serde_json::to_string(&Limits {
+        syn_proxy_pps: 0,
+        learn_leak_pps: 0,
+        ..got
+    })
+    .unwrap();
+    let res = app
+        .clone()
+        .oneshot(req("PUT", "/api/v1/limits", Some("tok"), Some(off)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(st.limits().syn_proxy_pps, 0);
+    assert_eq!(st.limits().learn_leak_pps, 0);
 
     // Zero threshold rejected.
     let bad = r#"{"pps":0,"syn_pps":1,"bps":1,"net_pps":1,"net_syn_pps":1,"net_bps":1,"exit_pct":50,"cooldown_secs":30}"#.to_string();

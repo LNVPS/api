@@ -49,6 +49,7 @@ fn thin_carpet_bomb_flips_whole_prefix() {
         src_cooldown_ns: SECOND_NS,
         escalate_pass_pps: u64::MAX,
         syn_proxy_pps: u64::MAX,
+        learn_leak_pps: 0,
     };
     let mut state = DetectionState::default();
 

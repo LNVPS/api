@@ -4,7 +4,7 @@ use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, ProgramArray};
 use lnvps_fw_common::{
     COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
-    LastSeen, PortKeyV4, PortKeyV6, SrcRateConfig, SrcState,
+    LastSeen, PROTO_TCP, PortKeyV4, PortKeyV6, SrcRateConfig, SrcState,
 };
 
 /// Max number of destination IPs to track (per address family). Sized to a
@@ -25,6 +25,9 @@ pub const MAX_SRC_IPS: u32 = 256 * 1024;
 /// Max number of CIDR block entries in the LPM tries. Kept bounded by the
 /// userspace aggregation/expansion logic (/32 -> /24 -> /16 -> /8).
 pub const MAX_CIDR_BLOCKS: u32 = 64 * 1024;
+
+/// Max number of per-(dest,port) learning-leak probe entries (LRU-bounded).
+pub const MAX_LEAK_PROBES: u32 = 256 * 1024;
 
 /// Per-destination traffic counters (IPv4), sampled by userspace detection loop
 #[map]
@@ -70,6 +73,35 @@ pub static V6_SRC_STATE: LruHashMap<[u8; 16], SrcState> =
 /// per-source blocking.
 #[map]
 pub static SRC_RATE_CFG: Array<SrcRateConfig> = Array::with_max_entries(1, 0);
+
+/// Per-destination learning-leak buckets (IPv4): a fixed 1s window counting
+/// SYNs to *unlearned* TCP ports that the port filter lets through so the
+/// passive learner can still discover open ports during mitigation. Keyed by
+/// destination, so it is bounded to the protected footprint (LRU).
+#[map]
+pub static V4_LEARN_LEAK: LruHashMap<[u8; 4], SrcState> =
+    LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Per-destination learning-leak buckets (IPv6).
+#[map]
+pub static V6_LEARN_LEAK: LruHashMap<[u8; 16], SrcState> =
+    LruHashMap::with_max_entries(MAX_DST_IPS, 0);
+
+/// Learning-leak budget (single entry): max NEW-port probes/second leaked
+/// through per destination. 0 disables the leak (drop-all).
+#[map]
+pub static LEARN_LEAK_CFG: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Per-(dest,port) first-touch probe state for the learning leak (IPv4):
+/// `last_seen` is the start of the current probe cycle. Bounded LRU.
+#[map]
+pub static V4_LEARN_PROBE: LruHashMap<PortKeyV4, LastSeen> =
+    LruHashMap::with_max_entries(MAX_LEAK_PROBES, 0);
+
+/// Per-(dest,port) first-touch probe state (IPv6).
+#[map]
+pub static V6_LEARN_PROBE: LruHashMap<PortKeyV6, LastSeen> =
+    LruHashMap::with_max_entries(MAX_LEAK_PROBES, 0);
 
 /// Mitigation state per destination (IPv4), an LPM trie written by userspace.
 /// Using a trie lets userspace mitigate a single IP (a /32 entry) or a whole
@@ -224,6 +256,117 @@ macro_rules! src_gate_for {
 src_gate_for!(src_gate_v4, [u8; 4], V4_SRC_STATE);
 src_gate_for!(src_gate_v6, [u8; 16], V6_SRC_STATE);
 
+/// Learning-leak probe TTLs. After the first leaked SYN to an unknown
+/// (dest,port) we keep leaking for GRACE (so the client's SYN retransmits
+/// still get through if the probe was lost), then — still unlearned — assume
+/// the port CLOSED and suppress until REPROBE, when we probe once more in case
+/// it has since opened. A port that answers is learned and short-circuits
+/// (`port_open_refresh`) before ever reaching here again.
+const LEARN_GRACE_NS: u64 = 3_000_000_000;
+const LEARN_REPROBE_NS: u64 = 30_000_000_000;
+
+/// Generate the per-destination learning-leak *budget* gate for one family: a
+/// fixed-1s-window token bucket (`LEARN_LEAK_CFG` tokens/sec/dest). Returns
+/// `true` and consumes a token if under budget. Shared by the general
+/// first-touch probe and the WireGuard handshake fast-path so the total leaked
+/// packets/sec/dest never exceeds the configured budget. `0` disables leaking.
+macro_rules! learn_budget_for {
+    ($name:ident, $key:ty, $map:ident) => {
+        #[inline(always)]
+        pub fn $name(dst: &$key) -> bool {
+            let budget = LEARN_LEAK_CFG.get(0).copied().unwrap_or(0);
+            if budget == 0 {
+                return false;
+            }
+            let now = unsafe { bpf_ktime_get_ns() };
+            match $map.get_ptr_mut(dst) {
+                Some(b) => {
+                    let b = unsafe { &mut *b };
+                    if now.wrapping_sub(b.window_start_ns) >= 1_000_000_000 {
+                        b.window_start_ns = now;
+                        b.count = 0;
+                    }
+                    if b.count >= budget as u64 {
+                        return false;
+                    }
+                    b.count += 1;
+                    true
+                }
+                None => {
+                    let b = SrcState {
+                        window_start_ns: now,
+                        count: 1,
+                        blocked_until_ns: 0,
+                    };
+                    let _ = $map.insert(dst, &b, 0);
+                    true
+                }
+            }
+        }
+    };
+}
+
+learn_budget_for!(learn_budget_v4, [u8; 4], V4_LEARN_LEAK);
+learn_budget_for!(learn_budget_v6, [u8; 16], V6_LEARN_LEAK);
+
+/// Generate the per-(dest,port,proto) first-touch learning-leak gate for one
+/// address family. Returns `true` if this packet to an unlearned port should
+/// be *leaked* so the destination can answer and the passive learner can
+/// discover the port. Each distinct port is probed once per cycle (not every
+/// packet), gated by the shared per-dest budget, so a random-port scan cannot
+/// leak unbounded and a spoofed amplification flood to one UDP port leaks only
+/// ~1 packet/cycle (the probe key is `(dest,port)`, not source).
+///
+/// Without this, `PORT_FILTER` drops every packet to an unlearned port — but
+/// the learner only sees open ports via the destination's *outbound* reply, so
+/// a genuinely-open port not learned when mitigation began can never be
+/// learned (we drop the very packets that would trigger the reply).
+macro_rules! learn_leak_for {
+    ($name:ident, $dst:ty, $pk:ty, $probe:ident, $budget:ident) => {
+        #[inline(always)]
+        pub fn $name(dst: &$dst, port: u16, proto: u8) -> bool {
+            if LEARN_LEAK_CFG.get(0).copied().unwrap_or(0) == 0 {
+                return false;
+            }
+            let now = unsafe { bpf_ktime_get_ns() };
+            let pk = <$pk>::new(*dst, port, proto);
+
+            // First-touch phase machine, anchored at the cycle's first probe
+            // (`last_seen`): [0,GRACE) keep leaking (reply / retransmit
+            // window), [GRACE,REPROBE) suppress (assumed closed), >=REPROBE
+            // re-probe.
+            let mut new_cycle = true;
+            if let Some(st) = unsafe { $probe.get(&pk) } {
+                let elapsed = now.wrapping_sub(st.last_seen);
+                if elapsed < LEARN_GRACE_NS {
+                    new_cycle = false;
+                } else if elapsed < LEARN_REPROBE_NS {
+                    return false;
+                }
+            }
+
+            // Consume a per-dest token only when actually leaking.
+            if !$budget(dst) {
+                return false;
+            }
+            // Anchor a fresh cycle's grace window at this first probe.
+            if new_cycle {
+                let seen = LastSeen { last_seen: now };
+                let _ = $probe.insert(&pk, &seen, 0);
+            }
+            true
+        }
+    };
+}
+
+learn_leak_for!(learn_leak_v4, [u8; 4], PortKeyV4, V4_LEARN_PROBE, learn_budget_v4);
+learn_leak_for!(learn_leak_v6, [u8; 16], PortKeyV6, V6_LEARN_PROBE, learn_budget_v6);
+
+/// How often (at most) an ingress packet refreshes a learned port's
+/// `last_seen`; throttled so a high-pps flow to a learned port does not incur
+/// a per-packet map write.
+const PORT_REFRESH_THROTTLE_NS: u64 = 1_000_000_000;
+
 /// Generate a learn-open-port function for one address family. Called from the
 /// TC egress program with the local (source) address/port of an outbound
 /// packet that indicates an open service (TCP SYN-ACK or any UDP). Inserts a
@@ -265,6 +408,37 @@ macro_rules! port_open_for {
 
 port_open_for!(port_is_open_v4, PortKeyV4, [u8; 4], OPEN_PORTS_V4);
 port_open_for!(port_is_open_v6, PortKeyV6, [u8; 16], OPEN_PORTS_V6);
+
+/// Like `port_is_open` but also refreshes the learned entry's `last_seen` from
+/// the INGRESS side (throttled), so a learned-open port stays alive on traffic
+/// in EITHER direction. The passive learner alone refreshes only on the VM's
+/// *outbound* packets, so a long-lived but inbound-heavy or idle connection
+/// can age out mid-flight — and under mitigation its non-SYN packets would then
+/// be dropped, with the SYN-only leak unable to rescue an established flow.
+/// Only updates existing entries (ingress never *learns* a port; that still
+/// requires the outbound SYN-ACK).
+macro_rules! port_open_refresh_for {
+    ($name:ident, $key:ty, $addr:ty, $map:ident) => {
+        #[inline(always)]
+        pub fn $name(addr: $addr, port: u16, proto: u8) -> bool {
+            let key = <$key>::new(addr, port, proto);
+            match $map.get_ptr_mut(&key) {
+                Some(v) => {
+                    let v = unsafe { &mut *v };
+                    let now = unsafe { bpf_ktime_get_ns() };
+                    if now.wrapping_sub(v.last_seen) > PORT_REFRESH_THROTTLE_NS {
+                        v.last_seen = now;
+                    }
+                    true
+                }
+                None => false,
+            }
+        }
+    };
+}
+
+port_open_refresh_for!(port_open_refresh_v4, PortKeyV4, [u8; 4], OPEN_PORTS_V4);
+port_open_refresh_for!(port_open_refresh_v6, PortKeyV6, [u8; 16], OPEN_PORTS_V6);
 
 /// CIDR block check for one address family: true if `src` matches a blocked
 /// prefix. A full-length prefix lookup returns the longest covering entry.

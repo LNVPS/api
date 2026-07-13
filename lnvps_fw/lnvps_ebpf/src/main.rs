@@ -24,7 +24,8 @@ mod maps;
 
 use maps::{
     OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cookie_secrets, counters_v4, counters_v6,
-    dest_mode_v4, dest_mode_v6, src_gate_v4, src_gate_v6,
+    dest_mode_v4, dest_mode_v6, learn_budget_v4, learn_budget_v6, learn_leak_v4, learn_leak_v6,
+    port_open_refresh_v4, port_open_refresh_v6, src_gate_v4, src_gate_v6,
     learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6, mark_verified_v4,
     mark_verified_v6, port_is_open_v4, port_is_open_v6, protected_v4, protected_v6, scoped,
     src_verified_v4, src_verified_v6, tx_counters_v4, tx_counters_v6,
@@ -43,6 +44,10 @@ struct L4Meta {
     dst_port: u16,
     /// Whether a TCP/UDP destination port was parsed
     has_port: bool,
+    /// True if this UDP packet is a WireGuard handshake-initiation (type 1,
+    /// 148-byte payload). Fast-pathed by the learning leak so a WG tunnel can
+    /// re-establish through PORT_FILTER even when its port is unlearned.
+    is_wg_init: bool,
 }
 
 impl L4Meta {
@@ -54,9 +59,15 @@ impl L4Meta {
             is_fragment,
             dst_port: 0,
             has_port: false,
+            is_wg_init: false,
         }
     }
 }
+
+/// WireGuard message type for a handshake initiation (first payload byte). The
+/// message is exactly 148 bytes (UDP length 156).
+const WG_MSG_HANDSHAKE_INIT: u8 = 1;
+const WG_HANDSHAKE_INIT_UDP_LEN: u16 = 156;
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<&T, ()> {
@@ -146,6 +157,15 @@ fn fill_l4(ctx: &XdpContext, meta: &mut L4Meta, l4_off: usize) -> Result<(), ()>
         let udp = ptr_at::<UdpHdr>(ctx, l4_off)?;
         meta.dst_port = u16::from_be_bytes(udp.dst);
         meta.has_port = true;
+        // WireGuard handshake-initiation fast-path signal: message type 1 with
+        // exactly 148 payload bytes (UDP length 156). Cheap to check; forged
+        // matches are crypto-rejected by WireGuard, so leaking them is safe.
+        if u16::from_be_bytes(udp.len) == WG_HANDSHAKE_INIT_UDP_LEN
+            && let Ok(t) = ptr_at::<u8>(ctx, l4_off + UdpHdr::LEN)
+            && unsafe { *t } == WG_MSG_HANDSHAKE_INIT
+        {
+            meta.is_wg_init = true;
+        }
     }
     Ok(())
 }
@@ -291,7 +311,24 @@ fn mitigate_v4(
 #[inline(always)]
 fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
     if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
-        if meta.has_port && port_is_open_v4(*dst, meta.dst_port, meta.proto) {
+        if meta.has_port && port_open_refresh_v4(*dst, meta.dst_port, meta.proto) {
+            XDP_PASS
+        } else if meta.proto == PROTO_TCP && meta.is_syn && learn_leak_v4(dst, meta.dst_port, PROTO_TCP)
+        {
+            // Leak a bounded rate of SYNs to unlearned ports so a genuinely-
+            // open port can answer (SYN-ACK) and be passively learned even
+            // while mitigating — otherwise the port filter black-holes any
+            // open port not learned before the flood began.
+            XDP_PASS
+        } else if meta.proto == PROTO_UDP && meta.is_wg_init && learn_budget_v4(dst) {
+            // WireGuard handshake-init fast-path: bypass the first-touch
+            // suppression (rate-capped only) so a tunnel re-establishes even
+            // under a garbage flood to its port.
+            XDP_PASS
+        } else if meta.proto == PROTO_UDP && learn_leak_v4(dst, meta.dst_port, PROTO_UDP) {
+            // General UDP first-touch: probe an unlearned port once so a
+            // request/response service (DNS, game servers, WG data) can answer
+            // and be learned.
             XDP_PASS
         } else {
             XDP_DROP
@@ -340,7 +377,14 @@ fn mitigate_v6(
 #[inline(always)]
 fn dest_policy_v6(dst: &[u8; 16], meta: &L4Meta) -> u32 {
     if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
-        if meta.has_port && port_is_open_v6(*dst, meta.dst_port, meta.proto) {
+        if meta.has_port && port_open_refresh_v6(*dst, meta.dst_port, meta.proto) {
+            XDP_PASS
+        } else if meta.proto == PROTO_TCP && meta.is_syn && learn_leak_v6(dst, meta.dst_port, PROTO_TCP)
+        {
+            XDP_PASS
+        } else if meta.proto == PROTO_UDP && meta.is_wg_init && learn_budget_v6(dst) {
+            XDP_PASS
+        } else if meta.proto == PROTO_UDP && learn_leak_v6(dst, meta.dst_port, PROTO_UDP) {
             XDP_PASS
         } else {
             XDP_DROP

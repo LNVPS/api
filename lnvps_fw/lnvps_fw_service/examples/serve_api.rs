@@ -32,6 +32,8 @@ const LIM: Limits = Limits {
     cooldown_secs: 30,
     src_rate_pps: 10_000,
     src_cooldown_secs: 10,
+    syn_proxy_pps: 5_000,
+    learn_leak_pps: 100,
 };
 const SYN_PROXY_PPS: u64 = 5_000;
 

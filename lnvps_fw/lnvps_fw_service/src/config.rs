@@ -272,6 +272,9 @@ fn default_escalate_pass_pps() -> u64 {
 fn default_max_real_sources() -> usize {
     10_000
 }
+fn default_learn_leak_pps() -> u64 {
+    100
+}
 fn default_syn_proxy_syn_pps() -> u64 {
     5_000
 }
@@ -347,8 +350,18 @@ pub struct Escalation {
     pub max_real_sources: usize,
     /// Enable the SYN_PROXY flag on a mitigating dest/prefix once its SYN rate
     /// reaches this many SYNs/second (spoofed SYN floods to open TCP ports).
+    /// **0 disables the SYN-proxy entirely** — required for tunneled /
+    /// asymmetric-routed routers (GRE-backed VMs, non-GRE tunnels, reply on a
+    /// different NIC) where the XDP_TX cookie reply cannot reach the client.
     #[serde(default = "default_syn_proxy_syn_pps")]
     pub syn_proxy_syn_pps: u64,
+    /// Per-destination budget of new distinct-port probes/second the port
+    /// filter leaks through while mitigating (first-touch: each unknown TCP
+    /// port probed once, grace window for the reply, then assumed closed and
+    /// suppressed), so a genuinely-open port not learned before the flood can
+    /// still answer and be passively learned. 0 disables the leak (drop-all).
+    #[serde(default = "default_learn_leak_pps")]
+    pub learn_leak_pps: u64,
 }
 
 impl Default for Escalation {
@@ -365,6 +378,7 @@ impl Default for Escalation {
             escalate_pass_pps: default_escalate_pass_pps(),
             max_real_sources: default_max_real_sources(),
             syn_proxy_syn_pps: default_syn_proxy_syn_pps(),
+            learn_leak_pps: default_learn_leak_pps(),
         }
     }
 }
@@ -533,6 +547,7 @@ impl Config {
             src_cooldown_ns: self.escalation.src_cooldown_secs * 1_000_000_000,
             escalate_pass_pps: self.escalation.escalate_pass_pps,
             syn_proxy_pps: self.escalation.syn_proxy_syn_pps,
+            learn_leak_pps: self.escalation.learn_leak_pps,
         })
     }
 }
