@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::geoip::{GeoInfo, GeoIp};
@@ -495,8 +495,9 @@ pub struct SharedState {
     /// Bumped whenever the limits are edited so the control loop reloads them.
     limits_version: AtomicU64,
     /// Optional GeoIP databases used to enrich listed IPs with ASN/org/country.
-    /// Set once at startup; absent = enrichment disabled (fields omitted).
-    geoip: OnceLock<GeoIp>,
+    /// Hot-swappable so the periodic refresh can replace the readers; `None` =
+    /// enrichment disabled (fields omitted).
+    geoip: RwLock<Option<Arc<GeoIp>>>,
 }
 
 impl SharedState {
@@ -533,21 +534,21 @@ impl SharedState {
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
             limits_version: AtomicU64::new(1),
-            geoip: OnceLock::new(),
+            geoip: RwLock::new(None),
         })
     }
 
-    /// Install the GeoIP lookup databases (called once at startup, before the
-    /// server begins handling requests). A second call is ignored.
+    /// Install (or hot-replace) the GeoIP lookup databases. Called at startup
+    /// and by the periodic refresh task.
     pub fn set_geoip(&self, geoip: GeoIp) {
-        let _ = self.geoip.set(geoip);
+        *self.geoip.write().unwrap() = Some(Arc::new(geoip));
     }
 
     /// Look up ASN/org/country for an IP or CIDR string (the network address is
     /// used for a CIDR). Returns empty enrichment when no DB is loaded or the
     /// string does not parse — callers flatten it, so empty means no fields.
     pub fn geo_for(&self, ip_or_cidr: &str) -> GeoInfo {
-        let Some(geoip) = self.geoip.get() else {
+        let Some(geoip) = self.geoip.read().unwrap().clone() else {
             return GeoInfo::default();
         };
         match ip_or_cidr.split('/').next().and_then(|s| s.parse().ok()) {

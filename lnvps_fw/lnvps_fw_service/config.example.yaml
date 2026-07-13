@@ -152,10 +152,22 @@ api:
 # --- Optional GeoIP enrichment ---------------------------------------------
 # Annotate every IP the control API returns (attacker sources on /sources and
 # /blocks; destinations on /tracked, /prefixes, /mitigations) with
-# {asn, org, country}, looked up from MaxMind GeoLite2 databases. You supply
-# the .mmdb files (the GeoLite2 EULA forbids bundling them); download them free
-# with a MaxMind account. Either path may be omitted to skip that field, and
-# omitting this whole section disables enrichment (fields are simply absent).
+# {asn, org, country}, looked up from MaxMind GeoLite2 databases. Omitting this
+# whole section disables enrichment (the fields are simply absent).
+#
+# Two ways to supply the databases:
+#
+# 1) Auto-download with a MaxMind license key (recommended). The GeoLite2-ASN
+#    and GeoLite2-Country databases are fetched on startup and re-downloaded on
+#    refresh-interval-hours, verified against MaxMind's SHA-256, and hot-
+#    reloaded. Get a free key at maxmind.com (Account -> Manage License Keys).
+# geoip:
+#   license-key: "your-maxmind-license-key"
+#   # download-dir: /var/lib/lnvps_fw     # default: the state dir
+#   # refresh-interval-hours: 24          # default: 24
+#
+# 2) Point at .mmdb files you manage yourself (either path may be omitted to
+#    skip that field). Explicit paths take precedence over auto-download.
 # geoip:
 #   asn-db: /var/lib/lnvps_fw/GeoLite2-ASN.mmdb
 #   country-db: /var/lib/lnvps_fw/GeoLite2-Country.mmdb

@@ -73,12 +73,31 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct GeoIpConfig {
-    /// Path to a `GeoLite2-ASN.mmdb` (provides asn + org).
+    /// Path to a `GeoLite2-ASN.mmdb` (provides asn + org). When a `license-key`
+    /// is set and this is omitted, the database is downloaded automatically.
     #[serde(default)]
     pub asn_db: Option<PathBuf>,
-    /// Path to a `GeoLite2-Country.mmdb` (provides the ISO country code).
+    /// Path to a `GeoLite2-Country.mmdb` (provides the ISO country code). When a
+    /// `license-key` is set and this is omitted, it is downloaded automatically.
     #[serde(default)]
     pub country_db: Option<PathBuf>,
+    /// MaxMind license key. When set, the GeoLite2-ASN and GeoLite2-Country
+    /// databases are downloaded automatically (for whichever of the two paths
+    /// above is not given explicitly) and refreshed periodically.
+    #[serde(default)]
+    pub license_key: Option<String>,
+    /// Directory to store auto-downloaded databases in. Defaults to the state
+    /// directory (`/var/lib/lnvps_fw`).
+    #[serde(default)]
+    pub download_dir: Option<PathBuf>,
+    /// How often (hours) to re-download when a license key is set. Default 24.
+    /// GeoLite2 is refreshed by MaxMind twice weekly, so daily is ample.
+    #[serde(default = "default_geoip_refresh_hours")]
+    pub refresh_interval_hours: u32,
+}
+
+fn default_geoip_refresh_hours() -> u32 {
+    24
 }
 
 /// Role of an attached interface, deciding which hooks are installed.

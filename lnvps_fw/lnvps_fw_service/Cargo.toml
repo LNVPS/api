@@ -56,6 +56,10 @@ getrandom = "0.2"
 # MaxMind GeoLite2 .mmdb files supplied by the operator; enrichment is skipped
 # when no DB is configured (the EULA forbids bundling the DB in the .deb).
 maxminddb = "0.28"
+# Auto-download of GeoLite2 databases (MaxMind ships .tar.gz over HTTPS keyed
+# by the operator's license key); pure-Rust gzip + tar extraction.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
 
 [build-dependencies]
 aya-build = "0.2.0"

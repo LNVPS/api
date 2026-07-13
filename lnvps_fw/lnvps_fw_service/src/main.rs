@@ -952,16 +952,43 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
         api_cfg.allow_remote_upgrade,
         api_cfg.upgrade_pubkey.clone(),
     );
-    // Optional GeoIP enrichment for listed IPs (ASN/org/country). Only wired in
-    // when at least one MaxMind database opens successfully.
-    {
-        let geoip = lnvps_fw_service::geoip::GeoIp::load(
-            cfg.geoip.asn_db.as_deref(),
-            cfg.geoip.country_db.as_deref(),
-        );
-        if geoip.enabled() {
-            state.set_geoip(geoip);
-        }
+    // Optional GeoIP enrichment for listed IPs (ASN/org/country). Databases are
+    // either explicit paths or auto-downloaded from MaxMind via a license key.
+    // Done in a background task (this fn is sync): the initial load may involve
+    // a download, and enrichment is best-effort, so requests before it is ready
+    // simply carry no geo fields.
+    let geoip_configured = cfg.geoip.asn_db.is_some()
+        || cfg.geoip.country_db.is_some()
+        || cfg.geoip.license_key.is_some();
+    if geoip_configured {
+        use lnvps_fw_service::geoip::{self, GeoIp};
+        let st = state.clone();
+        let gcfg = cfg.geoip.clone();
+        tokio::spawn(async move {
+            let dir = std::path::Path::new("/var/lib/lnvps_fw");
+            let load = |asn: Option<std::path::PathBuf>, country: Option<std::path::PathBuf>| {
+                let g = GeoIp::load(asn.as_deref(), country.as_deref());
+                g.enabled().then_some(g)
+            };
+            let (asn, country) = geoip::resolve_databases(&gcfg, dir, false).await;
+            if let Some(g) = load(asn, country) {
+                st.set_geoip(g);
+            }
+            // Periodic re-download + hot-reload only when a license key drives it.
+            if gcfg.license_key.is_some() {
+                let hours = gcfg.refresh_interval_hours.max(1) as u64;
+                let mut timer = tokio::time::interval(Duration::from_secs(hours * 3600));
+                timer.tick().await; // consume the immediate first tick
+                loop {
+                    timer.tick().await;
+                    let (asn, country) = geoip::resolve_databases(&gcfg, dir, true).await;
+                    if let Some(g) = load(asn, country) {
+                        st.set_geoip(g);
+                        info!("GeoIP databases refreshed");
+                    }
+                }
+            }
+        });
     }
     // Periodic self-upgrade check (immediately, then every 6h).
     {

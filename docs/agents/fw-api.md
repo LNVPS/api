@@ -134,13 +134,26 @@ Every IP-bearing item on `/sources`, `/blocks`, `/tracked`, `/prefixes`, and
 fields (ASN number, AS/ISP org name, ISO country code) looked up from MaxMind
 GeoLite2 databases. The fields are **omitted** from the JSON when the value is
 unknown or no database is configured, so the schema is unchanged when
-enrichment is off. Configure it under the top-level `geoip:` key with
-`asn-db` (GeoLite2-ASN.mmdb → asn + org) and/or `country-db`
-(GeoLite2-Country.mmdb → country); the operator supplies the `.mmdb` files (the
-GeoLite2 EULA forbids bundling them). A missing/unreadable DB logs a warning
-and disables that field rather than failing startup. Lookups run at
-response-build time over the bounded page — never on the detection hot path.
-For a CIDR the network address is looked up.
+enrichment is off. Configure it under the top-level `geoip:` key. Databases come from either:
+
+- **Auto-download** — set `license-key` (a free MaxMind license key) and the
+  `GeoLite2-ASN` and `GeoLite2-Country` databases are downloaded on startup
+  into `download-dir` (default: the state dir `/var/lib/lnvps_fw`), verified
+  against MaxMind's companion SHA-256, and **hot-reloaded** every
+  `refresh-interval-hours` (default 24). Downloads are best-effort: a failure
+  falls back to the last good copy on disk. The license key is only ever placed
+  in the request URL, never logged.
+- **Explicit paths** — `asn-db` (GeoLite2-ASN.mmdb → asn + org) and/or
+  `country-db` (GeoLite2-Country.mmdb → country) point at `.mmdb` files the
+  operator manages. Explicit paths take precedence over auto-download for that
+  edition.
+
+Enrichment is loaded in the background, so requests before the first load (or
+when no DB is configured) simply carry no geo fields. A missing/unreadable DB
+logs a warning and disables that field rather than failing startup. Lookups run
+at response-build time over the bounded page — never on the detection hot path.
+For a CIDR the network address is looked up. The GeoLite2 EULA forbids bundling
+the databases, so they are never shipped with the `.deb`.
 
 ### Rules / overrides model
 
