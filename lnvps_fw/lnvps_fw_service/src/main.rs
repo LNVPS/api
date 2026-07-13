@@ -348,6 +348,7 @@ fn collect_tracked(
                 mitigating,
                 flags,
                 load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, cfg),
+                geo: Default::default(),
             });
         }
     };
@@ -389,6 +390,7 @@ fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
             pps: src_pps_estimate(st, now_ns),
             manual: false,
             cooling: false,
+            geo: Default::default(),
         })
         .chain(
             det.src_v6
@@ -400,6 +402,7 @@ fn collect_blocks(det: &DetectionState, now_ns: u64) -> Vec<SourceBlock> {
                     pps: src_pps_estimate(st, now_ns),
                     manual: false,
                     cooling: false,
+                    geo: Default::default(),
                 }),
         )
         .collect();
@@ -423,6 +426,7 @@ fn collect_sources(det: &DetectionState, now_ns: u64) -> Vec<TrackedSource> {
         .to_string(),
         manual: false,
         age_secs: now_ns.saturating_sub(st.window_start_ns) / 1_000_000_000,
+        geo: Default::default(),
     };
     let mut out: Vec<TrackedSource> = det
         .src_v4
@@ -498,6 +502,7 @@ fn collect_prefixes(
                 mitigating: flags != DEST_MODE_NORMAL,
                 flags,
                 load_pct: load_pct(tr.last.pps, tr.last.syn_pps, tr.last.bps, cfg),
+                geo: Default::default(),
             });
         }
     };
@@ -947,6 +952,17 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
         api_cfg.allow_remote_upgrade,
         api_cfg.upgrade_pubkey.clone(),
     );
+    // Optional GeoIP enrichment for listed IPs (ASN/org/country). Only wired in
+    // when at least one MaxMind database opens successfully.
+    {
+        let geoip = lnvps_fw_service::geoip::GeoIp::load(
+            cfg.geoip.asn_db.as_deref(),
+            cfg.geoip.country_db.as_deref(),
+        );
+        if geoip.enabled() {
+            state.set_geoip(geoip);
+        }
+    }
     // Periodic self-upgrade check (immediately, then every 6h).
     {
         let st = state.clone();

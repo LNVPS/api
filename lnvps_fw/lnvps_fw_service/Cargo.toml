@@ -52,6 +52,10 @@ tower = { version = "0.5", features = ["util"] }
 sha2 = "0.10"
 minisign-verify = "0.2"
 getrandom = "0.2"
+# GeoIP enrichment (ASN + org + country) for IPs listed on the API. Reads
+# MaxMind GeoLite2 .mmdb files supplied by the operator; enrichment is skipped
+# when no DB is configured (the EULA forbids bundling the DB in the .deb).
+maxminddb = "0.28"
 
 [build-dependencies]
 aya-build = "0.2.0"

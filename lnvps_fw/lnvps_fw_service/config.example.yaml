@@ -148,3 +148,14 @@ api:
   # if a matching `.deb.minisig` release asset verifies against this key
   # (fail-closed). Leave unset to rely on the GitHub-reported SHA-256 digest.
   # upgrade-pubkey: "RWQ...base64..."
+
+# --- Optional GeoIP enrichment ---------------------------------------------
+# Annotate every IP the control API returns (attacker sources on /sources and
+# /blocks; destinations on /tracked, /prefixes, /mitigations) with
+# {asn, org, country}, looked up from MaxMind GeoLite2 databases. You supply
+# the .mmdb files (the GeoLite2 EULA forbids bundling them); download them free
+# with a MaxMind account. Either path may be omitted to skip that field, and
+# omitting this whole section disables enrichment (fields are simply absent).
+# geoip:
+#   asn-db: /var/lib/lnvps_fw/GeoLite2-ASN.mmdb
+#   country-db: /var/lib/lnvps_fw/GeoLite2-Country.mmdb

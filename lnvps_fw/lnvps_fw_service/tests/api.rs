@@ -26,6 +26,25 @@ fn state() -> Arc<SharedState> {
     )
 }
 
+#[test]
+fn geo_enrichment_absent_without_database() {
+    let st = state();
+    // No GeoIP DB installed -> every lookup is empty (fields omitted from JSON).
+    assert!(st.geo_for("1.1.1.1").is_empty());
+    assert!(
+        st.geo_for("203.0.113.0/24").is_empty(),
+        "CIDR network parses"
+    );
+    assert!(
+        st.geo_for("not-an-ip").is_empty(),
+        "unparseable is empty, not a panic"
+    );
+
+    // Installing databases that don't exist stays disabled -> still empty.
+    st.set_geoip(lnvps_fw_service::geoip::GeoIp::load(None, None));
+    assert!(st.geo_for("8.8.8.8").is_empty());
+}
+
 fn req(
     method: &str,
     uri: &str,
@@ -324,6 +343,7 @@ async fn blocks_endpoint() {
         pps: 5000,
         manual: false,
         cooling: false,
+        geo: Default::default(),
     }]);
     // Add a manual block via the API.
     let res = app
@@ -434,6 +454,7 @@ async fn blocks_paginated_sorted_by_pps_and_filtered() {
             pps: 100,
             manual: false,
             cooling: false,
+            geo: Default::default(),
         },
         SourceBlock {
             cidr: "10.0.0.2/32".into(),
@@ -441,6 +462,7 @@ async fn blocks_paginated_sorted_by_pps_and_filtered() {
             pps: 9000,
             manual: false,
             cooling: false,
+            geo: Default::default(),
         },
         SourceBlock {
             cidr: "10.0.0.3/32".into(),
@@ -448,6 +470,7 @@ async fn blocks_paginated_sorted_by_pps_and_filtered() {
             pps: 500,
             manual: false,
             cooling: true,
+            geo: Default::default(),
         },
     ]);
     // First page, limit 2: highest pps first.
@@ -496,6 +519,7 @@ async fn sources_unified_list_manual_pinned_then_by_pps() {
             state: "normal".into(),
             manual: false,
             age_secs: 0,
+            geo: Default::default(),
         },
         TrackedSource {
             ip: "10.0.0.2".into(),
@@ -503,6 +527,7 @@ async fn sources_unified_list_manual_pinned_then_by_pps() {
             state: "dropping".into(),
             manual: false,
             age_secs: 1,
+            geo: Default::default(),
         },
         TrackedSource {
             ip: "10.0.0.3".into(),
@@ -510,6 +535,7 @@ async fn sources_unified_list_manual_pinned_then_by_pps() {
             state: "cooling".into(),
             manual: false,
             age_secs: 2,
+            geo: Default::default(),
         },
     ]);
     let res = app

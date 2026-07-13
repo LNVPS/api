@@ -127,6 +127,21 @@ to the top. `?q=` substring-filters on the IP, `?offset=`/`?limit=` paginate
 possibly aggregated to /24 etc), but the dashboard now uses the unified
 `/sources` list. Manual blocks are still managed via `POST`/`DELETE /blocks`.
 
+### GeoIP enrichment
+
+Every IP-bearing item on `/sources`, `/blocks`, `/tracked`, `/prefixes`, and
+`/mitigations` is optionally annotated with flattened `{asn, org, country}`
+fields (ASN number, AS/ISP org name, ISO country code) looked up from MaxMind
+GeoLite2 databases. The fields are **omitted** from the JSON when the value is
+unknown or no database is configured, so the schema is unchanged when
+enrichment is off. Configure it under the top-level `geoip:` key with
+`asn-db` (GeoLite2-ASN.mmdb → asn + org) and/or `country-db`
+(GeoLite2-Country.mmdb → country); the operator supplies the `.mmdb` files (the
+GeoLite2 EULA forbids bundling them). A missing/unreadable DB logs a warning
+and disables that field rather than failing startup. Lookups run at
+response-build time over the bounded page — never on the detection hot path.
+For a CIDR the network address is looked up.
+
 ### Rules / overrides model
 
 `PUT /rules` sets `{ protected: ["203.0.113.0/24", ...], overrides: [{cidr,

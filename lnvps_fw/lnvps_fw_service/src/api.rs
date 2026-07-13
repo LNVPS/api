@@ -14,9 +14,10 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::geoip::{GeoInfo, GeoIp};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{StatusCode, header};
@@ -136,6 +137,9 @@ pub struct Mitigation {
     pub rx_drop_pct: u32,
     #[serde(default)]
     pub load_pct: u32,
+    /// GeoIP enrichment for `cidr` (empty/omitted when no DB is loaded).
+    #[serde(flatten, default)]
+    pub geo: GeoInfo,
 }
 
 /// Kind of mitigation event.
@@ -184,6 +188,9 @@ pub struct TrackedIp {
     /// How close this IP is to tripping mitigation: the max of its pps/syn/bps
     /// rates as a percentage of their entry thresholds (>=100 = tripping).
     pub load_pct: u32,
+    /// GeoIP enrichment for `ip` (empty/omitted when no DB is loaded).
+    #[serde(flatten, default)]
+    pub geo: GeoInfo,
 }
 
 /// Live aggregate rates for one protected prefix vs the carpet-bomb thresholds.
@@ -205,6 +212,9 @@ pub struct PrefixLoad {
     /// Aggregate load as a percentage of the network thresholds (>=100 =
     /// carpet-bomb mitigation trips for the whole prefix).
     pub load_pct: u32,
+    /// GeoIP enrichment for `cidr` (empty/omitted when no DB is loaded).
+    #[serde(flatten, default)]
+    pub geo: GeoInfo,
 }
 
 /// Top-level aggregate traffic across every tracked destination this tick.
@@ -294,6 +304,9 @@ pub struct SourceBlock {
     /// Always false for manual blocks.
     #[serde(default)]
     pub cooling: bool,
+    /// GeoIP enrichment for `cidr` (empty/omitted when no DB is loaded).
+    #[serde(flatten, default)]
+    pub geo: GeoInfo,
 }
 
 /// A page of source blocks (bounded payload even with very large block sets).
@@ -338,6 +351,9 @@ pub struct TrackedSource {
     pub manual: bool,
     /// Seconds since this source was last sampled (0 for manual blocks).
     pub age_secs: u64,
+    /// GeoIP enrichment for `ip` (empty/omitted when no DB is loaded).
+    #[serde(flatten, default)]
+    pub geo: GeoInfo,
 }
 
 /// A page of tracked sources (bounded payload even under a large flood).
@@ -478,6 +494,9 @@ pub struct SharedState {
     rules_version: AtomicU64,
     /// Bumped whenever the limits are edited so the control loop reloads them.
     limits_version: AtomicU64,
+    /// Optional GeoIP databases used to enrich listed IPs with ASN/org/country.
+    /// Set once at startup; absent = enrichment disabled (fields omitted).
+    geoip: OnceLock<GeoIp>,
 }
 
 impl SharedState {
@@ -514,7 +533,27 @@ impl SharedState {
             events: Mutex::new(EventRing::new(events_cap)),
             rules_version: AtomicU64::new(1),
             limits_version: AtomicU64::new(1),
+            geoip: OnceLock::new(),
         })
+    }
+
+    /// Install the GeoIP lookup databases (called once at startup, before the
+    /// server begins handling requests). A second call is ignored.
+    pub fn set_geoip(&self, geoip: GeoIp) {
+        let _ = self.geoip.set(geoip);
+    }
+
+    /// Look up ASN/org/country for an IP or CIDR string (the network address is
+    /// used for a CIDR). Returns empty enrichment when no DB is loaded or the
+    /// string does not parse — callers flatten it, so empty means no fields.
+    pub fn geo_for(&self, ip_or_cidr: &str) -> GeoInfo {
+        let Some(geoip) = self.geoip.get() else {
+            return GeoInfo::default();
+        };
+        match ip_or_cidr.split('/').next().and_then(|s| s.parse().ok()) {
+            Some(ip) => geoip.lookup(ip),
+            None => GeoInfo::default(),
+        }
     }
 
     /// Current ruleset (clone) — read by the control loop.
@@ -798,11 +837,19 @@ async fn get_ports(
 }
 
 async fn get_tracked(State(state): State<Arc<SharedState>>) -> Json<Vec<TrackedIp>> {
-    Json(state.tracked.read().unwrap().clone())
+    let mut items = state.tracked.read().unwrap().clone();
+    for it in &mut items {
+        it.geo = state.geo_for(&it.ip);
+    }
+    Json(items)
 }
 
 async fn get_prefixes(State(state): State<Arc<SharedState>>) -> Json<Vec<PrefixLoad>> {
-    Json(state.prefixes.read().unwrap().clone())
+    let mut items = state.prefixes.read().unwrap().clone();
+    for it in &mut items {
+        it.geo = state.geo_for(&it.cidr);
+    }
+    Json(items)
 }
 
 async fn get_blocks(
@@ -824,6 +871,7 @@ async fn get_blocks(
             pps: 0,
             manual: true,
             cooling: false,
+            geo: Default::default(),
         })
         .collect();
     all.extend(state.blocks.read().unwrap().iter().cloned());
@@ -842,7 +890,15 @@ async fn get_blocks(
     });
     let total = all.len();
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let items: Vec<SourceBlock> = all.into_iter().skip(q.offset).take(limit).collect();
+    let items: Vec<SourceBlock> = all
+        .into_iter()
+        .skip(q.offset)
+        .take(limit)
+        .map(|mut b| {
+            b.geo = state.geo_for(&b.cidr);
+            b
+        })
+        .collect();
     Json(BlocksPage {
         total,
         offset: q.offset,
@@ -872,6 +928,7 @@ async fn get_sources(
             state: "dropping".to_string(),
             manual: true,
             age_secs: 0,
+            geo: Default::default(),
         })
         .collect();
     all.extend(state.sources.read().unwrap().iter().cloned());
@@ -891,7 +948,15 @@ async fn get_sources(
     });
     let total = all.len();
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let items: Vec<TrackedSource> = all.into_iter().skip(q.offset).take(limit).collect();
+    let items: Vec<TrackedSource> = all
+        .into_iter()
+        .skip(q.offset)
+        .take(limit)
+        .map(|mut s| {
+            s.geo = state.geo_for(&s.ip);
+            s
+        })
+        .collect();
     Json(SourcesPage {
         total,
         offset: q.offset,
@@ -1083,7 +1148,11 @@ async fn put_rules(
 }
 
 async fn get_mitigations(State(state): State<Arc<SharedState>>) -> Json<Vec<Mitigation>> {
-    Json(state.active.read().unwrap().clone())
+    let mut items = state.active.read().unwrap().clone();
+    for it in &mut items {
+        it.geo = state.geo_for(&it.cidr);
+    }
+    Json(items)
 }
 
 async fn post_override(

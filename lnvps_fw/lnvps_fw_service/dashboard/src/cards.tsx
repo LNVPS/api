@@ -153,6 +153,14 @@ export function MitigationsCard({ token, mitigations, onChange }: {
   );
 }
 
+// GeoIP enrichment cell: "<CC> AS<n>" with the org name in the tooltip. Shows
+// a dash when no MaxMind DB is configured (all fields absent).
+function geoCell(g: { asn?: number; org?: string; country?: string }) {
+  if (!g.country && !g.asn && !g.org) return <span class="muted">—</span>;
+  const head = [g.country, g.asn ? "AS" + g.asn : ""].filter(Boolean).join(" ");
+  return <span class="muted" title={[g.org, head].filter(Boolean).join(" · ")}>{head || g.org}</span>;
+}
+
 // --- Sources: unified list of rate-tracked sources (normal/dropping)
 // + manual blocks. Server-paginated + filtered. Auto "blocks" are just the
 // dropping/cooling rows here — there is no separate block list. ---
@@ -187,7 +195,7 @@ export function SourcesCard({ token }: { token: string }) {
         : <span style={{ color: "#6fcf7f" }}>normal</span>;
   const pages = Math.max(1, Math.ceil(data.total / PAGE));
   const rows = data.items.map((s) => [
-    s.ip, <span class="tag">{s.manual ? "manual" : "auto"}</span>, stateCell(s),
+    s.ip, <span class="tag">{s.manual ? "manual" : "auto"}</span>, stateCell(s), geoCell(s),
     s.manual ? "—" : fmtn(s.pps), s.manual ? "—" : s.age_secs + "s", s.manual ? bin(s.ip) : "",
   ]);
   return (
@@ -196,7 +204,7 @@ export function SourcesCard({ token }: { token: string }) {
         <button onClick={() => { setShow(true); setMsg(""); }}>+ block source</button>
         <input placeholder="filter ip" value={q} onInput={(e) => { setPage(0); setQ((e.target as HTMLInputElement).value); }} />
       </div>
-      <div class="scroll"><Table cols={["source", "kind", "state", "pps", "age", ""]} rows={rows} /></div>
+      <div class="scroll"><Table cols={["source", "kind", "state", "origin", "pps", "age", ""]} rows={rows} /></div>
       {data.total > PAGE && <Pager page={Math.min(page, pages - 1)} pages={pages} total={data.total} onPage={setPage} />}
       {show && (
         <Modal title="Block a source CIDR" onClose={() => setShow(false)}>

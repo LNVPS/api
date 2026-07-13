@@ -10,23 +10,29 @@ export interface Status {
   protected_prefixes: number; active_mitigations: number; learned_ports: number;
   events_cursor: number; totals: Totals;
 }
+// GeoIP enrichment (present only when a MaxMind DB is configured); flattened
+// onto every IP-bearing item.
+export interface GeoInfo { asn?: number; org?: string; country?: string }
 export interface TrackedIp {
   ip: string; rx_pps: number; rx_bps: number; rx_syn_pps: number; rx_drop_pps: number;
   tx_pps: number; tx_bps: number; rx_drop_pct: number; mitigating: boolean; flags: number; load_pct: number;
+  asn?: number; org?: string; country?: string;
 }
 export interface PrefixLoad {
   cidr: string; rx_pps: number; rx_bps: number; rx_syn_pps: number; rx_drop_pps: number;
   tx_pps: number; tx_bps: number; rx_drop_pct: number; mitigating: boolean; flags: number; load_pct: number;
+  asn?: number; org?: string; country?: string;
 }
 export interface Mitigation {
   cidr: string; flags: number; since_unix: number; manual: boolean;
   peak_pps: number; peak_bps: number; peak_syn_pps: number;
   rx_pps: number; rx_bps: number; rx_syn_pps: number; rx_drop_pps: number;
   tx_pps: number; tx_bps: number; rx_drop_pct: number; load_pct: number;
+  asn?: number; org?: string; country?: string;
 }
-export interface SourceBlock { cidr: string; age_secs: number; pps: number; manual: boolean; cooling: boolean }
+export interface SourceBlock { cidr: string; age_secs: number; pps: number; manual: boolean; cooling: boolean; asn?: number; org?: string; country?: string }
 /** A row in the unified source list: tracked sources (any state) + manual blocks. */
-export interface TrackedSource { ip: string; pps: number; state: "normal" | "dropping"; manual: boolean; age_secs: number }
+export interface TrackedSource { ip: string; pps: number; state: "normal" | "dropping"; manual: boolean; age_secs: number; asn?: number; org?: string; country?: string }
 export interface LearnedPort { ip: string; port: number; proto: string; age_secs: number }
 export interface FwEvent {
   seq: number; kind: string; cidr: string; flags: number; ts_unix: number;

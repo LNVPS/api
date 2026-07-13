@@ -441,6 +441,7 @@ async fn run_sim(state: Arc<SharedState>) {
                 mitigating: s.flags != 0,
                 flags: s.flags,
                 load_pct: load_pct(s.pps, s.syn, s.bps),
+                geo: Default::default(),
             });
             if s.flags != 0 {
                 let bits = if h.v6 { 128 } else { 32 };
@@ -483,6 +484,7 @@ async fn run_sim(state: Arc<SharedState>) {
                 mitigating: true,
                 flags: DEST_MODE_PORT_FILTER | DEST_MODE_SYN_PROXY,
                 load_pct: load_pct(pps, 0, 0),
+                geo: Default::default(),
             });
         }
 
@@ -499,6 +501,7 @@ async fn run_sim(state: Arc<SharedState>) {
                 mitigating: false,
                 flags: 0,
                 load_pct: net_load_pct(a4.pps, a4.syn, a4.bps),
+                geo: Default::default(),
             },
             PrefixLoad {
                 cidr: "2001:db8:1::/48".into(),
@@ -512,6 +515,7 @@ async fn run_sim(state: Arc<SharedState>) {
                 mitigating: false,
                 flags: 0,
                 load_pct: net_load_pct(a6.pps, a6.syn, a6.bps),
+                geo: Default::default(),
             },
         ];
 
@@ -527,6 +531,7 @@ async fn run_sim(state: Arc<SharedState>) {
                     pps: rng.jitter(48_000, 20),
                     manual: false,
                     cooling: false,
+                    geo: Default::default(),
                 },
                 SourceBlock {
                     cidr: "193.32.162.7/32".into(),
@@ -534,6 +539,7 @@ async fn run_sim(state: Arc<SharedState>) {
                     pps: rng.jitter(9_000, 25),
                     manual: false,
                     cooling: true,
+                    geo: Default::default(),
                 },
             ],
             _ => {
@@ -565,6 +571,7 @@ async fn run_sim(state: Arc<SharedState>) {
                 state: if b.cooling { "cooling" } else { "dropping" }.to_string(),
                 manual: false,
                 age_secs: b.age_secs,
+                geo: Default::default(),
             })
             .collect();
         if block_started.is_some() {
@@ -574,6 +581,7 @@ async fn run_sim(state: Arc<SharedState>) {
                 state: "normal".into(),
                 manual: false,
                 age_secs: 0,
+                geo: Default::default(),
             });
         }
         state.set_blocks(blocks);

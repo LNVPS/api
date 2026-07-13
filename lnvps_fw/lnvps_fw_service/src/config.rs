@@ -4,7 +4,7 @@
 //! override the runtime values, but the interface list and file paths always
 //! come from here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -61,6 +61,24 @@ pub struct Config {
     /// RESTful control API (increment 7). Absent = API disabled.
     #[serde(default)]
     pub api: Option<ApiConfig>,
+    /// Optional GeoIP databases for enriching listed IPs with ASN/org/country.
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
+}
+
+/// Optional MaxMind GeoLite2 databases used to annotate every IP the control
+/// API returns with `{asn, org, country}`. The operator supplies the `.mmdb`
+/// files (the GeoLite2 EULA forbids bundling them); an absent path disables
+/// that part of the enrichment, and no config at all disables it entirely.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GeoIpConfig {
+    /// Path to a `GeoLite2-ASN.mmdb` (provides asn + org).
+    #[serde(default)]
+    pub asn_db: Option<PathBuf>,
+    /// Path to a `GeoLite2-Country.mmdb` (provides the ISO country code).
+    #[serde(default)]
+    pub country_db: Option<PathBuf>,
 }
 
 /// Role of an attached interface, deciding which hooks are installed.
@@ -443,6 +461,7 @@ impl Config {
             protected: Vec::new(),
             network: NetworkThresholds::default(),
             api: None,
+            geoip: GeoIpConfig::default(),
         }
     }
 
