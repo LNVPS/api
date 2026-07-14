@@ -120,9 +120,27 @@ impl DnsDataMigration {
 
         // Map ranges whose access policy points at an OVH router to that OVH DNS server
         // for reverse DNS (only where reverse is not already configured).
+        let ovh_ids: std::collections::HashSet<u64> = ovh_map.values().copied().collect();
         let ranges = db.list_ip_range().await?;
         for mut range in ranges {
-            if range.reverse_dns_server_id.is_some() {
+            // OVH keys reverse DNS on the IP block (CIDR), which is exactly the
+            // range's own CIDR. Store it as the reverse zone so DNS calls target
+            // `/ip/{block}/reverse` rather than a bare `/ip/{ip}` (404).
+            let ensure_zone = |range: &mut lnvps_db::IpRange| -> bool {
+                if range.reverse_zone_id.is_none() {
+                    range.reverse_zone_id = Some(range.cidr.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+
+            // Already pointed at an OVH DNS server (e.g. by a prior run): make
+            // sure the block zone is backfilled.
+            if let Some(rev_id) = range.reverse_dns_server_id {
+                if ovh_ids.contains(&rev_id) && ensure_zone(&mut range) {
+                    db.update_ip_range_dns(&range).await?;
+                }
                 continue;
             }
             let Some(policy_id) = range.access_policy_id else {
@@ -136,6 +154,7 @@ impl DnsDataMigration {
             };
             if let Some(dns_id) = ovh_map.get(&router_id) {
                 range.reverse_dns_server_id = Some(*dns_id);
+                ensure_zone(&mut range);
                 db.update_ip_range_dns(&range).await?;
             }
         }
