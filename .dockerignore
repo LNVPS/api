@@ -1,4 +1,7 @@
 **/target/
+**/recipe.json
+.git/
+.github/
 **/.claude/
 docs/
 work/

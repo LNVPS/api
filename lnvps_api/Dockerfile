@@ -1,12 +1,30 @@
 ARG IMAGE=rust:trixie
 ARG HOST_INFO_IMAGE=registry.v0l.io/lnvps-host-info:latest
 
-FROM $IMAGE AS build
+# --- cargo-chef base: install toolchain deps + cargo-chef once (cached) ---
+FROM $IMAGE AS chef
+RUN apt update && apt -y install protobuf-compiler libvirt-dev libva-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
 WORKDIR /app/src
+
+# --- planner: produce a dependency recipe from the manifests only ---
+FROM chef AS planner
 COPY . .
-RUN apt update && apt -y install protobuf-compiler libvirt-dev libva-dev
+RUN cargo chef prepare --recipe-path recipe.json
+
+# --- build: cook dependencies (cached layer), then compile the app ---
+FROM chef AS build
+COPY --from=planner /app/src/recipe.json recipe.json
+# Cook deps for both the dev profile (tests) and release profile (final build).
+# This layer is only invalidated when Cargo.toml / Cargo.lock change.
+RUN cargo chef cook --recipe-path recipe.json --tests --package lnvps_api \
+    && cargo chef cook --release --recipe-path recipe.json --package lnvps_api
+COPY . .
 RUN cargo test --locked --package lnvps_api -- --test-threads=1 \
-  && cargo install --locked --root /app/build --path lnvps_api --bin lnvps_api --bin fix_lnurlp_topups
+    && cargo build --release --locked --package lnvps_api --bin lnvps_api --bin fix_lnurlp_topups \
+    && mkdir -p /app/build/bin \
+    && cp target/release/lnvps_api target/release/fix_lnurlp_topups /app/build/bin/
 
 # Download host-info binaries from pre-built multi-arch images using crane
 FROM gcr.io/go-containerregistry/crane:latest AS crane-bin
