@@ -75,6 +75,8 @@ pub struct UserPaymentMethod {
     pub created: DateTime<Utc>,
     /// Payment processor (e.g. `revolut`)
     pub provider: String,
+    /// Optional user-defined label to distinguish multiple methods
+    pub name: Option<String>,
     /// Encrypted provider customer id owning the saved method (None for
     /// providers without one, e.g. NWC)
     pub external_customer_id: Option<EncryptedString>,

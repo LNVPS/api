@@ -319,10 +319,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<u64> {
         Ok(sqlx::query(
-            "insert into user_payment_method(user_id,provider,external_customer_id,external_id,card_brand,card_last_four,exp_month,exp_year,is_default,enabled) values(?,?,?,?,?,?,?,?,?,?) returning id",
+            "insert into user_payment_method(user_id,provider,name,external_customer_id,external_id,card_brand,card_last_four,exp_month,exp_year,is_default,enabled) values(?,?,?,?,?,?,?,?,?,?,?) returning id",
         )
         .bind(pm.user_id)
         .bind(&pm.provider)
+        .bind(&pm.name)
         .bind(&pm.external_customer_id)
         .bind(&pm.external_id)
         .bind(&pm.card_brand)
@@ -368,8 +369,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()> {
         sqlx::query(
-            "update user_payment_method set card_brand=?,card_last_four=?,exp_month=?,exp_year=?,is_default=?,enabled=? where id=?",
+            "update user_payment_method set name=?,card_brand=?,card_last_four=?,exp_month=?,exp_year=?,is_default=?,enabled=? where id=?",
         )
+        .bind(&pm.name)
         .bind(&pm.card_brand)
         .bind(&pm.card_last_four)
         .bind(pm.exp_month)

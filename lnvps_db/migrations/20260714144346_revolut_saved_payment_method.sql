@@ -15,6 +15,8 @@ CREATE TABLE user_payment_method
     created              TIMESTAMP        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     -- Payment processor: 'nwc', 'revolut'
     provider             VARCHAR(20)      NOT NULL,
+    -- Optional user-defined label to distinguish multiple methods
+    name                 VARCHAR(100)     NULL,
     -- Encrypted provider customer id (NULL for providers without one, e.g. nwc)
     external_customer_id TEXT             NULL,
     -- Encrypted reusable token charged for renewals: Revolut payment method id,

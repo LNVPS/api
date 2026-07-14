@@ -146,6 +146,8 @@ pub struct PaymentMethodResponse {
     pub id: u64,
     /// Payment processor: `nwc` or `revolut`
     pub provider: String,
+    /// Optional user-defined label
+    pub name: Option<String>,
     pub created: DateTime<Utc>,
     pub card_brand: Option<String>,
     pub card_last_four: Option<String>,
@@ -160,6 +162,7 @@ impl From<lnvps_db::UserPaymentMethod> for PaymentMethodResponse {
         PaymentMethodResponse {
             id: m.id,
             provider: m.provider,
+            name: m.name,
             created: m.created,
             card_brand: m.card_brand,
             card_last_four: m.card_last_four,
@@ -175,13 +178,22 @@ impl From<lnvps_db::UserPaymentMethod> for PaymentMethodResponse {
 #[derive(Deserialize)]
 pub struct AddNwcPaymentMethodRequest {
     pub nwc_connection_string: String,
+    /// Optional user-defined label
+    pub name: Option<String>,
 }
 
-/// Update a saved payment method (set default / enable-disable).
+/// Update a saved payment method (label / set default / enable-disable).
 #[derive(Deserialize)]
 pub struct PatchPaymentMethodRequest {
     pub is_default: Option<bool>,
     pub enabled: Option<bool>,
+    /// Set/clear the user-defined label. Use `Some(Some(..))` to set, `Some(None)` to clear.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub name: Option<Option<String>>,
 }
 
 impl From<lnvps_db::User> for AccountPatchRequest {

@@ -3451,6 +3451,7 @@ mod tests {
             user_id,
             created: Utc::now(),
             provider: provider.to_string(),
+            name: None,
             external_customer_id: Some("cust".to_string().into()),
             external_id: "pm".to_string().into(),
             card_brand: Some("VISA".to_string()),
@@ -3480,11 +3481,14 @@ mod tests {
         let got = db.get_user_payment_method(id1).await.unwrap();
         assert_eq!(got.provider, "revolut");
 
-        // Update (disable it)
+        // Update (disable + name it)
         let mut upd = got.clone();
         upd.enabled = false;
+        upd.name = Some("My spare card".to_string());
         db.update_user_payment_method(&upd).await.unwrap();
-        assert!(!db.get_user_payment_method(id1).await.unwrap().enabled);
+        let after = db.get_user_payment_method(id1).await.unwrap();
+        assert!(!after.enabled);
+        assert_eq!(after.name.as_deref(), Some("My spare card"));
 
         // Delete
         db.delete_user_payment_method(id1).await.unwrap();

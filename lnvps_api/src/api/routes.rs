@@ -381,6 +381,7 @@ async fn v1_add_nwc_payment_method(
         user_id: uid,
         created: chrono::Utc::now(),
         provider: "nwc".to_string(),
+        name: req.name.as_ref().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
         external_customer_id: None,
         external_id: nwc.into(),
         card_brand: None,
@@ -412,6 +413,12 @@ async fn v1_patch_payment_method(
 
     if let Some(enabled) = req.enabled {
         method.enabled = enabled;
+    }
+    if let Some(name) = &req.name {
+        method.name = name
+            .clone()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
     }
     if req.is_default == Some(true) {
         // Only one default: clear the flag on the user's other methods.
