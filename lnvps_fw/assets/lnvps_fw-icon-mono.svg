@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="currentColor" role="img" aria-labelledby="t">
+  <title id="t">lnvps_fw</title>
+  <!-- Monochrome: inherits color via currentColor. Shield with a knocked-out bolt. -->
+  <path fill-rule="evenodd" clip-rule="evenodd"
+        d="M128 40 L196 68 L196 132 C196 175 165 204 128 216 C91 204 60 175 60 132 L60 68 Z
+           M139 74 L99 137 L125 137 L116 186 L161 118 L133 118 Z"/>
+</svg>

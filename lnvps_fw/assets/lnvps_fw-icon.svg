@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t d">
+  <title id="t">lnvps_fw</title>
+  <desc id="d">A shield bearing a lightning bolt, deflecting attack packets — the LNVPS XDP firewall.</desc>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#142842"/>
+      <stop offset="1" stop-color="#0a1220"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fde047"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#tile)" stroke="#1e3a5f" stroke-width="2"/>
+
+  <!-- attack packets deflected at the shield edge -->
+  <g fill="#ff5d6c">
+    <rect x="30" y="84" width="17" height="10" rx="2.5" opacity=".45" transform="rotate(-20 38 89)"/>
+    <rect x="26" y="120" width="17" height="10" rx="2.5" opacity=".85" transform="rotate(-7 34 125)"/>
+    <rect x="32" y="156" width="17" height="10" rx="2.5" opacity=".55" transform="rotate(12 40 161)"/>
+  </g>
+  <!-- one allowed packet passing through -->
+  <rect x="212" y="120" width="17" height="10" rx="2.5" fill="#6fcf7f" opacity=".85" transform="rotate(6 220 125)"/>
+
+  <!-- shield -->
+  <path d="M128 44 L192 71 L192 131 C192 172 163 199 128 211 C93 199 64 172 64 131 L64 71 Z"
+        fill="url(#shield)" stroke="#93c5fd" stroke-opacity=".55" stroke-width="2.5"/>
+  <!-- inner bevel line -->
+  <path d="M128 60 L179 81 L179 131 C179 163 157 185 128 195 C99 185 77 163 77 131 L77 81 Z"
+        fill="none" stroke="#0a1220" stroke-opacity=".28" stroke-width="6"/>
+
+  <!-- lightning bolt -->
+  <path d="M139 76 L101 135 L125 135 L117 181 L159 117 L133 117 Z"
+        fill="url(#bolt)" stroke="#7c4a02" stroke-width="1.5" filter="url(#glow)"/>
+</svg>
