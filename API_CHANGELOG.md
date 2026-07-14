@@ -4,6 +4,21 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **2026-07-14** - Unified saved payment methods + Revolut auto-renewal
+  - Subscriptions with `auto_renewal_enabled` are now renewed automatically by charging the user's **default** saved payment method, dispatched by provider: Nostr Wallet Connect (Lightning) or a saved Revolut card charged off-session (merchant-initiated). Closes #159.
+  - Saved methods live in a new provider-agnostic `user_payment_method` table (one-to-many per user, with `is_default` and `enabled`). NWC and Revolut are both modelled as payment methods, so users can keep several and choose which is the default. Only opaque provider token references are stored, encrypted at rest, alongside non-sensitive card metadata (brand, last 4, expiry) for display + expiry handling — never card PAN/CVV.
+  - Revolut cards are saved automatically the next time the user completes a Revolut checkout while auto-renewal is enabled (no separate setup step).
+  - **New endpoints:**
+    - `GET /api/v1/payment-methods` — list saved methods (`id`, `provider`, `name`, `card_brand`, `card_last_four`, `exp_month`, `exp_year`, `is_default`, `enabled`, `created`). Tokens/NWC strings are never returned.
+    - `POST /api/v1/payment-methods` — add a Nostr Wallet Connect connection (`{ nwc_connection_string, name? }`); validated for `pay_invoice` support.
+    - `PATCH /api/v1/payment-methods/{id}` — set a user-defined `name`, set as default (`is_default`), and/or enable-disable (`enabled`).
+    - `DELETE /api/v1/payment-methods/{id}` — remove a saved method.
+  - **Breaking:** the `nwc_connection_string` field on `GET`/`PATCH /api/v1/account` has been removed. Existing NWC connections are migrated into `user_payment_method` (provider `nwc`); manage NWC via the new payment-methods endpoints instead.
+
 ## [0.4.0] - 2026-07-13
 
 ### Added

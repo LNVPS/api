@@ -137,13 +137,63 @@ pub struct AccountPatchRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub tax_id: Option<Option<String>>,
-    /// Nostr Wallet Connect connection string for automatic VM renewals
+}
+
+/// A saved payment method for automatic renewals. Never exposes the underlying
+/// provider tokens / NWC connection string.
+#[derive(Serialize, Deserialize)]
+pub struct PaymentMethodResponse {
+    pub id: u64,
+    /// Payment processor: `nwc` or `revolut`
+    pub provider: String,
+    /// Optional user-defined label
+    pub name: Option<String>,
+    pub created: DateTime<Utc>,
+    pub card_brand: Option<String>,
+    pub card_last_four: Option<String>,
+    pub exp_month: Option<u16>,
+    pub exp_year: Option<u16>,
+    pub is_default: bool,
+    pub enabled: bool,
+}
+
+impl From<lnvps_db::UserPaymentMethod> for PaymentMethodResponse {
+    fn from(m: lnvps_db::UserPaymentMethod) -> Self {
+        PaymentMethodResponse {
+            id: m.id,
+            provider: m.provider,
+            name: m.name,
+            created: m.created,
+            card_brand: m.card_brand,
+            card_last_four: m.card_last_four,
+            exp_month: m.exp_month,
+            exp_year: m.exp_year,
+            is_default: m.is_default,
+            enabled: m.enabled,
+        }
+    }
+}
+
+/// Add a Nostr Wallet Connect connection as a saved payment method.
+#[derive(Deserialize)]
+pub struct AddNwcPaymentMethodRequest {
+    pub nwc_connection_string: String,
+    /// Optional user-defined label
+    pub name: Option<String>,
+}
+
+/// Update a saved payment method (label / set default / enable-disable).
+#[derive(Deserialize)]
+pub struct PatchPaymentMethodRequest {
+    pub is_default: Option<bool>,
+    pub enabled: Option<bool>,
+    /// Set/clear the user-defined label. Use `Some(Some(..))` to set, `Some(None)` to clear.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
-    pub nwc_connection_string: Option<Option<String>>,
+    pub name: Option<Option<String>>,
 }
 
 impl From<lnvps_db::User> for AccountPatchRequest {
@@ -172,7 +222,6 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             city: Some(user.billing_city),
             postcode: Some(user.billing_postcode),
             tax_id: Some(user.billing_tax_id),
-            nwc_connection_string: Some(user.nwc_connection_string.map(|nwc| nwc.into())),
         }
     }
 }

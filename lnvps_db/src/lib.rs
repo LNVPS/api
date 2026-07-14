@@ -135,6 +135,25 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get total count of users
     async fn count_users(&self) -> DbResult<u64>;
 
+    /// Insert a saved payment method for a user; returns the new id
+    async fn insert_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<u64>;
+
+    /// List a user's saved payment methods (optionally filtered to one provider)
+    async fn list_user_payment_methods(
+        &self,
+        user_id: u64,
+        provider: Option<&str>,
+    ) -> DbResult<Vec<UserPaymentMethod>>;
+
+    /// Get a single saved payment method by id
+    async fn get_user_payment_method(&self, id: u64) -> DbResult<UserPaymentMethod>;
+
+    /// Update a saved payment method (enabled/default/card metadata)
+    async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()>;
+
+    /// Delete a saved payment method by id
+    async fn delete_user_payment_method(&self, id: u64) -> DbResult<()>;
+
     /// Insert a new user ssh key
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> DbResult<u64>;
 

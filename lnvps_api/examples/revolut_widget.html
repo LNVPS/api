@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Revolut Save-Card Widget Harness</title>
+    <script src="https://sandbox-merchant.revolut.com/embed.js"></script>
+  </head>
+  <body>
+    <h1 id="status">loading</h1>
+    <div id="card-field" style="border:1px solid #ccc;padding:12px;max-width:400px"></div>
+    <button id="pay">Pay &amp; Save Card</button>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const token = params.get("token");
+      window.RevolutCheckout(token, "sandbox").then(function (instance) {
+        const cardField = instance.createCardField({
+          target: document.getElementById("card-field"),
+          onSuccess: function () {
+            document.getElementById("status").innerText = "PAID";
+          },
+          onError: function (message) {
+            document.getElementById("status").innerText = "ERROR: " + message;
+          },
+        });
+        document.getElementById("status").innerText = "ready";
+        document.getElementById("pay").onclick = function () {
+          document.getElementById("status").innerText = "submitting";
+          cardField.submit({
+            name: "Test User",
+            email: "mitcard@lnvps.net",
+            savePaymentMethodFor: "merchant",
+            billingAddress: {
+              countryCode: "GB",
+              postcode: "SW1A1AA",
+            },
+          });
+        };
+      });
+    </script>
+  </body>
+</html>

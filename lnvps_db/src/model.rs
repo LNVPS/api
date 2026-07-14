@@ -62,8 +62,45 @@ pub struct User {
     pub billing_postcode: Option<String>,
     /// Billing tax id
     pub billing_tax_id: Option<String>,
-    /// Nostr Wallet Connect connection string for automatic renewals (encrypted)
-    pub nwc_connection_string: Option<EncryptedString>,
+}
+
+/// A saved payment method for off-session (merchant-initiated) automatic
+/// renewals. Provider-agnostic. Stores only opaque provider token references
+/// (encrypted) plus non-sensitive card metadata (brand/last4/expiry) — never
+/// card PAN/CVV.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct UserPaymentMethod {
+    pub id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    /// Payment processor (e.g. `revolut`)
+    pub provider: String,
+    /// Optional user-defined label to distinguish multiple methods
+    pub name: Option<String>,
+    /// Encrypted provider customer id owning the saved method (None for
+    /// providers without one, e.g. NWC)
+    pub external_customer_id: Option<EncryptedString>,
+    /// Encrypted reusable payment method id charged off-session
+    pub external_id: EncryptedString,
+    pub card_brand: Option<String>,
+    pub card_last_four: Option<String>,
+    pub exp_month: Option<u16>,
+    pub exp_year: Option<u16>,
+    /// Default method for this provider
+    pub is_default: bool,
+    /// Whether this method is usable (disabled when expired/revoked)
+    pub enabled: bool,
+}
+
+impl UserPaymentMethod {
+    /// Whether the card has expired as of the given year/month (1-based month).
+    /// Methods without expiry data are treated as non-expiring.
+    pub fn is_expired(&self, year: u16, month: u16) -> bool {
+        match (self.exp_year, self.exp_month) {
+            (Some(ey), Some(em)) => (ey, em) < (year, month),
+            _ => false,
+        }
+    }
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -82,6 +119,8 @@ pub struct AdminUserInfo {
     // Admin-specific fields
     pub vm_count: i64,
     pub is_admin: bool,
+    /// Whether the user has an NWC payment method configured (computed)
+    pub has_nwc: bool,
 }
 
 #[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
@@ -1945,6 +1984,30 @@ impl InternetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_payment_method_is_expired() {
+        let mut pm = UserPaymentMethod {
+            exp_year: Some(2029),
+            exp_month: Some(12),
+            ..Default::default()
+        };
+        // Before expiry
+        assert!(!pm.is_expired(2029, 11));
+        // Same month is not yet expired
+        assert!(!pm.is_expired(2029, 12));
+        // After expiry month
+        assert!(pm.is_expired(2030, 1));
+        assert!(pm.is_expired(2029, 12) == false);
+        // Earlier year
+        assert!(!pm.is_expired(2028, 12));
+        // Missing expiry data -> never expired
+        pm.exp_year = None;
+        assert!(!pm.is_expired(2030, 1));
+        pm.exp_year = Some(2029);
+        pm.exp_month = None;
+        assert!(!pm.is_expired(2030, 1));
+    }
 
     #[test]
     fn test_internet_registry_min_prefix_sizes() {

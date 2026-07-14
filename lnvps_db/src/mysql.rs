@@ -3,7 +3,8 @@ use crate::{
     IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
     PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserSshKey, Vm, VmCostPlan,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
+    VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
     VmForMigration, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage,
     VmPayment, VmPaymentRaw, VmTemplate,
@@ -216,7 +217,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             Some(crate::email_hash(user.email.as_str()).to_vec())
         };
         sqlx::query(
-            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
+            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=? where id = ?",
         )
             .bind(&user.email)
             .bind(hash)
@@ -239,7 +240,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&user.billing_state)
             .bind(&user.billing_postcode)
             .bind(&user.billing_tax_id)
-            .bind(&user.nwc_connection_string)
             .bind(user.id)
             .execute(&self.db)
             .await?;
@@ -315,6 +315,81 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
+    }
+
+    async fn insert_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "insert into user_payment_method(user_id,provider,name,external_customer_id,external_id,card_brand,card_last_four,exp_month,exp_year,is_default,enabled) values(?,?,?,?,?,?,?,?,?,?,?) returning id",
+        )
+        .bind(pm.user_id)
+        .bind(&pm.provider)
+        .bind(&pm.name)
+        .bind(&pm.external_customer_id)
+        .bind(&pm.external_id)
+        .bind(&pm.card_brand)
+        .bind(&pm.card_last_four)
+        .bind(pm.exp_month)
+        .bind(pm.exp_year)
+        .bind(pm.is_default)
+        .bind(pm.enabled)
+        .fetch_one(&self.db)
+        .await?
+        .try_get(0)?)
+    }
+
+    async fn list_user_payment_methods(
+        &self,
+        user_id: u64,
+        provider: Option<&str>,
+    ) -> DbResult<Vec<UserPaymentMethod>> {
+        Ok(if let Some(provider) = provider {
+            sqlx::query_as(
+                "select * from user_payment_method where user_id=? and provider=? order by is_default desc, id asc",
+            )
+            .bind(user_id)
+            .bind(provider)
+            .fetch_all(&self.db)
+            .await?
+        } else {
+            sqlx::query_as(
+                "select * from user_payment_method where user_id=? order by is_default desc, id asc",
+            )
+            .bind(user_id)
+            .fetch_all(&self.db)
+            .await?
+        })
+    }
+
+    async fn get_user_payment_method(&self, id: u64) -> DbResult<UserPaymentMethod> {
+        Ok(sqlx::query_as("select * from user_payment_method where id=?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()> {
+        sqlx::query(
+            "update user_payment_method set name=?,card_brand=?,card_last_four=?,exp_month=?,exp_year=?,is_default=?,enabled=? where id=?",
+        )
+        .bind(&pm.name)
+        .bind(&pm.card_brand)
+        .bind(&pm.card_last_four)
+        .bind(pm.exp_month)
+        .bind(pm.exp_year)
+        .bind(pm.is_default)
+        .bind(pm.enabled)
+        .bind(pm.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_user_payment_method(&self, id: u64) -> DbResult<()> {
+        sqlx::query("delete from user_payment_method where id=?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> DbResult<u64> {
@@ -1796,8 +1871,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 u.billing_city,
                 u.billing_state,
                 u.billing_postcode,
-                u.billing_tax_id,
-                u.nwc_connection_string
+                u.billing_tax_id
             FROM users u
             INNER JOIN vm ON u.id = vm.user_id
             WHERE vm.deleted = 0 
@@ -3677,7 +3751,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
-                u.nwc_connection_string,
+                EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
             FROM users u
@@ -3757,7 +3831,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
-                u.nwc_connection_string,
+                EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
             FROM users u

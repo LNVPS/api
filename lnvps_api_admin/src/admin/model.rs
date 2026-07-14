@@ -372,7 +372,8 @@ impl From<lnvps_db::User> for AdminUserInfo {
             vm_count: 0,
             last_login: None,
             is_admin: false,
-            has_nwc: user.nwc_connection_string.is_some(),
+            // Computed via a DB lookup (AdminUserInfo path); default false here.
+            has_nwc: false,
         }
     }
 }
@@ -403,7 +404,7 @@ impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
             vm_count: user.vm_count as _,
             last_login: None,
             is_admin: user.is_admin,
-            has_nwc: user.user_info.nwc_connection_string.is_some(),
+            has_nwc: user.has_nwc,
         }
     }
 }
