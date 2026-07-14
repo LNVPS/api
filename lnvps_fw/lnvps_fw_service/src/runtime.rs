@@ -27,7 +27,7 @@ use log::{info, warn};
 
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
-    DestCounters, DestState, SrcRateConfig, SrcState,
+    DestCounters, DestState, GlobalConfig, SrcRateConfig, SrcState,
 };
 
 use crate::cidr::{mask_v4, mask_v6};
@@ -56,7 +56,7 @@ pub struct RuntimeConfig {
     /// Manual override flags (IPv6).
     pub manual_v6: Vec<(u32, [u8; 16], u32)>,
     /// Per-source packets/second limit for the in-kernel rate machine
-    /// (written to `SRC_RATE_CFG` as `max_per_window` over a 1s window).
+    /// (written to `GLOBAL_CFG.src_rate` as `max_per_window` over a 1s window).
     pub src_rate_pps: u64,
     /// How long the kernel machine blocks a tripped source before it is
     /// re-evaluated (re-extended each window it is still over-rate).
@@ -69,7 +69,7 @@ pub struct RuntimeConfig {
     pub syn_proxy_pps: u64,
     /// Per-destination budget of SYNs/second to unlearned TCP ports leaked
     /// through the port filter so open ports can still be learned while
-    /// mitigating. 0 disables the leak. Written to `LEARN_LEAK_CFG`.
+    /// mitigating. 0 disables the leak. Written to `GLOBAL_CFG.learn_leak_pps`.
     pub learn_leak_pps: u64,
 }
 
@@ -111,10 +111,8 @@ pub struct DetectionState {
     /// `bpf_ktime_get_ns`-domain timestamp of the snapshot (SrcState fields
     /// are kernel-monotonic; compare against this, not userspace clocks).
     pub src_sampled_ns: u64,
-    /// Previous cumulative TX (egress) counter snapshots, keyed by local IP.
-    pub prev_tx_v4: HashMap<[u8; 4], DestCounters>,
-    pub prev_tx_v6: HashMap<[u8; 16], DestCounters>,
-    /// Latest per-local-IP TX rates (for the tx/rx dashboard view).
+    /// Latest per-local-IP TX rates (for the tx/rx dashboard view). Computed
+    /// directly from the drained per-window delta (no previous snapshot needed).
     pub tx_v4: HashMap<[u8; 4], Rates>,
     pub tx_v6: HashMap<[u8; 16], Rates>,
 }
@@ -243,8 +241,71 @@ fn log_event_stop(ip: &str, peak: &Rates, dropped_total: u64) {
     );
 }
 
+/// Advance one destination's state machine for a reconstructed cumulative
+/// snapshot `cur` and (re)write the dest-state LPM trie on transitions / level
+/// changes. Shared by the live sample pass and the synthetic zero-delta pass.
+#[allow(clippy::too_many_arguments)]
+fn apply_dest_decision<K>(
+    key: &K,
+    cur: DestCounters,
+    tracker: &mut DestTracker,
+    trie: &mut LpmTrie<&mut MapData, K, DestState>,
+    bits: u32,
+    cfg: &DetectionConfig,
+    escalate_pass_pps: u64,
+    syn_proxy_pps: u64,
+    now_ns: u64,
+    elapsed_ns: u64,
+    manual: u32,
+    fmt_ip: impl Fn(&K) -> String,
+) where
+    K: Pod + Eq + Hash + Copy,
+{
+    let (transition, rates) = process_sample(cur, tracker, cfg, now_ns, elapsed_ns);
+    if tracker.mode == DEST_MODE_NORMAL {
+        if transition == Transition::Exited {
+            // Restore the manual floor rather than deleting the entry: an
+            // auto-mitigation exit must not wipe an operator override.
+            if manual != DEST_MODE_NORMAL {
+                let _ = trie.insert(&Key::new(bits, *key), dest_state(manual, now_ns), 0);
+            } else {
+                let _ = trie.remove(&Key::new(bits, *key));
+            }
+            log_event_stop(&fmt_ip(key), &tracker.peak, cur.dropped);
+            tracker.peak = Rates::default();
+            tracker.flags = DEST_MODE_NORMAL;
+        }
+        return;
+    }
+    // Active: pick the enforcement level (never below the manual floor) and
+    // (re)write it if changed.
+    let target = enforced_flags(&rates, escalate_pass_pps, syn_proxy_pps) | manual;
+    if transition == Transition::Entered {
+        let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
+        tracker.flags = target;
+        log_event_start(&fmt_ip(key), &rates);
+    } else if target != tracker.flags {
+        let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
+        info!("MITIGATION FLAGS dest={} flags={target:#06b}", fmt_ip(key));
+        tracker.flags = target;
+    } else if manual != DEST_MODE_NORMAL {
+        // Re-assert the floor unconditionally while a manual override is
+        // present: `apply_rules` may have just (re)written the trie entry
+        // with manual-only flags when the override was pushed mid-attack,
+        // which would otherwise persist until the next flag change.
+        let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
+    }
+}
+
 /// Per-destination detection for one family, writing the escalation level into
 /// the dest-state LPM trie on transitions and level changes.
+///
+/// `samples` now carries **per-window deltas** (the counter maps are drained
+/// each tick). The cumulative snapshot the state machine expects is
+/// reconstructed in userspace as `tracker.prev + delta`, which is immune to
+/// kernel-side LRU eviction. Because a drained map drops silent destinations
+/// entirely, mitigating trackers absent from `samples` are fed a synthetic
+/// zero-delta sample so their cooldown/exit still advances.
 #[allow(clippy::too_many_arguments)]
 fn detect_family<K>(
     samples: &[(K, DestCounters)],
@@ -261,45 +322,56 @@ fn detect_family<K>(
 ) where
     K: Pod + Eq + Hash + Copy,
 {
-    for (key, cur) in samples {
+    let seen: std::collections::HashSet<K> = samples.iter().map(|(k, _)| *k).collect();
+    for (key, delta) in samples {
         // Operator-forced flags for this destination; a floor auto-detection
         // may add to but never drops (see RuntimeConfig::manual_flags_v4).
         let manual = manual_flags(key);
         let tracker = trackers.entry(*key).or_default();
-        let (transition, rates) = process_sample(*cur, tracker, cfg, now_ns, elapsed_ns);
-        if tracker.mode == DEST_MODE_NORMAL {
-            if transition == Transition::Exited {
-                // Restore the manual floor rather than deleting the entry: an
-                // auto-mitigation exit must not wipe an operator override.
-                if manual != DEST_MODE_NORMAL {
-                    let _ = trie.insert(&Key::new(bits, *key), dest_state(manual, now_ns), 0);
-                } else {
-                    let _ = trie.remove(&Key::new(bits, *key));
-                }
-                log_event_stop(&fmt_ip(key), &tracker.peak, cur.dropped);
-                tracker.peak = Rates::default();
-                tracker.flags = DEST_MODE_NORMAL;
-            }
-            continue;
-        }
-        // Active: pick the enforcement level (never below the manual floor) and
-        // (re)write it if changed.
-        let target = enforced_flags(&rates, escalate_pass_pps, syn_proxy_pps) | manual;
-        if transition == Transition::Entered {
-            let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
-            tracker.flags = target;
-            log_event_start(&fmt_ip(key), &rates);
-        } else if target != tracker.flags {
-            let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
-            info!("MITIGATION FLAGS dest={} flags={target:#06b}", fmt_ip(key));
-            tracker.flags = target;
-        } else if manual != DEST_MODE_NORMAL {
-            // Re-assert the floor unconditionally while a manual override is
-            // present: `apply_rules` may have just (re)written the trie entry
-            // with manual-only flags when the override was pushed mid-attack,
-            // which would otherwise persist until the next flag change.
-            let _ = trie.insert(&Key::new(bits, *key), dest_state(target, now_ns), 0);
-        }
+        // Reconstruct the cumulative snapshot from the accumulated previous plus
+        // this window's drained delta.
+        let mut cur = tracker.prev;
+        add_counters(&mut cur, delta);
+        apply_dest_decision(
+            key,
+            cur,
+            tracker,
+            trie,
+            bits,
+            cfg,
+            escalate_pass_pps,
+            syn_proxy_pps,
+            now_ns,
+            elapsed_ns,
+            manual,
+            &fmt_ip,
+        );
+    }
+    // Silent mitigating destinations (drained away this tick): feed a zero delta
+    // so `process_sample` still runs the cooldown clock and can exit.
+    let silent: Vec<K> = trackers
+        .iter()
+        .filter(|(k, t)| !seen.contains(*k) && t.mode != DEST_MODE_NORMAL)
+        .map(|(k, _)| *k)
+        .collect();
+    for key in silent {
+        let manual = manual_flags(&key);
+        let tracker = trackers.get_mut(&key).expect("tracked");
+        let cur = tracker.prev; // cumulative unchanged (zero-delta window)
+        apply_dest_decision(
+            &key,
+            cur,
+            tracker,
+            trie,
+            bits,
+            cfg,
+            escalate_pass_pps,
+            syn_proxy_pps,
+            now_ns,
+            elapsed_ns,
+            manual,
+            &fmt_ip,
+        );
     }
 }
 
@@ -324,20 +396,21 @@ fn detect_prefix<K>(
 ) where
     K: Pod + Eq + Hash + Copy,
 {
+    // `samples` are per-window deltas; sum them over the prefix to get the
+    // prefix's aggregate delta, then reconstruct the cumulative snapshot as
+    // `tracker.prev + aggregate delta` (same accumulate scheme as
+    // `detect_family`). detect_prefix runs every tick for every configured
+    // prefix, so no synthetic zero-delta pass is needed here.
     let mut agg = DestCounters::default();
     for (addr, c) in samples {
         if mask(*addr, prefix_len) == network {
-            agg.packets += c.packets;
-            agg.bytes += c.bytes;
-            agg.syn_packets += c.syn_packets;
-            agg.tcp_packets += c.tcp_packets;
-            agg.udp_packets += c.udp_packets;
-            agg.icmp_packets += c.icmp_packets;
-            agg.dropped += c.dropped;
+            add_counters(&mut agg, c);
         }
     }
     let tracker = trackers.entry((prefix_len, network)).or_default();
-    let (transition, rates) = process_sample(agg, tracker, cfg, now_ns, elapsed_ns);
+    let mut cur = tracker.prev;
+    add_counters(&mut cur, &agg);
+    let (transition, rates) = process_sample(cur, tracker, cfg, now_ns, elapsed_ns);
     if tracker.mode == DEST_MODE_NORMAL {
         if transition == Transition::Exited {
             // Restore the manual floor rather than deleting the prefix entry.
@@ -391,31 +464,45 @@ fn detect_prefix<K>(
     }
 }
 
-/// Read + per-CPU-sum a `DestCounters` map into an owned vec. Uses one
-/// `BPF_MAP_LOOKUP_BATCH` syscall per ~4k entries, falling back to aya's
-/// per-entry iteration (2 syscalls/entry) on kernels without batch support.
-fn read_counters<K>(bpf: &Ebpf, name: &str) -> Result<Vec<(K, DestCounters)>>
+/// Drain + per-CPU-sum a `DestCounters` map into an owned vec of **per-window
+/// deltas**. Uses one `BPF_MAP_LOOKUP_AND_DELETE_BATCH` syscall per ~4k entries
+/// (read-and-remove), so each entry returned is the traffic accumulated since
+/// the previous tick and the kernel map is left (near) empty. Draining removes
+/// LRU-eviction skew entirely (a churned entry can never make a counter appear
+/// to go backwards) and doubles as GC for cold destinations. Falls back to
+/// aya's per-entry iterate-then-remove on kernels without batch support (still
+/// drain semantics, just more syscalls).
+fn read_counters<K>(bpf: &mut Ebpf, name: &str) -> Result<Vec<(K, DestCounters)>>
 where
-    K: Pod,
+    K: Pod + Eq + Hash,
 {
-    let map = bpf.map(name).with_context(|| format!("{name} missing"))?;
-    if crate::batch::supported()
-        && let Some(fd) = batch_fd(map)
-    {
-        match crate::batch::read_percpu_folded::<K, DestCounters, DestCounters>(
-            fd,
-            possible_cpus()?,
-            add_counters,
-        ) {
-            Ok(v) => return Ok(v),
-            Err(e) => batch_fallback(name, e)?,
+    if crate::batch::supported() {
+        let map = bpf.map(name).with_context(|| format!("{name} missing"))?;
+        if let Some(fd) = batch_fd(map) {
+            match crate::batch::read_percpu_folded::<K, DestCounters, DestCounters>(
+                fd,
+                possible_cpus()?,
+                true,
+                add_counters,
+            ) {
+                Ok(v) => return Ok(v),
+                Err(e) => batch_fallback(name, e)?,
+            }
         }
     }
-    let map: PerCpuHashMap<_, K, DestCounters> = PerCpuHashMap::try_from(map)?;
-    let mut out = Vec::new();
-    for entry in map.iter() {
-        let (k, values) = entry?;
-        out.push((k, sum_counters(values.iter())));
+    // Per-entry fallback: read every entry, then remove it so the semantics
+    // still match the drain path (deltas, not cumulative).
+    let mut map: PerCpuHashMap<_, K, DestCounters> = PerCpuHashMap::try_from(
+        bpf.map_mut(name)
+            .with_context(|| format!("{name} missing"))?,
+    )?;
+    let keys: Vec<K> = map.keys().collect::<Result<_, _>>()?;
+    let mut out = Vec::with_capacity(keys.len());
+    for k in &keys {
+        if let Ok(values) = map.get(k, 0) {
+            out.push((*k, sum_counters(values.iter())));
+        }
+        let _ = map.remove(k);
     }
     Ok(out)
 }
@@ -425,34 +512,63 @@ where
 /// a delta over a variable sample interval.
 pub const SRC_WINDOW_NS: u64 = 1_000_000_000;
 
-/// Write the kernel per-source rate-machine config (`SRC_RATE_CFG[0]`).
+/// Read-modify-write the single consolidated `GLOBAL_CFG` entry. Each writer
+/// mutates only its own fields so independent callers (rate/leak limits,
+/// scoping, manual-block presence, verified TTL) never clobber one another.
+pub fn update_global_cfg(bpf: &mut Ebpf, f: impl FnOnce(&mut GlobalConfig)) -> Result<()> {
+    let mut arr: aya::maps::Array<_, GlobalConfig> =
+        aya::maps::Array::try_from(bpf.map_mut("GLOBAL_CFG").context("GLOBAL_CFG missing")?)?;
+    let mut cfg = arr.get(&0, 0).unwrap_or_default();
+    f(&mut cfg);
+    arr.set(0, cfg, 0).context("writing GLOBAL_CFG")?;
+    Ok(())
+}
+
+/// Write the kernel per-source rate-machine config into `GLOBAL_CFG.src_rate`.
 /// Called at startup and whenever the limits change (`PUT /limits`).
 /// `max_per_window` is precomputed so the datapath never divides.
 pub fn write_src_rate_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
-    let mut arr: aya::maps::Array<_, SrcRateConfig> = aya::maps::Array::try_from(
-        bpf.map_mut("SRC_RATE_CFG")
-            .context("SRC_RATE_CFG missing")?,
-    )?;
-    let c = SrcRateConfig {
+    let src_rate = SrcRateConfig {
         max_per_window: cfg.src_rate_pps.saturating_mul(SRC_WINDOW_NS) / 1_000_000_000,
         window_ns: SRC_WINDOW_NS,
         cooldown_ns: cfg.src_cooldown_ns,
     };
-    arr.set(0, c, 0).context("writing SRC_RATE_CFG")?;
-    Ok(())
+    update_global_cfg(bpf, |c| c.src_rate = src_rate)
 }
 
-/// Write the per-destination learning-leak budget (`LEARN_LEAK_CFG[0]`), the
-/// max SYNs/second to unlearned ports the port filter leaks per destination.
-/// Called at startup and on live `PUT /limits`.
+/// Write the per-destination learning-leak budget into
+/// `GLOBAL_CFG.learn_leak_pps`: the max SYNs/second to unlearned ports the port
+/// filter leaks per destination. Called at startup and on live `PUT /limits`.
 pub fn write_learn_leak_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
-    let mut arr: aya::maps::Array<_, u32> = aya::maps::Array::try_from(
-        bpf.map_mut("LEARN_LEAK_CFG")
-            .context("LEARN_LEAK_CFG missing")?,
+    let pps = cfg.learn_leak_pps.min(u32::MAX as u64) as u32;
+    update_global_cfg(bpf, |c| c.learn_leak_pps = pps)
+}
+
+/// Bulk-remove `keys` from a plain hash-family map named `name`, using one
+/// `BPF_MAP_DELETE_BATCH` syscall per ~4k keys and falling back to aya's
+/// per-key removal on kernels without batch-delete support.
+pub fn delete_keys<K, V>(bpf: &mut Ebpf, name: &str, keys: &[K]) -> Result<usize>
+where
+    K: Pod,
+    V: Pod,
+{
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    if crate::batch::supported() {
+        let map = bpf.map(name).with_context(|| format!("{name} missing"))?;
+        if let Some(fd) = batch_fd(map) {
+            match crate::batch::delete_batch(fd, keys) {
+                Ok(n) => return Ok(n),
+                Err(e) => batch_fallback(name, e)?,
+            }
+        }
+    }
+    let mut map: aya::maps::HashMap<_, K, V> = aya::maps::HashMap::try_from(
+        bpf.map_mut(name)
+            .with_context(|| format!("{name} missing"))?,
     )?;
-    arr.set(0, cfg.learn_leak_pps.min(u32::MAX as u64) as u32, 0)
-        .context("writing LEARN_LEAK_CFG")?;
-    Ok(())
+    Ok(keys.iter().filter(|k| map.remove(k).is_ok()).count())
 }
 
 /// Remove idle per-source state entries: the kernel machine never self-cleans,
@@ -481,19 +597,15 @@ where
         })
         .map(|(k, _)| *k)
         .collect();
-    let mut map: aya::maps::HashMap<_, K, SrcState> = aya::maps::HashMap::try_from(
-        bpf.map_mut(name)
-            .with_context(|| format!("{name} missing"))?,
-    )?;
-    Ok(stale.iter().filter(|k| map.remove(k).is_ok()).count())
+    delete_keys::<K, SrcState>(bpf, name, &stale)
 }
 
-/// Sample one TX-counter map, compute per-local-IP egress rates against the
-/// previous snapshot, and refresh both the rate map and the prev snapshot.
+/// Sample one TX-counter map (drained: each entry is this window's delta) and
+/// convert directly into per-local-IP egress rates. Silent IPs are drained
+/// away and simply drop off the live dashboard, which is the desired behaviour.
 fn compute_tx<K>(
-    bpf: &Ebpf,
+    bpf: &mut Ebpf,
     name: &str,
-    prev: &mut HashMap<K, DestCounters>,
     out: &mut HashMap<K, Rates>,
     elapsed_ns: u64,
 ) -> Result<()>
@@ -503,10 +615,8 @@ where
     let cur = read_counters::<K>(bpf, name)?;
     out.clear();
     for (k, c) in &cur {
-        let p = prev.get(k).copied().unwrap_or_default();
-        out.insert(*k, compute_rates(&p, c, elapsed_ns));
+        out.insert(*k, compute_rates(&DestCounters::default(), c, elapsed_ns));
     }
-    *prev = cur.into_iter().collect();
     Ok(())
 }
 
@@ -534,20 +644,8 @@ pub fn run_control(
     state.src_sampled_ns = crate::gc::monotonic_now_ns();
 
     // --- TX (egress) rates per local IP (display only; no mitigation) ---
-    compute_tx::<[u8; 4]>(
-        bpf,
-        "V4_TX_COUNTERS",
-        &mut state.prev_tx_v4,
-        &mut state.tx_v4,
-        elapsed,
-    )?;
-    compute_tx::<[u8; 16]>(
-        bpf,
-        "V6_TX_COUNTERS",
-        &mut state.prev_tx_v6,
-        &mut state.tx_v6,
-        elapsed,
-    )?;
+    compute_tx::<[u8; 4]>(bpf, "V4_TX_COUNTERS", &mut state.tx_v4, elapsed)?;
+    compute_tx::<[u8; 16]>(bpf, "V6_TX_COUNTERS", &mut state.tx_v6, elapsed)?;
 
     // --- Per-destination + per-prefix detection (shared dest-state trie) ---
     let v4 = read_counters::<[u8; 4]>(bpf, "V4_DEST_COUNTERS")?;

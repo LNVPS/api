@@ -42,20 +42,12 @@ fn gc_learned_ports(bpf: &mut Ebpf, tcp_ttl_ns: u64, udp_ttl_ns: u64) -> Result<
         // expired keys through the typed handle.
         let entries: Vec<(PortKeyV4, LastSeen)> = scan_plain(&*bpf, "OPEN_PORTS_V4")?;
         let expired = gc::expired_ports(&entries, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
-        let mut v4: AyaHashMap<_, PortKeyV4, LastSeen> = AyaHashMap::try_from(
-            bpf.map_mut("OPEN_PORTS_V4")
-                .context("open ports v4 missing")?,
-        )?;
-        removed += gc::remove_keys(&mut v4, &expired);
+        removed += runtime::delete_keys::<PortKeyV4, LastSeen>(bpf, "OPEN_PORTS_V4", &expired)?;
     }
     {
         let entries: Vec<(PortKeyV6, LastSeen)> = scan_plain(&*bpf, "OPEN_PORTS_V6")?;
         let expired = gc::expired_ports(&entries, now, tcp_ttl_ns, udp_ttl_ns, |k| k.proto);
-        let mut v6: AyaHashMap<_, PortKeyV6, LastSeen> = AyaHashMap::try_from(
-            bpf.map_mut("OPEN_PORTS_V6")
-                .context("open ports v6 missing")?,
-        )?;
-        removed += gc::remove_keys(&mut v6, &expired);
+        removed += runtime::delete_keys::<PortKeyV6, LastSeen>(bpf, "OPEN_PORTS_V6", &expired)?;
     }
     Ok(removed)
 }
@@ -179,17 +171,7 @@ where
         .filter(|(_, ts)| gc::is_expired(*ts, now, ttl_ns))
         .map(|(k, _)| *k)
         .collect();
-    let mut map: AyaHashMap<_, K, u64> = AyaHashMap::try_from(
-        bpf.map_mut(name)
-            .with_context(|| format!("{name} missing"))?,
-    )?;
-    let mut removed = 0;
-    for k in &expired {
-        if map.remove(k).is_ok() {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    runtime::delete_keys::<K, u64>(bpf, name, &expired)
 }
 
 /// Rotate the SYN-cookie secret: previous <- current, current <- `new`.
@@ -816,6 +798,10 @@ fn apply_rules(
         manual_block(bpf, *k, true)?;
         applied_blocks.insert(c.clone(), *k);
     }
+    // Let the XDP fast-path skip the per-packet MANUAL_BLOCK LPM lookup unless
+    // at least one block is installed.
+    let have_blocks = !applied_blocks.is_empty();
+    runtime::update_global_cfg(bpf, |c| c.manual_blocks = u32::from(have_blocks))?;
     Ok(())
 }
 
@@ -924,10 +910,8 @@ fn sync_protected(
             applied_v6.push((len, net));
         }
     }
-    let scoped = u32::from(!(v4.is_empty() && v6.is_empty()));
-    let mut s: Array<_, u32> =
-        Array::try_from(bpf.map_mut("SETTINGS").context("SETTINGS missing")?)?;
-    s.set(0, scoped, 0)?;
+    let scoped = !(v4.is_empty() && v6.is_empty());
+    runtime::update_global_cfg(bpf, |c| c.scoped = u32::from(scoped))?;
     Ok(())
 }
 
@@ -1133,6 +1117,9 @@ async fn main() -> Result<()> {
     // window still validate against the prev slot.
     let mut cookie_timer = tokio::time::interval(Duration::from_secs(120));
     let verified_ttl_ns = ttl_ns;
+    // Publish the verified-source TTL so the XDP SYN-proxy expires stale
+    // verifications in-kernel (userspace GC then only reclaims memory).
+    runtime::update_global_cfg(&mut bpf, |c| c.verified_ttl_ns = verified_ttl_ns)?;
 
     info!(
         "Learning: port TTL {}s, GC every {}s",

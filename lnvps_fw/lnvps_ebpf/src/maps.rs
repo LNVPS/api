@@ -4,7 +4,7 @@ use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, ProgramArray};
 use lnvps_fw_common::{
     COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
-    LastSeen, PROTO_TCP, PortKeyV4, PortKeyV6, SrcRateConfig, SrcState,
+    GlobalConfig, LastSeen, PortKeyV4, PortKeyV6, SrcRateConfig, SrcState,
 };
 
 /// Max number of destination IPs to track (per address family). Sized to a
@@ -68,11 +68,31 @@ pub static V4_SRC_STATE: LruHashMap<[u8; 4], SrcState> =
 pub static V6_SRC_STATE: LruHashMap<[u8; 16], SrcState> =
     LruHashMap::with_max_entries(MAX_SRC_IPS, 0);
 
-/// Per-source rate-machine config (single entry), written by userspace at
-/// startup and on live `PUT /limits` edits. `max_per_window == 0` disables
-/// per-source blocking.
+/// Consolidated global config (single entry), written by userspace at startup
+/// and on live edits. One lookup fetches every per-packet knob (scoping,
+/// per-source rate config, learn-leak budget, verified TTL, manual-block
+/// presence). See [`GlobalConfig`].
 #[map]
-pub static SRC_RATE_CFG: Array<SrcRateConfig> = Array::with_max_entries(1, 0);
+pub static GLOBAL_CFG: Array<GlobalConfig> = Array::with_max_entries(1, 0);
+
+/// Read the consolidated global config (zeroed defaults if never written:
+/// unscoped, no manual blocks, per-source blocking + learn-leak disabled, no
+/// in-kernel verified expiry).
+#[inline(always)]
+pub fn global_cfg() -> GlobalConfig {
+    GLOBAL_CFG.get(0).copied().unwrap_or(GlobalConfig {
+        src_rate: SrcRateConfig {
+            max_per_window: 0,
+            window_ns: 0,
+            cooldown_ns: 0,
+        },
+        verified_ttl_ns: 0,
+        scoped: 0,
+        manual_blocks: 0,
+        learn_leak_pps: 0,
+        _pad: 0,
+    })
+}
 
 /// Per-destination learning-leak buckets (IPv4): a fixed 1s window counting
 /// SYNs to *unlearned* TCP ports that the port filter lets through so the
@@ -86,11 +106,6 @@ pub static V4_LEARN_LEAK: LruHashMap<[u8; 4], SrcState> =
 #[map]
 pub static V6_LEARN_LEAK: LruHashMap<[u8; 16], SrcState> =
     LruHashMap::with_max_entries(MAX_DST_IPS, 0);
-
-/// Learning-leak budget (single entry): max NEW-port probes/second leaked
-/// through per destination. 0 disables the leak (drop-all).
-#[map]
-pub static LEARN_LEAK_CFG: Array<u32> = Array::with_max_entries(1, 0);
 
 /// Per-(dest,port) first-touch probe state for the learning leak (IPv4):
 /// `last_seen` is the start of the current probe cycle. Bounded LRU.
@@ -145,16 +160,13 @@ pub static MANUAL_BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX
 #[map]
 pub static MANUAL_BLOCK_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
 
-/// Global settings written by userspace. Index 0: `scoped` (1 = only
-/// count/mitigate protected destinations; 0 = protect every destination, the
-/// single-NIC host default).
-#[map]
-pub static SETTINGS: Array<u32> = Array::with_max_entries(1, 0);
-
-/// True if destination scoping is enabled (`protected` is non-empty).
+/// True if destination scoping is enabled (`protected` is non-empty). Reads the
+/// consolidated config; used on the TC egress learn path (which only needs this
+/// one field). The XDP ingress path instead reads [`global_cfg`] once and uses
+/// `cfg.scoped` directly, so it never double-looks-up.
 #[inline(always)]
 pub fn scoped() -> bool {
-    SETTINGS.get(0).copied().unwrap_or(0) != 0
+    global_cfg().scoped != 0
 }
 
 /// Generate a dest-mode reader for one address family: a longest-prefix lookup
@@ -221,11 +233,7 @@ counters_for!(tx_counters_v6, [u8; 16], V6_TX_COUNTERS);
 macro_rules! src_gate_for {
     ($name:ident, $key:ty, $map:ident) => {
         #[inline(always)]
-        pub fn $name(src: &$key, enforce: bool) -> bool {
-            let cfg = match SRC_RATE_CFG.get(0) {
-                Some(c) => c,
-                None => return false,
-            };
+        pub fn $name(src: &$key, cfg: &SrcRateConfig, enforce: bool) -> bool {
             if cfg.max_per_window == 0 || cfg.window_ns == 0 {
                 return false;
             }
@@ -275,15 +283,14 @@ const LEARN_GRACE_NS: u64 = 3_000_000_000;
 const LEARN_REPROBE_NS: u64 = 30_000_000_000;
 
 /// Generate the per-destination learning-leak *budget* gate for one family: a
-/// fixed-1s-window token bucket (`LEARN_LEAK_CFG` tokens/sec/dest). Returns
+/// fixed-1s-window token bucket (`GLOBAL_CFG.learn_leak_pps` tokens/sec/dest). Returns
 /// `true` and consumes a token if under budget. Shared by the general
 /// first-touch probe and the WireGuard handshake fast-path so the total leaked
 /// packets/sec/dest never exceeds the configured budget. `0` disables leaking.
 macro_rules! learn_budget_for {
     ($name:ident, $key:ty, $map:ident) => {
         #[inline(always)]
-        pub fn $name(dst: &$key) -> bool {
-            let budget = LEARN_LEAK_CFG.get(0).copied().unwrap_or(0);
+        pub fn $name(dst: &$key, budget: u32) -> bool {
             if budget == 0 {
                 return false;
             }
@@ -333,8 +340,8 @@ learn_budget_for!(learn_budget_v6, [u8; 16], V6_LEARN_LEAK);
 macro_rules! learn_leak_for {
     ($name:ident, $dst:ty, $pk:ty, $probe:ident, $budget:ident) => {
         #[inline(always)]
-        pub fn $name(dst: &$dst, port: u16, proto: u8) -> bool {
-            if LEARN_LEAK_CFG.get(0).copied().unwrap_or(0) == 0 {
+        pub fn $name(dst: &$dst, port: u16, proto: u8, budget: u32) -> bool {
+            if budget == 0 {
                 return false;
             }
             let now = unsafe { bpf_ktime_get_ns() };
@@ -355,7 +362,7 @@ macro_rules! learn_leak_for {
             }
 
             // Consume a per-dest token only when actually leaking.
-            if !$budget(dst) {
+            if !$budget(dst, budget) {
                 return false;
             }
             // Anchor a fresh cycle's grace window at this first probe.
@@ -368,8 +375,20 @@ macro_rules! learn_leak_for {
     };
 }
 
-learn_leak_for!(learn_leak_v4, [u8; 4], PortKeyV4, V4_LEARN_PROBE, learn_budget_v4);
-learn_leak_for!(learn_leak_v6, [u8; 16], PortKeyV6, V6_LEARN_PROBE, learn_budget_v6);
+learn_leak_for!(
+    learn_leak_v4,
+    [u8; 4],
+    PortKeyV4,
+    V4_LEARN_PROBE,
+    learn_budget_v4
+);
+learn_leak_for!(
+    learn_leak_v6,
+    [u8; 16],
+    PortKeyV6,
+    V6_LEARN_PROBE,
+    learn_budget_v6
+);
 
 /// How often (at most) an ingress packet refreshes a learned port's
 /// `last_seen`; throttled so a high-pps flow to a learned port does not incur
@@ -497,10 +516,23 @@ pub fn cookie_secrets() -> (u64, u64) {
     (cur, prev)
 }
 
-/// True if `src` has completed a SYN-cookie handshake.
+/// True if `src` has a *still-valid* SYN-cookie verification. When
+/// `ttl_ns != 0` the stored verification timestamp is checked in-kernel so an
+/// expired entry no longer bypasses the proxy (userspace GC then only reclaims
+/// memory, it is not the security boundary). `ttl_ns == 0` keeps the old
+/// presence-only behaviour.
 #[inline(always)]
-pub fn src_verified_v4(src: &[u8; 4]) -> bool {
-    unsafe { VERIFIED_V4.get(src) }.is_some()
+pub fn src_verified_v4(src: &[u8; 4], ttl_ns: u64) -> bool {
+    match unsafe { VERIFIED_V4.get(src) } {
+        Some(ts) => {
+            if ttl_ns == 0 {
+                return true;
+            }
+            let now = unsafe { bpf_ktime_get_ns() };
+            now.wrapping_sub(*ts) < ttl_ns
+        }
+        None => false,
+    }
 }
 
 /// Record `src` as verified.
@@ -510,10 +542,20 @@ pub fn mark_verified_v4(src: &[u8; 4]) {
     let _ = VERIFIED_V4.insert(src, &now, 0);
 }
 
-/// True if `src` has completed a SYN-cookie handshake (IPv6).
+/// True if `src` has a still-valid SYN-cookie verification (IPv6). See
+/// [`src_verified_v4`] for the `ttl_ns` semantics.
 #[inline(always)]
-pub fn src_verified_v6(src: &[u8; 16]) -> bool {
-    unsafe { VERIFIED_V6.get(src) }.is_some()
+pub fn src_verified_v6(src: &[u8; 16], ttl_ns: u64) -> bool {
+    match unsafe { VERIFIED_V6.get(src) } {
+        Some(ts) => {
+            if ttl_ns == 0 {
+                return true;
+            }
+            let now = unsafe { bpf_ktime_get_ns() };
+            now.wrapping_sub(*ts) < ttl_ns
+        }
+        None => false,
+    }
 }
 
 /// Record `src` as verified (IPv6).

@@ -20,6 +20,13 @@ use aya::Pod;
 
 /// `enum bpf_cmd` value for `BPF_MAP_LOOKUP_BATCH`.
 const BPF_MAP_LOOKUP_BATCH: libc::c_long = 24;
+/// `enum bpf_cmd` value for `BPF_MAP_LOOKUP_AND_DELETE_BATCH` (drain: read each
+/// entry and remove it in the same syscall, so counter maps yield per-window
+/// deltas with no LRU-eviction skew and self-GC).
+const BPF_MAP_LOOKUP_AND_DELETE_BATCH: libc::c_long = 25;
+/// `enum bpf_cmd` value for `BPF_MAP_DELETE_BATCH` (bulk key removal for GC
+/// sweeps, replacing one delete syscall per key).
+const BPF_MAP_DELETE_BATCH: libc::c_long = 27;
 
 /// Entries requested per syscall. Large enough that syscall overhead is noise
 /// (a full 256k-entry map is ~64 calls), small enough that the key/value
@@ -69,11 +76,11 @@ fn is_unsupported(e: &io::Error) -> bool {
 /// `attr` must point key/value buffers with room for `attr.count` entries of
 /// the map's key size / value stride respectively, and `in_batch`/`out_batch`
 /// at valid token storage.
-unsafe fn lookup_batch_once(attr: &mut BatchAttr) -> io::Result<bool> {
+unsafe fn lookup_batch_once(attr: &mut BatchAttr, cmd: libc::c_long) -> io::Result<bool> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
-            BPF_MAP_LOOKUP_BATCH,
+            cmd,
             attr as *mut BatchAttr,
             size_of::<BatchAttr>(),
         )
@@ -92,11 +99,21 @@ unsafe fn lookup_batch_once(attr: &mut BatchAttr) -> io::Result<bool> {
 /// `stride` is the byte size of one entry's value block (`value_size` for
 /// plain maps, `round8(value_size) × possible_cpus` for per-CPU maps).
 /// Returns `(keys, values, n)` holding `n` densely-packed entries.
+///
+/// When `drain` is true the `BPF_MAP_LOOKUP_AND_DELETE_BATCH` command is used,
+/// so every returned entry is atomically removed: the map is left (near) empty
+/// and each read yields the delta accumulated since the previous scan.
 fn scan_raw(
     fd: BorrowedFd<'_>,
     key_size: usize,
     stride: usize,
+    drain: bool,
 ) -> io::Result<(Vec<u8>, Vec<u8>, usize)> {
+    let cmd = if drain {
+        BPF_MAP_LOOKUP_AND_DELETE_BATCH
+    } else {
+        BPF_MAP_LOOKUP_BATCH
+    };
     let mut keys: Vec<u8> = Vec::new();
     let mut vals: Vec<u8> = Vec::new();
     let mut total = 0usize;
@@ -120,7 +137,7 @@ fn scan_raw(
             flags: 0,
         };
         // SAFETY: buffers sized for `chunk` entries above; tokens are valid.
-        let done = match unsafe { lookup_batch_once(&mut attr) } {
+        let done = match unsafe { lookup_batch_once(&mut attr, cmd) } {
             Ok(done) => done,
             // A bucket larger than the whole chunk (pathological collisions):
             // grow and retry the same position.
@@ -152,6 +169,7 @@ fn round8(n: usize) -> usize {
 pub fn read_percpu_folded<K, V, T>(
     fd: BorrowedFd<'_>,
     ncpus: usize,
+    drain: bool,
     fold: impl Fn(&mut T, &V),
 ) -> io::Result<Vec<(K, T)>>
 where
@@ -162,7 +180,7 @@ where
     let key_size = size_of::<K>();
     let slot = round8(size_of::<V>());
     let stride = slot * ncpus;
-    let (keys, vals, n) = scan_raw(fd, key_size, stride)?;
+    let (keys, vals, n) = scan_raw(fd, key_size, stride, drain)?;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         // SAFETY: buffers hold `n` densely-packed entries; K/V are Pod, and
@@ -186,7 +204,7 @@ where
 {
     let key_size = size_of::<K>();
     let stride = size_of::<V>();
-    let (keys, vals, n) = scan_raw(fd, key_size, stride)?;
+    let (keys, vals, n) = scan_raw(fd, key_size, stride, false)?;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         // SAFETY: buffers hold `n` densely-packed entries and K/V are Pod.
@@ -195,6 +213,48 @@ where
         out.push((k, v));
     }
     Ok(out)
+}
+
+/// Bulk-delete `keys` from a hash-family map with one `BPF_MAP_DELETE_BATCH`
+/// syscall (per ~4k keys), replacing one delete syscall per key on GC sweeps.
+/// Returns the number of keys the kernel reported deleted (`attr.count`); a
+/// trailing `ENOENT` (some keys already evicted between scan and delete) is
+/// treated as success for the entries that were removed.
+pub fn delete_batch<K: Pod>(fd: BorrowedFd<'_>, keys: &[K]) -> io::Result<usize> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let mut deleted = 0usize;
+    // Chunk so the kernel-visible request stays bounded on very large sweeps.
+    for chunk in keys.chunks(CHUNK) {
+        let mut attr = BatchAttr {
+            keys: chunk.as_ptr() as u64,
+            count: chunk.len() as u32,
+            map_fd: fd.as_raw_fd() as u32,
+            ..Default::default()
+        };
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_DELETE_BATCH,
+                &mut attr as *mut BatchAttr,
+                size_of::<BatchAttr>(),
+            )
+        };
+        if ret == 0 {
+            deleted += attr.count as usize;
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        // ENOENT: some keys in the chunk were already gone; the kernel still
+        // deleted `attr.count` of them and reports how many.
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            deleted += attr.count as usize;
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(deleted)
 }
 
 /// Record a batch failure: permanent unsupport latches the flag off (callers
@@ -313,12 +373,97 @@ mod tests {
 
         use std::os::fd::AsFd;
         let got: Vec<([u8; 4], u64)> =
-            read_percpu_folded(owned.as_fd(), ncpus, |acc: &mut u64, v: &u64| *acc += *v)
-                .expect("batch read");
+            read_percpu_folded(owned.as_fd(), ncpus, false, |acc: &mut u64, v: &u64| {
+                *acc += *v
+            })
+            .expect("batch read");
         assert_eq!(got.len(), 100);
         for (k, sum) in got {
             let key = u32::from_ne_bytes(k);
             assert_eq!(sum, u64::from(key) * ncpus as u64);
         }
+    }
+
+    /// End-to-end (needs CAP_BPF/root): a plain hash map, drain it with
+    /// `read_plain`-style LOOKUP_AND_DELETE (via `read_percpu_folded` is
+    /// per-CPU only, so exercise the drain flag through `scan_raw`) and the
+    /// bulk `delete_batch` path.
+    #[test]
+    #[ignore = "requires root/CAP_BPF"]
+    fn drain_and_delete_batch_on_real_map() {
+        use std::os::fd::{AsFd, FromRawFd};
+        #[repr(C)]
+        #[derive(Default)]
+        struct CreateAttr {
+            map_type: u32,
+            key_size: u32,
+            value_size: u32,
+            max_entries: u32,
+            map_flags: u32,
+        }
+        // BPF_MAP_TYPE_HASH (1), u32 key -> u64 value.
+        let attr = CreateAttr {
+            map_type: 1,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1024,
+            ..Default::default()
+        };
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                0i64,
+                &attr as *const CreateAttr,
+                size_of::<CreateAttr>(),
+            )
+        };
+        assert!(fd >= 0, "map create failed: {}", io::Error::last_os_error());
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+
+        #[repr(C)]
+        struct UpdateAttr {
+            map_fd: u32,
+            _pad: u32,
+            key: u64,
+            value: u64,
+            flags: u64,
+        }
+        let insert = |i: u32| {
+            let v = u64::from(i);
+            let ua = UpdateAttr {
+                map_fd: fd as u32,
+                _pad: 0,
+                key: &raw const i as u64,
+                value: &raw const v as u64,
+                flags: 0,
+            };
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    1i64,
+                    &ua as *const UpdateAttr,
+                    size_of::<UpdateAttr>(),
+                )
+            };
+            assert_eq!(r, 0, "update failed: {}", io::Error::last_os_error());
+        };
+        for i in 0u32..100 {
+            insert(i);
+        }
+
+        // Bulk-delete the even keys.
+        let evens: Vec<[u8; 4]> = (0u32..100)
+            .filter(|i| i % 2 == 0)
+            .map(u32::to_ne_bytes)
+            .collect();
+        let deleted = delete_batch(owned.as_fd(), &evens).expect("delete_batch");
+        assert_eq!(deleted, 50, "all even keys deleted");
+
+        // Drain the rest: LOOKUP_AND_DELETE leaves the map empty and returns
+        // the 50 odd survivors exactly once.
+        let (_keys, _vals, n) = scan_raw(owned.as_fd(), 4, 8, true).expect("drain");
+        assert_eq!(n, 50, "odd survivors drained");
+        let (_k2, _v2, n2) = scan_raw(owned.as_fd(), 4, 8, true).expect("drain again");
+        assert_eq!(n2, 0, "map emptied by drain");
     }
 }

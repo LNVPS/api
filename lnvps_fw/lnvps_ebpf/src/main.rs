@@ -8,7 +8,7 @@ use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
-    PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
+    GlobalConfig, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
     SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6, syn_cookie_v4, syn_cookie_v6,
 };
 
@@ -24,10 +24,10 @@ mod maps;
 
 use maps::{
     OPEN_PORTS_V4, OPEN_PORTS_V6, SYN_PROXY_JUMP, cookie_secrets, counters_v4, counters_v6,
-    dest_mode_v4, dest_mode_v6, learn_budget_v4, learn_budget_v6, learn_leak_v4, learn_leak_v6,
-    port_open_refresh_v4, port_open_refresh_v6, src_gate_v4, src_gate_v6,
-    learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6, mark_verified_v4,
-    mark_verified_v6, port_is_open_v4, port_is_open_v6, protected_v4, protected_v6, scoped,
+    dest_mode_v4, dest_mode_v6, global_cfg, learn_budget_v4, learn_budget_v6, learn_leak_v4,
+    learn_leak_v6, learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6,
+    mark_verified_v4, mark_verified_v6, port_is_open_v4, port_is_open_v6, port_open_refresh_v4,
+    port_open_refresh_v6, protected_v4, protected_v6, scoped, src_gate_v4, src_gate_v6,
     src_verified_v4, src_verified_v6, tx_counters_v4, tx_counters_v6,
 };
 
@@ -179,9 +179,13 @@ fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let ip = ptr_at::<Ipv4Hdr>(ctx, ip_off)?;
     let dst = ip.dst_addr;
 
+    // One consolidated config lookup for the whole packet (scoping, per-source
+    // rate config, learn-leak budget, verified TTL, manual-block presence).
+    let cfg = global_cfg();
+
     // Scope to protected destinations: pass anything we do not defend without
     // counting or mitigating it (a router must never touch transit traffic).
-    if scoped() && !protected_v4(dst) {
+    if cfg.scoped != 0 && !protected_v4(dst) {
         return Ok(XDP_PASS);
     }
 
@@ -200,13 +204,23 @@ fn handle_ipv4(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let counters = counters_v4(&dst);
     let mut verdict = XDP_PASS;
     let mut accounted = false;
-    // Manual source blocks drop unconditionally (independent of dest mitigation).
-    if manual_blocked_v4(src) {
+    // Manual source blocks drop unconditionally (independent of dest
+    // mitigation). Skip the per-packet LPM lookup entirely when none exist.
+    if cfg.manual_blocks != 0 && manual_blocked_v4(src) {
         verdict = XDP_DROP;
     } else {
         let flags = dest_mode_v4(&dst);
         if flags != DEST_MODE_NORMAL {
-            let (v, a) = mitigate_v4(ctx, &dst, &src, &meta, flags, allow_syn_proxy, counters);
+            let (v, a) = mitigate_v4(
+                ctx,
+                &dst,
+                &src,
+                &meta,
+                flags,
+                allow_syn_proxy,
+                counters,
+                &cfg,
+            );
             verdict = v;
             accounted = a;
         }
@@ -224,7 +238,9 @@ fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let ip = ptr_at::<Ipv6Hdr>(ctx, ip_off)?;
     let dst = ip.dst_addr;
 
-    if scoped() && !protected_v6(dst) {
+    let cfg = global_cfg();
+
+    if cfg.scoped != 0 && !protected_v6(dst) {
         return Ok(XDP_PASS);
     }
 
@@ -237,13 +253,21 @@ fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
     let counters = counters_v6(&dst);
     let mut verdict = XDP_PASS;
     let mut accounted = false;
-    if manual_blocked_v6(ip.src_addr) {
+    if cfg.manual_blocks != 0 && manual_blocked_v6(ip.src_addr) {
         verdict = XDP_DROP;
     } else {
         let flags = dest_mode_v6(&dst);
         if flags != DEST_MODE_NORMAL {
-            let (v, a) =
-                mitigate_v6(ctx, &dst, &ip.src_addr, &meta, flags, allow_syn_proxy, counters);
+            let (v, a) = mitigate_v6(
+                ctx,
+                &dst,
+                &ip.src_addr,
+                &meta,
+                flags,
+                allow_syn_proxy,
+                counters,
+                &cfg,
+            );
             verdict = v;
             accounted = a;
         }
@@ -279,12 +303,13 @@ fn mitigate_v4(
     flags: u32,
     allow_syn_proxy: bool,
     counters: Option<*mut lnvps_fw_common::DestCounters>,
+    cfg: &GlobalConfig,
 ) -> (u32, bool) {
     // In-kernel per-source rate machine: counts this packet against the
     // source's window and drops while the source is blocked. Both the flagging
     // and the drop are gated on the dest's SOURCE_BLOCK escalation; counting
     // still happens without it so userspace has per-source rates.
-    if src_gate_v4(src, flags & DEST_MODE_SOURCE_BLOCK != 0) {
+    if src_gate_v4(src, &cfg.src_rate, flags & DEST_MODE_SOURCE_BLOCK != 0) {
         return (XDP_DROP, false);
     }
     if allow_syn_proxy
@@ -292,7 +317,7 @@ fn mitigate_v4(
         && meta.proto == PROTO_TCP
         && meta.has_port
         && port_is_open_v4(*dst, meta.dst_port, PROTO_TCP)
-        && !src_verified_v4(src)
+        && !src_verified_v4(src, cfg.verified_ttl_ns)
     {
         // Account this packet as a dropped SYN *before* the tail-call, which
         // replaces this program and never returns here.
@@ -306,30 +331,34 @@ fn mitigate_v4(
         if meta.is_fragment {
             return (XDP_DROP, false);
         }
-        return (dest_policy_v4(dst, meta), false);
+        return (dest_policy_v4(dst, meta, cfg.learn_leak_pps), false);
     }
     (XDP_PASS, false)
 }
 
 /// Destination-port policy under mitigation (after source checks pass).
 #[inline(always)]
-fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta) -> u32 {
+fn dest_policy_v4(dst: &[u8; 4], meta: &L4Meta, leak_budget: u32) -> u32 {
     if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
         if meta.has_port && port_open_refresh_v4(*dst, meta.dst_port, meta.proto) {
             XDP_PASS
-        } else if meta.proto == PROTO_TCP && meta.is_syn && learn_leak_v4(dst, meta.dst_port, PROTO_TCP)
+        } else if meta.proto == PROTO_TCP
+            && meta.is_syn
+            && learn_leak_v4(dst, meta.dst_port, PROTO_TCP, leak_budget)
         {
             // Leak a bounded rate of SYNs to unlearned ports so a genuinely-
             // open port can answer (SYN-ACK) and be passively learned even
             // while mitigating — otherwise the port filter black-holes any
             // open port not learned before the flood began.
             XDP_PASS
-        } else if meta.proto == PROTO_UDP && meta.is_wg_init && learn_budget_v4(dst) {
+        } else if meta.proto == PROTO_UDP && meta.is_wg_init && learn_budget_v4(dst, leak_budget) {
             // WireGuard handshake-init fast-path: bypass the first-touch
             // suppression (rate-capped only) so a tunnel re-establishes even
             // under a garbage flood to its port.
             XDP_PASS
-        } else if meta.proto == PROTO_UDP && learn_leak_v4(dst, meta.dst_port, PROTO_UDP) {
+        } else if meta.proto == PROTO_UDP
+            && learn_leak_v4(dst, meta.dst_port, PROTO_UDP, leak_budget)
+        {
             // General UDP first-touch: probe an unlearned port once so a
             // request/response service (DNS, game servers, WG data) can answer
             // and be learned.
@@ -354,8 +383,9 @@ fn mitigate_v6(
     flags: u32,
     allow_syn_proxy: bool,
     counters: Option<*mut lnvps_fw_common::DestCounters>,
+    cfg: &GlobalConfig,
 ) -> (u32, bool) {
-    if src_gate_v6(src, flags & DEST_MODE_SOURCE_BLOCK != 0) {
+    if src_gate_v6(src, &cfg.src_rate, flags & DEST_MODE_SOURCE_BLOCK != 0) {
         return (XDP_DROP, false);
     }
     if allow_syn_proxy
@@ -363,7 +393,7 @@ fn mitigate_v6(
         && meta.proto == PROTO_TCP
         && meta.has_port
         && port_is_open_v6(*dst, meta.dst_port, PROTO_TCP)
-        && !src_verified_v6(src)
+        && !src_verified_v6(src, cfg.verified_ttl_ns)
     {
         account(ctx, counters, meta, PROTO_ICMPV6, XDP_DROP);
         unsafe { SYN_PROXY_JUMP.tail_call(ctx, SLOT_SYN_PROXY_V6) };
@@ -373,22 +403,26 @@ fn mitigate_v6(
         if meta.is_fragment {
             return (XDP_DROP, false);
         }
-        return (dest_policy_v6(dst, meta), false);
+        return (dest_policy_v6(dst, meta, cfg.learn_leak_pps), false);
     }
     (XDP_PASS, false)
 }
 
 #[inline(always)]
-fn dest_policy_v6(dst: &[u8; 16], meta: &L4Meta) -> u32 {
+fn dest_policy_v6(dst: &[u8; 16], meta: &L4Meta, leak_budget: u32) -> u32 {
     if meta.proto == PROTO_TCP || meta.proto == PROTO_UDP {
         if meta.has_port && port_open_refresh_v6(*dst, meta.dst_port, meta.proto) {
             XDP_PASS
-        } else if meta.proto == PROTO_TCP && meta.is_syn && learn_leak_v6(dst, meta.dst_port, PROTO_TCP)
+        } else if meta.proto == PROTO_TCP
+            && meta.is_syn
+            && learn_leak_v6(dst, meta.dst_port, PROTO_TCP, leak_budget)
         {
             XDP_PASS
-        } else if meta.proto == PROTO_UDP && meta.is_wg_init && learn_budget_v6(dst) {
+        } else if meta.proto == PROTO_UDP && meta.is_wg_init && learn_budget_v6(dst, leak_budget) {
             XDP_PASS
-        } else if meta.proto == PROTO_UDP && learn_leak_v6(dst, meta.dst_port, PROTO_UDP) {
+        } else if meta.proto == PROTO_UDP
+            && learn_leak_v6(dst, meta.dst_port, PROTO_UDP, leak_budget)
+        {
             XDP_PASS
         } else {
             XDP_DROP

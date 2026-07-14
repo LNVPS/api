@@ -199,9 +199,11 @@ impl Harness {
             lnvps_fw_service::runtime::scan_plain(&self.bpf, "OPEN_PORTS_V4")?;
         let expired =
             lnvps_fw_service::gc::expired_ports(&entries, now, ttl_ns, ttl_ns, |k| k.proto);
-        let mut map: AyaHashMap<_, PortKeyV4, LastSeen> =
-            AyaHashMap::try_from(self.bpf.map_mut("OPEN_PORTS_V4").unwrap())?;
-        Ok(lnvps_fw_service::gc::remove_keys(&mut map, &expired))
+        lnvps_fw_service::runtime::delete_keys::<PortKeyV4, LastSeen>(
+            &mut self.bpf,
+            "OPEN_PORTS_V4",
+            &expired,
+        )
     }
 
     /// Force an IPv4 destination (or prefix) into MITIGATE mode by writing the
@@ -242,11 +244,9 @@ impl Harness {
         Ok(())
     }
 
-    /// Toggle destination scoping (index 0 of the SETTINGS array).
+    /// Toggle destination scoping (`GLOBAL_CFG.scoped`).
     pub fn set_scoped(&mut self, on: bool) -> anyhow::Result<()> {
-        let mut s: Array<_, u32> = Array::try_from(self.bpf.map_mut("SETTINGS").unwrap())?;
-        s.set(0, u32::from(on), 0)?;
-        Ok(())
+        lnvps_fw_service::runtime::update_global_cfg(&mut self.bpf, |c| c.scoped = u32::from(on))
     }
 
     /// Read the effective mitigation mode covering an IPv4 destination via a

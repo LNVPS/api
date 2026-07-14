@@ -7,7 +7,6 @@
 //! serving are eventually forgotten.
 
 use aya::Pod;
-use aya::maps::{HashMap, MapData};
 
 use lnvps_fw_common::LastSeen;
 
@@ -56,15 +55,6 @@ where
         })
         .map(|(k, _)| *k)
         .collect()
-}
-
-/// Remove a set of keys from a map, returning how many were actually removed
-/// (an entry may have been LRU-evicted between the scan and the removal).
-pub fn remove_keys<K>(map: &mut HashMap<&mut MapData, K, LastSeen>, keys: &[K]) -> usize
-where
-    K: Pod,
-{
-    keys.iter().filter(|k| map.remove(k).is_ok()).count()
 }
 
 #[cfg(test)]

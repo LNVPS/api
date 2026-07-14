@@ -95,6 +95,41 @@ pub struct SrcRateConfig {
     pub cooldown_ns: u64,
 }
 
+/// Consolidated global configuration read on the XDP/TC hot path, replacing
+/// the former separate single-entry `SETTINGS`, `SRC_RATE_CFG`, and
+/// `LEARN_LEAK_CFG` maps: one `Array` lookup now fetches every per-packet knob.
+/// Written by userspace (startup + live edits) via read-modify-write so
+/// independent writers (rules apply, limits edit, protected-prefix sync) update
+/// only their own fields without clobbering the rest.
+///
+/// Field order is chosen for natural 8-byte alignment with no implicit padding
+/// (see the `key_sizes_have_no_hidden_padding` test).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct GlobalConfig {
+    /// Per-source fixed-window rate-machine config (see [`SrcRateConfig`]).
+    /// `max_per_window == 0` disables per-source blocking.
+    pub src_rate: SrcRateConfig,
+    /// TTL (ns, `bpf_ktime_get_ns` domain) after which a SYN-cookie-verified
+    /// source is treated as unverified in-kernel, closing the window in which a
+    /// once-verified source could flood past the proxy between userspace GC
+    /// sweeps. `0` disables in-kernel expiry (userspace GC still reclaims the
+    /// memory).
+    pub verified_ttl_ns: u64,
+    /// `1` = only count/mitigate protected destinations (scoped router mode);
+    /// `0` = protect every destination (single-NIC host default).
+    pub scoped: u32,
+    /// `1` = at least one manual source-CIDR block is installed, so the XDP
+    /// path must consult the `MANUAL_BLOCK_*` tries; `0` skips that per-packet
+    /// LPM lookup entirely (the common case).
+    pub manual_blocks: u32,
+    /// Max SYNs/second to unlearned ports leaked per destination through the
+    /// port filter so open ports can still be learned while mitigating. `0`
+    /// disables the leak.
+    pub learn_leak_pps: u32,
+    pub _pad: u32,
+}
+
 /// Mitigation state for a destination IP. Written by userspace (detection
 /// state machine), read by the XDP ingress program.
 #[repr(C)]
@@ -284,6 +319,7 @@ mod user {
 
     unsafe impl aya::Pod for DestCounters {}
     unsafe impl aya::Pod for DestState {}
+    unsafe impl aya::Pod for GlobalConfig {}
     unsafe impl aya::Pod for SrcState {}
     unsafe impl aya::Pod for SrcRateConfig {}
     unsafe impl aya::Pod for LastSeen {}
@@ -332,5 +368,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<DestState>(), 16);
         assert_eq!(core::mem::size_of::<LastSeen>(), 8);
         assert_eq!(core::mem::size_of::<DestCounters>(), 56);
+        assert_eq!(core::mem::size_of::<SrcRateConfig>(), 24);
+        // GlobalConfig: 24 (src_rate) + 8 (ttl) + 4+4+4+4 = 48, no padding.
+        assert_eq!(core::mem::size_of::<GlobalConfig>(), 48);
     }
 }
