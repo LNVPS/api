@@ -4,6 +4,15 @@ All notable changes to the LNVPS APIs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **2026-07-14** - Automatic renewal via saved Revolut card (off-session)
+  - Subscriptions with `auto_renewal_enabled` can now be renewed automatically by charging a saved Revolut payment method off-session, in addition to the existing Lightning/NWC auto-renewal. Closes #159.
+  - The customer's Revolut payment method is saved automatically the next time they complete a Revolut checkout while auto-renewal is enabled (no separate setup step). Saved methods are stored in a new provider-agnostic `user_payment_method` table (one-to-many per user, with a default method and enabled flag). Only opaque provider token references (`customer_id`, `payment_method_id`) are stored, encrypted at rest, alongside non-sensitive card metadata (brand, last 4, expiry) for display and expiry handling — never card PAN/CVV.
+  - `GET /api/v1/account` now returns a read-only `revolut_payment_method_saved` boolean indicating whether a usable saved Revolut method is on file for automatic renewals. Tokens are never exposed.
+
 ## [0.4.0] - 2026-07-13
 
 ### Added

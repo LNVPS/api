@@ -9,7 +9,8 @@ use lnvps_db::{
     OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
     ReferralPayout, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
-    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
     VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
@@ -29,6 +30,7 @@ pub struct MockDb {
     pub host_disks: Arc<Mutex<HashMap<u64, VmHostDisk>>>,
     pub users: Arc<Mutex<HashMap<u64, User>>>,
     pub user_ssh_keys: Arc<Mutex<HashMap<u64, UserSshKey>>>,
+    pub user_payment_methods: Arc<Mutex<HashMap<u64, UserPaymentMethod>>>,
     pub cost_plans: Arc<Mutex<HashMap<u64, VmCostPlan>>>,
     pub os_images: Arc<Mutex<HashMap<u64, VmOsImage>>>,
     pub templates: Arc<Mutex<HashMap<u64, VmTemplate>>>,
@@ -252,6 +254,7 @@ impl Default for MockDb {
             custom_pricing: Arc::new(Default::default()),
             custom_pricing_disk: Arc::new(Default::default()),
             user_ssh_keys: Arc::new(Mutex::new(Default::default())),
+            user_payment_methods: Arc::new(Default::default()),
             custom_template: Arc::new(Default::default()),
             payments: Arc::new(Default::default()),
             router: Arc::new(Default::default()),
@@ -443,6 +446,51 @@ impl LNVpsDbBase for MockDb {
     async fn count_users(&self) -> DbResult<u64> {
         let users = self.users.lock().await;
         Ok(users.len() as u64)
+    }
+
+    async fn insert_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<u64> {
+        let mut methods = self.user_payment_methods.lock().await;
+        let id = *methods.keys().max().unwrap_or(&0) + 1;
+        let mut new_pm = pm.clone();
+        new_pm.id = id;
+        methods.insert(id, new_pm);
+        Ok(id)
+    }
+
+    async fn list_user_payment_methods(
+        &self,
+        user_id: u64,
+        provider: Option<&str>,
+    ) -> DbResult<Vec<UserPaymentMethod>> {
+        let methods = self.user_payment_methods.lock().await;
+        let mut out: Vec<UserPaymentMethod> = methods
+            .values()
+            .filter(|m| m.user_id == user_id)
+            .filter(|m| provider.map(|p| m.provider == p).unwrap_or(true))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    async fn get_user_payment_method(&self, id: u64) -> DbResult<UserPaymentMethod> {
+        let methods = self.user_payment_methods.lock().await;
+        methods
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| DbError::from(anyhow!("Payment method not found")))
+    }
+
+    async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()> {
+        let mut methods = self.user_payment_methods.lock().await;
+        methods.insert(pm.id, pm.clone());
+        Ok(())
+    }
+
+    async fn delete_user_payment_method(&self, id: u64) -> DbResult<()> {
+        let mut methods = self.user_payment_methods.lock().await;
+        methods.remove(&id);
+        Ok(())
     }
 
     async fn insert_user_ssh_key(&self, new_key: &UserSshKey) -> DbResult<u64> {

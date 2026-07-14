@@ -144,6 +144,10 @@ pub struct AccountPatchRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub nwc_connection_string: Option<Option<String>>,
+    /// Whether a Revolut payment method is saved for off-session automatic
+    /// renewals (read-only; the token itself is never exposed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revolut_payment_method_saved: Option<bool>,
 }
 
 impl From<lnvps_db::User> for AccountPatchRequest {
@@ -173,6 +177,8 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             postcode: Some(user.billing_postcode),
             tax_id: Some(user.billing_tax_id),
             nwc_connection_string: Some(user.nwc_connection_string.map(|nwc| nwc.into())),
+            // Populated by the account handler (needs a DB lookup).
+            revolut_payment_method_saved: None,
         }
     }
 }

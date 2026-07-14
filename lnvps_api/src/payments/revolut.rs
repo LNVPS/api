@@ -1,8 +1,10 @@
 use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result};
-
+use chrono::Utc;
 use isocountry::CountryCode;
-use lnvps_db::{LNVpsDb, PaymentMethodConfig, ProviderConfig, SubscriptionPaymentType};
+use lnvps_db::{
+    LNVpsDb, PaymentMethodConfig, ProviderConfig, SubscriptionPaymentType, UserPaymentMethod,
+};
 use log::{error, info, warn};
 use payments_rs::fiat::{
     RevolutApi, RevolutConfig, RevolutOrderState, RevolutWebhookBody, RevolutWebhookEvent,
@@ -167,6 +169,57 @@ impl RevolutPaymentHandler {
         Ok(secret)
     }
 
+    /// Fetch the customer's merchant-initiated (off-session capable) saved
+    /// payment method and persist it as a `UserPaymentMethod` for automatic
+    /// renewals. Idempotent: skips methods already stored for the user.
+    async fn capture_saved_payment_method(&self, user_id: u64, customer_id: &str) -> Result<()> {
+        let methods = self
+            .api
+            .get_customer_payment_methods(customer_id, true)
+            .await?;
+        let Some(method) = methods.into_iter().next() else {
+            return Ok(());
+        };
+
+        // Dedupe: compare against already-stored Revolut methods (external_id is
+        // encrypted with a non-deterministic cipher, so compare decrypted).
+        let existing = self
+            .db
+            .list_user_payment_methods(user_id, Some("revolut"))
+            .await
+            .unwrap_or_default();
+        let already_stored = existing.iter().any(|m| {
+            let stored: String = m.external_id.clone().into();
+            stored == method.id
+        });
+        if already_stored {
+            return Ok(());
+        }
+
+        let card = method.method_details.as_ref();
+        let pm = UserPaymentMethod {
+            id: 0,
+            user_id,
+            created: Utc::now(),
+            provider: "revolut".to_string(),
+            external_customer_id: customer_id.to_string().into(),
+            external_id: method.id.clone().into(),
+            card_brand: card.and_then(|c| c.brand.clone()),
+            card_last_four: card.and_then(|c| c.last4.clone()),
+            exp_month: card.and_then(|c| c.expiry_month),
+            exp_year: card.and_then(|c| c.expiry_year),
+            // First saved method for the user becomes the default.
+            is_default: existing.is_empty(),
+            enabled: true,
+        };
+        self.db.insert_user_payment_method(&pm).await?;
+        info!(
+            "Saved Revolut payment method for user {} (off-session automatic renewals)",
+            user_id
+        );
+        Ok(())
+    }
+
     async fn try_complete_payment(&self, ext_id: &str) -> Result<()> {
         let mut payment = self.db.get_subscription_payment_by_ext_id(ext_id).await?;
 
@@ -178,12 +231,13 @@ impl RevolutPaymentHandler {
         }
         payment.external_data = serde_json::to_string(&order)?.into();
 
-        // Update user country from card country if not already set (best-effort)
+        // Update user country from the card country if not set (best-effort).
         if let Some(cc) = order
             .payments
-            .and_then(|p| p.first().cloned())
-            .and_then(|p| p.payment_method)
-            .and_then(|p| p.card_country_code)
+            .as_ref()
+            .and_then(|p| p.first())
+            .and_then(|p| p.payment_method.as_ref())
+            .and_then(|p| p.card_country_code.clone())
             .and_then(|c| CountryCode::for_alpha2(&c).ok())
         {
             if let Ok(mut user) = self.db.get_user(payment.user_id).await {
@@ -191,6 +245,20 @@ impl RevolutPaymentHandler {
                     user.country_code = Some(cc.alpha3().to_string());
                     let _ = self.db.update_user(&user).await;
                 }
+            }
+        }
+
+        // Capture any saved payment method for future off-session
+        // (merchant-initiated) automatic renewals. We store only opaque Revolut
+        // token references plus non-sensitive card metadata, never card data.
+        // The reusable payment method is NOT on the order — fetch it from the
+        // customer's saved payment methods (filtered to merchant capability).
+        if let Some(customer_id) = order.customer_id() {
+            if let Err(e) = self.capture_saved_payment_method(payment.user_id, &customer_id).await {
+                warn!(
+                    "Failed to capture saved Revolut payment method for user {}: {}",
+                    payment.user_id, e
+                );
             }
         }
 

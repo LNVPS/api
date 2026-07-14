@@ -350,7 +350,17 @@ async fn v1_get_account(
     let uid = this.db.upsert_user(&pubkey).await?;
     let user = this.db.get_user(uid).await?;
 
-    ApiData::ok(user.into())
+    let mut account: AccountPatchRequest = user.into();
+    // Whether the user has a usable saved Revolut method for automatic renewals.
+    let has_saved_method = this
+        .db
+        .list_user_payment_methods(uid, Some("revolut"))
+        .await
+        .map(|m| m.iter().any(|pm| pm.enabled))
+        .unwrap_or(false);
+    account.revolut_payment_method_saved = Some(has_saved_method);
+
+    ApiData::ok(account)
 }
 
 /// Notification channels configured on this server. The UI can use this to

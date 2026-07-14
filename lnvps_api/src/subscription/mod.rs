@@ -15,14 +15,14 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use lnvps_api_common::{
     CostResult, ExchangeRateService, NewPaymentInfo, PricingEngine, UpgradeConfig, WorkCommander,
     round_msat_to_sat,
 };
 use lnvps_db::{
     LNVpsDb, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentType, SubscriptionType,
+    SubscriptionPaymentType, SubscriptionType, User, UserPaymentMethod,
 };
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -241,12 +241,92 @@ impl SubscriptionHandler {
         }
     }
 
-    /// Create a renewal/purchase payment for a subscription
+    /// Create a Revolut order for a fiat payment, returning `(external_id, raw_data)`.
+    ///
+    /// When the subscription has automatic renewal enabled and the user does not
+    /// yet have a saved payment method, the order is created as a "subscription"
+    /// checkout (`create_subscription`) so Revolut saves the customer's payment
+    /// method for future off-session (merchant-initiated) charges. The saved
+    /// method is captured on webhook completion (see
+    /// `payments::revolut::RevolutPaymentHandler::capture_saved_payment_method`).
+    /// Select the user's saved Revolut payment method to charge off-session:
+    /// the default enabled, non-expired method, else the first enabled
+    /// non-expired one.
+    async fn default_revolut_payment_method(&self, user_id: u64) -> Result<UserPaymentMethod> {
+        let now = Utc::now();
+        let (year, month) = (now.year() as u16, now.month() as u16);
+        let methods = self
+            .db
+            .list_user_payment_methods(user_id, Some("revolut"))
+            .await?;
+        let usable: Vec<UserPaymentMethod> = methods
+            .into_iter()
+            .filter(|m| m.enabled && !m.is_expired(year, month))
+            .collect();
+        // list_user_payment_methods already orders default-first.
+        usable
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No usable saved Revolut payment method"))
+    }
+
+    async fn create_revolut_order(
+        &self,
+        rev: &Arc<dyn FiatPaymentService>,
+        subscription: &Subscription,
+        user: &User,
+        payment_type: SubscriptionPaymentType,
+        desc: &str,
+        amount: CurrencyAmount,
+    ) -> Result<(String, String)> {
+        // Save the card only when auto-renewal is on, this isn't an upgrade, and
+        // the user has no usable saved Revolut method yet.
+        let has_saved_method = self
+            .db
+            .list_user_payment_methods(user.id, Some("revolut"))
+            .await
+            .map(|m| m.iter().any(|pm| pm.enabled))
+            .unwrap_or(false);
+        let should_save = subscription.auto_renewal_enabled
+            && !has_saved_method
+            && payment_type != SubscriptionPaymentType::Upgrade;
+        if should_save {
+            let email: String = user.email.clone().into();
+            let customer_email = if email.is_empty() { None } else { Some(email) };
+            let info = rev
+                .create_subscription(desc, amount, customer_email, None)
+                .await?;
+            Ok((info.external_id, info.raw_data))
+        } else {
+            let info = rev.create_order(desc, amount, None).await?;
+            Ok((info.external_id, info.raw_data))
+        }
+    }
+
+    /// Create a renewal/purchase payment for a subscription.
+    ///
+    /// The customer completes the payment interactively (Lightning invoice or
+    /// Revolut checkout).
     pub async fn renew_subscription(
         &self,
         subscription_id: u64,
         method: PaymentMethod,
         intervals: u32,
+    ) -> Result<SubscriptionPayment> {
+        self.renew_subscription_inner(subscription_id, method, intervals, false)
+            .await
+    }
+
+    /// Create a renewal/purchase payment for a subscription.
+    ///
+    /// When `off_session` is true (Revolut only) the saved payment method is
+    /// charged off-session (merchant-initiated) without customer interaction.
+    async fn renew_subscription_inner(
+        &self,
+        subscription_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+        off_session: bool,
     ) -> Result<SubscriptionPayment> {
         let intervals = intervals.max(1);
 
@@ -471,7 +551,33 @@ impl SubscriptionHandler {
                     converted_currency,
                     converted_amount + tax + processing_fee,
                 );
-                let order = rev.create_order(&desc, order_amount, None).await?;
+                let (external_id, raw_data) = if off_session {
+                    // Off-session (merchant-initiated) charge against the user's
+                    // default saved Revolut payment method — no customer
+                    // interaction.
+                    let method = self.default_revolut_payment_method(user.id).await?;
+                    let customer_id: String = method.external_customer_id.clone().into();
+                    let payment_method_id: String = method.external_id.clone().into();
+                    let info = rev
+                        .charge_subscription(
+                            &customer_id,
+                            &payment_method_id,
+                            order_amount,
+                            &desc,
+                        )
+                        .await?;
+                    (info.external_id, info.raw_data)
+                } else {
+                    self.create_revolut_order(
+                        rev,
+                        &subscription,
+                        &user,
+                        payment_type,
+                        &desc,
+                        order_amount,
+                    )
+                    .await?
+                };
 
                 let new_id: [u8; 32] = rand::random();
                 SubscriptionPayment {
@@ -484,8 +590,8 @@ impl SubscriptionHandler {
                     currency: converted_currency.to_string(),
                     payment_method: method,
                     payment_type,
-                    external_data: order.raw_data.into(),
-                    external_id: Some(order.external_id),
+                    external_data: raw_data.into(),
+                    external_id: Some(external_id),
                     is_paid: false,
                     rate,
                     time_value: if time_value > 0 {
@@ -602,14 +708,19 @@ impl SubscriptionHandler {
                             p.currency != Currency::BTC,
                             "Cannot create revolut orders for BTC currency"
                         );
-                        let order = rev
-                            .create_order(
+                        let subscription = self.db.get_subscription(subscription_id).await?;
+                        let user = self.db.get_user(vm.user_id).await?;
+                        let (external_id, raw_data) = self
+                            .create_revolut_order(
+                                rev,
+                                &subscription,
+                                &user,
+                                payment_type,
                                 &desc,
                                 CurrencyAmount::from_u64(
                                     p.currency,
                                     p.amount + p.tax + p.processing_fee,
                                 ),
-                                None,
                             )
                             .await?;
                         let new_id: [u8; 32] = rand::random();
@@ -623,8 +734,8 @@ impl SubscriptionHandler {
                             currency: p.currency.to_string(),
                             payment_method: method,
                             payment_type,
-                            external_data: order.raw_data.into(),
-                            external_id: Some(order.external_id),
+                            external_data: raw_data.into(),
+                            external_id: Some(external_id),
                             is_paid: false,
                             rate: p.rate.rate,
                             time_value: Some(p.time_value),
@@ -681,6 +792,27 @@ impl SubscriptionHandler {
         Ok(vm_payment)
     }
 
+    /// Attempt automatic renewal by charging the user's saved Revolut payment
+    /// method off-session (merchant-initiated).
+    ///
+    /// The charge is submitted immediately; the resulting Revolut order is
+    /// completed asynchronously via the `OrderCompleted` webhook (same path as
+    /// interactive Revolut payments), which extends the subscription expiry.
+    pub async fn auto_renew_via_revolut(&self, sub_id: u64) -> Result<SubscriptionPayment> {
+        debug!(
+            "Attempting automatic renewal for sub {} via Revolut saved card",
+            sub_id
+        );
+        let payment = self
+            .renew_subscription_inner(sub_id, PaymentMethod::Revolut, 1, true)
+            .await?;
+        info!(
+            "Submitted Revolut off-session auto-renewal charge for sub {}",
+            sub_id
+        );
+        Ok(payment)
+    }
+
     /// Renew a VM using a specific amount
     pub async fn renew_amount(
         &self,
@@ -724,5 +856,141 @@ impl SubscriptionHandler {
             Some(metadata),
         )
         .await
+    }
+}
+
+#[cfg(all(test, feature = "revolut"))]
+mod revolut_autorenew_tests {
+    use super::*;
+    use crate::mocks::MockNode;
+    use crate::settings::mock_settings;
+    use config::{Config, File};
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{
+        IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, UserPaymentMethod,
+    };
+    use payments_rs::fiat::RevolutConfig;
+    use serde::Deserialize;
+    use std::path::PathBuf;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct HarnessConfig {
+        revolut: RevolutConfig,
+    }
+
+    /// Load the sandbox Revolut config from config.local.yaml (repo root).
+    fn load_revolut() -> Option<RevolutConfig> {
+        // Test runs from the crate dir (lnvps_api/), config.local.yaml is at the
+        // workspace root.
+        for p in ["../config.local.yaml", "config.local.yaml"] {
+            if PathBuf::from(p).exists() {
+                let cfg: HarnessConfig = Config::builder()
+                    .add_source(File::from(PathBuf::from(p)))
+                    .build()
+                    .ok()?
+                    .try_deserialize()
+                    .ok()?;
+                return Some(cfg.revolut);
+            }
+        }
+        None
+    }
+
+    /// End-to-end auto-renew against the Revolut sandbox. Requires:
+    ///   - config.local.yaml with a `revolut:` sandbox section
+    ///   - a previously-saved sandbox customer + payment method (env below)
+    /// Run with:
+    ///   REVOLUT_TEST_CUSTOMER=<id> REVOLUT_TEST_PM=<id> \
+    ///     cargo test -p lnvps_api --features revolut -- --ignored autorenew
+    #[tokio::test]
+    #[ignore = "hits the Revolut sandbox; needs config.local.yaml + saved method env"]
+    async fn auto_renew_via_revolut_charges_saved_card() -> Result<()> {
+        let Some(revolut) = load_revolut() else {
+            eprintln!("skipping: no config.local.yaml revolut section");
+            return Ok(());
+        };
+        let customer_id = std::env::var("REVOLUT_TEST_CUSTOMER")
+            .expect("set REVOLUT_TEST_CUSTOMER to a saved sandbox customer id");
+        let payment_method_id = std::env::var("REVOLUT_TEST_PM")
+            .expect("set REVOLUT_TEST_PM to a saved sandbox payment method id");
+
+        let mut settings = mock_settings();
+        settings.revolut = Some(revolut);
+
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+
+        // Seed user + saved Revolut method + auto-renew subscription (EUR).
+        let user_id = db.upsert_user(&[7u8; 32]).await?;
+        db.insert_user_payment_method(&UserPaymentMethod {
+            id: 0,
+            user_id,
+            created: Utc::now(),
+            provider: "revolut".to_string(),
+            external_customer_id: customer_id.into(),
+            external_id: payment_method_id.into(),
+            card_brand: Some("VISA".to_string()),
+            card_last_four: Some("5709".to_string()),
+            exp_month: Some(12),
+            exp_year: Some(2029),
+            is_default: true,
+            enabled: true,
+        })
+        .await?;
+
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "autorenew-test".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true, // already purchased -> Renewal
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: true,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 999, // €9.99
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let sub = SubscriptionHandler::new(
+            settings,
+            db.clone(),
+            node.clone(),
+            Arc::new(MockExchangeRate::default()),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )?;
+
+        let payment = sub.auto_renew_via_revolut(sub_id).await?;
+
+        assert_eq!(payment.payment_method, PaymentMethod::Revolut);
+        assert_eq!(payment.currency, "EUR");
+        assert_eq!(payment.amount, 999);
+        let ext_id = payment.external_id.expect("revolut order id");
+        eprintln!("off-session charge order id = {ext_id}");
+
+        // The payment row should be persisted and unpaid (completed via webhook).
+        let stored = db.list_subscription_payments(sub_id).await?;
+        assert!(stored.iter().any(|p| p.id == payment.id));
+        Ok(())
     }
 }

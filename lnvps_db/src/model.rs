@@ -66,6 +66,42 @@ pub struct User {
     pub nwc_connection_string: Option<EncryptedString>,
 }
 
+/// A saved payment method for off-session (merchant-initiated) automatic
+/// renewals. Provider-agnostic. Stores only opaque provider token references
+/// (encrypted) plus non-sensitive card metadata (brand/last4/expiry) — never
+/// card PAN/CVV.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct UserPaymentMethod {
+    pub id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    /// Payment processor (e.g. `revolut`)
+    pub provider: String,
+    /// Encrypted provider customer id owning the saved method
+    pub external_customer_id: EncryptedString,
+    /// Encrypted reusable payment method id charged off-session
+    pub external_id: EncryptedString,
+    pub card_brand: Option<String>,
+    pub card_last_four: Option<String>,
+    pub exp_month: Option<u16>,
+    pub exp_year: Option<u16>,
+    /// Default method for this provider
+    pub is_default: bool,
+    /// Whether this method is usable (disabled when expired/revoked)
+    pub enabled: bool,
+}
+
+impl UserPaymentMethod {
+    /// Whether the card has expired as of the given year/month (1-based month).
+    /// Methods without expiry data are treated as non-expiring.
+    pub fn is_expired(&self, year: u16, month: u16) -> bool {
+        match (self.exp_year, self.exp_month) {
+            (Some(ey), Some(em)) => (ey, em) < (year, month),
+            _ => false,
+        }
+    }
+}
+
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct UserSshKey {
     pub id: u64,
