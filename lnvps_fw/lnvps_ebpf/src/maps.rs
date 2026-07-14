@@ -205,9 +205,13 @@ counters_for!(tx_counters_v6, [u8; 16], V6_TX_COUNTERS);
 /// The machine, entirely in-kernel:
 /// - window rolled (`now - window_start >= window_ns`): reset the count;
 /// - count the packet; crossing `max_per_window` sets/extends
-///   `blocked_until = now + cooldown` (a still-flooding source re-extends its
-///   block every window, so the block naturally outlives the flood by exactly
-///   one cooldown — that is the hysteresis);
+///   `blocked_until = now + cooldown` **only while `enforce` (SOURCE_BLOCK) is
+///   engaged** — a still-flooding source re-extends its block every window, so
+///   the block naturally outlives the flood by exactly one cooldown (that is
+///   the hysteresis). Counting still happens without `enforce` (so userspace
+///   sees per-source rates), but a source is never *flagged blocked* until
+///   SOURCE_BLOCK is actually on — otherwise a legitimate high-rate flow would
+///   show as `dropping` and be pre-armed for the instant SOURCE_BLOCK escalates.
 /// - blocked sources keep being *counted* (the rate is measured pre-drop) so
 ///   expiry re-evaluates against live behaviour, not silence.
 ///
@@ -234,7 +238,12 @@ macro_rules! src_gate_for {
                         st.count = 0;
                     }
                     st.count += 1;
-                    if st.count > cfg.max_per_window {
+                    // Only flag (block) a source while SOURCE_BLOCK enforcement
+                    // is engaged. Without it we still count (for the rate view)
+                    // but never set `blocked_until`, so a legit high-rate flow
+                    // is neither shown as `dropping` nor pre-armed to be dropped
+                    // the moment SOURCE_BLOCK escalates.
+                    if enforce && st.count > cfg.max_per_window {
                         st.blocked_until_ns = now + cfg.cooldown_ns;
                     }
                     enforce && now < st.blocked_until_ns

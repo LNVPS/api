@@ -90,10 +90,13 @@ fn kernel_blocks_over_rate_source_and_releases_after_cooldown() {
     );
 }
 
-/// Enforcement is gated on the destination's SOURCE_BLOCK escalation: with
-/// only PORT_FILTER set, an over-rate source is *counted* (and marked blocked
-/// in its state) but its packets are not source-dropped — the escalation
-/// ladder still decides when source blocking engages.
+/// Enforcement AND flagging are gated on the destination's SOURCE_BLOCK
+/// escalation: with only PORT_FILTER set, an over-rate source is *counted* but
+/// is NOT flagged blocked and its packets are not source-dropped — so a
+/// legitimate high-rate flow (e.g. a large download hitting a learned service)
+/// is never marked `dropping` nor pre-armed. Once SOURCE_BLOCK escalates, the
+/// same over-rate source is blocked and dropped — including on a learned open
+/// port (an attacker hammering an open service must still be source-dropped).
 #[test]
 #[ignore = "requires root / CAP_NET_ADMIN"]
 fn source_drops_gated_on_source_block_flag() {
@@ -112,12 +115,18 @@ fn source_drops_gated_on_source_block_flag() {
     let offender = Ipv4Addr::new(10, 0, 9, 1);
     traffic::udp_flood_sources_v4(&attacker_ns(&h), &[offender], VM_V4, 9999, 50).expect("flood");
 
-    // The kernel marked it blocked in its state map…
+    // The kernel counted the source's rate…
     assert!(
-        h.src_blocked_v4(offender).unwrap(),
-        "over-rate source is marked blocked in the state map"
+        h.src_packets_v4(offender).unwrap() >= 10,
+        "over-rate source is counted in its window"
     );
-    // …but without the SOURCE_BLOCK flag its packets keep flowing.
+    // …but WITHOUT the SOURCE_BLOCK flag it is never flagged blocked (so it is
+    // never shown as `dropping` and its packets keep flowing). This is the
+    // fix: PORT_FILTER alone must never source-drop a legit high-rate flow.
+    assert!(
+        !h.src_blocked_v4(offender).unwrap(),
+        "source must NOT be flagged blocked without SOURCE_BLOCK escalation"
+    );
     let before = h
         .dest_counters_v4(VM_V4)
         .unwrap()
@@ -130,7 +139,8 @@ fn source_drops_gated_on_source_block_flag() {
         "packets still counted/passed without SOURCE_BLOCK escalation"
     );
 
-    // Escalate: now the same source's packets are dropped.
+    // Escalate: now the same source's packets are dropped — even to the learned
+    // open port (attacking an open service is still source-dropped).
     h.set_dest_flags_v4(VM_V4, 32, DEST_MODE_PORT_FILTER | DEST_MODE_SOURCE_BLOCK)
         .expect("escalate");
     let dropped_before = h
@@ -147,7 +157,7 @@ fn source_drops_gated_on_source_block_flag() {
         .dropped;
     assert!(
         dropped_after > dropped_before,
-        "SOURCE_BLOCK escalation engages the kernel's block"
+        "SOURCE_BLOCK escalation engages the kernel's block on the open port"
     );
 }
 

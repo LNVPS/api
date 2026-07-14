@@ -259,9 +259,12 @@ fn handle_ipv6(ctx: &XdpContext, ip_off: usize, allow_syn_proxy: bool) -> Result
 /// each flag is applied independently:
 /// - always: count this source (bounded LRU) so userspace can compute
 ///   per-source rates / cardinality and decide which flags to set — no decision
-///   here;
-/// - SOURCE_BLOCK: drop sources matching a blocked CIDR (the LPM trie userspace
-///   only populates for bounded/real offenders; last resort);
+///   here. A source is only *flagged blocked* while SOURCE_BLOCK is engaged, so
+///   PORT_FILTER alone never source-drops (nor shows a source as `dropping`).
+/// - SOURCE_BLOCK: drop sources over the per-source rate limit (and those
+///   matching a blocked CIDR trie userspace populates for bounded/real
+///   offenders). Applies to any traffic — including to a learned open port — so
+///   a source flooding an open service is dropped once escalated.
 /// - PORT_FILTER: drop non-first fragments and traffic to non-learned ports
 ///   (ICMP passes); this sheds the bulk of reflection/carpet-bomb floods.
 /// Returns `(verdict, accounted)`. `accounted` is true only when this function
@@ -278,8 +281,9 @@ fn mitigate_v4(
     counters: Option<*mut lnvps_fw_common::DestCounters>,
 ) -> (u32, bool) {
     // In-kernel per-source rate machine: counts this packet against the
-    // source's window and drops while the source is blocked (enforcement is
-    // gated on the dest's SOURCE_BLOCK escalation, counting is not).
+    // source's window and drops while the source is blocked. Both the flagging
+    // and the drop are gated on the dest's SOURCE_BLOCK escalation; counting
+    // still happens without it so userspace has per-source rates.
     if src_gate_v4(src, flags & DEST_MODE_SOURCE_BLOCK != 0) {
         return (XDP_DROP, false);
     }
