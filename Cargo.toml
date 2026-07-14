@@ -16,7 +16,7 @@ members = [
 exclude = ["lnvps_fw"]
 
 [workspace.package]
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 
 [workspace.dependencies]

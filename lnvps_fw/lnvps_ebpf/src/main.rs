@@ -436,14 +436,25 @@ struct EgressService {
 }
 
 /// TC egress classifier: passively learns which ports each local IP actually
-/// serves by observing outbound traffic. A TCP SYN-ACK from `src ip:port`
-/// marks that TCP port open; any outbound UDP from `ip:port` marks a UDP
-/// service. Never modifies or drops packets (always `TC_ACT_OK`).
+/// uses by observing outbound traffic. Any outbound TCP or UDP packet from
+/// `src ip:port` marks that port as a live local service/flow. Never modifies
+/// or drops packets (always `TC_ACT_OK`).
 ///
-/// UDP note: outbound UDP from an ephemeral client port is indistinguishable
-/// here from a real UDP service, so client ports are learned too. Short TTLs
-/// (userspace GC) plus attack-time relearning keep this pollution bounded;
-/// see docs/agents/fw-testing.md and work/ddos-protection.md.
+/// Why learn on *every* outbound segment (not just a TCP SYN-ACK): PORT_FILTER
+/// drops inbound traffic to non-learned ports, and the return traffic of a
+/// VM-initiated *outbound* connection lands on the VM's ephemeral source port.
+/// If we only learned the server half (SYN-ACK), that ephemeral port would
+/// stay unlearned and its inbound replies (SYN-ACK, then data) would be
+/// black-holed under mitigation — silently breaking every outbound connection.
+/// Learning the local source port of any outbound packet (a bare client SYN, or
+/// an already-established flow's next segment) keeps outbound working: the
+/// ephemeral port is learned before/with the first reply. This mirrors what UDP
+/// already did, and is why the SYN-ACK-only rule was insufficient.
+///
+/// Ephemeral-port note: outbound from a client ephemeral port is
+/// indistinguishable here from a real listening service, so client ports are
+/// learned too. Short TTLs (userspace GC) plus the 1M-entry LRU keep this
+/// pollution bounded; see docs/agents/fw-testing.md and work/ddos-protection.md.
 #[classifier]
 pub fn tc_lnvps_egress(ctx: TcContext) -> i32 {
     let _ = try_learn(&ctx);
@@ -470,20 +481,20 @@ fn try_learn(ctx: &TcContext) -> Result<(), ()> {
     }
 }
 
-/// Extract the learnable service from an L4 header at `l4_off`, if any.
+/// Extract the learnable local (source) port from an L4 header at `l4_off`, if
+/// this is a TCP or UDP packet. The local source port of *any* outbound
+/// TCP/UDP packet is learned — both the server half of a handshake (a listening
+/// service) and a client's ephemeral port (so inbound return traffic for a
+/// VM-initiated connection is not dropped by PORT_FILTER). See
+/// [`tc_lnvps_egress`] for the full rationale.
 #[inline(always)]
 fn egress_service(ctx: &TcContext, proto: u8, l4_off: usize) -> Result<Option<EgressService>, ()> {
     if proto == PROTO_TCP {
         let tcp = unsafe { &*tc_ptr_at::<TcpHdr>(ctx, l4_off)? };
-        // A SYN-ACK is the server's half of the handshake: proof the local
-        // src port is an open, listening TCP service.
-        if tcp.syn() != 0 && tcp.ack() != 0 {
-            return Ok(Some(EgressService {
-                port: u16::from_be_bytes(tcp.source),
-                proto: PROTO_TCP,
-            }));
-        }
-        Ok(None)
+        Ok(Some(EgressService {
+            port: u16::from_be_bytes(tcp.source),
+            proto: PROTO_TCP,
+        }))
     } else if proto == PROTO_UDP {
         let udp = unsafe { &*tc_ptr_at::<UdpHdr>(ctx, l4_off)? };
         Ok(Some(EgressService {

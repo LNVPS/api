@@ -368,8 +368,8 @@ learn_leak_for!(learn_leak_v6, [u8; 16], PortKeyV6, V6_LEARN_PROBE, learn_budget
 const PORT_REFRESH_THROTTLE_NS: u64 = 1_000_000_000;
 
 /// Generate a learn-open-port function for one address family. Called from the
-/// TC egress program with the local (source) address/port of an outbound
-/// packet that indicates an open service (TCP SYN-ACK or any UDP). Inserts a
+/// TC egress program with the local (source) address/port of any outbound
+/// TCP/UDP packet (a listening service or a client's ephemeral flow). Inserts a
 /// fresh entry or refreshes `last_seen` on an existing one. Fails open (best
 /// effort) if the map is full.
 macro_rules! learn_port_for {
@@ -416,7 +416,7 @@ port_open_for!(port_is_open_v6, PortKeyV6, [u8; 16], OPEN_PORTS_V6);
 /// can age out mid-flight — and under mitigation its non-SYN packets would then
 /// be dropped, with the SYN-only leak unable to rescue an established flow.
 /// Only updates existing entries (ingress never *learns* a port; that still
-/// requires the outbound SYN-ACK).
+/// requires an outbound packet observed by the egress learner).
 macro_rules! port_open_refresh_for {
     ($name:ident, $key:ty, $addr:ty, $map:ident) => {
         #[inline(always)]

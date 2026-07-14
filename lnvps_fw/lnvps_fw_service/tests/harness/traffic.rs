@@ -170,6 +170,89 @@ pub fn tcp_connect(ns_path: &str, dst: SocketAddr, timeout: Duration) -> io::Res
     })?
 }
 
+/// Connect a TCP socket from `ns_path` to `dst`, binding a KNOWN local source
+/// port first so a test can assert the egress learner recorded it (the VM
+/// acting as an outbound client). The far side must be accepting. IPv4 only.
+/// Returns whether the connection completed within `timeout`.
+pub fn tcp_connect_from(
+    ns_path: &str,
+    local_port: u16,
+    dst: SocketAddr,
+    timeout: Duration,
+) -> io::Result<bool> {
+    in_netns(ns_path, move || {
+        raw_tcp_connect_from(local_port, dst, timeout)
+    })?
+}
+
+fn raw_tcp_connect_from(local_port: u16, dst: SocketAddr, timeout: Duration) -> io::Result<bool> {
+    let dst4 = match dst {
+        SocketAddr::V4(a) => a,
+        SocketAddr::V6(_) => {
+            return Err(io::Error::new(io::ErrorKind::Other, "ipv4 only"));
+        }
+    };
+    // SAFETY: standard blocking TCP socket; fd closed on drop of `Fd`.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = Fd(fd);
+
+    let one: libc::c_int = 1;
+    // SO_REUSEADDR so a rapid test rerun can rebind the same local port.
+    unsafe {
+        libc::setsockopt(
+            fd.0,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    // Bind the known local source port (INADDR_ANY:local_port).
+    let mut la: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    la.sin_family = libc::AF_INET as libc::sa_family_t;
+    la.sin_port = local_port.to_be();
+    la.sin_addr.s_addr = libc::INADDR_ANY.to_be();
+    let rc = unsafe {
+        libc::bind(
+            fd.0,
+            &la as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Bound connect timeout via SO_SNDTIMEO.
+    let tv = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    unsafe {
+        libc::setsockopt(
+            fd.0,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+    let mut da: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    da.sin_family = libc::AF_INET as libc::sa_family_t;
+    da.sin_port = dst4.port().to_be();
+    da.sin_addr.s_addr = u32::from_ne_bytes(dst4.ip().octets());
+    let rc = unsafe {
+        libc::connect(
+            fd.0,
+            &da as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    Ok(rc == 0)
+}
+
 /// Send `count` TCP SYN packets from `ns_path` to `dst`, cycling the source
 /// port so each looks like a fresh connection attempt. Uses a raw IPv4 socket
 /// with `IP_HDRINCL`, so it only supports IPv4 destinations. Returns the

@@ -44,6 +44,49 @@ fn tcp_open_port_learned() {
     assert!(learned, "TCP port 8080 was not learned as open");
 }
 
+/// A VM-initiated *outbound* TCP connection must have its ephemeral source port
+/// learned, so that under PORT_FILTER the inbound return traffic (SYN-ACK, then
+/// data) is not black-holed. Regression test: previously only a SYN-ACK (the
+/// server half) was learned, so a client's ephemeral port stayed unlearned and
+/// outbound connections broke during mitigation.
+#[test]
+#[ignore = "requires root / CAP_NET_ADMIN"]
+fn outbound_tcp_client_port_learned() {
+    if !require_root() {
+        return;
+    }
+    let h = Harness::new().expect("harness setup");
+
+    // A listener in the attacker ns so the VM's outbound connection completes.
+    let listen: SocketAddr = SocketAddr::from((ATTACKER_V4, 7100));
+    let acceptor = {
+        let ns = attacker_ns(&h);
+        std::thread::spawn(move || traffic::tcp_listen_accept(&ns, listen, Duration::from_secs(3)))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The VM dials OUT from a known ephemeral source port.
+    const CLIENT_PORT: u16 = 54321;
+    let connected =
+        traffic::tcp_connect_from(&vm_ns(&h), CLIENT_PORT, listen, Duration::from_secs(2))
+            .expect("connect call");
+    assert!(
+        connected,
+        "vm could not connect outbound to attacker listener"
+    );
+    assert!(acceptor.join().expect("acceptor thread").expect("accept"));
+
+    std::thread::sleep(Duration::from_millis(200));
+    let learned = h
+        .open_port_v4(VM_V4, CLIENT_PORT, PROTO_TCP)
+        .expect("map read")
+        .is_some();
+    assert!(
+        learned,
+        "outbound client TCP source port {CLIENT_PORT} was not learned — return traffic would be dropped under PORT_FILTER"
+    );
+}
+
 /// Outbound UDP from a VM source port is learned as a UDP service.
 #[test]
 #[ignore = "requires root / CAP_NET_ADMIN"]
