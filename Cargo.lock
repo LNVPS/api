@@ -2284,7 +2284,8 @@ dependencies = [
 [[package]]
 name = "ipnetwork"
 version = "0.21.1"
-source = "git+https://git.v0l.io/Kieran/ipnetwork.git?rev=f01575cbf2fc596c0a1761c122aa92525cbb7974#f01575cbf2fc596c0a1761c122aa92525cbb7974"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 
 [[package]]
 name = "is_terminal_polyfill"
