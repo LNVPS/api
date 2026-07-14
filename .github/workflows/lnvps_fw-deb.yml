@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Assert Cargo.toml version matches the release tag
         # The lnvps_fw workspace version drives the daemon self-upgrade check
@@ -63,7 +63,7 @@ jobs:
           components: rust-src
 
       - name: Cache cargo + build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -91,13 +91,13 @@ jobs:
         run: dpkg-deb --info "${{ steps.deb.outputs.path }}" && dpkg-deb --contents "${{ steps.deb.outputs.path }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lnvps_fw-deb
           path: lnvps_fw/target/debian/*.deb
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: lnvps_fw/target/debian/*.deb

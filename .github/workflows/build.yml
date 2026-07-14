@@ -38,7 +38,7 @@ jobs:
       push: ${{ steps.meta.outputs.push }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Compute image tag + push flag
         id: meta
@@ -73,25 +73,25 @@ jobs:
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.docker == 'lnvps-host-info' || github.event.inputs.docker == 'all'))
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up QEMU
         if: needs.setup.outputs.push == 'true'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Registry
         if: needs.setup.outputs.push == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: registry
           password: ${{ secrets.REGISTRY_TOKEN }}
 
       - name: Build and push lnvps-host-info
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: lnvps_host_util
           file: lnvps_host_util/Dockerfile
@@ -133,14 +133,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to Docker Registry
         if: needs.setup.outputs.push == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: registry
@@ -151,7 +151,7 @@ jobs:
           github.event_name == 'push' ||
           github.event_name == 'pull_request' ||
           (github.event_name == 'workflow_dispatch' && (github.event.inputs.docker == matrix.name || github.event.inputs.docker == 'all'))
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.file }}
