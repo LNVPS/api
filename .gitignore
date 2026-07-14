@@ -19,3 +19,5 @@ node_modules/
 
 # Agent tooling artifacts
 .pi-subagents/
+
+.playwright-mcp/
