@@ -54,6 +54,15 @@ export const fmtUnit = (n: number): string => {
 
 export const timeStr = (t: number): string => new Date(t * 1000).toLocaleTimeString();
 
+/** ISO 3166-1 alpha-2 code -> regional-indicator flag emoji; globe for unknown
+ * or malformed codes (e.g. the "??" bucket for un-geolocated sources). */
+export const flagEmoji = (cc?: string): string => {
+  if (!cc || !/^[A-Za-z]{2}$/.test(cc)) return "\u{1F310}"; // globe
+  const A = 0x1f1e6, base = "A".charCodeAt(0);
+  const u = cc.toUpperCase();
+  return String.fromCodePoint(A + (u.charCodeAt(0) - base), A + (u.charCodeAt(1) - base));
+};
+
 // Scope palette: teal (calm) -> cyan -> amber (load) -> coral (alarm).
 export const loadColor = (p: number): string =>
   p >= 100 ? "#ff5d6c" : p >= 80 ? "#f5b13d" : p >= 50 ? "#5fc9e0" : "#2fd4c4";

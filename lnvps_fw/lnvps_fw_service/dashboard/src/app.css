@@ -20,7 +20,10 @@
   .grow{ flex:1; }
   /* posture indicator */
   .chip{ font-size:.64rem; letter-spacing:.14em; text-transform:uppercase;
-    padding:.24rem .6rem; border:1px solid var(--line2); border-radius:2px; color:var(--muted); white-space:nowrap; }
+    padding:.24rem .6rem; border:1px solid var(--line2); border-radius:2px; color:var(--muted); white-space:nowrap;
+    display:inline-flex; align-items:center; gap:.4em; }
+  /* inline heroicons: sized in em so they track the surrounding text */
+  .hi{ width:1em; height:1em; flex:none; vertical-align:-0.15em; }
   .chip.arm{ color:var(--rx); border-color:#1c4a45; background:#0b1c1b; }
   .chip.atk{ color:var(--alarm); border-color:#4a1c22; background:#1c0c0e; animation:pulse 1.4s ease-in-out infinite; }
   @keyframes pulse{ 50%{ opacity:.5; } }
@@ -33,11 +36,20 @@
   button:disabled{ opacity:.4; cursor:default; filter:none; }
   button.ghost{ background:transparent; color:var(--muted); border:1px solid var(--line2); font-weight:500; }
   button.ghost:hover{ color:var(--text); border-color:var(--dim); filter:none; }
+  /* buttons that carry a leading icon + label, and icon-only ghost buttons */
+  button{ display:inline-flex; align-items:center; gap:.4em; }
+  button.icon{ padding:.32rem .45rem; }
+  button.icon .hi{ font-size:1.05rem; }
   main{ padding:1.1rem; display:grid; gap:1.1rem;
     grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); }
   section{ background:var(--panel); border:1px solid var(--line2); border-radius:3px;
     padding:.8rem 1rem .85rem; min-width:0; }
   .wide{ grid-column:1 / -1; }
+  /* two-column split: left stack (traffic meters + protected prefixes) and the
+     traffic-origins map on the right */
+  .split2{ display:grid; gap:1.1rem; grid-template-columns:3fr 2fr; align-items:start; }
+  .split2-col{ display:grid; gap:1.1rem; align-content:start; }
+  @media (max-width:820px){ .split2{ grid-template-columns:1fr; } }
   section h2{ font-size:.66rem; text-transform:uppercase; letter-spacing:.18em;
     margin:0 0 .7rem; color:var(--muted); display:flex; gap:.5rem; align-items:center;
     padding-left:.65rem; position:relative; }
@@ -62,20 +74,24 @@
   .modal h3{ margin:0; font-size:.8rem; letter-spacing:.06em; text-transform:uppercase; color:var(--rx); }
   .modal .chk{ display:inline-flex; gap:.3rem; align-items:center; margin-right:.8rem; color:var(--text); font-size:.85rem; }
   .modal .act{ display:flex; gap:.5rem; align-items:center; margin-top:.3rem; }
+  .modal .limits{ max-width:min(80vw, 34rem); }
   .limits{ display:flex; flex-wrap:wrap; gap:.6rem 1rem; align-items:flex-end; }
   .limits label{ display:inline-flex; flex-direction:column; font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); gap:.25rem; }
   .limits input{ width:7.5rem; }
   .limits .act{ display:flex; gap:.5rem; align-items:center; width:100%; margin-top:.2rem; }
   /* traffic overview */
-  .traffic{ display:flex; flex-wrap:wrap; gap:.7rem 2.4rem; align-items:center; padding-left:.65rem; }
-  .meter{ display:flex; align-items:center; gap:.7rem; }
+  .traffic{ display:flex; flex-wrap:wrap; gap:.9rem 2.4rem; align-items:flex-start; padding-left:.65rem; }
+  /* each meter is a column: the numbers row on top, the line-rate bar stacked
+     full-width beneath it (rather than crammed inline to the right) */
+  .meter{ display:flex; flex-direction:column; gap:.4rem; align-items:stretch; }
+  .meter-main{ display:flex; align-items:center; gap:.7rem; }
   .meter .dir{ font-size:1.2rem; font-weight:700; line-height:1; }
   .meter .stack{ display:flex; flex-direction:column; line-height:1.16; }
   .meter .lbl{ font-size:.6rem; text-transform:uppercase; letter-spacing:.16em; color:var(--dim); }
   .meter .big{ font-size:1.45rem; font-weight:700; letter-spacing:-.01em; font-variant-numeric:tabular-nums; }
   .meter .sub{ font-size:.72rem; color:var(--muted); font-variant-numeric:tabular-nums; }
   .spark{ display:block; align-self:center; filter:drop-shadow(0 0 3px currentColor); }
-  .sat{ display:flex; flex-direction:column; gap:.28rem; min-width:118px; }
+  .sat{ display:flex; flex-direction:column; gap:.28rem; width:100%; }
   .sat .satbar{ height:5px; border-radius:2px; background:var(--inset); border:1px solid var(--line); overflow:hidden; }
   .sat .satbar span{ display:block; height:100%; }
   .sat .satlbl{ font-size:.66rem; color:var(--muted); font-variant-numeric:tabular-nums; }
@@ -83,6 +99,20 @@
   .barwrap{ display:flex; align-items:center; gap:.4rem; width:100%; min-width:0; }
   .bar{ background:var(--inset); border:1px solid var(--line); border-radius:2px; height:9px; flex:1 1 auto; min-width:20px; max-width:120px; overflow:hidden; }
   .bar .fill{ display:block; height:100%; }
+  /* traffic origins: ranked source-country list (flags, no geographic map).
+     fixed-height box so it never resizes as countries appear/disappear. */
+  .origins-box{ height:16rem; overflow:auto; }
+  .origins{ display:flex; flex-direction:column; gap:.35rem; }
+  .origin{ display:grid; grid-template-columns:1.4rem 3rem 1fr auto auto; align-items:center; gap:.5rem;
+    font-variant-numeric:tabular-nums; }
+  .origin .oflag{ font-size:1.05rem; line-height:1; }
+  .origin .occ{ font-weight:600; letter-spacing:.02em; }
+  .origin .obar{ background:var(--inset); border:1px solid var(--line); border-radius:2px; height:9px; overflow:hidden; }
+  /* outer fill = this country's total pps vs the busiest; inner = dropped share */
+  .origin .ofill{ display:block; height:100%; background:var(--dim); }
+  .origin .odrop{ display:block; height:100%; }
+  .origin .opps{ min-width:8rem; text-align:right; }
+  .origin .osrc{ min-width:6rem; text-align:right; font-size:.72rem; }
   /* connect screen (shown until the first successful load) */
   .connect-wrap{ min-height:100vh; display:flex; align-items:center; justify-content:center; padding:2rem; }
   .connect{ width:340px; background:linear-gradient(#0f161e,#0c1219); border:1px solid var(--line2);

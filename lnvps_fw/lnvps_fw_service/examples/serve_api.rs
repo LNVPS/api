@@ -19,6 +19,7 @@ use lnvps_fw_service::api::{
     self, EventKind, InterfaceInfo, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet,
     SharedState, SourceBlock, Totals, TrackedIp, TrackedSource,
 };
+use lnvps_fw_service::geoip::GeoInfo;
 
 // --- detection limits used by the simulator (mirrors the real defaults) ---
 const LIM: Limits = Limits {
@@ -36,6 +37,127 @@ const LIM: Limits = Limits {
     learn_leak_pps: 100,
 };
 const SYN_PROXY_PPS: u64 = 5_000;
+
+/// One simulated attacker in the botnet driving the periodic flood. `ip` may be
+/// a single address or a CIDR (matched to a geo override by string); `state` is
+/// the rate-machine state shown on the Sources view.
+struct Bot {
+    ip: &'static str,
+    cc: &'static str,
+    asn: u32,
+    org: &'static str,
+    base_pps: u64,
+    state: &'static str,
+}
+
+/// A spread-out botnet so the geo column and the Traffic-origins ranking show a
+/// realistic mix of source countries during an attack.
+const BOTNET: &[Bot] = &[
+    Bot {
+        ip: "111.7.100.22",
+        cc: "CN",
+        asn: 4837,
+        org: "China Unicom",
+        base_pps: 52_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "185.220.101.0/24",
+        cc: "DE",
+        asn: 205100,
+        org: "F3 Netze e.V.",
+        base_pps: 48_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "45.148.10.14",
+        cc: "RU",
+        asn: 49505,
+        org: "OOO Network of data-centers Selectel",
+        base_pps: 37_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "103.21.244.9",
+        cc: "IN",
+        asn: 132559,
+        org: "Sify Limited",
+        base_pps: 21_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "200.148.3.55",
+        cc: "BR",
+        asn: 7738,
+        org: "Telemar Norte Leste",
+        base_pps: 15_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "14.161.9.7",
+        cc: "VN",
+        asn: 7552,
+        org: "Viettel Group",
+        base_pps: 12_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "104.28.0.5",
+        cc: "US",
+        asn: 13335,
+        org: "Cloudflare",
+        base_pps: 6_000,
+        state: "dropping",
+    },
+    Bot {
+        ip: "193.32.162.7",
+        cc: "NL",
+        asn: 202425,
+        org: "IP Volume Inc",
+        base_pps: 9_000,
+        state: "cooling",
+    },
+    Bot {
+        ip: "91.198.174.192",
+        cc: "FR",
+        asn: 3215,
+        org: "Orange S.A.",
+        base_pps: 120,
+        state: "normal",
+    },
+];
+
+/// Mock GeoIP overrides for the demo (no real MaxMind DB is shipped): the
+/// protected destinations map to the LNVPS edge, and every botnet source maps
+/// to its origin country/ASN. Consumed by `SharedState::set_geo_overrides`.
+fn geo_overrides() -> std::collections::HashMap<String, GeoInfo> {
+    let g = |asn: u32, org: &str, cc: &str| GeoInfo {
+        asn: Some(asn),
+        org: Some(org.to_string()),
+        country: Some(cc.to_string()),
+    };
+    let mut m = std::collections::HashMap::new();
+    // Protected side (LNVPS): the two prefixes + every destination host.
+    for dst in [
+        "203.0.113.0/24",
+        "2001:db8:1::/48",
+        "203.0.113.10",
+        "203.0.113.20",
+        "203.0.113.53",
+        "203.0.113.30",
+        "203.0.113.90",
+        "203.0.113.7",
+        "2001:db8:1::10",
+        "192.0.2.9",
+    ] {
+        m.insert(dst.to_string(), g(209222, "LNVPS", "CH"));
+    }
+    // Attacker origins.
+    for b in BOTNET {
+        m.insert(b.ip.to_string(), g(b.asn, b.org, b.cc));
+    }
+    m
+}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -560,30 +682,34 @@ async fn run_sim(state: Arc<SharedState>) {
             tx_bps: tot_tx_bps,
         });
         state.set_active(book.step(&state, actives, now));
-        // Unified source list the dashboard now reads: the auto blocks as
-        // dropping/cooling rows, plus a couple of NORMAL tracked sources so the
-        // preview shows every state at once.
-        let mut sources: Vec<TrackedSource> = blocks
-            .iter()
-            .map(|b| TrackedSource {
-                ip: b.cidr.trim_end_matches("/32").to_string(),
-                pps: b.pps,
-                state: if b.cooling { "cooling" } else { "dropping" }.to_string(),
-                manual: false,
-                age_secs: b.age_secs,
-                geo: Default::default(),
-            })
-            .collect();
-        if block_started.is_some() {
-            sources.push(TrackedSource {
-                ip: "91.198.174.192".into(),
-                pps: rng.jitter(120, 30),
-                state: "normal".into(),
-                manual: false,
-                age_secs: 0,
-                geo: Default::default(),
-            });
-        }
+        // Unified source list the dashboard reads: the full botnet, scaled by
+        // the current attack intensity, spread across origin countries (the geo
+        // overrides supply each source's country/ASN). Empty while quiet.
+        let intensity = attack_intensity(t);
+        let sources: Vec<TrackedSource> = if intensity > 0.0 {
+            BOTNET
+                .iter()
+                .map(|b| {
+                    // NORMAL sources stay at their small baseline; attackers
+                    // scale with the flood.
+                    let pps = if b.state == "normal" {
+                        rng.jitter(b.base_pps, 30)
+                    } else {
+                        rng.jitter((b.base_pps as f64 * intensity) as u64, 20)
+                    };
+                    TrackedSource {
+                        ip: b.ip.trim_end_matches("/32").to_string(),
+                        pps,
+                        state: b.state.to_string(),
+                        manual: false,
+                        age_secs: t % 45,
+                        geo: Default::default(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         state.set_blocks(blocks);
         state.set_sources(sources);
         if t % 5 == 1 {
@@ -630,6 +756,9 @@ async fn main() -> anyhow::Result<()> {
         None,
     );
     state.set_limits(LIM);
+    // Mock GeoIP data (no real MaxMind DB in the demo) so the dashboard's geo
+    // column and the Traffic-origins ranking show realistic countries/ASNs.
+    state.set_geo_overrides(geo_overrides());
     // Demo NIC so the dashboard shows the link-speed + bps-vs-line-rate hint
     // (the 40 Gbit/s prefix bps limit exceeds this 10G link on purpose).
     state.set_nics(vec![InterfaceInfo {

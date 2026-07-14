@@ -1,6 +1,7 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { loadColor } from "./format";
+import { IconChevronLeft, IconChevronRight } from "./icons";
 
 export function LoadBar({ pct, color }: { pct: number; color?: (p: number) => string }) {
   const p = Math.min(pct, 100);
@@ -49,9 +50,9 @@ export function Pager({ page, pages, total, onPage }: {
 }) {
   return (
     <div class="pager">
-      <button class="ghost" disabled={page <= 0} onClick={() => onPage(page - 1)}>‹ prev</button>
+      <button class="ghost" disabled={page <= 0} onClick={() => onPage(page - 1)}><IconChevronLeft /> prev</button>
       <span class="muted">page {page + 1}/{pages} · {total} rows</span>
-      <button class="ghost" disabled={page >= pages - 1} onClick={() => onPage(page + 1)}>next ›</button>
+      <button class="ghost" disabled={page >= pages - 1} onClick={() => onPage(page + 1)}>next <IconChevronRight /></button>
     </div>
   );
 }

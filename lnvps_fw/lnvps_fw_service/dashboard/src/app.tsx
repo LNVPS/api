@@ -3,8 +3,12 @@ import type { ComponentChildren } from "preact";
 import { api } from "./api";
 import type { Status, TrackedIp, PrefixLoad, Mitigation, FwEvent, RuleSet, UpgradeStatus } from "./api";
 import { fmtn, fmtbps, timeStr, loadColor, dropColor } from "./format";
-import { LoadBar, Sparkline, PagedTable, Section, flagCell } from "./ui";
-import { Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard, geoCell } from "./cards";
+import { LoadBar, Sparkline, PagedTable, Section, Modal, flagCell } from "./ui";
+import { Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard, OriginsCard, geoCell } from "./cards";
+import {
+  IconUpgrade, IconRefresh, IconSettings, IconUpdateCheck, IconDisconnect,
+  IconArrowDown, IconArrowUp, IconNoSymbol, IconShieldCheck, IconShieldAlert,
+} from "./icons";
 
 interface Data {
   status: Status | null;
@@ -30,6 +34,7 @@ const DEMO_TOKEN = (import.meta.env.VITE_DEMO_TOKEN as string | undefined) || ""
 export function App() {
   const [token, setToken] = useState(localStorage.getItem("fwtoken") || DEMO_TOKEN);
   const [auto, setAuto] = useState(true);
+  const [showLimits, setShowLimits] = useState(false);
   const [d, setD] = useState<Data>(EMPTY);
   const [upMsg, setUpMsg] = useState("");
   const [events, setEvents] = useState<FwEvent[]>([]);
@@ -118,11 +123,14 @@ export function App() {
       </div>
     );
   };
-  const meter = (dir: string, lbl: string, color: string, big: string, sub: string, spark: ComponentChildren, sat: ComponentChildren) => (
+  const meter = (dir: ComponentChildren, lbl: string, color: string, big: string, sub: string, spark: ComponentChildren, sat: ComponentChildren) => (
     <div class="meter">
-      <span class="dir" style={{ color }}>{dir}</span>
-      <div class="stack"><span class="lbl">{lbl}</span><span class="big" style={{ color }}>{big}</span><span class="sub">{sub}</span></div>
-      {spark}{sat}
+      <div class="meter-main">
+        <span class="dir" style={{ color }}>{dir}</span>
+        <div class="stack"><span class="lbl">{lbl}</span><span class="big" style={{ color }}>{big}</span><span class="sub">{sub}</span></div>
+        {spark}
+      </div>
+      {sat}
     </div>
   );
 
@@ -143,8 +151,8 @@ export function App() {
   const evRows = events.map((e) => [e.seq, timeStr(e.ts_unix), e.kind, e.cidr, flagCell(e.flags), fmtn(e.pps), fmtbps(e.bps), fmtn(e.syn_pps)]);
 
   const posture = s.active_mitigations > 0
-    ? <span class="chip atk">● under attack</span>
-    : <span class="chip arm">● armed</span>;
+    ? <span class="chip atk"><IconShieldAlert /> under attack</span>
+    : <span class="chip arm"><IconShieldCheck /> armed</span>;
 
   return (
     <>
@@ -154,35 +162,45 @@ export function App() {
         <span class="muted">up {s.uptime_secs}s · {s.active_mitigations} active · {s.learned_ports} ports{nicStr ? " · " + nicStr : ""}</span>
         {d.err ? <span class="err">{d.err}</span> : null}
         {d.upgrade && d.upgrade.available
-          ? <button title={"download & install " + d.upgrade.latest + ", then restart"} onClick={doUpgrade}>⬆ upgrade {d.upgrade.latest}</button>
+          ? <button title={"download & install " + d.upgrade.latest + ", then restart"} onClick={doUpgrade}><IconUpgrade /> upgrade {d.upgrade.latest}</button>
           : null}
         {upMsg ? <span class="muted">{upMsg}</span> : null}
         <span class="grow" />
-        <button class="ghost" title="Check for updates now" onClick={checkUpdates}>↻</button>
+        <button class="ghost icon" title="Detection limits" onClick={() => setShowLimits(true)}><IconSettings /></button>
+        <button class="ghost icon" title="Check for updates now" onClick={checkUpdates}><IconUpdateCheck /></button>
         <label class="muted"><input type="checkbox" checked={auto} onChange={(e) => setAuto((e.target as HTMLInputElement).checked)} /> auto</label>
-        <button class="ghost" onClick={refresh}>refresh</button>
-        <button class="ghost" onClick={disconnect}>disconnect</button>
+        <button class="ghost icon" title="Refresh now" onClick={refresh}><IconRefresh /></button>
+        <button class="ghost icon" title="Disconnect" onClick={disconnect}><IconDisconnect /></button>
       </header>
       <main>
         {t0 && (
-          <section class="wide"><div class="traffic">
-            {meter("↓", "rx · ingress", "#2fd4c4", fmtbps(t0.rx_bps), fmtn(t0.rx_pps) + " pps · " + fmtn(t0.rx_syn_pps) + " syn/s",
-              <Sparkline data={hist.rx} color="#2fd4c4" />, satBar(t0.rx_bps))}
-            {meter("↑", "tx · egress", "#9a86ff", fmtbps(t0.tx_bps), fmtn(t0.tx_pps) + " pps",
-              <Sparkline data={hist.tx} color="#9a86ff" />, satBar(t0.tx_bps))}
-            {meter("●", "dropped", dropColor(t0.rx_drop_pct), t0.rx_drop_pct + "%", fmtn(t0.rx_drop_pps) + " pps",
-              <Sparkline data={hist.drop} color={dropColor(t0.rx_drop_pct)} max={100} />, null)}
-          </div></section>
+          <div class="wide split2">
+            <div class="split2-col">
+              <section><div class="traffic">
+                {meter(<IconArrowDown />, "rx · ingress", "#2fd4c4", fmtbps(t0.rx_bps), fmtn(t0.rx_pps) + " pps · " + fmtn(t0.rx_syn_pps) + " syn/s",
+                  <Sparkline data={hist.rx} color="#2fd4c4" />, satBar(t0.rx_bps))}
+                {meter(<IconArrowUp />, "tx · egress", "#9a86ff", fmtbps(t0.tx_bps), fmtn(t0.tx_pps) + " pps",
+                  <Sparkline data={hist.tx} color="#9a86ff" />, satBar(t0.tx_bps))}
+                {meter(<IconNoSymbol />, "dropped", dropColor(t0.rx_drop_pct), t0.rx_drop_pct + "%", fmtn(t0.rx_drop_pps) + " pps",
+                  <Sparkline data={hist.drop} color={dropColor(t0.rx_drop_pct)} max={100} />, null)}
+              </div></section>
+              <Section title="Protected prefixes" extra={"(" + d.prefixes.length + ")"}>
+                <PagedTable cols={["prefix", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={prefixRows} />
+              </Section>
+            </div>
+            <Section title="Traffic origins" extra="source countries by pps"><OriginsCard token={token} /></Section>
+          </div>
         )}
-        <Section wide title="Detection limits"><LimitsCard token={token} nics={s.nics} /></Section>
+        {showLimits && (
+          <Modal title="Detection limits" onClose={() => setShowLimits(false)}>
+            <LimitsCard token={token} nics={s.nics} />
+          </Modal>
+        )}
         <Section wide title="Active mitigations" extra={"(" + d.mitigations.length + ")"}>
           <MitigationsCard token={token} mitigations={d.mitigations} onChange={refresh} />
         </Section>
         <Section wide title="Live tracked IPs" extra={"(" + d.tracked.length + ")"}>
           <PagedTable cols={["ip", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={trackedRows} />
-        </Section>
-        <Section wide title="Protected prefixes" extra={"(" + d.prefixes.length + ")"}>
-          <PagedTable cols={["prefix", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={prefixRows} />
         </Section>
         <Section wide title="Sources"><SourcesCard token={token} /></Section>
         <PortsCard token={token} />

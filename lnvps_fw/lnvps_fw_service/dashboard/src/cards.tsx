@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { api, authHeaders } from "./api";
-import type { InterfaceInfo, Limits, Mitigation, TrackedSource, SourcesPage, PortsPage } from "./api";
-import { fmtn, fmtbps, fmtUnit, parseUnit, timeStr, dropColor } from "./format";
+import type { InterfaceInfo, Limits, Mitigation, TrackedSource, SourcesPage, PortsPage, OriginsResponse } from "./api";
+import { fmtn, fmtbps, fmtUnit, parseUnit, timeStr, dropColor, flagEmoji } from "./format";
 import { LoadBar, Table, Pager, PagedTable, Section, Modal, flagCell } from "./ui";
+import { IconTrash } from "./icons";
 
 const FLAGS: [number, string][] = [[1, "PORT_FILTER"], [2, "SYN_PROXY"], [4, "RATE_CAPS"], [8, "SOURCE_BLOCK"]];
 
@@ -124,7 +125,7 @@ export function MitigationsCard({ token, mitigations, onChange }: {
     } catch (e) { setMsg((e as Error).message); }
   };
   const del = async (c: string) => { try { await fetch("/api/v1/mitigations?cidr=" + encodeURIComponent(c), { method: "DELETE", headers: hdr }); onChange(); } catch { /* */ } };
-  const bin = (c: string) => <button class="binbtn" title="remove override" onClick={() => del(c)}>🗑</button>;
+  const bin = (c: string) => <button class="binbtn" title="remove override" onClick={() => del(c)}><IconTrash /></button>;
   const meta = (m: Mitigation) => m.manual ? <span><span class="tag">manual</span> {timeStr(m.since_unix)}</span> : timeStr(m.since_unix);
   const rows = mitigations.map((m) => [
     m.cidr, geoCell(m), fmtn(m.rx_pps), fmtbps(m.rx_bps), fmtn(m.tx_pps), fmtbps(m.tx_bps),
@@ -188,7 +189,7 @@ export function SourcesCard({ token }: { token: string }) {
     } catch (e) { setMsg((e as Error).message); }
   };
   const del = async (c: string) => { try { await fetch("/api/v1/blocks?cidr=" + encodeURIComponent(c), { method: "DELETE", headers: hdr }); load(); } catch { /* */ } };
-  const bin = (c: string) => <button class="binbtn" title="remove block" onClick={() => del(c)}>🗑</button>;
+  const bin = (c: string) => <button class="binbtn" title="remove block" onClick={() => del(c)}><IconTrash /></button>;
   const stateCell = (s: TrackedSource) => s.manual
     ? <span class="tag">pinned</span>
       : s.state === "dropping" ? <span style={{ color: "#ff5d6c" }}>dropping</span>
@@ -216,6 +217,43 @@ export function SourcesCard({ token }: { token: string }) {
           </div>
         </Modal>
       )}
+    </div>
+  );
+}
+
+// --- Traffic origins: attack-source pps aggregated by origin country, ranked
+// as a compact flags list (no geographic map). Server-side aggregation keeps
+// the payload bounded to one row per country even under a large flood. ---
+export function OriginsCard({ token }: { token: string }) {
+  const [data, setData] = useState<OriginsResponse | null>(null);
+  const load = useCallback(async () => {
+    try { setData(await api<OriginsResponse>("/api/v1/origins", token)); } catch { /* surfaced by the main poller */ }
+  }, [token]);
+  useEffect(() => { load(); const id = setInterval(load, 3000); return () => clearInterval(id); }, [load]);
+  const top = data?.items.slice(0, 12) ?? [];
+  const max = Math.max(...top.map((o) => o.pps), 1);
+  // Fixed-height box so the card doesn't resize as countries come and go.
+  return (
+    <div class="origins-box">
+      {!data ? <div class="muted">…</div>
+        : !top.length ? <div class="muted">no rate-tracked sources — origins appear here during a mitigation</div>
+        : <div class="origins">{top.map((o) => {
+        const share = data.total_pps ? Math.round((o.pps / data.total_pps) * 100) : 0;
+        const dropPct = o.pps ? Math.round((o.drop_pps / o.pps) * 100) : 0;
+        const name = o.country === "??" ? "unknown" : o.country;
+        return (
+          <div class="origin" key={o.country}>
+            <span class="oflag">{flagEmoji(o.country)}</span>
+            <span class="occ" title={name + " · " + share + "% of tracked source pps · " + dropPct + "% dropped"}>{name}</span>
+            {/* full bar = total pps vs the busiest country; inner fill = dropped share */}
+            <span class="obar"><span class="ofill" style={{ width: (o.pps / max) * 100 + "%" }}>
+              <span class="odrop" style={{ width: dropPct + "%", background: dropColor(dropPct) }} />
+            </span></span>
+            <span class="opps"><b style={{ color: dropColor(dropPct) }}>{fmtn(o.drop_pps)}</b> / {fmtn(o.pps)} pps</span>
+            <span class="muted osrc">{o.sources} src{o.dropping ? " · " + o.dropping + " blk" : ""}</span>
+          </div>
+        );
+      })}</div>}
     </div>
   );
 }

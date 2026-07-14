@@ -34,6 +34,9 @@ export interface SourceBlock { cidr: string; age_secs: number; pps: number; manu
 /** A row in the unified source list: tracked sources (any state) + manual blocks. */
 export interface TrackedSource { ip: string; pps: number; state: "normal" | "dropping"; manual: boolean; age_secs: number; asn?: number; org?: string; country?: string }
 export interface LearnedPort { ip: string; port: number; proto: string; age_secs: number }
+/** One origin-country row in the traffic-origins ranking. */
+export interface OriginStat { country: string; sources: number; pps: number; drop_pps: number; dropping: number }
+export interface OriginsResponse { items: OriginStat[]; total_pps: number; total_sources: number }
 export interface FwEvent {
   seq: number; kind: string; cidr: string; flags: number; ts_unix: number;
   pps: number; bps: number; syn_pps: number;

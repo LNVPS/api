@@ -8,8 +8,8 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
-    BlocksPage, Event, EventKind, EventsResponse, LearnedPort, Limits, Override, PortsPage,
-    RuleSet, SharedState, SourceBlock, SourcesPage, Status, TrackedSource, router,
+    BlocksPage, Event, EventKind, EventsResponse, LearnedPort, Limits, OriginsResponse, Override,
+    PortsPage, RuleSet, SharedState, SourceBlock, SourcesPage, Status, TrackedSource, router,
 };
 use tower::ServiceExt;
 
@@ -561,6 +561,47 @@ async fn sources_unified_list_manual_pinned_then_by_pps() {
     let page: SourcesPage = body_json(res).await;
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].ip, "10.0.0.1");
+}
+
+#[tokio::test]
+async fn origins_aggregates_by_country() {
+    let st = state();
+    let app = router(st.clone());
+    // No GeoIP DB in tests, so every source folds into the "??" bucket; this
+    // still exercises the handler + aggregation end to end (grouping, summing,
+    // dropping count, totals).
+    st.set_sources(vec![
+        TrackedSource {
+            ip: "10.0.0.1".into(),
+            pps: 100,
+            state: "normal".into(),
+            manual: false,
+            age_secs: 0,
+            geo: Default::default(),
+        },
+        TrackedSource {
+            ip: "10.0.0.2".into(),
+            pps: 9000,
+            state: "dropping".into(),
+            manual: false,
+            age_secs: 1,
+            geo: Default::default(),
+        },
+    ]);
+    let res = app
+        .oneshot(req("GET", "/api/v1/origins", Some("tok"), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let out: OriginsResponse = body_json(res).await;
+    assert_eq!(out.total_sources, 2);
+    assert_eq!(out.total_pps, 9100);
+    assert_eq!(out.items.len(), 1);
+    assert_eq!(out.items[0].country, "??");
+    assert_eq!(out.items[0].sources, 2);
+    assert_eq!(out.items[0].pps, 9100);
+    assert_eq!(out.items[0].dropping, 1);
+    assert_eq!(out.items[0].drop_pps, 9000); // only the dropping source contributes
 }
 
 #[tokio::test]

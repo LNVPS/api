@@ -11,7 +11,7 @@
 //! request is authenticated with a static bearer token (constant-time compare)
 //! and an optional source-IP allow-list.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -365,6 +365,80 @@ pub struct SourcesPage {
     pub items: Vec<TrackedSource>,
 }
 
+/// Attack-source traffic aggregated for one origin country, for the dashboard's
+/// "traffic origins" ranking. Built from the live tracked-source snapshot (the
+/// same data behind `/sources`), so only auto-tracked sources with a live
+/// per-source rate contribute — operator-pinned manual blocks (dropped before
+/// per-source counting, always 0 pps) are excluded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OriginStat {
+    /// ISO 3166-1 alpha-2 country code, or `"??"` when the source has no
+    /// country resolved (no GeoIP DB, or a private/unlisted address).
+    pub country: String,
+    /// Number of distinct sources seen from this country.
+    pub sources: usize,
+    /// Aggregate packets/second from this country (sum over its sources).
+    pub pps: u64,
+    /// Aggregate packets/second from this country that are being dropped (sum
+    /// of `pps` over its sources currently in the `dropping` state).
+    pub drop_pps: u64,
+    /// How many of this country's sources are currently being dropped.
+    pub dropping: usize,
+}
+
+/// Per-origin-country traffic ranking plus the totals used to compute each
+/// country's share. `items` is sorted by pps descending (bounded: at most one
+/// row per country).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OriginsResponse {
+    pub items: Vec<OriginStat>,
+    /// Total pps across every origin (denominator for share bars).
+    pub total_pps: u64,
+    /// Total number of tracked sources folded into `items`.
+    pub total_sources: usize,
+}
+
+/// Fold a tracked-source snapshot into per-origin-country stats. `country_of`
+/// resolves a source IP/CIDR to an ISO country code (via GeoIP in production);
+/// sources with no country collapse into a single `"??"` bucket. The result is
+/// sorted by pps descending (then source count, then country code) so the
+/// ranking is stable across polls. Kept as a free function so the aggregation
+/// is unit-testable without a MaxMind database.
+pub fn aggregate_origins(
+    sources: &[TrackedSource],
+    country_of: impl Fn(&str) -> Option<String>,
+) -> OriginsResponse {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, OriginStat> = HashMap::new();
+    let mut total_pps: u64 = 0;
+    for s in sources {
+        let cc = country_of(&s.ip).unwrap_or_else(|| "??".to_string());
+        let e = map.entry(cc.clone()).or_insert_with(|| OriginStat {
+            country: cc,
+            ..Default::default()
+        });
+        e.sources += 1;
+        e.pps = e.pps.saturating_add(s.pps);
+        if s.state == "dropping" {
+            e.dropping += 1;
+            e.drop_pps = e.drop_pps.saturating_add(s.pps);
+        }
+        total_pps = total_pps.saturating_add(s.pps);
+    }
+    let mut items: Vec<OriginStat> = map.into_values().collect();
+    items.sort_by(|a, b| {
+        b.pps
+            .cmp(&a.pps)
+            .then_with(|| b.sources.cmp(&a.sources))
+            .then_with(|| a.country.cmp(&b.country))
+    });
+    OriginsResponse {
+        items,
+        total_pps,
+        total_sources: sources.len(),
+    }
+}
+
 /// A learned open port on a protected IP (surfaced for `lnvps_api` / admin).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LearnedPort {
@@ -498,6 +572,11 @@ pub struct SharedState {
     /// Hot-swappable so the periodic refresh can replace the readers; `None` =
     /// enrichment disabled (fields omitted).
     geoip: RwLock<Option<Arc<GeoIp>>>,
+    /// Static geo overrides consulted before the MaxMind lookup, keyed by the
+    /// exact IP/CIDR string (and matched against the network address of a
+    /// CIDR). Empty in production; the demo simulator populates it to inject
+    /// mock ASN/country data without shipping a real database.
+    geo_overrides: RwLock<HashMap<String, GeoInfo>>,
 }
 
 impl SharedState {
@@ -535,6 +614,7 @@ impl SharedState {
             rules_version: AtomicU64::new(1),
             limits_version: AtomicU64::new(1),
             geoip: RwLock::new(None),
+            geo_overrides: RwLock::new(HashMap::new()),
         })
     }
 
@@ -544,10 +624,29 @@ impl SharedState {
         *self.geoip.write().unwrap() = Some(Arc::new(geoip));
     }
 
+    /// Install static geo overrides (used by the demo simulator to supply mock
+    /// ASN/country data). Replaces any previously-set overrides.
+    pub fn set_geo_overrides(&self, overrides: HashMap<String, GeoInfo>) {
+        *self.geo_overrides.write().unwrap() = overrides;
+    }
+
     /// Look up ASN/org/country for an IP or CIDR string (the network address is
-    /// used for a CIDR). Returns empty enrichment when no DB is loaded or the
-    /// string does not parse — callers flatten it, so empty means no fields.
+    /// used for a CIDR). Static overrides are consulted first (by the full
+    /// string, then by the CIDR's network address), then the MaxMind DB.
+    /// Returns empty enrichment when nothing matches — callers flatten it, so
+    /// empty means no fields.
     pub fn geo_for(&self, ip_or_cidr: &str) -> GeoInfo {
+        {
+            let ov = self.geo_overrides.read().unwrap();
+            if let Some(g) = ov.get(ip_or_cidr) {
+                return g.clone();
+            }
+            if let Some(head) = ip_or_cidr.split('/').next()
+                && let Some(g) = ov.get(head)
+            {
+                return g.clone();
+            }
+        }
         let Some(geoip) = self.geoip.read().unwrap().clone() else {
             return GeoInfo::default();
         };
@@ -710,6 +809,7 @@ pub fn router(state: Arc<SharedState>) -> Router {
             get(get_blocks).post(post_block).delete(delete_block),
         )
         .route("/api/v1/sources", get(get_sources))
+        .route("/api/v1/origins", get(get_origins))
         .route("/api/v1/limits", get(get_limits).put(put_limits))
         .route("/api/v1/upgrade", get(get_upgrade).post(post_upgrade))
         // Cap request bodies: the largest legitimate payload is a full ruleset
@@ -964,6 +1064,14 @@ async fn get_sources(
         limit,
         items,
     })
+}
+
+/// `GET /api/v1/origins` — attack-source traffic aggregated by origin country,
+/// for the dashboard's "traffic origins" ranking. Built from the live
+/// tracked-source snapshot (the same data behind `/sources`).
+async fn get_origins(State(state): State<Arc<SharedState>>) -> Json<OriginsResponse> {
+    let sources = state.sources.read().unwrap();
+    Json(aggregate_origins(&sources, |ip| state.geo_for(ip).country))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1446,6 +1554,99 @@ mod tests {
             String::from_utf8_lossy(&tls.key_pem).contains("PRIVATE KEY"),
             "key PEM present"
         );
+    }
+
+    #[test]
+    fn aggregate_origins_groups_sorts_and_totals() {
+        let src = |ip: &str, pps: u64, state: &str| TrackedSource {
+            ip: ip.into(),
+            pps,
+            state: state.into(),
+            manual: false,
+            age_secs: 0,
+            geo: Default::default(),
+        };
+        let sources = vec![
+            src("1.0.0.1", 100, "normal"),
+            src("1.0.0.2", 900, "dropping"),
+            src("2.0.0.1", 500, "dropping"),
+            src("3.0.0.1", 50, "normal"), // no country -> "??" bucket
+        ];
+        // Map 1.0.0.x -> CN, 2.0.0.x -> US, 3.0.0.x -> unknown.
+        let out = aggregate_origins(&sources, |ip| {
+            if ip.starts_with("1.") {
+                Some("CN".into())
+            } else if ip.starts_with("2.") {
+                Some("US".into())
+            } else {
+                None
+            }
+        });
+        assert_eq!(out.total_sources, 4);
+        assert_eq!(out.total_pps, 1550);
+        // CN (1000 pps) ranks above US (500) above ?? (50).
+        assert_eq!(out.items.len(), 3);
+        assert_eq!(out.items[0].country, "CN");
+        assert_eq!(out.items[0].pps, 1000);
+        assert_eq!(out.items[0].sources, 2);
+        assert_eq!(out.items[0].dropping, 1);
+        assert_eq!(out.items[0].drop_pps, 900); // only the dropping source's pps
+        assert_eq!(out.items[1].country, "US");
+        assert_eq!(out.items[1].dropping, 1);
+        assert_eq!(out.items[1].drop_pps, 500);
+        assert_eq!(out.items[2].country, "??");
+        assert_eq!(out.items[2].pps, 50);
+        assert_eq!(out.items[2].dropping, 0);
+        assert_eq!(out.items[2].drop_pps, 0);
+    }
+
+    #[test]
+    fn geo_overrides_match_full_string_and_cidr_head() {
+        let st = SharedState::new(
+            "t".into(),
+            vec![],
+            vec![],
+            RuleSet::default(),
+            8,
+            "r".into(),
+            false,
+            None,
+        );
+        // No override + no DB -> empty.
+        assert!(st.geo_for("203.0.113.10").is_empty());
+        let mut ov = HashMap::new();
+        ov.insert(
+            "203.0.113.10".to_string(),
+            GeoInfo {
+                asn: Some(209222),
+                org: Some("LNVPS".into()),
+                country: Some("CH".into()),
+            },
+        );
+        ov.insert(
+            "203.0.113.0/24".to_string(),
+            GeoInfo {
+                country: Some("CH".into()),
+                ..Default::default()
+            },
+        );
+        st.set_geo_overrides(ov);
+        // Exact host string.
+        assert_eq!(st.geo_for("203.0.113.10").country.as_deref(), Some("CH"));
+        // A /32 mitigation cidr matches the host override via its network head.
+        assert_eq!(st.geo_for("203.0.113.10/32").asn, Some(209222));
+        // A prefix matches its own full-string override.
+        assert_eq!(st.geo_for("203.0.113.0/24").country.as_deref(), Some("CH"));
+        // Unknown stays empty.
+        assert!(st.geo_for("8.8.8.8").is_empty());
+    }
+
+    #[test]
+    fn aggregate_origins_empty_snapshot() {
+        let out = aggregate_origins(&[], |_| Some("XX".into()));
+        assert!(out.items.is_empty());
+        assert_eq!(out.total_pps, 0);
+        assert_eq!(out.total_sources, 0);
     }
 
     #[test]
