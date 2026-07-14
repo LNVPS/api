@@ -62,8 +62,6 @@ pub struct User {
     pub billing_postcode: Option<String>,
     /// Billing tax id
     pub billing_tax_id: Option<String>,
-    /// Nostr Wallet Connect connection string for automatic renewals (encrypted)
-    pub nwc_connection_string: Option<EncryptedString>,
 }
 
 /// A saved payment method for off-session (merchant-initiated) automatic
@@ -77,8 +75,9 @@ pub struct UserPaymentMethod {
     pub created: DateTime<Utc>,
     /// Payment processor (e.g. `revolut`)
     pub provider: String,
-    /// Encrypted provider customer id owning the saved method
-    pub external_customer_id: EncryptedString,
+    /// Encrypted provider customer id owning the saved method (None for
+    /// providers without one, e.g. NWC)
+    pub external_customer_id: Option<EncryptedString>,
     /// Encrypted reusable payment method id charged off-session
     pub external_id: EncryptedString,
     pub card_brand: Option<String>,
@@ -118,6 +117,8 @@ pub struct AdminUserInfo {
     // Admin-specific fields
     pub vm_count: i64,
     pub is_admin: bool,
+    /// Whether the user has an NWC payment method configured (computed)
+    pub has_nwc: bool,
 }
 
 #[derive(Clone, Debug, sqlx::Type, Default, PartialEq, Eq)]
@@ -1981,6 +1982,30 @@ impl InternetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_payment_method_is_expired() {
+        let mut pm = UserPaymentMethod {
+            exp_year: Some(2029),
+            exp_month: Some(12),
+            ..Default::default()
+        };
+        // Before expiry
+        assert!(!pm.is_expired(2029, 11));
+        // Same month is not yet expired
+        assert!(!pm.is_expired(2029, 12));
+        // After expiry month
+        assert!(pm.is_expired(2030, 1));
+        assert!(pm.is_expired(2029, 12) == false);
+        // Earlier year
+        assert!(!pm.is_expired(2028, 12));
+        // Missing expiry data -> never expired
+        pm.exp_year = None;
+        assert!(!pm.is_expired(2030, 1));
+        pm.exp_year = Some(2029);
+        pm.exp_month = None;
+        assert!(!pm.is_expired(2030, 1));
+    }
 
     #[test]
     fn test_internet_registry_min_prefix_sizes() {

@@ -1092,7 +1092,6 @@ async fn create_users(db: &LNVpsDbMysql) -> Result<Vec<User>> {
             billing_state: None,
             billing_postcode: None,
             billing_tax_id: None,
-            nwc_connection_string: None,
             email_hash: None,
         };
 

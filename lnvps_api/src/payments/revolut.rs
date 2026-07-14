@@ -202,7 +202,7 @@ impl RevolutPaymentHandler {
             user_id,
             created: Utc::now(),
             provider: "revolut".to_string(),
-            external_customer_id: customer_id.to_string().into(),
+            external_customer_id: Some(customer_id.to_string().into()),
             external_id: method.id.clone().into(),
             card_brand: card.and_then(|c| c.brand.clone()),
             card_last_four: card.and_then(|c| c.last4.clone()),

@@ -31,9 +31,10 @@ use crate::api::model::{
     AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
     ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy,
     ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote,
-    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
-    PatchVmFirewallPolicy, PatchVmFirewallRule, VMPatchRequest, validate_firewall_cidr,
-    validate_firewall_ports, vm_to_status,
+    ApiVmUpgradeRequest, AddNwcPaymentMethodRequest, CreateSshKey, CreateVmFirewallRule,
+    CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
+    PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr, validate_firewall_ports,
+    vm_to_status,
 };
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
@@ -46,6 +47,14 @@ pub fn routes() -> Router<RouterState> {
             get(v1_get_account).patch(v1_patch_account),
         )
         .route("/api/v1/account/verify-email", get(v1_verify_email))
+        .route(
+            "/api/v1/payment-methods",
+            get(v1_list_payment_methods).post(v1_add_nwc_payment_method),
+        )
+        .route(
+            "/api/v1/payment-methods/{id}",
+            patch(v1_patch_payment_method).delete(v1_delete_payment_method),
+        )
         .route(
             "/api/v1/account/telegram/link",
             post(v1_telegram_link).delete(v1_telegram_unlink),
@@ -132,27 +141,6 @@ async fn v1_patch_account(
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
-
-    // validate nwc string (skip validation if empty - treat as clearing the value)
-    #[cfg(feature = "nostr-nwc")]
-    if let Some(Some(nwc)) = &req.nwc_connection_string
-        && !nwc.is_empty()
-    {
-        match nwc::prelude::NostrWalletConnectUri::parse(nwc) {
-            Ok(s) => {
-                // test connection
-                let client = nwc::NostrWalletConnect::new(s);
-                let info = client
-                    .get_info()
-                    .await
-                    .map_err(|e| ApiError::bad_request(format!("Failed to connect to NWC: {}", e)))?;
-                if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
-                    return ApiData::err("NWC connection must allow pay_invoice");
-                }
-            }
-            Err(e) => return ApiData::err(&format!("Failed to parse NWC url: {}", e)),
-        }
-    }
 
     // validate tax_id if provided
     if let Some(Some(tax_id)) = &req.tax_id {
@@ -244,13 +232,6 @@ async fn v1_patch_account(
     }
     if let Some(tax_id) = &req.tax_id {
         user.billing_tax_id = tax_id.clone();
-    }
-    if let Some(nwc_connection_string) = &req.nwc_connection_string {
-        // Treat empty string as None (clear the value)
-        user.nwc_connection_string = nwc_connection_string
-            .clone()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.into());
     }
 
     this.db.update_user(&user).await?;
@@ -349,18 +330,119 @@ async fn v1_get_account(
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
     let user = this.db.get_user(uid).await?;
+    ApiData::ok(user.into())
+}
 
-    let mut account: AccountPatchRequest = user.into();
-    // Whether the user has a usable saved Revolut method for automatic renewals.
-    let has_saved_method = this
-        .db
-        .list_user_payment_methods(uid, Some("revolut"))
-        .await
-        .map(|m| m.iter().any(|pm| pm.enabled))
-        .unwrap_or(false);
-    account.revolut_payment_method_saved = Some(has_saved_method);
+/// List the user's saved payment methods for automatic renewals.
+async fn v1_list_payment_methods(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<Vec<PaymentMethodResponse>> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let methods = this.db.list_user_payment_methods(uid, None).await?;
+    ApiData::ok(methods.into_iter().map(Into::into).collect())
+}
 
-    ApiData::ok(account)
+/// Add a Nostr Wallet Connect connection as a saved payment method.
+async fn v1_add_nwc_payment_method(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    req: Json<AddNwcPaymentMethodRequest>,
+) -> ApiResult<PaymentMethodResponse> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let nwc = req.nwc_connection_string.trim().to_string();
+    if nwc.is_empty() {
+        return ApiData::err("NWC connection string cannot be empty");
+    }
+
+    // Validate the NWC connection and ensure it can pay invoices.
+    #[cfg(feature = "nostr-nwc")]
+    match nwc::prelude::NostrWalletConnectUri::parse(&nwc) {
+        Ok(s) => {
+            let client = nwc::NostrWalletConnect::new(s);
+            let info = client
+                .get_info()
+                .await
+                .map_err(|e| ApiError::bad_request(format!("Failed to connect to NWC: {}", e)))?;
+            if !info.methods.contains(&nwc::prelude::Method::PayInvoice) {
+                return ApiData::err("NWC connection must allow pay_invoice");
+            }
+        }
+        Err(e) => return ApiData::err(&format!("Failed to parse NWC url: {}", e)),
+    }
+
+    // First method for the user becomes the default.
+    let existing = this.db.list_user_payment_methods(uid, None).await?;
+    let pm = lnvps_db::UserPaymentMethod {
+        id: 0,
+        user_id: uid,
+        created: chrono::Utc::now(),
+        provider: "nwc".to_string(),
+        external_customer_id: None,
+        external_id: nwc.into(),
+        card_brand: None,
+        card_last_four: None,
+        exp_month: None,
+        exp_year: None,
+        is_default: existing.is_empty(),
+        enabled: true,
+    };
+    let id = this.db.insert_user_payment_method(&pm).await?;
+    let saved = this.db.get_user_payment_method(id).await?;
+    ApiData::ok(saved.into())
+}
+
+/// Update a saved payment method: set it as default and/or enable-disable it.
+async fn v1_patch_payment_method(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    req: Json<PatchPaymentMethodRequest>,
+) -> ApiResult<PaymentMethodResponse> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let mut method = this.db.get_user_payment_method(id).await?;
+    if method.user_id != uid {
+        return ApiData::err("Payment method not found");
+    }
+
+    if let Some(enabled) = req.enabled {
+        method.enabled = enabled;
+    }
+    if req.is_default == Some(true) {
+        // Only one default: clear the flag on the user's other methods.
+        for mut other in this.db.list_user_payment_methods(uid, None).await? {
+            if other.id != id && other.is_default {
+                other.is_default = false;
+                this.db.update_user_payment_method(&other).await?;
+            }
+        }
+        method.is_default = true;
+    } else if req.is_default == Some(false) {
+        method.is_default = false;
+    }
+    this.db.update_user_payment_method(&method).await?;
+    ApiData::ok(this.db.get_user_payment_method(id).await?.into())
+}
+
+/// Delete a saved payment method.
+async fn v1_delete_payment_method(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let method = this.db.get_user_payment_method(id).await?;
+    if method.user_id != uid {
+        return ApiData::err("Payment method not found");
+    }
+    this.db.delete_user_payment_method(id).await?;
+    ApiData::ok(())
 }
 
 /// Notification channels configured on this server. The UI can use this to
@@ -867,20 +949,22 @@ async fn v1_renew_vm(
     Query(q): Query<PaymentMethodQuery>,
 ) -> ApiResult<ApiVmPayment> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
-    let user = this.db.get_user(uid).await?;
     let intervals = q.intervals.unwrap_or(1);
     let vm_line = this
         .db
         .get_subscription_line_item(vm.subscription_line_item_id)
         .await?;
 
-    // handle "nwc" payments automatically
-    let payment = if q.method.as_deref() == Some("nwc") && user.nwc_connection_string.is_some() {
+    // handle "nwc" payments automatically (uses the user's saved NWC method)
+    let has_nwc = this
+        .db
+        .list_user_payment_methods(uid, Some("nwc"))
+        .await
+        .map(|m| m.iter().any(|pm| pm.enabled))
+        .unwrap_or(false);
+    let payment = if q.method.as_deref() == Some("nwc") && has_nwc {
         this.sub_handler
-            .auto_renew_via_nwc(
-                vm_line.subscription_id,
-                user.nwc_connection_string.unwrap().as_str(),
-            )
+            .auto_renew_via_nwc(vm_line.subscription_id)
             .await?
     } else {
         this.sub_handler

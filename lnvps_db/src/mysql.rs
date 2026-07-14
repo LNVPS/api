@@ -217,7 +217,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             Some(crate::email_hash(user.email.as_str()).to_vec())
         };
         sqlx::query(
-            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, nwc_connection_string=? where id = ?",
+            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=? where id = ?",
         )
             .bind(&user.email)
             .bind(hash)
@@ -240,7 +240,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&user.billing_state)
             .bind(&user.billing_postcode)
             .bind(&user.billing_tax_id)
-            .bind(&user.nwc_connection_string)
             .bind(user.id)
             .execute(&self.db)
             .await?;
@@ -1870,8 +1869,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 u.billing_city,
                 u.billing_state,
                 u.billing_postcode,
-                u.billing_tax_id,
-                u.nwc_connection_string
+                u.billing_tax_id
             FROM users u
             INNER JOIN vm ON u.id = vm.user_id
             WHERE vm.deleted = 0 
@@ -3751,7 +3749,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
-                u.nwc_connection_string,
+                EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
             FROM users u
@@ -3831,7 +3829,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
-                u.nwc_connection_string,
+                EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
             FROM users u

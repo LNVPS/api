@@ -2772,6 +2772,7 @@ impl lnvps_db::AdminDb for MockDb {
                 user_info: u.clone(),
                 vm_count: 0,
                 is_admin: false,
+                has_nwc: false,
             })
             .collect();
         Ok((paginated_users, total))
@@ -3438,6 +3439,58 @@ impl LNVPSNostrDb for MockDb {
 mod tests {
     use super::*;
     use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+
+    /// user_payment_method CRUD + provider filter via the mock DB.
+    #[tokio::test]
+    async fn test_user_payment_method_crud() {
+        use lnvps_db::UserPaymentMethod;
+
+        let db = MockDb::default();
+        let mk = |user_id: u64, provider: &str, default: bool| UserPaymentMethod {
+            id: 0,
+            user_id,
+            created: Utc::now(),
+            provider: provider.to_string(),
+            external_customer_id: Some("cust".to_string().into()),
+            external_id: "pm".to_string().into(),
+            card_brand: Some("VISA".to_string()),
+            card_last_four: Some("5709".to_string()),
+            exp_month: Some(12),
+            exp_year: Some(2029),
+            is_default: default,
+            enabled: true,
+        };
+
+        // Insert two revolut methods (2nd is default) + one other provider
+        let id1 = db.insert_user_payment_method(&mk(1, "revolut", false)).await.unwrap();
+        let id2 = db.insert_user_payment_method(&mk(1, "revolut", true)).await.unwrap();
+        let _id3 = db.insert_user_payment_method(&mk(1, "stripe", false)).await.unwrap();
+        assert_ne!(id1, id2);
+
+        // Provider filter + default-first ordering
+        let revolut = db.list_user_payment_methods(1, Some("revolut")).await.unwrap();
+        assert_eq!(revolut.len(), 2);
+        assert_eq!(revolut[0].id, id2, "default method should sort first");
+
+        // All providers for the user
+        let all = db.list_user_payment_methods(1, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Get one
+        let got = db.get_user_payment_method(id1).await.unwrap();
+        assert_eq!(got.provider, "revolut");
+
+        // Update (disable it)
+        let mut upd = got.clone();
+        upd.enabled = false;
+        db.update_user_payment_method(&upd).await.unwrap();
+        assert!(!db.get_user_payment_method(id1).await.unwrap().enabled);
+
+        // Delete
+        db.delete_user_payment_method(id1).await.unwrap();
+        assert!(db.get_user_payment_method(id1).await.is_err());
+        assert_eq!(db.list_user_payment_methods(1, Some("revolut")).await.unwrap().len(), 1);
+    }
 
     /// Build a minimal SubscriptionPayment for the default mock subscription (id=1).
     fn make_payment(subscription_id: u64, time_value: Option<u64>) -> SubscriptionPayment {

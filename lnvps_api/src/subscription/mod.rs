@@ -122,6 +122,11 @@ impl SubscriptionHandler {
         self.db.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_revolut_for_test(&mut self, r: Arc<dyn FiatPaymentService>) {
+        self.revolut = Some(r);
+    }
+
     pub async fn make_line_item_handler(
         &self,
         li: &SubscriptionLineItem,
@@ -556,7 +561,11 @@ impl SubscriptionHandler {
                     // default saved Revolut payment method — no customer
                     // interaction.
                     let method = self.default_revolut_payment_method(user.id).await?;
-                    let customer_id: String = method.external_customer_id.clone().into();
+                    let customer_id: String = method
+                        .external_customer_id
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Revolut method missing customer id"))?
+                        .into();
                     let payment_method_id: String = method.external_id.clone().into();
                     let info = rev
                         .charge_subscription(
@@ -758,16 +767,60 @@ impl SubscriptionHandler {
         }
     }
 
+    /// The user's default usable (enabled, non-expired) saved payment method,
+    /// across all providers. Methods are ordered default-first.
+    pub async fn default_payment_method(&self, user_id: u64) -> Result<UserPaymentMethod> {
+        let now = Utc::now();
+        let (year, month) = (now.year() as u16, now.month() as u16);
+        self.db
+            .list_user_payment_methods(user_id, None)
+            .await?
+            .into_iter()
+            .find(|pm| pm.enabled && !pm.is_expired(year, month))
+            .ok_or_else(|| anyhow::anyhow!("No usable saved payment method"))
+    }
+
+    /// The user's first enabled NWC payment method.
+    async fn nwc_payment_method(&self, user_id: u64) -> Result<UserPaymentMethod> {
+        self.db
+            .list_user_payment_methods(user_id, Some("nwc"))
+            .await?
+            .into_iter()
+            .find(|pm| pm.enabled)
+            .ok_or_else(|| anyhow::anyhow!("No NWC payment method configured"))
+    }
+
+    /// Attempt automatic renewal using the user's default saved payment method,
+    /// dispatching by provider (NWC Lightning wallet or Revolut card).
+    pub async fn auto_renew(&self, sub_id: u64) -> Result<SubscriptionPayment> {
+        let sub = self.db.get_subscription(sub_id).await?;
+        let method = self.default_payment_method(sub.user_id).await?;
+        match method.provider.as_str() {
+            "nwc" => {
+                #[cfg(feature = "nostr-nwc")]
+                {
+                    self.auto_renew_via_nwc(sub_id).await
+                }
+                #[cfg(not(feature = "nostr-nwc"))]
+                {
+                    bail!("NWC auto-renewal is not supported by this build")
+                }
+            }
+            "revolut" => self.auto_renew_via_revolut(sub_id).await,
+            other => bail!("No auto-renewal handler for provider {other}"),
+        }
+    }
+
     #[cfg(feature = "nostr-nwc")]
-    /// Attempt automatic renewal via Nostr Wallet Connect
-    pub async fn auto_renew_via_nwc(
-        &self,
-        sub_id: u64,
-        nwc_string: &str,
-    ) -> Result<SubscriptionPayment> {
+    /// Attempt automatic renewal via the user's saved Nostr Wallet Connect method
+    pub async fn auto_renew_via_nwc(&self, sub_id: u64) -> Result<SubscriptionPayment> {
         use nostr_sdk::prelude::*;
 
         debug!("Attempting automatic renewal for sub {} via NWC", sub_id);
+
+        let sub = self.db.get_subscription(sub_id).await?;
+        let nwc_method = self.nwc_payment_method(sub.user_id).await?;
+        let nwc_string: String = nwc_method.external_id.clone().into();
 
         // Use existing renew_subscription method to create the payment/invoice
         let vm_payment = self
@@ -782,8 +835,8 @@ impl SubscriptionHandler {
         );
 
         // Parse NWC connection string
-        let nwc_uri =
-            NostrWalletConnectUri::from_str(nwc_string).context("Invalid NWC connection string")?;
+        let nwc_uri = NostrWalletConnectUri::from_str(&nwc_string)
+            .context("Invalid NWC connection string")?;
 
         // Create nostr client for NWC
         let client = nwc::NostrWalletConnect::new(nwc_uri);
@@ -928,7 +981,7 @@ mod revolut_autorenew_tests {
             user_id,
             created: Utc::now(),
             provider: "revolut".to_string(),
-            external_customer_id: customer_id.into(),
+            external_customer_id: Some(customer_id.into()),
             external_id: payment_method_id.into(),
             card_brand: Some("VISA".to_string()),
             card_last_four: Some("5709".to_string()),
@@ -992,5 +1045,291 @@ mod revolut_autorenew_tests {
         let stored = db.list_subscription_payments(sub_id).await?;
         assert!(stored.iter().any(|p| p.id == payment.id));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod revolut_offline_tests {
+    use super::*;
+    use crate::mocks::MockNode;
+    use crate::settings::mock_settings;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{
+        IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, UserPaymentMethod,
+    };
+    use payments_rs::currency::CurrencyAmount;
+    use payments_rs::fiat::{FiatPaymentInfo, LineItem, SubscriptionPaymentInfo};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    /// A FiatPaymentService mock that records calls for assertions.
+    #[derive(Default)]
+    struct MockFiat {
+        charged: Mutex<Vec<(String, String, u64)>>,
+        created_subscription: Mutex<bool>,
+        created_order: Mutex<bool>,
+    }
+
+    impl FiatPaymentService for MockFiat {
+        fn create_order(
+            &self,
+            _d: &str,
+            _amount: CurrencyAmount,
+            _li: Option<Vec<LineItem>>,
+        ) -> Pin<Box<dyn Future<Output = Result<FiatPaymentInfo>> + Send>> {
+            *self.created_order.lock().unwrap() = true;
+            Box::pin(async {
+                Ok(FiatPaymentInfo {
+                    external_id: "order_mock".to_string(),
+                    raw_data: "{}".to_string(),
+                })
+            })
+        }
+        fn cancel_order(&self, _id: &str) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn create_subscription(
+            &self,
+            _d: &str,
+            _a: CurrencyAmount,
+            _e: Option<String>,
+            _li: Option<Vec<LineItem>>,
+        ) -> Pin<Box<dyn Future<Output = Result<SubscriptionPaymentInfo>> + Send>> {
+            *self.created_subscription.lock().unwrap() = true;
+            Box::pin(async {
+                Ok(SubscriptionPaymentInfo {
+                    external_id: "sub_mock".to_string(),
+                    customer_id: Some("cust_mock".to_string()),
+                    payment_method_id: None,
+                    checkout_url: Some("https://checkout".to_string()),
+                    raw_data: "{}".to_string(),
+                })
+            })
+        }
+        fn charge_subscription(
+            &self,
+            customer_id: &str,
+            payment_method_id: &str,
+            amount: CurrencyAmount,
+            _d: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<FiatPaymentInfo>> + Send>> {
+            self.charged.lock().unwrap().push((
+                customer_id.to_string(),
+                payment_method_id.to_string(),
+                amount.value(),
+            ));
+            Box::pin(async {
+                Ok(FiatPaymentInfo {
+                    external_id: "charge_mock".to_string(),
+                    raw_data: "{}".to_string(),
+                })
+            })
+        }
+    }
+
+    fn mk_method(user_id: u64, cust: &str, pm: &str, default: bool, enabled: bool, exp: (u16, u16)) -> UserPaymentMethod {
+        UserPaymentMethod {
+            id: 0,
+            user_id,
+            created: Utc::now(),
+            provider: "revolut".to_string(),
+            external_customer_id: Some(cust.to_string().into()),
+            external_id: pm.to_string().into(),
+            card_brand: Some("VISA".to_string()),
+            card_last_four: Some("5709".to_string()),
+            exp_month: Some(exp.1),
+            exp_year: Some(exp.0),
+            is_default: default,
+            enabled,
+        }
+    }
+
+    async fn setup(auto_renew: bool) -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: auto_renew,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 999,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            Arc::new(MockExchangeRate::default()),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        (db, sub, user_id, sub_id)
+    }
+
+    #[tokio::test]
+    async fn test_default_revolut_payment_method_selection() {
+        let (db, sub, user_id, _sub_id) = setup(true).await;
+
+        // No methods -> error
+        assert!(sub.default_revolut_payment_method(user_id).await.is_err());
+
+        // Default enabled non-expired method is chosen
+        let d = db
+            .insert_user_payment_method(&mk_method(user_id, "cA", "pA", true, true, (2999, 12)))
+            .await
+            .unwrap();
+        let got = sub.default_revolut_payment_method(user_id).await.unwrap();
+        assert_eq!(got.id, d);
+
+        // Expire the default; add a non-default enabled non-expired one -> that is chosen
+        let mut expired = db.get_user_payment_method(d).await.unwrap();
+        expired.exp_year = Some(2000);
+        db.update_user_payment_method(&expired).await.unwrap();
+        let good = db
+            .insert_user_payment_method(&mk_method(user_id, "cB", "pB", false, true, (2999, 12)))
+            .await
+            .unwrap();
+        assert_eq!(sub.default_revolut_payment_method(user_id).await.unwrap().id, good);
+
+        // Disable all remaining -> error
+        let mut g = db.get_user_payment_method(good).await.unwrap();
+        g.enabled = false;
+        db.update_user_payment_method(&g).await.unwrap();
+        assert!(sub.default_revolut_payment_method(user_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_auto_renew_via_revolut_offline() {
+        let (db, mut sub, user_id, sub_id) = setup(true).await;
+        db.insert_user_payment_method(&mk_method(user_id, "cust1", "pm1", true, true, (2999, 12)))
+            .await
+            .unwrap();
+        let fiat = Arc::new(MockFiat::default());
+        sub.set_revolut_for_test(fiat.clone());
+
+        let payment = sub.auto_renew_via_revolut(sub_id).await.unwrap();
+        assert_eq!(payment.payment_method, PaymentMethod::Revolut);
+        assert_eq!(payment.currency, "EUR");
+        assert_eq!(payment.amount, 999);
+
+        let charged = fiat.charged.lock().unwrap();
+        assert_eq!(charged.len(), 1);
+        assert_eq!(charged[0].0, "cust1");
+        assert_eq!(charged[0].1, "pm1");
+
+        // Payment row persisted
+        assert!(db
+            .list_subscription_payments(sub_id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.id == payment.id));
+    }
+
+    #[tokio::test]
+    async fn test_auto_renew_via_revolut_no_method_errors() {
+        let (_db, mut sub, _user_id, sub_id) = setup(true).await;
+        sub.set_revolut_for_test(Arc::new(MockFiat::default()));
+        assert!(sub.auto_renew_via_revolut(sub_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_auto_renew_dispatches_by_provider() {
+        // Default method is a revolut card -> auto_renew dispatches to Revolut.
+        let (db, mut sub, user_id, sub_id) = setup(true).await;
+        db.insert_user_payment_method(&mk_method(user_id, "cust1", "pm1", true, true, (2999, 12)))
+            .await
+            .unwrap();
+        let fiat = Arc::new(MockFiat::default());
+        sub.set_revolut_for_test(fiat.clone());
+
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert_eq!(payment.payment_method, PaymentMethod::Revolut);
+        assert_eq!(fiat.charged.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_default_payment_method_prefers_default_flag() {
+        // NWC is the default even though a revolut method also exists.
+        let (db, sub, user_id, _sub_id) = setup(true).await;
+        let nwc = UserPaymentMethod {
+            id: 0,
+            user_id,
+            created: Utc::now(),
+            provider: "nwc".to_string(),
+            external_customer_id: None,
+            external_id: "nostr+walletconnect://x".to_string().into(),
+            card_brand: None,
+            card_last_four: None,
+            exp_month: None,
+            exp_year: None,
+            is_default: true,
+            enabled: true,
+        };
+        db.insert_user_payment_method(&nwc).await.unwrap();
+        db.insert_user_payment_method(&mk_method(user_id, "c", "p", false, true, (2999, 12)))
+            .await
+            .unwrap();
+
+        let got = sub.default_payment_method(user_id).await.unwrap();
+        assert_eq!(got.provider, "nwc");
+    }
+
+    #[tokio::test]
+    async fn test_create_revolut_order_saves_when_no_method() {
+        // auto-renew on, no saved method -> create_subscription (savable checkout)
+        let (_db, mut sub, _user_id, sub_id) = setup(true).await;
+        let fiat = Arc::new(MockFiat::default());
+        sub.set_revolut_for_test(fiat.clone());
+
+        sub.renew_subscription(sub_id, PaymentMethod::Revolut, 1)
+            .await
+            .unwrap();
+        assert!(*fiat.created_subscription.lock().unwrap());
+        assert!(!*fiat.created_order.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_revolut_order_plain_when_method_exists() {
+        // A saved method already exists -> plain create_order (no re-save)
+        let (db, mut sub, user_id, sub_id) = setup(true).await;
+        db.insert_user_payment_method(&mk_method(user_id, "cust1", "pm1", true, true, (2999, 12)))
+            .await
+            .unwrap();
+        let fiat = Arc::new(MockFiat::default());
+        sub.set_revolut_for_test(fiat.clone());
+
+        sub.renew_subscription(sub_id, PaymentMethod::Revolut, 1)
+            .await
+            .unwrap();
+        assert!(*fiat.created_order.lock().unwrap());
+        assert!(!*fiat.created_subscription.lock().unwrap());
     }
 }

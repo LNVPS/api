@@ -167,6 +167,15 @@ async fn validate_lightning_address(addr: &str) -> Result<(), ApiError> {
 }
 
 /// Generate a random 8-character base63 referral code (A-Za-z0-9_)
+/// Whether the user has an enabled NWC payment method configured.
+async fn user_has_nwc(this: &RouterState, uid: u64) -> bool {
+    this.db
+        .list_user_payment_methods(uid, Some("nwc"))
+        .await
+        .map(|m| m.iter().any(|pm| pm.enabled))
+        .unwrap_or(false)
+}
+
 fn generate_referral_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
     let bytes: [u8; 8] = rand::random();
@@ -230,12 +239,9 @@ async fn v1_signup_referral(
         validate_lightning_address(addr).await?;
     }
 
-    // If use_nwc is requested, ensure user has NWC configured
-    if req.use_nwc {
-        let user = this.db.get_user(uid).await?;
-        if user.nwc_connection_string.is_none() {
-            return ApiData::err("NWC connection is not configured on your account");
-        }
+    // If use_nwc is requested, ensure user has an NWC payment method configured
+    if req.use_nwc && !user_has_nwc(&this, uid).await {
+        return ApiData::err("NWC connection is not configured on your account");
     }
 
     let code = generate_referral_code();
@@ -276,11 +282,8 @@ async fn v1_update_referral(
         referral.lightning_address = addr.clone();
     }
     if let Some(use_nwc) = req.use_nwc {
-        if use_nwc {
-            let user = this.db.get_user(uid).await?;
-            if user.nwc_connection_string.is_none() {
-                return ApiData::err("NWC connection is not configured on your account");
-            }
+        if use_nwc && !user_has_nwc(&this, uid).await {
+            return ApiData::err("NWC connection is not configured on your account");
         }
         referral.use_nwc = use_nwc;
     }

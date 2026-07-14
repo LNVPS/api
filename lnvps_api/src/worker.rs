@@ -255,85 +255,31 @@ impl Worker {
             && expires < expiry_window
             && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS))
         {
-            // Track whether NWC auto-renewal was attempted and succeeded (so we skip the
-            // generic "expiring soon" notification below).
+            // Attempt auto-renewal using the user's default saved payment method
+            // (NWC Lightning wallet or Revolut card), dispatched by provider.
             let mut auto_renewed = false;
 
-            #[cfg(feature = "nostr-nwc")]
             if sub.auto_renewal_enabled {
-                let user = self.db.get_user(sub.user_id).await?;
-                if let Some(ref nwc_connection) = user.nwc_connection_string {
-                    let nwc_string: String = nwc_connection.clone().into();
-                    if !nwc_string.is_empty() {
-                        info!(
-                            "Attempting auto-renewal for subscription {} via NWC",
-                            sub.id
-                        );
-                        match self
-                            .subscription_handler
-                            .auto_renew_via_nwc(sub.id, &nwc_string)
-                            .await
-                        {
-                            Ok(_) => {
-                                info!("Successfully auto-renewed subscription {} via NWC", sub.id);
-                                self.queue_notification(
-                                    sub.user_id,
-                                    format!("Your subscription has been automatically renewed via Nostr Wallet Connect.\n{}", sub_notification_descr),
-                                    Some(format!("[{}] Auto-Renewed", sub_notification_subject)),
-                                ).await;
-                                auto_renewed = true;
-                            }
-                            Err(e) => {
-                                warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
-                                self.queue_notification(
-                                    sub.user_id,
-                                    format!(
-                                        "Your subscription will expire soon.\nAutomatic renewal failed: '{}'\nPlease renew manually in the next {} day(s).\n{}",
-                                        e, BEFORE_EXPIRE_NOTIFICATION_DAYS, sub_notification_descr
-                                    ),
-                                    Some(format!("[{}] Expiring Soon", sub_notification_subject)),
-                                )
-                                    .await;
-                                auto_renewed = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Revolut fallback: if NWC auto-renewal did not run but the user has a
-            // saved Revolut payment method, charge it off-session.
-            #[cfg(feature = "revolut")]
-            if !auto_renewed && sub.auto_renewal_enabled {
-                let has_saved_method = self
+                let has_method = self
                     .db
-                    .list_user_payment_methods(sub.user_id, Some("revolut"))
+                    .list_user_payment_methods(sub.user_id, None)
                     .await
                     .map(|m| m.iter().any(|pm| pm.enabled))
                     .unwrap_or(false);
-                if has_saved_method {
-                    info!(
-                        "Attempting auto-renewal for subscription {} via Revolut saved card",
-                        sub.id
-                    );
-                    match self.subscription_handler.auto_renew_via_revolut(sub.id).await {
+                if has_method {
+                    info!("Attempting auto-renewal for subscription {}", sub.id);
+                    match self.subscription_handler.auto_renew(sub.id).await {
                         Ok(_) => {
-                            info!(
-                                "Successfully submitted Revolut auto-renewal for subscription {}",
-                                sub.id
-                            );
+                            info!("Successfully auto-renewed subscription {}", sub.id);
                             self.queue_notification(
                                 sub.user_id,
-                                format!("Your subscription is being automatically renewed using your saved card.\n{}", sub_notification_descr),
+                                format!("Your subscription is being automatically renewed using your saved payment method.\n{}", sub_notification_descr),
                                 Some(format!("[{}] Auto-Renewed", sub_notification_subject)),
                             ).await;
                             auto_renewed = true;
                         }
                         Err(e) => {
-                            warn!(
-                                "Revolut auto-renewal error for subscription {}: {}",
-                                sub.id, e
-                            );
+                            warn!("Auto-renewal error for subscription {}: {}", sub.id, e);
                             self.queue_notification(
                                 sub.user_id,
                                 format!(
@@ -350,7 +296,7 @@ impl Worker {
             }
 
             // Send a plain expiry warning whenever auto-renewal was not attempted
-            // (feature disabled, auto_renewal off, or no saved payment method).
+            // (auto_renewal off, or no saved payment method).
             if !auto_renewed {
                 self.queue_notification(
                     sub.user_id,
