@@ -116,7 +116,7 @@ impl MockDb {
             template_id: Some(template.id),
             custom_template_id: None,
             subscription_line_item_id: 1,
-            ssh_key_id: 1,
+            ssh_key_id: Some(1),
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
@@ -831,7 +831,9 @@ impl LNVpsDbBase for MockDb {
         if let Some(t) = vm.custom_template_id {
             self.get_custom_vm_template(t).await?;
         }
-        self.get_user_ssh_key(vm.ssh_key_id).await?;
+        if let Some(k) = vm.ssh_key_id {
+            self.get_user_ssh_key(k).await?;
+        }
         self.get_host_disk(vm.disk_id).await?;
 
         vms.insert(
@@ -848,6 +850,7 @@ impl LNVpsDbBase for MockDb {
         let mut vms = self.vms.lock().await;
         if let Some(vm) = vms.get_mut(&vm_id) {
             vm.deleted = true;
+            vm.ssh_key_id = None;
         }
         Ok(())
     }

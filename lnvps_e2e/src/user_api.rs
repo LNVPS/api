@@ -598,9 +598,34 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         let keys = body["data"].as_array().unwrap();
+        let created_key = keys
+            .iter()
+            .find(|k| k["id"].as_u64() == Some(key_id))
+            .expect("Created SSH key should appear in list");
         assert!(
-            keys.iter().any(|k| k["id"].as_u64() == Some(key_id)),
-            "Created SSH key should appear in list"
+            created_key["vms"].as_array().unwrap().is_empty(),
+            "Newly created SSH key should have no linked VMs"
+        );
+
+        // Delete the SSH key
+        let resp = client
+            .delete_auth(&format!("/api/v1/ssh-key/{}", key_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "SSH key deletion should succeed"
+        );
+
+        // Verify it no longer appears in the list
+        let resp = client.get_auth("/api/v1/ssh-key").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let keys = body["data"].as_array().unwrap();
+        assert!(
+            !keys.iter().any(|k| k["id"].as_u64() == Some(key_id)),
+            "Deleted SSH key should not appear in list"
         );
     }
 

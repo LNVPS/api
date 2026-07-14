@@ -523,7 +523,10 @@ impl AdminVmInfo {
         ref_code: Option<String>,
     ) -> anyhow::Result<Self> {
         let image = db.get_os_image(vm.image_id).await?;
-        let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+        let ssh_key = match vm.ssh_key_id {
+            Some(k) => Some(db.get_user_ssh_key(k).await?),
+            None => None,
+        };
         let ips = db.list_vm_ip_assignments(vm.id).await?;
 
         // Get template info and VM resources
@@ -650,8 +653,8 @@ impl AdminVmInfo {
             template_name,
             custom_template_id,
             is_standard_template,
-            ssh_key_id: vm.ssh_key_id,
-            ssh_key_name: ssh_key.name,
+            ssh_key_id: vm.ssh_key_id.unwrap_or(0),
+            ssh_key_name: ssh_key.map(|k| k.name).unwrap_or_default(),
             ip_addresses,
             running_state,
             auto_renewal_enabled: sub.auto_renewal_enabled,

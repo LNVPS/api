@@ -2116,7 +2116,7 @@ mod tests {
                 image_id: 1,
                 template_id: Some(1),
                 custom_template_id: None,
-                ssh_key_id: 1,
+                ssh_key_id: Some(1),
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
                 ..Default::default()

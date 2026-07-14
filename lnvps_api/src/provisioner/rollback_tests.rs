@@ -560,7 +560,7 @@ mod tests {
             host_id: 1,
             user_id: user.id,
             image_id: 1,
-            ssh_key_id: ssh_key.id,
+            ssh_key_id: Some(ssh_key.id),
             template_id: Some(1),
             custom_template_id: None,
             subscription_line_item_id: 0,

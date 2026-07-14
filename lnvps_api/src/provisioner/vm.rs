@@ -85,6 +85,9 @@ impl VmProvisioner {
         let template = self.db.get_vm_template(template_id).await?;
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
+        if ssh_key.user_id != user.id {
+            bail!("SSH key does not belong to this user");
+        }
 
         if !template.enabled {
             bail!("Cant create VM from disabled template");
@@ -155,7 +158,7 @@ impl VmProvisioner {
             template_id: Some(template.id),
             custom_template_id: None,
             subscription_line_item_id,
-            ssh_key_id: ssh_key.id,
+            ssh_key_id: Some(ssh_key.id),
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
@@ -200,6 +203,9 @@ impl VmProvisioner {
         let pricing = self.db.get_custom_pricing(template.pricing_id).await?;
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
+        if ssh_key.user_id != user.id {
+            bail!("SSH key does not belong to this user");
+        }
 
         if !pricing.enabled {
             bail!("Cant create VM from disabled custom pricing");
@@ -285,7 +291,7 @@ impl VmProvisioner {
             template_id: None,
             custom_template_id: Some(template_id),
             subscription_line_item_id,
-            ssh_key_id: ssh_key.id,
+            ssh_key_id: Some(ssh_key.id),
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             deleted: false,
@@ -1069,6 +1075,38 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_provision_rejects_foreign_ssh_key() -> Result<()> {
+        env_logger::try_init().ok();
+        let settings = settings();
+        let db = Arc::new(MockDb::default());
+        let prov = VmProvisioner::new(settings.clone(), db.clone());
+
+        let template = VmTemplate {
+            id: 0,
+            name: "mock-template".to_string(),
+            enabled: true,
+            cost_plan_id: 1,
+            region_id: 1,
+            ..Default::default()
+        };
+        let id = db.insert_vm_template(&template).await?;
+
+        // Two separate users, each with their own SSH key
+        let (user_a, _key_a) = add_user(&db).await?;
+        let (_user_b, key_b) = add_user(&db).await?;
+
+        // user_a tries to order a VM using user_b's SSH key
+        let res = prov.provision(user_a.id, id, 1, key_b.id, None).await;
+        assert!(res.is_err());
+        let msg = res.unwrap_err().to_string().to_lowercase();
+        assert!(
+            msg.contains("ssh key does not belong"),
+            "unexpected error: {msg}"
+        );
+        Ok(())
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /// Build a minimal provisioner backed by the given MockDb (no DNS, no rates needed).
@@ -1187,7 +1225,7 @@ mod tests {
                 template_id: Some(1),
                 custom_template_id: None,
                 subscription_line_item_id,
-                ssh_key_id: ssh_key.id,
+                ssh_key_id: Some(ssh_key.id),
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
                 deleted: false,
@@ -1351,7 +1389,7 @@ mod tests {
                 image_id: 1,
                 template_id: None,
                 custom_template_id: Some(custom_tpl_id),
-                ssh_key_id: ssh_key.id,
+                ssh_key_id: Some(ssh_key.id),
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:f0".to_string(),
                 deleted: false,
@@ -1599,7 +1637,7 @@ mod tests {
                 template_id: None,
                 custom_template_id: Some(custom_template_id),
                 subscription_line_item_id,
-                ssh_key_id: ssh_key.id,
+                ssh_key_id: Some(ssh_key.id),
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
                 deleted: false,
@@ -1822,7 +1860,7 @@ mod tests {
                 template_id: None,
                 custom_template_id: Some(custom_template_id),
                 subscription_line_item_id,
-                ssh_key_id: ssh_key.id,
+                ssh_key_id: Some(ssh_key.id),
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
                 deleted: false,
@@ -2022,7 +2060,7 @@ mod tests {
                 template_id: None,
                 custom_template_id: Some(small_template_id),
                 subscription_line_item_id,
-                ssh_key_id: ssh_key.id,
+                ssh_key_id: Some(ssh_key.id),
                 disk_id: 1,
                 mac_address: "aa:bb:cc:dd:ee:f1".to_string(),
                 deleted: false,

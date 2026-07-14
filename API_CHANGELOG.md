@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-14** - `DELETE /api/v1/ssh-key/{id}` — remove a saved SSH key from the account. Only the key's owner may delete it.
+- **2026-07-14** - `GET /api/v1/ssh-key` now includes a `vms` field on each key: the list of the user's active (non-deleted) VM IDs currently using that SSH key.
+- **2026-07-14** - VM orders now validate that the supplied `ssh_key_id` belongs to the requesting user (previously any existing key id was accepted). Ordering a VM continues to require a valid `ssh_key_id`.
+- **2026-07-14** - When a VM is deleted its SSH key reference is now cleared (`vm.ssh_key_id` is nullable), so an SSH key that was only ever used by now-deleted VMs can be removed via `DELETE /api/v1/ssh-key/{id}` instead of failing with a foreign-key error.
+
 - **2026-07-14** - Unified saved payment methods + Revolut auto-renewal
   - Subscriptions with `auto_renewal_enabled` are now renewed automatically by charging the user's **default** saved payment method, dispatched by provider: Nostr Wallet Connect (Lightning) or a saved Revolut card charged off-session (merchant-initiated). Closes #159.
   - Saved methods live in a new provider-agnostic `user_payment_method` table (one-to-many per user, with `is_default` and `enabled`). NWC and Revolut are both modelled as payment methods, so users can keep several and choose which is the default. Only opaque provider token references are stored, encrypted at rest, alongside non-sensitive card metadata (brand, last 4, expiry) for display + expiry handling — never card PAN/CVV.

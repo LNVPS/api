@@ -1057,8 +1057,8 @@ pub struct Vm {
     pub custom_template_id: Option<u64>,
     /// The subscription line item managing billing for this VM (mirrors ip_range_subscription pattern)
     pub subscription_line_item_id: u64,
-    /// Users ssh-key assigned to this VM
-    pub ssh_key_id: u64,
+    /// Users ssh-key assigned to this VM (None once the VM is deleted)
+    pub ssh_key_id: Option<u64>,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
     /// Network MAC address

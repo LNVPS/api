@@ -242,7 +242,10 @@ pub async fn vm_to_status(
     state: Option<VmRunningState>,
 ) -> Result<ApiVmStatus> {
     let image = db.get_os_image(vm.image_id).await?;
-    let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+    let ssh_key: ApiUserSshKey = match vm.ssh_key_id {
+        Some(k) => db.get_user_ssh_key(k).await?.into(),
+        None => ApiUserSshKey::default(),
+    };
     let ips = db.list_vm_ip_assignments(vm.id).await?;
     let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
     let ip_ranges: Vec<_> = ip_range_ids.iter().map(|i| db.get_ip_range(*i)).collect();
@@ -275,7 +278,7 @@ pub async fn vm_to_status(
         mac_address: vm.mac_address,
         image: image.into(),
         template,
-        ssh_key: ssh_key.into(),
+        ssh_key,
         status: state.unwrap_or_default(),
         ip_assignments: ips
             .into_iter()
@@ -546,11 +549,13 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct ApiUserSshKey {
     pub id: u64,
     pub name: String,
     pub created: DateTime<Utc>,
+    /// IDs of the user's active VMs currently using this SSH key
+    pub vms: Vec<u64>,
 }
 
 impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
@@ -559,6 +564,7 @@ impl From<lnvps_db::UserSshKey> for ApiUserSshKey {
             id: ssh_key.id,
             name: ssh_key.name,
             created: ssh_key.created,
+            vms: vec![],
         }
     }
 }

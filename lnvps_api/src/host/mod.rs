@@ -1,5 +1,5 @@
 use crate::settings::ProvisionerConfig;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::future::join_all;
 use lnvps_api_common::VmRunningState;
@@ -164,7 +164,10 @@ impl FullVmInfo {
         let host = db.get_host(vm.host_id).await?;
         let image = db.get_os_image(vm.image_id).await?;
         let disk = db.get_host_disk(vm.disk_id).await?;
-        let ssh_key = db.get_user_ssh_key(vm.ssh_key_id).await?;
+        let ssh_key_id = vm
+            .ssh_key_id
+            .ok_or_else(|| anyhow!("VM {} has no SSH key assigned", vm_id))?;
+        let ssh_key = db.get_user_ssh_key(ssh_key_id).await?;
         let ips = db.list_vm_ip_assignments(vm_id).await?;
 
         let ip_range_ids: HashSet<u64> = ips.iter().map(|i| i.ip_range_id).collect();
@@ -365,7 +368,7 @@ mod tests {
                 template_id: Some(template.id),
                 custom_template_id: None,
                 subscription_line_item_id: 0,
-                ssh_key_id: 1,
+                ssh_key_id: Some(1),
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 deleted: false,

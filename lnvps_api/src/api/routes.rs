@@ -2,7 +2,7 @@ use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{any, get, patch, post};
+use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
@@ -87,6 +87,7 @@ pub fn routes() -> Router<RouterState> {
             "/api/v1/ssh-key",
             get(v1_list_ssh_keys).post(v1_add_ssh_key),
         )
+        .route("/api/v1/ssh-key/{id}", delete(v1_delete_ssh_key))
         .route("/api/v1/vm", post(v1_create_vm_order))
         .route("/api/v1/vm/{id}/renew", get(v1_renew_vm))
         .route("/api/v1/vm/{id}/renew-lnurlp", get(v1_renew_vm_lnurlp))
@@ -657,7 +658,7 @@ async fn v1_patch_vm(
         if ssh_key.user_id != uid {
             return Err(ApiError::forbidden("SSH key doesnt belong to you"));
         }
-        vm.ssh_key_id = ssh_key.id;
+        vm.ssh_key_id = Some(ssh_key.id);
         vm_config = true;
         host_config = true;
     }
@@ -862,12 +863,21 @@ async fn v1_list_ssh_keys(
     State(this): State<RouterState>,
 ) -> ApiResult<Vec<ApiUserSshKey>> {
     let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+    let vms = this.db.list_user_vms(uid).await?;
     let ret = this
         .db
         .list_user_ssh_key(uid)
         .await?
         .into_iter()
-        .map(|i| i.into())
+        .map(|i| {
+            let mut key: ApiUserSshKey = i.into();
+            key.vms = vms
+                .iter()
+                .filter(|vm| !vm.deleted && vm.ssh_key_id == Some(key.id))
+                .map(|vm| vm.id)
+                .collect();
+            key
+        })
         .collect();
     ApiData::ok(ret)
 }
@@ -902,6 +912,23 @@ async fn v1_add_ssh_key(
     new_key.id = key_id;
 
     ApiData::ok(new_key.into())
+}
+
+/// Delete an SSH key from account
+async fn v1_delete_ssh_key(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+
+    let ssh_key = this.db.get_user_ssh_key(id).await?;
+    if ssh_key.user_id != uid {
+        return ApiData::err("SSH key not found");
+    }
+
+    this.db.delete_user_ssh_key(id).await?;
+    ApiData::ok(())
 }
 
 /// Create a new VM order

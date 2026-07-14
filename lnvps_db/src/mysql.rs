@@ -411,8 +411,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
-    async fn delete_user_ssh_key(&self, _id: u64) -> DbResult<()> {
-        todo!()
+    async fn delete_user_ssh_key(&self, id: u64) -> DbResult<()> {
+        sqlx::query("delete from user_ssh_key where id=?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn list_user_ssh_key(&self, user_id: u64) -> DbResult<Vec<UserSshKey>> {
@@ -878,7 +882,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
-        sqlx::query("update vm set deleted = 1 where id = ?")
+        sqlx::query("update vm set deleted = 1, ssh_key_id = null where id = ?")
             .bind(vm_id)
             .execute(&self.db)
             .await?;

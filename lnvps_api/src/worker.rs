@@ -3065,7 +3065,7 @@ mod tests {
             image_id: 1,
             template_id: Some(1),
             custom_template_id: None,
-            ssh_key_id,
+            ssh_key_id: Some(ssh_key_id),
             subscription_line_item_id: line_item_ids[0],
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
