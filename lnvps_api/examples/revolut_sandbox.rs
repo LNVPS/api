@@ -112,12 +112,7 @@ async fn main() -> Result<()> {
             // customer (via email) + save_payment_method_for=merchant so the
             // card is saved for future off-session charges.
             let info = api
-                .create_subscription(
-                    "LNVPS auto-renewal sandbox test",
-                    amt,
-                    Some(email),
-                    None,
-                )
+                .create_subscription("LNVPS auto-renewal sandbox test", amt, Some(email), None)
                 .await?;
             println!("ORDER_ID={}", info.external_id);
             println!(
@@ -129,7 +124,9 @@ async fn main() -> Result<()> {
             let token = checkout_url.rsplit('/').next().unwrap_or("").to_string();
             println!("TOKEN={}", token);
             println!("CHECKOUT_URL={}", checkout_url);
-            println!("--> Save a card via the widget (savePaymentMethodFor=merchant), then run `status`.");
+            println!(
+                "--> Save a card via the widget (savePaymentMethodFor=merchant), then run `status`."
+            );
         }
         Cmd::Status { order_id } => {
             let order = api.get_order(&order_id).await?;
@@ -147,7 +144,10 @@ async fn main() -> Result<()> {
                     println!("PAYMENT_METHOD_ID=<none> (no merchant-initiated method saved yet)");
                 }
                 for m in methods {
-                    println!("PAYMENT_METHOD_ID={} TYPE={:?} SAVED_FOR={:?}", m.id, m.kind, m.saved_for);
+                    println!(
+                        "PAYMENT_METHOD_ID={} TYPE={:?} SAVED_FOR={:?}",
+                        m.id, m.kind, m.saved_for
+                    );
                 }
             }
         }

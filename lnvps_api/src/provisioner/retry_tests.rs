@@ -5,13 +5,13 @@
 
 #[cfg(test)]
 mod tests {
-    use lnvps_api_common::{BasicRecord, DnsRef, DnsServer, RecordType};
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::router::{ArpEntry, Router};
     use crate::settings::mock_settings;
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use lnvps_api_common::retry::{OpError, OpResult};
+    use lnvps_api_common::{BasicRecord, DnsRef, DnsServer, RecordType};
     use lnvps_api_common::{InMemoryRateCache, MockDb};
     use lnvps_db::{LNVpsDbBase, User, UserSshKey};
     use std::sync::Arc;

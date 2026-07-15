@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
 use crate::retry::{OpError, OpResult};
 use crate::{op_fatal, op_transient};
+use anyhow::{Result, anyhow};
 use log::debug;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
 use reqwest::{Client, Method, Request, RequestBuilder, Url};

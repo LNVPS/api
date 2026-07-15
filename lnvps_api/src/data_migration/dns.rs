@@ -1,7 +1,7 @@
 use crate::data_migration::DataMigration;
-use lnvps_api_common::{BasicRecord, DnsRef, get_dns_server};
 use crate::settings::Settings;
 use anyhow::Result;
+use lnvps_api_common::{BasicRecord, DnsRef, get_dns_server};
 use lnvps_db::{DnsServer, DnsServerKind, LNVpsDb, RouterKind};
 use log::warn;
 use std::future::Future;

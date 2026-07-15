@@ -185,9 +185,11 @@ impl NotificationChannel for WhatsAppChannel {
             .await
         {
             Ok(()) => Ok(()),
-            Err(e @ WhatsAppError::Api { permanent: true, .. }) => {
-                Err(OpError::Fatal(anyhow::Error::msg(e.to_string())))
-            }
+            Err(
+                e @ WhatsAppError::Api {
+                    permanent: true, ..
+                },
+            ) => Err(OpError::Fatal(anyhow::Error::msg(e.to_string()))),
             Err(e) => Err(OpError::Transient(anyhow::Error::msg(e.to_string()))),
         }
     }

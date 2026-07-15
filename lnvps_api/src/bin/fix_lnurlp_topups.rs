@@ -327,10 +327,7 @@ async fn plan_and_apply(
     }
 
     let time_value = payment.time_value.unwrap_or(0);
-    let new_expiry = intended_sub
-        .expires
-        .map(|e| e.max(now))
-        .unwrap_or(now)
+    let new_expiry = intended_sub.expires.map(|e| e.max(now)).unwrap_or(now)
         + chrono::Duration::seconds(time_value as i64);
 
     info!(

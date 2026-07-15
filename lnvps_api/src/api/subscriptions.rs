@@ -193,7 +193,9 @@ async fn v1_create_subscription(
             ApiCreateSubscriptionLineItemRequest::AsnSponsoring { asn: _ } => {
                 // TODO: Implement ASN sponsoring pricing lookup
                 // For now, return error
-                return Err(ApiError::not_implemented("ASN sponsoring not yet implemented"));
+                return Err(ApiError::not_implemented(
+                    "ASN sponsoring not yet implemented",
+                ));
             }
             ApiCreateSubscriptionLineItemRequest::DnsHosting { domain: _ } => {
                 // TODO: Implement DNS hosting pricing lookup

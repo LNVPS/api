@@ -5,8 +5,8 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use lnvps_api_common::{
-    ApiData, ApiDiskInterface, ApiDiskType, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult,
-    PageQuery,
+    ApiData, ApiDiskInterface, ApiDiskType, ApiError, ApiPaginatedData, ApiPaginatedResult,
+    ApiResult, PageQuery,
 };
 use lnvps_db::{AdminAction, AdminResource};
 use serde::Deserialize;
@@ -353,7 +353,10 @@ async fn admin_get_host_disk(
 
     // Verify disk belongs to this host
     if disk.host_id != host_id {
-        return Err(ApiError::not_found(format!("Disk {} does not belong to host {}", disk_id, host_id)));
+        return Err(ApiError::not_found(format!(
+            "Disk {} does not belong to host {}",
+            disk_id, host_id
+        )));
     }
 
     ApiData::ok(disk.into())
@@ -377,7 +380,10 @@ async fn admin_update_host_disk(
 
     // Verify disk belongs to this host
     if disk.host_id != host_id {
-        return Err(ApiError::not_found(format!("Disk {} does not belong to host {}", disk_id, host_id)));
+        return Err(ApiError::not_found(format!(
+            "Disk {} does not belong to host {}",
+            disk_id, host_id
+        )));
     }
 
     // Update fields if provided

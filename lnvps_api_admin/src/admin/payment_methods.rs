@@ -7,7 +7,9 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
+};
 use lnvps_db::{AdminAction, AdminResource};
 
 pub fn router() -> Router<RouterState> {
@@ -92,7 +94,9 @@ async fn admin_update_payment_method(
     // Update fields if provided
     if let Some(name) = &request.name {
         if name.trim().is_empty() {
-            return Err(ApiError::bad_request("Payment method config name cannot be empty"));
+            return Err(ApiError::bad_request(
+                "Payment method config name cannot be empty",
+            ));
         }
         config.name = name.trim().to_string();
     }

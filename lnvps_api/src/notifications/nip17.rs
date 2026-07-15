@@ -37,8 +37,7 @@ impl NotificationChannel for Nip17Channel {
             .signer()
             .await
             .map_err(|e| OpError::Transient(e.into()))?;
-        let pubkey =
-            PublicKey::from_slice(&user.pubkey).map_err(|e| OpError::Fatal(e.into()))?;
+        let pubkey = PublicKey::from_slice(&user.pubkey).map_err(|e| OpError::Fatal(e.into()))?;
         let ev = EventBuilder::private_msg(&sig, pubkey, notification.message.clone(), None)
             .await
             .map_err(|e| OpError::Transient(e.into()))?;

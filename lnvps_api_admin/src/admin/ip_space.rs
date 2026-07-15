@@ -344,7 +344,9 @@ async fn admin_get_ip_space_pricing(
 
     // Verify the pricing belongs to this space
     if pricing.available_ip_space_id != space_id {
-        return Err(ApiError::not_found("Pricing does not belong to the specified IP space"));
+        return Err(ApiError::not_found(
+            "Pricing does not belong to the specified IP space",
+        ));
     }
 
     let mut info = AdminIpSpacePricingInfo::from(pricing);
@@ -418,7 +420,9 @@ async fn admin_update_ip_space_pricing(
 
     // Verify the pricing belongs to this space
     if pricing.available_ip_space_id != space_id {
-        return Err(ApiError::not_found("Pricing does not belong to the specified IP space"));
+        return Err(ApiError::not_found(
+            "Pricing does not belong to the specified IP space",
+        ));
     }
 
     // Update fields if provided
