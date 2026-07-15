@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-15** - Admin management of users' saved payment methods
+  - New admin endpoints to list/inspect/edit/delete the payment methods users save for automatic renewals (NWC connections and off-session Revolut cards). Distinct from the existing `payment_methods` provider-config endpoints.
+    - `GET /api/admin/v1/user_payment_methods` — paginated list across all users; optional `user_id` filter (`user_payment_method::view`).
+    - `GET /api/admin/v1/user_payment_methods/{id}` — fetch one (`user_payment_method::view`).
+    - `PATCH /api/admin/v1/user_payment_methods/{id}` — set `name` (nullable), `is_default`, and/or `enabled` (`user_payment_method::update`).
+    - `DELETE /api/admin/v1/user_payment_methods/{id}` — remove a saved method (`user_payment_method::delete`).
+  - Responses expose only non-sensitive metadata (provider, label, card brand/last4/expiry, default/enabled) plus a `has_external_customer_id` flag; encrypted provider tokens / NWC strings are never returned.
+  - Adds the `AdminResource::UserPaymentMethod` (23) RBAC resource; a migration grants the full permission set to the default `super_admin` role.
+
+- **2026-07-15** - Save cards on demand and pay with a saved card
+  - Card-payment renewal/purchase requests now accept `save_card=true` to explicitly tokenize the entered card as a reusable payment method, **independent of `auto_renewal_enabled`**. Previously a card was only saved when auto-renewal happened to be enabled, so ticking a "save card" checkout box without auto-renewal saved nothing.
+  - Renewal requests now accept `method=saved` to charge an already-saved card directly (merchant-initiated, no checkout). An optional `payment_method_id` selects a specific saved card; omitted uses the user's default saved card.
+  - Applies to `POST /api/v1/vm/{id}/renew` and `POST /api/v1/subscriptions/{id}/renew` via the shared query params (`method`, `intervals`, `save_card`, `payment_method_id`).
+
 - **2026-07-15** - `GET /api/admin/v1/dns_servers/{id}/zones` (admin) — list the DNS zones available on a configured DNS server (`{ id, name }` per zone), for populating forward/reverse zone id pickers on IP ranges. Cloudflare returns its zones; OVH (reverse-only, zoneless) returns an empty list. Requires `dns_server::view`.
 
 - **2026-07-14** - `DELETE /api/v1/ssh-key/{id}` — remove a saved SSH key from the account. Only the key's owner may delete it.

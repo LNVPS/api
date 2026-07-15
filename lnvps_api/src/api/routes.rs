@@ -39,6 +39,7 @@ use crate::api::model::{
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, PricingEngine};
+use crate::subscription::RenewMode;
 
 pub fn routes() -> Router<RouterState> {
     Router::new()
@@ -1008,14 +1009,31 @@ async fn v1_renew_vm(
         this.sub_handler
             .auto_renew_via_nwc(vm_line.subscription_id)
             .await?
+    } else if q.method.as_deref() == Some("saved") {
+        // Pay directly with an already-saved card (merchant-initiated charge).
+        // `payment_method_id` selects a specific saved card; omitted uses the
+        // user's default saved card.
+        this.sub_handler
+            .renew_subscription_with_mode(
+                vm_line.subscription_id,
+                PaymentMethod::Revolut,
+                intervals,
+                RenewMode::SavedCard {
+                    method_id: q.payment_method_id,
+                },
+            )
+            .await?
     } else {
         this.sub_handler
-            .renew_subscription(
+            .renew_subscription_with_mode(
                 vm_line.subscription_id,
                 q.method
                     .and_then(|m| PaymentMethod::from_str(&m).ok())
                     .unwrap_or(PaymentMethod::Lightning),
                 intervals,
+                RenewMode::Interactive {
+                    save_card: q.save_card.unwrap_or(false),
+                },
             )
             .await?
     };

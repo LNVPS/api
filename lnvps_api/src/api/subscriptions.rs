@@ -1,5 +1,6 @@
 use crate::api::model::{ApiCreateSubscriptionRequest, ApiSubscription, ApiSubscriptionPayment};
 use crate::api::{PaymentMethodQuery, RouterState};
+use crate::subscription::RenewMode;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -280,16 +281,29 @@ async fn v1_renew_subscription(
         return Err(ApiError::forbidden("Access denied: not your subscription"));
     }
 
-    // Determine payment method
-    let method = q
-        .method
-        .and_then(|m| PaymentMethod::from_str(&m).ok())
-        .unwrap_or(PaymentMethod::Lightning);
+    // Pay directly with an already-saved card (merchant-initiated charge), or
+    // create an interactive payment (optionally saving the entered card).
+    let mode = if q.method.as_deref() == Some("saved") {
+        RenewMode::SavedCard {
+            method_id: q.payment_method_id,
+        }
+    } else {
+        RenewMode::Interactive {
+            save_card: q.save_card.unwrap_or(false),
+        }
+    };
+    let method = if q.method.as_deref() == Some("saved") {
+        PaymentMethod::Revolut
+    } else {
+        q.method
+            .and_then(|m| PaymentMethod::from_str(&m).ok())
+            .unwrap_or(PaymentMethod::Lightning)
+    };
 
     // Generate payment via provisioner
     let payment = this
         .sub_handler
-        .renew_subscription(id, method, 1)
+        .renew_subscription_with_mode(id, method, 1, mode)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
 

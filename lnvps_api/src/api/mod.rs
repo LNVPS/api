@@ -32,6 +32,12 @@ pub(crate) struct PaymentMethodQuery {
     pub method: Option<String>,
     /// Number of intervals to renew for (e.g., 2 means renew for 2x the normal period)
     pub intervals: Option<u32>,
+    /// For interactive card payments: save the entered card as a reusable
+    /// payment method for future use (independent of auto-renewal).
+    pub save_card: Option<bool>,
+    /// For `method=saved` off-session charges: the specific saved payment
+    /// method id to charge. Omitted selects the user's default saved card.
+    pub payment_method_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
