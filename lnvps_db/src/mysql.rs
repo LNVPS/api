@@ -1667,7 +1667,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 u.billing_city,
                 u.billing_state,
                 u.billing_postcode,
-                u.billing_tax_id
+                u.billing_tax_id,
+                u.geo_country_code,
+                u.geo_ip,
+                u.geo_updated
             FROM users u
             INNER JOIN vm ON u.id = vm.user_id
             WHERE vm.deleted = 0 
@@ -3552,6 +3555,9 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
+                u.geo_country_code,
+                u.geo_ip,
+                u.geo_updated,
                 EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
@@ -3632,6 +3638,9 @@ impl AdminDb for LNVpsDbMysql {
                 u.billing_state,
                 u.billing_postcode,
                 u.billing_tax_id,
+                u.geo_country_code,
+                u.geo_ip,
+                u.geo_updated,
                 EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
