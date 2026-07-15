@@ -9,7 +9,7 @@ use isocountry::CountryCode;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
 };
-use lnvps_db::{AdminAction, AdminResource, email_hash};
+use lnvps_db::{AdminAction, AdminResource, UserFilters, email_hash};
 use serde::Deserialize;
 
 pub fn router() -> Router<RouterState> {
@@ -54,7 +54,15 @@ async fn admin_get_user(
 struct ListUsersQuery {
     #[serde(flatten)]
     pub page: PageQuery,
+    /// Search by exact 64-character hex pubkey
     pub search: Option<String>,
+    /// Only users with at least one VM whose host is in this region
+    pub region_id: Option<u64>,
+    /// Only users with an active assignment to this admin role
+    /// (`super_admin`, `admin`, `read_only`)
+    pub role: Option<AdminUserRole>,
+    /// Filter by whether the user has any VMs
+    pub has_vms: Option<bool>,
 }
 
 /// List all users with pagination and filtering
@@ -70,11 +78,13 @@ async fn admin_list_users(
     let offset = query.page.offset.unwrap_or(0);
 
     // Get users with admin data in a single efficient query
-    let search_pubkey = query.search.as_deref();
-    let (db_admin_users, total) = this
-        .db
-        .admin_list_users(limit, offset, search_pubkey)
-        .await?;
+    let filters = UserFilters {
+        search_pubkey: query.search.clone(),
+        region_id: query.region_id,
+        role: query.role.map(|r| r.role_name().to_string()),
+        has_vms: query.has_vms,
+    };
+    let (db_admin_users, total) = this.db.admin_list_users(limit, offset, &filters).await?;
 
     ApiPaginatedData::ok(
         db_admin_users.into_iter().map(|u| u.into()).collect(),
@@ -189,11 +199,7 @@ async fn admin_update_user(
     if let Some(admin_role) = &req.admin_role {
         match admin_role {
             AdminUserRole::SuperAdmin | AdminUserRole::Admin | AdminUserRole::ReadOnly => {
-                let role_name = match admin_role {
-                    AdminUserRole::SuperAdmin => "super_admin",
-                    AdminUserRole::Admin => "admin",
-                    AdminUserRole::ReadOnly => "read_only",
-                };
+                let role_name = admin_role.role_name();
 
                 // Get the role by name
                 if let Ok(role) = this.db.get_role_by_name(role_name).await {

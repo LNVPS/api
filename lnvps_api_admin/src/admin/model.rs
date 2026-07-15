@@ -369,6 +369,17 @@ pub enum AdminUserRole {
     ReadOnly,
 }
 
+impl AdminUserRole {
+    /// The role's canonical name as stored in the `admin_roles` table.
+    pub fn role_name(&self) -> &'static str {
+        match self {
+            AdminUserRole::SuperAdmin => "super_admin",
+            AdminUserRole::Admin => "admin",
+            AdminUserRole::ReadOnly => "read_only",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WebSocketMessage {

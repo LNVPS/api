@@ -2718,7 +2718,7 @@ impl lnvps_db::AdminDb for MockDb {
         &self,
         limit: u64,
         offset: u64,
-        _search_pubkey: Option<&str>,
+        _filters: &lnvps_db::UserFilters,
     ) -> DbResult<(Vec<AdminUserInfo>, u64)> {
         let users = self.users.lock().await;
         let total = users.len() as u64;

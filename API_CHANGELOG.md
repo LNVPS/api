@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Admin user list gains region/role/has_vms filters
+  - `GET /api/admin/v1/users` accepts optional query params to narrow the list (combined with AND, alongside the existing `search` pubkey filter): `region_id` (only users with at least one non-deleted VM whose host is in that region), `role` (`super_admin`/`admin`/`read_only` — only users with an active assignment to that admin role), and `has_vms` (`true`/`false` — filter by whether the user has any non-deleted VMs). Requires `users::view`.
+
 - **2026-07-18** - Toggle subscription auto-renewal (user-facing)
   - `PATCH /api/v1/subscriptions/{id}` accepts optional `auto_renewal_enabled` to enable/disable automatic renewal on an existing subscription. Ownership is enforced (NIP-98). Returns the updated `ApiSubscription`. Previously auto-renewal could only be set at creation time (`POST /api/v1/subscriptions`) or via the admin API.
 

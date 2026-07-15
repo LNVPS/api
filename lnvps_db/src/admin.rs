@@ -2,6 +2,25 @@ use crate::{AdminRole, AdminRoleAssignment, DbResult, RegionStats};
 use async_trait::async_trait;
 use std::collections::HashSet;
 
+/// Filters for [`AdminDb::admin_list_users`].
+///
+/// All fields are optional; `None` means "don't filter on this field".
+/// Multiple filters are combined with AND.
+#[derive(Debug, Clone, Default)]
+pub struct UserFilters {
+    /// Search by exact 64-character hex pubkey.
+    pub search_pubkey: Option<String>,
+    /// Only include users who have at least one (non-deleted) VM whose host is
+    /// in this region.
+    pub region_id: Option<u64>,
+    /// Only include users with an active assignment to the admin role with this
+    /// name (e.g. `super_admin`, `admin`, `read_only`).
+    pub role: Option<String>,
+    /// Filter by whether the user has any (non-deleted) VMs.
+    /// `Some(true)` = only users with VMs, `Some(false)` = only users without.
+    pub has_vms: Option<bool>,
+}
+
 /// Database trait for admin/RBAC operations
 #[async_trait]
 pub trait AdminDb: Send + Sync {
@@ -72,7 +91,7 @@ pub trait AdminDb: Send + Sync {
         &self,
         limit: u64,
         offset: u64,
-        search_pubkey: Option<&str>,
+        filters: &UserFilters,
     ) -> DbResult<(Vec<crate::AdminUserInfo>, u64)>;
 
     /// Find a user by their email hash (SHA-256 of lowercased+trimmed email).

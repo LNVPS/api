@@ -3512,11 +3512,12 @@ impl AdminDb for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-        search_pubkey: Option<&str>,
+        filters: &crate::UserFilters,
     ) -> DbResult<(Vec<crate::AdminUserInfo>, u64)> {
-        let (where_clause, search_param) = if let Some(pubkey) = search_pubkey {
+        // Validate the pubkey search up front so we can return a clear error.
+        let search_param = if let Some(pubkey) = filters.search_pubkey.as_deref() {
             if pubkey.len() == 64 {
-                (" WHERE HEX(u.pubkey) = ? ", Some(pubkey.to_uppercase()))
+                Some(pubkey.to_uppercase())
             } else {
                 return Err(DbError::Source(
                     anyhow::anyhow!("Search only supports 64-character hex pubkeys")
@@ -3524,7 +3525,42 @@ impl AdminDb for LNVpsDbMysql {
                 ));
             }
         } else {
-            ("", None)
+            None
+        };
+
+        // Build WHERE conditions. The bind order below must match the order in
+        // which conditions are pushed here (and is reused for the count query).
+        let mut conditions: Vec<&str> = Vec::new();
+        if search_param.is_some() {
+            conditions.push("HEX(u.pubkey) = ?");
+        }
+        if filters.region_id.is_some() {
+            conditions.push(
+                "EXISTS(SELECT 1 FROM vm v \
+                 JOIN vm_host h ON v.host_id = h.id \
+                 WHERE v.user_id = u.id AND v.deleted = 0 AND h.region_id = ?)",
+            );
+        }
+        if filters.role.is_some() {
+            conditions.push(
+                "EXISTS(SELECT 1 FROM admin_role_assignments ara \
+                 JOIN admin_roles r ON ara.role_id = r.id \
+                 WHERE ara.user_id = u.id AND r.name = ? \
+                 AND (ara.expires_at IS NULL OR ara.expires_at > NOW()))",
+            );
+        }
+        if let Some(has_vms) = filters.has_vms {
+            conditions.push(if has_vms {
+                "EXISTS(SELECT 1 FROM vm v WHERE v.user_id = u.id AND v.deleted = 0)"
+            } else {
+                "NOT EXISTS(SELECT 1 FROM vm v WHERE v.user_id = u.id AND v.deleted = 0)"
+            });
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {} ", conditions.join(" AND "))
         };
 
         // Single query to get all user data with stats
@@ -3584,8 +3620,15 @@ impl AdminDb for LNVpsDbMysql {
 
         let mut query_builder = sqlx::query_as::<_, crate::AdminUserInfo>(&query);
 
+        // Bind filter params in the same order the conditions were pushed above.
         if let Some(ref pubkey_hex) = search_param {
-            query_builder = query_builder.bind(pubkey_hex);
+            query_builder = query_builder.bind(pubkey_hex.clone());
+        }
+        if let Some(region_id) = filters.region_id {
+            query_builder = query_builder.bind(region_id);
+        }
+        if let Some(ref role) = filters.role {
+            query_builder = query_builder.bind(role.clone());
         }
 
         let users = query_builder
@@ -3599,7 +3642,13 @@ impl AdminDb for LNVpsDbMysql {
         let mut count_query_builder = sqlx::query_scalar::<_, i64>(&count_query);
 
         if let Some(ref pubkey_hex) = search_param {
-            count_query_builder = count_query_builder.bind(pubkey_hex);
+            count_query_builder = count_query_builder.bind(pubkey_hex.clone());
+        }
+        if let Some(region_id) = filters.region_id {
+            count_query_builder = count_query_builder.bind(region_id);
+        }
+        if let Some(ref role) = filters.role {
+            count_query_builder = count_query_builder.bind(role.clone());
         }
 
         let total = count_query_builder.fetch_one(&self.db).await? as u64;

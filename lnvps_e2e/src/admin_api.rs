@@ -136,6 +136,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_list_users_with_filters() {
+        let client = setup().await;
+
+        // has_vms filter (both variants should succeed)
+        for has_vms in ["true", "false"] {
+            let resp = client
+                .get_auth(&format!("/api/admin/v1/users?has_vms={has_vms}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
+            let expect_vms = has_vms == "true";
+            for u in &data.data {
+                let has = u["vm_count"].as_u64().unwrap_or(0) > 0;
+                assert_eq!(has, expect_vms, "has_vms={has_vms} returned mismatched user");
+            }
+        }
+
+        // region_id filter
+        let resp = client
+            .get_auth("/api/admin/v1/users?region_id=1")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // role filter
+        let resp = client
+            .get_auth("/api/admin/v1/users?role=admin")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
+        for u in &data.data {
+            assert_eq!(u["is_admin"], Value::Bool(true));
+        }
+    }
+
+    #[tokio::test]
     async fn test_admin_get_user() {
         let client = setup().await;
         let resp = client
