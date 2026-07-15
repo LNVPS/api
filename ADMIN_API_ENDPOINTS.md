@@ -3082,6 +3082,68 @@ Response:
 }
 ```
 
+#### Profit/Loss Report
+
+```
+GET /api/admin/v1/reports/profit-loss
+```
+
+Aggregates paid revenue against tracked resource costs (see *Resource Cost
+Tracking*) into per-period profit/loss rows. **All amounts are converted into a
+single target currency** (the company's base currency by default) using current
+exchange rates, so each period yields one row. Recurring costs are normalized to
+each calendar month they are active; `ip_range` per-IP costs are multiplied by
+the range's current assigned-IP count; one-time (capital) costs are booked in
+the period containing their `billing_start`.
+
+Query Parameters:
+
+- `start_date`: string (required) - YYYY-MM-DD
+- `end_date`: string (required) - YYYY-MM-DD
+- `group_by`: `month` (default) | `year`
+- `company_id`: number (optional) - filter the revenue side to one company; `0`/omitted = all companies. Costs are global (not company-scoped) in this version.
+- `region_id`: number (optional) - filter both revenue (payment's VM region) and costs (host / IP-range region); `0`/omitted = all regions.
+- `currency`: string (optional) - target currency (e.g. `EUR`). Defaults to the selected company's base currency; **required when `company_id` is omitted**.
+
+Required Permission: `analytics::view`
+
+Response:
+
+```json
+{
+  "data": {
+    "start_date": "2026-01-01",
+    "end_date": "2026-12-31",
+    "group_by": "month",
+    "currency": "EUR",
+    "periods": [
+      {
+        "period": "2026-01",
+        "revenue_net": 480000,
+        "revenue_tax": 96000,
+        "cost_recurring": 8000,
+        "cost_one_time": 250000,
+        "cost_total": 258000,
+        "profit": 222000
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+
+- **Revenue uses each payment's stored historical `rate`** to reconstruct its
+  company-base-currency value (never live rates). A further base→report-currency
+  step only applies when aggregating companies with different base currencies.
+- **Costs** have no stored rate, so they are converted into the report `currency`
+  using current exchange rates (BTC-pivoted).
+- `profit = revenue_net - cost_total` and may be negative.
+- Amounts are in smallest currency units (cents for fiat, millisats for BTC).
+- Recurring-cost month normalization uses ~30.44 days/month for `day` intervals,
+  the interval count directly for `month`, and ×12 for `year`.
+- Payments/costs in a currency with no available exchange rate are skipped.
+
 ## Error Responses
 
 All error responses follow the format:
@@ -5154,3 +5216,105 @@ having newer active configurations.
   "notes": "IPv6 PI allocation from ARIN"
 }
 ```
+
+---
+
+## Resource Cost Tracking
+
+Optional, admin-only cost tracking (issue #82) used to compute profit/loss.
+Costs are stored in a single generic `resource_cost` table weakly linked to any
+resource via `(resource_type, resource_id)` — no schema change is needed to add
+new cost-bearing resource kinds, and a single resource may carry multiple cost
+records (e.g. a host with recurring rent **and** a one-time hardware investment).
+
+Cost data is **never** exposed to end users. All amounts are in the smallest
+currency units (cents for fiat, millisats for BTC). For an `ip_range` recurring
+cost, `amount` is the cost per single IP.
+
+**Permission resource:** `resource_cost` (Create/View/Update/Delete)
+
+### List Resource Costs
+
+`GET /api/admin/v1/resource_costs`
+
+Query parameters:
+
+- `limit` (default 50, max 100), `offset` (default 0)
+- `resource_type` (optional): `vm_host` | `ip_range`
+- `resource_id` (optional): filter to a single resource
+
+### Get Resource Cost
+
+`GET /api/admin/v1/resource_costs/{id}`
+
+### Create Resource Cost
+
+`POST /api/admin/v1/resource_costs`
+
+```json
+{
+  "resource_type": "vm_host",
+  "resource_id": 12,
+  "cost_type": "recurring",
+  "amount": 8000,
+  "currency": "EUR",
+  "interval_amount": 1,
+  "interval_type": "month",
+  "billing_start": "2026-01-01T00:00:00Z",
+  "billing_end": null
+}
+```
+
+One-time capital cost (break-even) example:
+
+```json
+{
+  "resource_type": "vm_host",
+  "resource_id": 12,
+  "cost_type": "one_time",
+  "amount": 250000,
+  "currency": "EUR",
+  "billing_start": "2025-11-15T00:00:00Z"
+}
+```
+
+### Update Resource Cost
+
+`PATCH /api/admin/v1/resource_costs/{id}`
+
+All fields optional. Interval/billing fields use PATCH-clear semantics: omit a
+field to leave it unchanged, or send `null` to clear it.
+
+```json
+{ "amount": 9000, "billing_end": "2026-06-01T00:00:00Z" }
+```
+
+### Delete Resource Cost
+
+`DELETE /api/admin/v1/resource_costs/{id}`
+
+### Data Types
+
+**AdminResourceCostDetail**
+
+| Field           | Type                       | Notes                                             |
+|-----------------|----------------------------|---------------------------------------------------|
+| id              | u64                        |                                                   |
+| resource_type   | `vm_host` \| `ip_range`    | Weak link kind                                    |
+| resource_id     | u64                        | Id within the resource's table (no FK)            |
+| cost_type       | `recurring` \| `one_time`  |                                                   |
+| amount          | u64                        | Smallest currency units; per-IP for ip_range      |
+| currency        | string                     | e.g. `USD`, `EUR`                                 |
+| interval_amount | u64 \| null                | Required for `recurring`; null for `one_time`     |
+| interval_type   | `day`\|`month`\|`year`\|null | Billing interval unit                           |
+| billing_start   | datetime \| null           | Cost start / one-time purchase date               |
+| billing_end     | datetime \| null           | Cost end date; null = still active/ongoing         |
+| created         | datetime                   |                                                   |
+| updated         | datetime                   |                                                   |
+
+**Notes:**
+
+- All cost fields are optional; a resource with no `resource_cost` rows simply
+  has no cost data (no behaviour change).
+- Currency conversion (when costs and revenues differ in currency) is deferred
+  to a follow-up issue.

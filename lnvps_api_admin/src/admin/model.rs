@@ -209,6 +209,133 @@ impl CreateDnsServerRequest {
     }
 }
 
+/// The kind of resource a cost record is attached to (weak/polymorphic link).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminCostResourceType {
+    VmHost,
+    IpRange,
+}
+
+impl From<lnvps_db::CostResourceType> for AdminCostResourceType {
+    fn from(v: lnvps_db::CostResourceType) -> Self {
+        match v {
+            lnvps_db::CostResourceType::VmHost => Self::VmHost,
+            lnvps_db::CostResourceType::IpRange => Self::IpRange,
+        }
+    }
+}
+
+impl From<AdminCostResourceType> for lnvps_db::CostResourceType {
+    fn from(v: AdminCostResourceType) -> Self {
+        match v {
+            AdminCostResourceType::VmHost => Self::VmHost,
+            AdminCostResourceType::IpRange => Self::IpRange,
+        }
+    }
+}
+
+/// Recurring vs one-time capital cost.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminCostType {
+    Recurring,
+    OneTime,
+}
+
+impl From<lnvps_db::CostType> for AdminCostType {
+    fn from(v: lnvps_db::CostType) -> Self {
+        match v {
+            lnvps_db::CostType::Recurring => Self::Recurring,
+            lnvps_db::CostType::OneTime => Self::OneTime,
+        }
+    }
+}
+
+impl From<AdminCostType> for lnvps_db::CostType {
+    fn from(v: AdminCostType) -> Self {
+        match v {
+            AdminCostType::Recurring => Self::Recurring,
+            AdminCostType::OneTime => Self::OneTime,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct AdminResourceCostDetail {
+    pub id: u64,
+    pub resource_type: AdminCostResourceType,
+    pub resource_id: u64,
+    pub cost_type: AdminCostType,
+    /// Cost amount in smallest currency units (per-IP for ip_range recurring)
+    pub amount: u64,
+    pub currency: String,
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
+    pub billing_start: Option<DateTime<Utc>>,
+    pub billing_end: Option<DateTime<Utc>>,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+}
+
+impl From<lnvps_db::ResourceCost> for AdminResourceCostDetail {
+    fn from(c: lnvps_db::ResourceCost) -> Self {
+        Self {
+            id: c.id,
+            resource_type: c.resource_type.into(),
+            resource_id: c.resource_id,
+            cost_type: c.cost_type.into(),
+            amount: c.amount,
+            currency: c.currency,
+            interval_amount: c.interval_amount,
+            interval_type: c.interval_type.map(Into::into),
+            billing_start: c.billing_start,
+            billing_end: c.billing_end,
+            created: c.created,
+            updated: c.updated,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateResourceCostRequest {
+    pub resource_type: AdminCostResourceType,
+    pub resource_id: u64,
+    pub cost_type: AdminCostType,
+    pub amount: u64,
+    pub currency: String,
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
+    pub billing_start: Option<DateTime<Utc>>,
+    pub billing_end: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateResourceCostRequest {
+    pub cost_type: Option<AdminCostType>,
+    pub amount: Option<u64>,
+    pub currency: Option<String>,
+    // Interval / billing fields: present-but-null clears the value, absent leaves unchanged.
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub interval_amount: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub interval_type: Option<Option<ApiIntervalType>>,
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub billing_start: Option<Option<DateTime<Utc>>>,
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub billing_end: Option<Option<DateTime<Utc>>>,
+}
+
+/// Deserialize helper distinguishing an absent field (`None`) from an explicit
+/// JSON `null` (`Some(None)`), enabling PATCH semantics that can clear a value.
+pub fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminUserStatus {

@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-16** - Cost tracking (P/L groundwork, issue #82)
+  - Optional, admin-only cost data stored in a new generic `resource_cost` table, weakly linked to any resource via `(resource_type, resource_id)` — no schema change needed to add new cost-bearing resource kinds, and a single resource can hold multiple cost records (e.g. a host's recurring rent plus a one-time hardware investment).
+    - `GET /api/admin/v1/resource_costs` — paginated list; optional `resource_type` (`vm_host`|`ip_range`) and `resource_id` filters (`resource_cost::view`).
+    - `GET /api/admin/v1/resource_costs/{id}` — fetch one (`resource_cost::view`).
+    - `POST /api/admin/v1/resource_costs` — create (`resource_cost::create`).
+    - `PATCH /api/admin/v1/resource_costs/{id}` — update; interval/billing fields use PATCH-clear semantics (omit = unchanged, `null` = clear) (`resource_cost::update`).
+    - `DELETE /api/admin/v1/resource_costs/{id}` — remove (`resource_cost::delete`).
+  - Each cost record has `cost_type` (`recurring`|`one_time`), `amount` (smallest currency units; per-IP for `ip_range` recurring), `currency`, an optional billing interval (`interval_amount` + `interval_type`), and optional `billing_start`/`billing_end` dates (`billing_end` null = still active).
+  - Cost data is never exposed to end users. Currency conversion between costs and revenues is deferred to a follow-up.
+  - Adds the `AdminResource::ResourceCost` (24) RBAC resource; a migration grants the full permission set to the default `super_admin` role.
+  - `GET /api/admin/v1/reports/profit-loss` — per-period (month/year) profit/loss report netting paid revenue against tracked resource costs. Reported in a single target currency (`currency` param, or the selected company's base currency), so each period is one row. Revenue uses each payment's stored historical exchange rate to value it in its company base currency; costs (no stored rate) use current exchange rates. Recurring costs are normalized per active calendar month, `ip_range` per-IP costs scale by the range's current assigned-IP count, and one-time costs are booked in their `billing_start` period. Optional `group_by` (`month`|`year`), `company_id` and `region_id` filters (`currency` required when `company_id` omitted). Requires `analytics::view`.
+
 - **2026-07-15** - Admin management of users' saved payment methods
   - New admin endpoints to list/inspect/edit/delete the payment methods users save for automatic renewals (NWC connections and off-session Revolut cards). Distinct from the existing `payment_methods` provider-config endpoints.
     - `GET /api/admin/v1/user_payment_methods` — paginated list across all users; optional `user_id` filter (`user_payment_method::view`).
