@@ -17,8 +17,8 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use chrono::{Datelike, Utc};
 use lnvps_api_common::{
-    CostResult, ExchangeRateService, NewPaymentInfo, PricingEngine, UpgradeConfig, WorkCommander,
-    round_msat_to_sat,
+    CostResult, ExchangeRateService, NewPaymentInfo, PricingEngine, UpgradeConfig, VatClient,
+    WorkCommander, round_msat_to_sat,
 };
 use lnvps_db::{
     LNVpsDb, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionPayment,
@@ -112,12 +112,13 @@ impl SubscriptionHandler {
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
         rates: Arc<dyn ExchangeRateService>,
+        vat: VatClient,
         tx: Arc<dyn WorkCommander>,
         vm_state_cache: VmStateCache,
     ) -> Result<Self> {
         Ok(Self {
             revolut: settings.get_revolut()?,
-            pe: PricingEngine::new(db.clone(), rates, settings.tax_rate.clone()),
+            pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             db,
             tx,
@@ -447,18 +448,20 @@ impl SubscriptionHandler {
         let non_vm_base = non_vm_interval_cost + setup_fee_due;
 
         // Convert non-VM amounts (+ setup fee) to the payment method currency
-        let (non_vm_converted_amount, non_vm_rate, non_vm_tax, non_vm_processing_fee): (
-            u64,
-            f32,
-            u64,
-            u64,
-        ) = if non_vm_base > 0 {
+        #[allow(clippy::type_complexity)]
+        let (
+            non_vm_converted_amount,
+            non_vm_rate,
+            non_vm_tax,
+            non_vm_processing_fee,
+            non_vm_tax_line,
+        ): (u64, f32, u64, u64, Option<lnvps_api_common::TaxLine>) = if non_vm_base > 0 {
             let base = non_vm_base;
             let list_price = CurrencyAmount::from_u64(subscription_currency, base);
             let converted = self.pe.get_amount_and_rate(list_price, method).await?;
-            let tax = self
+            let det = self
                 .pe
-                .get_tax_for_user(user.id, converted.amount.value())
+                .determine_tax(user.id, converted.amount.value(), subscription.company_id)
                 .await?;
             let processing_fee = self
                 .pe
@@ -469,14 +472,16 @@ impl SubscriptionHandler {
                     converted.amount.value(),
                 )
                 .await;
+            let line = det.to_line(converted.amount.value());
             (
                 converted.amount.value(),
                 converted.rate.rate,
-                tax,
+                det.amount,
                 processing_fee,
+                Some(line),
             )
         } else {
-            (0u64, 0f32, 0u64, 0u64)
+            (0u64, 0f32, 0u64, 0u64, None)
         };
 
         // Aggregate all line item amounts.  All VM infos are already in the
@@ -499,6 +504,27 @@ impl SubscriptionHandler {
             + non_vm_processing_fee;
 
         let total_amount = vm_amount + non_vm_converted_amount;
+
+        // Per-line tax breakdown for the payment. Each VM line carries its own
+        // computed line (against its own company), plus the non-VM line if
+        // present. Stored as an array so per-line values are preserved when they
+        // differ across lines.
+        let mut tax_lines: Vec<lnvps_api_common::TaxLine> = vm_payment_infos
+            .iter()
+            .map(|p| p.tax_details.to_line(p.amount))
+            .collect();
+        if let Some(line) = non_vm_tax_line {
+            tax_lines.push(line);
+        }
+        let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
+        let tax_breakdown = serde_json::to_value(&tax_lines).ok();
+        // The country signals are the same for every line (one customer).
+        let tax_evidence = Some(
+            self.pe
+                .determine_tax(subscription.user_id, 0, subscription.company_id)
+                .await?
+                .evidence_json(),
+        );
 
         // Payment method currency: BTC for Lightning, otherwise subscription currency
         let payment_currency = vm_payment_infos
@@ -570,6 +596,11 @@ impl SubscriptionHandler {
                     tax,
                     processing_fee,
                     paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
                 }
             }
             PaymentMethod::Revolut => {
@@ -604,14 +635,11 @@ impl SubscriptionHandler {
                         // Merchant-initiated charge against a saved Revolut
                         // payment method (specific one if requested, else the
                         // default) — no customer interaction.
-                        let method =
-                            self.revolut_payment_method(user.id, *method_id).await?;
+                        let method = self.revolut_payment_method(user.id, *method_id).await?;
                         let customer_id: String = method
                             .external_customer_id
                             .clone()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Revolut method missing customer id")
-                            })?
+                            .ok_or_else(|| anyhow::anyhow!("Revolut method missing customer id"))?
                             .into();
                         let payment_method_id: String = method.external_id.clone().into();
                         let info = rev
@@ -662,6 +690,11 @@ impl SubscriptionHandler {
                     tax,
                     processing_fee,
                     paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
                 }
             }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
@@ -716,6 +749,12 @@ impl SubscriptionHandler {
                     SubscriptionPaymentType::Upgrade => format!("VM upgrade {vm_id}"),
                     SubscriptionPaymentType::Purchase => format!("VM purchase {vm_id}"),
                 };
+                // Record the tax values on the payment. Single line item, so the
+                // breakdown has exactly one entry.
+                let tax_lines = vec![p.tax_details.to_line(p.amount)];
+                let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
+                let tax_breakdown = serde_json::to_value(&tax_lines).ok();
+                let tax_evidence = Some(p.tax_details.evidence_json());
                 let payment = match method {
                     PaymentMethod::Lightning => {
                         ensure!(
@@ -755,6 +794,11 @@ impl SubscriptionHandler {
                             tax: p.tax,
                             processing_fee: p.processing_fee,
                             paid_at: None,
+                            tax_rate: tax_summary.rate,
+                            tax_country_code: tax_summary.country_code.clone(),
+                            tax_treatment: tax_summary.treatment.clone(),
+                            tax_evidence: tax_evidence.clone(),
+                            tax_breakdown: tax_breakdown.clone(),
                         }
                     }
                     PaymentMethod::Revolut => {
@@ -803,6 +847,11 @@ impl SubscriptionHandler {
                             tax: p.tax,
                             processing_fee: p.processing_fee,
                             paid_at: None,
+                            tax_rate: tax_summary.rate,
+                            tax_country_code: tax_summary.country_code.clone(),
+                            tax_treatment: tax_summary.treatment.clone(),
+                            tax_evidence: tax_evidence.clone(),
+                            tax_breakdown: tax_breakdown.clone(),
                         }
                     }
                     PaymentMethod::Paypal => bail!("PayPal not implemented"),
@@ -952,7 +1001,8 @@ impl SubscriptionHandler {
             rate: cost_difference.upgrade.rate,
             time_value: 0, //upgrades dont add time
             new_expiry: Default::default(),
-            tax: 0,            // No tax on upgrades for now
+            tax: 0, // No tax on upgrades for now
+            tax_details: lnvps_api_common::TaxDetermination::untaxed(),
             processing_fee: 0, // No processing fee on upgrades for now
         };
         let metadata = serde_json::to_value(cfg)?;
@@ -1086,6 +1136,7 @@ mod revolut_autorenew_tests {
             db.clone(),
             node.clone(),
             Arc::new(MockExchangeRate::default()),
+            VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?;
@@ -1185,7 +1236,14 @@ mod revolut_offline_tests {
         }
     }
 
-    fn mk_method(user_id: u64, cust: &str, pm: &str, default: bool, enabled: bool, exp: (u16, u16)) -> UserPaymentMethod {
+    fn mk_method(
+        user_id: u64,
+        cust: &str,
+        pm: &str,
+        default: bool,
+        enabled: bool,
+        exp: (u16, u16),
+    ) -> UserPaymentMethod {
         UserPaymentMethod {
             id: 0,
             user_id,
@@ -1239,16 +1297,108 @@ mod revolut_offline_tests {
             )
             .await
             .unwrap();
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
         let sub = SubscriptionHandler::new(
             mock_settings(),
             db.clone(),
             node,
-            Arc::new(MockExchangeRate::default()),
+            rates,
+            VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )
         .unwrap();
         (db, sub, user_id, sub_id)
+    }
+
+    /// A renewal freezes the VAT determination (rate/country/treatment/evidence
+    /// + per-line breakdown) onto the persisted subscription_payment.
+    #[tokio::test]
+    async fn renew_persists_vat_snapshot() {
+        use std::collections::HashMap;
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let user_id = db.upsert_user(&[21u8; 32]).await.unwrap();
+
+        // Seller (company 1) in IRL, customer in DEU -> EU B2C, OSS at 19%.
+        {
+            let mut c = db.companies.lock().await;
+            c.get_mut(&1).unwrap().country_code = Some("IRL".to_string());
+        }
+        {
+            let mut u = db.users.lock().await;
+            u.get_mut(&user_id).unwrap().country_code = Some("DEU".to_string());
+        }
+
+        // BTC-denominated subscription so a Lightning renewal needs no FX.
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 100_000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            Arc::new(MockExchangeRate::default()),
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        // Seed the handler's shared VAT client with the German standard rate.
+        sub.pricing_engine()
+            .vat_client()
+            .set_rates(HashMap::from([(isocountry::CountryCode::DEU, 19.0)]));
+
+        let payment = sub
+            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
+            .await
+            .unwrap();
+
+        assert!(payment.tax > 0, "VAT should be charged");
+        assert_eq!(payment.tax_rate, Some(19.0));
+        assert_eq!(payment.tax_country_code.as_deref(), Some("DEU"));
+        assert_eq!(payment.tax_treatment.as_deref(), Some("oss_b2c"));
+        // Breakdown + evidence are frozen on the payment.
+        let breakdown = payment.tax_breakdown.expect("breakdown present");
+        assert!(breakdown.is_array());
+        let ev = payment.tax_evidence.expect("evidence present");
+        assert_eq!(ev["declared_country"], "DEU");
     }
 
     #[tokio::test]
@@ -1274,7 +1424,10 @@ mod revolut_offline_tests {
             .insert_user_payment_method(&mk_method(user_id, "cB", "pB", false, true, (2999, 12)))
             .await
             .unwrap();
-        assert_eq!(sub.revolut_payment_method(user_id, None).await.unwrap().id, good);
+        assert_eq!(
+            sub.revolut_payment_method(user_id, None).await.unwrap().id,
+            good
+        );
 
         // Disable all remaining -> error
         let mut g = db.get_user_payment_method(good).await.unwrap();
@@ -1303,12 +1456,13 @@ mod revolut_offline_tests {
         assert_eq!(charged[0].1, "pm1");
 
         // Payment row persisted
-        assert!(db
-            .list_subscription_payments(sub_id)
-            .await
-            .unwrap()
-            .iter()
-            .any(|p| p.id == payment.id));
+        assert!(
+            db.list_subscription_payments(sub_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.id == payment.id)
+        );
     }
 
     #[tokio::test]

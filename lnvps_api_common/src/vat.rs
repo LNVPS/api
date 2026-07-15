@@ -1,7 +1,21 @@
 use anyhow::{Result, bail};
+use isocountry::CountryCode;
 use log::trace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+/// Convert a VAT-territory 2-letter code to an [`isocountry::CountryCode`].
+///
+/// Greek VAT rates are published under the `EL` code rather than the ISO
+/// `GR`; that special case is mapped so Greece is not silently dropped.
+pub fn vat_code_to_isocountry(code: &str) -> Option<CountryCode> {
+    let alpha2 = match code.to_uppercase().as_str() {
+        "EL" => "GR".to_string(),
+        other => other.to_string(),
+    };
+    CountryCode::for_alpha2(&alpha2).ok()
+}
 
 /// EU VAT rates API response
 #[derive(Debug, Deserialize)]
@@ -85,22 +99,37 @@ impl VatRate {
     }
 }
 
-/// Client for fetching EU VAT rates and validating VAT numbers
-#[derive(Debug, Clone, Default)]
-pub struct EuVatClient {
+/// Client for fetching VAT rates and validating VAT numbers.
+///
+/// Cloneable and cheap to share: clones point at the same internal rate cache
+/// (`Arc<RwLock<..>>`), so refreshing rates on one clone is visible to all
+/// others. The cache starts empty; call [`refresh_rates`](Self::refresh_rates)
+/// (e.g. at startup and periodically) to populate it. Rate lookups
+/// ([`rate_for`](Self::rate_for)) are synchronous and never hit the network.
+#[derive(Debug, Clone)]
+pub struct VatClient {
     /// URL for fetching VAT rates
     rates_url: String,
     /// URL for VAT validation API
     validation_url: String,
+    /// Cached standard VAT rates keyed by country, shared across clones.
+    cache: Arc<RwLock<HashMap<CountryCode, f32>>>,
 }
 
-impl EuVatClient {
-    /// Create a new client with default API URLs
+impl Default for VatClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VatClient {
+    /// Create a new client with default API URLs and an empty rate cache.
     pub fn new() -> Self {
         Self {
             rates_url: "https://euvatrates.com/rates.json".to_string(),
             validation_url: "https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number"
                 .to_string(),
+            cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -109,7 +138,40 @@ impl EuVatClient {
         Self {
             rates_url: rates_url.into(),
             validation_url: validation_url.into(),
+            cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Create a client with a pre-populated rate cache (useful for testing /
+    /// offline operation). No network access is performed.
+    pub fn with_rates(rates: HashMap<CountryCode, f32>) -> Self {
+        let s = Self::new();
+        *s.cache.write().expect("vat cache poisoned") = rates;
+        s
+    }
+
+    /// Replace the cached rate table directly (no network). Useful for tests and
+    /// for seeding rates from an alternative source.
+    pub fn set_rates(&self, rates: HashMap<CountryCode, f32>) {
+        *self.cache.write().expect("vat cache poisoned") = rates;
+    }
+
+    /// Fetch the latest rates and replace the cached table. Returns the number
+    /// of countries loaded.
+    pub async fn refresh_rates(&self) -> Result<usize> {
+        let map = self.fetch_rates_map().await?;
+        let n = map.len();
+        *self.cache.write().expect("vat cache poisoned") = map;
+        Ok(n)
+    }
+
+    /// Look up the cached standard VAT rate (%) for a country, if known.
+    pub fn rate_for(&self, country: CountryCode) -> Option<f32> {
+        self.cache
+            .read()
+            .expect("vat cache poisoned")
+            .get(&country)
+            .copied()
     }
 
     /// Fetch all EU VAT rates
@@ -131,6 +193,18 @@ impl EuVatClient {
         Ok(rates)
     }
 
+    /// Fetch all EU standard VAT rates as a map keyed by [`CountryCode`].
+    ///
+    /// Codes that don't resolve to a known country are skipped. Intended for
+    /// building the pricing engine's rate table at startup.
+    pub async fn fetch_rates_map(&self) -> Result<HashMap<CountryCode, f32>> {
+        let rates = self.fetch_rates().await?;
+        Ok(rates
+            .into_iter()
+            .filter_map(|r| vat_code_to_isocountry(r.country_code_str()).map(|cc| (cc, r.rate)))
+            .collect())
+    }
+
     /// Fetch VAT rate for a specific country
     pub async fn fetch_rate(&self, country_code: &str) -> Result<VatRate> {
         let rates = self.fetch_rates().await?;
@@ -149,7 +223,7 @@ impl EuVatClient {
     ///
     /// # Examples
     /// ```ignore
-    /// let client = EuVatClient::new();
+    /// let client = VatClient::new();
     /// // With country prefix
     /// let result = client.validate_vat_number("DE123456789", None).await?;
     /// // Without country prefix
@@ -221,6 +295,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_vat_code_to_isocountry() {
+        assert_eq!(vat_code_to_isocountry("DE"), Some(CountryCode::DEU));
+        assert_eq!(vat_code_to_isocountry("ie"), Some(CountryCode::IRL));
+        // Greek VAT code EL must map to Greece.
+        assert_eq!(vat_code_to_isocountry("EL"), Some(CountryCode::GRC));
+        assert_eq!(vat_code_to_isocountry("GR"), Some(CountryCode::GRC));
+        assert_eq!(vat_code_to_isocountry("ZZ"), None);
+    }
+
+    #[test]
     fn test_vat_rate_new() {
         let rate = VatRate::new("DE", 19.0).unwrap();
         assert_eq!(rate.country_code_str(), "DE");
@@ -290,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_vat_rates() {
-        let client = EuVatClient::new();
+        let client = VatClient::new();
         let rates = client.fetch_rates().await.unwrap();
 
         // Should have rates for EU member states
@@ -299,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_vat_number() {
-        let client = EuVatClient::new();
+        let client = VatClient::new();
 
         // Test with an invalid VAT number - should return valid=false
         let result = client
@@ -316,7 +400,7 @@ mod tests {
     /// `&cleaned[..2]`. Parsing fails before any network call is made.
     #[tokio::test]
     async fn test_validate_vat_number_multibyte_does_not_panic() {
-        let client = EuVatClient::new();
+        let client = VatClient::new();
         let result = client.validate_vat_number("€12345", None).await;
         assert!(
             result.is_err(),
@@ -327,7 +411,7 @@ mod tests {
     /// A single-character (too short) input must also error cleanly.
     #[tokio::test]
     async fn test_validate_vat_number_too_short() {
-        let client = EuVatClient::new();
+        let client = VatClient::new();
         assert!(client.validate_vat_number("D", None).await.is_err());
     }
 }

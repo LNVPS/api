@@ -224,16 +224,42 @@ encryption:
 
 Encrypted fields: SSH key material, NWC connection strings, email addresses, host API tokens.
 
-### Taxes
+### Taxes (VAT)
 
-```yaml
-# ISO 3166-1 alpha-2 country codes, values are whole-number percentages
-tax-rate:
-  IE: 23
-  US: 15
-```
+This implements **EU VAT only**. The seller's country is taken from the
+company's own VAT number (`tax_id`) when set — that number is the company's VIES
+registration and identifies the country it is registered in — otherwise from the
+company's `country_code`. EU VAT applies only when that country is in the EU VAT
+area; if it is outside the list (e.g. a US company), no tax is applied here —
+other tax systems (such as US sales tax) are not handled.
 
-Taxes are applied based on the user's specified country. EU VAT numbers are validated against the VIES service before being stored.
+When the seller is in the EU, standard rates for all member states are fetched
+from an external source at startup and refreshed daily (cached in-memory by the
+shared `VatClient`). The rate applied to a payment is then determined from the
+seller's country and the customer:
+
+- **B2B** with a stored (VIES-validated) VAT number: same country as seller →
+  domestic VAT; another EU country → reverse charge (0%); outside the EU → out
+  of scope (0%).
+- **B2C**: place of supply is taken from the self-declared country, falling back
+  to the IP-derived country. EU → that country's destination rate (OSS); non-EU
+  → out of scope (0%).
+- **Undetermined** (no country evidence): the seller's domestic rate is applied
+  conservatively when the seller is in the EU, otherwise out of scope.
+
+IP geolocation (for the fallback location signal) requires the optional
+`geoip-database` setting pointing at a MaxMind GeoLite2/GeoIP2 Country `.mmdb`.
+EU VAT numbers are validated against the VIES service before being stored.
+
+Until the first successful rate refresh (or if the rate source is unreachable),
+no rates are known and VAT falls back to 0%.
+
+> **Disclaimer:** This VAT handling is an automated, best-effort determination
+> from the available evidence and configuration — it is **not tax or legal
+> advice** and makes no guarantee of compliance in any jurisdiction. Rates and
+> validation come from third-party sources that may lag official changes. The
+> operator is solely responsible for confirming the correct VAT/OSS treatment
+> for their business and should have it reviewed by a qualified tax professional.
 
 ### Nostr address host (optional)
 

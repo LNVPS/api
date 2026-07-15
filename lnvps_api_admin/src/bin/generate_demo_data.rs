@@ -7,8 +7,9 @@ use lnvps_api_admin::settings::Settings;
 use lnvps_db::{
     AdminDb, Company, DiskInterface, DiskType, EncryptedString, EncryptionContext, IntervalType,
     IpRange, IpRangeAllocationMode, LNVpsDbBase, LNVpsDbMysql, OsDistribution, PaymentMethod,
-    PaymentType, User, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomTemplate, VmHost,
-    VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    SubscriptionPayment, SubscriptionPaymentType, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
+    VmIpAssignment, VmOsImage, VmTemplate,
 };
 use log::info;
 use std::path::PathBuf;
@@ -1286,7 +1287,7 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             1 => PaymentMethod::Revolut,
             _ => PaymentMethod::Paypal,
         };
-        let payment_type = PaymentType::Renewal;
+        let payment_type = SubscriptionPaymentType::Renewal;
         let amount = match payment_method {
             PaymentMethod::Lightning => 500000 + (i as u64 * 100000), // Lightning in sats (0.005-0.025 BTC range)
             _ => 500 + (i as u64 * 50), // Fiat in cents ($5.00-$15.00 range)
@@ -1310,21 +1311,27 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             _ => 1.0,                                                  // USD base rate
         };
 
-        let sub_created = db
+        let subscription = db
             .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await
+            .ok();
+        let sub_created = subscription
+            .as_ref()
             .map(|s| s.created)
-            .unwrap_or_else(|_| Utc::now());
+            .unwrap_or_else(Utc::now);
+        let subscription_id = subscription.as_ref().map(|s| s.id).unwrap_or(0);
 
         let payment_id_bytes = hex::decode(&payment_id)?;
-        let payment = VmPayment {
+        let payment = SubscriptionPayment {
             id: payment_id_bytes,
-            vm_id: vm.id,
+            subscription_id,
+            user_id: vm.user_id,
             created: sub_created,
             expires: sub_created + Duration::hours(1),
             amount,
             external_data: EncryptedString::new(external_data),
-            time_value: 7776000,
+            time_value: Some(7776000),
+            metadata: None,
             is_paid: true,
             rate,
             currency: currency.to_string(),
@@ -1333,11 +1340,15 @@ async fn create_payments(db: &LNVpsDbMysql, vms: &[Vm]) -> Result<()> {
             payment_type,
             tax: 0,
             processing_fee: 0,
-            upgrade_params: None,
             paid_at: Some(sub_created), // Demo data: assume paid immediately
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         };
 
-        db.insert_vm_payment(&payment).await?;
+        db.insert_subscription_payment(&payment).await?;
     }
 
     Ok(())

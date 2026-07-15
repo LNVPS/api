@@ -79,6 +79,12 @@ struct TimeSeriesPayment {
     rate: f32,       // Exchange rate to company's base currency
     time_value: u64, // Seconds this payment adds to VM expiry
     tax: u64,        // Tax amount in smallest currency unit
+    // Tax fields recorded on the payment. Summary fields are null when the
+    // payment's lines differ; `tax_breakdown` holds the per-line values.
+    tax_rate: Option<f32>,                    // Rate (%) when uniform
+    tax_country_code: Option<String>,         // Country (ISO alpha-3) when uniform
+    tax_treatment: Option<String>,            // Treatment label when uniform
+    tax_breakdown: Option<serde_json::Value>, // Per-line-item VAT breakdown
     // Company information
     company_id: u64,
     company_name: String,
@@ -168,6 +174,10 @@ async fn admin_time_series_report(
             rate: payment.rate,
             time_value: payment.time_value.unwrap_or(0),
             tax: payment.tax,
+            tax_rate: payment.tax_rate,
+            tax_country_code: payment.tax_country_code.clone(),
+            tax_treatment: payment.tax_treatment.clone(),
+            tax_breakdown: payment.tax_breakdown.clone(),
             company_id: payment.company_id,
             company_name: payment.company_name.clone(),
             company_base_currency: payment.company_base_currency.clone(),

@@ -1,10 +1,8 @@
 use anyhow::Result;
-use isocountry::CountryCode;
 use lnvps_api_common::RedisConfig;
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::LightningNode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -52,10 +50,6 @@ pub struct Settings {
     /// Config for accepting revolut payments
     pub revolut: Option<payments_rs::fiat::RevolutConfig>,
 
-    #[serde(default)]
-    /// Tax rates to change per country as a percent of the amount
-    pub tax_rate: HashMap<CountryCode, f32>,
-
     /// public host of lnvps_nostr service
     pub nostr_address_host: Option<String>,
 
@@ -67,6 +61,11 @@ pub struct Settings {
 
     /// Captcha config
     pub captcha: Option<CaptchaConfig>,
+
+    /// Path to a MaxMind GeoLite2/GeoIP2 Country database (`.mmdb`) used to
+    /// resolve client IPs to a country as VAT place-of-supply evidence. When
+    /// unset, IP geolocation is disabled.
+    pub geoip_database: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -340,11 +339,11 @@ pub fn mock_settings() -> Settings {
         telegram: None,
         whatsapp: None,
         revolut: None,
-        tax_rate: HashMap::from([(CountryCode::IRL, 23.0), (CountryCode::USA, 1.0)]),
         nostr_address_host: None,
         redis: None,
         encryption: None,
         captcha: None,
+        geoip_database: None,
     }
 }
 

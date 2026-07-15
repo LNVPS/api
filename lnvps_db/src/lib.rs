@@ -378,46 +378,6 @@ pub trait LNVpsDbBase: Send + Sync {
         policy_out: Option<VmFirewallPolicy>,
     ) -> DbResult<()>;
 
-    /// List payments by VM id
-    async fn list_vm_payment(&self, vm_id: u64) -> DbResult<Vec<VmPayment>>;
-
-    /// List payments by VM id with pagination
-    async fn list_vm_payment_paginated(
-        &self,
-        vm_id: u64,
-        limit: u64,
-        offset: u64,
-    ) -> DbResult<Vec<VmPayment>>;
-
-    /// List active payments by VM id, payment method, and payment type
-    async fn list_vm_payment_by_method_and_type(
-        &self,
-        vm_id: u64,
-        method: PaymentMethod,
-        payment_type: PaymentType,
-    ) -> DbResult<Vec<VmPayment>>;
-
-    /// Insert a new VM payment record
-    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()>;
-
-    /// Get VM payment by payment id
-    async fn get_vm_payment(&self, id: &Vec<u8>) -> DbResult<VmPayment>;
-
-    /// Get VM payment by payment id
-    async fn get_vm_payment_by_ext_id(&self, id: &str) -> DbResult<VmPayment>;
-
-    /// Update a VM payment record
-    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()>;
-
-    /// Mark a payment as paid and update the vm expiry
-    async fn vm_payment_paid(&self, id: &VmPayment) -> DbResult<()>;
-
-    /// Return the most recently settled invoice
-    async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>>;
-
-    /// Count active (unpaid, non-expired) payments for a VM
-    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64>;
-
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>>;
 

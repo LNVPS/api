@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **2026-07-16** - Invoices now show the VAT treatment
+  - `GET /api/v1/payment/{id}/invoice` renders the applied VAT rate on the tax line (e.g. "VAT 23% (IRL)"), and prints a legal note for **reverse charge** ("VAT reverse charged — the recipient is liable to account for VAT (Article 196, Council Directive 2006/112/EC)") and **out-of-scope** ("Outside the scope of EU VAT.") supplies. Seller and customer VAT numbers were already shown.
+
+- **2026-07-16** - VAT determination frozen on every payment (OSS filing / audit)
+  - Each `subscription_payment` now stores the VAT determination made at sale time: a per-line-item `tax_breakdown` (JSON array of `{net, tax, rate, country_code, treatment}`) as the authoritative record, a uniform summary (`tax_rate`, `tax_country_code`, `tax_treatment`, left NULL when the payment mixes rates/treatments across line items), and the customer `tax_evidence` (declared country, IP-derived country, VAT number). Admin time-series reports expose these per payment.
+  - The breakdown is per-line-item so a payment whose lines resolve to different sellers (e.g. reverse charge on one, domestic VAT on another) is recorded losslessly rather than collapsed to one rate.
+
+- **2026-07-16** - Retired the defunct `vm_payment` table
+  - `vm_payment` is dropped; all payments live in `subscription_payment` (the public API already read from it). The startup backfill's payment-copy phase (Phase 2) and all `vm_payment` models/queries/DTO conversions are removed. The `ApiVmPayment` response shape and the `vm_payment` RBAC resource are unchanged.
+
+- **2026-07-16** - VAT is now charged using EU place-of-supply rules instead of a flat per-country lookup
+  - **EU VAT only, gated on the seller.** The seller's country is taken from the company's own VAT number (`tax_id`, i.e. its VIES registration) when set, else `country_code`. Tax is applied only when that country is in the EU VAT area. A non-EU seller (e.g. a US company) charges no tax here; other systems such as US sales tax are not handled.
+  - When the seller is in the EU, the tax charged is determined from the **seller's country** and the **customer's status/location**:
+    - **B2B** with a stored (VIES-validated) VAT number: same country as seller → domestic VAT; another EU country → **reverse charge** (0%); outside the EU → out of scope (0%).
+    - **B2C**: place of supply is taken from the self-declared country, falling back to the IP-derived country. EU → that country's destination rate (OSS); non-EU → out of scope (0%).
+    - **Undetermined** (no customer country evidence): the seller-country rate is applied as a fallback.
+  - **Behaviour change:** non-EU customers are now correctly out of scope (0%). Previously any country present in the `tax_rate` config map was charged its configured rate regardless of EU membership (e.g. a placeholder `USA: 1%`).
+  - **Config removed:** the static `tax-rate` config map is gone. Standard EU rates for all member states are now fetched at startup and refreshed daily, cached in-memory by a shared cloneable `VatClient` (formerly `EuVatClient`). Until the first successful refresh, VAT falls back to 0%.
+  - New public API in `lnvps_api_common`: `PricingEngine::determine_tax` (full treatment + audit detail), `TaxTreatment`, `TaxDetermination`, `is_eu_vat_country`, `vat_number_country_alpha3`; `VatClient` gains `refresh_rates`/`rate_for`/`with_rates`. `get_tax_for_user` now also takes the seller `company_id`.
+
 ### Added
 
 - **2026-07-16** - Cost tracking (P/L groundwork, issue #82)
@@ -20,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - Cost data is never exposed to end users. Currency conversion between costs and revenues is deferred to a follow-up.
   - Adds the `AdminResource::ResourceCost` (24) RBAC resource; a migration grants the full permission set to the default `super_admin` role.
   - `GET /api/admin/v1/reports/profit-loss` — per-period (month/year) profit/loss report netting paid revenue against tracked resource costs. Reported in a single target currency (`currency` param, or the selected company's base currency), so each period is one row. Revenue uses each payment's stored historical exchange rate to value it in its company base currency; costs (no stored rate) use current exchange rates. Recurring costs are normalized per active calendar month, `ip_range` per-IP costs scale by the range's current assigned-IP count, and one-time costs are booked in their `billing_start` period. Optional `group_by` (`month`|`year`), `company_id` and `region_id` filters (`currency` required when `company_id` omitted). Requires `analytics::view`.
+
+- **2026-07-16** - IP geolocation captured as VAT place-of-supply evidence
+  - `PATCH /api/v1/account` **and both VM order endpoints** (`POST /api/v1/vm`, `POST /api/v1/vm/custom-template`) now record the client's IP-derived country (ISO 3166-1 alpha-3) alongside the self-declared `country_code`, stored independently on the user (`geo_country_code`, `geo_ip`, `geo_updated`) so the two signals can be compared when determining EU VAT. Capturing at order time ensures customers who never touch the account API still have a resolved country at purchase. The client IP is read from the `X-Forwarded-For`/`X-Real-IP` headers set by the trusted front proxy.
+  - New optional config key `geoip-database`: path to a local MaxMind GeoLite2/GeoIP2 Country `.mmdb`. When unset, IP geolocation is disabled and no country is recorded. Lookups are local and never leave the host.
+  - Non-routable addresses (private/loopback/link-local/documentation) are skipped without a lookup.
 
 - **2026-07-15** - Admin management of users' saved payment methods
   - New admin endpoints to list/inspect/edit/delete the payment methods users save for automatic renewals (NWC connections and off-session Revolut cards). Distinct from the existing `payment_methods` provider-config endpoints.
