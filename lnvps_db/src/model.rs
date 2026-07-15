@@ -931,7 +931,9 @@ pub enum CostResourceType {
     IpRange = 1,
     /// Not tied to any internal entity — a free-form cost/subscription
     /// identified only by its user-supplied `label` (e.g. "Colo cross-connect",
-    /// "Upstream transit"). `resource_id` is unused (0).
+    /// "Upstream transit"). `resource_id` is overloaded as the region id this
+    /// cost is attributed to in the P/L report (0 = global / not
+    /// region-specific, excluded from region-filtered reports).
     Generic = 2,
 }
 
@@ -963,7 +965,7 @@ impl FromStr for CostResourceType {
 #[serde(rename_all = "snake_case")]
 pub enum CostType {
     /// Recurring cost billed every `interval_amount` `interval_type` (rent/colo,
-    /// or per-IP monthly for an ip_range).
+    /// or the whole-block monthly cost for an ip_range).
     #[default]
     Recurring = 0,
     /// One-time capital investment (e.g. hardware purchase) used for break-even.
@@ -998,8 +1000,9 @@ pub struct ResourceCost {
     pub id: u64,
     /// What kind of resource this cost is attached to
     pub resource_type: CostResourceType,
-    /// Id of the resource within its table (weak link, no FK). Unused (0) for
-    /// `Generic` costs, which are identified by `label` instead.
+    /// Id of the resource within its table (weak link, no FK). For `Generic`
+    /// costs (identified by `label`) this is overloaded as the region id the
+    /// cost is attributed to in the P/L report (0 = global).
     pub resource_id: u64,
     /// Free-form label for costs not tied to an internal entity (required for
     /// `Generic`; optional/ignored for entity-linked costs).
@@ -1007,7 +1010,8 @@ pub struct ResourceCost {
     /// Recurring vs one-time capital cost
     pub cost_type: CostType,
     /// Cost amount in smallest currency units (cents for fiat, millisats for BTC).
-    /// For an `ip_range` recurring cost this is the cost per single IP.
+    /// For an `ip_range` recurring cost this is the cost of the entire block
+    /// (charged regardless of how many IPs are assigned).
     pub amount: u64,
     /// Currency code (e.g. USD, EUR)
     pub currency: String,

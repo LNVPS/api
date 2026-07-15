@@ -105,15 +105,19 @@ async fn admin_create_resource_cost(
     if resource_type == lnvps_db::CostResourceType::Generic && label.is_none() {
         return ApiData::err("Generic costs require a label");
     }
+    // For generic costs `resource_id` is overloaded as the region id (0 =
+    // global). Validate the region exists so P/L attribution is meaningful.
+    if resource_type == lnvps_db::CostResourceType::Generic
+        && req.resource_id != 0
+        && this.db.get_host_region(req.resource_id).await.is_err()
+    {
+        return ApiData::err("Region not found for generic cost");
+    }
 
     let cost = ResourceCost {
         id: 0,
         resource_type,
-        resource_id: if resource_type == lnvps_db::CostResourceType::Generic {
-            0
-        } else {
-            req.resource_id
-        },
+        resource_id: req.resource_id,
         label,
         cost_type,
         amount: req.amount,
@@ -157,6 +161,15 @@ async fn admin_update_resource_cost(
     }
     if cost.resource_type == lnvps_db::CostResourceType::Generic && cost.label.is_none() {
         return ApiData::err("Generic costs require a label");
+    }
+    // Allow re-assigning a generic cost's region (resource_id overload).
+    if cost.resource_type == lnvps_db::CostResourceType::Generic
+        && let Some(rid) = req.resource_id
+    {
+        if rid != 0 && this.db.get_host_region(rid).await.is_err() {
+            return ApiData::err("Region not found for generic cost");
+        }
+        cost.resource_id = rid;
     }
     if let Some(v) = req.interval_amount {
         cost.interval_amount = v;

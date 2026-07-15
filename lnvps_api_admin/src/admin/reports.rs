@@ -515,19 +515,6 @@ async fn admin_profit_loss_report(
         .admin_list_resource_costs_active_between(start_dt, end_dt)
         .await?;
 
-    // Cache assigned-IP counts per ip_range so per-IP recurring costs scale correctly.
-    let mut ip_counts: HashMap<u64, u64> = HashMap::new();
-    for c in &costs {
-        if c.resource_type == CostResourceType::IpRange && !ip_counts.contains_key(&c.resource_id) {
-            let n = this
-                .db
-                .admin_count_ip_range_assignments(c.resource_id)
-                .await
-                .unwrap_or(0);
-            ip_counts.insert(c.resource_id, n);
-        }
-    }
-
     for c in &costs {
         // Region filter: resolve the cost's resource region and skip mismatches.
         if params.region_id != 0 {
@@ -544,8 +531,15 @@ async fn admin_profit_loss_report(
                     .await
                     .ok()
                     .map(|r| r.region_id),
-                // Generic costs aren't tied to a region; exclude when filtering.
-                CostResourceType::Generic => None,
+                // Generic costs overload `resource_id` as the region id
+                // (0 = global/no region, excluded when filtering by region).
+                CostResourceType::Generic => {
+                    if c.resource_id != 0 {
+                        Some(c.resource_id)
+                    } else {
+                        None
+                    }
+                }
             };
             if region != Some(params.region_id) {
                 continue;
@@ -569,18 +563,13 @@ async fn admin_profit_loss_report(
                 }
             }
             CostType::Recurring => {
-                let units = if c.resource_type == CostResourceType::IpRange {
-                    *ip_counts.get(&c.resource_id).unwrap_or(&0)
-                } else {
-                    1
-                };
-                if units == 0 {
-                    continue;
-                }
+                // Recurring costs are the full amount for the resource (for an
+                // ip_range this is the cost of the entire block, regardless of
+                // how many IPs are assigned — we pay for the block either way).
                 let (Some(ia), Some(it)) = (c.interval_amount, c.interval_type) else {
                     continue;
                 };
-                let monthly = amount_c as f64 * per_month_fraction(ia, it) * units as f64;
+                let monthly = amount_c as f64 * per_month_fraction(ia, it);
                 let active_start = c.billing_start.unwrap_or(DateTime::<Utc>::MIN_UTC);
                 let active_end = c.billing_end.unwrap_or(DateTime::<Utc>::MAX_UTC);
 

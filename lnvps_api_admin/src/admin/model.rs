@@ -306,7 +306,9 @@ impl From<lnvps_db::ResourceCost> for AdminResourceCostDetail {
 #[derive(Deserialize)]
 pub struct CreateResourceCostRequest {
     pub resource_type: AdminCostResourceType,
-    /// Ignored for `generic` costs (defaults to 0)
+    /// Id within the resource's table. For `generic` costs this is overloaded
+    /// as the region id it should be attributed to in the P/L report
+    /// (0 = global / not region-specific).
     #[serde(default)]
     pub resource_id: u64,
     /// Required for `generic` costs; optional otherwise
@@ -322,6 +324,9 @@ pub struct CreateResourceCostRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateResourceCostRequest {
+    /// For `generic` costs, the region id to attribute this cost to in the P/L
+    /// report (0 = global). Ignored for entity-linked costs.
+    pub resource_id: Option<u64>,
     pub cost_type: Option<AdminCostType>,
     pub amount: Option<u64>,
     pub currency: Option<String>,
