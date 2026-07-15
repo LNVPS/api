@@ -137,6 +137,45 @@ pub struct AccountPatchRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub tax_id: Option<Option<String>>,
+    /// Tax (VAT) rate that will be applied to this user's payments, per seller
+    /// company (read-only, ignored on PATCH)
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub tax: Option<Vec<AccountTaxInfo>>,
+}
+
+/// The tax (VAT) that will be charged to a user for a given seller company,
+/// determined from the user's current billing information (VAT number,
+/// declared country, IP-derived country).
+#[derive(Serialize, Deserialize)]
+pub struct AccountTaxInfo {
+    /// Seller company id
+    pub company_id: u64,
+    /// Seller company name
+    pub company_name: String,
+    /// VAT rate applied, as a percentage (e.g. 23.0 for 23%)
+    pub rate: f32,
+    /// Place-of-supply country (ISO 3166-1 alpha-3), if determined
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    /// How the sale is treated: `domestic`, `oss_b2c`, `reverse_charge`,
+    /// `out_of_scope` or `undetermined_default`
+    pub treatment: String,
+}
+
+impl AccountTaxInfo {
+    /// Build the API view of a tax determination for one seller company.
+    pub fn from_determination(
+        company: &lnvps_db::Company,
+        d: &lnvps_api_common::TaxDetermination,
+    ) -> Self {
+        Self {
+            company_id: company.id,
+            company_name: company.name.clone(),
+            rate: d.rate,
+            country_code: d.country_code.clone(),
+            treatment: d.treatment_str(),
+        }
+    }
 }
 
 /// A saved payment method for automatic renewals. Never exposes the underlying
@@ -222,6 +261,7 @@ impl From<lnvps_db::User> for AccountPatchRequest {
             city: Some(user.billing_city),
             postcode: Some(user.billing_postcode),
             tax_id: Some(user.billing_tax_id),
+            tax: None,
         }
     }
 }

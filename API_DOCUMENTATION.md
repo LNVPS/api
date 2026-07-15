@@ -56,6 +56,15 @@ interface AccountInfo {
   postcode?: string;
   tax_id?: string;
   nwc_connection_string?: string; // Nostr Wallet Connect URI for automatic renewals
+  tax?: AccountTaxInfo[]; // Read-only, GET only: tax (VAT) applied to payments, per seller company. Ignored on PATCH.
+}
+
+interface AccountTaxInfo {
+  company_id: number;
+  company_name: string;
+  rate: number; // VAT rate as a percentage, e.g. 23.0 for 23%
+  country_code?: string; // Place-of-supply country (ISO 3166-1 alpha-3), if determined
+  treatment: string; // "domestic" | "oss_b2c" | "reverse_charge" | "out_of_scope" | "undetermined_default"
 }
 ```
 
@@ -355,6 +364,7 @@ interface VmUpgradeQuote {
 - **GET** `/api/v1/account`
 - **Auth**: Required
 - **Response**: `AccountInfo`
+- **Notes**: The `tax` field lists the VAT rate that will currently be charged to the user for each seller company, determined from the user's billing info (VAT number, declared country, IP-derived country). Use it to show expected tax up-front; the authoritative amount is still computed per payment.
 
 #### Update Account Information
 - **PATCH** `/api/v1/account`

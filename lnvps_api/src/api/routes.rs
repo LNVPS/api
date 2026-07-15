@@ -24,17 +24,18 @@ use lnvps_api_common::{
     ApiVmTemplate, ClientIp, Nip98Auth, PageQuery, UpgradeConfig, VatClient, WorkJob,
 };
 use lnvps_db::{
-    PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
+    LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHostRegion,
 };
 
 use crate::api::model::{
-    AccountPatchRequest, AddNwcPaymentMethodRequest, ApiCompany, ApiCustomTemplateParams,
-    ApiCustomVmOrder, ApiCustomVmRequest, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod,
-    ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
-    ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule,
-    CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
-    PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr, validate_firewall_ports,
-    vm_to_status,
+    AccountPatchRequest, AccountTaxInfo, AddNwcPaymentMethodRequest, ApiCompany,
+    ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest, ApiInvoiceItem, ApiPaymentInfo,
+    ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory,
+    ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
+    CreateVmFirewallRule, CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy,
+    PatchVmFirewallRule, PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr,
+    validate_firewall_ports, vm_to_status,
 };
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
@@ -354,7 +355,29 @@ async fn v1_get_account(
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
     let user = this.db.get_user(uid).await?;
-    ApiData::ok(user.into())
+    let mut rsp: AccountPatchRequest = user.into();
+    rsp.tax = Some(
+        build_account_tax_info(this.db.as_ref(), &this.sub_handler.pricing_engine(), uid).await,
+    );
+    ApiData::ok(rsp)
+}
+
+/// Determine the tax (VAT) that would currently be charged to a user for each
+/// seller company, so the frontend can show the expected tax rate up-front.
+/// Companies whose determination fails are skipped (best effort).
+async fn build_account_tax_info(
+    db: &dyn LNVpsDb,
+    pricing: &PricingEngine,
+    uid: u64,
+) -> Vec<AccountTaxInfo> {
+    let companies = db.list_companies().await.unwrap_or_default();
+    let mut out = Vec::with_capacity(companies.len());
+    for company in companies {
+        if let Ok(d) = pricing.determine_tax(uid, 0, company.id).await {
+            out.push(AccountTaxInfo::from_determination(&company, &d));
+        }
+    }
+    out
 }
 
 /// List the user's saved payment methods for automatic renewals.
@@ -2130,6 +2153,54 @@ mod tests {
             created: Utc::now(),
             modified: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_build_account_tax_info_eu_seller() {
+        use lnvps_db::LNVpsDbBase;
+        let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        {
+            // Make the default company an EU (Irish) seller.
+            let mut companies = mock.companies.lock().await;
+            companies.get_mut(&1).unwrap().country_code = Some("IRL".to_string());
+        }
+        let uid = mock.upsert_user(&[1; 32]).await.unwrap();
+        {
+            // EU (Irish) customer with no VAT number -> domestic rate.
+            let mut users = mock.users.lock().await;
+            users.get_mut(&uid).unwrap().country_code = Some("IRL".to_string());
+        }
+        let db: std::sync::Arc<dyn LNVpsDb> = mock;
+        let vat = VatClient::with_rates(HashMap::from([(CountryCode::IRL, 23.0)]));
+        let pricing = PricingEngine::new(
+            db.clone(),
+            std::sync::Arc::new(lnvps_api_common::MockExchangeRate::new()),
+            vat,
+        );
+        let info = build_account_tax_info(db.as_ref(), &pricing, uid).await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].company_id, 1);
+        assert_eq!(info[0].company_name, "Default Company");
+        assert_eq!(info[0].rate, 23.0);
+        assert_eq!(info[0].country_code.as_deref(), Some("IRL"));
+        assert_eq!(info[0].treatment, "domestic");
+    }
+
+    #[tokio::test]
+    async fn test_build_account_tax_info_non_eu_seller() {
+        // Default mock company has no country / VAT number -> out of scope, 0%.
+        let db: std::sync::Arc<dyn LNVpsDb> =
+            std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let uid = db.upsert_user(&[1; 32]).await.unwrap();
+        let pricing = PricingEngine::new(
+            db.clone(),
+            std::sync::Arc::new(lnvps_api_common::MockExchangeRate::new()),
+            VatClient::default(),
+        );
+        let info = build_account_tax_info(db.as_ref(), &pricing, uid).await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].rate, 0.0);
+        assert_eq!(info[0].treatment, "out_of_scope");
     }
 
     #[test]

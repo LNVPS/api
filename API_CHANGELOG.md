@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **2026-07-17** - Account info now includes the applicable tax rate
+  - `GET /api/v1/account` returns a read-only `tax` array with one entry per seller company: `{company_id, company_name, rate, country_code, treatment}`. The rate is determined from the user's current billing information (VAT number, declared country, IP-derived country) using the same EU place-of-supply rules as invoicing, so frontends can show the expected VAT up-front. The field is ignored on PATCH.
+
 ### Changed
 
 - **2026-07-16** - Invoices now show the VAT treatment
