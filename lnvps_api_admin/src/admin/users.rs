@@ -4,6 +4,7 @@ use crate::admin::model::{AdminUserInfo, AdminUserRole, AdminUserUpdateRequest};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::Utc;
 use isocountry::CountryCode;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
@@ -152,6 +153,33 @@ async fn admin_update_user(
     }
     if let Some(billing_tax_id) = &req.billing_tax_id {
         user.billing_tax_id = Some(billing_tax_id.clone());
+    }
+    // IP-resolved geolocation evidence. Editing either field bumps geo_updated
+    // to reflect the manual override time.
+    let mut geo_changed = false;
+    if let Some(geo_country_code) = &req.geo_country_code {
+        user.geo_country_code = if geo_country_code.is_empty() {
+            None
+        } else {
+            Some(
+                CountryCode::for_alpha3(geo_country_code)
+                    .map_err(|_| ApiError::bad_request("Invalid geo_country_code"))?
+                    .alpha3()
+                    .to_string(),
+            )
+        };
+        geo_changed = true;
+    }
+    if let Some(geo_ip) = &req.geo_ip {
+        user.geo_ip = if geo_ip.is_empty() {
+            None
+        } else {
+            Some(geo_ip.clone())
+        };
+        geo_changed = true;
+    }
+    if geo_changed {
+        user.geo_updated = Some(Utc::now());
     }
 
     // Update user in database

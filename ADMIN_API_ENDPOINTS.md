@@ -153,6 +153,10 @@ Body (all optional):
   "billing_state": "string",
   "billing_postcode": "string",
   "billing_tax_id": "string",
+  "geo_country_code": "string",
+  // ISO 3166-1 alpha-3; empty string clears. Editing geo bumps geo_updated
+  "geo_ip": "string",
+  // empty string clears
   "admin_role": "super_admin"
   // AdminUserRole enum or null
 }
@@ -3284,6 +3288,12 @@ The RBAC system uses the following permission format: `resource::action`
   "billing_state": "string | null",
   "billing_postcode": "string | null",
   "billing_tax_id": "string | null",
+  "geo_country_code": "string | null",
+  // ISO 3166-1 alpha-3 country resolved from the client IP (independent VAT place-of-supply evidence)
+  "geo_ip": "string | null",
+  // Last client IP geolocation was resolved from
+  "geo_updated": "string (ISO 8601) | null",
+  // When the geolocation was last resolved (auto-updated on admin edit)
   "vm_count": number,
   "last_login": "string (ISO 8601) | null",
   "is_admin": boolean,

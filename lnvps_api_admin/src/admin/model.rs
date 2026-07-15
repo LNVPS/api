@@ -414,6 +414,14 @@ pub struct AdminUserInfo {
     pub billing_state: Option<String>,
     pub billing_postcode: Option<String>,
     pub billing_tax_id: Option<String>,
+    /// Country (ISO 3166-1 alpha-3) resolved from the client's IP address.
+    /// Independent place-of-supply evidence, captured automatically and stored
+    /// separately from the self-declared `country_code`.
+    pub geo_country_code: Option<String>,
+    /// Last client IP address geolocation was resolved from.
+    pub geo_ip: Option<String>,
+    /// When the geolocation was last resolved (auto-updated on edit).
+    pub geo_updated: Option<DateTime<Utc>>,
     // Admin-specific fields
     pub vm_count: u64,
     pub last_login: Option<DateTime<Utc>>,
@@ -434,6 +442,11 @@ pub struct AdminUserUpdateRequest {
     pub billing_state: Option<String>,
     pub billing_postcode: Option<String>,
     pub billing_tax_id: Option<String>,
+    /// IP-resolved country evidence (ISO 3166-1 alpha-3). Editing either geo
+    /// field bumps `geo_updated` to now.
+    pub geo_country_code: Option<String>,
+    /// Last client IP address geolocation was resolved from.
+    pub geo_ip: Option<String>,
     // Admin fields
     pub notes: Option<String>,
     pub status: Option<AdminUserStatus>,
@@ -512,6 +525,9 @@ impl From<lnvps_db::User> for AdminUserInfo {
             billing_state: user.billing_state,
             billing_postcode: user.billing_postcode,
             billing_tax_id: user.billing_tax_id,
+            geo_country_code: user.geo_country_code,
+            geo_ip: user.geo_ip,
+            geo_updated: user.geo_updated,
             // Admin-specific fields will be filled by the handler
             vm_count: 0,
             last_login: None,
@@ -544,6 +560,9 @@ impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
             billing_state: user.user_info.billing_state,
             billing_postcode: user.user_info.billing_postcode,
             billing_tax_id: user.user_info.billing_tax_id,
+            geo_country_code: user.user_info.geo_country_code,
+            geo_ip: user.user_info.geo_ip,
+            geo_updated: user.user_info.geo_updated,
             // Admin-specific fields will be filled by the handler
             vm_count: user.vm_count as _,
             last_login: None,

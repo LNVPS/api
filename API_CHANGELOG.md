@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-15** - Admin API exposes IP-derived geolocation evidence on users
+  - `AdminUserInfo` (returned by `GET /api/admin/v1/users`, `.../users/{id}`, `.../users/by-email`) now includes read-only `geo_country_code` (ISO 3166-1 alpha-3, resolved from the client IP as independent VAT place-of-supply evidence), `geo_ip`, and `geo_updated` (ISO 8601).
+  - `PATCH /api/admin/v1/users/{id}` accepts optional `geo_country_code` (validated alpha-3; empty string clears) and `geo_ip` (empty string clears). Editing either bumps `geo_updated` to the edit time. Requires `users::update`.
+
 - **2026-07-15** - VM status now includes the actual deletion date
   - `GET /api/v1/vms` and `GET /api/v1/vms/{id}` responses include a read-only `deleting_on` (ISO 8601) — the date the VM will be deleted if not renewed. This is `expires` plus the subscription's grace period, which is dynamic (tiered by subscription age), so the field reflects the real deletion date rather than a fixed offset. It is `null`/omitted for VMs with no expiry (never paid).
 

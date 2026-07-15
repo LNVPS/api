@@ -382,6 +382,17 @@ impl LNVpsDbBase for MockDb {
             u.whatsapp_number = user.whatsapp_number.clone();
             u.whatsapp_verified = user.whatsapp_verified;
             u.whatsapp_verify_code = user.whatsapp_verify_code.clone();
+            u.country_code = user.country_code.clone();
+            u.billing_name = user.billing_name.clone();
+            u.billing_address_1 = user.billing_address_1.clone();
+            u.billing_address_2 = user.billing_address_2.clone();
+            u.billing_city = user.billing_city.clone();
+            u.billing_state = user.billing_state.clone();
+            u.billing_postcode = user.billing_postcode.clone();
+            u.billing_tax_id = user.billing_tax_id.clone();
+            u.geo_country_code = user.geo_country_code.clone();
+            u.geo_ip = user.geo_ip.clone();
+            u.geo_updated = user.geo_updated;
         }
         Ok(())
     }
