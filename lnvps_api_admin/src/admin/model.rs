@@ -3582,6 +3582,63 @@ impl PartialProviderConfig {
     }
 }
 
+/// Admin view of a user's saved payment method for automatic renewals.
+/// Never exposes the underlying provider tokens / NWC connection string.
+#[derive(Serialize, Deserialize)]
+pub struct AdminUserPaymentMethodInfo {
+    pub id: u64,
+    /// User that owns this payment method
+    pub user_id: u64,
+    /// Payment processor: `nwc` or `revolut`
+    pub provider: String,
+    /// Optional user-defined label
+    pub name: Option<String>,
+    pub created: DateTime<Utc>,
+    /// Whether a provider customer id is on file (secret value is redacted)
+    pub has_external_customer_id: bool,
+    pub card_brand: Option<String>,
+    pub card_last_four: Option<String>,
+    pub exp_month: Option<u16>,
+    pub exp_year: Option<u16>,
+    pub is_default: bool,
+    pub enabled: bool,
+}
+
+impl From<lnvps_db::UserPaymentMethod> for AdminUserPaymentMethodInfo {
+    fn from(m: lnvps_db::UserPaymentMethod) -> Self {
+        Self {
+            id: m.id,
+            user_id: m.user_id,
+            provider: m.provider,
+            name: m.name,
+            created: m.created,
+            has_external_customer_id: m.external_customer_id.is_some(),
+            card_brand: m.card_brand,
+            card_last_four: m.card_last_four,
+            exp_month: m.exp_month,
+            exp_year: m.exp_year,
+            is_default: m.is_default,
+            enabled: m.enabled,
+        }
+    }
+}
+
+/// Admin request to update a user's saved payment method.
+/// Only mutates non-sensitive fields (label / default / enabled).
+#[derive(Deserialize)]
+pub struct AdminUpdateUserPaymentMethodRequest {
+    /// Mark this method as the user's default (clears the flag on their others)
+    pub is_default: Option<bool>,
+    /// Enable/disable the method
+    pub enabled: Option<bool>,
+    /// Set/clear the user-defined label. `Some(Some(..))` sets, `Some(None)` clears.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub name: Option<Option<String>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

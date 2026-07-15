@@ -10,9 +10,8 @@ use lnvps_db::{
     ReferralPayout, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
     UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -389,6 +388,21 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn set_user_geo(
+        &self,
+        user_id: u64,
+        country_code: Option<&str>,
+        ip: &str,
+    ) -> DbResult<()> {
+        let mut users = self.users.lock().await;
+        if let Some(u) = users.get_mut(&user_id) {
+            u.geo_country_code = country_code.map(|s| s.to_string());
+            u.geo_ip = Some(ip.to_string());
+            u.geo_updated = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
     async fn delete_user(&self, id: u64) -> DbResult<()> {
         let mut users = self.users.lock().await;
         users.remove(&id);
@@ -479,6 +493,28 @@ impl LNVpsDbBase for MockDb {
             .get(&id)
             .cloned()
             .ok_or_else(|| DbError::from(anyhow!("Payment method not found")))
+    }
+
+    async fn admin_list_user_payment_methods_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+    ) -> DbResult<(Vec<UserPaymentMethod>, u64)> {
+        let methods = self.user_payment_methods.lock().await;
+        let mut all: Vec<UserPaymentMethod> = methods
+            .values()
+            .filter(|m| user_id.map(|u| m.user_id == u).unwrap_or(true))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
     }
 
     async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()> {
@@ -3470,19 +3506,60 @@ mod tests {
         };
 
         // Insert two revolut methods (2nd is default) + one other provider
-        let id1 = db.insert_user_payment_method(&mk(1, "revolut", false)).await.unwrap();
-        let id2 = db.insert_user_payment_method(&mk(1, "revolut", true)).await.unwrap();
-        let _id3 = db.insert_user_payment_method(&mk(1, "stripe", false)).await.unwrap();
+        let id1 = db
+            .insert_user_payment_method(&mk(1, "revolut", false))
+            .await
+            .unwrap();
+        let id2 = db
+            .insert_user_payment_method(&mk(1, "revolut", true))
+            .await
+            .unwrap();
+        let _id3 = db
+            .insert_user_payment_method(&mk(1, "stripe", false))
+            .await
+            .unwrap();
         assert_ne!(id1, id2);
 
         // Provider filter + default-first ordering
-        let revolut = db.list_user_payment_methods(1, Some("revolut")).await.unwrap();
+        let revolut = db
+            .list_user_payment_methods(1, Some("revolut"))
+            .await
+            .unwrap();
         assert_eq!(revolut.len(), 2);
         assert_eq!(revolut[0].id, id2, "default method should sort first");
 
         // All providers for the user
         let all = db.list_user_payment_methods(1, None).await.unwrap();
         assert_eq!(all.len(), 3);
+
+        // Admin cross-user paginated listing + user filter
+        let _other = db
+            .insert_user_payment_method(&mk(2, "nwc", true))
+            .await
+            .unwrap();
+        let (page, total) = db
+            .admin_list_user_payment_methods_paginated(10, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(page.len(), 4);
+        // Newest id first
+        assert!(page[0].id > page[1].id);
+        // Pagination: limit 2 returns 2 of 4
+        let (page2, total2) = db
+            .admin_list_user_payment_methods_paginated(2, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(total2, 4);
+        assert_eq!(page2.len(), 2);
+        // Filter to user 2
+        let (u2, u2_total) = db
+            .admin_list_user_payment_methods_paginated(10, 0, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(u2_total, 1);
+        assert_eq!(u2.len(), 1);
+        assert_eq!(u2[0].user_id, 2);
 
         // Get one
         let got = db.get_user_payment_method(id1).await.unwrap();
@@ -3500,7 +3577,13 @@ mod tests {
         // Delete
         db.delete_user_payment_method(id1).await.unwrap();
         assert!(db.get_user_payment_method(id1).await.is_err());
-        assert_eq!(db.list_user_payment_methods(1, Some("revolut")).await.unwrap().len(), 1);
+        assert_eq!(
+            db.list_user_payment_methods(1, Some("revolut"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Build a minimal SubscriptionPayment for the default mock subscription (id=1).

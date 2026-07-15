@@ -1,9 +1,9 @@
-use lnvps_api_common::{BasicRecord, DnsRef, get_dns_server};
 use crate::router::{ArpEntry, get_router};
 use anyhow::{Context, anyhow};
 use ipnetwork::IpNetwork;
 use lnvps_api_common::op_fatal;
 use lnvps_api_common::retry::OpResult;
+use lnvps_api_common::{BasicRecord, DnsRef, get_dns_server};
 use lnvps_db::{AccessPolicy, IpRange, LNVpsDb, NetworkAccessPolicy, VmIpAssignment};
 use log::warn;
 use std::net::IpAddr;

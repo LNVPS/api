@@ -22,6 +22,7 @@ mod reports;
 mod roles;
 mod routers;
 mod subscriptions;
+mod user_payment_methods;
 mod users;
 mod vm_ip_assignments;
 mod vm_os_images;
@@ -68,6 +69,7 @@ pub fn admin_router(
         .merge(reports::router())
         .merge(websocket::router())
         .merge(payment_methods::router())
+        .merge(user_payment_methods::router())
         .with_state(RouterState {
             db,
             work_commander,

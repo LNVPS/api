@@ -255,7 +255,10 @@ impl RevolutPaymentHandler {
         // The reusable payment method is NOT on the order — fetch it from the
         // customer's saved payment methods (filtered to merchant capability).
         if let Some(customer_id) = order.customer_id() {
-            if let Err(e) = self.capture_saved_payment_method(payment.user_id, &customer_id).await {
+            if let Err(e) = self
+                .capture_saved_payment_method(payment.user_id, &customer_id)
+                .await
+            {
                 warn!(
                     "Failed to capture saved Revolut payment method for user {}: {}",
                     payment.user_id, e

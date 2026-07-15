@@ -8,8 +8,8 @@ use lnvps_api_common::{
     WorkJob,
 };
 use lnvps_db::{
-    LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentType, SubscriptionType, Vm,
+    LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
+    SubscriptionType, Vm,
 };
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -199,16 +199,16 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         Ok(())
     }
 
-    async fn on_expired(
-        &self,
-        sub: &Subscription,
-        line_item: &SubscriptionLineItem,
-    ) -> Result<()> {
+    async fn on_expired(&self, sub: &Subscription, line_item: &SubscriptionLineItem) -> Result<()> {
         // skip anything that isn't the vm line item (skip upgrade lines)
         if line_item.subscription_type != SubscriptionType::Vps {
             return Ok(());
         }
-        let grace_days = crate::worker::grace_period_days_for_sub(sub, Utc::now(), self.provisioner.delete_after);
+        let grace_days = crate::worker::grace_period_days_for_sub(
+            sub,
+            Utc::now(),
+            self.provisioner.delete_after,
+        );
         info!("Stopping expired VM {}", self.vm.id);
         // Stop is best-effort (the host may be unreachable or the VM already
         // stopped), but the history entry must always be written: it is the

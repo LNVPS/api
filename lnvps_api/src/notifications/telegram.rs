@@ -177,9 +177,11 @@ impl NotificationChannel for TelegramChannel {
         };
         match self.client.send_message(chat_id, &text).await {
             Ok(()) => Ok(()),
-            Err(e @ TelegramError::Api { permanent: true, .. }) => {
-                Err(OpError::Fatal(anyhow::Error::msg(e.to_string())))
-            }
+            Err(
+                e @ TelegramError::Api {
+                    permanent: true, ..
+                },
+            ) => Err(OpError::Fatal(anyhow::Error::msg(e.to_string()))),
             Err(e) => Err(OpError::Transient(anyhow::Error::msg(e.to_string()))),
         }
     }

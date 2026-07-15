@@ -127,7 +127,9 @@ async fn admin_create_vm_ip_assignment(
     // Validate IP range exists and is enabled
     let ip_range = this.db.admin_get_ip_range(req.ip_range_id).await?;
     if !ip_range.enabled {
-        return Err(ApiError::conflict("Cannot assign IP from a disabled IP range"));
+        return Err(ApiError::conflict(
+            "Cannot assign IP from a disabled IP range",
+        ));
     }
 
     // If IP is provided, validate it's within the range

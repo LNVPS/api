@@ -6,7 +6,9 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
+};
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCostPlan};
 use std::sync::Arc;
 

@@ -176,9 +176,7 @@ impl HostCapacityService {
                 let max_disk_size = hosts_in_region
                     .clone()
                     .filter(host_has_ipv4)
-                    .filter(|h| {
-                        h.available_cpu() >= min_cpu && h.available_memory() >= min_memory
-                    })
+                    .filter(|h| h.available_cpu() >= min_cpu && h.available_memory() >= min_memory)
                     .flat_map(|h| {
                         h.disks
                             .iter()
