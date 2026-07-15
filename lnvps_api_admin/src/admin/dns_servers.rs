@@ -4,7 +4,9 @@ use crate::admin::model::{AdminDnsServerDetail, CreateDnsServerRequest, UpdateDn
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, DnsZone, PageQuery, get_dns_server,
+};
 use lnvps_db::{AdminAction, AdminResource};
 
 pub fn router() -> Router<RouterState> {
@@ -18,6 +20,10 @@ pub fn router() -> Router<RouterState> {
             get(admin_get_dns_server)
                 .patch(admin_update_dns_server)
                 .delete(admin_delete_dns_server),
+        )
+        .route(
+            "/api/admin/v1/dns_servers/{id}/zones",
+            get(admin_list_dns_server_zones),
         )
 }
 
@@ -113,6 +119,18 @@ async fn admin_update_dns_server(
     let updated = this.db.get_dns_server(dns_server_id).await?;
 
     ApiData::ok(detail_with_count(&this, updated).await)
+}
+
+async fn admin_list_dns_server_zones(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(dns_server_id): Path<u64>,
+) -> ApiResult<Vec<DnsZone>> {
+    auth.require_permission(AdminResource::DnsServer, AdminAction::View)?;
+
+    let server = get_dns_server(&this.db, dns_server_id).await?;
+    let zones = server.list_zones().await?;
+    ApiData::ok(zones)
 }
 
 async fn admin_delete_dns_server(

@@ -5,12 +5,12 @@
 //! Only reverse records are supported; forward (A/AAAA) records must be managed
 //! by another provider (e.g. Cloudflare).
 
-use crate::dns::{BasicRecord, DnsRef, DnsServer, RecordType};
+use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone, RecordType};
 use crate::json_api::JsonApi;
+use crate::op_fatal;
 use crate::ovh::ovh_json_api;
+use crate::retry::OpResult;
 use async_trait::async_trait;
-use lnvps_api_common::op_fatal;
-use lnvps_api_common::retry::OpResult;
 use log::info;
 use serde::{Deserialize, Serialize};
 
@@ -104,6 +104,11 @@ impl DnsServer for OvhDns {
             )
             .await?;
         Ok(())
+    }
+
+    /// OVH reverse DNS is keyed per-IP block and exposes no listable zones.
+    async fn list_zones(&self) -> OpResult<Vec<DnsZone>> {
+        Ok(vec![])
     }
 }
 

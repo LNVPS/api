@@ -1,4 +1,4 @@
-use crate::json_api::JsonApi;
+use lnvps_api_common::JsonApi;
 use crate::router::{
     ArpEntry, BgpPeer, BgpPeerDirection, BgpRoute, BgpRouter, BgpSession, GreConfig, Router,
     Tunnel, TunnelConfig, TunnelKind, TunnelRouter, TunnelTraffic, VxlanConfig, WireguardConfig,

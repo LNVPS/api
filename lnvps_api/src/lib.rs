@@ -1,10 +1,7 @@
 pub mod api;
 pub mod data_migration;
-pub mod dns;
 pub mod host;
-pub mod json_api;
 pub mod notifications;
-pub mod ovh;
 pub mod payment_factory;
 pub mod payments;
 pub mod provisioner;

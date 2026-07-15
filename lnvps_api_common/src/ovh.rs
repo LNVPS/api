@@ -5,15 +5,15 @@
 //! `$1$` + SHA1(`app_secret+consumer_key+METHOD+URL+BODY+TIMESTAMP`). A clock
 //! delta against OVH's `/auth/time` endpoint is applied so signatures stay valid.
 //!
-//! Both the additional-IP "router" ([`crate::router::OvhDedicatedServerVMacRouter`])
-//! and the reverse-DNS provider ([`crate::dns::OvhDns`]) share this code.
+//! Both the additional-IP "router" (`OvhDedicatedServerVMacRouter`) and the
+//! reverse-DNS provider ([`crate::dns::OvhDns`]) share this code.
 
 use crate::json_api::{JsonApi, TokenGen};
+use crate::retry::{OpError, OpResult};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use lnvps_api_common::retry::{OpError, OpResult};
-use nostr_sdk::hashes::{Hash, sha1};
 use reqwest::{Method, RequestBuilder, Url};
+use sha1::{Digest, Sha1};
 use std::ops::Sub;
 
 /// Generates signed OVH API request headers from an `app_key:app_secret:consumer_key` token.
@@ -79,8 +79,9 @@ impl OvhTokenGen {
         signature.push_str(sep);
         signature.push_str(timestamp);
 
-        let sha1: sha1::Hash = Hash::hash(signature.as_bytes());
-        let sig = hex::encode(sha1);
+        let mut hasher = Sha1::new();
+        hasher.update(signature.as_bytes());
+        let sig = hex::encode(hasher.finalize());
         prefix + &sig
     }
 }

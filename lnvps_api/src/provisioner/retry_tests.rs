@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::dns::{BasicRecord, DnsRef, DnsServer, RecordType};
+    use lnvps_api_common::{BasicRecord, DnsRef, DnsServer, RecordType};
     use crate::mocks::{MockDnsServer, MockNode, MockRouter};
     use crate::router::{ArpEntry, Router};
     use crate::settings::mock_settings;
@@ -87,6 +87,10 @@ mod tests {
                 )));
             }
             self.inner.delete_record(record).await
+        }
+
+        async fn list_zones(&self) -> OpResult<Vec<lnvps_api_common::DnsZone>> {
+            self.inner.list_zones().await
         }
     }
 

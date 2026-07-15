@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsRef, get_dns_server};
+use lnvps_api_common::{BasicRecord, DnsRef, get_dns_server};
 use crate::router::{ArpEntry, get_router};
 use anyhow::{Context, anyhow};
 use ipnetwork::IpNetwork;

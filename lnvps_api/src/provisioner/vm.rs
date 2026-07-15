@@ -1,4 +1,4 @@
-use crate::dns::DnsServer;
+use lnvps_api_common::DnsServer;
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};

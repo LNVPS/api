@@ -2551,6 +2551,33 @@ GET /api/admin/v1/dns_servers/{dns_server_id}
 
 Required Permission: `dns_server::view`
 
+#### List DNS Server Zones
+
+```
+GET /api/admin/v1/dns_servers/{dns_server_id}/zones
+```
+
+Required Permission: `dns_server::view`
+
+Lists the DNS zones available on the given DNS server, for use when selecting a
+forward/reverse zone id on an IP range. Providers without a zone concept return
+an empty list (OVH reverse DNS is keyed per-IP block and exposes no zones).
+
+Response:
+
+```json
+{
+  "data": [
+    {
+      "id": "string",
+      // Provider specific zone id (e.g. Cloudflare zone id)
+      "name": "string"
+      // Human readable zone name (e.g. example.com)
+    }
+  ]
+}
+```
+
 #### Create DNS Server
 
 ```

@@ -1,5 +1,5 @@
-use crate::json_api::JsonApi;
-use crate::ovh::ovh_json_api;
+use lnvps_api_common::JsonApi;
+use lnvps_api_common::ovh_json_api;
 use crate::router::{ArpEntry, Router};
 use anyhow::Result;
 use async_trait::async_trait;

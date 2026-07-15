@@ -28,10 +28,13 @@ base64 = { version = "0.22", features = ["alloc"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", features = ["json"] }
 rand = "0.9"
+sha1 = "0.10"
 isocountry = "0.3"
 redis = { version = "1", features = ["tokio-comp", "cluster"] }
 
 [dev-dependencies]
 env_logger = "0.11"
 sqlx = { version = "0.8", default-features = false }
+wiremock = "0.6"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

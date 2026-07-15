@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
-use lnvps_api_common::retry::{OpError, OpResult};
-use lnvps_api_common::{op_fatal, op_transient};
+use crate::retry::{OpError, OpResult};
+use crate::{op_fatal, op_transient};
 use log::debug;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
 use reqwest::{Client, Method, Request, RequestBuilder, Url};

@@ -4202,3 +4202,146 @@ mod tests {
         assert!(db.list_router_bgp_routes(1).await.unwrap().is_empty());
     }
 }
+
+use crate::dns::{BasicRecord, DnsRef, DnsZone, RecordType};
+use crate::retry::{OpError, OpResult};
+
+#[derive(Clone)]
+pub struct MockDnsServer {
+    pub zones: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>,
+}
+
+pub struct MockDnsEntry {
+    pub name: String,
+    pub value: String,
+    pub kind: String,
+}
+
+impl Default for MockDnsServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockDnsServer {
+    pub fn new() -> Self {
+        // Per-test-thread state (see `MockRouter::new`): isolates parallel
+        // tests while sharing within a single test.
+        thread_local! {
+            static TL_ZONES: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+        }
+        Self {
+            zones: TL_ZONES.with(|z| z.clone()),
+        }
+    }
+
+    pub async fn reset() {
+        Self::new().zones.lock().await.clear();
+    }
+}
+
+#[async_trait]
+impl crate::dns::DnsServer for MockDnsServer {
+    async fn add_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| record.ip.clone());
+        let mut zones = self.zones.lock().await;
+        let table = if let Some(t) = zones.get_mut(&zone_id) {
+            t
+        } else {
+            zones.insert(zone_id.clone(), HashMap::new());
+            zones.get_mut(&zone_id).unwrap()
+        };
+
+        if table
+            .values()
+            .any(|v| v.name == record.name && v.kind == record.kind.to_string())
+        {
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Duplicate record with name {}",
+                record.name
+            )));
+        }
+
+        let rnd_id: [u8; 12] = rand::random();
+        let id = hex::encode(rnd_id);
+        table.insert(
+            id.clone(),
+            MockDnsEntry {
+                name: record.name.to_string(),
+                value: record.value.to_string(),
+                kind: record.kind.to_string(),
+            },
+        );
+        Ok(BasicRecord {
+            name: match record.kind {
+                RecordType::PTR => format!("{}.X.Y.Z.addr.in-arpa", record.name),
+                _ => format!("{}.lnvps.mock", record.name),
+            },
+            value: record.value.clone(),
+            id: Some(DnsRef::Id(id)),
+            kind: record.kind.clone(),
+            ip: record.ip.clone(),
+            zone: record.zone.clone(),
+        })
+    }
+
+    async fn delete_record(&self, record: &BasicRecord) -> OpResult<()> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| record.ip.clone());
+        let mut zones = self.zones.lock().await;
+        let table = if let Some(t) = zones.get_mut(&zone_id) {
+            t
+        } else {
+            zones.insert(zone_id.clone(), HashMap::new());
+            zones.get_mut(&zone_id).unwrap()
+        };
+        let record_id = record
+            .id
+            .as_ref()
+            .and_then(DnsRef::as_id)
+            .ok_or_else(|| OpError::Fatal(anyhow::anyhow!("Id is missing")))?;
+        table.remove(record_id);
+        Ok(())
+    }
+
+    async fn update_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        let zone_id = record
+            .zone
+            .as_id()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| record.ip.clone());
+        let mut zones = self.zones.lock().await;
+        let table = if let Some(t) = zones.get_mut(&zone_id) {
+            t
+        } else {
+            zones.insert(zone_id.clone(), HashMap::new());
+            zones.get_mut(&zone_id).unwrap()
+        };
+        let record_id = record
+            .id
+            .as_ref()
+            .and_then(DnsRef::as_id)
+            .ok_or_else(|| OpError::Fatal(anyhow::anyhow!("Id is missing")))?;
+        if let Some(r) = table.get_mut(record_id) {
+            r.name = record.name.clone();
+            r.value = record.value.clone();
+            r.kind = record.kind.to_string();
+        }
+        Ok(record.clone())
+    }
+
+    async fn list_zones(&self) -> OpResult<Vec<DnsZone>> {
+        Ok(vec![DnsZone {
+            id: "mock-zone-id".to_string(),
+            name: "mock.example.com".to_string(),
+        }])
+    }
+}

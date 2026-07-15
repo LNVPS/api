@@ -1,9 +1,9 @@
-use crate::dns::{BasicRecord, DnsRef, DnsServer};
+use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone};
 use crate::json_api::JsonApi;
+use crate::op_transient;
+use crate::retry::OpResult;
 use anyhow::Context;
 use async_trait::async_trait;
-use lnvps_api_common::op_transient;
-use lnvps_api_common::retry::OpResult;
 use log::info;
 use serde::{Deserialize, Serialize};
 
@@ -13,13 +13,14 @@ pub struct Cloudflare {
 
 impl Cloudflare {
     pub fn new(token: &str) -> Cloudflare {
+        Self::with_base("https://api.cloudflare.com", token)
+    }
+
+    /// Construct a client pointed at an arbitrary base URL (used in tests to
+    /// target a mock server).
+    fn with_base(base: &str, token: &str) -> Cloudflare {
         Self {
-            api: JsonApi::token(
-                "https://api.cloudflare.com",
-                &format!("Bearer {}", token),
-                false,
-            )
-            .unwrap(),
+            api: JsonApi::token(base, &format!("Bearer {}", token), false).unwrap(),
         }
     }
 
@@ -144,6 +145,36 @@ impl DnsServer for Cloudflare {
             zone: record.zone.clone(),
         })
     }
+
+    /// Fetch all Cloudflare zones, following pagination.
+    async fn list_zones(&self) -> OpResult<Vec<DnsZone>> {
+        let mut zones = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp: CfResult<Vec<CfZone>> = self
+                .api
+                .get(&format!("/client/v4/zones?per_page=50&page={page}"))
+                .await?;
+            Self::bail_error(&resp)?;
+
+            zones.extend(resp.result.into_iter().map(|z| DnsZone {
+                id: z.id,
+                name: z.name,
+            }));
+
+            let total_pages = resp
+                .result_info
+                .as_ref()
+                .map(|i| i.total_pages)
+                .unwrap_or(1)
+                .max(1);
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+        Ok(zones)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -168,10 +199,98 @@ struct CfResult<T> {
     pub success: bool,
     pub errors: Option<Vec<CfError>>,
     pub result: T,
+    #[serde(default)]
+    pub result_info: Option<CfResultInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CfZone {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CfResultInfo {
+    pub total_pages: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CfError {
     pub code: i32,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dns::DnsServer;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_list_zones_paginates() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": [{ "id": "z1", "name": "one.example.com" }],
+                "result_info": { "total_pages": 2 }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": [{ "id": "z2", "name": "two.example.com" }],
+                "result_info": { "total_pages": 2 }
+            })))
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let zones = cf.list_zones().await?;
+        assert_eq!(
+            zones,
+            vec![
+                DnsZone {
+                    id: "z1".to_string(),
+                    name: "one.example.com".to_string()
+                },
+                DnsZone {
+                    id: "z2".to_string(),
+                    name: "two.example.com".to_string()
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_zones_api_error() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false,
+                "errors": [{ "code": 1000, "message": "bad token" }],
+                "result": [],
+                "result_info": null
+            })))
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let err = cf.list_zones().await.unwrap_err();
+        assert!(err.to_string().contains("bad token"));
+        Ok(())
+    }
 }

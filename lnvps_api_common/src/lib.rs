@@ -1,9 +1,12 @@
 mod capacity;
+mod dns;
 mod exchange;
+mod json_api;
 mod kv;
 mod mock;
 mod model;
 mod network;
+mod ovh;
 mod nip98;
 mod pricing;
 pub mod retry;
@@ -15,11 +18,14 @@ mod vm_history;
 mod work;
 
 pub use capacity::*;
+pub use dns::*;
 pub use exchange::*;
+pub use json_api::*;
 pub use kv::*;
 pub use mock::*;
 pub use model::*;
 pub use network::*;
+pub use ovh::*;
 pub use nip98::*;
 pub use pricing::*;
 pub use routes::*;

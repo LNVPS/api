@@ -1,24 +1,28 @@
+use crate::NetworkProvisioner;
+use crate::retry::OpResult;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use lnvps_api_common::retry::OpResult;
 use lnvps_db::VmIpAssignment;
+use lnvps_db::{DnsServerKind, LNVpsDb};
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;
-
-use lnvps_api_common::retry::OpError;
-use lnvps_db::{DnsServerKind, LNVpsDb};
 use std::sync::Arc;
 
-#[cfg(feature = "cloudflare")]
 mod cloudflare;
-#[cfg(feature = "ovh")]
 mod ovh;
-use crate::provisioner::NetworkProvisioner;
-#[cfg(feature = "cloudflare")]
 pub use cloudflare::*;
-#[cfg(feature = "ovh")]
 pub use ovh::*;
+
+/// A DNS zone available on a DNS server (provider specific, e.g. a Cloudflare zone).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsZone {
+    /// Provider specific zone id (e.g. Cloudflare zone id).
+    pub id: String,
+    /// Human readable zone name (e.g. `example.com`).
+    pub name: String,
+}
 
 #[async_trait]
 pub trait DnsServer: Send + Sync {
@@ -30,6 +34,13 @@ pub trait DnsServer: Send + Sync {
 
     /// Update a DNS record. The target zone (if any) is carried on `record.zone_id`.
     async fn update_record(&self, record: &BasicRecord) -> OpResult<BasicRecord>;
+
+    /// List the DNS zones available on this server.
+    ///
+    /// Read-only helper used by the admin API to populate zone pickers. Returns
+    /// an empty list for providers that have no zone concept (e.g. OVH reverse
+    /// DNS, which is keyed per-IP block).
+    async fn list_zones(&self) -> OpResult<Vec<DnsZone>>;
 }
 
 /// Construct a DNS server client from a database `dns_server` row.
@@ -39,31 +50,11 @@ pub async fn get_dns_server(
 ) -> OpResult<Arc<dyn DnsServer>> {
     let cfg = db.get_dns_server(dns_server_id).await?;
     match cfg.kind {
-        #[cfg(feature = "cloudflare")]
         DnsServerKind::Cloudflare => Ok(Arc::new(cloudflare::Cloudflare::new(cfg.token.as_str()))),
-        #[cfg(not(feature = "cloudflare"))]
-        DnsServerKind::Cloudflare => Err(OpError::Fatal(anyhow::anyhow!(
-            "Cloudflare DNS support is not enabled in this build"
-        ))),
-        #[cfg(feature = "ovh")]
         DnsServerKind::Ovh => Ok(Arc::new(
             ovh::OvhDns::new(&cfg.url, cfg.token.as_str()).await?,
         )),
-        #[cfg(not(feature = "ovh"))]
-        DnsServerKind::Ovh => Err(OpError::Fatal(anyhow::anyhow!(
-            "OVH DNS support is not enabled in this build"
-        ))),
-        DnsServerKind::MockDns => {
-            #[cfg(test)]
-            return Ok(Arc::new(crate::mocks::MockDnsServer::new()));
-            #[cfg(not(test))]
-            {
-                #[allow(unreachable_code)]
-                Err(OpError::Fatal(anyhow::anyhow!(
-                    "Cannot use mock DNS server outside tests"
-                )))
-            }
-        }
+        DnsServerKind::MockDns => Ok(Arc::new(crate::MockDnsServer::new())),
     }
 }
 
@@ -255,7 +246,7 @@ pub fn is_valid_fqdn(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lnvps_api_common::MockDb;
+    use crate::MockDb;
     use lnvps_db::VmIpAssignment;
 
     fn v4_assignment() -> VmIpAssignment {

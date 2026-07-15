@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-15** - `GET /api/admin/v1/dns_servers/{id}/zones` (admin) — list the DNS zones available on a configured DNS server (`{ id, name }` per zone), for populating forward/reverse zone id pickers on IP ranges. Cloudflare returns its zones; OVH (reverse-only, zoneless) returns an empty list. Requires `dns_server::view`.
+
 - **2026-07-14** - `DELETE /api/v1/ssh-key/{id}` — remove a saved SSH key from the account. Only the key's owner may delete it.
 - **2026-07-14** - `GET /api/v1/ssh-key` now includes a `vms` field on each key: the list of the user's active (non-deleted) VM IDs currently using that SSH key.
 - **2026-07-14** - VM orders now validate that the supplied `ssh_key_id` belongs to the requesting user (previously any existing key id was accepted). Ordering a VM continues to require a valid `ssh_key_id`.
