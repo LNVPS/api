@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - VM status exposes its subscription id
+  - `GET /api/v1/vm` and `GET /api/v1/vm/{id}` responses include a read-only `subscription_id`. A VM is billed by a subscription underneath, so clients can renew a VM by renewing its subscription (`GET /api/v1/subscriptions/{id}/renew`) and unify VM/subscription payment handling. `null`/omitted for VMs that were never paid.
+
 - **2026-07-18** - VM host regions expose their seller company
   - `VmHostRegion` (embedded in template/VM responses, e.g. `GET /api/v1/vms`, `GET /api/v1/vm/templates`) now includes a read-only `company_id`. Match it against `account.tax[].company_id` to display the VAT rate that applies to a specific VM up-front.
 

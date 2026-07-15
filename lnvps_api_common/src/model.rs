@@ -238,6 +238,10 @@ pub struct ApiVmStatus {
     /// Date the VM will be deleted if not renewed (expiry + dynamic grace period).
     /// `None` when the VM has no expiry (never paid).
     pub deleting_on: Option<DateTime<Utc>>,
+    /// The subscription this VM is billed under. Renew the VM by renewing this
+    /// subscription (`/api/v1/subscriptions/{id}/renew`). `None` if the VM has
+    /// no subscription record yet (never paid).
+    pub subscription_id: Option<u64>,
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -295,7 +299,7 @@ pub async fn vm_to_status(
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
-    let (sub_created, sub_expires, sub_auto_renewal, deleting_on) = match db
+    let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on) = match db
         .get_subscription_by_line_item_id(vm.subscription_line_item_id)
         .await
     {
@@ -307,9 +311,15 @@ pub async fn vm_to_status(
                 let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
                 expires.checked_add_days(Days::new(grace as u64))
             });
-            (sub.created, sub.expires, sub.auto_renewal_enabled, deleting_on)
+            (
+                Some(sub.id),
+                sub.created,
+                sub.expires,
+                sub.auto_renewal_enabled,
+                deleting_on,
+            )
         }
-        Err(_) => (Utc::now(), None, false, None),
+        Err(_) => (None, Utc::now(), None, false, None),
     };
 
     Ok(ApiVmStatus {
@@ -332,6 +342,7 @@ pub async fn vm_to_status(
             .collect::<Result<Vec<_>>>()?,
         auto_renewal_enabled: sub_auto_renewal,
         deleting_on,
+        subscription_id: sub_id,
     })
 }
 
