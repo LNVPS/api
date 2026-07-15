@@ -109,6 +109,18 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update user record
     async fn update_user(&self, user: &User) -> DbResult<()>;
 
+    /// Store IP-derived geolocation evidence for a user (place-of-supply / VAT).
+    ///
+    /// Written independently of [`update_user`] so background geolocation does
+    /// not race with user-initiated profile edits. `country_code` is ISO 3166-1
+    /// alpha-3 (or `None` if the IP could not be resolved to a country).
+    async fn set_user_geo(
+        &self,
+        user_id: u64,
+        country_code: Option<&str>,
+        ip: &str,
+    ) -> DbResult<()>;
+
     /// Delete user record
     async fn delete_user(&self, id: u64) -> DbResult<()>;
 
@@ -147,6 +159,15 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Get a single saved payment method by id
     async fn get_user_payment_method(&self, id: u64) -> DbResult<UserPaymentMethod>;
+
+    /// Admin: list saved payment methods across all users (optionally filtered
+    /// to a single user), paginated. Returns the page plus the total count.
+    async fn admin_list_user_payment_methods_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+    ) -> DbResult<(Vec<UserPaymentMethod>, u64)>;
 
     /// Update a saved payment method (enabled/default/card metadata)
     async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()>;

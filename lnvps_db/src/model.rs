@@ -62,6 +62,19 @@ pub struct User {
     pub billing_postcode: Option<String>,
     /// Billing tax id
     pub billing_tax_id: Option<String>,
+    /// Country (ISO 3166-1 alpha-3) resolved from the client's IP address.
+    ///
+    /// This is an *independent* place-of-supply evidence signal for EU VAT,
+    /// captured automatically and stored separately from the self-declared
+    /// `country_code` so the two can be compared / conflicts flagged.
+    #[sqlx(default)]
+    pub geo_country_code: Option<String>,
+    /// Last client IP address geolocation was resolved from.
+    #[sqlx(default)]
+    pub geo_ip: Option<String>,
+    /// When the geolocation was last resolved.
+    #[sqlx(default)]
+    pub geo_updated: Option<DateTime<Utc>>,
 }
 
 /// A saved payment method for off-session (merchant-initiated) automatic
@@ -1582,6 +1595,7 @@ pub enum AdminResource {
     IpSpace = 20,
     PaymentMethodConfig = 21,
     DnsServer = 22,
+    UserPaymentMethod = 23,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1620,6 +1634,7 @@ impl Display for AdminResource {
             AdminResource::IpSpace => write!(f, "ip_space"),
             AdminResource::PaymentMethodConfig => write!(f, "payment_method_config"),
             AdminResource::DnsServer => write!(f, "dns_server"),
+            AdminResource::UserPaymentMethod => write!(f, "user_payment_method"),
         }
     }
 }
@@ -1652,6 +1667,7 @@ impl FromStr for AdminResource {
             "ip_space" => Ok(AdminResource::IpSpace),
             "payment_method_config" => Ok(AdminResource::PaymentMethodConfig),
             "dns_server" => Ok(AdminResource::DnsServer),
+            "user_payment_method" => Ok(AdminResource::UserPaymentMethod),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1685,6 +1701,7 @@ impl TryFrom<u16> for AdminResource {
             20 => Ok(AdminResource::IpSpace),
             21 => Ok(AdminResource::PaymentMethodConfig),
             22 => Ok(AdminResource::DnsServer),
+            23 => Ok(AdminResource::UserPaymentMethod),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1717,6 +1734,7 @@ impl AdminResource {
             AdminResource::IpSpace,
             AdminResource::PaymentMethodConfig,
             AdminResource::DnsServer,
+            AdminResource::UserPaymentMethod,
         ]
     }
 }
@@ -2037,6 +2055,23 @@ mod tests {
             AdminResource::DnsServer
         );
         assert!(AdminResource::all().contains(&AdminResource::DnsServer));
+    }
+
+    #[test]
+    fn test_admin_resource_user_payment_method_roundtrip() {
+        assert_eq!(
+            "user_payment_method".parse::<AdminResource>().unwrap(),
+            AdminResource::UserPaymentMethod
+        );
+        assert_eq!(
+            AdminResource::UserPaymentMethod.to_string(),
+            "user_payment_method"
+        );
+        assert_eq!(
+            AdminResource::try_from(23u16).unwrap(),
+            AdminResource::UserPaymentMethod
+        );
+        assert!(AdminResource::all().contains(&AdminResource::UserPaymentMethod));
     }
 
     #[test]

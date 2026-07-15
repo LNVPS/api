@@ -4,10 +4,9 @@ use crate::{
     PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmForMigration, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage,
-    VmPayment, VmPaymentRaw, VmTemplate,
+    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
+    VmFirewallRule, VmForMigration, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment,
+    VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -246,6 +245,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn set_user_geo(
+        &self,
+        user_id: u64,
+        country_code: Option<&str>,
+        ip: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "update users set geo_country_code=?, geo_ip=?, geo_updated=current_timestamp where id=?",
+        )
+        .bind(country_code)
+        .bind(ip)
+        .bind(user_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     async fn delete_user(&self, _id: u64) -> DbResult<()> {
         Err(DbError::Source(
             anyhow!("Deleting users is not supported").into_boxed_dyn_error(),
@@ -361,10 +377,48 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_user_payment_method(&self, id: u64) -> DbResult<UserPaymentMethod> {
-        Ok(sqlx::query_as("select * from user_payment_method where id=?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await?)
+        Ok(
+            sqlx::query_as("select * from user_payment_method where id=?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn admin_list_user_payment_methods_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+    ) -> DbResult<(Vec<UserPaymentMethod>, u64)> {
+        if let Some(user_id) = user_id {
+            let total: i64 =
+                sqlx::query_scalar("select count(*) from user_payment_method where user_id=?")
+                    .bind(user_id)
+                    .fetch_one(&self.db)
+                    .await?;
+            let rows = sqlx::query_as(
+                "select * from user_payment_method where user_id=? order by id desc limit ? offset ?",
+            )
+            .bind(user_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+            Ok((rows, total as u64))
+        } else {
+            let total: i64 = sqlx::query_scalar("select count(*) from user_payment_method")
+                .fetch_one(&self.db)
+                .await?;
+            let rows = sqlx::query_as(
+                "select * from user_payment_method order by id desc limit ? offset ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+            Ok((rows, total as u64))
+        }
     }
 
     async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()> {

@@ -4787,6 +4787,99 @@ Response:
 
 ---
 
+## User Payment Methods Management
+
+User payment methods are the **saved payment methods that users register on their own account** for automatic
+renewals (Nostr Wallet Connect connections, or Revolut cards saved off-session). This is distinct from the
+**Payment Method Configuration** above, which stores the provider/merchant settings.
+
+> **Security:** The underlying provider tokens / NWC connection strings are **never** returned. Responses expose only
+> non-sensitive metadata (provider, label, card brand/last4/expiry, default/enabled flags) plus a
+> `has_external_customer_id` boolean.
+
+There is no admin *create* endpoint — methods are added by users via the customer API. Admins can list, inspect,
+edit (label / default / enable-disable), and delete them.
+
+### List User Payment Methods
+
+```
+GET /api/admin/v1/user_payment_methods
+```
+
+Query Parameters:
+
+- `limit`: number (optional) - max 100, default 50
+- `offset`: number (optional) - default 0
+- `user_id`: number (optional) - filter to a single user's saved methods
+
+Required Permission: `user_payment_method::view`
+
+Returns a paginated list of `AdminUserPaymentMethodInfo`.
+
+### Get User Payment Method
+
+```
+GET /api/admin/v1/user_payment_methods/{id}
+```
+
+Required Permission: `user_payment_method::view`
+
+Returns a single `AdminUserPaymentMethodInfo`.
+
+### Update User Payment Method
+
+```
+PATCH /api/admin/v1/user_payment_methods/{id}
+```
+
+Required Permission: `user_payment_method::update`
+
+Request body (all fields optional):
+
+```json
+{
+  "is_default": boolean,
+  // set this method as the owning user's default (clears the flag on their other methods)
+  "enabled": boolean,
+  // enable/disable the method
+  "name": string | null
+  // set the user-defined label, or null to clear it
+}
+```
+
+Returns the updated `AdminUserPaymentMethodInfo`.
+
+### Delete User Payment Method
+
+```
+DELETE /api/admin/v1/user_payment_methods/{id}
+```
+
+Required Permission: `user_payment_method::delete`
+
+### AdminUserPaymentMethodInfo
+
+```json
+{
+  "id": number,
+  "user_id": number,
+  "provider": "nwc",
+  // payment processor: "nwc" or "revolut"
+  "name": "string | null",
+  "created": "2026-07-15T00:00:00Z",
+  "has_external_customer_id": boolean,
+  // whether a provider customer id is on file (the value itself is redacted)
+  "card_brand": "string | null",
+  "card_last_four": "string | null",
+  "exp_month": number | null,
+  "exp_year": number | null,
+  "is_default": boolean,
+  "enabled": boolean
+}
+```
+
+---
+
 ## Payment Method Configuration Data Types
 
 ### AdminPaymentMethodConfigInfo
