@@ -3,13 +3,13 @@ use crate::admin::auth::AdminAuth;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
-use chrono::{Datelike, DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use lnvps_api_common::{ApiData, ApiError, ApiResult, Ticker, TickerRate};
 use lnvps_db::{AdminAction, AdminResource, CostResourceType, CostType, IntervalType};
 use payments_rs::currency::{Currency, CurrencyAmount};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
-use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -337,17 +337,23 @@ fn payment_base_amount(amount: u64, pay_cur: Currency, base: Currency, rate: f32
     }
     if pay_cur == Currency::BTC {
         // BTC -> base fiat using the stored rate
-        return TickerRate { ticker: Ticker(Currency::BTC, base), rate }
-            .convert(CurrencyAmount::from_u64(Currency::BTC, amount))
-            .ok()
-            .map(|c| c.value());
+        return TickerRate {
+            ticker: Ticker(Currency::BTC, base),
+            rate,
+        }
+        .convert(CurrencyAmount::from_u64(Currency::BTC, amount))
+        .ok()
+        .map(|c| c.value());
     }
     if base == Currency::BTC {
         // fiat payment -> BTC base using the stored rate
-        return TickerRate { ticker: Ticker(Currency::BTC, pay_cur), rate }
-            .convert(CurrencyAmount::from_u64(pay_cur, amount))
-            .ok()
-            .map(|c| c.value());
+        return TickerRate {
+            ticker: Ticker(Currency::BTC, pay_cur),
+            rate,
+        }
+        .convert(CurrencyAmount::from_u64(pay_cur, amount))
+        .ok()
+        .map(|c| c.value());
     }
     None
 }
@@ -370,18 +376,24 @@ fn convert_amount(
         src
     } else {
         let r = *rates.get(&from)?;
-        TickerRate { ticker: Ticker(Currency::BTC, from), rate: r }
-            .convert(src)
-            .ok()?
+        TickerRate {
+            ticker: Ticker(Currency::BTC, from),
+            rate: r,
+        }
+        .convert(src)
+        .ok()?
     };
     // Step 2: BTC -> target
     let out = if to == Currency::BTC {
         btc
     } else {
         let r = *rates.get(&to)?;
-        TickerRate { ticker: Ticker(Currency::BTC, to), rate: r }
-            .convert(btc)
-            .ok()?
+        TickerRate {
+            ticker: Ticker(Currency::BTC, to),
+            rate: r,
+        }
+        .convert(btc)
+        .ok()?
     };
     Some(out.value())
 }
@@ -419,7 +431,10 @@ async fn admin_profit_loss_report(
     let target_str = if let Some(c) = &params.currency {
         c.trim().to_uppercase()
     } else if params.company_id != 0 {
-        this.db.admin_get_company(params.company_id).await?.base_currency
+        this.db
+            .admin_get_company(params.company_id)
+            .await?
+            .base_currency
     } else {
         return Err(ApiError::bad_request(
             "currency is required when company_id is omitted",
@@ -493,9 +508,7 @@ async fn admin_profit_loss_report(
     // Cache assigned-IP counts per ip_range so per-IP recurring costs scale correctly.
     let mut ip_counts: HashMap<u64, u64> = HashMap::new();
     for c in &costs {
-        if c.resource_type == CostResourceType::IpRange
-            && !ip_counts.contains_key(&c.resource_id)
-        {
+        if c.resource_type == CostResourceType::IpRange && !ip_counts.contains_key(&c.resource_id) {
             let n = this
                 .db
                 .admin_count_ip_range_assignments(c.resource_id)
@@ -509,9 +522,12 @@ async fn admin_profit_loss_report(
         // Region filter: resolve the cost's resource region and skip mismatches.
         if params.region_id != 0 {
             let region = match c.resource_type {
-                CostResourceType::VmHost => {
-                    this.db.get_host(c.resource_id).await.ok().map(|h| h.region_id)
-                }
+                CostResourceType::VmHost => this
+                    .db
+                    .get_host(c.resource_id)
+                    .await
+                    .ok()
+                    .map(|h| h.region_id),
                 CostResourceType::IpRange => this
                     .db
                     .admin_get_ip_range(c.resource_id)

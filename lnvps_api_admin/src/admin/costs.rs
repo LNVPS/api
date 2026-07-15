@@ -53,7 +53,10 @@ async fn admin_list_resource_costs(
         )
         .await?;
 
-    let out = rows.into_iter().map(AdminResourceCostDetail::from).collect();
+    let out = rows
+        .into_iter()
+        .map(AdminResourceCostDetail::from)
+        .collect();
     ApiPaginatedData::ok(out, total, limit, offset)
 }
 
@@ -68,7 +71,11 @@ async fn admin_get_resource_cost(
     ApiData::ok(cost.into())
 }
 
-fn validate(cost_type: lnvps_db::CostType, interval_amount: Option<u64>, currency: &str) -> Result<(), &'static str> {
+fn validate(
+    cost_type: lnvps_db::CostType,
+    interval_amount: Option<u64>,
+    currency: &str,
+) -> Result<(), &'static str> {
     if currency.trim().is_empty() {
         return Err("Currency cannot be empty");
     }
@@ -91,7 +98,10 @@ async fn admin_create_resource_cost(
     }
 
     let resource_type: lnvps_db::CostResourceType = req.resource_type.into();
-    let label = req.label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+    let label = req
+        .label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
     if resource_type == lnvps_db::CostResourceType::Generic && label.is_none() {
         return ApiData::err("Generic costs require a label");
     }
@@ -141,7 +151,9 @@ async fn admin_update_resource_cost(
         cost.currency = currency.trim().to_string();
     }
     if let Some(label) = req.label {
-        cost.label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+        cost.label = label
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty());
     }
     if cost.resource_type == lnvps_db::CostResourceType::Generic && cost.label.is_none() {
         return ApiData::err("Generic costs require a label");

@@ -2201,12 +2201,24 @@ mod tests {
 
     #[test]
     fn test_cost_type_and_resource_type_roundtrip() {
-        assert_eq!("vm_host".parse::<CostResourceType>().unwrap(), CostResourceType::VmHost);
-        assert_eq!("ip_range".parse::<CostResourceType>().unwrap(), CostResourceType::IpRange);
+        assert_eq!(
+            "vm_host".parse::<CostResourceType>().unwrap(),
+            CostResourceType::VmHost
+        );
+        assert_eq!(
+            "ip_range".parse::<CostResourceType>().unwrap(),
+            CostResourceType::IpRange
+        );
         assert_eq!(CostResourceType::IpRange.to_string(), "ip_range");
-        assert_eq!("generic".parse::<CostResourceType>().unwrap(), CostResourceType::Generic);
+        assert_eq!(
+            "generic".parse::<CostResourceType>().unwrap(),
+            CostResourceType::Generic
+        );
         assert_eq!(CostResourceType::Generic.to_string(), "generic");
-        assert_eq!("recurring".parse::<CostType>().unwrap(), CostType::Recurring);
+        assert_eq!(
+            "recurring".parse::<CostType>().unwrap(),
+            CostType::Recurring
+        );
         assert_eq!("one_time".parse::<CostType>().unwrap(), CostType::OneTime);
         assert_eq!(CostType::OneTime.to_string(), "one_time");
     }
