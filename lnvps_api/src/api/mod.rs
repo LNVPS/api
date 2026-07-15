@@ -16,7 +16,9 @@ pub use contact::router as contacts_router;
 pub use docs::router as docs_router;
 pub use ip_space::router as ip_space_router;
 pub use legal::router as legal_router;
-use lnvps_api_common::{ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander};
+use lnvps_api_common::{
+    CountryResolver, ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander,
+};
 use lnvps_db::LNVpsDb;
 #[cfg(feature = "nostr-domain")]
 pub use nostr_domain::router as nostr_domain_router;
@@ -60,4 +62,7 @@ pub struct RouterState {
     pub settings: Settings,
     pub rates: Arc<dyn ExchangeRateService>,
     pub work_sender: Arc<dyn WorkCommander>,
+    /// Resolves client IPs to a country for VAT place-of-supply evidence.
+    /// `None` when no geolocation database is configured.
+    pub geoip: Option<Arc<dyn CountryResolver>>,
 }

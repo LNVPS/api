@@ -6,7 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
-use lnvps_db::{PaymentMethod, PaymentType, VmCustomTemplate};
+use lnvps_db::{PaymentMethod, VmCustomTemplate};
 
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -309,17 +309,6 @@ impl ApiInvoiceItem {
         })
     }
 
-    /// Creates a formatted invoice item from a VmPayment
-    pub fn from_vm_payment(payment: &lnvps_db::VmPayment) -> Result<Self, anyhow::Error> {
-        Self::from_payment_data(
-            payment.amount,
-            payment.tax,
-            payment.processing_fee,
-            &payment.currency,
-            payment.time_value,
-        )
-    }
-
     /// Creates a formatted invoice item from a SubscriptionPayment
     pub fn from_subscription_payment(
         payment: &lnvps_db::SubscriptionPayment,
@@ -386,52 +375,6 @@ impl ApiVmPayment {
             upgrade_params,
             data,
         })
-    }
-}
-
-impl From<lnvps_db::VmPayment> for ApiVmPayment {
-    fn from(value: lnvps_db::VmPayment) -> Self {
-        Self {
-            id: hex::encode(&value.id),
-            vm_id: value.vm_id,
-            created: value.created,
-            expires: value.expires,
-            amount: value.amount,
-            tax: value.tax,
-            processing_fee: value.processing_fee,
-            currency: value.currency,
-            is_paid: value.is_paid,
-            paid_at: value.paid_at,
-            time: value.time_value,
-            is_upgrade: value.payment_type == PaymentType::Upgrade,
-            upgrade_params: value.upgrade_params.clone(),
-            data: match &value.payment_method {
-                PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
-                PaymentMethod::Revolut => {
-                    #[derive(Deserialize)]
-                    struct RevolutData {
-                        pub token: String,
-                    }
-                    let data: RevolutData =
-                        serde_json::from_str(value.external_data.as_str()).unwrap();
-                    ApiPaymentData::Revolut { token: data.token }
-                }
-                PaymentMethod::Paypal => {
-                    todo!()
-                }
-                PaymentMethod::Stripe => {
-                    #[derive(Deserialize)]
-                    struct StripeData {
-                        pub session_id: String,
-                    }
-                    let data: StripeData =
-                        serde_json::from_str(value.external_data.as_str()).unwrap();
-                    ApiPaymentData::Stripe {
-                        session_id: data.session_id,
-                    }
-                }
-            },
-        }
     }
 }
 
@@ -1083,10 +1026,9 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                 struct StripeData {
                     pub session_id: String,
                 }
-                let session_id =
-                    serde_json::from_str::<StripeData>(payment.external_data.as_str())
-                        .map(|d| d.session_id)
-                        .unwrap_or_default();
+                let session_id = serde_json::from_str::<StripeData>(payment.external_data.as_str())
+                    .map(|d| d.session_id)
+                    .unwrap_or_default();
                 ApiPaymentData::Stripe { session_id }
             }
             PaymentMethod::Paypal => ApiPaymentData::Lightning(String::new()),
@@ -1300,36 +1242,6 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use lnvps_db::{EncryptedString, PaymentMethod, PaymentType, VmPayment};
-
-    fn make_payment(
-        currency: &str,
-        amount: u64,
-        tax: u64,
-        processing_fee: u64,
-        time_value: u64,
-    ) -> VmPayment {
-        VmPayment {
-            id: vec![0u8; 32],
-            vm_id: 1,
-            created: Utc::now(),
-            expires: Utc::now(),
-            amount,
-            currency: currency.to_string(),
-            payment_method: PaymentMethod::Lightning,
-            payment_type: PaymentType::Renewal,
-            external_data: EncryptedString::from("test"),
-            external_id: None,
-            is_paid: true,
-            rate: 1.0,
-            time_value,
-            tax,
-            processing_fee,
-            upgrade_params: None,
-            paid_at: Some(Utc::now()),
-        }
-    }
 
     #[test]
     fn test_from_payment_data_fiat() {
@@ -1367,21 +1279,6 @@ mod tests {
     fn test_from_payment_data_invalid_currency() {
         let result = ApiInvoiceItem::from_payment_data(100, 0, 0, "NOTACURRENCY", 3600);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_from_vm_payment() {
-        let payment = make_payment("EUR", 500, 115, 6, 86400);
-        let item = ApiInvoiceItem::from_vm_payment(&payment).expect("should succeed");
-
-        assert_eq!(item.amount, 500);
-        assert_eq!(item.tax, 115);
-        assert_eq!(item.processing_fee, 6);
-        assert_eq!(item.currency, "EUR");
-        assert_eq!(item.time, 86400);
-        assert_eq!(item.formatted_amount, "EUR 5.00");
-        assert_eq!(item.formatted_tax, "EUR 1.15");
-        assert!(!item.formatted_duration.is_empty());
     }
 
     #[test]

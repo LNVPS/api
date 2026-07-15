@@ -1,4 +1,3 @@
-use lnvps_api_common::DnsServer;
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
@@ -7,6 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
+use lnvps_api_common::DnsServer;
 use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
@@ -16,7 +16,7 @@ use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
     IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType,
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    SubscriptionType, Vm, VmCustomTemplate, VmIpAssignment, VmPayment, VmTemplate,
+    SubscriptionType, Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
 };
 use log::{debug, info};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -908,6 +908,7 @@ mod tests {
             db.clone(),
             node.clone(),
             rates.clone(),
+            lnvps_api_common::VatClient::new(),
             wrk.clone(),
             VmStateCache::new(),
         )?;
@@ -931,7 +932,11 @@ mod tests {
             vm.subscription_line_item_id > 0,
             "VM must have a subscription line item"
         );
-        assert_eq!(payment.tax, (payment.amount as f64 * 0.01).floor() as u64);
+        // No VAT rates are loaded into the pricing engine's VatClient in this
+        // test and the mock company/user have no EU country, so the place-of-
+        // supply determination yields no tax. (VAT logic is covered by the
+        // pricing engine unit tests.)
+        assert_eq!(payment.tax, 0);
 
         // check invoice amount matches rounded amount+tax
         let inv = node.invoices.lock().await;
@@ -1070,7 +1075,11 @@ mod tests {
         assert!(prov.is_err());
         if let Err(e) = prov {
             println!("{}", e);
-            assert!(e.to_string().to_lowercase().contains("no hosts with enough capacity"))
+            assert!(
+                e.to_string()
+                    .to_lowercase()
+                    .contains("no hosts with enough capacity")
+            )
         }
         Ok(())
     }
@@ -1124,6 +1133,7 @@ mod tests {
             db.clone(),
             node,
             rates,
+            lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?)
@@ -2408,6 +2418,7 @@ mod tests {
             db.clone(),
             node,
             rates,
+            lnvps_api_common::VatClient::new(),
             wrk,
             VmStateCache::new(),
         )?)

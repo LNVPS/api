@@ -228,6 +228,7 @@ mod tests {
             db.clone(),
             node.clone(),
             exch.clone(),
+            lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?;

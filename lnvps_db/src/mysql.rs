@@ -5,8 +5,8 @@ use crate::{
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
     VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmForMigration, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment,
-    VmOsImage, VmPayment, VmPaymentRaw, VmTemplate,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage,
+    VmTemplate,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -36,145 +36,6 @@ impl LNVpsDbMysql {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.db
-    }
-
-    /// List IDs of ALL VMs (including deleted) that have not yet been linked to a subscription
-    /// line item. Used by the data migration tool to avoid decoding nullable
-    /// subscription_line_item_id via the Vm struct (which requires it non-null).
-    pub async fn list_vm_ids_without_subscription(&self) -> DbResult<Vec<u64>> {
-        let rows = sqlx::query(
-            "SELECT id FROM vm \
-             WHERE subscription_line_item_id IS NULL OR subscription_line_item_id = 0",
-        )
-        .fetch_all(&self.db)
-        .await?;
-        Ok(rows.iter().map(|r| r.get::<u32, _>("id") as u64).collect())
-    }
-
-    /// List ids of all VMs that already have a subscription linked. Used by the one-time
-    /// repair pass that corrects fields written incorrectly by earlier backfill revisions
-    /// (subscription.created/currency/is_setup and the custom-VM line-item amount).
-    pub async fn list_vm_ids_with_subscription(&self) -> DbResult<Vec<u64>> {
-        let rows = sqlx::query(
-            "SELECT id FROM vm \
-             WHERE subscription_line_item_id IS NOT NULL AND subscription_line_item_id != 0",
-        )
-        .fetch_all(&self.db)
-        .await?;
-        Ok(rows.iter().map(|r| r.get::<u32, _>("id") as u64).collect())
-    }
-
-    /// Insert a subscription_payment row by copying a vm_payment row verbatim,
-    /// writing external_data as raw bytes (no encrypt/decrypt round-trip).
-    pub async fn insert_subscription_payment_raw(
-        &self,
-        vp: &VmPaymentRaw,
-        subscription_id: u64,
-        user_id: u64,
-        payment_type: u16,
-        time_value: Option<u64>,
-        metadata: Option<&str>,
-    ) -> DbResult<()> {
-        sqlx::query(
-            "INSERT INTO subscription_payment \
-             (id, subscription_id, user_id, created, expires, amount, currency, \
-              payment_method, payment_type, external_data, external_id, is_paid, rate, \
-              time_value, metadata, tax, processing_fee, paid_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&vp.id)
-        .bind(subscription_id)
-        .bind(user_id)
-        .bind(vp.created)
-        .bind(vp.expires)
-        .bind(vp.amount)
-        .bind(&vp.currency)
-        .bind(vp.payment_method as u16)
-        .bind(payment_type)
-        .bind(&vp.external_data) // raw string — no encryption
-        .bind(&vp.external_id)
-        .bind(vp.is_paid)
-        .bind(vp.rate)
-        .bind(time_value)
-        .bind(metadata)
-        .bind(vp.tax)
-        .bind(vp.processing_fee)
-        .bind(vp.paid_at)
-        .execute(&self.db)
-        .await?;
-        Ok(())
-    }
-
-    /// List the binary ids of all subscription_payments for a subscription.
-    /// Used by the migration tool for idempotency checking without decrypting external_data.
-    pub async fn list_subscription_payment_ids_for_subscription(
-        &self,
-        subscription_id: u64,
-    ) -> DbResult<Vec<Vec<u8>>> {
-        let rows = sqlx::query("SELECT id FROM subscription_payment WHERE subscription_id = ?")
-            .bind(subscription_id)
-            .fetch_all(&self.db)
-            .await?;
-        Ok(rows.iter().map(|r| r.get::<Vec<u8>, _>("id")).collect())
-    }
-
-    /// List VM ids that have vm_payment rows not yet copied to subscription_payment.
-    /// Identifies by id: a vm_payment is considered copied if a subscription_payment
-    /// with the same binary id exists.
-    pub async fn list_vm_ids_with_uncopied_payments(&self) -> DbResult<Vec<u64>> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT vp.vm_id FROM vm_payment vp \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM subscription_payment sp WHERE sp.id = vp.id \
-             )",
-        )
-        .fetch_all(&self.db)
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| r.get::<u32, _>("vm_id") as u64)
-            .collect())
-    }
-
-    /// List all vm_payment rows for a VM, with external_data as raw String (no decryption).
-    /// Used by the data migration tool to copy rows without needing the encryption key.
-    pub async fn list_vm_payments_for_migration(&self, vm_id: u64) -> DbResult<Vec<VmPaymentRaw>> {
-        Ok(sqlx::query_as(
-            "SELECT id, vm_id, created, expires, amount, currency, payment_method, payment_type, \
-             external_data, external_id, is_paid, rate, time_value, tax, upgrade_params, \
-             processing_fee, paid_at FROM vm_payment WHERE vm_id = ? ORDER BY created ASC",
-        )
-        .bind(vm_id)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
-    /// Set subscription_line_item_id on a VM by id.
-    /// Used by the data migration tool where full Vm round-trip is not possible.
-    pub async fn set_vm_subscription_line_item(
-        &self,
-        vm_id: u64,
-        subscription_line_item_id: u64,
-    ) -> DbResult<()> {
-        sqlx::query("UPDATE vm SET subscription_line_item_id = ? WHERE id = ?")
-            .bind(subscription_line_item_id)
-            .bind(vm_id)
-            .execute(&self.db)
-            .await?;
-        Ok(())
-    }
-
-    /// Fetch a VM row with subscription_line_item_id decoded as Option<u64>.
-    /// Used by the data migration tool where the column may still be NULL.
-    pub async fn get_vm_for_migration(&self, vm_id: u64) -> DbResult<VmForMigration> {
-        Ok(sqlx::query_as(
-            "SELECT id, user_id, template_id, custom_template_id, created, expires, \
-             auto_renewal_enabled, subscription_line_item_id, deleted \
-             FROM vm WHERE id = ?",
-        )
-        .bind(vm_id)
-        .fetch_one(&self.db)
-        .await?)
     }
 }
 
@@ -1203,132 +1064,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&self.db)
             .await?;
         Ok(())
-    }
-
-    async fn list_vm_payment(&self, vm_id: u64) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as("select * from vm_payment where vm_id = ?")
-            .bind(vm_id)
-            .fetch_all(&self.db)
-            .await?)
-    }
-
-    async fn list_vm_payment_paginated(
-        &self,
-        vm_id: u64,
-        limit: u64,
-        offset: u64,
-    ) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as(
-            "select * from vm_payment where vm_id = ? order by created desc limit ? offset ?",
-        )
-        .bind(vm_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
-    async fn list_vm_payment_by_method_and_type(
-        &self,
-        vm_id: u64,
-        method: PaymentMethod,
-        payment_type: PaymentType,
-    ) -> DbResult<Vec<VmPayment>> {
-        Ok(sqlx::query_as(
-            "select * from vm_payment where vm_id = ? and payment_method = ? and payment_type = ? and expires > NOW() and is_paid = false order by created desc",
-        )
-        .bind(vm_id)
-        .bind(method)
-        .bind(payment_type)
-        .fetch_all(&self.db)
-        .await?)
-    }
-
-    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        sqlx::query("insert into vm_payment(id,vm_id,created,expires,amount,tax,processing_fee,currency,payment_method,payment_type,time_value,is_paid,rate,external_id,external_data,upgrade_params,paid_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(&vm_payment.id)
-            .bind(vm_payment.vm_id)
-            .bind(vm_payment.created)
-            .bind(vm_payment.expires)
-            .bind(vm_payment.amount)
-            .bind(vm_payment.tax)
-            .bind(vm_payment.processing_fee)
-            .bind(&vm_payment.currency)
-            .bind(vm_payment.payment_method)
-            .bind(vm_payment.payment_type)
-            .bind(vm_payment.time_value)
-            .bind(vm_payment.is_paid)
-            .bind(vm_payment.rate)
-            .bind(&vm_payment.external_id)
-            .bind(&vm_payment.external_data)
-            .bind(&vm_payment.upgrade_params)
-            .bind(vm_payment.paid_at)
-            .execute(&self.db)
-            .await?;
-        Ok(())
-    }
-
-    async fn get_vm_payment(&self, id: &Vec<u8>) -> DbResult<VmPayment> {
-        Ok(sqlx::query_as("select * from vm_payment where id=?")
-            .bind(id)
-            .fetch_one(&self.db)
-            .await?)
-    }
-
-    async fn get_vm_payment_by_ext_id(&self, id: &str) -> DbResult<VmPayment> {
-        Ok(
-            sqlx::query_as("select * from vm_payment where external_id=?")
-                .bind(id)
-                .fetch_one(&self.db)
-                .await?,
-        )
-    }
-
-    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        sqlx::query("update vm_payment set is_paid = ? where id = ?")
-            .bind(vm_payment.is_paid)
-            .bind(&vm_payment.id)
-            .execute(&self.db)
-            .await?;
-        Ok(())
-    }
-
-    async fn vm_payment_paid(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        if vm_payment.is_paid {
-            return Err(DbError::Source(
-                anyhow!("Invoice already paid").into_boxed_dyn_error(),
-            ));
-        }
-
-        let mut tx = self.db.begin().await?;
-
-        sqlx::query(
-            "update vm_payment set is_paid = true, external_data = ?, paid_at = NOW() where id = ?",
-        )
-        .bind(&vm_payment.external_data)
-        .bind(&vm_payment.id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>> {
-        Ok(sqlx::query_as(
-            "select * from vm_payment where is_paid = true order by created desc limit 1",
-        )
-        .fetch_optional(&self.db)
-        .await?)
-    }
-
-    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64> {
-        let (count,): (i64,) =
-            sqlx::query_as("select count(*) from vm_payment where vm_id = ? and is_paid = false and expires > NOW()")
-                .bind(vm_id)
-                .fetch_one(&self.db)
-                .await?;
-        Ok(count as u64)
     }
 
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>> {
@@ -2506,7 +2241,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&payment.id)
         .bind(payment.subscription_id)
@@ -2526,6 +2261,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(payment.time_value)
         .bind(&payment.metadata)
         .bind(payment.paid_at)
+        .bind(payment.tax_rate)
+        .bind(&payment.tax_country_code)
+        .bind(&payment.tax_treatment)
+        .bind(&payment.tax_evidence)
+        .bind(&payment.tax_breakdown)
         .execute(&self.db)
         .await?;
 

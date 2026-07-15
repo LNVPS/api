@@ -206,6 +206,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         };
         db.insert_subscription_payment(&payment).await?;
 
@@ -214,6 +219,7 @@ mod tests {
             db.clone(),
             node.clone(),
             Arc::new(MockExchangeRate::default()),
+            lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?;
@@ -354,6 +360,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         };
         db.insert_subscription_payment(&payment).await?;
         let sub = SubscriptionHandler::new(
@@ -361,6 +372,7 @@ mod tests {
             db.clone(),
             node.clone(),
             Arc::new(MockExchangeRate::default()),
+            lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?;
@@ -407,9 +419,7 @@ mod tests {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::default());
-        rates
-            .set_rate(Ticker::btc_rate("EUR")?, 100_000.0)
-            .await;
+        rates.set_rate(Ticker::btc_rate("EUR")?, 100_000.0).await;
 
         // Create a user
         let pubkey: [u8; 32] = [3u8; 32];
@@ -537,6 +547,7 @@ mod tests {
             db.clone(),
             node.clone(),
             rates,
+            lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?;

@@ -21,17 +21,17 @@ use std::str::FromStr;
 use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey, ApiVmOsImage,
-    ApiVmTemplate, EuVatClient, Nip98Auth, PageQuery, UpgradeConfig, WorkJob,
+    ApiVmTemplate, ClientIp, Nip98Auth, PageQuery, UpgradeConfig, VatClient, WorkJob,
 };
 use lnvps_db::{
     PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHostRegion,
 };
 
 use crate::api::model::{
-    AccountPatchRequest, ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest,
-    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy,
-    ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote,
-    ApiVmUpgradeRequest, AddNwcPaymentMethodRequest, CreateSshKey, CreateVmFirewallRule,
+    AccountPatchRequest, AddNwcPaymentMethodRequest, ApiCompany, ApiCustomTemplateParams,
+    ApiCustomVmOrder, ApiCustomVmRequest, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod,
+    ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
+    ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule,
     CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
     PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr, validate_firewall_ports,
     vm_to_status,
@@ -134,9 +134,29 @@ pub fn routes() -> Router<RouterState> {
         )
 }
 
+/// Capture IP-derived geolocation for a user as an independent place-of-supply
+/// evidence signal for EU VAT. Best-effort: never blocks or fails the caller.
+///
+/// Invoked on every path where a user acts (account edits *and* VM orders) so
+/// that a customer who never touches the account API still has a resolved
+/// country recorded at purchase time.
+async fn capture_client_geo(this: &RouterState, uid: u64, client_ip: ClientIp) {
+    if let (Some(ip), Some(geoip)) = (client_ip.0, this.geoip.as_ref()) {
+        let country = geoip.resolve(ip);
+        if let Err(e) = this
+            .db
+            .set_user_geo(uid, country.as_deref(), &ip.to_string())
+            .await
+        {
+            error!("Failed to store geolocation for user {}: {}", uid, e);
+        }
+    }
+}
+
 /// Update user account
 async fn v1_patch_account(
     auth: Nip98Auth,
+    client_ip: ClientIp,
     State(this): State<RouterState>,
     req: Json<AccountPatchRequest>,
 ) -> ApiResult<()> {
@@ -144,9 +164,11 @@ async fn v1_patch_account(
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
+    capture_client_geo(&this, uid, client_ip).await;
+
     // validate tax_id if provided
     if let Some(Some(tax_id)) = &req.tax_id {
-        let vat_client = EuVatClient::new();
+        let vat_client = VatClient::new();
         let result = vat_client
             .validate_vat_number(tax_id, None)
             .await
@@ -383,7 +405,11 @@ async fn v1_add_nwc_payment_method(
         user_id: uid,
         created: chrono::Utc::now(),
         provider: "nwc".to_string(),
-        name: req.name.as_ref().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
+        name: req
+            .name
+            .as_ref()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty()),
         external_customer_id: None,
         external_id: nwc.into(),
         card_brand: None,
@@ -824,11 +850,15 @@ async fn v1_custom_template_calc(
 /// Unpaid VM orders will be deleted after 1 hour
 async fn v1_create_custom_vm_order(
     auth: Nip98Auth,
+    client_ip: ClientIp,
     State(this): State<RouterState>,
     Json(req): Json<ApiCustomVmOrder>,
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
+
+    // Capture place-of-supply evidence at purchase time (see capture_client_geo).
+    capture_client_geo(&this, uid, client_ip).await;
 
     let user = this.db.get_user(uid).await?;
     // Email verification is only enforced when SMTP is configured; otherwise
@@ -948,11 +978,15 @@ async fn v1_delete_ssh_key(
 /// Unpaid VM orders will be deleted after 1 hour
 async fn v1_create_vm_order(
     auth: Nip98Auth,
+    client_ip: ClientIp,
     State(this): State<RouterState>,
     Json(req): Json<CreateVmRequest>,
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
+
+    // Capture place-of-supply evidence at purchase time (see capture_client_geo).
+    capture_client_geo(&this, uid, client_ip).await;
 
     let user = this.db.get_user(uid).await?;
     // Email verification is only enforced when SMTP is configured (see
@@ -1452,7 +1486,54 @@ async fn v1_get_payment(
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, vm.id)?)
 }
 
-/// Print payment invoice
+/// Map a payment's stored tax fields to invoice display fields:
+/// `(rate_label, is_reverse_charge, is_out_of_scope, note)`.
+///
+/// `rate_label` (e.g. `"23% (IRL)"`) is produced for lines that carried tax. The
+/// reverse-charge and out-of-scope notes are EU-specific and only emitted when
+/// the seller is established in the EU VAT area (`seller_in_eu`); a non-EU
+/// seller shows no such note.
+fn invoice_vat_display(
+    treatment: Option<&str>,
+    tax: u64,
+    rate: Option<f32>,
+    country: Option<&str>,
+    seller_in_eu: bool,
+) -> (Option<String>, bool, bool, Option<String>) {
+    match treatment {
+        Some("reverse_charge") if seller_in_eu => (
+            None,
+            true,
+            false,
+            Some(
+                "VAT reverse charged — the recipient is liable to account for VAT \
+                 (Article 196, Council Directive 2006/112/EC)."
+                    .to_string(),
+            ),
+        ),
+        Some("out_of_scope") if seller_in_eu => (
+            None,
+            false,
+            true,
+            Some("Outside the scope of EU VAT.".to_string()),
+        ),
+        // Any taxed line (domestic / oss_b2c / undetermined_default, or a mixed
+        // payment whose summary is null but which carried tax): show the rate.
+        _ => {
+            let label = if tax > 0 {
+                Some(match (rate, country) {
+                    (Some(r), Some(cc)) => format!("{:.0}% ({})", r, cc),
+                    (Some(r), None) => format!("{:.0}%", r),
+                    _ => "VAT".to_string(),
+                })
+            } else {
+                None
+            };
+            (label, false, false, None)
+        }
+    }
+}
+
 async fn v1_get_payment_invoice(
     State(this): State<RouterState>,
     Path(id): Path<String>,
@@ -1510,6 +1591,23 @@ async fn v1_get_payment_invoice(
         company: Option<ApiCompany>,
         #[serde(skip_serializing_if = "Option::is_none")]
         upgrade_details: Option<UpgradeDetails>,
+        vat: InvoiceVat,
+    }
+
+    /// VAT presentation derived from the payment's frozen determination.
+    #[derive(Serialize, Default)]
+    struct InvoiceVat {
+        /// Human label for the applied rate line, e.g. "23% (IRL)". Present only
+        /// when VAT was actually charged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rate_label: Option<String>,
+        /// True for an EU B2B reverse-charge supply (0%, recipient accounts).
+        is_reverse_charge: bool,
+        /// True for a supply outside the scope of EU VAT (non-EU customer).
+        is_out_of_scope: bool,
+        /// Legal note to print under the totals (reverse charge / out of scope).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     }
 
     #[derive(Serialize)]
@@ -1560,6 +1658,27 @@ async fn v1_get_payment_invoice(
     let invoice_item = ApiInvoiceItem::from_subscription_payment(&payment)
         .map_err(|_| "Failed to create formatted invoice item")?;
 
+    // Present the tax fields stored on the payment. EU-specific notes are only
+    // shown for a seller established in the EU VAT area.
+    let seller_in_eu = company
+        .as_ref()
+        .and_then(|c| c.country_code.as_deref())
+        .map(lnvps_api_common::is_eu_vat_country)
+        .unwrap_or(false);
+    let (rate_label, is_reverse_charge, is_out_of_scope, note) = invoice_vat_display(
+        payment.tax_treatment.as_deref(),
+        payment.tax,
+        payment.tax_rate,
+        payment.tax_country_code.as_deref(),
+        seller_in_eu,
+    );
+    let vat = InvoiceVat {
+        rate_label,
+        is_reverse_charge,
+        is_out_of_scope,
+        note,
+    };
+
     let mut html = Cursor::new(Vec::new());
     template
         .render(
@@ -1586,6 +1705,7 @@ async fn v1_get_payment_invoice(
                 user: user.into(),
                 company: company.map(|c| c.into()),
                 upgrade_details,
+                vat,
             },
         )
         .map_err(|_| "Failed to generate invoice")?;
@@ -1860,7 +1980,9 @@ async fn v1_patch_firewall_rule(
 
     let mut rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
-        return Err(ApiError::not_found("Firewall rule does not belong to this VM"));
+        return Err(ApiError::not_found(
+            "Firewall rule does not belong to this VM",
+        ));
     }
 
     if let Some(p) = req.priority {
@@ -1917,7 +2039,9 @@ async fn v1_delete_firewall_rule(
 
     let rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
-        return Err(ApiError::not_found("Firewall rule does not belong to this VM"));
+        return Err(ApiError::not_found(
+            "Firewall rule does not belong to this VM",
+        ));
     }
 
     this.db.delete_vm_firewall_rule(rule_id).await?;
@@ -2206,5 +2330,64 @@ mod tests {
     fn test_expired_vm_reinstall_error_is_payment_required() {
         let err = ApiError::payment_required("Cannot re-install an expired VM");
         assert_eq!(err.code, axum::http::StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[test]
+    fn invoice_vat_display_domestic_shows_rate_line() {
+        let (label, rc, oos, note) =
+            invoice_vat_display(Some("domestic"), 230, Some(23.0), Some("IRL"), true);
+        assert_eq!(label.as_deref(), Some("23% (IRL)"));
+        assert!(!rc && !oos);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn invoice_vat_display_oss_shows_destination_rate() {
+        let (label, rc, oos, _note) =
+            invoice_vat_display(Some("oss_b2c"), 1900, Some(19.0), Some("DEU"), true);
+        assert_eq!(label.as_deref(), Some("19% (DEU)"));
+        assert!(!rc && !oos);
+    }
+
+    #[test]
+    fn invoice_vat_display_reverse_charge_has_note_no_rate() {
+        let (label, rc, oos, note) =
+            invoice_vat_display(Some("reverse_charge"), 0, None, Some("DEU"), true);
+        assert!(label.is_none());
+        assert!(rc && !oos);
+        assert!(note.unwrap().contains("Article 196"));
+    }
+
+    #[test]
+    fn invoice_vat_display_out_of_scope_note_only_for_eu_seller() {
+        // EU seller selling to a non-EU customer: out-of-scope note shown.
+        let (label, rc, oos, note) =
+            invoice_vat_display(Some("out_of_scope"), 0, None, Some("USA"), true);
+        assert!(label.is_none());
+        assert!(!rc && oos);
+        assert_eq!(note.as_deref(), Some("Outside the scope of EU VAT."));
+
+        // Non-EU (e.g. US) seller: no EU note at all.
+        let (label, rc, oos, note) =
+            invoice_vat_display(Some("out_of_scope"), 0, None, Some("USA"), false);
+        assert!(label.is_none());
+        assert!(!rc && !oos);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn invoice_vat_display_no_tax_no_line() {
+        // No treatment recorded and no tax -> nothing shown.
+        let (label, rc, oos, note) = invoice_vat_display(None, 0, None, None, true);
+        assert!(label.is_none());
+        assert!(!rc && !oos);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn invoice_vat_display_mixed_summary_null_but_taxed() {
+        // Mixed payment: summary rate/country are null but tax was charged.
+        let (label, _rc, _oos, _note) = invoice_vat_display(None, 500, None, None, true);
+        assert_eq!(label.as_deref(), Some("VAT"));
     }
 }

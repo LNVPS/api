@@ -1,14 +1,17 @@
-use crate::{ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate, UpgradeConfig};
+use crate::{
+    ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate, UpgradeConfig, VatClient,
+};
 use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
-    PaymentType, SubscriptionPayment, SubscriptionPaymentType, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomTemplate, VmPayment,
+    SubscriptionPayment, SubscriptionPaymentType, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
@@ -53,26 +56,230 @@ pub struct RemainingTimeInfo {
     pub prorated_cost: CurrencyAmount,
 }
 
+/// ISO 3166-1 alpha-3 codes treated as inside the EU VAT area (27 member states).
+const EU_VAT_COUNTRIES: [&str; 27] = [
+    "AUT", "BEL", "BGR", "HRV", "CYP", "CZE", "DNK", "EST", "FIN", "FRA", "DEU", "GRC", "HUN",
+    "IRL", "ITA", "LVA", "LTU", "LUX", "MLT", "NLD", "POL", "PRT", "ROU", "SVK", "SVN", "ESP",
+    "SWE",
+];
+
+/// Returns `true` if the ISO 3166-1 alpha-3 country code is inside the EU VAT area.
+pub fn is_eu_vat_country(alpha3: &str) -> bool {
+    let up = alpha3.to_uppercase();
+    EU_VAT_COUNTRIES.contains(&up.as_str())
+}
+
+/// Extract the country of a VAT number (its 2-letter prefix) as ISO alpha-3.
+///
+/// Greek VAT numbers use the `EL` prefix rather than the ISO code `GR`; that
+/// special case is mapped. Returns `None` if no valid country prefix is present.
+pub fn vat_number_country_alpha3(vat: &str) -> Option<String> {
+    let cleaned: String = vat.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let prefix: String = cleaned.chars().take(2).collect();
+    if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let alpha2 = match prefix.to_uppercase().as_str() {
+        "EL" => "GR".to_string(),
+        other => other.to_string(),
+    };
+    CountryCode::for_alpha2(&alpha2)
+        .ok()
+        .map(|c| c.alpha3().to_string())
+}
+
+/// Which rate branch was selected for a payment. Recorded on the payment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaxTreatment {
+    /// Customer country equals the seller country: seller-country rate applied.
+    Domestic,
+    /// EU customer in a different country, no VAT number: destination-country rate.
+    OssB2c,
+    /// EU customer in a different country with a VAT number: 0% (reverse charge).
+    ReverseCharge,
+    /// Non-EU customer: 0%.
+    OutOfScope,
+    /// Country could not be determined; the seller-country fallback rate applied.
+    UndeterminedDefault,
+}
+
+impl TaxTreatment {
+    /// Stable machine-readable identifier (for storage / reports).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaxTreatment::Domestic => "domestic",
+            TaxTreatment::OssB2c => "oss_b2c",
+            TaxTreatment::ReverseCharge => "reverse_charge",
+            TaxTreatment::OutOfScope => "out_of_scope",
+            TaxTreatment::UndeterminedDefault => "undetermined_default",
+        }
+    }
+}
+
+/// The tax values for a single line of a payment.
+///
+/// A payment stores an array of these (`tax_breakdown`) so per-line values are
+/// preserved when lines differ, rather than collapsed to a single rate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaxLine {
+    /// Net (pre-tax) amount for this line, in the payment's smallest unit.
+    pub net: u64,
+    /// Tax amount for this line, in the payment's smallest unit.
+    pub tax: u64,
+    /// Rate applied, as a percentage.
+    pub rate: f32,
+    /// Country (ISO alpha-3) used for this line, if known.
+    pub country_code: Option<String>,
+    /// The rate branch selected for this line.
+    pub treatment: TaxTreatment,
+}
+
+/// The shared summary of a breakdown, when every line has the same rate,
+/// country and treatment; `None` fields indicate the lines differ.
+#[derive(Debug, Clone, Default)]
+pub struct TaxSummary {
+    pub rate: Option<f32>,
+    pub country_code: Option<String>,
+    pub treatment: Option<String>,
+}
+
+/// Summarise a per-line breakdown: return the shared rate/country/treatment when
+/// uniform, otherwise leave the differing field(s) `None` ("mixed").
+pub fn summarize_tax_lines(lines: &[TaxLine]) -> TaxSummary {
+    let mut it = lines.iter();
+    let Some(first) = it.next() else {
+        return TaxSummary::default();
+    };
+    let mut rate = Some(first.rate);
+    let mut country = first.country_code.clone();
+    let mut treatment = Some(first.treatment);
+    for l in it {
+        if Some(l.rate) != rate {
+            rate = None;
+        }
+        if l.country_code != country {
+            country = None;
+        }
+        if Some(l.treatment) != treatment {
+            treatment = None;
+        }
+    }
+    TaxSummary {
+        rate,
+        country_code: country,
+        treatment: treatment.map(|t| t.as_str().to_string()),
+    }
+}
+
+/// Result of a VAT place-of-supply determination.
+#[derive(Debug, Clone)]
+pub struct TaxDetermination {
+    /// Tax amount in the same unit as the input amount (smallest currency unit).
+    pub amount: u64,
+    /// VAT rate applied, as a percentage (e.g. `23.0`).
+    pub rate: f32,
+    /// Determined place-of-supply country (ISO alpha-3), if known.
+    pub country_code: Option<String>,
+    /// How the sale was treated.
+    pub treatment: TaxTreatment,
+    /// The customer VAT number used (B2B reverse charge / domestic), if any.
+    pub vat_number: Option<String>,
+    /// Evidence used at determination time: the customer's self-declared
+    /// country (ISO alpha-3), if any.
+    pub declared_country: Option<String>,
+    /// Evidence used at determination time: the IP-derived country (ISO
+    /// alpha-3), if any.
+    pub geo_country: Option<String>,
+}
+
+impl TaxDetermination {
+    fn taxed(
+        amount: u64,
+        rate: f32,
+        cc: Option<String>,
+        t: TaxTreatment,
+        vat: Option<String>,
+    ) -> Self {
+        let tax = ((amount as f64) * (rate as f64 / 100.0)).floor() as u64;
+        Self {
+            amount: tax,
+            rate,
+            country_code: cc,
+            treatment: t,
+            vat_number: vat,
+            declared_country: None,
+            geo_country: None,
+        }
+    }
+
+    fn zero(cc: Option<String>, t: TaxTreatment, vat: Option<String>) -> Self {
+        Self {
+            amount: 0,
+            rate: 0.0,
+            country_code: cc,
+            treatment: t,
+            vat_number: vat,
+            declared_country: None,
+            geo_country: None,
+        }
+    }
+
+    /// Attach the evidence signals observed at determination time.
+    fn with_evidence(mut self, declared: Option<String>, geo: Option<String>) -> Self {
+        self.declared_country = declared;
+        self.geo_country = geo;
+        self
+    }
+
+    /// The evidence used, as a JSON object suitable for freezing on a payment.
+    pub fn evidence_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "declared_country": self.declared_country,
+            "geo_country": self.geo_country,
+            "vat_number": self.vat_number,
+        })
+    }
+
+    /// The treatment as its stable string identifier (for storage).
+    pub fn treatment_str(&self) -> String {
+        self.treatment.as_str().to_string()
+    }
+
+    /// A determination carrying no VAT (e.g. upgrade lines that are not taxed).
+    pub fn untaxed() -> Self {
+        Self::zero(None, TaxTreatment::OutOfScope, None)
+    }
+
+    /// Turn this determination into a breakdown line for a given net amount.
+    pub fn to_line(&self, net: u64) -> TaxLine {
+        TaxLine {
+            net,
+            tax: self.amount,
+            rate: self.rate,
+            country_code: self.country_code.clone(),
+            treatment: self.treatment,
+        }
+    }
+}
+
 /// Pricing engine is used to calculate billing amounts for
 /// different resource allocations
 #[derive(Clone)]
 pub struct PricingEngine {
     db: Arc<dyn LNVpsDb>,
     rates: Arc<dyn ExchangeRateService>,
-    tax_rates: HashMap<CountryCode, f32>,
+    vat: VatClient,
 }
 
 impl PricingEngine {
-    pub fn new(
-        db: Arc<dyn LNVpsDb>,
-        rates: Arc<dyn ExchangeRateService>,
-        tax_rates: HashMap<CountryCode, f32>,
-    ) -> Self {
-        Self {
-            db,
-            rates,
-            tax_rates,
-        }
+    pub fn new(db: Arc<dyn LNVpsDb>, rates: Arc<dyn ExchangeRateService>, vat: VatClient) -> Self {
+        Self { db, rates, vat }
+    }
+
+    /// The shared VAT client backing this engine (for rate refreshes).
+    pub fn vat_client(&self) -> VatClient {
+        self.vat.clone()
     }
 
     /// Convert cost plan interval to seconds
@@ -211,13 +418,17 @@ impl PricingEngine {
             .await
             .unwrap_or_else(Utc::now)
             .max(Utc::now());
+        let tax_details = self
+            .determine_tax(vm.user_id, input.value(), company_id)
+            .await?;
         Ok(CostResult::New(NewPaymentInfo {
             amount: input.value(),
             currency: cost.currency,
             time_value: new_time,
             new_expiry: vm_expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
-            tax: self.get_tax_for_user(vm.user_id, input.value()).await?,
+            tax: tax_details.amount,
+            tax_details,
             processing_fee: self
                 .calculate_processing_fee(company_id, method, cost.currency, input.value())
                 .await,
@@ -274,13 +485,16 @@ impl PricingEngine {
         } else {
             let scaled_amount = base_cost.amount * intervals as u64;
             let scaled_time = base_cost.time_value * intervals as u64;
-            let scaled_tax = self.get_tax_for_user(vm.user_id, scaled_amount).await?;
+            let tax_details = self
+                .determine_tax(vm.user_id, scaled_amount, company_id)
+                .await?;
             let processing_fee = self
                 .calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount)
                 .await;
             Ok(CostResult::New(NewPaymentInfo {
                 amount: scaled_amount,
-                tax: scaled_tax,
+                tax: tax_details.amount,
+                tax_details,
                 processing_fee,
                 currency: base_cost.currency,
                 rate: base_cost.rate,
@@ -438,11 +652,13 @@ impl PricingEngine {
                 method,
             )
             .await?;
+        let tax_details = self
+            .determine_tax(vm.user_id, converted_amount.amount.value(), company_id)
+            .await?;
         Ok(NewPaymentInfo {
             amount: converted_amount.amount.value(),
-            tax: self
-                .get_tax_for_user(vm.user_id, converted_amount.amount.value())
-                .await?,
+            tax: tax_details.amount,
+            tax_details,
             processing_fee: self
                 .calculate_processing_fee(
                     company_id,
@@ -458,16 +674,128 @@ impl PricingEngine {
         })
     }
 
-    pub async fn get_tax_for_user(&self, user_id: u64, amount: u64) -> Result<u64> {
+    /// Look up the VAT rate (%) for an ISO alpha-3 country from the VAT client's
+    /// cached table, or `0.0` when unknown.
+    fn rate_for_country(&self, alpha3: &str) -> f32 {
+        CountryCode::for_alpha3(alpha3)
+            .ok()
+            .and_then(|cc| self.vat.rate_for(cc))
+            .unwrap_or(0.0)
+    }
+
+    /// Select the rate for a sale from the seller and customer countries.
+    ///
+    /// The seller country comes from the VM's company. Selection order:
+    /// 1. Customer has a stored VAT number: same country as seller → seller
+    ///    rate; different EU country → 0%; non-EU → 0%.
+    /// 2. No VAT number: customer country from the self-declared value, else the
+    ///    IP-derived value. EU → that country's rate; non-EU → 0%.
+    /// 3. No country available: seller-country rate when the seller is in the
+    ///    EU list, otherwise 0%.
+    pub async fn determine_tax(
+        &self,
+        user_id: u64,
+        amount: u64,
+        company_id: u64,
+    ) -> Result<TaxDetermination> {
         let user = self.db.get_user(user_id).await?;
-        if let Some(cc) = user
-            .country_code
-            .and_then(|c| CountryCode::for_alpha3(&c).ok())
-            && let Some(c) = self.tax_rates.get(&cc)
-        {
-            return Ok((amount as f64 * (*c as f64 / 100f64)).floor() as u64);
+        // The seller country is taken from our own VAT registration number
+        // (`company.tax_id`) when present — that number is our VIES registration
+        // and identifies the country we are registered in — and otherwise from
+        // the company's configured country.
+        let seller_cc = self.db.get_company(company_id).await.ok().and_then(|c| {
+            c.tax_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(vat_number_country_alpha3)
+                .or_else(|| c.country_code.map(|cc| cc.to_uppercase()))
+        });
+
+        // Record the raw country signals observed now, even when only one of
+        // them drives the decision.
+        let declared = user.country_code.as_ref().map(|c| c.to_uppercase());
+        let geo = user.geo_country_code.as_ref().map(|c| c.to_uppercase());
+        let determination = self.determine_tax_inner(&user, amount, seller_cc);
+        Ok(determination.with_evidence(declared, geo))
+    }
+
+    /// Core rate selection, without evidence attachment.
+    ///
+    /// This implements EU VAT only. It is scoped to sellers established in the
+    /// EU VAT area: when the seller country is not in that list (e.g. a US
+    /// company) no rate is selected here and the amount is untaxed. Other tax
+    /// systems (e.g. US sales tax) are out of scope for this function.
+    fn determine_tax_inner(
+        &self,
+        user: &lnvps_db::User,
+        amount: u64,
+        seller_cc: Option<String>,
+    ) -> TaxDetermination {
+        // Only sellers in the EU VAT area select a rate here.
+        if !seller_cc.as_deref().map(is_eu_vat_country).unwrap_or(false) {
+            return TaxDetermination::zero(None, TaxTreatment::OutOfScope, None);
         }
-        Ok(0)
+
+        // 1. Customer supplied a VAT number (validated when it was saved).
+        if let Some(vat) = user
+            .billing_tax_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && let Some(vat_cc) = vat_number_country_alpha3(vat)
+        {
+            if seller_cc.as_deref() == Some(vat_cc.as_str()) {
+                let rate = self.rate_for_country(&vat_cc);
+                return TaxDetermination::taxed(
+                    amount,
+                    rate,
+                    Some(vat_cc),
+                    TaxTreatment::Domestic,
+                    Some(vat.to_string()),
+                );
+            }
+            let treatment = if is_eu_vat_country(&vat_cc) {
+                TaxTreatment::ReverseCharge
+            } else {
+                TaxTreatment::OutOfScope
+            };
+            return TaxDetermination::zero(Some(vat_cc), treatment, Some(vat.to_string()));
+        }
+
+        // 2. No VAT number: pick the customer country from available signals.
+        let customer_cc = user
+            .country_code
+            .clone()
+            .or_else(|| user.geo_country_code.clone())
+            .map(|c| c.to_uppercase());
+        match customer_cc {
+            Some(cc) if is_eu_vat_country(&cc) => {
+                let rate = self.rate_for_country(&cc);
+                let treatment = if seller_cc.as_deref() == Some(cc.as_str()) {
+                    TaxTreatment::Domestic
+                } else {
+                    TaxTreatment::OssB2c
+                };
+                TaxDetermination::taxed(amount, rate, Some(cc), treatment, None)
+            }
+            Some(cc) => TaxDetermination::zero(Some(cc), TaxTreatment::OutOfScope, None),
+            // 3. No customer country available: fall back to the seller country
+            //    (guaranteed in the EU list by the gate above).
+            None => match seller_cc {
+                Some(scc) => {
+                    let rate = self.rate_for_country(&scc);
+                    TaxDetermination::taxed(
+                        amount,
+                        rate,
+                        Some(scc),
+                        TaxTreatment::UndeterminedDefault,
+                        None,
+                    )
+                }
+                None => TaxDetermination::zero(None, TaxTreatment::OutOfScope, None),
+            },
+        }
     }
 
     async fn get_ticker(
@@ -527,11 +855,13 @@ impl PricingEngine {
             .unwrap_or_else(Utc::now);
         let time_value = Self::next_template_expire(vm_expires, &cost_plan);
         let base = vm_expires.max(Utc::now());
+        let tax_details = self
+            .determine_tax(vm.user_id, converted_amount.amount.value(), company_id)
+            .await?;
         Ok(NewPaymentInfo {
             amount: converted_amount.amount.value(),
-            tax: self
-                .get_tax_for_user(vm.user_id, converted_amount.amount.value())
-                .await?,
+            tax: tax_details.amount,
+            tax_details,
             processing_fee: self
                 .calculate_processing_fee(
                     company_id,
@@ -889,6 +1219,9 @@ pub struct NewPaymentInfo {
     pub new_expiry: DateTime<Utc>,
     /// Taxes to charge
     pub tax: u64,
+    /// Full VAT determination for this (single line item) cost, so callers can
+    /// build a per-line-item breakdown on the aggregated payment.
+    pub tax_details: TaxDetermination,
     /// Processing fee charged by the payment provider
     pub processing_fee: u64,
 }
@@ -1060,7 +1393,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         // Test a range of amounts to ensure gross-up always holds
         for base in [100u64, 345, 1000, 9999, 50000] {
@@ -1129,7 +1462,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let amount = 990u64; // €9.90 in cents
         let fee = pe
@@ -1286,11 +1619,14 @@ mod tests {
                     ..Default::default()
                 },
             );
+
+            // Seller company is established in the EU (IE) so EU VAT applies.
+            db.companies.lock().await.get_mut(&1).unwrap().country_code = Some("IRL".to_string());
         }
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
-        let taxes = HashMap::from([(CountryCode::IRL, 23.0)]);
+        let taxes = VatClient::with_rates(HashMap::from([(CountryCode::IRL, 23.0)]));
 
         let pe = PricingEngine::new(db.clone(), rates, taxes);
         let plan = MockDb::mock_cost_plan();
@@ -1434,7 +1770,7 @@ mod tests {
         }
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         // Test upgrade configuration - increase CPU from 1 to 2
@@ -1491,7 +1827,7 @@ mod tests {
         }
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let upgrade_config = UpgradeConfig {
@@ -1541,7 +1877,7 @@ mod tests {
         }
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let upgrade_config = UpgradeConfig {
@@ -1592,7 +1928,7 @@ mod tests {
         }
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let upgrade_config = UpgradeConfig {
@@ -1653,7 +1989,7 @@ mod tests {
         }
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         // Test upgrade - increase CPU from 2 to 4 (double the CPU)
@@ -1824,7 +2160,7 @@ mod tests {
         }
 
         let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         // Test large upgrade - significantly increase all resources
@@ -1981,7 +2317,7 @@ mod tests {
         add_revolut_processing_fee_config(&db).await;
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
-        let taxes = HashMap::new();
+        let taxes = VatClient::new();
         let pe = PricingEngine::new(db.clone(), rates, taxes.clone());
 
         // Test Lightning payment (no processing fee)
@@ -2142,7 +2478,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2165,7 +2501,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2192,7 +2528,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2220,7 +2556,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2244,7 +2580,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2283,7 +2619,7 @@ mod tests {
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let rates = Arc::new(MockExchangeRate::new());
-        let pe = PricingEngine::new(db, rates, HashMap::new());
+        let pe = PricingEngine::new(db, rates, VatClient::new());
 
         let cfg = crate::UpgradeConfig {
             new_cpu: Some(4),
@@ -2304,7 +2640,7 @@ mod tests {
         rates
             .set_rate(Ticker::btc_rate("EUR").unwrap(), MOCK_RATE)
             .await;
-        PricingEngine::new(db, rates as Arc<dyn ExchangeRateService>, HashMap::new())
+        PricingEngine::new(db, rates as Arc<dyn ExchangeRateService>, VatClient::new())
     }
 
     /// get_vm_cost_for_intervals returns CostResult::Existing when a valid (non-expired)
@@ -2356,6 +2692,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         };
         db.insert_subscription_payment(&existing).await?;
 
@@ -2421,6 +2762,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         };
         db.insert_subscription_payment(&existing).await?;
 
@@ -2472,6 +2818,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         };
         db.insert_subscription_payment(&expired).await?;
 
@@ -2493,6 +2844,330 @@ mod tests {
                 bail!("expected New, got Existing — expired invoice was reused")
             }
         }
+        Ok(())
+    }
+
+    // ---- VAT place-of-supply determination -------------------------------
+
+    fn eu_tax_rates() -> HashMap<CountryCode, f32> {
+        HashMap::from([
+            (CountryCode::IRL, 23.0),
+            (CountryCode::DEU, 19.0),
+            (CountryCode::FRA, 20.0),
+        ])
+    }
+
+    async fn tax_db(seller_cc: Option<&str>) -> MockDb {
+        let db = MockDb::default();
+        {
+            let mut c = db.companies.lock().await;
+            c.get_mut(&1).unwrap().country_code = seller_cc.map(|s| s.to_string());
+        }
+        db
+    }
+
+    async fn tax_db_with_vat(seller_vat: &str) -> MockDb {
+        let db = MockDb::default();
+        {
+            let mut c = db.companies.lock().await;
+            let company = c.get_mut(&1).unwrap();
+            company.country_code = None;
+            company.tax_id = Some(seller_vat.to_string());
+        }
+        db
+    }
+
+    async fn tax_user(
+        db: &MockDb,
+        id: u64,
+        country: Option<&str>,
+        geo: Option<&str>,
+        vat: Option<&str>,
+    ) {
+        let mut u = db.users.lock().await;
+        u.insert(
+            id,
+            User {
+                id,
+                pubkey: vec![],
+                country_code: country.map(|s| s.to_string()),
+                geo_country_code: geo.map(|s| s.to_string()),
+                billing_tax_id: vat.map(|s| s.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+
+    async fn make_pe_tax(db: MockDb) -> PricingEngine {
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        PricingEngine::new(
+            db,
+            Arc::new(MockExchangeRate::new()),
+            VatClient::with_rates(eu_tax_rates()),
+        )
+    }
+
+    #[test]
+    fn eu_membership_and_vat_prefix() {
+        assert!(is_eu_vat_country("IRL"));
+        assert!(is_eu_vat_country("deu"));
+        assert!(!is_eu_vat_country("USA"));
+        assert!(!is_eu_vat_country("GBR"));
+        assert_eq!(
+            vat_number_country_alpha3("DE123456789").as_deref(),
+            Some("DEU")
+        );
+        assert_eq!(
+            vat_number_country_alpha3("IE1234567X").as_deref(),
+            Some("IRL")
+        );
+        // Greek VAT numbers use the EL prefix, not the ISO code GR.
+        assert_eq!(
+            vat_number_country_alpha3("EL123456789").as_deref(),
+            Some("GRC")
+        );
+        assert_eq!(vat_number_country_alpha3("12345"), None);
+    }
+
+    #[tokio::test]
+    async fn seller_country_from_own_vat_number() -> Result<()> {
+        // Seller country is taken from our own VAT number even when country_code
+        // is unset. IE VAT number + IE customer -> domestic 23%.
+        let db = tax_db_with_vat("IE1234567X").await;
+        tax_user(&db, 10, Some("IRL"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::Domestic);
+        assert_eq!(d.amount, 2300);
+
+        // Same IE-registered seller, German consumer -> OSS 19%.
+        let db = tax_db_with_vat("IE1234567X").await;
+        tax_user(&db, 11, Some("DEU"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(11, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OssB2c);
+        assert_eq!(d.amount, 1900);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_eu_seller_charges_no_tax() -> Result<()> {
+        // A US company selling to an EU consumer charges no EU VAT here.
+        let db = tax_db(Some("USA")).await;
+        tax_user(&db, 10, Some("DEU"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OutOfScope);
+        assert_eq!(d.amount, 0);
+
+        // Even a same-country US B2C sale is untaxed by this (EU-only) logic.
+        let db = tax_db(Some("USA")).await;
+        tax_user(&db, 11, Some("USA"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(11, 10000, 1).await?;
+        assert_eq!(d.amount, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_seller_country_charges_no_tax() -> Result<()> {
+        let db = tax_db(None).await;
+        tax_user(&db, 10, Some("DEU"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OutOfScope);
+        assert_eq!(d.amount, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_non_eu_consumer_out_of_scope() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("USA"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OutOfScope);
+        assert_eq!(d.amount, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_eu_consumer_destination_rate() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("DEU"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OssB2c);
+        assert_eq!(d.country_code.as_deref(), Some("DEU"));
+        assert_eq!(d.amount, 1900); // 19% of 10000
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_eu_consumer_domestic_when_same_as_seller() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("IRL"), None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::Domestic);
+        assert_eq!(d.amount, 2300); // 23%
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_b2b_reverse_charge_other_eu_country() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("DEU"), None, Some("DE123456789")).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::ReverseCharge);
+        assert_eq!(d.amount, 0);
+        assert_eq!(d.vat_number.as_deref(), Some("DE123456789"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_b2b_domestic_same_country_vat() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("IRL"), None, Some("IE1234567X")).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::Domestic);
+        assert_eq!(d.amount, 2300);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_b2b_non_eu_vat_out_of_scope() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        // A non-EU (e.g. Norwegian) VAT number.
+        tax_user(&db, 10, Some("NOR"), None, Some("NO999999999")).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OutOfScope);
+        assert_eq!(d.amount, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_geo_fallback_when_no_self_declared_country() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, None, Some("FRA"), None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OssB2c);
+        assert_eq!(d.country_code.as_deref(), Some("FRA"));
+        assert_eq!(d.amount, 2000); // 20%
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_undetermined_defaults_to_eu_seller_rate() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, None, None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::UndeterminedDefault);
+        assert_eq!(d.country_code.as_deref(), Some("IRL"));
+        assert_eq!(d.amount, 2300);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_undetermined_non_eu_seller_out_of_scope() -> Result<()> {
+        let db = tax_db(Some("USA")).await;
+        tax_user(&db, 10, None, None, None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.treatment, TaxTreatment::OutOfScope);
+        assert_eq!(d.amount, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn summarize_uniform_and_mixed_breakdowns() {
+        // Uniform: two lines, same rate/country/treatment -> populated summary.
+        let uniform = vec![
+            TaxLine {
+                net: 1000,
+                tax: 190,
+                rate: 19.0,
+                country_code: Some("DEU".into()),
+                treatment: TaxTreatment::OssB2c,
+            },
+            TaxLine {
+                net: 500,
+                tax: 95,
+                rate: 19.0,
+                country_code: Some("DEU".into()),
+                treatment: TaxTreatment::OssB2c,
+            },
+        ];
+        let s = summarize_tax_lines(&uniform);
+        assert_eq!(s.rate, Some(19.0));
+        assert_eq!(s.country_code.as_deref(), Some("DEU"));
+        assert_eq!(s.treatment.as_deref(), Some("oss_b2c"));
+
+        // Mixed: reverse charge (0%) on one line, domestic 23% on another ->
+        // differing fields collapse to None ("see breakdown").
+        let mixed = vec![
+            TaxLine {
+                net: 1000,
+                tax: 0,
+                rate: 0.0,
+                country_code: Some("DEU".into()),
+                treatment: TaxTreatment::ReverseCharge,
+            },
+            TaxLine {
+                net: 1000,
+                tax: 230,
+                rate: 23.0,
+                country_code: Some("IRL".into()),
+                treatment: TaxTreatment::Domestic,
+            },
+        ];
+        let s = summarize_tax_lines(&mixed);
+        assert_eq!(s.rate, None);
+        assert_eq!(s.country_code, None);
+        assert_eq!(s.treatment, None);
+
+        // Empty breakdown -> empty summary.
+        let s = summarize_tax_lines(&[]);
+        assert_eq!(s.rate, None);
+        assert_eq!(s.country_code, None);
+        assert_eq!(s.treatment, None);
+    }
+
+    #[tokio::test]
+    async fn determination_to_line_and_evidence() -> Result<()> {
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("DEU"), Some("FRA"), None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        let line = d.to_line(10000);
+        assert_eq!(line.net, 10000);
+        assert_eq!(line.tax, 1900);
+        assert_eq!(line.rate, 19.0);
+        assert_eq!(line.treatment, TaxTreatment::OssB2c);
+        // Evidence records both declared and geo signals.
+        let ev = d.evidence_json();
+        assert_eq!(ev["declared_country"], "DEU");
+        assert_eq!(ev["geo_country"], "FRA");
+        assert!(ev["vat_number"].is_null());
+        // Untaxed determination yields a zero line.
+        assert_eq!(TaxDetermination::untaxed().to_line(500).tax, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tax_self_declared_takes_priority_over_geo() -> Result<()> {
+        // Conflicting evidence: self-declared IE (domestic 23%) beats geo DE.
+        let db = tax_db(Some("IRL")).await;
+        tax_user(&db, 10, Some("IRL"), Some("DEU"), None).await;
+        let pe = make_pe_tax(db).await;
+        let d = pe.determine_tax(10, 10000, 1).await?;
+        assert_eq!(d.country_code.as_deref(), Some("IRL"));
+        assert_eq!(d.amount, 2300);
         Ok(())
     }
 }

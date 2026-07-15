@@ -1,5 +1,4 @@
 #![allow(unused)]
-pub use lnvps_api_common::MockDnsServer;
 use crate::host::dummy_host::DummyVmHost;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
@@ -7,6 +6,7 @@ use crate::host::{
 use crate::router::{
     ArpEntry, BgpPeer, BgpRoute, BgpRouter, BgpSession, Router, Tunnel, TunnelRouter, TunnelTraffic,
 };
+pub use lnvps_api_common::MockDnsServer;
 
 /// Type alias so tests can refer to the in-memory VM host as `MockVmHost`.
 pub type MockVmHost = DummyVmHost;
@@ -28,7 +28,7 @@ use lnvps_db::{
     AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
     NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate,
 };
 use nostr_sdk::Timestamp;
 use payments_rs::lightning::{
@@ -409,4 +409,3 @@ impl LightningNode for MockNode {
         todo!()
     }
 }
-

@@ -1194,46 +1194,6 @@ pub struct Vm {
     pub fw_policy_out: Option<VmFirewallPolicy>,
 }
 
-/// Raw vm_payment row with external_data as a plain String (not decrypted).
-/// Used by the data migration tool to copy rows without needing the encryption key.
-#[derive(FromRow, Clone, Debug)]
-pub struct VmPaymentRaw {
-    pub id: Vec<u8>,
-    pub vm_id: u64,
-    pub created: DateTime<Utc>,
-    pub expires: DateTime<Utc>,
-    pub amount: u64,
-    pub currency: String,
-    pub payment_method: PaymentMethod,
-    pub payment_type: PaymentType,
-    pub external_data: String,
-    pub external_id: Option<String>,
-    pub is_paid: bool,
-    pub rate: f32,
-    pub time_value: u64,
-    pub tax: u64,
-    pub upgrade_params: Option<String>,
-    pub processing_fee: u64,
-    pub paid_at: Option<DateTime<Utc>>,
-}
-
-/// Minimal VM projection used by the data migration tool where
-/// `subscription_line_item_id` may still be NULL for pre-migration rows.
-#[derive(FromRow, Clone, Debug)]
-pub struct VmForMigration {
-    pub id: u64,
-    pub user_id: u64,
-    pub template_id: Option<u64>,
-    pub custom_template_id: Option<u64>,
-    pub created: DateTime<Utc>,
-    /// Legacy expiry column. Nullable since the new provisioning path no longer writes it
-    /// (expiry now lives on the subscription). `None` => managed by the new subscription path.
-    pub expires: Option<DateTime<Utc>>,
-    pub auto_renewal_enabled: bool,
-    pub subscription_line_item_id: Option<u64>,
-    pub deleted: bool,
-}
-
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VmIpAssignment {
     /// Unique id of this assignment
@@ -1343,35 +1303,6 @@ pub struct VmFirewallRule {
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
-pub struct VmPayment {
-    pub id: Vec<u8>,
-    pub vm_id: u64,
-    pub created: DateTime<Utc>,
-    pub expires: DateTime<Utc>,
-    pub amount: u64,
-    pub currency: String,
-    pub payment_method: PaymentMethod,
-    pub payment_type: PaymentType,
-    /// External data (invoice / json) (encrypted)
-    pub external_data: EncryptedString,
-    /// External id on other system
-    pub external_id: Option<String>,
-    pub is_paid: bool,
-    /// Exchange rate back to company's base currency
-    pub rate: f32,
-    /// Number of seconds this payment will add to vm expiry
-    pub time_value: u64,
-    /// Taxes to charge on payment
-    pub tax: u64,
-    /// Processing fee charged by the payment provider
-    pub processing_fee: u64,
-    /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
-    pub upgrade_params: Option<String>,
-    /// Timestamp when the payment was completed
-    pub paid_at: Option<DateTime<Utc>>,
-}
-
-#[derive(FromRow, Clone, Debug, Default)]
 pub struct Referral {
     /// Unique id of this referral entry
     pub id: u64,
@@ -1416,46 +1347,6 @@ pub struct ReferralCostUsage {
     pub currency: String,
     pub rate: f32,
     pub base_currency: String,
-}
-
-/// VM Payment with company information for time-series reporting
-#[derive(FromRow, Clone, Debug)]
-pub struct VmPaymentWithCompany {
-    pub id: Vec<u8>,
-    pub vm_id: u64,
-    pub created: DateTime<Utc>,
-    pub expires: DateTime<Utc>,
-    pub amount: u64,
-    pub currency: String,
-    pub payment_method: PaymentMethod,
-    pub payment_type: PaymentType,
-    /// External data (invoice / json) (encrypted)
-    pub external_data: EncryptedString,
-    /// External id on other system
-    pub external_id: Option<String>,
-    pub is_paid: bool,
-    /// Exchange rate back to company's base currency
-    pub rate: f32,
-    /// Number of seconds this payment will add to vm expiry
-    pub time_value: u64,
-    /// Taxes to charge on payment
-    pub tax: u64,
-    /// Processing fee charged by the payment provider
-    pub processing_fee: u64,
-    /// JSON-encoded upgrade parameters (CPU, memory, disk) for upgrade payments
-    pub upgrade_params: Option<String>,
-    // Company information
-    pub company_id: u64,
-    pub company_name: String,
-    pub company_base_currency: String,
-    // User information
-    pub user_id: u64,
-    // Host information
-    pub host_id: u64,
-    pub host_name: String,
-    // Region information
-    pub region_id: u64,
-    pub region_name: String,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2021,6 +1912,24 @@ pub struct SubscriptionPayment {
     pub processing_fee: u64,
     /// Timestamp when the payment was completed
     pub paid_at: Option<DateTime<Utc>>,
+    /// Summary VAT rate (%) when the breakdown is uniform; `None` if the payment
+    /// mixes rates across line items (see `tax_breakdown`).
+    #[sqlx(default)]
+    pub tax_rate: Option<f32>,
+    /// Summary place-of-supply country (ISO alpha-3) when uniform; `None` if mixed.
+    #[sqlx(default)]
+    pub tax_country_code: Option<String>,
+    /// Summary treatment (see `TaxTreatment`) when uniform; `None` if mixed.
+    #[sqlx(default)]
+    pub tax_treatment: Option<String>,
+    /// Evidence used for the determination (declared/geo country, VAT number),
+    /// as JSON, frozen at sale time. Uniform per payment (one customer).
+    #[sqlx(default)]
+    pub tax_evidence: Option<serde_json::Value>,
+    /// Authoritative per-line-item VAT breakdown (JSON array), frozen at sale
+    /// time. Losslessly records payments that mix rates/treatments.
+    #[sqlx(default)]
+    pub tax_breakdown: Option<serde_json::Value>,
 }
 
 /// Subscription payment with company info (for admin views and time-series reporting)
@@ -2047,6 +1956,21 @@ pub struct SubscriptionPaymentWithCompany {
     pub processing_fee: u64,
     /// Timestamp when the payment was completed
     pub paid_at: Option<DateTime<Utc>>,
+    /// Summary VAT rate (%) when uniform; `None` if mixed (see `tax_breakdown`).
+    #[sqlx(default)]
+    pub tax_rate: Option<f32>,
+    /// Summary place-of-supply country (ISO alpha-3) when uniform; `None` if mixed.
+    #[sqlx(default)]
+    pub tax_country_code: Option<String>,
+    /// Summary treatment (see `TaxTreatment`) when uniform; `None` if mixed.
+    #[sqlx(default)]
+    pub tax_treatment: Option<String>,
+    /// Evidence used for the determination, as JSON, frozen at sale time.
+    #[sqlx(default)]
+    pub tax_evidence: Option<serde_json::Value>,
+    /// Authoritative per-line-item VAT breakdown (JSON array), frozen at sale time.
+    #[sqlx(default)]
+    pub tax_breakdown: Option<serde_json::Value>,
     // Company information
     pub company_id: u64,
     pub company_name: String,

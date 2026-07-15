@@ -11,7 +11,7 @@ use lnvps_db::{
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
     UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmPayment, VmTemplate,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate,
 };
 
 use async_trait::async_trait;
@@ -39,7 +39,6 @@ pub struct MockDb {
     pub custom_pricing: Arc<Mutex<HashMap<u64, VmCustomPricing>>>,
     pub custom_pricing_disk: Arc<Mutex<HashMap<u64, VmCustomPricingDisk>>>,
     pub custom_template: Arc<Mutex<HashMap<u64, VmCustomTemplate>>>,
-    pub payments: Arc<Mutex<Vec<VmPayment>>>,
     pub router: Arc<Mutex<HashMap<u64, Router>>>,
     pub dns_servers: Arc<Mutex<HashMap<u64, DnsServer>>>,
     pub access_policy: Arc<Mutex<HashMap<u64, AccessPolicy>>>,
@@ -255,7 +254,6 @@ impl Default for MockDb {
             user_ssh_keys: Arc::new(Mutex::new(Default::default())),
             user_payment_methods: Arc::new(Default::default()),
             custom_template: Arc::new(Default::default()),
-            payments: Arc::new(Default::default()),
             router: Arc::new(Default::default()),
             dns_servers: Arc::new(Mutex::new(dns_servers)),
             access_policy: Arc::new(Default::default()),
@@ -1132,105 +1130,6 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn list_vm_payment(&self, vm_id: u64) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        Ok(p.iter().filter(|p| p.vm_id == vm_id).cloned().collect())
-    }
-
-    async fn list_vm_payment_paginated(
-        &self,
-        vm_id: u64,
-        limit: u64,
-        offset: u64,
-    ) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        let mut filtered: Vec<_> = p.iter().filter(|p| p.vm_id == vm_id).cloned().collect();
-        filtered.sort_by(|a, b| b.created.cmp(&a.created));
-        Ok(filtered
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect())
-    }
-
-    async fn list_vm_payment_by_method_and_type(
-        &self,
-        vm_id: u64,
-        method: lnvps_db::PaymentMethod,
-        payment_type: lnvps_db::PaymentType,
-    ) -> DbResult<Vec<VmPayment>> {
-        let p = self.payments.lock().await;
-        let mut filtered: Vec<_> = p
-            .iter()
-            .filter(|p| {
-                p.vm_id == vm_id
-                    && p.payment_method == method
-                    && p.payment_type == payment_type
-                    && p.expires > Utc::now()
-                    && !p.is_paid
-            })
-            .cloned()
-            .collect();
-        filtered.sort_by(|a, b| b.created.cmp(&a.created));
-        Ok(filtered)
-    }
-
-    async fn insert_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        let mut p = self.payments.lock().await;
-        p.push(vm_payment.clone());
-        Ok(())
-    }
-
-    async fn get_vm_payment(&self, id: &Vec<u8>) -> DbResult<VmPayment> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .find(|p| p.id == *id)
-            .context("no vm_payment")?
-            .clone())
-    }
-
-    async fn get_vm_payment_by_ext_id(&self, id: &str) -> DbResult<VmPayment> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .find(|p| p.external_id == Some(id.to_string()))
-            .context("no vm_payment")?
-            .clone())
-    }
-
-    async fn update_vm_payment(&self, vm_payment: &VmPayment) -> DbResult<()> {
-        let mut p = self.payments.lock().await;
-        if let Some(p) = p.iter_mut().find(|p| p.id == *vm_payment.id) {
-            p.is_paid = vm_payment.is_paid;
-            p.paid_at = vm_payment.paid_at;
-        }
-        Ok(())
-    }
-
-    async fn vm_payment_paid(&self, payment: &VmPayment) -> DbResult<()> {
-        let mut p = self.payments.lock().await;
-        if let Some(p) = p.iter_mut().find(|p| p.id == *payment.id) {
-            p.is_paid = true;
-            p.paid_at = Some(Utc::now());
-        }
-        // vm.expires removed — expiry is managed exclusively via subscription.expires
-        Ok(())
-    }
-
-    async fn last_paid_invoice(&self) -> DbResult<Option<VmPayment>> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .filter(|p| p.is_paid)
-            .max_by(|a, b| a.created.cmp(&b.created))
-            .cloned())
-    }
-
-    async fn count_active_vm_payments(&self, vm_id: u64) -> DbResult<u64> {
-        let p = self.payments.lock().await;
-        Ok(p.iter()
-            .filter(|p| p.vm_id == vm_id && !p.is_paid && p.expires > Utc::now())
-            .count() as u64)
-    }
-
     async fn list_custom_pricing(&self, _tb: u64) -> DbResult<Vec<VmCustomPricing>> {
         let p = self.custom_pricing.lock().await;
         Ok(p.values().cloned().collect())
@@ -2096,6 +1995,11 @@ impl LNVpsDbBase for MockDb {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             paid_at: payment.paid_at,
+            tax_rate: payment.tax_rate,
+            tax_country_code: payment.tax_country_code.clone(),
+            tax_treatment: payment.tax_treatment.clone(),
+            tax_evidence: payment.tax_evidence.clone(),
+            tax_breakdown: payment.tax_breakdown.clone(),
             company_id: 0,
             company_name: String::new(),
             company_base_currency: "EUR".to_string(),
@@ -3151,6 +3055,11 @@ impl lnvps_db::AdminDb for MockDb {
                     tax: payment.tax,
                     processing_fee: payment.processing_fee,
                     paid_at: payment.paid_at,
+                    tax_rate: payment.tax_rate,
+                    tax_country_code: payment.tax_country_code.clone(),
+                    tax_treatment: payment.tax_treatment.clone(),
+                    tax_evidence: payment.tax_evidence.clone(),
+                    tax_breakdown: payment.tax_breakdown.clone(),
                     company_id: cid,
                     company_name: company.name.clone(),
                     company_base_currency: company.base_currency.clone(),
@@ -3649,6 +3558,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         }
     }
 
@@ -3744,6 +3658,27 @@ mod tests {
     }
 
     /// subscription_payment_paid marks the payment as paid and sets paid_at.
+    #[tokio::test]
+    async fn test_set_user_geo_persists_evidence() {
+        let db = MockDb::default();
+        let uid = db.upsert_user(&[7u8; 32]).await.unwrap();
+
+        // Resolved country is stored independently of country_code.
+        db.set_user_geo(uid, Some("DEU"), "198.51.100.9")
+            .await
+            .unwrap();
+        let user = db.get_user(uid).await.unwrap();
+        assert_eq!(user.geo_country_code.as_deref(), Some("DEU"));
+        assert_eq!(user.geo_ip.as_deref(), Some("198.51.100.9"));
+        assert!(user.geo_updated.is_some());
+
+        // An unresolved IP records the IP but no country.
+        db.set_user_geo(uid, None, "10.0.0.1").await.unwrap();
+        let user = db.get_user(uid).await.unwrap();
+        assert_eq!(user.geo_country_code, None);
+        assert_eq!(user.geo_ip.as_deref(), Some("10.0.0.1"));
+    }
+
     #[tokio::test]
     async fn test_subscription_payment_paid_marks_payment() {
         let db = MockDb::default();

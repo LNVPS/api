@@ -6,8 +6,11 @@ use lnvps_api::dvm::start_dvms;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
 use lnvps_api::worker::Worker;
-use lnvps_api_common::{ChannelWorkCommander, RedisWorkCommander, VmHistoryLogger, WorkCommander};
-use lnvps_api_common::{VmStateCache, WorkJob, make_exchange_service};
+use lnvps_api_common::{
+    ChannelWorkCommander, CountryResolver, MaxmindCountryResolver, RedisWorkCommander,
+    VmHistoryLogger, WorkCommander,
+};
+use lnvps_api_common::{VatClient, VmStateCache, WorkJob, make_exchange_service};
 use std::fmt::{Display, Formatter};
 
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
@@ -108,15 +111,7 @@ async fn main() -> Result<(), Error> {
         db.execute(setup_script).await?;
         info!("Executed dev_setup.sql");
     }
-    // Backfill VMs/payments into the subscription system. Must run AFTER schema
-    // migrations and BEFORE the Arc<dyn LNVpsDb> is used anywhere (the worker data
-    // migrations and all VM reads decode the non-nullable subscription_line_item_id,
-    // which is NULL for pre-migration rows until this backfill links them).
-    // Idempotent — a no-op once every VM is linked and every payment copied.
-    let db = Arc::new(db);
-    lnvps_api::data_migration::vm_subscription_backfill::run_vm_subscription_backfill(db.clone())
-        .await?;
-    let db: Arc<dyn LNVpsDb> = db;
+    let db: Arc<dyn LNVpsDb> = Arc::new(db);
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
         for r in &c.relays {
@@ -131,6 +126,21 @@ async fn main() -> Result<(), Error> {
     let exchange = make_exchange_service(&settings.redis);
     let node = settings.get_node().await?;
 
+    // Optional IP -> country geolocation for VAT place-of-supply evidence.
+    let geoip: Option<Arc<dyn CountryResolver>> = match &settings.geoip_database {
+        Some(path) => match MaxmindCountryResolver::open(path) {
+            Ok(r) => {
+                info!("Loaded GeoIP database from {}", path.display());
+                Some(Arc::new(r))
+            }
+            Err(e) => {
+                error!("Failed to load GeoIP database {}: {}", path.display(), e);
+                None
+            }
+        },
+        None => None,
+    };
+
     let status = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {
@@ -144,11 +154,39 @@ async fn main() -> Result<(), Error> {
         Arc::new(ChannelWorkCommander::new())
     };
 
+    // One shared VAT rate cache for the whole process. It is populated now and
+    // refreshed periodically; the same instance is handed to the subscription
+    // handler (and thus every PricingEngine clone) so rate updates are visible
+    // everywhere without restarting. Until the first successful refresh no rates
+    // are known and tax falls back to 0%.
+    let vat = VatClient::new();
+    match vat.refresh_rates().await {
+        Ok(n) => info!("Loaded {} VAT rates", n),
+        Err(e) => warn!(
+            "Failed to load VAT rates (tax will be 0% until refreshed): {}",
+            e
+        ),
+    }
+    tasks.push(tokio::spawn({
+        let vat = vat.clone();
+        async move {
+            loop {
+                // Refresh once a day - standard rates change rarely.
+                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+                match vat.refresh_rates().await {
+                    Ok(n) => info!("Refreshed {} VAT rates", n),
+                    Err(e) => error!("Failed to refresh VAT rates: {}", e),
+                }
+            }
+        }
+    }));
+
     let sub_handler = SubscriptionHandler::new(
         settings.clone(),
         db.clone(),
         node.clone(),
         exchange.clone(),
+        vat.clone(),
         work_commander.clone(),
         status.clone(),
     )?;
@@ -292,6 +330,7 @@ async fn main() -> Result<(), Error> {
                         settings,
                         rates: exchange,
                         work_sender: worker.commander(),
+                        geoip: geoip.clone(),
                     }),
             )
             .await

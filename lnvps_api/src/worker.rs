@@ -2997,6 +2997,7 @@ mod tests {
             db.clone(),
             node,
             rates,
+            lnvps_api_common::VatClient::new(),
             work_commander.clone(),
             cache.clone(),
         )?;
@@ -3102,6 +3103,11 @@ mod tests {
             tax: 0,
             processing_fee: 0,
             paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
         }
     }
 

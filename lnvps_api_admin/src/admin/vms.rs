@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
-    UpgradeConfig, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
+    UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -575,7 +575,9 @@ async fn admin_get_vm_history(
 
     // Verify history entry belongs to this VM
     if history.vm_id != vm_id {
-        return Err(ApiError::not_found("History entry does not belong to this VM"));
+        return Err(ApiError::not_found(
+            "History entry does not belong to this VM",
+        ));
     }
 
     let admin_history_info =
@@ -691,10 +693,10 @@ async fn admin_calculate_vm_refund(
         Utc::now()
     };
 
-    // Create pricing engine instance with real exchange rates
-    let tax_rates = std::collections::HashMap::new();
-
-    let pricing_engine = PricingEngine::new(this.db.clone(), this.exchange.clone(), tax_rates);
+    // Create pricing engine instance with real exchange rates. Refunds are
+    // computed from stored payment amounts, so an empty VAT client is fine here.
+    let pricing_engine =
+        PricingEngine::new(this.db.clone(), this.exchange.clone(), VatClient::new());
 
     // Calculate the refund amount from the specified date
     let refund_result = pricing_engine

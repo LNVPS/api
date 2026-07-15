@@ -187,11 +187,6 @@ pub async fn hard_delete_vm(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<()> 
     .fetch_optional(pool)
     .await?;
 
-    // Delete legacy vm_payment rows (pre-subscription-migration VMs only).
-    sqlx::query("DELETE FROM vm_payment WHERE vm_id = ?")
-        .bind(vm_id)
-        .execute(pool)
-        .await?;
     sqlx::query("DELETE FROM vm_ip_assignment WHERE vm_id = ?")
         .bind(vm_id)
         .execute(pool)
