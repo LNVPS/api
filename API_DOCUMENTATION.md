@@ -82,6 +82,7 @@ interface VmStatus {
   ip_assignments: VmIpAssignment[];
   status: VmRunningState; // Full running state with metrics; check status.state for the current lifecycle state
   auto_renewal_enabled: boolean; // Whether automatic renewal via NWC is enabled for this VM
+  deleting_on?: string; // ISO 8601 datetime — date the VM will be deleted if not renewed (expiry + dynamic grace period); null/omitted for VMs not yet paid
 }
 
 interface VmRunningState {

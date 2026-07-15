@@ -1,11 +1,11 @@
 use crate::VmRunningState;
 use crate::pricing::PricingEngine;
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Days, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, SubscriptionLineItem,
+    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, Subscription, SubscriptionLineItem,
     SubscriptionType, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmHostRegion, VmTemplate,
 };
@@ -233,6 +233,35 @@ pub struct ApiVmStatus {
     pub status: VmRunningState,
     /// Enable automatic renewal (from subscription)
     pub auto_renewal_enabled: bool,
+    /// Date the VM will be deleted if not renewed (expiry + dynamic grace period).
+    /// `None` when the VM has no expiry (never paid).
+    pub deleting_on: Option<DateTime<Utc>>,
+}
+
+/// Grace period (days) for a subscription, tiered by how long the subscription
+/// has existed (age-based). Newer subscriptions get shorter grace windows so
+/// resources aren't held open for days after a brand-new VM expires.
+///
+/// | Age (days) | Grace (days) |
+/// |------------|---------------|
+/// | ≤ 1        | 1             |
+/// | ≤ 7        | 2             |
+/// | ≤ 28       | 7             |
+/// | ≤ 180      | 14            |
+/// | > 180      | delete_after  |
+pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_after: u16) -> u16 {
+    let age_days = (now - sub.created).num_days().max(0);
+    if age_days <= 1 {
+        1
+    } else if age_days <= 7 {
+        2
+    } else if age_days <= 28 {
+        7
+    } else if age_days <= 180 {
+        14
+    } else {
+        delete_after
+    }
 }
 
 // Function to build ApiVmStatus from VM data (moved from common)
@@ -240,6 +269,7 @@ pub async fn vm_to_status(
     db: &Arc<dyn LNVpsDb>,
     vm: Vm,
     state: Option<VmRunningState>,
+    delete_after: u16,
 ) -> Result<ApiVmStatus> {
     let image = db.get_os_image(vm.image_id).await?;
     let ssh_key: ApiUserSshKey = match vm.ssh_key_id {
@@ -262,13 +292,22 @@ pub async fn vm_to_status(
         .collect();
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
-    // Load subscription for created + expiry + auto_renewal
-    let (sub_created, sub_expires, sub_auto_renewal) = match db
+    // Load subscription for created + expiry + auto_renewal + dynamic deletion date
+    let (sub_created, sub_expires, sub_auto_renewal, deleting_on) = match db
         .get_subscription_by_line_item_id(vm.subscription_line_item_id)
         .await
     {
-        Ok(sub) => (sub.created, sub.expires, sub.auto_renewal_enabled),
-        Err(_) => (Utc::now(), None, false),
+        Ok(sub) => {
+            // Deletion happens once `expires + grace_period` has passed; the grace
+            // period is dynamic (subscription-age based), so surface the resulting
+            // date rather than a fixed offset.
+            let deleting_on = sub.expires.and_then(|expires| {
+                let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
+                expires.checked_add_days(Days::new(grace as u64))
+            });
+            (sub.created, sub.expires, sub.auto_renewal_enabled, deleting_on)
+        }
+        Err(_) => (Utc::now(), None, false, None),
     };
 
     Ok(ApiVmStatus {
@@ -290,6 +329,7 @@ pub async fn vm_to_status(
             })
             .collect::<Result<Vec<_>>>()?,
         auto_renewal_enabled: sub_auto_renewal,
+        deleting_on,
     })
 }
 

@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-15** - VM status now includes the actual deletion date
+  - `GET /api/v1/vms` and `GET /api/v1/vms/{id}` responses include a read-only `deleting_on` (ISO 8601) — the date the VM will be deleted if not renewed. This is `expires` plus the subscription's grace period, which is dynamic (tiered by subscription age), so the field reflects the real deletion date rather than a fixed offset. It is `null`/omitted for VMs with no expiry (never paid).
+
 - **2026-07-17** - Account info now includes the applicable tax rate
   - `GET /api/v1/account` returns a read-only `tax` array with one entry per seller company: `{company_id, company_name, rate, country_code, treatment}`. The rate is determined from the user's current billing information (VAT number, declared country, IP-derived country) using the same EU place-of-supply rules as invoicing, so frontends can show the expected VAT up-front. The field is ignored on PATCH.
 

@@ -3869,7 +3869,7 @@ mod tests {
 
         let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
         let vm = db.get_vm(1).await.unwrap();
-        let res = vm_to_status(&db, vm, None).await;
+        let res = vm_to_status(&db, vm, None, 0).await;
         assert!(res.is_err(), "expected error, not a panic");
     }
 

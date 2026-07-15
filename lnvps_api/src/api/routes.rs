@@ -675,7 +675,15 @@ async fn v1_list_vms(
     let mut ret = vec![];
     for vm in vms {
         let vm_id = vm.id;
-        ret.push(vm_to_status(&this.db, vm, this.state.get_state(vm_id).await).await?);
+        ret.push(
+            vm_to_status(
+                &this.db,
+                vm,
+                this.state.get_state(vm_id).await,
+                this.settings.delete_after,
+            )
+            .await?,
+        );
     }
 
     ApiData::ok(ret)
@@ -688,7 +696,15 @@ async fn v1_get_vm(
     Path(id): Path<u64>,
 ) -> ApiResult<ApiVmStatus> {
     let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
-    ApiData::ok(vm_to_status(&this.db, vm, this.state.get_state(id).await).await?)
+    ApiData::ok(
+        vm_to_status(
+            &this.db,
+            vm,
+            this.state.get_state(id).await,
+            this.settings.delete_after,
+        )
+        .await?,
+    )
 }
 
 /// Update a VM config
@@ -908,7 +924,7 @@ async fn v1_create_custom_vm_order(
         .await
         .ok();
 
-    ApiData::ok(vm_to_status(&this.db, rsp, None).await?)
+    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after).await?)
 }
 
 /// List user SSH keys
@@ -1038,7 +1054,7 @@ async fn v1_create_vm_order(
         .await
         .ok();
 
-    ApiData::ok(vm_to_status(&this.db, rsp, None).await?)
+    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after).await?)
 }
 
 /// Renew(Extend) a VM
@@ -1709,7 +1725,7 @@ async fn v1_get_payment_invoice(
             &PaymentInfo {
                 year: now.year(),
                 current_date: now,
-                vm: vm_to_status(&this.db, vm, None)
+                vm: vm_to_status(&this.db, vm, None, this.settings.delete_after)
                     .await
                     .map_err(|_| "Failed to get VM state")?,
                 total: payment.amount + payment.tax + payment.processing_fee,
