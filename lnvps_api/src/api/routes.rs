@@ -927,6 +927,14 @@ async fn v1_delete_ssh_key(
         return ApiData::err("SSH key not found");
     }
 
+    // Prevent deleting a key that is still in use by an active VM, otherwise the
+    // database foreign key constraint (fk_vm_ssh_key_id) would fail with an
+    // opaque internal error.
+    let vms = this.db.list_user_vms(uid).await?;
+    if vms.iter().any(|vm| vm.ssh_key_id == Some(id)) {
+        return ApiData::err("SSH key is in use by one or more VMs and cannot be deleted");
+    }
+
     this.db.delete_user_ssh_key(id).await?;
     ApiData::ok(())
 }
