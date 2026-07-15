@@ -5344,4 +5344,142 @@ impl AdminDb for LNVpsDbMysql {
 
         Ok(())
     }
+
+    async fn admin_list_resource_costs(
+        &self,
+        limit: u64,
+        offset: u64,
+        resource_type: Option<crate::CostResourceType>,
+        resource_id: Option<u64>,
+    ) -> DbResult<(Vec<crate::ResourceCost>, u64)> {
+        let rows = sqlx::query_as::<_, crate::ResourceCost>(
+            "SELECT * FROM resource_cost \
+             WHERE (? IS NULL OR resource_type = ?) \
+               AND (? IS NULL OR resource_id = ?) \
+             ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(resource_type)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(resource_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM resource_cost \
+             WHERE (? IS NULL OR resource_type = ?) \
+               AND (? IS NULL OR resource_id = ?)",
+        )
+        .bind(resource_type)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(resource_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok((rows, total.0 as u64))
+    }
+
+    async fn admin_list_resource_costs_for(
+        &self,
+        resource_type: crate::CostResourceType,
+        resource_id: u64,
+    ) -> DbResult<Vec<crate::ResourceCost>> {
+        Ok(sqlx::query_as::<_, crate::ResourceCost>(
+            "SELECT * FROM resource_cost WHERE resource_type = ? AND resource_id = ? ORDER BY id DESC",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn admin_get_resource_cost(&self, id: u64) -> DbResult<crate::ResourceCost> {
+        Ok(sqlx::query_as("SELECT * FROM resource_cost WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn admin_create_resource_cost(&self, cost: &crate::ResourceCost) -> DbResult<u64> {
+        let result = sqlx::query(
+            "INSERT INTO resource_cost \
+             (resource_type, resource_id, label, cost_type, amount, currency, \
+              interval_amount, interval_type, billing_start, billing_end) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(cost.resource_type)
+        .bind(cost.resource_id)
+        .bind(&cost.label)
+        .bind(cost.cost_type)
+        .bind(cost.amount)
+        .bind(&cost.currency)
+        .bind(cost.interval_amount)
+        .bind(cost.interval_type)
+        .bind(cost.billing_start)
+        .bind(cost.billing_end)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn admin_update_resource_cost(&self, cost: &crate::ResourceCost) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE resource_cost SET \
+             resource_type = ?, resource_id = ?, label = ?, cost_type = ?, amount = ?, currency = ?, \
+             interval_amount = ?, interval_type = ?, billing_start = ?, billing_end = ? \
+             WHERE id = ?",
+        )
+        .bind(cost.resource_type)
+        .bind(cost.resource_id)
+        .bind(&cost.label)
+        .bind(cost.cost_type)
+        .bind(cost.amount)
+        .bind(&cost.currency)
+        .bind(cost.interval_amount)
+        .bind(cost.interval_type)
+        .bind(cost.billing_start)
+        .bind(cost.billing_end)
+        .bind(cost.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn admin_delete_resource_cost(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM resource_cost WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn admin_list_resource_costs_active_between(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<crate::ResourceCost>> {
+        // cost_type: 0 = recurring, 1 = one_time
+        Ok(sqlx::query_as::<_, crate::ResourceCost>(
+            "SELECT * FROM resource_cost WHERE \
+             (cost_type = 0 \
+                AND (billing_start IS NULL OR billing_start <= ?) \
+                AND (billing_end IS NULL OR billing_end >= ?)) \
+             OR (cost_type = 1 \
+                AND billing_start IS NOT NULL \
+                AND billing_start >= ? AND billing_start <= ?) \
+             ORDER BY id",
+        )
+        .bind(end)
+        .bind(start)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.db)
+        .await?)
+    }
 }

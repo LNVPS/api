@@ -919,6 +919,112 @@ pub enum IntervalType {
     Year = 2,
 }
 
+/// The kind of resource a cost record is attached to (weak/polymorphic link).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum CostResourceType {
+    /// Links to `vm_host.id`
+    #[default]
+    VmHost = 0,
+    /// Links to `ip_range.id`
+    IpRange = 1,
+    /// Not tied to any internal entity — a free-form cost/subscription
+    /// identified only by its user-supplied `label` (e.g. "Colo cross-connect",
+    /// "Upstream transit"). `resource_id` is unused (0).
+    Generic = 2,
+}
+
+impl Display for CostResourceType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CostResourceType::VmHost => write!(f, "vm_host"),
+            CostResourceType::IpRange => write!(f, "ip_range"),
+            CostResourceType::Generic => write!(f, "generic"),
+        }
+    }
+}
+
+impl FromStr for CostResourceType {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "vm_host" | "host" => Ok(CostResourceType::VmHost),
+            "ip_range" => Ok(CostResourceType::IpRange),
+            "generic" | "subscription" => Ok(CostResourceType::Generic),
+            _ => Err(anyhow!("unknown cost resource type: {}", s)),
+        }
+    }
+}
+
+/// Whether a cost is a recurring charge or a one-time capital outlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum CostType {
+    /// Recurring cost billed every `interval_amount` `interval_type` (rent/colo,
+    /// or per-IP monthly for an ip_range).
+    #[default]
+    Recurring = 0,
+    /// One-time capital investment (e.g. hardware purchase) used for break-even.
+    OneTime = 1,
+}
+
+impl Display for CostType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CostType::Recurring => write!(f, "recurring"),
+            CostType::OneTime => write!(f, "one_time"),
+        }
+    }
+}
+
+impl FromStr for CostType {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "recurring" => Ok(CostType::Recurring),
+            "one_time" | "onetime" | "investment" => Ok(CostType::OneTime),
+            _ => Err(anyhow!("unknown cost type: {}", s)),
+        }
+    }
+}
+
+/// An optional cost record weakly linked to another resource by
+/// `(resource_type, resource_id)`. Used to compute P/L; admin-only, never
+/// exposed to end users. Costs are all in `amount` smallest currency units.
+#[derive(FromRow, Clone, Debug)]
+pub struct ResourceCost {
+    pub id: u64,
+    /// What kind of resource this cost is attached to
+    pub resource_type: CostResourceType,
+    /// Id of the resource within its table (weak link, no FK). Unused (0) for
+    /// `Generic` costs, which are identified by `label` instead.
+    pub resource_id: u64,
+    /// Free-form label for costs not tied to an internal entity (required for
+    /// `Generic`; optional/ignored for entity-linked costs).
+    pub label: Option<String>,
+    /// Recurring vs one-time capital cost
+    pub cost_type: CostType,
+    /// Cost amount in smallest currency units (cents for fiat, millisats for BTC).
+    /// For an `ip_range` recurring cost this is the cost per single IP.
+    pub amount: u64,
+    /// Currency code (e.g. USD, EUR)
+    pub currency: String,
+    /// Number of intervals per billing cycle (e.g. 1 for "every 1 month").
+    /// NULL for one-time costs.
+    pub interval_amount: Option<u64>,
+    /// Interval unit (Day, Month, Year). NULL for one-time costs.
+    pub interval_type: Option<IntervalType>,
+    /// Date the cost starts / the one-time purchase was made.
+    pub billing_start: Option<DateTime<Utc>>,
+    /// Date the recurring cost stops being paid. `None` = still active/ongoing.
+    /// Only counts towards P/L while now() is within `[billing_start, billing_end)`.
+    pub billing_end: Option<DateTime<Utc>>,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+}
+
 #[derive(FromRow, Clone, Debug)]
 pub struct VmCostPlan {
     pub id: u64,
@@ -1596,6 +1702,7 @@ pub enum AdminResource {
     PaymentMethodConfig = 21,
     DnsServer = 22,
     UserPaymentMethod = 23,
+    ResourceCost = 24,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1635,6 +1742,7 @@ impl Display for AdminResource {
             AdminResource::PaymentMethodConfig => write!(f, "payment_method_config"),
             AdminResource::DnsServer => write!(f, "dns_server"),
             AdminResource::UserPaymentMethod => write!(f, "user_payment_method"),
+            AdminResource::ResourceCost => write!(f, "resource_cost"),
         }
     }
 }
@@ -1668,6 +1776,7 @@ impl FromStr for AdminResource {
             "payment_method_config" => Ok(AdminResource::PaymentMethodConfig),
             "dns_server" => Ok(AdminResource::DnsServer),
             "user_payment_method" => Ok(AdminResource::UserPaymentMethod),
+            "resource_cost" => Ok(AdminResource::ResourceCost),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1702,6 +1811,7 @@ impl TryFrom<u16> for AdminResource {
             21 => Ok(AdminResource::PaymentMethodConfig),
             22 => Ok(AdminResource::DnsServer),
             23 => Ok(AdminResource::UserPaymentMethod),
+            24 => Ok(AdminResource::ResourceCost),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1735,6 +1845,7 @@ impl AdminResource {
             AdminResource::PaymentMethodConfig,
             AdminResource::DnsServer,
             AdminResource::UserPaymentMethod,
+            AdminResource::ResourceCost,
         ]
     }
 }
@@ -2072,6 +2183,44 @@ mod tests {
             AdminResource::UserPaymentMethod
         );
         assert!(AdminResource::all().contains(&AdminResource::UserPaymentMethod));
+    }
+
+    #[test]
+    fn test_admin_resource_cost_roundtrip() {
+        assert_eq!(
+            "resource_cost".parse::<AdminResource>().unwrap(),
+            AdminResource::ResourceCost
+        );
+        assert_eq!(AdminResource::ResourceCost.to_string(), "resource_cost");
+        assert_eq!(
+            AdminResource::try_from(24u16).unwrap(),
+            AdminResource::ResourceCost
+        );
+        assert!(AdminResource::all().contains(&AdminResource::ResourceCost));
+    }
+
+    #[test]
+    fn test_cost_type_and_resource_type_roundtrip() {
+        assert_eq!(
+            "vm_host".parse::<CostResourceType>().unwrap(),
+            CostResourceType::VmHost
+        );
+        assert_eq!(
+            "ip_range".parse::<CostResourceType>().unwrap(),
+            CostResourceType::IpRange
+        );
+        assert_eq!(CostResourceType::IpRange.to_string(), "ip_range");
+        assert_eq!(
+            "generic".parse::<CostResourceType>().unwrap(),
+            CostResourceType::Generic
+        );
+        assert_eq!(CostResourceType::Generic.to_string(), "generic");
+        assert_eq!(
+            "recurring".parse::<CostType>().unwrap(),
+            CostType::Recurring
+        );
+        assert_eq!("one_time".parse::<CostType>().unwrap(), CostType::OneTime);
+        assert_eq!(CostType::OneTime.to_string(), "one_time");
     }
 
     #[test]

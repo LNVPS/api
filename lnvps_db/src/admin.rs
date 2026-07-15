@@ -366,4 +366,43 @@ pub trait AdminDb: Send + Sync {
 
     /// Delete VM IP assignment (soft delete)
     async fn admin_delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()>;
+
+    // Resource cost tracking (issue #82) - admin-only, optional cost data
+    /// List cost records, optionally filtered by resource, with pagination.
+    /// Returns (rows, total_count).
+    async fn admin_list_resource_costs(
+        &self,
+        limit: u64,
+        offset: u64,
+        resource_type: Option<crate::CostResourceType>,
+        resource_id: Option<u64>,
+    ) -> DbResult<(Vec<crate::ResourceCost>, u64)>;
+
+    /// List all cost records attached to a specific resource
+    async fn admin_list_resource_costs_for(
+        &self,
+        resource_type: crate::CostResourceType,
+        resource_id: u64,
+    ) -> DbResult<Vec<crate::ResourceCost>>;
+
+    /// Get a single cost record by id
+    async fn admin_get_resource_cost(&self, id: u64) -> DbResult<crate::ResourceCost>;
+
+    /// Create a new cost record, returns its id
+    async fn admin_create_resource_cost(&self, cost: &crate::ResourceCost) -> DbResult<u64>;
+
+    /// Update an existing cost record
+    async fn admin_update_resource_cost(&self, cost: &crate::ResourceCost) -> DbResult<()>;
+
+    /// Delete a cost record
+    async fn admin_delete_resource_cost(&self, id: u64) -> DbResult<()>;
+
+    /// List cost records that are active at any point within `[start, end]`,
+    /// for P/L reporting. Includes recurring costs whose active window overlaps
+    /// the range and one-time costs whose `billing_start` falls within it.
+    async fn admin_list_resource_costs_active_between(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<crate::ResourceCost>>;
 }

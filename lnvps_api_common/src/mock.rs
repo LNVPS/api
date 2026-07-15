@@ -3396,6 +3396,48 @@ impl lnvps_db::AdminDb for MockDb {
         // Mock implementation
         Ok(())
     }
+
+    async fn admin_list_resource_costs(
+        &self,
+        _limit: u64,
+        _offset: u64,
+        _resource_type: Option<lnvps_db::CostResourceType>,
+        _resource_id: Option<u64>,
+    ) -> DbResult<(Vec<lnvps_db::ResourceCost>, u64)> {
+        Ok((vec![], 0))
+    }
+
+    async fn admin_list_resource_costs_for(
+        &self,
+        _resource_type: lnvps_db::CostResourceType,
+        _resource_id: u64,
+    ) -> DbResult<Vec<lnvps_db::ResourceCost>> {
+        Ok(vec![])
+    }
+
+    async fn admin_get_resource_cost(&self, _id: u64) -> DbResult<lnvps_db::ResourceCost> {
+        todo!()
+    }
+
+    async fn admin_create_resource_cost(&self, _cost: &lnvps_db::ResourceCost) -> DbResult<u64> {
+        Ok(1)
+    }
+
+    async fn admin_update_resource_cost(&self, _cost: &lnvps_db::ResourceCost) -> DbResult<()> {
+        Ok(())
+    }
+
+    async fn admin_delete_resource_cost(&self, _id: u64) -> DbResult<()> {
+        Ok(())
+    }
+
+    async fn admin_list_resource_costs_active_between(
+        &self,
+        _start: chrono::DateTime<chrono::Utc>,
+        _end: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<lnvps_db::ResourceCost>> {
+        Ok(vec![])
+    }
 }
 
 // Nostr trait implementation with stub methods
