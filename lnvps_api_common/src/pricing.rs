@@ -302,9 +302,10 @@ impl PricingEngine {
             .expires
     }
 
-    /// Calculate processing fee for a payment based on payment method and amount
-    /// Returns the processing fee in the same currency as the amount
-    /// Queries the database for fee configuration
+    /// Calculate processing fee for a payment based on payment method and amount.
+    /// `amount` must be the gross charge the provider actually processes, i.e.
+    /// net + tax (the fee is added on top of that). Returns the processing fee in
+    /// the same currency as the amount. Queries the database for fee configuration.
     pub async fn calculate_processing_fee(
         &self,
         company_id: u64,
@@ -421,6 +422,16 @@ impl PricingEngine {
         let tax_details = self
             .determine_tax(vm.user_id, input.value(), company_id)
             .await?;
+        // Processing fee applies to the gross amount (net + tax): the payment
+        // provider takes their cut on the entire charged total.
+        let processing_fee = self
+            .calculate_processing_fee(
+                company_id,
+                method,
+                cost.currency,
+                input.value() + tax_details.amount,
+            )
+            .await;
         Ok(CostResult::New(NewPaymentInfo {
             amount: input.value(),
             currency: cost.currency,
@@ -429,9 +440,7 @@ impl PricingEngine {
             rate: cost.rate,
             tax: tax_details.amount,
             tax_details,
-            processing_fee: self
-                .calculate_processing_fee(company_id, method, cost.currency, input.value())
-                .await,
+            processing_fee,
         }))
     }
 
@@ -488,8 +497,14 @@ impl PricingEngine {
             let tax_details = self
                 .determine_tax(vm.user_id, scaled_amount, company_id)
                 .await?;
+            // Processing fee applies to the gross amount (net + tax).
             let processing_fee = self
-                .calculate_processing_fee(company_id, method, base_cost.currency, scaled_amount)
+                .calculate_processing_fee(
+                    company_id,
+                    method,
+                    base_cost.currency,
+                    scaled_amount + tax_details.amount,
+                )
                 .await;
             Ok(CostResult::New(NewPaymentInfo {
                 amount: scaled_amount,
@@ -655,18 +670,20 @@ impl PricingEngine {
         let tax_details = self
             .determine_tax(vm.user_id, converted_amount.amount.value(), company_id)
             .await?;
+        // Processing fee applies to the gross amount (net + tax).
+        let processing_fee = self
+            .calculate_processing_fee(
+                company_id,
+                method,
+                converted_amount.amount.currency(),
+                converted_amount.amount.value() + tax_details.amount,
+            )
+            .await;
         Ok(NewPaymentInfo {
             amount: converted_amount.amount.value(),
             tax: tax_details.amount,
             tax_details,
-            processing_fee: self
-                .calculate_processing_fee(
-                    company_id,
-                    method,
-                    converted_amount.amount.currency(),
-                    converted_amount.amount.value(),
-                )
-                .await,
+            processing_fee,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -858,18 +875,20 @@ impl PricingEngine {
         let tax_details = self
             .determine_tax(vm.user_id, converted_amount.amount.value(), company_id)
             .await?;
+        // Processing fee applies to the gross amount (net + tax).
+        let processing_fee = self
+            .calculate_processing_fee(
+                company_id,
+                method,
+                converted_amount.amount.currency(),
+                converted_amount.amount.value() + tax_details.amount,
+            )
+            .await;
         Ok(NewPaymentInfo {
             amount: converted_amount.amount.value(),
             tax: tax_details.amount,
             tax_details,
-            processing_fee: self
-                .calculate_processing_fee(
-                    company_id,
-                    method,
-                    converted_amount.amount.currency(),
-                    converted_amount.amount.value(),
-                )
-                .await,
+            processing_fee,
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
@@ -2354,6 +2373,78 @@ mod tests {
             }
             _ => bail!("Expected new payment"),
         }
+
+        Ok(())
+    }
+
+    /// Regression: the processing fee must be charged on the GROSS amount
+    /// (net + tax), not on the net alone. The payment provider takes their cut
+    /// on the entire charged total, so the gross-up base has to include VAT.
+    #[tokio::test]
+    async fn test_processing_fee_charged_on_net_plus_tax() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        // VM owned by an IRL customer; seller company established in IE so 23%
+        // EU VAT applies. Price is billed in EUR (Revolut) so amounts stay in cents.
+        {
+            let mut v = db.vms.lock().await;
+            v.insert(1, MockDb::mock_vm());
+
+            let mut u = db.users.lock().await;
+            u.insert(
+                1,
+                User {
+                    id: 1,
+                    pubkey: vec![],
+                    country_code: Some("IRL".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            db.companies.lock().await.get_mut(&1).unwrap().country_code = Some("IRL".to_string());
+        }
+        add_revolut_processing_fee_config(&db).await;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let taxes = VatClient::with_rates(HashMap::from([(CountryCode::IRL, 23.0)]));
+        let pe = PricingEngine::new(db.clone(), rates, taxes);
+
+        let payment_info = match pe.get_vm_cost(1, PaymentMethod::Revolut).await? {
+            CostResult::New(p) => p,
+            _ => bail!("Expected new payment"),
+        };
+
+        // Sanity: VAT was actually charged on the net amount.
+        assert!(payment_info.tax > 0, "expected non-zero VAT");
+        assert_eq!(
+            (payment_info.amount as f64 * 0.23).floor() as u64,
+            payment_info.tax,
+            "VAT should be 23% of the net amount"
+        );
+
+        // The fee the engine stored must equal the fee computed on net + tax…
+        let gross = payment_info.amount + payment_info.tax;
+        let fee_on_gross = pe
+            .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, gross)
+            .await;
+        assert_eq!(
+            fee_on_gross, payment_info.processing_fee,
+            "processing fee must be charged on net + tax (gross), got fee on net instead"
+        );
+
+        // …and it must be strictly larger than the (buggy) fee on net alone,
+        // proving the tax portion is now included in the gross-up base.
+        let fee_on_net = pe
+            .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, payment_info.amount)
+            .await;
+        assert!(
+            payment_info.processing_fee > fee_on_net,
+            "fee on gross ({}) should exceed fee on net ({})",
+            payment_info.processing_fee,
+            fee_on_net
+        );
 
         Ok(())
     }

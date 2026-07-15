@@ -463,13 +463,14 @@ impl SubscriptionHandler {
                 .pe
                 .determine_tax(user.id, converted.amount.value(), subscription.company_id)
                 .await?;
+            // Processing fee applies to the gross amount (net + tax).
             let processing_fee = self
                 .pe
                 .calculate_processing_fee(
                     subscription.company_id,
                     method,
                     converted.amount.currency(),
-                    converted.amount.value(),
+                    converted.amount.value() + det.amount,
                 )
                 .await;
             let line = det.to_line(converted.amount.value());
