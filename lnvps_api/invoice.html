@@ -10,17 +10,59 @@
             rel="stylesheet"
     />
     <style>
+        :root {
+            --cyber-darker: #050505;
+            --cyber-dark: #0a0a0a;
+            --cyber-panel: #0d1117;
+            --cyber-panel-light: #161b22;
+            --cyber-border: rgba(57, 255, 20, 0.2);
+            --cyber-border-bright: rgba(57, 255, 20, 0.53);
+            --cyber-primary: #39ff14;
+            --cyber-accent: #00fff2;
+            --cyber-muted: #4a5568;
+            --cyber-text: #b8c4d0;
+            --cyber-text-bright: #e2e8f0;
+        }
+
         html, body {
             margin: 0;
             font-size: 12px;
             font-family: "Source Code Pro", monospace;
+            background-color: var(--cyber-darker);
+            color: var(--cyber-text);
+        }
+
+        .page {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
         }
 
         @media screen {
             .page {
-                margin-left: 4rem;
-                margin-right: 4rem;
+                margin-top: 2rem;
+                margin-bottom: 2rem;
+                border: 1px solid var(--cyber-border);
+                background-color: var(--cyber-panel);
+                box-shadow: 0 0 5px rgba(57, 255, 20, 0.15), 0 0 40px rgba(57, 255, 20, 0.05);
             }
+        }
+
+        h1, h2, h3 {
+            color: var(--cyber-primary);
+            font-weight: 500;
+            margin-block: 0.5rem;
+        }
+
+        a {
+            color: var(--cyber-accent);
+            text-decoration: none;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid var(--cyber-border);
+            margin: 1.2rem 0;
         }
 
         .header {
@@ -29,12 +71,20 @@
             align-items: center;
             justify-content: space-between;
             font-size: 3rem;
-            margin: 2rem 0;
+            font-weight: 600;
+            color: var(--cyber-primary);
+            text-shadow: 0 0 8px rgba(57, 255, 20, 0.4);
+            margin: 1rem 0 2rem;
+        }
+
+        .header img {
+            border-radius: 6px;
         }
 
         .billing {
             display: grid;
             grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
         }
 
         .flex-col {
@@ -43,21 +93,153 @@
             gap: 0.2rem;
         }
 
+        .meta b, .billing b {
+            color: var(--cyber-text-bright);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.1em 0.6em;
+            border: 1px solid var(--cyber-border-bright);
+            border-radius: 4px;
+            color: var(--cyber-primary);
+            font-weight: 600;
+        }
+
+        .badge.unpaid {
+            color: var(--cyber-accent);
+            border-color: rgba(0, 255, 242, 0.53);
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
+            margin-top: 0.5rem;
+        }
+
+        thead th {
+            background-color: var(--cyber-panel-light);
+            color: var(--cyber-primary);
+            text-align: left;
+            font-weight: 600;
         }
 
         td, th {
-            border: 1px solid #ccc;
-            padding: 0.4em 0.1em;
+            border: 1px solid var(--cyber-border);
+            padding: 0.5em 0.6em;
         }
 
-        .total {
+        td.num, th.num {
             text-align: end;
-            font-size: 16px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        tfoot td {
+            border: none;
+            padding: 0.35em 0.6em;
+        }
+
+        .summary-label {
+            text-align: end;
+            color: var(--cyber-muted);
+        }
+
+        .summary-value {
+            text-align: end;
+            font-variant-numeric: tabular-nums;
+            color: var(--cyber-text-bright);
+        }
+
+        .total-label, .total-value {
+            font-size: 15px;
             font-weight: bold;
-            padding: 0.5em 0.2em;
+            color: var(--cyber-primary);
+            border-top: 1px solid var(--cyber-border-bright) !important;
+            padding-top: 0.6em !important;
+        }
+
+        .total-value {
+            text-align: end;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .note td {
+            color: var(--cyber-muted);
+        }
+
+        footer {
+            color: var(--cyber-muted);
+        }
+
+        @media print {
+            @page {
+                margin: 1.5cm;
+            }
+
+            html, body {
+                background-color: #ffffff;
+                color: #1a1a1a;
+                font-size: 11px;
+            }
+
+            .page {
+                max-width: none;
+                margin: 0;
+                padding: 0;
+                border: none;
+                background-color: #ffffff;
+                box-shadow: none;
+            }
+
+            /* Legible brand-green headings without neon glow */
+            h1, h2, h3, .header {
+                color: #0a7d2c;
+                text-shadow: none;
+            }
+
+            a {
+                color: #0a6d63;
+            }
+
+            hr {
+                border-top: 1px solid #cccccc;
+            }
+
+            .badge {
+                color: #0a7d2c;
+                border-color: #0a7d2c;
+            }
+
+            .badge.unpaid {
+                color: #b26a00;
+                border-color: #b26a00;
+            }
+
+            .meta b, .billing b {
+                color: #000000;
+            }
+
+            thead th {
+                background-color: #eef1f4;
+                color: #0a7d2c;
+            }
+
+            td, th {
+                border: 1px solid #bbbbbb;
+            }
+
+            .summary-label, .note td, footer {
+                color: #555555;
+            }
+
+            .summary-value {
+                color: #000000;
+            }
+
+            .total-label, .total-value {
+                color: #0a7d2c;
+                border-top: 1px solid #0a7d2c !important;
+            }
         }
     </style>
 </head>
@@ -69,7 +251,7 @@
     </div>
     <hr/>
     <h2>Invoice</h2>
-    <div class="flex-col">
+    <div class="flex-col meta">
         <div>
             <b>ID:</b>
             {{payment.id}}
@@ -80,8 +262,8 @@
         </div>
         <div>
             <b>Status:</b>
-            {{#payment.is_paid}}Paid{{/payment.is_paid}}
-            {{^payment.is_paid}}Unpaid{{/payment.is_paid}}
+            {{#payment.is_paid}}<span class="badge">Paid</span>{{/payment.is_paid}}
+            {{^payment.is_paid}}<span class="badge unpaid">Unpaid</span>{{/payment.is_paid}}
         </div>
         <div>
             <b>Type:</b>
@@ -128,8 +310,8 @@
         <tr>
             <th>Description</th>
             <th>Currency</th>
-            <th>Net</th>
-            <th>VAT{{#vat.rate_label}} {{vat.rate_label}}{{/vat.rate_label}}</th>
+            <th class="num">Net</th>
+            <th class="num">VAT{{#vat.rate_label}} {{vat.rate_label}}{{/vat.rate_label}}</th>
         </tr>
         </thead>
         <tbody>
@@ -153,28 +335,47 @@
                 {{/payment.is_upgrade}}
             </td>
             <td>{{invoice_item.currency}}</td>
-            <td>{{invoice_item.formatted_amount}}</td>
-            <td>{{invoice_item.formatted_tax}}</td>
+            <td class="num">{{invoice_item.formatted_amount}}</td>
+            <td class="num">{{invoice_item.formatted_tax}}</td>
         </tr>
-        </tbody>
-        <tbody>
         {{#vat.note}}
-        <tr>
+        <tr class="note">
             <td colspan="4"><small><em>{{vat.note}}</em></small></td>
         </tr>
         {{/vat.note}}
-        <tr>
-            <td colspan="4" class="total">
-                Total: {{total_formatted}}
-            </td>
-        </tr>
         </tbody>
+        <tfoot>
+        <tr>
+            <td colspan="2"></td>
+            <td class="summary-label">Net</td>
+            <td class="summary-value">{{invoice_item.formatted_amount}}</td>
+        </tr>
+        {{#invoice_item.has_processing_fee}}
+        <tr>
+            <td colspan="2"></td>
+            <td class="summary-label">Processing Fee</td>
+            <td class="summary-value">{{invoice_item.formatted_processing_fee}}</td>
+        </tr>
+        {{/invoice_item.has_processing_fee}}
+        <tr>
+            <td colspan="2"></td>
+            <td class="summary-label">VAT{{#vat.rate_label}} {{vat.rate_label}}{{/vat.rate_label}}</td>
+            <td class="summary-value">{{invoice_item.formatted_tax}}</td>
+        </tr>
+        <tr>
+            <td colspan="2"></td>
+            <td class="total-label">Total</td>
+            <td class="total-value">{{total_formatted}}</td>
+        </tr>
+        </tfoot>
     </table>
     <br/>
     <hr/>
-    <small>
-        (c) {{year}} LNVPS.net - Generated at {{current_date}}
-    </small>
+    <footer>
+        <small>
+            (c) {{year}} LNVPS.net - Generated at {{current_date}}
+        </small>
+    </footer>
 </div>
 </body>
 </html>

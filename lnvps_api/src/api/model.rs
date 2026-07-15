@@ -316,6 +316,10 @@ pub struct ApiInvoiceItem {
     pub formatted_amount: String,
     /// Human-readable tax string (e.g. "EUR 1.97" or "BTC 0.00000304")
     pub formatted_tax: String,
+    /// Human-readable processing fee string (e.g. "EUR 0.30" or "BTC 0.00000050")
+    pub formatted_processing_fee: String,
+    /// True when a non-zero processing fee applies (drives conditional display)
+    pub has_processing_fee: bool,
     /// Human-readable duration string (e.g. "1month" or "30days")
     pub formatted_duration: String,
 }
@@ -335,6 +339,8 @@ impl ApiInvoiceItem {
         let formatted_amount =
             payments_rs::currency::CurrencyAmount::from_u64(cur, amount).to_string();
         let formatted_tax = payments_rs::currency::CurrencyAmount::from_u64(cur, tax).to_string();
+        let formatted_processing_fee =
+            payments_rs::currency::CurrencyAmount::from_u64(cur, processing_fee).to_string();
         let duration = Duration::from_secs(time_seconds);
         let formatted_duration = format_duration(duration).to_string();
         Ok(Self {
@@ -345,6 +351,8 @@ impl ApiInvoiceItem {
             time: time_seconds,
             formatted_amount,
             formatted_tax,
+            formatted_processing_fee,
+            has_processing_fee: processing_fee > 0,
             formatted_duration,
         })
     }
@@ -1297,6 +1305,8 @@ mod tests {
         // CurrencyAmount::to_string for fiat: "{CURRENCY} {value/100:.2}"
         assert_eq!(item.formatted_amount, "EUR 8.55");
         assert_eq!(item.formatted_tax, "EUR 1.97");
+        assert_eq!(item.formatted_processing_fee, "EUR 0.10");
+        assert!(item.has_processing_fee);
         // humantime produces something like "30days" or "720h" for 30*24*3600 seconds
         assert!(!item.formatted_duration.is_empty());
     }
@@ -1312,6 +1322,8 @@ mod tests {
         assert_eq!(item.tax, 0);
         assert_eq!(item.formatted_amount, "BTC 0.00001320");
         assert_eq!(item.formatted_tax, "BTC 0.00000000");
+        assert_eq!(item.formatted_processing_fee, "BTC 0.00000000");
+        assert!(!item.has_processing_fee);
         assert!(!item.formatted_duration.is_empty());
     }
 
