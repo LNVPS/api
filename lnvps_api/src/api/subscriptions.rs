@@ -1,9 +1,12 @@
-use crate::api::model::{ApiCreateSubscriptionRequest, ApiSubscription, ApiSubscriptionPayment};
+use crate::api::model::{
+    ApiCreateSubscriptionRequest, ApiSubscription, ApiSubscriptionPayment,
+    ApiUpdateSubscriptionRequest,
+};
 use crate::api::{PaymentMethodQuery, RouterState};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{get, patch};
 use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
@@ -16,7 +19,10 @@ pub fn router() -> Router<RouterState> {
             "/api/v1/subscriptions",
             get(v1_list_subscriptions).post(v1_create_subscription),
         )
-        .route("/api/v1/subscriptions/{id}", get(v1_get_subscription))
+        .route(
+            "/api/v1/subscriptions/{id}",
+            get(v1_get_subscription).patch(v1_update_subscription),
+        )
         .route(
             "/api/v1/subscriptions/{id}/payments",
             get(v1_list_subscription_payments),
@@ -104,6 +110,35 @@ pub async fn v1_list_subscription_payments(
         page.into_iter().map(ApiSubscriptionPayment::from).collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
+}
+
+/// Update a subscription (user-facing)
+///
+/// Currently supports toggling `auto_renewal_enabled`. Ownership is enforced.
+async fn v1_update_subscription(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<ApiUpdateSubscriptionRequest>,
+) -> ApiResult<ApiSubscription> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let mut subscription = this.db.get_subscription(id).await?;
+
+    // Verify ownership
+    if subscription.user_id != uid {
+        return Err(ApiError::forbidden("Access denied: not your subscription"));
+    }
+
+    if let Some(auto_renewal_enabled) = req.auto_renewal_enabled {
+        subscription.auto_renewal_enabled = auto_renewal_enabled;
+    }
+
+    this.db.update_subscription(&subscription).await?;
+
+    let updated = this.db.get_subscription(id).await?;
+    ApiData::ok(ApiSubscription::from_subscription(this.db.as_ref(), updated).await?)
 }
 
 // ============================================================================

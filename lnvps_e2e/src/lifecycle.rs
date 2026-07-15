@@ -407,6 +407,36 @@ mod tests {
         );
         eprintln!("User can read subscription {sub_id} ✓");
 
+        // User can toggle auto-renewal via PATCH
+        let patched = json_ok(
+            user.patch_auth(
+                &format!("/api/v1/subscriptions/{sub_id}"),
+                &serde_json::json!({ "auto_renewal_enabled": false }),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            patched["data"]["auto_renewal_enabled"].as_bool().unwrap(),
+            false,
+            "PATCH should disable auto-renewal"
+        );
+        // Another user cannot patch someone else's subscription
+        let forbidden = admin
+            .patch_auth(
+                &format!("/api/v1/subscriptions/{sub_id}"),
+                &serde_json::json!({ "auto_renewal_enabled": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            forbidden.status(),
+            StatusCode::FORBIDDEN,
+            "Non-owner must not be able to patch subscription"
+        );
+        eprintln!("User toggled auto-renewal on subscription {sub_id} ✓");
+
         // ----------------------------------------------------------------
         // 13. Renew VM → creates an unpaid payment
         //     Use the VM shortcut (`/api/v1/vm/{id}/renew`) — this goes

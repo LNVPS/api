@@ -781,6 +781,14 @@ const result: ApiResponse<Subscription> = await response.json();
 - **Auth**: Required
 - **Response**: `Subscription` (includes all line items)
 
+#### Update Subscription
+- **PATCH** `/api/v1/subscriptions/{id}`
+- **Auth**: Required (must own the subscription)
+- **Body**:
+  - `auto_renewal_enabled`: Optional boolean — enable/disable automatic renewal
+- **Response**: Updated `Subscription`
+- **Description**: Modifies user-editable fields on an existing subscription. Only fields present in the body are changed. Currently limited to toggling `auto_renewal_enabled`.
+
 #### Renew Subscription
 - **GET** `/api/v1/subscriptions/{id}/renew?method={payment_method}`
 - **Auth**: Required

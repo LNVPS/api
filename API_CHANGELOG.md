@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Toggle subscription auto-renewal (user-facing)
+  - `PATCH /api/v1/subscriptions/{id}` accepts optional `auto_renewal_enabled` to enable/disable automatic renewal on an existing subscription. Ownership is enforced (NIP-98). Returns the updated `ApiSubscription`. Previously auto-renewal could only be set at creation time (`POST /api/v1/subscriptions`) or via the admin API.
+
 - **2026-07-18** - Pay VM upgrades with saved payment methods
   - `POST /api/v1/vm/{id}/upgrade` now accepts `method=nwc` and `method=saved` (with optional `payment_method_id`), matching the renewal endpoint. Saved methods are collected on the spot: NWC pays the Lightning invoice via the user's saved wallet, and `saved` charges a saved Revolut card off-session. For these off-session methods the request briefly waits (~10s) for settlement, returning the `VmPayment` as `is_paid: true` if it settled in time, otherwise pending (settles asynchronously). An immediate charge failure returns an error and leaves the payment unpaid.
   - `GET /api/v1/subscriptions/{id}/renew` accepts the same `method=nwc` for parity with VM renewals/upgrades.

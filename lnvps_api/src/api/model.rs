@@ -1273,6 +1273,13 @@ pub struct ApiCreateSubscriptionRequest {
     pub line_items: Vec<ApiCreateSubscriptionLineItemRequest>,
 }
 
+/// User-facing subscription update. Only fields present are modified.
+#[derive(Deserialize)]
+pub struct ApiUpdateSubscriptionRequest {
+    /// Toggle automatic renewal of the subscription.
+    pub auto_renewal_enabled: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 pub enum ApiCreateSubscriptionLineItemRequest {
