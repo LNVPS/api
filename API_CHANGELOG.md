@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - VM host regions expose their seller company
+  - `VmHostRegion` (embedded in template/VM responses, e.g. `GET /api/v1/vms`, `GET /api/v1/vm/templates`) now includes a read-only `company_id`. Match it against `account.tax[].company_id` to display the VAT rate that applies to a specific VM up-front.
+
 - **2026-07-15** - Admin API exposes IP-derived geolocation evidence on users
   - `AdminUserInfo` (returned by `GET /api/admin/v1/users`, `.../users/{id}`, `.../users/by-email`) now includes read-only `geo_country_code` (ISO 3166-1 alpha-3, resolved from the client IP as independent VAT place-of-supply evidence), `geo_ip`, and `geo_updated` (ISO 8601).
   - `PATCH /api/admin/v1/users/{id}` accepts optional `geo_country_code` (validated alpha-3; empty string clears) and `geo_ip` (empty string clears). Editing either bumps `geo_updated` to the edit time. Requires `users::update`.

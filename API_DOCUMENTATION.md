@@ -143,6 +143,7 @@ interface Price {
 interface VmHostRegion {
   id: number;
   name: string;
+  company_id: number; // Seller company id; match against account.tax[].company_id for the applicable VAT rate
 }
 ```
 

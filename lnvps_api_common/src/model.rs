@@ -147,6 +147,7 @@ impl ApiVmTemplate {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name,
+                company_id: region.company_id,
             },
         })
     }
@@ -205,6 +206,7 @@ impl ApiVmTemplate {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name.clone(),
+                company_id: region.company_id,
             },
         })
     }
@@ -520,6 +522,9 @@ pub struct ApiVmCostPlan {
 pub struct ApiVmHostRegion {
     pub id: u64,
     pub name: String,
+    /// Seller company id for this region; use with the account `tax` info to
+    /// determine the VAT rate that applies to payments for VMs in this region.
+    pub company_id: u64,
 }
 
 // Shared models used by ApiVmStatus
@@ -671,6 +676,7 @@ impl ApiCustomTemplateParams {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name.clone(),
+                company_id: region.company_id,
             },
             cpu_features: pricing
                 .cpu_features
