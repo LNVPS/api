@@ -5406,12 +5406,13 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_create_resource_cost(&self, cost: &crate::ResourceCost) -> DbResult<u64> {
         let result = sqlx::query(
             "INSERT INTO resource_cost \
-             (resource_type, resource_id, cost_type, amount, currency, \
+             (resource_type, resource_id, label, cost_type, amount, currency, \
               interval_amount, interval_type, billing_start, billing_end) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(cost.resource_type)
         .bind(cost.resource_id)
+        .bind(&cost.label)
         .bind(cost.cost_type)
         .bind(cost.amount)
         .bind(&cost.currency)
@@ -5428,12 +5429,13 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_update_resource_cost(&self, cost: &crate::ResourceCost) -> DbResult<()> {
         sqlx::query(
             "UPDATE resource_cost SET \
-             resource_type = ?, resource_id = ?, cost_type = ?, amount = ?, currency = ?, \
+             resource_type = ?, resource_id = ?, label = ?, cost_type = ?, amount = ?, currency = ?, \
              interval_amount = ?, interval_type = ?, billing_start = ?, billing_end = ? \
              WHERE id = ?",
         )
         .bind(cost.resource_type)
         .bind(cost.resource_id)
+        .bind(&cost.label)
         .bind(cost.cost_type)
         .bind(cost.amount)
         .bind(&cost.currency)

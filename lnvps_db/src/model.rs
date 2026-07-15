@@ -929,6 +929,10 @@ pub enum CostResourceType {
     VmHost = 0,
     /// Links to `ip_range.id`
     IpRange = 1,
+    /// Not tied to any internal entity — a free-form cost/subscription
+    /// identified only by its user-supplied `label` (e.g. "Colo cross-connect",
+    /// "Upstream transit"). `resource_id` is unused (0).
+    Generic = 2,
 }
 
 impl Display for CostResourceType {
@@ -936,6 +940,7 @@ impl Display for CostResourceType {
         match self {
             CostResourceType::VmHost => write!(f, "vm_host"),
             CostResourceType::IpRange => write!(f, "ip_range"),
+            CostResourceType::Generic => write!(f, "generic"),
         }
     }
 }
@@ -946,6 +951,7 @@ impl FromStr for CostResourceType {
         match s.to_lowercase().as_str() {
             "vm_host" | "host" => Ok(CostResourceType::VmHost),
             "ip_range" => Ok(CostResourceType::IpRange),
+            "generic" | "subscription" => Ok(CostResourceType::Generic),
             _ => Err(anyhow!("unknown cost resource type: {}", s)),
         }
     }
@@ -992,8 +998,12 @@ pub struct ResourceCost {
     pub id: u64,
     /// What kind of resource this cost is attached to
     pub resource_type: CostResourceType,
-    /// Id of the resource within its table (weak link, no FK)
+    /// Id of the resource within its table (weak link, no FK). Unused (0) for
+    /// `Generic` costs, which are identified by `label` instead.
     pub resource_id: u64,
+    /// Free-form label for costs not tied to an internal entity (required for
+    /// `Generic`; optional/ignored for entity-linked costs).
+    pub label: Option<String>,
     /// Recurring vs one-time capital cost
     pub cost_type: CostType,
     /// Cost amount in smallest currency units (cents for fiat, millisats for BTC).
@@ -2194,6 +2204,8 @@ mod tests {
         assert_eq!("vm_host".parse::<CostResourceType>().unwrap(), CostResourceType::VmHost);
         assert_eq!("ip_range".parse::<CostResourceType>().unwrap(), CostResourceType::IpRange);
         assert_eq!(CostResourceType::IpRange.to_string(), "ip_range");
+        assert_eq!("generic".parse::<CostResourceType>().unwrap(), CostResourceType::Generic);
+        assert_eq!(CostResourceType::Generic.to_string(), "generic");
         assert_eq!("recurring".parse::<CostType>().unwrap(), CostType::Recurring);
         assert_eq!("one_time".parse::<CostType>().unwrap(), CostType::OneTime);
         assert_eq!(CostType::OneTime.to_string(), "one_time");

@@ -5231,6 +5231,10 @@ Cost data is **never** exposed to end users. All amounts are in the smallest
 currency units (cents for fiat, millisats for BTC). For an `ip_range` recurring
 cost, `amount` is the cost per single IP.
 
+The `generic` resource type covers costs **not tied to any internal entity**
+(e.g. a colo cross-connect or upstream transit subscription): it carries a
+free-form `label` and ignores `resource_id`.
+
 **Permission resource:** `resource_cost` (Create/View/Update/Delete)
 
 ### List Resource Costs
@@ -5262,6 +5266,20 @@ Query parameters:
   "interval_type": "month",
   "billing_start": "2026-01-01T00:00:00Z",
   "billing_end": null
+}
+```
+
+Generic (unlinked) subscription cost — `resource_id` is ignored, `label` required:
+
+```json
+{
+  "resource_type": "generic",
+  "label": "Upstream transit (Cogent)",
+  "cost_type": "recurring",
+  "amount": 15000,
+  "currency": "USD",
+  "interval_amount": 1,
+  "interval_type": "month"
 }
 ```
 
@@ -5300,8 +5318,9 @@ field to leave it unchanged, or send `null` to clear it.
 | Field           | Type                       | Notes                                             |
 |-----------------|----------------------------|---------------------------------------------------|
 | id              | u64                        |                                                   |
-| resource_type   | `vm_host` \| `ip_range`    | Weak link kind                                    |
-| resource_id     | u64                        | Id within the resource's table (no FK)            |
+| resource_type   | `vm_host`\|`ip_range`\|`generic` | Weak link kind                              |
+| resource_id     | u64                        | Id within the resource's table (no FK); 0 for `generic` |
+| label           | string \| null             | Free-form label; required for `generic`           |
 | cost_type       | `recurring` \| `one_time`  |                                                   |
 | amount          | u64                        | Smallest currency units; per-IP for ip_range      |
 | currency        | string                     | e.g. `USD`, `EUR`                                 |

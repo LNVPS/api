@@ -518,6 +518,8 @@ async fn admin_profit_loss_report(
                     .await
                     .ok()
                     .map(|r| r.region_id),
+                // Generic costs aren't tied to a region; exclude when filtering.
+                CostResourceType::Generic => None,
             };
             if region != Some(params.region_id) {
                 continue;

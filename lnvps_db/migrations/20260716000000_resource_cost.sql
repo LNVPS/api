@@ -12,7 +12,8 @@
 -- currency units (cents for fiat, millisats for BTC). For an `ip_range`
 -- recurring cost, `amount` is the cost per single IP.
 --
--- resource_type: 0 = vm_host, 1 = ip_range
+-- resource_type: 0 = vm_host, 1 = ip_range, 2 = generic (no FK; identified by
+--                `label`, e.g. a colo/transit subscription)
 -- cost_type:     0 = recurring, 1 = one_time (capital investment)
 -- interval_type: 0 = Day, 1 = Month, 2 = Year (NULL for one_time)
 CREATE TABLE resource_cost
@@ -20,8 +21,12 @@ CREATE TABLE resource_cost
     id              INTEGER UNSIGNED  NOT NULL AUTO_INCREMENT PRIMARY KEY,
     -- Weak link: what kind of resource this cost belongs to
     resource_type   TINYINT UNSIGNED  NOT NULL,
-    -- Weak link: id within that resource's table (no FK, may be soft-deleted)
+    -- Weak link: id within that resource's table (no FK, may be soft-deleted).
+    -- Unused (0) for generic costs.
     resource_id     INTEGER UNSIGNED  NOT NULL,
+    -- Free-form label for costs not tied to an internal entity (required for
+    -- generic costs; optional otherwise)
+    label           VARCHAR(200)      NULL,
     -- Recurring charge vs one-time capital cost
     cost_type       TINYINT UNSIGNED  NOT NULL,
     -- Cost amount in smallest currency units (per-IP for ip_range recurring)

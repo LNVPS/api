@@ -215,6 +215,7 @@ impl CreateDnsServerRequest {
 pub enum AdminCostResourceType {
     VmHost,
     IpRange,
+    Generic,
 }
 
 impl From<lnvps_db::CostResourceType> for AdminCostResourceType {
@@ -222,6 +223,7 @@ impl From<lnvps_db::CostResourceType> for AdminCostResourceType {
         match v {
             lnvps_db::CostResourceType::VmHost => Self::VmHost,
             lnvps_db::CostResourceType::IpRange => Self::IpRange,
+            lnvps_db::CostResourceType::Generic => Self::Generic,
         }
     }
 }
@@ -231,6 +233,7 @@ impl From<AdminCostResourceType> for lnvps_db::CostResourceType {
         match v {
             AdminCostResourceType::VmHost => Self::VmHost,
             AdminCostResourceType::IpRange => Self::IpRange,
+            AdminCostResourceType::Generic => Self::Generic,
         }
     }
 }
@@ -266,6 +269,8 @@ pub struct AdminResourceCostDetail {
     pub id: u64,
     pub resource_type: AdminCostResourceType,
     pub resource_id: u64,
+    /// Free-form label for `generic` costs (null for entity-linked costs)
+    pub label: Option<String>,
     pub cost_type: AdminCostType,
     /// Cost amount in smallest currency units (per-IP for ip_range recurring)
     pub amount: u64,
@@ -284,6 +289,7 @@ impl From<lnvps_db::ResourceCost> for AdminResourceCostDetail {
             id: c.id,
             resource_type: c.resource_type.into(),
             resource_id: c.resource_id,
+            label: c.label,
             cost_type: c.cost_type.into(),
             amount: c.amount,
             currency: c.currency,
@@ -300,7 +306,11 @@ impl From<lnvps_db::ResourceCost> for AdminResourceCostDetail {
 #[derive(Deserialize)]
 pub struct CreateResourceCostRequest {
     pub resource_type: AdminCostResourceType,
+    /// Ignored for `generic` costs (defaults to 0)
+    #[serde(default)]
     pub resource_id: u64,
+    /// Required for `generic` costs; optional otherwise
+    pub label: Option<String>,
     pub cost_type: AdminCostType,
     pub amount: u64,
     pub currency: String,
@@ -315,6 +325,8 @@ pub struct UpdateResourceCostRequest {
     pub cost_type: Option<AdminCostType>,
     pub amount: Option<u64>,
     pub currency: Option<String>,
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub label: Option<Option<String>>,
     // Interval / billing fields: present-but-null clears the value, absent leaves unchanged.
     #[serde(default, deserialize_with = "crate::admin::model::double_option")]
     pub interval_amount: Option<Option<u64>>,
