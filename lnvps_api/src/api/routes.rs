@@ -40,7 +40,6 @@ use crate::api::model::{
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, PricingEngine};
-use crate::subscription::RenewMode;
 
 pub fn routes() -> Router<RouterState> {
     Router::new()
@@ -1071,45 +1070,11 @@ async fn v1_renew_vm(
         .get_subscription_line_item(vm.subscription_line_item_id)
         .await?;
 
-    // handle "nwc" payments automatically (uses the user's saved NWC method)
-    let has_nwc = this
-        .db
-        .list_user_payment_methods(uid, Some("nwc"))
-        .await
-        .map(|m| m.iter().any(|pm| pm.enabled))
-        .unwrap_or(false);
-    let payment = if q.method.as_deref() == Some("nwc") && has_nwc {
-        this.sub_handler
-            .auto_renew_via_nwc(vm_line.subscription_id)
-            .await?
-    } else if q.method.as_deref() == Some("saved") {
-        // Pay directly with an already-saved card (merchant-initiated charge).
-        // `payment_method_id` selects a specific saved card; omitted uses the
-        // user's default saved card.
-        this.sub_handler
-            .renew_subscription_with_mode(
-                vm_line.subscription_id,
-                PaymentMethod::Revolut,
-                intervals,
-                RenewMode::SavedCard {
-                    method_id: q.payment_method_id,
-                },
-            )
-            .await?
-    } else {
-        this.sub_handler
-            .renew_subscription_with_mode(
-                vm_line.subscription_id,
-                q.method
-                    .and_then(|m| PaymentMethod::from_str(&m).ok())
-                    .unwrap_or(PaymentMethod::Lightning),
-                intervals,
-                RenewMode::Interactive {
-                    save_card: q.save_card.unwrap_or(false),
-                },
-            )
-            .await?
-    };
+    let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
+    let payment = this
+        .sub_handler
+        .renew_subscription_with_mode(vm_line.subscription_id, method, intervals, mode)
+        .await?;
 
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
 }
@@ -1842,11 +1807,16 @@ async fn v1_vm_upgrade_quote(
         )
         .await
     {
-        Ok(quote) => ApiData::ok(ApiVmUpgradeQuote {
-            cost_difference: quote.upgrade.amount.into(),
-            new_renewal_cost: quote.renewal.amount.into(),
-            discount: quote.discount.amount.into(),
-        }),
+        Ok(quote) => {
+            let currency = quote.upgrade.amount.currency();
+            ApiData::ok(ApiVmUpgradeQuote {
+                cost_difference: quote.upgrade.amount.into(),
+                new_renewal_cost: quote.renewal.amount.into(),
+                discount: quote.discount.amount.into(),
+                tax: CurrencyAmount::from_u64(currency, quote.tax.amount).into(),
+                processing_fee: CurrencyAmount::from_u64(currency, quote.processing_fee).into(),
+            })
+        }
         Err(e) => ApiData::err(e.to_string().as_str()),
     }
 }
@@ -1873,16 +1843,12 @@ async fn v1_vm_upgrade(
         new_disk: req.disk,
     };
 
-    // Create upgrade payment
+    // Same payment resolution as renewals/purchases: interactive, saved NWC
+    // wallet, or saved Revolut card — collected on the spot for saved methods.
+    let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
     let payment = this
         .sub_handler
-        .create_vm_upgrade_payment(
-            id,
-            &cfg,
-            q.method
-                .and_then(|m| PaymentMethod::from_str(&m).ok())
-                .unwrap_or(PaymentMethod::Lightning),
-        )
+        .create_vm_upgrade_payment(id, &cfg, method, mode)
         .await?;
 
     // Note: The actual upgrade happens after payment is confirmed

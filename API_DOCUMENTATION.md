@@ -353,9 +353,11 @@ interface VmUpgradeRequest {
 }
 
 interface VmUpgradeQuote {
-  cost_difference: Price; // Pro-rated cost for remaining VM time
+  cost_difference: Price; // Net pro-rated cost for remaining VM time (before tax)
   new_renewal_cost: Price; // Monthly renewal cost after upgrade
   discount: Price; // Amount discounted for remaining time on the old rate
+  tax: Price; // VAT charged on the upgrade cost
+  processing_fee: Price; // Payment processing fee added on top (zero for Lightning)
 }
 ```
 
@@ -533,10 +535,11 @@ console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
 - **POST** `/api/v1/vm/{id}/upgrade?method={payment_method}`
 - **Auth**: Required
 - **Query Params**: 
-  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
+  - `method`: Optional payment method ('lightning' | 'revolut' | 'nwc' | 'saved'). Defaults to 'lightning'
+  - `payment_method_id`: Optional; for `method=saved`, the specific saved card to charge (omit to use the default saved card)
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmPayment`
-- **Description**: Create a payment for upgrading VM specifications. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
+- **Description**: Create a payment for upgrading VM specifications. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
 
 ### VM Operations
 

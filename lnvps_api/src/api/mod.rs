@@ -66,3 +66,51 @@ pub struct RouterState {
     /// `None` when no geolocation database is configured.
     pub geoip: Option<Arc<dyn CountryResolver>>,
 }
+
+/// Resolve a payment-method query into a concrete `(PaymentMethod, RenewMode)`.
+///
+/// `method=nwc` collects the user's saved NWC (Lightning) wallet; `method=saved`
+/// charges a saved Revolut card off-session (optionally a specific
+/// `payment_method_id`); anything else is an interactive payment in the requested
+/// method (default Lightning). Shared by the VM renew, VM upgrade and generic
+/// subscription renew endpoints so every payment type is collected identically.
+pub(crate) async fn resolve_payment_mode(
+    this: &RouterState,
+    uid: u64,
+    q: &PaymentMethodQuery,
+) -> Result<(lnvps_db::PaymentMethod, crate::subscription::RenewMode), lnvps_api_common::ApiError> {
+    use crate::subscription::RenewMode;
+    use lnvps_db::PaymentMethod;
+    use std::str::FromStr;
+
+    match q.method.as_deref() {
+        Some("nwc") => {
+            let has_nwc = this
+                .db
+                .list_user_payment_methods(uid, Some("nwc"))
+                .await
+                .map(|m| m.iter().any(|pm| pm.enabled))
+                .unwrap_or(false);
+            if !has_nwc {
+                return Err(lnvps_api_common::ApiError::from(anyhow::anyhow!(
+                    "No NWC payment method configured"
+                )));
+            }
+            Ok((PaymentMethod::Lightning, RenewMode::Saved { method_id: None }))
+        }
+        Some("saved") => Ok((
+            PaymentMethod::Revolut,
+            RenewMode::Saved {
+                method_id: q.payment_method_id,
+            },
+        )),
+        other => Ok((
+            other
+                .and_then(|m| PaymentMethod::from_str(m).ok())
+                .unwrap_or(PaymentMethod::Lightning),
+            RenewMode::Interactive {
+                save_card: q.save_card.unwrap_or(false),
+            },
+        )),
+    }
+}

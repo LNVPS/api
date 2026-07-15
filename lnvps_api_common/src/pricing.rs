@@ -33,12 +33,17 @@ fn round_to_sat(amount: CurrencyAmount) -> CurrencyAmount {
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
 pub struct UpgradeCostQuote {
-    /// The prorated cost to be paid now to upgrade the VM
+    /// The prorated cost to be paid now to upgrade the VM (net, before tax)
     pub upgrade: ConvertedCurrencyAmount,
     /// New cost for a full renewal
     pub renewal: ConvertedCurrencyAmount,
     /// Amount discounted for the remaining time on the old rate
     pub discount: ConvertedCurrencyAmount,
+    /// VAT determination for the prorated upgrade amount.
+    pub tax: TaxDetermination,
+    /// Payment processing fee (in the upgrade currency's minor units), grossed up
+    /// on the upgrade amount + tax. Zero for Lightning.
+    pub processing_fee: u64,
 }
 
 /// Information about remaining time and costs for a VM
@@ -1177,10 +1182,29 @@ impl PricingEngine {
         let discount_currency = self.get_amount_and_rate(discount_currency, method).await?;
         let new_renewal_currency = self.get_amount_and_rate(new_price, method).await?;
 
+        let upgrade = new_cost_until_expire.sub(discount_currency)?;
+
+        // Upgrades are taxed like any other charge: VAT on the net upgrade amount,
+        // and the processing fee grossed up on net + tax.
+        let company_id = self.db.get_vm_company_id(vm_id).await?;
+        let tax = self
+            .determine_tax(vm.user_id, upgrade.amount.value(), company_id)
+            .await?;
+        let processing_fee = self
+            .calculate_processing_fee(
+                company_id,
+                method,
+                upgrade.amount.currency(),
+                upgrade.amount.value() + tax.amount,
+            )
+            .await;
+
         Ok(UpgradeCostQuote {
-            upgrade: new_cost_until_expire.sub(discount_currency)?,
+            upgrade,
             renewal: new_renewal_currency,
             discount: discount_currency,
+            tax,
+            processing_fee,
         })
     }
 
@@ -1810,6 +1834,87 @@ mod tests {
         // The upgrade cost should be less than the full new renewal cost
         // since we're getting a discount for time remaining on the old plan
         assert!(quote.upgrade.amount.value() < quote.renewal.amount.value());
+
+        Ok(())
+    }
+
+    /// Regression: upgrade quotes must include VAT and the processing fee, not
+    /// just the net upgrade cost.
+    #[tokio::test]
+    async fn test_upgrade_cost_includes_tax_and_processing_fee() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        setup_upgrade_test_data(&db).await?;
+        // Revolut processing fee config for company 1 (2.8% + €0.20).
+        add_revolut_processing_fee_config(&db).await;
+
+        // Give the VM's subscription a future expiry so the upgrade is allowed.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(15));
+                s.is_setup = true;
+            }
+        }
+        // Taxable customer: IRL customer + IE-established seller => 23% EU VAT.
+        {
+            let mut u = db.users.lock().await;
+            u.insert(
+                1,
+                User {
+                    id: 1,
+                    pubkey: vec![],
+                    country_code: Some("IRL".to_string()),
+                    ..Default::default()
+                },
+            );
+            db.companies.lock().await.get_mut(&1).unwrap().country_code = Some("IRL".to_string());
+            let mut vms = db.vms.lock().await;
+            vms.insert(
+                1,
+                Vm {
+                    id: 1,
+                    user_id: 1,
+                    template_id: Some(1),
+                    custom_template_id: None,
+                    deleted: false,
+                    ..MockDb::mock_vm()
+                },
+            );
+        }
+
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+        let taxes = VatClient::with_rates(HashMap::from([(CountryCode::IRL, 23.0)]));
+        let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(2),
+            new_memory: None,
+            new_disk: None,
+        };
+        // Revolut so a processing fee applies (Lightning has none).
+        let quote = pe
+            .calculate_vm_upgrade_cost(1, &cfg, PaymentMethod::Revolut)
+            .await?;
+
+        // VAT is 23% of the net upgrade amount.
+        assert!(quote.upgrade.amount.value() > 0);
+        assert_eq!(
+            (quote.upgrade.amount.value() as f64 * 0.23).floor() as u64,
+            quote.tax.amount,
+            "upgrade VAT should be 23% of the net upgrade cost"
+        );
+
+        // Processing fee is grossed up on net + tax, and must exceed the fee on
+        // net alone (proving tax is included in the fee base).
+        let gross = quote.upgrade.amount.value() + quote.tax.amount;
+        let fee_on_gross = pe
+            .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, gross)
+            .await;
+        assert_eq!(fee_on_gross, quote.processing_fee);
+        assert!(quote.processing_fee > 0, "expected a non-zero processing fee");
 
         Ok(())
     }

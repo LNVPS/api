@@ -650,9 +650,14 @@ pub struct ApiVmUpgradeRequest {
 
 #[derive(Serialize)]
 pub struct ApiVmUpgradeQuote {
+    /// Net prorated upgrade cost (before tax).
     pub cost_difference: ApiPrice,
     pub new_renewal_cost: ApiPrice,
     pub discount: ApiPrice,
+    /// VAT charged on the upgrade cost.
+    pub tax: ApiPrice,
+    /// Payment processing fee added on top (zero for Lightning).
+    pub processing_fee: ApiPrice,
 }
 
 // ============================================================================

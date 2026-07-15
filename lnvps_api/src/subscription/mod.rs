@@ -31,7 +31,7 @@ use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod ip_range;
 mod vm;
@@ -81,10 +81,11 @@ pub enum RenewMode {
     /// tokenizes the entered card as a reusable payment method for future use
     /// (independent of auto-renewal).
     Interactive { save_card: bool },
-    /// Charge an already-saved Revolut card directly, with no customer
-    /// interaction (merchant-initiated). `method_id` selects a specific saved
-    /// card; `None` uses the user's default saved card. Revolut only.
-    SavedCard { method_id: Option<u64> },
+    /// Collect with an already-saved payment method on the spot, with no customer
+    /// interaction: a saved Revolut card is charged (merchant-initiated), a saved
+    /// NWC (Lightning) wallet pays the invoice. `method_id` selects a specific
+    /// saved method; `None` uses the user's default for the chosen provider.
+    Saved { method_id: Option<u64> },
 }
 
 impl Default for RenewMode {
@@ -92,6 +93,12 @@ impl Default for RenewMode {
         RenewMode::Interactive { save_card: false }
     }
 }
+
+/// Poll interval while waiting for an off-session (saved-method) payment to settle.
+const SAVED_PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Default maximum time to wait for an off-session payment to settle before
+/// returning it as still-pending.
+const SAVED_PAYMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct SubscriptionHandler {
@@ -104,6 +111,8 @@ pub struct SubscriptionHandler {
     pe: PricingEngine,
     vm_provisioner: VmProvisioner,
     vm_state_cache: VmStateCache,
+    /// How long [`Self::collect_saved_payment`] polls for settlement.
+    saved_payment_settle_timeout: Duration,
 }
 
 impl SubscriptionHandler {
@@ -124,6 +133,7 @@ impl SubscriptionHandler {
             tx,
             node,
             vm_state_cache,
+            saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
         })
     }
 
@@ -146,6 +156,11 @@ impl SubscriptionHandler {
     #[cfg(test)]
     pub(crate) fn set_revolut_for_test(&mut self, r: Arc<dyn FiatPaymentService>) {
         self.revolut = Some(r);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_settle_timeout_for_test(&mut self, d: Duration) {
+        self.saved_payment_settle_timeout = d;
     }
 
     pub async fn make_line_item_handler(
@@ -368,8 +383,9 @@ impl SubscriptionHandler {
 
     /// Create a renewal/purchase payment for a subscription.
     ///
-    /// For [`RenewMode::SavedCard`] (Revolut only) the saved payment method is
-    /// charged directly (merchant-initiated) without customer interaction.
+    /// For [`RenewMode::Saved`] the saved payment method is collected on the spot
+    /// (Revolut card charged, or NWC wallet pays the Lightning invoice) without
+    /// customer interaction, then briefly polled for settlement.
     async fn renew_subscription_inner(
         &self,
         subscription_id: u64,
@@ -632,7 +648,7 @@ impl SubscriptionHandler {
                     converted_amount + tax + processing_fee,
                 );
                 let (external_id, raw_data) = match &mode {
-                    RenewMode::SavedCard { method_id } => {
+                    RenewMode::Saved { method_id } => {
                         // Merchant-initiated charge against a saved Revolut
                         // payment method (specific one if requested, else the
                         // default) — no customer interaction.
@@ -707,7 +723,8 @@ impl SubscriptionHandler {
             .insert_subscription_payment(&subscription_payment)
             .await?;
 
-        Ok(subscription_payment)
+        // For saved-method payments, charge on the spot and wait for settlement.
+        self.collect_saved_payment(subscription_payment, &mode).await
     }
 
     async fn price_to_payment(
@@ -722,6 +739,7 @@ impl SubscriptionHandler {
             price,
             SubscriptionPaymentType::Renewal,
             None,
+            RenewMode::Interactive { save_card: false },
         )
         .await
     }
@@ -733,6 +751,7 @@ impl SubscriptionHandler {
         price: CostResult,
         payment_type: SubscriptionPaymentType,
         metadata: Option<serde_json::Value>,
+        mode: RenewMode,
     ) -> Result<SubscriptionPayment> {
         match price {
             CostResult::Existing(p) => Ok(p),
@@ -814,20 +833,49 @@ impl SubscriptionHandler {
                         );
                         let subscription = self.db.get_subscription(subscription_id).await?;
                         let user = self.db.get_user(vm.user_id).await?;
-                        let (external_id, raw_data) = self
-                            .create_revolut_order(
-                                rev,
-                                &subscription,
-                                &user,
-                                payment_type,
-                                &desc,
-                                CurrencyAmount::from_u64(
-                                    p.currency,
-                                    p.amount + p.tax + p.processing_fee,
-                                ),
-                                false,
-                            )
-                            .await?;
+                        let order_amount = CurrencyAmount::from_u64(
+                            p.currency,
+                            p.amount + p.tax + p.processing_fee,
+                        );
+                        let (external_id, raw_data) = match &mode {
+                            RenewMode::Saved { method_id } => {
+                                // Merchant-initiated off-session charge against a
+                                // saved Revolut card (e.g. for an upgrade paid with
+                                // a saved method) — no customer interaction.
+                                let method =
+                                    self.revolut_payment_method(user.id, *method_id).await?;
+                                let customer_id: String = method
+                                    .external_customer_id
+                                    .clone()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("Revolut method missing customer id")
+                                    })?
+                                    .into();
+                                let payment_method_id: String =
+                                    method.external_id.clone().into();
+                                let info = rev
+                                    .charge_subscription(
+                                        &customer_id,
+                                        &payment_method_id,
+                                        order_amount,
+                                        &desc,
+                                    )
+                                    .await?;
+                                (info.external_id, info.raw_data)
+                            }
+                            RenewMode::Interactive { save_card } => {
+                                self.create_revolut_order(
+                                    rev,
+                                    &subscription,
+                                    &user,
+                                    payment_type,
+                                    &desc,
+                                    order_amount,
+                                    *save_card,
+                                )
+                                .await?
+                            }
+                        };
                         let new_id: [u8; 32] = rand::random();
                         SubscriptionPayment {
                             id: new_id.to_vec(),
@@ -863,7 +911,9 @@ impl SubscriptionHandler {
 
                 self.db.insert_subscription_payment(&payment).await?;
 
-                Ok(payment)
+                // For saved-method payments, charge on the spot and wait for
+                // settlement before returning.
+                self.collect_saved_payment(payment, &mode).await
             }
         }
     }
@@ -912,38 +962,85 @@ impl SubscriptionHandler {
         }
     }
 
+    /// Pay an already-created Lightning payment off-session using the user's saved
+    /// Nostr Wallet Connect wallet.
+    ///
+    /// This is payment-type agnostic: the `payment` may be a purchase, renewal or
+    /// upgrade — it just settles the Lightning invoice held in `external_data`.
+    #[cfg(feature = "nostr-nwc")]
+    pub async fn pay_via_nwc(&self, payment: &SubscriptionPayment) -> Result<()> {
+        use nostr_sdk::prelude::*;
+
+        ensure!(
+            payment.payment_method == PaymentMethod::Lightning,
+            "NWC can only pay Lightning payments"
+        );
+        let nwc_method = self.nwc_payment_method(payment.user_id).await?;
+        let nwc_string: String = nwc_method.external_id.clone().into();
+        let invoice: String = payment.external_data.clone().into();
+
+        let nwc_uri = NostrWalletConnectUri::from_str(&nwc_string)
+            .context("Invalid NWC connection string")?;
+        let client = nwc::NostrWalletConnect::new(nwc_uri);
+        client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
+        Ok(())
+    }
+
+    /// Collect an off-session (saved-method) payment on the spot, then briefly
+    /// poll for completion.
+    ///
+    /// [`RenewMode::Interactive`] payments are paid externally by the customer, so
+    /// the payment is returned unchanged (pending). For [`RenewMode::Saved`] the
+    /// charge is submitted immediately — Lightning via the saved NWC wallet;
+    /// Revolut saved-card charges were already issued during order creation — then
+    /// the payment is polled for up to `saved_payment_settle_timeout` while the
+    /// asynchronous settlement (LN invoice listener / Revolut webhook) marks it
+    /// paid. A still-pending payment is returned as-is; an immediate charge
+    /// failure propagates as an error, leaving the payment unpaid.
+    async fn collect_saved_payment(
+        &self,
+        payment: SubscriptionPayment,
+        mode: &RenewMode,
+    ) -> Result<SubscriptionPayment> {
+        if !matches!(mode, RenewMode::Saved { .. }) {
+            return Ok(payment);
+        }
+
+        // Submit the on-the-spot charge for providers that settle after creation.
+        if payment.payment_method == PaymentMethod::Lightning {
+            #[cfg(feature = "nostr-nwc")]
+            {
+                self.pay_via_nwc(&payment).await?;
+            }
+            #[cfg(not(feature = "nostr-nwc"))]
+            {
+                bail!("NWC payments are not supported by this build");
+            }
+        }
+
+        // Poll for settlement, which arrives asynchronously (invoice listener /
+        // webhook). Return the latest row whether paid or still pending.
+        let deadline = Instant::now() + self.saved_payment_settle_timeout;
+        loop {
+            let latest = self.db.get_subscription_payment(&payment.id).await?;
+            if latest.is_paid || Instant::now() >= deadline {
+                return Ok(latest);
+            }
+            tokio::time::sleep(SAVED_PAYMENT_POLL_INTERVAL).await;
+        }
+    }
+
     #[cfg(feature = "nostr-nwc")]
     /// Attempt automatic renewal via the user's saved Nostr Wallet Connect method
     pub async fn auto_renew_via_nwc(&self, sub_id: u64) -> Result<SubscriptionPayment> {
-        use nostr_sdk::prelude::*;
-
         debug!("Attempting automatic renewal for sub {} via NWC", sub_id);
-
-        let sub = self.db.get_subscription(sub_id).await?;
-        let nwc_method = self.nwc_payment_method(sub.user_id).await?;
-        let nwc_string: String = nwc_method.external_id.clone().into();
-
-        // Use existing renew_subscription method to create the payment/invoice
-        let vm_payment = self
-            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
-            .await?;
-
-        // Extract the invoice from external_data
-        let invoice: String = vm_payment.external_data.clone().into();
-        debug!(
-            "Created renewal invoice for sub {}, attempting NWC payment",
-            sub_id
-        );
-
-        // Parse NWC connection string
-        let nwc_uri = NostrWalletConnectUri::from_str(&nwc_string)
-            .context("Invalid NWC connection string")?;
-
-        // Create nostr client for NWC
-        let client = nwc::NostrWalletConnect::new(nwc_uri);
-        client.pay_invoice(PayInvoiceRequest::new(invoice)).await?;
-        info!("Successful NWC auto-renewal payment for sub {}", sub_id);
-        Ok(vm_payment)
+        self.renew_subscription_with_mode(
+            sub_id,
+            PaymentMethod::Lightning,
+            1,
+            RenewMode::Saved { method_id: None },
+        )
+        .await
     }
 
     /// Attempt automatic renewal by charging the user's saved Revolut payment
@@ -962,7 +1059,7 @@ impl SubscriptionHandler {
                 sub_id,
                 PaymentMethod::Revolut,
                 1,
-                RenewMode::SavedCard { method_id: None },
+                RenewMode::Saved { method_id: None },
             )
             .await?;
         info!(
@@ -983,28 +1080,36 @@ impl SubscriptionHandler {
         self.price_to_payment(vm_id, method, price).await
     }
 
-    /// Create a VM upgrade payment
+    /// Create a VM upgrade payment.
+    ///
+    /// `mode` controls collection: [`RenewMode::Interactive`] returns an invoice /
+    /// checkout for the customer to pay, while [`RenewMode::Saved`] collects a
+    /// saved method off-session (merchant-initiated Revolut charge, or NWC wallet
+    /// paying the Lightning invoice).
     pub async fn create_vm_upgrade_payment(
         &self,
         vm_id: u64,
         cfg: &UpgradeConfig,
         method: PaymentMethod,
+        mode: RenewMode,
     ) -> Result<SubscriptionPayment> {
         let cost_difference = self
             .pe
             .calculate_vm_upgrade_cost(vm_id, cfg, method)
             .await?;
 
-        // create a payment entry for upgrade
+        // create a payment entry for upgrade. Tax + processing fee are computed by
+        // the pricing engine as part of the quote (VAT on the net upgrade amount,
+        // fee grossed up on net + tax).
         let payment = NewPaymentInfo {
             amount: cost_difference.upgrade.amount.value(),
             currency: cost_difference.upgrade.amount.currency(),
             rate: cost_difference.upgrade.rate,
             time_value: 0, //upgrades dont add time
             new_expiry: Default::default(),
-            tax: 0, // No tax on upgrades for now
-            tax_details: lnvps_api_common::TaxDetermination::untaxed(),
-            processing_fee: 0, // No processing fee on upgrades for now
+            tax: cost_difference.tax.amount,
+            tax_details: cost_difference.tax,
+            processing_fee: cost_difference.processing_fee,
         };
         let metadata = serde_json::to_value(cfg)?;
 
@@ -1014,6 +1119,7 @@ impl SubscriptionHandler {
             CostResult::New(payment),
             SubscriptionPaymentType::Upgrade,
             Some(metadata),
+            mode,
         )
         .await
     }
@@ -1305,7 +1411,7 @@ mod revolut_offline_tests {
                 100_000.0,
             )
             .await;
-        let sub = SubscriptionHandler::new(
+        let mut sub = SubscriptionHandler::new(
             mock_settings(),
             db.clone(),
             node,
@@ -1315,6 +1421,9 @@ mod revolut_offline_tests {
             VmStateCache::new(),
         )
         .unwrap();
+        // Don't block the test suite polling for settlement that never arrives
+        // from the mocks.
+        sub.set_settle_timeout_for_test(Duration::ZERO);
         (db, sub, user_id, sub_id)
     }
 
@@ -1569,5 +1678,83 @@ mod revolut_offline_tests {
         .unwrap();
         assert!(*fiat.created_order.lock().unwrap());
         assert!(!*fiat.created_subscription.lock().unwrap());
+    }
+
+    /// Build a minimal pending Revolut payment row for collect_saved_payment tests.
+    fn mk_pending_payment(sub_id: u64, user_id: u64, id: u8) -> SubscriptionPayment {
+        SubscriptionPayment {
+            id: vec![id; 16],
+            subscription_id: sub_id,
+            user_id,
+            created: Utc::now(),
+            expires: Utc::now() + chrono::Duration::hours(1),
+            amount: 999,
+            currency: "EUR".to_string(),
+            payment_method: PaymentMethod::Revolut,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "{}".to_string().into(),
+            external_id: Some("order_mock".to_string()),
+            is_paid: false,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+        }
+    }
+
+    /// Interactive payments are collected externally, so collect_saved_payment is
+    /// a no-op: it returns the payment unchanged without even touching the DB.
+    #[tokio::test]
+    async fn collect_saved_payment_noop_for_interactive() {
+        let (_db, sub, user_id, sub_id) = setup(true).await;
+        // Not inserted into the DB — a poll would fail, proving no poll happens.
+        let payment = mk_pending_payment(sub_id, user_id, 7);
+        let got = sub
+            .collect_saved_payment(
+                payment.clone(),
+                &RenewMode::Interactive { save_card: false },
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.id, payment.id);
+        assert!(!got.is_paid);
+    }
+
+    /// A saved-method payment that has already settled is returned as paid on the
+    /// first poll (no waiting).
+    #[tokio::test]
+    async fn collect_saved_payment_returns_paid_when_settled() {
+        let (db, mut sub, user_id, sub_id) = setup(true).await;
+        sub.set_settle_timeout_for_test(Duration::from_secs(30));
+        let mut payment = mk_pending_payment(sub_id, user_id, 8);
+        payment.is_paid = true; // already settled (webhook arrived)
+        db.insert_subscription_payment(&payment).await.unwrap();
+        let got = sub
+            .collect_saved_payment(payment.clone(), &RenewMode::Saved { method_id: None })
+            .await
+            .unwrap();
+        assert!(got.is_paid);
+    }
+
+    /// A saved-method payment that hasn't settled within the timeout is returned
+    /// as still-pending (not an error).
+    #[tokio::test]
+    async fn collect_saved_payment_returns_pending_on_timeout() {
+        let (db, mut sub, user_id, sub_id) = setup(true).await;
+        sub.set_settle_timeout_for_test(Duration::ZERO);
+        let payment = mk_pending_payment(sub_id, user_id, 9);
+        db.insert_subscription_payment(&payment).await.unwrap();
+        let got = sub
+            .collect_saved_payment(payment.clone(), &RenewMode::Saved { method_id: None })
+            .await
+            .unwrap();
+        assert!(!got.is_paid);
     }
 }

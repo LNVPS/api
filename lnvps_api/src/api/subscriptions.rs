@@ -1,6 +1,5 @@
 use crate::api::model::{ApiCreateSubscriptionRequest, ApiSubscription, ApiSubscriptionPayment};
 use crate::api::{PaymentMethodQuery, RouterState};
-use crate::subscription::RenewMode;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -9,8 +8,7 @@ use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
 };
-use lnvps_db::{IntervalType, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType};
-use std::str::FromStr;
+use lnvps_db::{IntervalType, Subscription, SubscriptionLineItem, SubscriptionType};
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -283,29 +281,13 @@ async fn v1_renew_subscription(
         return Err(ApiError::forbidden("Access denied: not your subscription"));
     }
 
-    // Pay directly with an already-saved card (merchant-initiated charge), or
-    // create an interactive payment (optionally saving the entered card).
-    let mode = if q.method.as_deref() == Some("saved") {
-        RenewMode::SavedCard {
-            method_id: q.payment_method_id,
-        }
-    } else {
-        RenewMode::Interactive {
-            save_card: q.save_card.unwrap_or(false),
-        }
-    };
-    let method = if q.method.as_deref() == Some("saved") {
-        PaymentMethod::Revolut
-    } else {
-        q.method
-            .and_then(|m| PaymentMethod::from_str(&m).ok())
-            .unwrap_or(PaymentMethod::Lightning)
-    };
-
-    // Generate payment via provisioner
+    // Resolve interactive / saved NWC / saved Revolut identically to VM renewals
+    // and upgrades; saved methods are collected on the spot.
+    let intervals = q.intervals.unwrap_or(1);
+    let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
     let payment = this
         .sub_handler
-        .renew_subscription_with_mode(id, method, 1, mode)
+        .renew_subscription_with_mode(id, method, intervals, mode)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
 

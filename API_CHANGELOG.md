@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Pay VM upgrades with saved payment methods
+  - `POST /api/v1/vm/{id}/upgrade` now accepts `method=nwc` and `method=saved` (with optional `payment_method_id`), matching the renewal endpoint. Saved methods are collected on the spot: NWC pays the Lightning invoice via the user's saved wallet, and `saved` charges a saved Revolut card off-session. For these off-session methods the request briefly waits (~10s) for settlement, returning the `VmPayment` as `is_paid: true` if it settled in time, otherwise pending (settles asynchronously). An immediate charge failure returns an error and leaves the payment unpaid.
+  - `GET /api/v1/subscriptions/{id}/renew` accepts the same `method=nwc` for parity with VM renewals/upgrades.
+
+- **2026-07-18** - VM upgrades now include VAT and processing fee
+  - Upgrade payments (`POST /api/v1/vm/{id}/upgrade`) are now charged VAT on the net upgrade cost plus the payment processing fee (previously both were `0`). `VmUpgradeQuote` (`POST /api/v1/vm/{id}/upgrade/quote`) gains `tax` and `processing_fee` fields so the full upgrade total can be shown up-front.
+
 - **2026-07-18** - VM status exposes its subscription id
   - `GET /api/v1/vm` and `GET /api/v1/vm/{id}` responses include a read-only `subscription_id`. A VM is billed by a subscription underneath, so clients can renew a VM by renewing its subscription (`GET /api/v1/subscriptions/{id}/renew`) and unify VM/subscription payment handling. `null`/omitted for VMs that were never paid.
 
