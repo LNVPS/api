@@ -1,6 +1,6 @@
 use crate::Template;
 use crate::network::parse_gateway;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
@@ -10,6 +10,27 @@ use lnvps_db::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Errors related to host capacity that should be surfaced to the user rather
+/// than logged as an opaque internal server error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapacityError {
+    /// No host in the region can accommodate the requested configuration.
+    NoAvailableHosts,
+}
+
+impl std::fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapacityError::NoAvailableHosts => write!(
+                f,
+                "No hosts with enough capacity are currently available in this region for the selected configuration"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapacityError {}
 
 /// Simple capacity management
 #[derive(Clone)]
@@ -71,7 +92,7 @@ impl HostCapacityService {
         if let Some(f) = host_cap.into_iter().next() {
             Ok(f)
         } else {
-            bail!("No available hosts found");
+            Err(CapacityError::NoAvailableHosts.into())
         }
     }
 
@@ -132,55 +153,79 @@ impl HostCapacityService {
                 }
                 true
             });
-            let max_cpu = hosts_in_region
-                .clone()
-                .map(|h| h.available_cpu())
-                .max()
-                .unwrap_or(0);
-            let max_memory = hosts_in_region
-                .clone()
-                .map(|h| h.available_memory())
-                .max()
-                .unwrap_or(0);
+            let min_cpu = template.min_cpu;
+            let min_memory = template.min_memory;
 
-            // If no host in this region has a free IPv4 slot, the template cannot
-            // be ordered regardless of CPU/memory availability.
-            let has_ipv4_capacity = hosts_in_region.clone().any(|h| {
+            // Whether a host has a free IPv4 slot (required for every order).
+            let host_has_ipv4 = |h: &&HostCapacity| {
                 h.ranges
                     .iter()
                     .any(|r| r.is_ipv4() && r.available_capacity() >= 1)
-            });
-
-            // Limit the template maximums to what's actually available
-            template.max_cpu = if has_ipv4_capacity {
-                template.max_cpu.min(max_cpu)
-            } else {
-                0
             };
-            template.max_memory = template.max_memory.min(max_memory);
 
-            // Limit disk maximums based on actual host capacity
+            // Limit disk maximums based on actual host capacity.
+            //
+            // CPU, memory, an IPv4 address and a matching disk must all be
+            // satisfiable on the *same* host, otherwise we would advertise a
+            // configuration (e.g. HDD storage) whose disk only exists on a host
+            // that has no spare CPU. Only consider disks on hosts that can also
+            // provide the minimum CPU/memory and a free IPv4 address.
             for disk in &mut template.disks {
-                let disks_in_region = hosts_in_region.clone().flat_map(|d| {
-                    d.disks.iter().filter(|c| {
-                        c.disk.kind == disk.disk_type.into()
-                            && c.disk.interface == disk.disk_interface.into()
+                let dt: DiskType = disk.disk_type.into();
+                let di: DiskInterface = disk.disk_interface.into();
+                let max_disk_size = hosts_in_region
+                    .clone()
+                    .filter(host_has_ipv4)
+                    .filter(|h| {
+                        h.available_cpu() >= min_cpu && h.available_memory() >= min_memory
                     })
-                });
-                let max_disk_size = disks_in_region
+                    .flat_map(|h| {
+                        h.disks
+                            .iter()
+                            .filter(|c| c.disk.kind == dt && c.disk.interface == di)
+                    })
                     .map(|d| d.available_capacity())
                     .max()
                     .unwrap_or(0);
                 disk.max_disk = disk.max_disk.min(max_disk_size);
             }
 
-            // remove disks with 0 max
+            // Remove disks that can no longer fit their minimum size on any
+            // capable host.
             template.disks = template
                 .disks
                 .iter()
-                .filter(|d| d.max_disk > 0)
+                .filter(|d| d.max_disk >= d.min_disk && d.max_disk > 0)
                 .cloned()
                 .collect();
+
+            // Limit the template CPU/memory maximums to hosts that can serve at
+            // least one of the remaining disk options (same-host requirement).
+            let servable_max = |select: &dyn Fn(&HostCapacity) -> u64| -> u64 {
+                hosts_in_region
+                    .clone()
+                    .filter(host_has_ipv4)
+                    .filter(|h| {
+                        h.available_cpu() >= min_cpu
+                            && h.available_memory() >= min_memory
+                            && template.disks.iter().any(|disk| {
+                                let dt: DiskType = disk.disk_type.into();
+                                let di: DiskInterface = disk.disk_interface.into();
+                                h.disks.iter().any(|c| {
+                                    c.disk.kind == dt
+                                        && c.disk.interface == di
+                                        && c.available_capacity() >= disk.min_disk
+                                })
+                            })
+                    })
+                    .map(|h| select(h))
+                    .max()
+                    .unwrap_or(0)
+            };
+            let max_cpu = servable_max(&|h| h.available_cpu() as u64) as u16;
+            let max_memory = servable_max(&|h| h.available_memory());
+            template.max_cpu = template.max_cpu.min(max_cpu);
+            template.max_memory = template.max_memory.min(max_memory);
         }
 
         // remove templates with 0 max cpu/ram/disk
@@ -1011,6 +1056,96 @@ mod tests {
             1,
             "custom template should be kept when IPv4 is available"
         );
+        Ok(())
+    }
+
+    /// Regression (Dublin scenario): a disk type (HDD) that only exists on a
+    /// host with no spare CPU must NOT be offered, even though another host in
+    /// the region has free CPU (but only SSD). CPU and disk must be satisfiable
+    /// on the same host.
+    #[tokio::test]
+    async fn apply_host_capacity_limits_drops_disk_only_on_cpu_full_host() -> Result<()> {
+        use crate::model::{ApiCustomTemplateDiskParam, ApiDiskInterface, ApiDiskType};
+        use lnvps_db::VmHostKind;
+
+        let db = Arc::new(MockDb::default());
+
+        // Default host 1: SSD/PCIe, cpu=4 (has free CPU), region 1.
+        // Add host 2: HDD/SATA only, but with zero schedulable CPU.
+        {
+            let mut hosts = db.hosts.lock().await;
+            hosts.insert(
+                2,
+                VmHost {
+                    id: 2,
+                    kind: VmHostKind::Dummy,
+                    region_id: 1,
+                    name: "hdd-full-host".to_string(),
+                    ip: "https://localhost".to_string(),
+                    cpu: 0, // no schedulable CPU -> available_cpu() == 0
+                    cpu_mfg: CpuMfg::Intel,
+                    cpu_arch: CpuArch::X86_64,
+                    cpu_features: Default::default(),
+                    memory: 8 * GB,
+                    enabled: true,
+                    api_token: "".into(),
+                    load_cpu: 1.0,
+                    load_memory: 1.0,
+                    load_disk: 1.0,
+                    vlan_id: Some(100),
+                    mtu: None,
+                    ssh_user: None,
+                    ssh_key: None,
+                },
+            );
+            let mut disks = db.host_disks.lock().await;
+            disks.insert(
+                2,
+                VmHostDisk {
+                    id: 2,
+                    host_id: 2,
+                    name: "hdd-disk".to_string(),
+                    size: crate::TB * 10,
+                    kind: DiskType::HDD,
+                    interface: DiskInterface::SATA,
+                    enabled: true,
+                },
+            );
+        }
+
+        let hc = HostCapacityService::new(db.clone() as Arc<dyn LNVpsDb>);
+
+        // Template offers both SSD/PCIe and HDD/SATA.
+        let mut template = make_custom_template_params(4, 8 * GB);
+        template.disks = vec![
+            ApiCustomTemplateDiskParam {
+                min_disk: GB,
+                max_disk: 100 * GB,
+                disk_type: ApiDiskType::SSD,
+                disk_interface: ApiDiskInterface::PCIe,
+            },
+            ApiCustomTemplateDiskParam {
+                min_disk: GB,
+                max_disk: 100 * GB,
+                disk_type: ApiDiskType::HDD,
+                disk_interface: ApiDiskInterface::SATA,
+            },
+        ];
+
+        let result = hc.apply_host_capacity_limits(&vec![template]).await?;
+
+        assert_eq!(result.len(), 1, "SSD template must remain orderable");
+        let disks = &result[0].disks;
+        assert_eq!(
+            disks.len(),
+            1,
+            "HDD disk (only on the CPU-full host) must be dropped"
+        );
+        assert!(
+            matches!(disks[0].disk_type, ApiDiskType::SSD),
+            "only the SSD option should remain"
+        );
+        assert!(result[0].max_cpu > 0, "SSD host still has schedulable CPU");
         Ok(())
     }
 }

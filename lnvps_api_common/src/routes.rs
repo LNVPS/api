@@ -135,6 +135,11 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
+        // Surface known capacity errors as a user-facing 409 instead of a
+        // generic internal server error.
+        if let Some(cap) = value.downcast_ref::<crate::CapacityError>() {
+            return Self::conflict(cap);
+        }
         Self::internal(value)
     }
 }

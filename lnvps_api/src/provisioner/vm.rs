@@ -1070,7 +1070,7 @@ mod tests {
         assert!(prov.is_err());
         if let Err(e) = prov {
             println!("{}", e);
-            assert!(e.to_string().to_lowercase().contains("no available host"))
+            assert!(e.to_string().to_lowercase().contains("no hosts with enough capacity"))
         }
         Ok(())
     }

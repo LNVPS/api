@@ -610,9 +610,13 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
-    async fn list_host_disks(&self, _tb: u64) -> DbResult<Vec<VmHostDisk>> {
+    async fn list_host_disks(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>> {
         let disks = self.host_disks.lock().await;
-        Ok(disks.values().filter(|d| d.enabled).cloned().collect())
+        Ok(disks
+            .values()
+            .filter(|d| d.enabled && d.host_id == host_id)
+            .cloned()
+            .collect())
     }
 
     async fn get_host_disk(&self, disk_id: u64) -> DbResult<VmHostDisk> {
