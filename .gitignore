@@ -21,3 +21,8 @@ node_modules/
 .pi-subagents/
 
 .playwright-mcp/
+
+# Workspace members must not carry their own lockfile (root Cargo.lock is authoritative)
+lnvps_api/Cargo.lock
+lnvps_db/Cargo.lock
+lnvps_nostr/Cargo.lock
