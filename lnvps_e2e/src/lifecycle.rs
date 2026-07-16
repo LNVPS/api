@@ -423,8 +423,11 @@ mod tests {
             false,
             "PATCH should disable auto-renewal"
         );
-        // Another user cannot patch someone else's subscription
-        let forbidden = admin
+        // Another user cannot patch someone else's subscription. Use a second
+        // *user* client (the referrer) — the admin client targets the admin API
+        // server, which doesn't mount the user subscription route, so it would
+        // return 404 (route not found) rather than exercising the ownership check.
+        let forbidden = referrer
             .patch_auth(
                 &format!("/api/v1/subscriptions/{sub_id}"),
                 &serde_json::json!({ "auto_renewal_enabled": true }),
