@@ -2486,6 +2486,12 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn delete_referral(&self, referral_id: u64) -> DbResult<()> {
+        let mut referrals = self.referrals.lock().await;
+        referrals.remove(&referral_id);
+        Ok(())
+    }
+
     async fn list_all_referrals(&self) -> DbResult<Vec<Referral>> {
         let referrals = self.referrals.lock().await;
         let mut all: Vec<Referral> = referrals.values().cloned().collect();
@@ -3513,6 +3519,31 @@ impl LNVPSNostrDb for MockDb {
 mod tests {
     use super::*;
     use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+
+    /// list_all_referrals + delete_referral base-trait methods.
+    #[tokio::test]
+    async fn test_referral_delete_and_list_all() {
+        use lnvps_db::{Referral, ReferralPayoutMode};
+
+        let db = MockDb::default();
+        let mk = |code: &str| Referral {
+            id: 0,
+            user_id: 1,
+            code: code.to_string(),
+            lightning_address: Some("a@b.com".to_string()),
+            mode: ReferralPayoutMode::LightningAddress,
+            referral_rate: None,
+            created: Utc::now(),
+        };
+        let id_a = db.insert_referral(&mk("AAA")).await.unwrap();
+        db.insert_referral(&mk("BBB")).await.unwrap();
+        assert_eq!(db.list_all_referrals().await.unwrap().len(), 2);
+
+        db.delete_referral(id_a).await.unwrap();
+        let rest = db.list_all_referrals().await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].code, "BBB");
+    }
 
     /// admin_list_referrals (pagination + code search) and admin_get_referral.
     #[cfg(feature = "admin")]

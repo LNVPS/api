@@ -2949,6 +2949,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn delete_referral(&self, referral_id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM referral WHERE id = ?")
+            .bind(referral_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn list_all_referrals(&self) -> DbResult<Vec<Referral>> {
         Ok(sqlx::query_as("SELECT * FROM referral ORDER BY id")
             .fetch_all(&self.db)

@@ -101,9 +101,14 @@ not users. `referral.referral_rate` NULL = use company default.
 feature; new `WorkJob::ProcessReferralPayouts`; `Worker::new` gained a `node` param.
 
 ### PR 4 — User API extras  [M]
-- [ ] `DELETE /api/v1/referral` (leave program; guard pending payouts).
-- [ ] `GET /api/v1/referral/usage` — per-referred-VM breakdown.
-- [ ] Refine payout status surfacing. Tests, docs, changelog.
+- [x] `DELETE /api/v1/referral` (leave program). Blocks on pending payout (409)
+      and on paid payout history (retained for accounting). New base DB method
+      `delete_referral` + mock test.
+- [x] `GET /api/v1/referral/usage` — per-referred-VM breakdown (vm_id, first
+      payment, currency, effective_rate, commission).
+- [x] `pre_image` already surfaced in payout records (PR3). Tests, docs, changelog.
+
+**PR4 committed:** (pending).
 
 ## Notes
 

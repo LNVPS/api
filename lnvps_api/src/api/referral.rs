@@ -14,12 +14,15 @@ use lnvps_db::{Referral, ReferralCostUsage, ReferralPayout, ReferralPayoutMode};
 use crate::api::RouterState;
 
 pub fn router() -> Router<RouterState> {
-    Router::new().route(
-        "/api/v1/referral",
-        get(v1_get_referral)
-            .post(v1_signup_referral)
-            .patch(v1_update_referral),
-    )
+    Router::new()
+        .route(
+            "/api/v1/referral",
+            get(v1_get_referral)
+                .post(v1_signup_referral)
+                .patch(v1_update_referral)
+                .delete(v1_delete_referral),
+        )
+        .route("/api/v1/referral/usage", get(v1_get_referral_usage))
 }
 
 /// Response type for a referral entry
@@ -131,6 +134,23 @@ impl ApiReferralState {
             payouts: payouts.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+/// A single referred VM and the commission earned from its first payment.
+#[derive(Serialize)]
+pub struct ApiReferralUsage {
+    /// The referred VM's id.
+    pub vm_id: u64,
+    /// When the first paid payment was made.
+    pub created: chrono::DateTime<Utc>,
+    /// The referred VM's first payment amount (smallest currency unit).
+    pub amount: u64,
+    /// Currency of the payment / commission.
+    pub currency: String,
+    /// Effective commission rate applied (whole %).
+    pub effective_rate: f32,
+    /// Commission earned = amount * effective_rate% (smallest currency unit).
+    pub commission: u64,
 }
 
 /// Request to sign up for the referral program
@@ -339,6 +359,67 @@ async fn v1_update_referral(
     this.db.update_referral(&referral).await?;
 
     ApiData::ok(referral.into())
+}
+
+/// Leave the referral program.
+///
+/// Blocked while any payout records exist: a **pending** payout must settle
+/// first, and paid payout history is retained for accounting (so a referrer who
+/// has ever been paid cannot delete their enrollment).
+async fn v1_delete_referral(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let referral = this
+        .db
+        .get_referral_by_user(uid)
+        .await
+        .map_err(|_| ApiError::not_found("Not enrolled in referral program"))?;
+
+    let payouts = this.db.list_referral_payouts(referral.id).await?;
+    if payouts.iter().any(|p| !p.is_paid) {
+        return Err(ApiError::conflict(
+            "Cannot leave the referral program while a payout is pending",
+        ));
+    }
+    if !payouts.is_empty() {
+        return Err(ApiError::conflict(
+            "Cannot leave the referral program because payout history exists",
+        ));
+    }
+
+    this.db.delete_referral(referral.id).await?;
+    ApiData::ok(())
+}
+
+/// Per-referred-VM breakdown: each referred VM's first payment and the
+/// commission earned from it.
+async fn v1_get_referral_usage(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<Vec<ApiReferralUsage>> {
+    let pubkey = auth.event.pubkey.to_bytes();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let referral = this
+        .db
+        .get_referral_by_user(uid)
+        .await
+        .map_err(|_| ApiError::not_found("Not enrolled in referral program"))?;
+
+    let usage = this.db.list_referral_usage(&referral.code).await?;
+    let out: Vec<ApiReferralUsage> = usage
+        .into_iter()
+        .map(|u| ApiReferralUsage {
+            vm_id: u.vm_id,
+            created: u.created,
+            amount: u.amount,
+            commission: u.commission(),
+            effective_rate: u.effective_rate,
+            currency: u.currency,
+        })
+        .collect();
+    ApiData::ok(out)
 }
 
 #[cfg(test)]

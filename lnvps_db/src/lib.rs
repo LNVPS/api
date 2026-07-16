@@ -802,6 +802,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update an existing referral entry
     async fn update_referral(&self, referral: &Referral) -> DbResult<()>;
 
+    /// Delete a referral enrollment (used when a user leaves the program). The
+    /// caller must ensure no payout records reference it (the FK has no cascade).
+    async fn delete_referral(&self, referral_id: u64) -> DbResult<()>;
+
     /// List every referral enrollment (used by the automated payout job).
     async fn list_all_referrals(&self) -> DbResult<Vec<Referral>>;
 
