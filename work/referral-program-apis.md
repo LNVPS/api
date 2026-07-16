@@ -1,8 +1,8 @@
 # Referral Program API Completion
 
-**Status:** in-progress
+**Status:** complete
 **Started:** 2026-07-18
-**Last updated:** 2026-07-18 (PR1 in progress: commission rate + payout mode)
+**Last updated:** 2026-07-18 (all 4 PRs complete)
 
 ## Goal
 
@@ -108,7 +108,15 @@ feature; new `WorkJob::ProcessReferralPayouts`; `Worker::new` gained a `node` pa
       payment, currency, effective_rate, commission).
 - [x] `pre_image` already surfaced in payout records (PR3). Tests, docs, changelog.
 
-**PR4 committed:** (pending).
+**PR4 committed:** `b5dac33`.
+
+## Summary
+
+All four increments are merged: PR1 `4048398` (commission rate + payout mode),
+PR2 `4d19600` (admin management + RBAC), PR3 `8980e48` (automated payout worker),
+PR4 `b5dac33` (leave program + per-VM usage). The referral program is now
+complete end-to-end: configurable per-referrer/company commission, admin
+management, automated BTC Lightning payouts (opt-in), and full user self-service.
 
 ## Notes
 
