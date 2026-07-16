@@ -97,7 +97,7 @@ not users. `referral.referral_rate` NULL = use company default.
 - [x] Expose `pre_image` (hex) in `ApiReferralPayout`. Tests (payable math),
       docs, changelog.
 
-**PR3 committed:** (pending). Note: enabled lnurl-rs `async-https-native`
+**PR3 committed:** `8980e48`. Note: enabled lnurl-rs `async-https-native`
 feature; new `WorkJob::ProcessReferralPayouts`; `Worker::new` gained a `node` param.
 
 ### PR 4 — User API extras  [M]
