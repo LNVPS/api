@@ -1660,6 +1660,7 @@ pub enum AdminResource {
     DnsServer = 22,
     UserPaymentMethod = 23,
     ResourceCost = 24,
+    Referral = 25,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1700,6 +1701,7 @@ impl Display for AdminResource {
             AdminResource::DnsServer => write!(f, "dns_server"),
             AdminResource::UserPaymentMethod => write!(f, "user_payment_method"),
             AdminResource::ResourceCost => write!(f, "resource_cost"),
+            AdminResource::Referral => write!(f, "referral"),
         }
     }
 }
@@ -1734,6 +1736,7 @@ impl FromStr for AdminResource {
             "dns_server" => Ok(AdminResource::DnsServer),
             "user_payment_method" => Ok(AdminResource::UserPaymentMethod),
             "resource_cost" => Ok(AdminResource::ResourceCost),
+            "referral" => Ok(AdminResource::Referral),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1769,6 +1772,7 @@ impl TryFrom<u16> for AdminResource {
             22 => Ok(AdminResource::DnsServer),
             23 => Ok(AdminResource::UserPaymentMethod),
             24 => Ok(AdminResource::ResourceCost),
+            25 => Ok(AdminResource::Referral),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1803,6 +1807,7 @@ impl AdminResource {
             AdminResource::DnsServer,
             AdminResource::UserPaymentMethod,
             AdminResource::ResourceCost,
+            AdminResource::Referral,
         ]
     }
 }
@@ -2236,6 +2241,20 @@ mod tests {
             AdminResource::ResourceCost
         );
         assert!(AdminResource::all().contains(&AdminResource::ResourceCost));
+    }
+
+    #[test]
+    fn test_admin_resource_referral_roundtrip() {
+        assert_eq!(
+            "referral".parse::<AdminResource>().unwrap(),
+            AdminResource::Referral
+        );
+        assert_eq!(AdminResource::Referral.to_string(), "referral");
+        assert_eq!(
+            AdminResource::try_from(25u16).unwrap(),
+            AdminResource::Referral
+        );
+        assert!(AdminResource::all().contains(&AdminResource::Referral));
     }
 
     #[test]

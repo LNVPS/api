@@ -18,6 +18,7 @@ mod ip_ranges;
 mod ip_space;
 mod model;
 mod payment_methods;
+mod referrals;
 mod regions;
 mod reports;
 mod roles;
@@ -68,6 +69,7 @@ pub fn admin_router(
         .merge(dns_servers::router())
         .merge(vm_ip_assignments::router())
         .merge(subscriptions::router())
+        .merge(referrals::router())
         .merge(reports::router())
         .merge(websocket::router())
         .merge(payment_methods::router())

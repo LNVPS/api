@@ -2940,12 +2940,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         sqlx::query(
             "UPDATE referral SET lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
         )
-            .bind(&referral.lightning_address)
-            .bind(referral.mode)
-            .bind(referral.referral_rate)
-            .bind(referral.id)
-            .execute(&self.db)
-            .await?;
+        .bind(&referral.lightning_address)
+        .bind(referral.mode)
+        .bind(referral.referral_rate)
+        .bind(referral.id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -2963,12 +2963,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
-        sqlx::query("UPDATE referral_payout SET is_paid = ?, pre_image = ? WHERE id = ?")
-            .bind(payout.is_paid)
-            .bind(&payout.pre_image)
-            .bind(payout.id)
-            .execute(&self.db)
-            .await?;
+        sqlx::query(
+            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ? WHERE id = ?",
+        )
+        .bind(payout.is_paid)
+        .bind(&payout.invoice)
+        .bind(&payout.pre_image)
+        .bind(payout.id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -4516,6 +4519,58 @@ impl AdminDb for LNVpsDbMysql {
         }
 
         Ok(db_query.fetch_all(&self.db).await?)
+    }
+
+    async fn admin_list_referrals(
+        &self,
+        limit: u64,
+        offset: u64,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<Referral>, u64)> {
+        // A 64-char hex search term is treated as a user pubkey (matched via
+        // SQL HEX() so the DB layer needs no hex dependency); otherwise the term
+        // is matched against the referral code as a substring.
+        let pubkey_hex = search
+            .map(str::trim)
+            .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+        let code_like = match (pubkey_hex, search) {
+            (None, Some(s)) if !s.trim().is_empty() => Some(format!("%{}%", s.trim())),
+            _ => None,
+        };
+
+        let where_clause = if pubkey_hex.is_some() {
+            "WHERE r.user_id = (SELECT id FROM users WHERE HEX(pubkey) = ?)"
+        } else if code_like.is_some() {
+            "WHERE r.code LIKE ?"
+        } else {
+            ""
+        };
+
+        let list_sql = format!(
+            "SELECT r.* FROM referral r {where_clause} ORDER BY r.created DESC LIMIT ? OFFSET ?"
+        );
+        let count_sql = format!("SELECT COUNT(*) FROM referral r {where_clause}");
+
+        let mut list_q = sqlx::query_as::<_, Referral>(&list_sql);
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        if let Some(pk) = pubkey_hex {
+            let up = pk.to_uppercase();
+            list_q = list_q.bind(up.clone());
+            count_q = count_q.bind(up);
+        } else if let Some(like) = &code_like {
+            list_q = list_q.bind(like.clone());
+            count_q = count_q.bind(like.clone());
+        }
+        let rows = list_q.bind(limit).bind(offset).fetch_all(&self.db).await?;
+        let total = count_q.fetch_one(&self.db).await? as u64;
+        Ok((rows, total))
+    }
+
+    async fn admin_get_referral(&self, referral_id: u64) -> DbResult<Referral> {
+        Ok(sqlx::query_as("SELECT * FROM referral WHERE id = ?")
+            .bind(referral_id)
+            .fetch_one(&self.db)
+            .await?)
     }
 
     async fn admin_list_ip_ranges(

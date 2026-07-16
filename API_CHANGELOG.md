@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Admin referral program management
+  - New admin endpoints under the `referral` RBAC resource (granted to `super_admin`): `GET /api/admin/v1/referrals` (paginated; `search` by code substring or 64-char hex pubkey), `GET /api/admin/v1/referrals/{id}` (referral + per-currency earned commission + payout history + success/failed counts), `PATCH /api/admin/v1/referrals/{id}` (set/clear the per-referrer commission override), `GET`/`POST /api/admin/v1/referrals/{id}/payouts` (list / create a manual payout record), and `PATCH /api/admin/v1/referrals/{id}/payouts/{payout_id}` (mark paid / set invoice / set preimage for reconciliation). NWC secrets are never exposed.
+
 - **2026-07-18** - Flexible referral payout mode (replaces `use_nwc`)
   - The referral payout method is now an extensible `mode` enum instead of the `use_nwc` boolean. `GET /api/v1/referral` returns `mode` (`lightning_address` | `nwc` | `account_credit`) instead of `use_nwc`. `POST`/`PATCH /api/v1/referral` accept `mode` instead of `use_nwc`: `lightning_address` (default) requires a resolvable `lightning_address`; `nwc` requires a configured NWC connection; `account_credit` is reserved for a future account-balance payout and is currently rejected. Existing enrollments migrate `use_nwc = true` → `nwc`, otherwise `lightning_address`.
 

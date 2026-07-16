@@ -70,12 +70,18 @@ Decisions:
 not users. `referral.referral_rate` NULL = use company default.
 
 ### PR 2 — Admin referral management APIs + RBAC  [L]
-- [ ] Add `AdminResource::Referral = 25`; explicit permission migration.
-- [ ] DB: `admin_list_referrals` (paginated + search by code/user), `admin_get_referral`,
-      `admin_list_referral_payouts`, earnings aggregation per referral.
-- [ ] Endpoints: list referrals, get referral detail (earnings + payouts),
-      create manual payout record, mark payout paid / reconcile (with external ref).
-- [ ] Sanitize responses (no NWC secrets). Tests, docs, changelog.
+- [x] Add `AdminResource::Referral = 25` (Display/FromStr/TryFrom/all + roundtrip
+      test); explicit permission migration `20260718002000` (grants super_admin).
+- [x] DB: `admin_list_referrals` (paginated + search by code substring or 64-char
+      hex pubkey via SQL HEX()), `admin_get_referral`; extended
+      `update_referral_payout` to also set invoice; mock impls + test.
+- [x] Endpoints (`admin/referrals.rs`): list, detail (earnings + payouts +
+      counts), PATCH commission override, list/create payout, PATCH reconcile
+      (is_paid/invoice/pre_image).
+- [x] Sanitized (no NWC secrets). Tests, docs, changelog.
+
+**PR2 committed:** (pending). Per-referrer override is set here via
+`PATCH /api/admin/v1/referrals/{id}`.
 
 ### PR 3 — Automated payout processing (worker)  [L]
 - [ ] Accrual: owed = sum(reward per referred VM first payment) − sum(existing payouts) per currency.

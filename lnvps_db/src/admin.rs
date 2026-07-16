@@ -254,6 +254,20 @@ pub trait AdminDb: Send + Sync {
         ref_code: Option<&str>,
     ) -> DbResult<Vec<crate::ReferralCostUsage>>;
 
+    // Referral program administration
+    /// List referral enrollments with pagination. `search` (optional) matches a
+    /// referral code (substring) or, when it is a 64-char hex pubkey, the owning
+    /// user. Ordered by `created DESC`. Returns `(rows, total)`.
+    async fn admin_list_referrals(
+        &self,
+        limit: u64,
+        offset: u64,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<crate::Referral>, u64)>;
+
+    /// Get a single referral enrollment by its id.
+    async fn admin_get_referral(&self, referral_id: u64) -> DbResult<crate::Referral>;
+
     // IP Range management methods
     /// List all IP ranges with pagination
     async fn admin_list_ip_ranges(
