@@ -96,7 +96,10 @@ pub(crate) async fn resolve_payment_mode(
                     "No NWC payment method configured"
                 )));
             }
-            Ok((PaymentMethod::Lightning, RenewMode::Saved { method_id: None }))
+            Ok((
+                PaymentMethod::Lightning,
+                RenewMode::Saved { method_id: None },
+            ))
         }
         Some("saved") => Ok((
             PaymentMethod::Revolut,

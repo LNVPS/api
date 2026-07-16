@@ -724,7 +724,8 @@ impl SubscriptionHandler {
             .await?;
 
         // For saved-method payments, charge on the spot and wait for settlement.
-        self.collect_saved_payment(subscription_payment, &mode).await
+        self.collect_saved_payment(subscription_payment, &mode)
+            .await
     }
 
     async fn price_to_payment(
@@ -851,8 +852,7 @@ impl SubscriptionHandler {
                                         anyhow::anyhow!("Revolut method missing customer id")
                                     })?
                                     .into();
-                                let payment_method_id: String =
-                                    method.external_id.clone().into();
+                                let payment_method_id: String = method.external_id.clone().into();
                                 let info = rev
                                     .charge_subscription(
                                         &customer_id,

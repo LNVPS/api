@@ -1914,7 +1914,10 @@ mod tests {
             .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, gross)
             .await;
         assert_eq!(fee_on_gross, quote.processing_fee);
-        assert!(quote.processing_fee > 0, "expected a non-zero processing fee");
+        assert!(
+            quote.processing_fee > 0,
+            "expected a non-zero processing fee"
+        );
 
         Ok(())
     }
@@ -2542,7 +2545,12 @@ mod tests {
         // …and it must be strictly larger than the (buggy) fee on net alone,
         // proving the tax portion is now included in the gross-up base.
         let fee_on_net = pe
-            .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, payment_info.amount)
+            .calculate_processing_fee(
+                1,
+                PaymentMethod::Revolut,
+                Currency::EUR,
+                payment_info.amount,
+            )
             .await;
         assert!(
             payment_info.processing_fee > fee_on_net,
