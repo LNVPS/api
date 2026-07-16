@@ -344,18 +344,11 @@ async fn v1_update_referral(
         referral.mode = mode;
     }
 
-    // The resulting configuration must have the details its mode needs.
-    if referral.mode == ReferralPayoutMode::LightningAddress
-        && referral
-            .lightning_address
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-    {
-        return ApiData::err("lightning_address is required when mode is 'lightning_address'");
-    }
-
+    // Note: we intentionally do NOT require the resulting config to be immediately
+    // payable (e.g. a lightning_address-mode referral may temporarily have no
+    // address). The payout worker skips referrers whose method can't produce an
+    // invoice, so an incomplete config simply defers payouts rather than losing
+    // them. Signup still requires a valid method up-front.
     this.db.update_referral(&referral).await?;
 
     ApiData::ok(referral.into())
