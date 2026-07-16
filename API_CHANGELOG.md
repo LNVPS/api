@@ -45,6 +45,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **2026-07-18** - New VMs default to auto-renewal enabled
+  - Ordering a VM (standard or custom template) now creates its subscription with `auto_renewal_enabled = true` by default (previously `false`), matching the subscription-creation API which already defaulted on. Auto-renewal only actually charges when the user has a saved payment method (NWC wallet or Revolut card); users without one are unaffected and still receive the normal expiry reminders. Users can opt out anytime via `PATCH /api/v1/subscriptions/{id}` (`auto_renewal_enabled: false`).
+
 - **2026-07-16** - Invoices now show the VAT treatment
   - `GET /api/v1/payment/{id}/invoice` renders the applied VAT rate on the tax line (e.g. "VAT 23% (IRL)"), and prints a legal note for **reverse charge** ("VAT reverse charged — the recipient is liable to account for VAT (Article 196, Council Directive 2006/112/EC)") and **out-of-scope** ("Outside the scope of EU VAT.") supplies. Seller and customer VAT numbers were already shown.
 

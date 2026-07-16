@@ -131,7 +131,10 @@ impl VmProvisioner {
             interval_amount: cost_plan.interval_amount,
             interval_type: cost_plan.interval_type,
             setup_fee: 0,
-            auto_renewal_enabled: false,
+            // Default new VM subscriptions to auto-renew. Renewal only actually
+            // fires when the user has a saved payment method (the worker checks),
+            // so this is a no-op for users without one.
+            auto_renewal_enabled: true,
             external_id: None,
         };
         let line_item = SubscriptionLineItem {
@@ -261,7 +264,8 @@ impl VmProvisioner {
             interval_amount: 1,
             interval_type: IntervalType::Month,
             setup_fee: 0,
-            auto_renewal_enabled: false,
+            // Default new custom VM subscriptions to auto-renew (see note above).
+            auto_renewal_enabled: true,
             external_id: None,
         };
         let line_item = SubscriptionLineItem {
