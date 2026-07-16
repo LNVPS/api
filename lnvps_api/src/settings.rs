@@ -66,6 +66,24 @@ pub struct Settings {
     /// resolve client IPs to a country as VAT place-of-supply evidence. When
     /// unset, IP geolocation is disabled.
     pub geoip_database: Option<PathBuf>,
+
+    /// Referral program automated payout settings. **Automated payouts are
+    /// opt-in**: when this section is omitted, commission still accrues and can
+    /// be paid manually by admins, but no automatic Lightning payouts are made.
+    pub referral: Option<ReferralConfig>,
+}
+
+fn default_min_payout_sats() -> u64 {
+    1000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ReferralConfig {
+    /// Minimum accrued BTC commission (in satoshis) before an automated payout
+    /// is attempted for a referrer. Defaults to 1000 sats.
+    #[serde(default = "default_min_payout_sats")]
+    pub min_payout_sats: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -344,6 +362,7 @@ pub fn mock_settings() -> Settings {
         encryption: None,
         captcha: None,
         geoip_database: None,
+        referral: None,
     }
 }
 

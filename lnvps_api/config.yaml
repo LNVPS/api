@@ -5,6 +5,11 @@ lightning:
     cert: "/home/kieran/.polar/networks/1/volumes/lnd/alice/tls.cert"
     macaroon: "/home/kieran/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
 delete-after: 3
+# Automated referral commission payouts (opt-in). Omit this section to disable
+# automatic payouts (commission still accrues and can be paid manually by admins).
+referral:
+  # Minimum accrued BTC commission (satoshis) before a payout is attempted.
+  min-payout-sats: 1000
 public-url: "https://api.lnvps.net"
 read-only: false
 redis:

@@ -360,7 +360,7 @@ pub async fn insert_referral(
     lightning_address: Option<&str>,
 ) -> anyhow::Result<u64> {
     let res: (u64,) = sqlx::query_as(
-        "INSERT INTO referral (user_id, code, use_nwc, lightning_address) VALUES (?, ?, 0, ?) RETURNING id",
+        "INSERT INTO referral (user_id, code, mode, lightning_address) VALUES (?, ?, 0, ?) RETURNING id",
     )
     .bind(user_id)
     .bind(code)

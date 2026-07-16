@@ -128,6 +128,8 @@ pub enum WorkJob {
     DownloadOsImages { image_id: Option<u64> },
     /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
     CheckSubscriptions,
+    /// Process automated referral commission payouts (BTC, over Lightning).
+    ProcessReferralPayouts,
     /// Poll routers to refresh cached tunnel/BGP session/route state and record
     /// per-tunnel traffic samples.
     SyncRouterState,
@@ -199,6 +201,7 @@ impl fmt::Display for WorkJob {
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
+            WorkJob::ProcessReferralPayouts => write!(f, "ProcessReferralPayouts"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
             WorkJob::SyncRouterState => write!(f, "SyncRouterState"),
             WorkJob::ToggleBgpSession { .. } => write!(f, "ToggleBgpSession"),

@@ -275,6 +275,7 @@ impl Default for MockDb {
                         phone: None,
                         email: None,
                         base_currency: "EUR".to_string(),
+                        referral_rate: 0.0,
                     },
                 );
                 companies
@@ -2479,8 +2480,28 @@ impl LNVpsDbBase for MockDb {
         let mut referrals = self.referrals.lock().await;
         if let Some(r) = referrals.get_mut(&referral.id) {
             r.lightning_address = referral.lightning_address.clone();
-            r.use_nwc = referral.use_nwc;
+            r.mode = referral.mode;
+            r.referral_rate = referral.referral_rate;
         }
+        Ok(())
+    }
+
+    async fn delete_referral(&self, referral_id: u64) -> DbResult<()> {
+        let mut referrals = self.referrals.lock().await;
+        referrals.remove(&referral_id);
+        Ok(())
+    }
+
+    async fn list_all_referrals(&self) -> DbResult<Vec<Referral>> {
+        let referrals = self.referrals.lock().await;
+        let mut all: Vec<Referral> = referrals.values().cloned().collect();
+        all.sort_by_key(|r| r.id);
+        Ok(all)
+    }
+
+    async fn delete_referral_payout(&self, payout_id: u64) -> DbResult<()> {
+        let mut payouts = self.referral_payouts.lock().await;
+        payouts.retain(|p| p.id != payout_id);
         Ok(())
     }
 
@@ -2498,6 +2519,7 @@ impl LNVpsDbBase for MockDb {
         let mut payouts = self.referral_payouts.lock().await;
         if let Some(p) = payouts.iter_mut().find(|p| p.id == payout.id) {
             p.is_paid = payout.is_paid;
+            p.invoice = payout.invoice.clone();
             p.pre_image = payout.pre_image.clone();
         }
         Ok(())
@@ -2516,6 +2538,24 @@ impl LNVpsDbBase for MockDb {
         let vms = self.vms.lock().await;
         let line_items = self.subscription_line_items.lock().await;
         let sub_payments = self.subscription_payments.lock().await;
+        // Effective rate: referrer override, else the default company's rate.
+        let effective_rate = {
+            let referrals = self.referrals.lock().await;
+            let override_rate = referrals
+                .values()
+                .find(|r| r.code == code)
+                .and_then(|r| r.referral_rate);
+            match override_rate {
+                Some(r) => r,
+                None => self
+                    .companies
+                    .lock()
+                    .await
+                    .get(&1)
+                    .map(|c| c.referral_rate)
+                    .unwrap_or(0.0),
+            }
+        };
         let mut result = Vec::new();
         for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
             let subscription_id = line_items
@@ -2536,6 +2576,7 @@ impl LNVpsDbBase for MockDb {
                         currency: first.currency.clone(),
                         rate: first.rate,
                         base_currency: "EUR".to_string(),
+                        effective_rate,
                     });
                 }
             }
@@ -3096,6 +3137,40 @@ impl lnvps_db::AdminDb for MockDb {
         // Mock implementation - return empty for now
         Ok(vec![])
     }
+
+    async fn admin_list_referrals(
+        &self,
+        limit: u64,
+        offset: u64,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<Referral>, u64)> {
+        let referrals = self.referrals.lock().await;
+        let mut all: Vec<Referral> = referrals
+            .values()
+            .filter(|r| match search {
+                Some(s) if !s.trim().is_empty() => r.code.contains(s.trim()),
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.created.cmp(&a.created));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
+    async fn admin_get_referral(&self, referral_id: u64) -> DbResult<Referral> {
+        let referrals = self.referrals.lock().await;
+        referrals
+            .get(&referral_id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("referral not found")))
+    }
+
     async fn admin_list_ip_ranges(
         &self,
         _limit: u64,
@@ -3444,6 +3519,71 @@ impl LNVPSNostrDb for MockDb {
 mod tests {
     use super::*;
     use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+
+    /// list_all_referrals + delete_referral base-trait methods.
+    #[tokio::test]
+    async fn test_referral_delete_and_list_all() {
+        use lnvps_db::{Referral, ReferralPayoutMode};
+
+        let db = MockDb::default();
+        let mk = |code: &str| Referral {
+            id: 0,
+            user_id: 1,
+            code: code.to_string(),
+            lightning_address: Some("a@b.com".to_string()),
+            mode: ReferralPayoutMode::LightningAddress,
+            referral_rate: None,
+            created: Utc::now(),
+        };
+        let id_a = db.insert_referral(&mk("AAA")).await.unwrap();
+        db.insert_referral(&mk("BBB")).await.unwrap();
+        assert_eq!(db.list_all_referrals().await.unwrap().len(), 2);
+
+        db.delete_referral(id_a).await.unwrap();
+        let rest = db.list_all_referrals().await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].code, "BBB");
+    }
+
+    /// admin_list_referrals (pagination + code search) and admin_get_referral.
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn test_admin_referral_listing() {
+        use lnvps_db::{AdminDb, Referral, ReferralPayoutMode};
+
+        let db = MockDb::default();
+        let mk = |code: &str| Referral {
+            id: 0,
+            user_id: 1,
+            code: code.to_string(),
+            lightning_address: Some("a@b.com".to_string()),
+            mode: ReferralPayoutMode::LightningAddress,
+            referral_rate: None,
+            created: Utc::now(),
+        };
+        let id_a = db.insert_referral(&mk("ALPHA123")).await.unwrap();
+        db.insert_referral(&mk("BETA456")).await.unwrap();
+
+        // List all
+        let (rows, total) = db.admin_list_referrals(50, 0, None).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
+
+        // Search by code substring
+        let (rows, total) = db.admin_list_referrals(50, 0, Some("ALPHA")).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].code, "ALPHA123");
+
+        // Pagination
+        let (rows, total) = db.admin_list_referrals(1, 0, None).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
+
+        // Get by id
+        let got = db.admin_get_referral(id_a).await.unwrap();
+        assert_eq!(got.code, "ALPHA123");
+        assert!(db.admin_get_referral(9999).await.is_err());
+    }
 
     /// user_payment_method CRUD + provider filter via the mock DB.
     #[tokio::test]

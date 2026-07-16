@@ -1316,10 +1316,15 @@ pub struct Referral {
     pub code: String,
     /// Lightning address for automatic payouts
     pub lightning_address: Option<String>,
-    /// If true, use the user's NWC connection for payouts
-    pub use_nwc: bool,
+    /// How the referrer is paid their commission.
+    pub mode: ReferralPayoutMode,
     /// When this referral entry was created
     pub created: DateTime<Utc>,
+    /// Optional per-referrer commission override, as a whole percentage of a
+    /// referred VM's first payment. `None` falls back to the referred VM's
+    /// `company.referral_rate` default.
+    #[sqlx(default)]
+    pub referral_rate: Option<f32>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -1351,6 +1356,58 @@ pub struct ReferralCostUsage {
     pub currency: String,
     pub rate: f32,
     pub base_currency: String,
+    /// Effective commission rate applied to this referred VM's first payment, as
+    /// a whole percentage: the referrer's override if set, else the referred
+    /// VM's `company.referral_rate` default.
+    #[sqlx(default)]
+    pub effective_rate: f32,
+}
+
+impl ReferralCostUsage {
+    /// Commission earned on this referral: `amount * effective_rate%`, floored,
+    /// in the same smallest-currency unit as `amount`.
+    pub fn commission(&self) -> u64 {
+        ((self.amount as f64) * (self.effective_rate as f64 / 100.0)).floor() as u64
+    }
+}
+
+/// How a referrer receives their commission payouts. Stored as a small integer;
+/// new methods are added as new variants (append-only to preserve values).
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ReferralPayoutMode {
+    /// Pay to the referrer's Lightning address (LNURL-pay).
+    #[default]
+    LightningAddress = 0,
+    /// Pay via the referrer's Nostr Wallet Connect (NWC) connection.
+    Nwc = 1,
+    /// Credit the referrer's account balance (not yet implemented).
+    AccountCredit = 2,
+}
+
+impl Display for ReferralPayoutMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReferralPayoutMode::LightningAddress => "lightning_address",
+            ReferralPayoutMode::Nwc => "nwc",
+            ReferralPayoutMode::AccountCredit => "account_credit",
+        })
+    }
+}
+
+impl FromStr for ReferralPayoutMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "lightning_address" | "lightning" | "lnaddress" => {
+                Ok(ReferralPayoutMode::LightningAddress)
+            }
+            "nwc" => Ok(ReferralPayoutMode::Nwc),
+            "account_credit" | "credit" => Ok(ReferralPayoutMode::AccountCredit),
+            other => anyhow::bail!("Invalid referral payout mode: {}", other),
+        }
+    }
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1456,6 +1513,11 @@ pub struct Company {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: String,
+    /// Default referral commission, as a whole percentage of a referred VM's
+    /// first payment (e.g. `10.0` = 10%). Applies when the referrer has no
+    /// per-referrer override. `0` disables commission for this company.
+    #[sqlx(default)]
+    pub referral_rate: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1598,6 +1660,7 @@ pub enum AdminResource {
     DnsServer = 22,
     UserPaymentMethod = 23,
     ResourceCost = 24,
+    Referral = 25,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1638,6 +1701,7 @@ impl Display for AdminResource {
             AdminResource::DnsServer => write!(f, "dns_server"),
             AdminResource::UserPaymentMethod => write!(f, "user_payment_method"),
             AdminResource::ResourceCost => write!(f, "resource_cost"),
+            AdminResource::Referral => write!(f, "referral"),
         }
     }
 }
@@ -1672,6 +1736,7 @@ impl FromStr for AdminResource {
             "dns_server" => Ok(AdminResource::DnsServer),
             "user_payment_method" => Ok(AdminResource::UserPaymentMethod),
             "resource_cost" => Ok(AdminResource::ResourceCost),
+            "referral" => Ok(AdminResource::Referral),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1707,6 +1772,7 @@ impl TryFrom<u16> for AdminResource {
             22 => Ok(AdminResource::DnsServer),
             23 => Ok(AdminResource::UserPaymentMethod),
             24 => Ok(AdminResource::ResourceCost),
+            25 => Ok(AdminResource::Referral),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1741,6 +1807,7 @@ impl AdminResource {
             AdminResource::DnsServer,
             AdminResource::UserPaymentMethod,
             AdminResource::ResourceCost,
+            AdminResource::Referral,
         ]
     }
 }
@@ -2043,6 +2110,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_referral_payout_mode_roundtrip() {
+        for (s, m) in [
+            ("lightning_address", ReferralPayoutMode::LightningAddress),
+            ("nwc", ReferralPayoutMode::Nwc),
+            ("account_credit", ReferralPayoutMode::AccountCredit),
+        ] {
+            assert_eq!(ReferralPayoutMode::from_str(s).unwrap(), m);
+            assert_eq!(m.to_string(), s);
+        }
+        // Aliases + case-insensitivity
+        assert_eq!(
+            ReferralPayoutMode::from_str("NWC").unwrap(),
+            ReferralPayoutMode::Nwc
+        );
+        assert_eq!(
+            ReferralPayoutMode::from_str("lightning").unwrap(),
+            ReferralPayoutMode::LightningAddress
+        );
+        assert!(ReferralPayoutMode::from_str("bogus").is_err());
+        assert_eq!(
+            ReferralPayoutMode::default(),
+            ReferralPayoutMode::LightningAddress
+        );
+    }
+
+    #[test]
+    fn test_referral_cost_usage_commission() {
+        let mut u = ReferralCostUsage {
+            vm_id: 1,
+            ref_code: "X".to_string(),
+            created: Utc::now(),
+            amount: 10_000,
+            currency: "EUR".to_string(),
+            rate: 1.0,
+            base_currency: "EUR".to_string(),
+            effective_rate: 10.0,
+        };
+        // 10% of 10_000 = 1_000
+        assert_eq!(u.commission(), 1_000);
+        // 0% disables commission
+        u.effective_rate = 0.0;
+        assert_eq!(u.commission(), 0);
+        // Floored (2.5% of 101 = 2.525 -> 2)
+        u.amount = 101;
+        u.effective_rate = 2.5;
+        assert_eq!(u.commission(), 2);
+    }
+
+    #[test]
     fn test_user_payment_method_is_expired() {
         let mut pm = UserPaymentMethod {
             exp_year: Some(2029),
@@ -2125,6 +2241,20 @@ mod tests {
             AdminResource::ResourceCost
         );
         assert!(AdminResource::all().contains(&AdminResource::ResourceCost));
+    }
+
+    #[test]
+    fn test_admin_resource_referral_roundtrip() {
+        assert_eq!(
+            "referral".parse::<AdminResource>().unwrap(),
+            AdminResource::Referral
+        );
+        assert_eq!(AdminResource::Referral.to_string(), "referral");
+        assert_eq!(
+            AdminResource::try_from(25u16).unwrap(),
+            AdminResource::Referral
+        );
+        assert!(AdminResource::all().contains(&AdminResource::Referral));
     }
 
     #[test]

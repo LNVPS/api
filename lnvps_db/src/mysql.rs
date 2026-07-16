@@ -2924,22 +2924,48 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, lightning_address, use_nwc) VALUES (?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, lightning_address, mode, referral_rate) VALUES (?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
         .bind(&referral.lightning_address)
-        .bind(referral.use_nwc)
+        .bind(referral.mode)
+        .bind(referral.referral_rate)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
     }
 
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
-        sqlx::query("UPDATE referral SET lightning_address = ?, use_nwc = ? WHERE id = ?")
-            .bind(&referral.lightning_address)
-            .bind(referral.use_nwc)
-            .bind(referral.id)
+        sqlx::query(
+            "UPDATE referral SET lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
+        )
+        .bind(&referral.lightning_address)
+        .bind(referral.mode)
+        .bind(referral.referral_rate)
+        .bind(referral.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_referral(&self, referral_id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM referral WHERE id = ?")
+            .bind(referral_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_all_referrals(&self) -> DbResult<Vec<Referral>> {
+        Ok(sqlx::query_as("SELECT * FROM referral ORDER BY id")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn delete_referral_payout(&self, payout_id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM referral_payout WHERE id = ?")
+            .bind(payout_id)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -2959,12 +2985,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
-        sqlx::query("UPDATE referral_payout SET is_paid = ?, pre_image = ? WHERE id = ?")
-            .bind(payout.is_paid)
-            .bind(&payout.pre_image)
-            .bind(payout.id)
-            .execute(&self.db)
-            .await?;
+        sqlx::query(
+            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ? WHERE id = ?",
+        )
+        .bind(payout.is_paid)
+        .bind(&payout.invoice)
+        .bind(&payout.pre_image)
+        .bind(payout.id)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -2985,7 +3014,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
                     sp.amount,
                     sp.currency,
                     sp.rate,
-                    c.base_currency
+                    c.base_currency,
+                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
              FROM vm v
              JOIN (
                  SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
@@ -2999,6 +3029,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
              JOIN vm_host vh ON v.host_id = vh.id
              JOIN vm_host_region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
+             LEFT JOIN referral r ON r.code = v.ref_code
              WHERE v.ref_code = ?
              ORDER BY sp.created DESC",
         )
@@ -4337,8 +4368,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_company(&self, company: &Company) -> DbResult<u64> {
         let result = sqlx::query(
-            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)"#,
+            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency, referral_rate)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)"#,
         )
         .bind(&company.name)
         .bind(&company.address_1)
@@ -4351,6 +4382,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.phone)
         .bind(&company.email)
             .bind(&company.base_currency)
+        .bind(company.referral_rate)
         .execute(&self.db)
         .await?;
 
@@ -4361,7 +4393,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"UPDATE company SET 
                name = ?, address_1 = ?, address_2 = ?, city = ?, state = ?, 
-               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?
+               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?, referral_rate = ?
                WHERE id = ?"#,
         )
         .bind(&company.name)
@@ -4375,6 +4407,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.phone)
         .bind(&company.email)
         .bind(&company.base_currency)
+        .bind(company.referral_rate)
         .bind(company.id)
         .execute(&self.db)
         .await?;
@@ -4471,7 +4504,8 @@ impl AdminDb for LNVpsDbMysql {
                                 sp.amount,
                                 sp.currency,
                                 sp.rate,
-                                c.base_currency
+                                c.base_currency,
+                                COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
                          FROM vm v
                          JOIN (
                              SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
@@ -4485,6 +4519,7 @@ impl AdminDb for LNVpsDbMysql {
                          JOIN vm_host vh ON v.host_id = vh.id
                          JOIN vm_host_region vhr ON vh.region_id = vhr.id
                          JOIN company c ON vhr.company_id = c.id
+                         LEFT JOIN referral r ON r.code = v.ref_code
                          WHERE v.ref_code IS NOT NULL
                            AND sp.created >= ?
                            AND sp.created <= ?
@@ -4506,6 +4541,58 @@ impl AdminDb for LNVpsDbMysql {
         }
 
         Ok(db_query.fetch_all(&self.db).await?)
+    }
+
+    async fn admin_list_referrals(
+        &self,
+        limit: u64,
+        offset: u64,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<Referral>, u64)> {
+        // A 64-char hex search term is treated as a user pubkey (matched via
+        // SQL HEX() so the DB layer needs no hex dependency); otherwise the term
+        // is matched against the referral code as a substring.
+        let pubkey_hex = search
+            .map(str::trim)
+            .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+        let code_like = match (pubkey_hex, search) {
+            (None, Some(s)) if !s.trim().is_empty() => Some(format!("%{}%", s.trim())),
+            _ => None,
+        };
+
+        let where_clause = if pubkey_hex.is_some() {
+            "WHERE r.user_id = (SELECT id FROM users WHERE HEX(pubkey) = ?)"
+        } else if code_like.is_some() {
+            "WHERE r.code LIKE ?"
+        } else {
+            ""
+        };
+
+        let list_sql = format!(
+            "SELECT r.* FROM referral r {where_clause} ORDER BY r.created DESC LIMIT ? OFFSET ?"
+        );
+        let count_sql = format!("SELECT COUNT(*) FROM referral r {where_clause}");
+
+        let mut list_q = sqlx::query_as::<_, Referral>(&list_sql);
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        if let Some(pk) = pubkey_hex {
+            let up = pk.to_uppercase();
+            list_q = list_q.bind(up.clone());
+            count_q = count_q.bind(up);
+        } else if let Some(like) = &code_like {
+            list_q = list_q.bind(like.clone());
+            count_q = count_q.bind(like.clone());
+        }
+        let rows = list_q.bind(limit).bind(offset).fetch_all(&self.db).await?;
+        let total = count_q.fetch_one(&self.db).await? as u64;
+        Ok((rows, total))
+    }
+
+    async fn admin_get_referral(&self, referral_id: u64) -> DbResult<Referral> {
+        Ok(sqlx::query_as("SELECT * FROM referral WHERE id = ?")
+            .bind(referral_id)
+            .fetch_one(&self.db)
+            .await?)
     }
 
     async fn admin_list_ip_ranges(

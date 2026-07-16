@@ -150,7 +150,10 @@ mod tests {
             let expect_vms = has_vms == "true";
             for u in &data.data {
                 let has = u["vm_count"].as_u64().unwrap_or(0) > 0;
-                assert_eq!(has, expect_vms, "has_vms={has_vms} returned mismatched user");
+                assert_eq!(
+                    has, expect_vms,
+                    "has_vms={has_vms} returned mismatched user"
+                );
             }
         }
 

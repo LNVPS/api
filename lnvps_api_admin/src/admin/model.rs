@@ -1827,6 +1827,9 @@ pub struct AdminCompanyInfo {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: String,
+    /// Default referral commission for VMs sold by this company, as a whole
+    /// percentage of a referred VM's first payment (0 = disabled).
+    pub referral_rate: f32,
     pub region_count: u64, // Number of regions assigned to this company
 }
 
@@ -1843,6 +1846,8 @@ pub struct CreateCompanyRequest {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: Option<String>, // 3-letter ISO currency code (default: EUR)
+    /// Default referral commission %, whole percentage (default 0).
+    pub referral_rate: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1858,6 +1863,8 @@ pub struct UpdateCompanyRequest {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: Option<String>, // 3-letter ISO currency code
+    /// Default referral commission %, whole percentage.
+    pub referral_rate: Option<f32>,
 }
 
 impl From<lnvps_db::Company> for AdminCompanyInfo {
@@ -1876,9 +1883,122 @@ impl From<lnvps_db::Company> for AdminCompanyInfo {
             phone: company.phone,
             email: company.email,
             base_currency: company.base_currency,
+            referral_rate: company.referral_rate,
             region_count: 0, // Will be filled by handler
         }
     }
+}
+
+// Referral Program Management Models
+
+/// A referral enrollment as seen by admins. Never exposes NWC secrets (the NWC
+/// connection lives on the user's payment method, not here).
+#[derive(Serialize)]
+pub struct AdminReferralInfo {
+    pub id: u64,
+    pub user_id: u64,
+    /// Owner's Nostr pubkey (hex), for cross-referencing with users.
+    pub user_pubkey: String,
+    pub code: String,
+    pub lightning_address: Option<String>,
+    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    pub mode: String,
+    /// Per-referrer commission override (whole %); `null` = use company default.
+    pub referral_rate: Option<f32>,
+    pub created: DateTime<Utc>,
+}
+
+/// Per-currency earned commission for a referral.
+#[derive(Serialize)]
+pub struct AdminReferralEarning {
+    pub currency: String,
+    /// Commission earned = sum of (first payment * effective_rate%) in this currency.
+    pub amount: u64,
+}
+
+/// A payout record for a referral (admin view; includes preimage for audit).
+#[derive(Serialize)]
+pub struct AdminReferralPayoutInfo {
+    pub id: u64,
+    pub amount: u64,
+    pub currency: String,
+    pub created: DateTime<Utc>,
+    pub is_paid: bool,
+    pub invoice: Option<String>,
+    /// Payment preimage (hex), when the payout has been settled.
+    pub pre_image: Option<String>,
+}
+
+impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
+    fn from(p: lnvps_db::ReferralPayout) -> Self {
+        Self {
+            id: p.id,
+            amount: p.amount,
+            currency: p.currency,
+            created: p.created,
+            is_paid: p.is_paid,
+            invoice: p.invoice,
+            pre_image: p.pre_image.map(hex::encode),
+        }
+    }
+}
+
+/// Full referral detail: enrollment + earnings + payout history + counts.
+#[derive(Serialize)]
+pub struct AdminReferralDetail {
+    #[serde(flatten)]
+    pub referral: AdminReferralInfo,
+    pub earned: Vec<AdminReferralEarning>,
+    pub payouts: Vec<AdminReferralPayoutInfo>,
+    /// Referred VMs that made at least one payment.
+    pub referrals_success: u64,
+    /// Referred VMs that never made a payment.
+    pub referrals_failed: u64,
+}
+
+/// Update a referral's admin-controlled fields (currently the commission override).
+#[derive(Deserialize)]
+pub struct AdminUpdateReferralRequest {
+    /// Set (`Some(Some(rate))`) or clear (`Some(None)`) the per-referrer
+    /// commission override, as a whole percentage; omitted leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub referral_rate: Option<Option<f32>>,
+}
+
+/// Create a manual payout record for a referral.
+#[derive(Deserialize)]
+pub struct AdminCreateReferralPayoutRequest {
+    /// Amount in the smallest currency unit.
+    pub amount: u64,
+    /// Currency code (e.g. `BTC`, `EUR`).
+    pub currency: String,
+    /// Optional Lightning invoice associated with the payout.
+    pub invoice: Option<String>,
+    /// Mark the payout as already paid (e.g. reconciling an out-of-band payment).
+    #[serde(default)]
+    pub is_paid: bool,
+}
+
+/// Update / reconcile a payout record.
+#[derive(Deserialize)]
+pub struct AdminUpdateReferralPayoutRequest {
+    /// Mark paid / unpaid.
+    pub is_paid: Option<bool>,
+    /// Set or clear the associated Lightning invoice.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub invoice: Option<Option<String>>,
+    /// Set or clear the payment preimage (hex-encoded, 32 bytes).
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub pre_image: Option<Option<String>>,
 }
 
 // IP Range Management Models

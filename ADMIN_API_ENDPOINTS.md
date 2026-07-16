@@ -1962,13 +1962,16 @@ Body:
   // Optional - Postal/ZIP code
   "phone": "string | null",
   // Optional - Phone number
-  "email": "string | null"
+  "email": "string | null",
   // Optional - Contact email
+  "referral_rate": 0.0
+  // Optional - Default referral commission (whole %, default 0) applied to a
+  // referred VM's first payment when the referrer has no per-referrer override
 }
 ```
 
 The `base_currency` field is validated against the supported Currency enum values. Invalid currency codes will be
-rejected with an error message listing valid currencies.
+rejected with an error message listing valid currencies. `referral_rate` must be >= 0.
 
 #### Update Company
 
@@ -2002,12 +2005,16 @@ Body (all optional):
   // Postal/ZIP code
   "phone": "string | null",
   // Phone number
-  "email": "string | null"
+  "email": "string | null",
   // Contact email
+  "referral_rate": 0.0
+  // Default referral commission (whole %); must be >= 0
 }
 ```
 
-The `base_currency` field is validated against the supported Currency enum values.
+The `base_currency` field is validated against the supported Currency enum values. `referral_rate` (when provided) must be >= 0.
+
+GET/list company responses include `referral_rate` (the company's default referral commission %).
 
 Note: Empty strings are treated as null values (clearing the field).
 
@@ -2997,6 +3004,151 @@ All messages are structured with a `type` field for consistent handling:
   }
   ```
 
+### Referral Program Management
+
+All endpoints require the `referral` resource permissions. Responses never expose
+NWC connection secrets (the NWC connection lives on the user's payment method).
+
+#### List Referrals
+
+```
+GET /api/admin/v1/referrals
+```
+
+Required Permission: `referral::view`
+
+Query Parameters:
+
+- `limit`: number (optional, default 50, max 100)
+- `offset`: number (optional, default 0)
+- `search`: string (optional) - substring match on referral code, or a 64-char hex user pubkey
+
+Returns a paginated list of `AdminReferralInfo`:
+
+```json
+{
+  "data": [
+    {
+      "id": 12,
+      "user_id": 34,
+      "user_pubkey": "<hex>",
+      "code": "ALPHA123",
+      "lightning_address": "user@domain.com",
+      "mode": "lightning_address",
+      "referral_rate": 12.5,
+      "created": "2026-07-18T10:00:00Z"
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`referral_rate` is the per-referrer commission override (whole %); `null` means the referred VM's `company.referral_rate` default applies.
+
+#### Get Referral Detail
+
+```
+GET /api/admin/v1/referrals/{id}
+```
+
+Required Permission: `referral::view`
+
+Returns the referral plus per-currency earned commission, payout history and counts:
+
+```json
+{
+  "data": {
+    "id": 12,
+    "user_id": 34,
+    "user_pubkey": "<hex>",
+    "code": "ALPHA123",
+    "lightning_address": "user@domain.com",
+    "mode": "lightning_address",
+    "referral_rate": 12.5,
+    "created": "2026-07-18T10:00:00Z",
+    "earned": [ { "currency": "BTC", "amount": 5000 } ],
+    "payouts": [
+      { "id": 1, "amount": 5000, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "invoice": "lnbc...", "pre_image": "<hex>" }
+    ],
+    "referrals_success": 3,
+    "referrals_failed": 1
+  }
+}
+```
+
+`earned` is commission (`first payment * effective_rate%`) aggregated per currency.
+
+#### Update Referral (commission override)
+
+```
+PATCH /api/admin/v1/referrals/{id}
+```
+
+Required Permission: `referral::update`
+
+Body:
+
+```json
+{
+  "referral_rate": 12.5
+  // Set (number, >= 0), clear to company default (null), or omit to leave unchanged
+}
+```
+
+#### List Referral Payouts
+
+```
+GET /api/admin/v1/referrals/{id}/payouts
+```
+
+Required Permission: `referral::view`
+
+Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first.
+
+#### Create Referral Payout
+
+```
+POST /api/admin/v1/referrals/{id}/payouts
+```
+
+Required Permission: `referral::create`
+
+Creates a manual payout record (e.g. reconciling an out-of-band payment).
+
+```json
+{
+  "amount": 5000,
+  // Required - smallest currency unit, > 0
+  "currency": "BTC",
+  // Required
+  "invoice": "lnbc...",
+  // Optional - associated Lightning invoice
+  "is_paid": false
+  // Optional - mark already paid (default false)
+}
+```
+
+#### Update / Reconcile Referral Payout
+
+```
+PATCH /api/admin/v1/referrals/{id}/payouts/{payout_id}
+```
+
+Required Permission: `referral::update`
+
+```json
+{
+  "is_paid": true,
+  // Optional - mark paid/unpaid
+  "invoice": "lnbc...",
+  // Optional - set (string) or clear (null) the invoice
+  "pre_image": "<hex>"
+  // Optional - set (hex, 32 bytes) or clear (null) the payment preimage
+}
+```
+
 ### Reports
 
 #### Time Series Report
@@ -3079,12 +3231,16 @@ Response:
         "amount": 125000,
         "currency": "USD",
         "rate": 1.0,
-        "base_currency": "USD"
+        "base_currency": "USD",
+        "effective_rate": 10.0,
+        "commission": 12500
       }
     ]
   }
 }
 ```
+
+`amount` is the referred VM's first payment; `effective_rate` is the applied commission % (the referrer's per-referrer override if set, else the referred VM's `company.referral_rate`); `commission = amount * effective_rate%` (floored), in `currency` smallest units.
 
 #### Profit/Loss Report
 
