@@ -278,24 +278,25 @@ mod tests {
         let referrer_keys = nostr::Keys::generate();
         let referrer = user_client_with_keys(referrer_keys.clone());
 
-        // Referrer signs up for referral program (use_nwc requires NWC
-        // configured, lightning_address requires resolution — neither
-        // works in a local test, so test the error handling first)
+        // Referrer signs up for referral program. Default mode is
+        // lightning_address (requires a resolvable address) and nwc mode
+        // requires an NWC connection — neither works in a local test, so test
+        // the error handling first.
         let resp = referrer
-            .post_auth("/api/v1/referral", &serde_json::json!({"use_nwc": false}))
+            .post_auth("/api/v1/referral", &serde_json::json!({}))
             .await
             .unwrap();
-        // Should fail: no payout method specified
+        // Should fail: lightning_address required for default mode
         assert_ne!(resp.status(), StatusCode::OK);
         eprintln!("Referral signup without payout method correctly rejected");
 
-        // Sign up with use_nwc=true — will fail because no NWC configured
+        // Sign up with mode=nwc — will fail because no NWC configured
         let resp = referrer
-            .post_auth("/api/v1/referral", &serde_json::json!({"use_nwc": true}))
+            .post_auth("/api/v1/referral", &serde_json::json!({"mode": "nwc"}))
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::OK);
-        eprintln!("Referral signup with use_nwc but no NWC string correctly rejected");
+        eprintln!("Referral signup with mode=nwc but no NWC string correctly rejected");
 
         // Insert referral directly via DB (bypasses lightning address validation)
         let ref_code = format!("E2E{}", &format!("{ts}")[..5]);

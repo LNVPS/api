@@ -1962,13 +1962,16 @@ Body:
   // Optional - Postal/ZIP code
   "phone": "string | null",
   // Optional - Phone number
-  "email": "string | null"
+  "email": "string | null",
   // Optional - Contact email
+  "referral_rate": 0.0
+  // Optional - Default referral commission (whole %, default 0) applied to a
+  // referred VM's first payment when the referrer has no per-referrer override
 }
 ```
 
 The `base_currency` field is validated against the supported Currency enum values. Invalid currency codes will be
-rejected with an error message listing valid currencies.
+rejected with an error message listing valid currencies. `referral_rate` must be >= 0.
 
 #### Update Company
 
@@ -2002,12 +2005,16 @@ Body (all optional):
   // Postal/ZIP code
   "phone": "string | null",
   // Phone number
-  "email": "string | null"
+  "email": "string | null",
   // Contact email
+  "referral_rate": 0.0
+  // Default referral commission (whole %); must be >= 0
 }
 ```
 
-The `base_currency` field is validated against the supported Currency enum values.
+The `base_currency` field is validated against the supported Currency enum values. `referral_rate` (when provided) must be >= 0.
+
+GET/list company responses include `referral_rate` (the company's default referral commission %).
 
 Note: Empty strings are treated as null values (clearing the field).
 
@@ -3079,12 +3086,16 @@ Response:
         "amount": 125000,
         "currency": "USD",
         "rate": 1.0,
-        "base_currency": "USD"
+        "base_currency": "USD",
+        "effective_rate": 10.0,
+        "commission": 12500
       }
     ]
   }
 }
 ```
+
+`amount` is the referred VM's first payment; `effective_rate` is the applied commission % (the referrer's per-referrer override if set, else the referred VM's `company.referral_rate`); `commission = amount * effective_rate%` (floored), in `currency` smallest units.
 
 #### Profit/Loss Report
 

@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Flexible referral payout mode (replaces `use_nwc`)
+  - The referral payout method is now an extensible `mode` enum instead of the `use_nwc` boolean. `GET /api/v1/referral` returns `mode` (`lightning_address` | `nwc` | `account_credit`) instead of `use_nwc`. `POST`/`PATCH /api/v1/referral` accept `mode` instead of `use_nwc`: `lightning_address` (default) requires a resolvable `lightning_address`; `nwc` requires a configured NWC connection; `account_credit` is reserved for a future account-balance payout and is currently rejected. Existing enrollments migrate `use_nwc = true` → `nwc`, otherwise `lightning_address`.
+
+- **2026-07-18** - Referral commission rate (percentage of first payment)
+  - The referral program now pays a commission = a percentage of each referred VM's **first** payment. The effective rate is per-referrer with a company default: `company.referral_rate` (new, default `0`) applies unless the referrer has an override. Admin company `POST`/`PATCH /api/admin/v1/companies` accept `referral_rate` (whole %, `>= 0`) and GET/list responses expose it.
+  - `GET /api/v1/referral` now returns `referral_rate` (the per-referrer override, `null` = use company default; read-only — set by admins) and its `earned` amounts are now the commission (`payment * effective_rate%`) rather than the full first payment.
+  - `GET /api/admin/v1/reports/referral-usage/time-series` rows gain `effective_rate` and `commission`.
+
 - **2026-07-18** - OSS (One-Stop Shop) VAT report
   - `GET /api/admin/v1/reports/oss` aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing period and destination member state for transcription onto an OSS VAT return. Query params: `start_date`, `end_date` (YYYY-MM-DD), optional `company_id` (`0`/omitted = all), and `period` = `quarter` (default, calendar Q1-Q4) | `bimonthly` (two-month buckets B1-B6). Rows are keyed by `(period, company, destination country, VAT rate)` and expressed in each seller company's base currency using the exchange rate frozen on each payment. Only paid payments are counted. Requires `analytics::view`.
 

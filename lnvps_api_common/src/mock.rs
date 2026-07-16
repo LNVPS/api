@@ -275,6 +275,7 @@ impl Default for MockDb {
                         phone: None,
                         email: None,
                         base_currency: "EUR".to_string(),
+                        referral_rate: 0.0,
                     },
                 );
                 companies
@@ -2479,7 +2480,8 @@ impl LNVpsDbBase for MockDb {
         let mut referrals = self.referrals.lock().await;
         if let Some(r) = referrals.get_mut(&referral.id) {
             r.lightning_address = referral.lightning_address.clone();
-            r.use_nwc = referral.use_nwc;
+            r.mode = referral.mode;
+            r.referral_rate = referral.referral_rate;
         }
         Ok(())
     }
@@ -2516,6 +2518,24 @@ impl LNVpsDbBase for MockDb {
         let vms = self.vms.lock().await;
         let line_items = self.subscription_line_items.lock().await;
         let sub_payments = self.subscription_payments.lock().await;
+        // Effective rate: referrer override, else the default company's rate.
+        let effective_rate = {
+            let referrals = self.referrals.lock().await;
+            let override_rate = referrals
+                .values()
+                .find(|r| r.code == code)
+                .and_then(|r| r.referral_rate);
+            match override_rate {
+                Some(r) => r,
+                None => self
+                    .companies
+                    .lock()
+                    .await
+                    .get(&1)
+                    .map(|c| c.referral_rate)
+                    .unwrap_or(0.0),
+            }
+        };
         let mut result = Vec::new();
         for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
             let subscription_id = line_items
@@ -2536,6 +2556,7 @@ impl LNVpsDbBase for MockDb {
                         currency: first.currency.clone(),
                         rate: first.rate,
                         base_currency: "EUR".to_string(),
+                        effective_rate,
                     });
                 }
             }

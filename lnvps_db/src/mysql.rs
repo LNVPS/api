@@ -2924,21 +2924,25 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, lightning_address, use_nwc) VALUES (?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, lightning_address, mode, referral_rate) VALUES (?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
         .bind(&referral.lightning_address)
-        .bind(referral.use_nwc)
+        .bind(referral.mode)
+        .bind(referral.referral_rate)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
     }
 
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
-        sqlx::query("UPDATE referral SET lightning_address = ?, use_nwc = ? WHERE id = ?")
+        sqlx::query(
+            "UPDATE referral SET lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
+        )
             .bind(&referral.lightning_address)
-            .bind(referral.use_nwc)
+            .bind(referral.mode)
+            .bind(referral.referral_rate)
             .bind(referral.id)
             .execute(&self.db)
             .await?;
@@ -2985,7 +2989,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
                     sp.amount,
                     sp.currency,
                     sp.rate,
-                    c.base_currency
+                    c.base_currency,
+                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
              FROM vm v
              JOIN (
                  SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
@@ -2999,6 +3004,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
              JOIN vm_host vh ON v.host_id = vh.id
              JOIN vm_host_region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
+             LEFT JOIN referral r ON r.code = v.ref_code
              WHERE v.ref_code = ?
              ORDER BY sp.created DESC",
         )
@@ -4337,8 +4343,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_company(&self, company: &Company) -> DbResult<u64> {
         let result = sqlx::query(
-            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)"#,
+            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency, referral_rate)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)"#,
         )
         .bind(&company.name)
         .bind(&company.address_1)
@@ -4351,6 +4357,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.phone)
         .bind(&company.email)
             .bind(&company.base_currency)
+        .bind(company.referral_rate)
         .execute(&self.db)
         .await?;
 
@@ -4361,7 +4368,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"UPDATE company SET 
                name = ?, address_1 = ?, address_2 = ?, city = ?, state = ?, 
-               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?
+               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?, referral_rate = ?
                WHERE id = ?"#,
         )
         .bind(&company.name)
@@ -4375,6 +4382,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.phone)
         .bind(&company.email)
         .bind(&company.base_currency)
+        .bind(company.referral_rate)
         .bind(company.id)
         .execute(&self.db)
         .await?;
@@ -4471,7 +4479,8 @@ impl AdminDb for LNVpsDbMysql {
                                 sp.amount,
                                 sp.currency,
                                 sp.rate,
-                                c.base_currency
+                                c.base_currency,
+                                COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
                          FROM vm v
                          JOIN (
                              SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
@@ -4485,6 +4494,7 @@ impl AdminDb for LNVpsDbMysql {
                          JOIN vm_host vh ON v.host_id = vh.id
                          JOIN vm_host_region vhr ON vh.region_id = vhr.id
                          JOIN company c ON vhr.company_id = c.id
+                         LEFT JOIN referral r ON r.code = v.ref_code
                          WHERE v.ref_code IS NOT NULL
                            AND sp.created >= ?
                            AND sp.created <= ?

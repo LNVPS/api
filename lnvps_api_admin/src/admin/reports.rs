@@ -57,6 +57,10 @@ struct ReferralReport {
     currency: String,
     rate: f32,
     base_currency: String,
+    /// Effective commission rate applied (referrer override or company default), %.
+    effective_rate: f32,
+    /// Commission earned = amount * effective_rate%, in `currency` smallest units.
+    commission: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -235,14 +239,19 @@ async fn admin_referral_time_series_report(
 
     let mut referrals: Vec<ReferralReport> = referral_data
         .into_iter()
-        .map(|data| ReferralReport {
-            vm_id: data.vm_id,
-            ref_code: data.ref_code,
-            created: data.created.to_rfc3339(),
-            amount: data.amount,
-            currency: data.currency,
-            rate: data.rate,
-            base_currency: data.base_currency,
+        .map(|data| {
+            let commission = data.commission();
+            ReferralReport {
+                vm_id: data.vm_id,
+                ref_code: data.ref_code,
+                created: data.created.to_rfc3339(),
+                amount: data.amount,
+                currency: data.currency,
+                rate: data.rate,
+                base_currency: data.base_currency,
+                effective_rate: data.effective_rate,
+                commission,
+            }
         })
         .collect();
 

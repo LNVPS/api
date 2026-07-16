@@ -1827,6 +1827,9 @@ pub struct AdminCompanyInfo {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: String,
+    /// Default referral commission for VMs sold by this company, as a whole
+    /// percentage of a referred VM's first payment (0 = disabled).
+    pub referral_rate: f32,
     pub region_count: u64, // Number of regions assigned to this company
 }
 
@@ -1843,6 +1846,8 @@ pub struct CreateCompanyRequest {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: Option<String>, // 3-letter ISO currency code (default: EUR)
+    /// Default referral commission %, whole percentage (default 0).
+    pub referral_rate: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1858,6 +1863,8 @@ pub struct UpdateCompanyRequest {
     pub phone: Option<String>,
     pub email: Option<String>,
     pub base_currency: Option<String>, // 3-letter ISO currency code
+    /// Default referral commission %, whole percentage.
+    pub referral_rate: Option<f32>,
 }
 
 impl From<lnvps_db::Company> for AdminCompanyInfo {
@@ -1876,6 +1883,7 @@ impl From<lnvps_db::Company> for AdminCompanyInfo {
             phone: company.phone,
             email: company.email,
             base_currency: company.base_currency,
+            referral_rate: company.referral_rate,
             region_count: 0, // Will be filled by handler
         }
     }

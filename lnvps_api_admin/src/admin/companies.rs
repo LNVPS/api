@@ -156,6 +156,7 @@ async fn admin_create_company(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         base_currency,
+        referral_rate: req.referral_rate.unwrap_or(0.0).max(0.0),
     };
 
     let company_id = this.db.admin_create_company(&company).await?;
@@ -265,6 +266,12 @@ async fn admin_update_company(
             }
             company.base_currency = currency;
         }
+    }
+    if let Some(rate) = req.referral_rate {
+        if rate < 0.0 {
+            return ApiData::err("referral_rate cannot be negative");
+        }
+        company.referral_rate = rate;
     }
 
     // Update company in database
