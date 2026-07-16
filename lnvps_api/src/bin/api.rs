@@ -196,6 +196,7 @@ async fn main() -> Result<(), Error> {
         db.clone(),
         work_commander.clone(),
         sub_handler.clone(),
+        node.clone(),
         &settings,
         status.clone(),
         nostr_client.clone(),
@@ -211,6 +212,13 @@ async fn main() -> Result<(), Error> {
         tasks.push(worker.spawn_job_interval(WorkJob::CheckSubscriptions, Duration::from_secs(30)));
         // Refresh cached router tunnel/BGP session/route state + traffic every 60s
         tasks.push(worker.spawn_job_interval(WorkJob::SyncRouterState, Duration::from_secs(60)));
+        // Automated referral payouts are opt-in (config-gated); run hourly.
+        if settings.referral.is_some() {
+            tasks.push(
+                worker
+                    .spawn_job_interval(WorkJob::ProcessReferralPayouts, Duration::from_secs(3600)),
+            );
+        }
         tasks.push(worker.spawn_handler_loop());
 
         // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)

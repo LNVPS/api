@@ -84,11 +84,21 @@ not users. `referral.referral_rate` NULL = use company default.
 `PATCH /api/admin/v1/referrals/{id}`.
 
 ### PR 3 — Automated payout processing (worker)  [L]
-- [ ] Accrual: owed = sum(reward per referred VM first payment) − sum(existing payouts) per currency.
-- [ ] Config: min payout threshold + schedule; expose in settings.
-- [ ] Worker job: create `ReferralPayout`, pay via Lightning address (LNURL-pay)
-      or NWC, capture `pre_image`, mark `is_paid`; failure handling + retries + notifications.
-- [ ] Expose `pre_image` (hex) in `ApiReferralPayout`. Tests, docs, changelog.
+- [x] Accrual: owed BTC = sum(commission on first payments) − sum(existing BTC
+      payouts, paid + reserved). Only BTC is auto-paid (Lightning settles sats);
+      fiat commission left for manual admin payout.
+- [x] Config: opt-in `referral` settings section (`min-payout-sats`, default
+      1000). Absent = automated payouts disabled. Job scheduled hourly, gated on config.
+- [x] Dedicated `ReferralPayoutHandler` (`lnvps_api/src/referral/mod.rs`) —
+      **not** in SubscriptionHandler. Reserve-then-pay (delete reservation on
+      failure) so no double-pay; LNURL-pay + NWC make_invoice; captures pre_image;
+      notifies referrer. New DB base methods `list_all_referrals` /
+      `delete_referral_payout`; `update_referral_payout` also persists invoice.
+- [x] Expose `pre_image` (hex) in `ApiReferralPayout`. Tests (payable math),
+      docs, changelog.
+
+**PR3 committed:** (pending). Note: enabled lnurl-rs `async-https-native`
+feature; new `WorkJob::ProcessReferralPayouts`; `Worker::new` gained a `node` param.
 
 ### PR 4 — User API extras  [M]
 - [ ] `DELETE /api/v1/referral` (leave program; guard pending payouts).

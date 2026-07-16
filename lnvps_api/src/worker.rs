@@ -104,6 +104,7 @@ pub struct Worker {
     feedback: Arc<dyn WorkFeedback>,
     kv: Arc<dyn KeyValueStore>,
     http_client: reqwest::Client,
+    referral_payouts: crate::referral::ReferralPayoutHandler,
 }
 
 #[derive(Clone)]
@@ -115,6 +116,9 @@ pub struct WorkerSettings {
     pub provisioner_config: ProvisionerConfig,
     pub redis: Option<RedisConfig>,
     pub nostr_hostname: Option<String>,
+    /// Minimum accrued BTC referral commission (satoshis) before an automated
+    /// payout is attempted. `None` disables automated referral payouts.
+    pub referral_min_payout_sats: Option<u64>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -127,6 +131,7 @@ impl From<&Settings> for WorkerSettings {
             provisioner_config: val.provisioner.clone(),
             redis: val.redis.clone(),
             nostr_hostname: val.nostr_address_host.clone(),
+            referral_min_payout_sats: val.referral.as_ref().map(|r| r.min_payout_sats),
         }
     }
 }
@@ -138,12 +143,19 @@ impl Worker {
         db: Arc<dyn LNVpsDb>,
         work_commander: Arc<dyn WorkCommander>,
         subscription_handler: SubscriptionHandler,
+        node: Arc<dyn payments_rs::lightning::LightningNode>,
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
         nostr: Option<Client>,
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         let settings = settings.into();
+        let referral_payouts = crate::referral::ReferralPayoutHandler::new(
+            db.clone(),
+            node,
+            work_commander.clone(),
+            settings.referral_min_payout_sats,
+        );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
             Arc::new(RedisKeyValueStore::new(&c.url).await?)
@@ -173,6 +185,7 @@ impl Worker {
             settings,
             work_commander,
             http_client,
+            referral_payouts,
         })
     }
 
@@ -1969,6 +1982,9 @@ impl Worker {
             WorkJob::CheckSubscriptions => {
                 self.check_subscriptions().await?;
             }
+            WorkJob::ProcessReferralPayouts => {
+                self.referral_payouts.process_payouts().await?;
+            }
             WorkJob::SyncRouterState => {
                 self.sync_router_state().await?;
             }
@@ -2974,13 +2990,22 @@ mod tests {
         let sub_handler = SubscriptionHandler::new(
             settings.clone(),
             db.clone(),
-            node,
+            node.clone(),
             rates,
             lnvps_api_common::VatClient::new(),
             work_commander.clone(),
             cache.clone(),
         )?;
-        Worker::new(db, work_commander, sub_handler, &settings, cache, None).await
+        Worker::new(
+            db,
+            work_commander,
+            sub_handler,
+            node,
+            &settings,
+            cache,
+            None,
+        )
+        .await
     }
 
     /// Create a VM linked to a subscription with the given created timestamp and is_setup state.

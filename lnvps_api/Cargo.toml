@@ -79,7 +79,7 @@ rand = "0.9"
 clap = { version = "4.5", features = ["derive"] }
 ssh-key = "0.6"
 lettre = { version = "0.11", features = ["tokio1-native-tls"] }
-lnurl-rs = { version = "0.9", default-features = false }
+lnurl-rs = { version = "0.9", default-features = false, features = ["async-https-native"] }
 mustache = "0.9"
 isocountry = "0.3"
 hickory-resolver = "0.26"

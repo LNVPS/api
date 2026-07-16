@@ -802,11 +802,18 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update an existing referral entry
     async fn update_referral(&self, referral: &Referral) -> DbResult<()>;
 
+    /// List every referral enrollment (used by the automated payout job).
+    async fn list_all_referrals(&self) -> DbResult<Vec<Referral>>;
+
     /// Insert a new referral payout record
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64>;
 
     /// Update a referral payout record
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()>;
+
+    /// Delete a referral payout record (used to release a reserved payout when
+    /// the outgoing Lightning payment fails, so the balance can be retried).
+    async fn delete_referral_payout(&self, payout_id: u64) -> DbResult<()>;
 
     /// List all payout records for a referral
     async fn list_referral_payouts(&self, referral_id: u64) -> DbResult<Vec<ReferralPayout>>;

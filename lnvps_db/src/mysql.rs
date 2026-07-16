@@ -2949,6 +2949,20 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn list_all_referrals(&self) -> DbResult<Vec<Referral>> {
+        Ok(sqlx::query_as("SELECT * FROM referral ORDER BY id")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn delete_referral_payout(&self, payout_id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM referral_payout WHERE id = ?")
+            .bind(payout_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO referral_payout (referral_id, amount, currency, invoice) VALUES (?, ?, ?, ?) returning id",

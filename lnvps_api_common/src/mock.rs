@@ -2486,6 +2486,19 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn list_all_referrals(&self) -> DbResult<Vec<Referral>> {
+        let referrals = self.referrals.lock().await;
+        let mut all: Vec<Referral> = referrals.values().cloned().collect();
+        all.sort_by_key(|r| r.id);
+        Ok(all)
+    }
+
+    async fn delete_referral_payout(&self, payout_id: u64) -> DbResult<()> {
+        let mut payouts = self.referral_payouts.lock().await;
+        payouts.retain(|p| p.id != payout_id);
+        Ok(())
+    }
+
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let mut payouts = self.referral_payouts.lock().await;
         let new_id = payouts.len() as u64 + 1;

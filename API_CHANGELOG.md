@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Automated referral commission payouts
+  - A new opt-in worker job pays referrers their accrued **BTC** commission over Lightning. For each referrer whose owed commission (earned minus already paid/reserved) clears a configurable threshold, it reserves a payout, fetches a BOLT11 invoice (LNURL-pay for a `lightning_address` referrer, or NWC `make_invoice` for an `nwc` referrer), pays it from the node, and records the preimage. Non-BTC (fiat) commission is not auto-paid and is left for manual admin payout. Enabled by adding a `referral` config section (`min-payout-sats`, default 1000); when omitted, automated payouts are disabled. `GET /api/v1/referral` payout records now include `pre_image` (hex, once settled).
+
 - **2026-07-18** - Admin referral program management
   - New admin endpoints under the `referral` RBAC resource (granted to `super_admin`): `GET /api/admin/v1/referrals` (paginated; `search` by code substring or 64-char hex pubkey), `GET /api/admin/v1/referrals/{id}` (referral + per-currency earned commission + payout history + success/failed counts), `PATCH /api/admin/v1/referrals/{id}` (set/clear the per-referrer commission override), `GET`/`POST /api/admin/v1/referrals/{id}/payouts` (list / create a manual payout record), and `PATCH /api/admin/v1/referrals/{id}/payouts/{payout_id}` (mark paid / set invoice / set preimage for reconciliation). NWC secrets are never exposed.
 

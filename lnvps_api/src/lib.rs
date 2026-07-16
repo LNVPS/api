@@ -5,6 +5,7 @@ pub mod notifications;
 pub mod payment_factory;
 pub mod payments;
 pub mod provisioner;
+pub mod referral;
 pub mod router;
 pub mod settings;
 #[cfg(any(feature = "proxmox", feature = "linux-ssh"))]

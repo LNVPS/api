@@ -72,6 +72,8 @@ pub struct ApiReferralPayout {
     pub created: chrono::DateTime<Utc>,
     pub is_paid: bool,
     pub invoice: Option<String>,
+    /// Payment preimage (hex), present once the payout has settled.
+    pub pre_image: Option<String>,
 }
 
 impl From<ReferralPayout> for ApiReferralPayout {
@@ -83,6 +85,7 @@ impl From<ReferralPayout> for ApiReferralPayout {
             created: p.created,
             is_paid: p.is_paid,
             invoice: p.invoice,
+            pre_image: p.pre_image.map(hex::encode),
         }
     }
 }
