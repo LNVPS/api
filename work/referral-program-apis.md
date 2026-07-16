@@ -80,7 +80,7 @@ not users. `referral.referral_rate` NULL = use company default.
       (is_paid/invoice/pre_image).
 - [x] Sanitized (no NWC secrets). Tests, docs, changelog.
 
-**PR2 committed:** (pending). Per-referrer override is set here via
+**PR2 committed:** `4d19600`. Per-referrer override is set here via
 `PATCH /api/admin/v1/referrals/{id}`.
 
 ### PR 3 — Automated payout processing (worker)  [L]
