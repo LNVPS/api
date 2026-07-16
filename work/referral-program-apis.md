@@ -54,17 +54,20 @@ Decisions:
       (`lightning_address` | `nwc` | `account_credit`, extensible). Migration
       migrates use_nwc=1 -> nwc. API `mode` field replaces `use_nwc`;
       `account_credit` reserved/rejected until implemented.
-- [ ] Migration: add `referral_rate FLOAT NOT NULL DEFAULT 0` to `company`
+- [x] Migration: add `referral_rate FLOAT NOT NULL DEFAULT 0` to `company`
       (default) and `referral_rate FLOAT NULL` to `referral` (per-user override).
-- [ ] `Company` + `Referral` models + all inserts/updates/selects (`lnvps_db`).
-- [ ] Admin company GET/PATCH expose + edit `referral_rate` (`admin/companies.rs`).
-- [ ] User `GET`/`PATCH /api/v1/referral` expose + edit the per-user override
-      (`referral_rate`, null = use company default).
-- [ ] Compute reward = first_payment * effective_rate% where
-      effective_rate = referral.referral_rate ?? company.referral_rate: surface
-      both the company rate and the referrer override in `list_referral_usage` /
-      `ReferralCostUsage`, apply in `ApiReferralState` `earned` and the admin report.
-- [ ] Tests (override wins, company default fallback, 0% default), docs + changelog.
+- [x] `Company` + `Referral` models + all inserts/updates/selects (`lnvps_db`).
+- [x] Admin company GET/PATCH expose + edit `referral_rate` (`admin/companies.rs`).
+- [x] User `GET /api/v1/referral` exposes the per-referrer override (read-only;
+      admin-controlled — users cannot set their own commission).
+- [x] Compute reward = first_payment * effective_rate% where
+      effective_rate = referral.referral_rate ?? company.referral_rate: surfaced
+      in `list_referral_usage` / `ReferralCostUsage.effective_rate`, applied in
+      `ApiReferralState` `earned` and the admin report (`effective_rate`,`commission`).
+- [x] Tests (commission floor/0%, mode roundtrip, parse_payout_mode), docs + changelog.
+
+**PR1 committed:** `4048398`. Note: per-referrer override is set by admins (PR2),
+not users. `referral.referral_rate` NULL = use company default.
 
 ### PR 2 — Admin referral management APIs + RBAC  [L]
 - [ ] Add `AdminResource::Referral = 25`; explicit permission migration.
