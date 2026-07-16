@@ -21,7 +21,8 @@ use std::str::FromStr;
 use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey, ApiVmOsImage,
-    ApiVmTemplate, ClientIp, Nip98Auth, PageQuery, UpgradeConfig, VatClient, WorkJob,
+    ApiVmTemplate, ClientIp, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig, VatClient,
+    WorkJob,
 };
 use lnvps_db::{
     LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
@@ -29,10 +30,10 @@ use lnvps_db::{
 };
 
 use crate::api::model::{
-    AccountPatchRequest, AccountTaxInfo, AddNwcPaymentMethodRequest, ApiCompany,
-    ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest, ApiInvoiceItem, ApiPaymentInfo,
-    ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory,
-    ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
+    AccountPatchRequest, AccountPatchResult, AccountTaxInfo, AddNwcPaymentMethodRequest,
+    ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest, ApiInvoiceItem,
+    ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule,
+    ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
     CreateVmFirewallRule, CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy,
     PatchVmFirewallRule, PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr,
     validate_firewall_ports, vm_to_status,
@@ -159,24 +160,12 @@ async fn v1_patch_account(
     client_ip: ClientIp,
     State(this): State<RouterState>,
     req: Json<AccountPatchRequest>,
-) -> ApiResult<()> {
+) -> ApiResult<AccountPatchResult> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
     capture_client_geo(&this, uid, client_ip).await;
-
-    // validate tax_id if provided
-    if let Some(Some(tax_id)) = &req.tax_id {
-        let vat_client = VatClient::new();
-        let result = vat_client
-            .validate_vat_number(tax_id, None)
-            .await
-            .map_err(|e| ApiError::bad_request(format!("Failed to validate tax ID: {}", e)))?;
-        if !result.valid {
-            return ApiData::err("Invalid tax ID");
-        }
-    }
 
     // validate and handle email change
     let mut pending_verification: Option<String> = None;
@@ -258,6 +247,45 @@ async fn v1_patch_account(
         user.billing_tax_id = tax_id.clone();
     }
 
+    // Validate the tax ID (VAT number) against VIES when one is set, and ask
+    // VIES to match the customer's billing name/address against the registered
+    // values. An invalid VAT number is a hard error; name/address mismatches are
+    // surfaced as non-fatal warnings so the account is still saved.
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(tax_id) = user
+        .billing_tax_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let trader = TraderDetails {
+            name: user.billing_name.clone(),
+            street: match (&user.billing_address_1, &user.billing_address_2) {
+                (Some(a1), Some(a2)) if !a2.trim().is_empty() => Some(format!("{} {}", a1, a2)),
+                (Some(a1), _) => Some(a1.clone()),
+                (None, Some(a2)) => Some(a2.clone()),
+                _ => None,
+            },
+            postal_code: user.billing_postcode.clone(),
+            city: user.billing_city.clone(),
+            company_type: None,
+        };
+        let result = VatClient::new()
+            .validate_vat_number_with_trader(tax_id, None, Some(&trader))
+            .await
+            .map_err(|e| ApiError::bad_request(format!("Failed to validate tax ID: {}", e)))?;
+        if !result.valid {
+            return ApiData::err("Invalid tax ID");
+        }
+        let mismatches = result.mismatched_fields();
+        if !mismatches.is_empty() {
+            warnings.push(format!(
+                "The following billing details do not match the VAT registration: {}",
+                mismatches.join(", ")
+            ));
+        }
+    }
+
     this.db.update_user(&user).await?;
 
     // Queue verification email after successful save
@@ -278,7 +306,7 @@ async fn v1_patch_account(
         }
     }
 
-    ApiData::ok(())
+    ApiData::ok(AccountPatchResult { warnings })
 }
 
 #[derive(serde::Serialize)]

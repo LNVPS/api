@@ -143,6 +143,17 @@ pub struct AccountPatchRequest {
     pub tax: Option<Vec<AccountTaxInfo>>,
 }
 
+/// Result of a successful account PATCH.
+///
+/// Carries any non-fatal warnings raised while saving — currently VIES
+/// name/address mismatches, which do not block the save.
+#[derive(Serialize, Deserialize, Default)]
+pub struct AccountPatchResult {
+    /// Non-fatal warnings for the client to surface to the user.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// The tax (VAT) that will be charged to a user for a given seller company,
 /// determined from the user's current billing information (VAT number,
 /// declared country, IP-derived country).

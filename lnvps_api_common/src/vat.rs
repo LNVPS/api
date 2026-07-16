@@ -28,6 +28,51 @@ struct EuVatCountryRates {
     standard_rate: f32,
 }
 
+/// Outcome of VIES matching a supplied trader detail (name / address parts)
+/// against the registered value for a VAT number.
+///
+/// Not all member states support this "approximate" matching, so a field can be
+/// [`TraderMatch::NotProcessed`] even when the VAT number itself is valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TraderMatch {
+    /// The supplied value matches the registered value.
+    Valid,
+    /// The supplied value does not match the registered value.
+    Invalid,
+    /// The member state did not process this field (matching unsupported).
+    NotProcessed,
+}
+
+/// Trader (business) details supplied for VIES approximate matching.
+///
+/// Any subset may be provided; empty fields are omitted from the request.
+#[derive(Debug, Clone, Default)]
+pub struct TraderDetails {
+    /// Registered business name.
+    pub name: Option<String>,
+    /// Street (address line).
+    pub street: Option<String>,
+    /// Postal / ZIP code.
+    pub postal_code: Option<String>,
+    /// City.
+    pub city: Option<String>,
+    /// Company type/legal form (rarely used).
+    pub company_type: Option<String>,
+}
+
+impl TraderDetails {
+    /// True when no trader field is set (nothing to verify).
+    pub fn is_empty(&self) -> bool {
+        let empty = |s: &Option<String>| s.as_deref().map(str::trim).unwrap_or("").is_empty();
+        empty(&self.name)
+            && empty(&self.street)
+            && empty(&self.postal_code)
+            && empty(&self.city)
+            && empty(&self.company_type)
+    }
+}
+
 /// EU VAT number validation response
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +82,11 @@ struct EuVatValidationResponse {
     name: Option<String>,
     address: Option<String>,
     request_identifier: Option<String>,
+    trader_name_match: Option<TraderMatch>,
+    trader_street_match: Option<TraderMatch>,
+    trader_postal_code_match: Option<TraderMatch>,
+    trader_city_match: Option<TraderMatch>,
+    trader_company_type_match: Option<TraderMatch>,
 }
 
 /// Result of a VAT number validation
@@ -54,6 +104,36 @@ pub struct VatValidationResult {
     pub address: Option<String>,
     /// Request identifier
     pub request_identifier: Option<String>,
+    /// VIES match result for the supplied trader name, if a name was supplied.
+    pub name_match: Option<TraderMatch>,
+    /// VIES match result for the supplied street, if a street was supplied.
+    pub street_match: Option<TraderMatch>,
+    /// VIES match result for the supplied postal code, if one was supplied.
+    pub postal_code_match: Option<TraderMatch>,
+    /// VIES match result for the supplied city, if a city was supplied.
+    pub city_match: Option<TraderMatch>,
+    /// VIES match result for the supplied company type, if one was supplied.
+    pub company_type_match: Option<TraderMatch>,
+}
+
+impl VatValidationResult {
+    /// Human-readable labels of the trader fields VIES explicitly reported as
+    /// [`TraderMatch::Invalid`]. Fields that were `NOT_PROCESSED` or matched are
+    /// omitted, so an empty result means "no confirmed mismatch".
+    pub fn mismatched_fields(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut push = |m: &Option<TraderMatch>, label: &'static str| {
+            if *m == Some(TraderMatch::Invalid) {
+                out.push(label);
+            }
+        };
+        push(&self.name_match, "name");
+        push(&self.street_match, "address");
+        push(&self.postal_code_match, "postcode");
+        push(&self.city_match, "city");
+        push(&self.company_type_match, "company type");
+        out
+    }
 }
 
 /// VAT rate for a specific country
@@ -234,6 +314,22 @@ impl VatClient {
         vat_number: &str,
         country_code: Option<&str>,
     ) -> Result<VatValidationResult> {
+        self.validate_vat_number_with_trader(vat_number, country_code, None)
+            .await
+    }
+
+    /// Validate a VAT number and, when `trader` details are supplied, ask VIES to
+    /// match the business name/address against the registered values.
+    ///
+    /// The returned [`VatValidationResult`] carries per-field match indicators
+    /// (`name_match`, `street_match`, ...). Note that many member states do not
+    /// support approximate matching and will report `NOT_PROCESSED`.
+    pub async fn validate_vat_number_with_trader(
+        &self,
+        vat_number: &str,
+        country_code: Option<&str>,
+        trader: Option<&TraderDetails>,
+    ) -> Result<VatValidationResult> {
         let cleaned = vat_number.replace([' ', '.', '-'], "");
 
         let (country, number) = if let Some(cc) = country_code {
@@ -261,13 +357,29 @@ impl VatClient {
 
         trace!("Validating VAT number: {} for country: {}", number, country);
 
+        let mut body = serde_json::json!({
+            "countryCode": country,
+            "vatNumber": number
+        });
+        // Attach trader details for approximate matching when provided.
+        if let Some(t) = trader.filter(|t| !t.is_empty()) {
+            let obj = body.as_object_mut().expect("json object");
+            let mut add = |key: &str, val: &Option<String>| {
+                if let Some(v) = val.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    obj.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+                }
+            };
+            add("traderName", &t.name);
+            add("traderStreet", &t.street);
+            add("traderPostalCode", &t.postal_code);
+            add("traderCity", &t.city);
+            add("traderCompanyType", &t.company_type);
+        }
+
         let client = reqwest::Client::new();
         let response = client
             .post(&self.validation_url)
-            .json(&serde_json::json!({
-                "countryCode": country,
-                "vatNumber": number
-            }))
+            .json(&body)
             .send()
             .await?
             .text()
@@ -286,6 +398,11 @@ impl VatClient {
             name: vat_response.name.filter(|s| !s.is_empty() && s != "---"),
             address: vat_response.address.filter(|s| !s.is_empty() && s != "---"),
             request_identifier: vat_response.request_identifier,
+            name_match: vat_response.trader_name_match,
+            street_match: vat_response.trader_street_match,
+            postal_code_match: vat_response.trader_postal_code_match,
+            city_match: vat_response.trader_city_match,
+            company_type_match: vat_response.trader_company_type_match,
         })
     }
 }
@@ -413,5 +530,58 @@ mod tests {
     async fn test_validate_vat_number_too_short() {
         let client = VatClient::new();
         assert!(client.validate_vat_number("D", None).await.is_err());
+    }
+
+    #[test]
+    fn test_trader_details_is_empty() {
+        assert!(TraderDetails::default().is_empty());
+        assert!(
+            TraderDetails {
+                name: Some("   ".to_string()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TraderDetails {
+                name: Some("ACME".to_string()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_trader_match_deserialization() {
+        assert_eq!(
+            serde_json::from_str::<TraderMatch>("\"VALID\"").unwrap(),
+            TraderMatch::Valid
+        );
+        assert_eq!(
+            serde_json::from_str::<TraderMatch>("\"INVALID\"").unwrap(),
+            TraderMatch::Invalid
+        );
+        assert_eq!(
+            serde_json::from_str::<TraderMatch>("\"NOT_PROCESSED\"").unwrap(),
+            TraderMatch::NotProcessed
+        );
+    }
+
+    #[test]
+    fn test_mismatched_fields() {
+        let result = VatValidationResult {
+            valid: true,
+            country_code: "DE".to_string(),
+            vat_number: "123".to_string(),
+            name: None,
+            address: None,
+            request_identifier: None,
+            name_match: Some(TraderMatch::Invalid),
+            street_match: Some(TraderMatch::Valid),
+            postal_code_match: Some(TraderMatch::NotProcessed),
+            city_match: Some(TraderMatch::Invalid),
+            company_type_match: None,
+        };
+        assert_eq!(result.mismatched_fields(), vec!["name", "city"]);
     }
 }

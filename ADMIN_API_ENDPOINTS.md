@@ -3148,6 +3148,66 @@ Response:
   the interval count directly for `month`, and ×12 for `year`.
 - Payments/costs in a currency with no available exchange rate are skipped.
 
+#### OSS (One-Stop Shop) VAT Report
+
+```
+GET /api/admin/v1/reports/oss
+```
+
+Aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing
+period and destination member state, so the totals can be transcribed onto a
+quarterly (or bi-monthly) OSS VAT return. Only **paid** payments are included.
+Each row is keyed by `(period, company, destination country, VAT rate)` because
+each seller company is a separate VAT-registered entity. Amounts are expressed
+in each company's **base currency**, converted from the payment currency using
+the exchange rate frozen on the payment at sale time.
+
+Query Parameters:
+
+- `start_date`: string (required) - YYYY-MM-DD
+- `end_date`: string (required) - YYYY-MM-DD
+- `company_id`: number (optional) - filter to one seller company; `0`/omitted = all companies.
+- `period`: `quarter` (default, calendar Q1-Q4) | `bimonthly` (two-month buckets B1=Jan-Feb … B6=Nov-Dec).
+
+Required Permission: `analytics::view`
+
+Response:
+
+```json
+{
+  "data": {
+    "start_date": "2026-01-01",
+    "end_date": "2026-03-31",
+    "period": "quarter",
+    "rows": [
+      {
+        "period": "2026-Q1",
+        "company_id": 1,
+        "company_name": "LNVPS",
+        "currency": "EUR",
+        "country_code": "DEU",
+        "vat_rate": 19.0,
+        "net_total": 210000,
+        "tax_total": 39900,
+        "transaction_count": 12
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+
+- Only `oss_b2c` lines are counted; `domestic`, `reverse_charge` and
+  `out_of_scope` sales are excluded (domestic sales belong on the national VAT
+  return, not the OSS return).
+- Uses each payment's frozen per-line `tax_breakdown` when present, else the
+  payment's summary tax fields when the whole payment was treated as `oss_b2c`.
+- `country_code` is the destination member state (ISO 3166-1 alpha-3).
+- Amounts are in smallest currency units (cents for fiat, millisats for BTC).
+- Payments whose currency cannot be converted to the company base currency are
+  skipped.
+
 ## Error Responses
 
 All error responses follow the format:

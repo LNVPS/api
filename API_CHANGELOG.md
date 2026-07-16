@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - OSS (One-Stop Shop) VAT report
+  - `GET /api/admin/v1/reports/oss` aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing period and destination member state for transcription onto an OSS VAT return. Query params: `start_date`, `end_date` (YYYY-MM-DD), optional `company_id` (`0`/omitted = all), and `period` = `quarter` (default, calendar Q1-Q4) | `bimonthly` (two-month buckets B1-B6). Rows are keyed by `(period, company, destination country, VAT rate)` and expressed in each seller company's base currency using the exchange rate frozen on each payment. Only paid payments are counted. Requires `analytics::view`.
+
+- **2026-07-18** - VIES trader name/address verification on tax ID
+  - `PATCH /api/v1/account` now sends the customer's billing name/address to VIES alongside the VAT number so VIES can match them against the registered values. An invalid VAT number is still a hard error; name/address mismatches are non-fatal. The endpoint response body changed from `null` to `{ "warnings": [string] }` (a `warnings` array is present only when VIES reports a confirmed field mismatch, e.g. name or address; the account is still saved).
+
 - **2026-07-18** - Admin user list gains region/role/has_vms filters
   - `GET /api/admin/v1/users` accepts optional query params to narrow the list (combined with AND, alongside the existing `search` pubkey filter): `region_id` (only users with at least one non-deleted VM whose host is in that region), `role` (`super_admin`/`admin`/`read_only` — only users with an active assignment to that admin role), and `has_vms` (`true`/`false` — filter by whether the user has any non-deleted VMs). Requires `users::view`.
 

@@ -4,7 +4,7 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
-use lnvps_api_common::{ApiData, ApiError, ApiResult, Ticker, TickerRate};
+use lnvps_api_common::{ApiData, ApiError, ApiResult, TaxLine, TaxTreatment, Ticker, TickerRate};
 use lnvps_db::{AdminAction, AdminResource, CostResourceType, CostType, IntervalType};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/reports/profit-loss",
             get(admin_profit_loss_report),
         )
+        .route("/api/admin/v1/reports/oss", get(admin_oss_report))
 }
 
 #[derive(Deserialize, Default)]
@@ -623,4 +624,266 @@ async fn admin_profit_loss_report(
         currency: target_str,
         periods,
     })
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OssReportQuery {
+    start_date: String,
+    end_date: String,
+    /// Optional company filter; 0 / omitted = all companies. Each company is a
+    /// separate VAT-registered entity, so rows are always keyed by company and
+    /// expressed in that company's base currency.
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str")]
+    company_id: u64,
+    /// Filing period grouping: "quarter" (default, the OSS standard) or
+    /// "bimonthly" (two-month buckets).
+    period: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OssReportRow {
+    /// Period identifier ("2025-Q1" for quarter, "2025-B1" for bimonthly).
+    period: String,
+    /// Seller company id.
+    company_id: u64,
+    /// Seller company name.
+    company_name: String,
+    /// Currency all amounts in this row are expressed in (company base currency).
+    currency: String,
+    /// Destination member state (ISO 3166-1 alpha-3).
+    country_code: String,
+    /// VAT rate applied for this country/rate bucket, as a percentage.
+    vat_rate: f32,
+    /// Net (pre-tax) sales to this country, in `currency` smallest units.
+    net_total: u64,
+    /// VAT collected for this country, in `currency` smallest units.
+    tax_total: u64,
+    /// Number of payments contributing to this row.
+    transaction_count: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OssReport {
+    start_date: String,
+    end_date: String,
+    /// Period grouping used ("quarter" or "bimonthly").
+    period: String,
+    /// Aggregated OSS B2C rows, sorted by period, company, country then rate.
+    rows: Vec<OssReportRow>,
+}
+
+/// Build the OSS period key for a date. Quarters are calendar Q1-Q4; bimonthly
+/// buckets are B1=Jan-Feb, B2=Mar-Apr, ... B6=Nov-Dec.
+fn oss_period_key(date: DateTime<Utc>, bimonthly: bool) -> String {
+    let m = date.month();
+    if bimonthly {
+        format!("{:04}-B{}", date.year(), (m - 1) / 2 + 1)
+    } else {
+        format!("{:04}-Q{}", date.year(), (m - 1) / 3 + 1)
+    }
+}
+
+/// Accumulator key for one OSS declaration line: a distinct
+/// (period, company, destination country, VAT rate) bucket.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct OssKey {
+    period: String,
+    company_id: u64,
+    country_code: String,
+    /// VAT rate stored as raw bits so it can be a map key.
+    rate_bits: u32,
+}
+
+#[derive(Default)]
+struct OssAcc {
+    net_total: u64,
+    tax_total: u64,
+    transaction_count: u32,
+    company_name: String,
+    currency: String,
+}
+
+/// OSS (One-Stop Shop) VAT report.
+///
+/// Aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing
+/// period and destination member state, so the totals can be transcribed onto a
+/// quarterly (or bi-monthly) OSS VAT return. Only paid payments are included;
+/// amounts are expressed in each seller company's base currency using the
+/// exchange rate frozen on the payment at sale time.
+async fn admin_oss_report(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<OssReportQuery>,
+) -> ApiResult<OssReport> {
+    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+
+    let period = params
+        .period
+        .clone()
+        .unwrap_or_else(|| "quarter".to_string())
+        .to_lowercase();
+    let bimonthly = match period.as_str() {
+        "quarter" | "bimonthly" => period == "bimonthly",
+        _ => {
+            return Err(ApiError::bad_request(
+                "period must be 'quarter' or 'bimonthly'",
+            ));
+        }
+    };
+
+    let start_date = NaiveDate::parse_from_str(&params.start_date, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("Invalid start_date format. Use YYYY-MM-DD"))?;
+    let end_date = NaiveDate::parse_from_str(&params.end_date, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("Invalid end_date format. Use YYYY-MM-DD"))?;
+    if start_date >= end_date {
+        return Err(ApiError::bad_request("start_date must be before end_date"));
+    }
+
+    let start_dt = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let end_dt = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+
+    // Resolve the set of companies to report on.
+    let company_ids: Vec<u64> = if params.company_id != 0 {
+        vec![params.company_id]
+    } else {
+        let (companies, _) = this.db.admin_list_companies(10_000, 0).await?;
+        companies.into_iter().map(|c| c.id).collect()
+    };
+
+    let mut acc: HashMap<OssKey, OssAcc> = HashMap::new();
+
+    for cid in company_ids {
+        let payments = this
+            .db
+            .admin_get_payments_with_company_info(start_dt, end_dt, cid, None)
+            .await?;
+        for p in payments {
+            let (Ok(pay_cur), Ok(base_cur)) = (
+                Currency::from_str(&p.currency),
+                Currency::from_str(&p.company_base_currency),
+            ) else {
+                continue;
+            };
+
+            // Extract the OSS B2C lines for this payment: prefer the frozen
+            // per-line breakdown, else synthesise a single line from the
+            // summary fields when the whole payment was treated as oss_b2c.
+            let lines: Vec<TaxLine> = if let Some(bd) = &p.tax_breakdown {
+                match serde_json::from_value::<Vec<TaxLine>>(bd.clone()) {
+                    Ok(lines) => lines
+                        .into_iter()
+                        .filter(|l| l.treatment == TaxTreatment::OssB2c)
+                        .collect(),
+                    Err(_) => continue,
+                }
+            } else if p.tax_treatment.as_deref() == Some(TaxTreatment::OssB2c.as_str()) {
+                vec![TaxLine {
+                    net: p.amount.saturating_sub(p.tax),
+                    tax: p.tax,
+                    rate: p.tax_rate.unwrap_or(0.0),
+                    country_code: p.tax_country_code.clone(),
+                    treatment: TaxTreatment::OssB2c,
+                }]
+            } else {
+                continue;
+            };
+
+            // Fold this payment's OSS lines into per-bucket contributions,
+            // converting to the company base currency using the frozen rate.
+            let period_key = oss_period_key(p.created, bimonthly);
+            let mut per_payment: HashMap<OssKey, (u64, u64)> = HashMap::new();
+            for l in lines {
+                let Some(country) = l.country_code.clone() else {
+                    continue;
+                };
+                let (Some(net_base), Some(tax_base)) = (
+                    payment_base_amount(l.net, pay_cur, base_cur, p.rate),
+                    payment_base_amount(l.tax, pay_cur, base_cur, p.rate),
+                ) else {
+                    continue;
+                };
+                let key = OssKey {
+                    period: period_key.clone(),
+                    company_id: p.company_id,
+                    country_code: country,
+                    rate_bits: l.rate.to_bits(),
+                };
+                let e = per_payment.entry(key).or_default();
+                e.0 = e.0.saturating_add(net_base);
+                e.1 = e.1.saturating_add(tax_base);
+            }
+
+            for (key, (net, tax)) in per_payment {
+                let e = acc.entry(key).or_default();
+                e.net_total = e.net_total.saturating_add(net);
+                e.tax_total = e.tax_total.saturating_add(tax);
+                e.transaction_count = e.transaction_count.saturating_add(1);
+                e.company_name = p.company_name.clone();
+                e.currency = p.company_base_currency.clone();
+            }
+        }
+    }
+
+    let mut rows: Vec<OssReportRow> = acc
+        .into_iter()
+        .map(|(key, a)| OssReportRow {
+            period: key.period,
+            company_id: key.company_id,
+            company_name: a.company_name,
+            currency: a.currency,
+            country_code: key.country_code,
+            vat_rate: f32::from_bits(key.rate_bits),
+            net_total: a.net_total,
+            tax_total: a.tax_total,
+            transaction_count: a.transaction_count,
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        a.period
+            .cmp(&b.period)
+            .then(a.company_id.cmp(&b.company_id))
+            .then(a.country_code.cmp(&b.country_code))
+            .then(
+                a.vat_rate
+                    .partial_cmp(&b.vat_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    ApiData::ok(OssReport {
+        start_date: params.start_date,
+        end_date: params.end_date,
+        period,
+        rows,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn dt(y: i32, m: u32, d: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_oss_period_key_quarter() {
+        assert_eq!(oss_period_key(dt(2025, 1, 15), false), "2025-Q1");
+        assert_eq!(oss_period_key(dt(2025, 3, 31), false), "2025-Q1");
+        assert_eq!(oss_period_key(dt(2025, 4, 1), false), "2025-Q2");
+        assert_eq!(oss_period_key(dt(2025, 7, 1), false), "2025-Q3");
+        assert_eq!(oss_period_key(dt(2025, 12, 31), false), "2025-Q4");
+    }
+
+    #[test]
+    fn test_oss_period_key_bimonthly() {
+        assert_eq!(oss_period_key(dt(2025, 1, 1), true), "2025-B1");
+        assert_eq!(oss_period_key(dt(2025, 2, 28), true), "2025-B1");
+        assert_eq!(oss_period_key(dt(2025, 3, 1), true), "2025-B2");
+        assert_eq!(oss_period_key(dt(2025, 11, 1), true), "2025-B6");
+        assert_eq!(oss_period_key(dt(2025, 12, 31), true), "2025-B6");
+    }
 }
