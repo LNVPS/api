@@ -1114,6 +1114,86 @@ Body (all optional):
 }
 ```
 
+#### List Unmanaged VMs
+
+```
+GET /api/admin/v1/hosts/{id}/vms/unmanaged
+```
+
+Required Permission: `hosts::view`
+
+Discovers VMs that exist on the host but are **not** tracked in the database
+(candidates for import). The admin service has no direct connection to the host,
+so it dispatches a discovery job to the worker and waits for the reply over a
+temporary Redis pub/sub channel; this endpoint therefore requires a running
+worker and Redis (returns an error otherwise) and may take up to ~30s. Currently
+supported on Proxmox hosts only. VMs outside the managed id range (Proxmox
+`vmid < 100`) are omitted since they can't be imported.
+
+Returns an array:
+
+```json
+[
+  {
+    "host_vm_id": number,
+    // Raw host VM id (e.g. Proxmox vmid)
+    "mapped_vm_id": number | null,
+    // Database id this VM would map to on import (vmid - 100)
+    "name": "string" | null,
+    "cpu": number,
+    // Allocated CPU cores
+    "memory": number,
+    // Allocated memory in bytes
+    "disk_size": number,
+    // Primary disk size in bytes
+    "disk_storage": "string" | null,
+    // Storage pool backing the primary disk
+    "mac_address": "string" | null,
+    "running": boolean
+  }
+]
+```
+
+#### Import VM
+
+```
+POST /api/admin/v1/hosts/{id}/vms/import
+```
+
+Required Permission: `virtual_machines::create`
+
+Imports an existing host VM into the database, assigning it to a user. Billing
+always uses the region's **custom pricing** (required) — if the region has no
+enabled custom pricing the import fails. The VM's current specs (CPU/memory/disk,
+read live from the host) are captured into a custom template. The database VM id
+is fixed by the host id mapping (Proxmox `vmid = db_id + 100`) so all subsequent
+lifecycle operations target the correct host VM. No changes are made on the host.
+Currently supported on Proxmox hosts only.
+
+The work is performed asynchronously by the worker; the response returns a
+`job_id` whose progress can be followed on the job feedback WebSocket.
+
+Body:
+
+```json
+{
+  "host_vm_id": number,
+  // Required - Raw host VM id (e.g. Proxmox vmid)
+  "user_id": number,
+  // Required - User the imported VM is assigned to
+  "reason": "string"
+  // Optional - Recorded in VM history metadata
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "string"
+}
+```
+
 ### Region Management
 
 #### List Regions
