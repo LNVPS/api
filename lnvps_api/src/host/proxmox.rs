@@ -956,10 +956,13 @@ impl ProxmoxClient {
             VmFirewallProtocol::Udp => Some("udp".to_string()),
             VmFirewallProtocol::Icmp => Some("icmp".to_string()),
         };
-        let dport = match (rule.dst_port_start, rule.dst_port_end) {
-            (Some(s), Some(e)) if e != s => Some(format!("{}:{}", s, e)),
-            (Some(s), _) => Some(s.to_string()),
-            (None, _) => None,
+        // Proxmox rejects `dport` unless `proto` is also set
+        // ("'dport' requires this property"). A port only makes sense with a
+        // specific protocol, so drop the port when protocol is Any.
+        let dport = match (proto.is_some(), rule.dst_port_start, rule.dst_port_end) {
+            (true, Some(s), Some(e)) if e != s => Some(format!("{}:{}", s, e)),
+            (true, Some(s), _) => Some(s.to_string()),
+            _ => None,
         };
 
         VmFirewallRule {
@@ -2828,9 +2831,38 @@ mod tests {
         assert_eq!(pve.action, VmFirewallAction::DROP);
         assert_eq!(pve.rule_type, VmFirewallRuleType::Out);
         assert_eq!(pve.proto, None);
-        assert_eq!(pve.dport.as_deref(), Some("53"));
+        // Proxmox rejects a dport without a proto, so a port on an "Any"
+        // protocol rule must be dropped (see issue #165).
+        assert_eq!(pve.dport, None);
         assert_eq!(pve.source, None);
         assert_eq!(pve.enable, Some(0));
+    }
+
+    #[test]
+    fn test_to_pve_firewall_rule_any_proto_port_range_drops_dport() {
+        // Regression for issue #165: Proxmox returns 400
+        // "'dport' requires this property" when dport is sent without proto.
+        let rule = lnvps_db::VmFirewallRule {
+            id: 165,
+            vm_id: 1,
+            priority: 0,
+            direction: lnvps_db::VmFirewallDirection::Inbound,
+            protocol: lnvps_db::VmFirewallProtocol::Any,
+            action: lnvps_db::VmFirewallRuleAction::Accept,
+            src_cidr: None,
+            dst_port_start: Some(80),
+            dst_port_end: Some(443),
+            enabled: true,
+            created: Default::default(),
+            updated: Default::default(),
+        };
+        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
+        assert_eq!(pve.proto, None);
+        assert_eq!(pve.dport, None);
+        // The serialized request must contain neither proto nor dport.
+        let json = serde_json::to_string(&pve).unwrap();
+        assert!(!json.contains("dport"), "json: {json}");
+        assert!(!json.contains("proto"), "json: {json}");
     }
 
     #[test]
