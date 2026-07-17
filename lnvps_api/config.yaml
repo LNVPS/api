@@ -110,6 +110,12 @@ captcha:
 #  rp-origin: "https://app.example.com"
 #  # Human-friendly name shown in the authenticator prompt.
 #  rp-name: "LNVPS"
+#  # Require a discoverable (resident-key) credential at registration so
+#  # usernameless "Sign in with a passkey" works on all authenticators
+#  # (platform passkeys, security keys, Windows Hello). Default: true. Only set
+#  # false to work around an authenticator that refuses resident-key
+#  # registration (its credentials then won't work for usernameless login).
+#  require-resident-key: true
 # Shared session-token settings. Required whenever `oauth` or `webauthn` is
 # enabled — both issue the same stateless session JWTs. Omit to disable Bearer
 # session auth entirely (Nostr / NIP-98 only).

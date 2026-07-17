@@ -110,6 +110,19 @@ pub struct WebauthnConfig {
     pub rp_origin: String,
     /// Human-friendly Relying Party name shown in the authenticator UI.
     pub rp_name: String,
+    /// Require a discoverable (resident-key) credential at registration so
+    /// usernameless "Sign in with a passkey" works across all authenticators
+    /// (platform passkeys, security keys, Windows Hello). Defaults to `true`.
+    ///
+    /// Set to `false` only to work around a specific authenticator that refuses
+    /// resident-key registration — non-discoverable credentials it creates will
+    /// NOT be usable for usernameless login.
+    #[serde(default = "default_require_resident_key")]
+    pub require_resident_key: bool,
+}
+
+fn default_require_resident_key() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

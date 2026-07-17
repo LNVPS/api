@@ -36,6 +36,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Passkey usernameless login failing on non-synced authenticators** — passkey registration now always creates a **discoverable (resident-key)** credential (`residentKey: "required"`, `userVerification: "required"`), so "Sign in with a passkey" reliably works on security keys and Windows Hello, not just synced platform passkeys (iCloud Keychain / Google Password Manager). Previously registration went through webauthn-rs' high-level flow which hardcodes `residentKey: "discouraged"`, causing those authenticators to store a non-discoverable credential that usernameless login (`start_discoverable_authentication`) couldn't find (`NotAllowedError`). Applies to both new-account registration and adding a passkey to an existing account. New optional config `webauthn.require-resident-key` (default `true`) can relax this for a misbehaving authenticator. Trade-off: a security key with no free resident-key slots now fails clearly at registration instead of silently registering an unusable-for-login credential.
+
 - **2026-07-18** - Referral commission rate not visible to referrers (user API)
   - `GET`/`POST`/`PATCH /api/v1/referral` only returned `referral_rate`, the per-referrer override, which is `null` for most referrers (it's admin-set). A referrer with an unset override therefore saw no commission rate even though the default company rate applied. The response now also includes `effective_referral_rate` (whole %): the rate that currently applies — the override when set, otherwise the default (primary) company's `referral_rate`.
 

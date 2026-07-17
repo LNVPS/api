@@ -81,7 +81,13 @@ p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 # Passwordless WebAuthn / passkey login. conditional-ui enables discoverable
 # (usernameless) credentials; danger-allow-state-serialisation lets us carry the
 # ceremony state through the client inside a signed challenge token.
-webauthn-rs = { version = "0.5", features = ["conditional-ui", "danger-allow-state-serialisation"] }
+# danger-credential-internals exposes From<Credential> for Passkey so we can build
+# passkeys from credentials registered via the lower-level webauthn-rs-core (needed
+# to force discoverable/resident-key registration).
+webauthn-rs = { version = "0.5", features = ["conditional-ui", "danger-allow-state-serialisation", "danger-credential-internals"] }
+# Lower-level core: high-level start_passkey_registration hardcodes
+# require_resident_key(false); we drop to core to force residentKey: required.
+webauthn-rs-core = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 ssh-key = "0.6"
 lettre = { version = "0.11", features = ["tokio1-native-tls"] }

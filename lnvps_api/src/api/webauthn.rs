@@ -31,8 +31,13 @@ use lnvps_db::{WebauthnCredential, webauthn_pubkey};
 
 use webauthn_rs::prelude::{
     CreationChallengeResponse, CredentialID, DiscoverableAuthentication, DiscoverableKey, Passkey,
-    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
-    RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
+    Webauthn, WebauthnBuilder,
+};
+use webauthn_rs_core::WebauthnCore;
+use webauthn_rs_core::proto::{
+    AttestationConveyancePreference, COSEAlgorithm, CredProtect, CredentialProtectionPolicy,
+    RegistrationState, RequestRegistrationExtensions, UserVerificationPolicy,
 };
 
 use crate::api::RouterState;
@@ -96,7 +101,7 @@ struct RegisterStartResponse {
 struct RegState {
     /// Per-account user handle minted at start; basis of the synthetic pubkey.
     handle: String,
-    reg: PasskeyRegistration,
+    reg: RegistrationState,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +172,91 @@ fn build_webauthn(cfg: &WebauthnConfig) -> Result<Webauthn, ApiError> {
         .map_err(|e| ApiError::internal(format!("Failed to build webauthn: {}", e)))
 }
 
+/// Build the lower-level [`WebauthnCore`] used to generate discoverable
+/// (resident-key) registration challenges.
+///
+/// webauthn-rs' high-level `start_passkey_registration` hardcodes
+/// `require_resident_key(false)` (`residentKey: "discouraged"`), so non-synced
+/// authenticators (security keys, Windows Hello) create a *non-discoverable*
+/// credential that usernameless `start_discoverable_authentication` can't find.
+/// We drop to core to force `residentKey: "required"`.
+fn build_webauthn_core(cfg: &WebauthnConfig) -> Result<WebauthnCore, ApiError> {
+    let origin = Url::parse(&cfg.rp_origin)
+        .map_err(|e| ApiError::internal(format!("Invalid webauthn rp_origin: {}", e)))?;
+    Ok(WebauthnCore::new_unsafe_experts_only(
+        &cfg.rp_name,
+        &cfg.rp_id,
+        vec![origin],
+        // Matches webauthn-rs' default authenticator timeout.
+        std::time::Duration::from_millis(60_000),
+        None,
+        None,
+    ))
+}
+
+/// Registration extensions matching webauthn-rs' `start_passkey_registration`
+/// (cred_protect UV-required, uvm, cred_props) so behaviour is otherwise
+/// unchanged versus the high-level flow.
+fn passkey_reg_extensions() -> RequestRegistrationExtensions {
+    RequestRegistrationExtensions {
+        cred_protect: Some(CredProtect {
+            credential_protection_policy: CredentialProtectionPolicy::UserVerificationRequired,
+            // Requesting strict enforcement makes many devices fail outright; we
+            // request the policy but don't force it (same as webauthn-rs).
+            enforce_credential_protection_policy: Some(false),
+        }),
+        uvm: Some(true),
+        cred_props: Some(true),
+        min_pin_length: None,
+        hmac_create_secret: None,
+    }
+}
+
+/// Begin a passkey registration that yields a **discoverable** credential.
+///
+/// Mirrors webauthn-rs' `start_passkey_registration` but with
+/// `require_resident_key` driven by config (default `true`) and
+/// `userVerification: required`, so usernameless login works across all
+/// authenticator classes.
+fn start_discoverable_registration(
+    core: &WebauthnCore,
+    handle: Uuid,
+    name: &str,
+    exclude: Option<Vec<CredentialID>>,
+    require_resident_key: bool,
+) -> Result<(CreationChallengeResponse, RegistrationState), ApiError> {
+    let builder = core
+        .new_challenge_register_builder(handle.as_bytes(), name, name)
+        .map_err(|e| ApiError::internal(format!("Failed to start registration: {}", e)))?
+        .attestation(AttestationConveyancePreference::None)
+        .credential_algorithms(COSEAlgorithm::secure_algs())
+        .require_resident_key(require_resident_key)
+        .authenticator_attachment(None)
+        .user_verification_policy(UserVerificationPolicy::Required)
+        .reject_synchronised_authenticators(false)
+        .exclude_credentials(exclude)
+        .hints(None)
+        .extensions(Some(passkey_reg_extensions()));
+    core.generate_challenge_register(builder)
+        .map_err(|e| ApiError::internal(format!("Failed to start registration: {}", e)))
+}
+
+/// Finish a discoverable passkey registration into a high-level [`Passkey`].
+///
+/// The result serialises/deserialises identically to a `Passkey` produced by
+/// the high-level flow, so the login path (`DiscoverableKey::from(&Passkey)`,
+/// `finish_discoverable_authentication`) keeps working unchanged.
+fn finish_discoverable_registration(
+    core: &WebauthnCore,
+    reg: &RegisterPublicKeyCredential,
+    state: &RegistrationState,
+) -> Result<Passkey, ApiError> {
+    let cred = core
+        .register_credential(reg, state, None)
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Registration failed: {}", e)))?;
+    Ok(Passkey::from(cred))
+}
+
 /// Session token lifetime from the shared `[session]` config (default 30 days).
 fn session_ttl(this: &RouterState) -> u64 {
     this.settings
@@ -190,7 +280,7 @@ async fn register_start(
     body: Option<Json<RegisterStartRequest>>,
 ) -> ApiResult<RegisterStartResponse> {
     let cfg = webauthn_cfg(&this)?;
-    let webauthn = build_webauthn(&cfg)?;
+    let core = build_webauthn_core(&cfg)?;
 
     let name = body
         .and_then(|b| b.0.name)
@@ -201,9 +291,10 @@ async fn register_start(
     // the authenticator during discoverable login.
     let handle = Uuid::new_v4();
 
-    let (ccr, reg) = webauthn
-        .start_passkey_registration(handle, &name, &name, None)
-        .map_err(|e| ApiError::internal(format!("Failed to start registration: {}", e)))?;
+    // Force a discoverable (resident-key) credential so usernameless login can
+    // find it on every authenticator type.
+    let (ccr, reg) =
+        start_discoverable_registration(&core, handle, &name, None, cfg.require_resident_key)?;
 
     let state = RegState {
         handle: handle.to_string(),
@@ -229,15 +320,13 @@ async fn register_finish(
     Json(req): Json<RegisterFinishRequest>,
 ) -> ApiResult<WebauthnTokenResponse> {
     let cfg = webauthn_cfg(&this)?;
-    let webauthn = build_webauthn(&cfg)?;
+    let core = build_webauthn_core(&cfg)?;
 
     let state_json = verify_challenge_token(PURPOSE_REG, &req.state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid registration state: {}", e)))?;
     let state: RegState = serde_json::from_str(&state_json).map_err(ApiError::internal)?;
 
-    let passkey = webauthn
-        .finish_passkey_registration(&req.credential, &state.reg)
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Registration failed: {}", e)))?;
+    let passkey = finish_discoverable_registration(&core, &req.credential, &state.reg)?;
 
     let cred_id = passkey.cred_id().as_ref().to_vec();
 
@@ -366,7 +455,7 @@ async fn add_credential_start(
     body: Option<Json<RegisterStartRequest>>,
 ) -> ApiResult<RegisterStartResponse> {
     let cfg = webauthn_cfg(&this)?;
-    let webauthn = build_webauthn(&cfg)?;
+    let core = build_webauthn_core(&cfg)?;
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
 
     let name = body
@@ -383,9 +472,14 @@ async fn add_credential_start(
         .collect();
 
     let handle = account_handle(&auth.pubkey());
-    let (ccr, reg) = webauthn
-        .start_passkey_registration(handle, &name, &name, Some(exclude))
-        .map_err(|e| ApiError::internal(format!("Failed to start registration: {}", e)))?;
+    // Discoverable so an added passkey also works for usernameless login.
+    let (ccr, reg) = start_discoverable_registration(
+        &core,
+        handle,
+        &name,
+        Some(exclude),
+        cfg.require_resident_key,
+    )?;
 
     let token = issue_challenge_token(
         PURPOSE_CRED_REG,
@@ -407,15 +501,13 @@ async fn add_credential_finish(
     Json(req): Json<RegisterFinishRequest>,
 ) -> ApiResult<WebauthnCredentialInfo> {
     let cfg = webauthn_cfg(&this)?;
-    let webauthn = build_webauthn(&cfg)?;
+    let core = build_webauthn_core(&cfg)?;
 
     let state_json = verify_challenge_token(PURPOSE_CRED_REG, &req.state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid registration state: {}", e)))?;
-    let reg: PasskeyRegistration = serde_json::from_str(&state_json).map_err(ApiError::internal)?;
+    let reg: RegistrationState = serde_json::from_str(&state_json).map_err(ApiError::internal)?;
 
-    let passkey = webauthn
-        .finish_passkey_registration(&req.credential, &reg)
-        .map_err(|e| ApiError::from(anyhow::anyhow!("Registration failed: {}", e)))?;
+    let passkey = finish_discoverable_registration(&core, &req.credential, &reg)?;
 
     let cred_id = passkey.cred_id().as_ref().to_vec();
     if this.db.get_webauthn_credential(&cred_id).await.is_ok() {
@@ -494,6 +586,7 @@ mod tests {
             rp_id: "example.com".to_string(),
             rp_origin: "https://example.com".to_string(),
             rp_name: "Example".to_string(),
+            require_resident_key: true,
         }
     }
 
@@ -505,6 +598,49 @@ mod tests {
         let mut bad = test_cfg();
         bad.rp_origin = "not a url".to_string();
         assert!(build_webauthn(&bad).is_err());
+    }
+
+    /// Registration options must request a discoverable (resident-key)
+    /// credential with user verification required, so usernameless login works
+    /// across all authenticator types (issue: non-synced authenticators).
+    #[test]
+    fn registration_requests_resident_key() {
+        let core = build_webauthn_core(&test_cfg()).unwrap_or_else(|_| panic!("core builds"));
+        let (ccr, _state) =
+            start_discoverable_registration(&core, Uuid::new_v4(), "alice", None, true)
+                .unwrap_or_else(|_| panic!("registration starts"));
+
+        let sel = ccr
+            .public_key
+            .authenticator_selection
+            .expect("authenticator_selection present");
+        assert_eq!(
+            sel.resident_key,
+            Some(webauthn_rs_core::proto::ResidentKeyRequirement::Required),
+            "residentKey must be required"
+        );
+        assert!(
+            sel.require_resident_key,
+            "require_resident_key must be true"
+        );
+        assert_eq!(
+            sel.user_verification,
+            UserVerificationPolicy::Required,
+            "userVerification must be required"
+        );
+
+        // With the flag disabled, resident key is no longer required.
+        let (ccr2, _s2) =
+            start_discoverable_registration(&core, Uuid::new_v4(), "alice", None, false)
+                .unwrap_or_else(|_| panic!("registration starts"));
+        let sel2 = ccr2
+            .public_key
+            .authenticator_selection
+            .expect("authenticator_selection present");
+        assert_ne!(
+            sel2.resident_key,
+            Some(webauthn_rs_core::proto::ResidentKeyRequirement::Required)
+        );
     }
 
     /// The credential store round-trips: a passkey account can be minted, its

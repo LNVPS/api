@@ -2903,6 +2903,7 @@ dependencies = [
  "uuid",
  "virt",
  "webauthn-rs",
+ "webauthn-rs-core",
  "wiremock",
 ]
 
