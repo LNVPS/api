@@ -233,10 +233,26 @@ async fn main() -> Result<(), Error> {
         worker.send(WorkJob::CheckVms).await?;
     }
 
-    // setup payment handlers
-    tasks.extend(
-        listen_all_payments(&settings, node.clone(), db.clone(), sub_handler.clone()).await?,
-    );
+    // Payment settlement handlers run in API mode only.
+    //
+    // This is deliberate, not just to avoid double-processing when API and
+    // worker are separate processes:
+    //   * Revolut / Stripe / Bitvora settle via HTTP webhooks. The
+    //     `/api/v1/webhook/*` endpoints hand messages to the payment handlers
+    //     over an IN-PROCESS broadcast (`payments_rs::webhook::WEBHOOK_BRIDGE`),
+    //     so the handler MUST live in the same process as the HTTP listener.
+    //   * The LND invoice subscription is a direct node stream; running it in
+    //     the single API process keeps settlement in one place.
+    // Settlement itself only marks payments paid and enqueues jobs
+    // (`SpawnVm`, `ProcessVmUpgrade`, ...); the worker performs the actual
+    // provisioning. NOTE: if you scale the API tier to multiple replicas while
+    // using LND, each replica opens its own invoice subscription — run a single
+    // API replica (or move LND settlement to the worker) to avoid double work.
+    if mode.contains(&ExecMode::Api) {
+        tasks.extend(
+            listen_all_payments(&settings, node.clone(), db.clone(), sub_handler.clone()).await?,
+        );
+    }
 
     // refresh rates every 1min
     let rates = exchange.clone();
@@ -254,19 +270,27 @@ async fn main() -> Result<(), Error> {
         }
     }));
 
+    // DVMs subscribe to Nostr job requests to place VM orders — a single-consumer
+    // background listener (like the Telegram poller), so run it in the singleton
+    // worker to avoid duplicate order handling when the API tier is scaled out.
     #[cfg(feature = "nostr-dvm")]
-    if let Some(nostr_client) = &nostr_client {
-        tasks.push(start_dvms(nostr_client.clone(), sub_handler.clone()));
-    } else {
-        warn!("nostr-dvm feature is enabled but no nostr config is set; skipping DVMs");
+    if mode.contains(&ExecMode::Worker) {
+        if let Some(nostr_client) = &nostr_client {
+            tasks.push(start_dvms(nostr_client.clone(), sub_handler.clone()));
+        } else {
+            warn!("nostr-dvm feature is enabled but no nostr config is set; skipping DVMs");
+        }
     }
 
     // request for host info to be patched
     worker.send(WorkJob::PatchHosts).await?;
 
-    // Telegram bot poller completes account linking (single getUpdates consumer).
-    // Run it in API mode where account linking originates.
-    if mode.contains(&ExecMode::Api)
+    // Telegram bot poller completes account linking. `getUpdates` allows only a
+    // SINGLE consumer per bot token, so it must run in exactly one process.
+    // It runs in the worker (the singleton tier, co-located with notification
+    // SENDING via the SendNotification job) so the API tier can be scaled to
+    // multiple replicas without every replica opening a conflicting poller.
+    if mode.contains(&ExecMode::Worker)
         && let Some(tg) = &settings.telegram
     {
         let bot = lnvps_api::notifications::TelegramBot::new(
