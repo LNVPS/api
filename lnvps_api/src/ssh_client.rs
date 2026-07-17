@@ -69,8 +69,24 @@ impl SshClient {
         channel.exec(command)?;
         let mut s = String::new();
         channel.read_to_string(&mut s)?;
+        // Also drain stderr. Tools like `qm`/`qemu-img` print the actual failure
+        // reason here (stdout only carries the terse "update VM ..." echo and
+        // syslog only logs "creating disks failed"), so without this the real
+        // cause of a non-zero exit is invisible. Fold it into the returned
+        // output on failure so callers that log the string surface it; on
+        // success stderr is left out to avoid disturbing output parsers.
+        let mut err = String::new();
+        channel.stderr().read_to_string(&mut err)?;
         channel.wait_close()?;
-        Ok((channel.exit_status()?, s))
+        let code = channel.exit_status()?;
+        if code != 0 && !err.trim().is_empty() {
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str("stderr: ");
+            s.push_str(err.trim_end());
+        }
+        Ok((code, s))
     }
 
     /// Upload a file to the remote host via SFTP
