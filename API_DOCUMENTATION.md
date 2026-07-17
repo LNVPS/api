@@ -55,7 +55,8 @@ interface AccountInfo {
   state?: string;
   postcode?: string;
   tax_id?: string;
-  nwc_connection_string?: string; // Nostr Wallet Connect URI for automatic renewals
+  // Note: NWC wallets are no longer stored on the account. Add one via
+  // POST /api/v1/payment-methods (see "Saved Payment Methods").
   tax?: AccountTaxInfo[]; // Read-only, GET only: tax (VAT) applied to payments, per seller company. Ignored on PATCH.
 }
 
@@ -439,7 +440,7 @@ The LNVPS platform supports automatic VM renewal using Nostr Wallet Connect (NWC
 
 #### Setup Process
 
-1. **Configure NWC Connection**: Use the account PATCH endpoint to set your `nwc_connection_string`
+1. **Configure NWC Connection**: Add your NWC connection string as a saved payment method via `POST /api/v1/payment-methods` (see [Saved Payment Methods](#saved-payment-methods) below)
 2. **Enable Per-VM**: Use the VM PATCH endpoint to set `auto_renewal_enabled: true` for desired VMs
 3. **Monitor Status**: Check VM details to see current auto-renewal status
 
@@ -461,11 +462,12 @@ nostr+walletconnect://relay_url?relay=ws://...&secret=...&pubkey=...
 #### Example Usage
 
 ```typescript
-// 1. Set up NWC connection string
-const accountUpdate = {
-  nwc_connection_string: "nostr+walletconnect://relay.damus.io?relay=wss://relay.damus.io&secret=..."
+// 1. Add an NWC connection as a saved payment method
+const addNwc = {
+  nwc_connection_string: "nostr+walletconnect://relay.damus.io?relay=wss://relay.damus.io&secret=...",
+  name: "My wallet"
 };
-await api.patch('/api/v1/account', accountUpdate);
+await api.post('/api/v1/payment-methods', addNwc);
 
 // 2. Enable auto-renewal for a specific VM
 const vmUpdate = {
@@ -476,6 +478,62 @@ await api.patch('/api/v1/vm/123', vmUpdate);
 // 3. Check VM auto-renewal status
 const vmStatus = await api.get('/api/v1/vm/123');
 console.log('Auto-renewal enabled:', vmStatus.data.auto_renewal_enabled);
+```
+
+### Saved Payment Methods
+
+Saved payment methods are the wallets/cards used for automatic renewals and for referral payouts (NWC). The underlying provider tokens / NWC connection strings are **never** returned by the API. The two supported providers are `nwc` (Nostr Wallet Connect, added by the user) and `revolut` (a saved card, created during an interactive card payment).
+
+#### List Saved Payment Methods
+- **GET** `/api/v1/payment-methods`
+- **Auth**: Required
+- **Response**: `PaymentMethodResponse[]`
+
+#### Add NWC Payment Method
+- **POST** `/api/v1/payment-methods`
+- **Auth**: Required
+- **Body**: `AddNwcPaymentMethodRequest`
+- **Response**: `PaymentMethodResponse`
+- **Notes**: The NWC connection is validated (it must expose `pay_invoice`). The first method a user adds becomes their default.
+- **Error**: Returns an error if the connection string is empty, cannot be parsed, or does not allow `pay_invoice`.
+
+#### Update Saved Payment Method
+- **PATCH** `/api/v1/payment-methods/{id}`
+- **Auth**: Required
+- **Body**: `PatchPaymentMethodRequest`
+- **Response**: `PaymentMethodResponse`
+- **Notes**: Setting `is_default: true` clears the default flag on the user's other methods (only one default at a time).
+
+#### Delete Saved Payment Method
+- **DELETE** `/api/v1/payment-methods/{id}`
+- **Auth**: Required
+- **Response**: `null`
+
+**Types:**
+```typescript
+interface PaymentMethodResponse {
+  id: number;
+  provider: "nwc" | "revolut"; // Payment processor
+  name?: string;               // Optional user-defined label
+  created: string;             // ISO 8601 datetime
+  card_brand?: string;         // Card brand (revolut only)
+  card_last_four?: string;     // Last 4 digits (revolut only)
+  exp_month?: number;          // Card expiry month (revolut only)
+  exp_year?: number;           // Card expiry year (revolut only)
+  is_default: boolean;         // Whether this is the default method
+  enabled: boolean;            // Whether this method is usable
+}
+
+interface AddNwcPaymentMethodRequest {
+  nwc_connection_string: string; // NWC URI (nostr+walletconnect://...)
+  name?: string;                 // Optional user-defined label
+}
+
+interface PatchPaymentMethodRequest {
+  is_default?: boolean;          // Set/unset as the default method
+  enabled?: boolean;             // Enable/disable this method
+  name?: string | null;          // Set (string) or clear (null) the label; omit to leave unchanged
+}
 ```
 
 ### SSH Key Management
@@ -808,9 +866,58 @@ const result: ApiResponse<Subscription> = await response.json();
 // Returns: PaginatedResponse<SubscriptionPayment>
 ```
 
+### IP Space (Public)
+
+Browse the additional IP space (extra subnets) available for purchase, with pricing. These endpoints are **public** (no auth) and only return spaces that are available and not reserved.
+
+#### List Available IP Space
+- **GET** `/api/v1/ip_space?limit={limit}&offset={offset}`
+- **Auth**: None
+- **Query Params**: `limit` (optional, default 50, max 100), `offset` (optional, default 0)
+- **Response**: `PaginatedResponse<AvailableIpSpace>`
+
+#### Get IP Space Details
+- **GET** `/api/v1/ip_space/{id}`
+- **Auth**: None
+- **Response**: `AvailableIpSpace`
+- **Error**: Returns an error if the space is not available or is reserved.
+
+**Types:**
+```typescript
+interface AvailableIpSpace {
+  id: number;
+  min_prefix_size: number;         // Smallest allocatable prefix (e.g. 29)
+  max_prefix_size: number;         // Largest allocatable prefix (e.g. 24)
+  registry: "ARIN" | "RIPE" | "APNIC" | "LACNIC" | "AFRINIC";
+  ip_version: "ipv4" | "ipv6";
+  pricing: IpSpacePricing[];        // Pricing per allocatable prefix size
+}
+
+interface IpSpacePricing {
+  id: number;
+  prefix_size: number;
+  price: Price;                     // Recurring price in the base currency
+  setup_fee: Price;                 // One-time setup fee in the base currency
+  other_price: Price[];             // Same recurring price in alternative currencies
+  other_setup_fee: Price[];         // Same setup fee in alternative currencies
+}
+```
+
 ### Referral Program
 
 Users can enroll in the referral program to earn payouts when others sign up using their code.
+
+**Commission rate fields — how they relate**
+
+The referral program pays a commission = a percentage of each referred VM's **first** payment. Three separate rate fields appear across these endpoints; they are easy to confuse, so read this first:
+
+| Field | Where | Meaning |
+|---|---|---|
+| `referral_rate` | `Referral` | The **per-referrer override**, whole %. This is **admin-controlled** and is `null` for most referrers. `null` means “no override — fall back to the company default”. It is **not** the rate you earn on its own. |
+| `effective_referral_rate` | `Referral` | The rate that **currently applies to you** for display, whole %: the `referral_rate` override when set, otherwise the default (primary) company's rate. Use this to show “your commission rate”. |
+| `effective_rate` | `ReferralUsage` (per VM) | The rate that was **actually applied to one referred VM's** first payment, whole %. Resolved against that VM's own company, so it can differ per referred VM. |
+
+> `effective_referral_rate` is a headline/default for the UI. The amount actually earned on a given referral is always computed per referred VM (`ReferralUsage.effective_rate`), because each referred VM may belong to a different company with its own default rate.
 
 #### Sign Up for Referral Program
 - **POST** `/api/v1/referral`
@@ -818,17 +925,18 @@ Users can enroll in the referral program to earn payouts when others sign up usi
 - **Body**:
 ```typescript
 interface ReferralSignupRequest {
-  lightning_address?: string; // Lightning address for automatic payouts
-  use_nwc?: boolean;          // Use NWC wallet for payouts (requires NWC configured on account)
+  lightning_address?: string; // Lightning address for payouts (required when mode is "lightning_address")
+  mode?: "lightning_address" | "nwc"; // Payout method; defaults to "lightning_address"
 }
 ```
 - **Response**: `Referral`
-- **Error**: Returns error if already enrolled, or if no payout method is provided, or if `use_nwc` is true but NWC is not configured
+- **Error**: Returns error if already enrolled; if `mode` is `lightning_address` (or omitted) without a resolvable `lightning_address`; or if `mode` is `nwc` but no NWC connection is configured on the account. `account_credit` is a defined-but-unimplemented mode and is rejected.
 
 #### Get Referral State
 - **GET** `/api/v1/referral`
 - **Auth**: Required
 - **Response**: `ReferralState`
+- **Error**: `404` if not enrolled
 
 #### Update Referral Payout Options
 - **PATCH** `/api/v1/referral`
@@ -836,26 +944,39 @@ interface ReferralSignupRequest {
 - **Body**:
 ```typescript
 interface ReferralPatchRequest {
-  lightning_address?: string | null; // Set or clear lightning address
-  use_nwc?: boolean;                 // Enable/disable NWC payout
+  lightning_address?: string | null;  // Set (string) or clear (null) the lightning address; omit to leave unchanged
+  mode?: "lightning_address" | "nwc"; // Change payout method; omit to leave unchanged
 }
 ```
 - **Response**: `Referral`
+- **Note**: `referral_rate` (the commission override) is **admin-controlled** and cannot be set through this endpoint.
+
+#### Leave Referral Program
+- **DELETE** `/api/v1/referral`
+- **Auth**: Required
+- **Response**: empty (`null` data)
+- **Error**: `409` while a payout is still pending, or when paid payout history exists (retained for accounting).
+
+#### Get Per-VM Referral Usage
+- **GET** `/api/v1/referral/usage`
+- **Auth**: Required
+- **Response**: `ReferralUsage[]` — one row per referred VM that made a first payment (most recent first)
+- **Error**: `404` if not enrolled
 
 **Response Types:**
 ```typescript
 interface Referral {
   code: string;                    // 8-character base63 referral code to share
-  lightning_address?: string;      // Lightning address for payouts
-  use_nwc: boolean;                // Whether to use NWC for payouts
-  referral_rate: number | null;    // Per-referrer commission override (whole %); null = use company default (admin-controlled)
-  effective_referral_rate: number; // The rate that currently applies (whole %): the override if set, else the default company's referral_rate
+  lightning_address?: string;      // Lightning address for payouts (used when mode is "lightning_address")
+  mode: "lightning_address" | "nwc" | "account_credit"; // Payout method
+  referral_rate: number | null;    // Per-referrer commission override (whole %), admin-controlled; null = no override, use company default. NOT the rate you earn by itself.
+  effective_referral_rate: number; // The commission rate that currently applies to you (whole %): the override if set, else the default company's rate. Use this for display.
   created: string;                 // ISO 8601 datetime
 }
 
 interface ReferralEarning {
   currency: string;   // Currency code (e.g. "EUR", "BTC")
-  amount: number;     // Total earned in this currency (smallest currency unit)
+  amount: number;     // Total commission earned in this currency (smallest currency unit) = sum over referred VMs of (first payment * effective_rate%)
 }
 
 interface ReferralPayout {
@@ -865,13 +986,23 @@ interface ReferralPayout {
   created: string;    // ISO 8601 datetime
   is_paid: boolean;
   invoice?: string;   // BOLT11 lightning invoice
+  pre_image?: string; // Payment preimage (hex), present once the payout has settled
+}
+
+interface ReferralUsage {
+  vm_id: number;         // The referred VM
+  created: string;       // ISO 8601 datetime of that VM's first paid payment
+  amount: number;        // The referred VM's first payment amount (smallest currency unit)
+  currency: string;      // Currency of the payment / commission
+  effective_rate: number;// Rate actually applied to THIS referred VM (whole %); resolved against the VM's own company
+  commission: number;    // Commission earned from this VM = amount * effective_rate% (smallest currency unit)
 }
 
 interface ReferralState extends Referral {
-  earned: ReferralEarning[];     // Per-currency breakdown of referral earnings
+  earned: ReferralEarning[];     // Per-currency breakdown of commission earned
   payouts: ReferralPayout[];     // Complete payout history (most recent first)
-  referrals_success: number;     // Number of referred users that made a payment
-  referrals_failed: number;      // Number of referred users that never paid
+  referrals_success: number;     // Number of referred VMs that made at least one payment
+  referrals_failed: number;      // Number of referred VMs that never paid
 }
 ```
 
