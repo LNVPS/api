@@ -167,6 +167,15 @@ fn build_webauthn(cfg: &WebauthnConfig) -> Result<Webauthn, ApiError> {
         .map_err(|e| ApiError::internal(format!("Failed to build webauthn: {}", e)))
 }
 
+/// Session token lifetime from the shared `[session]` config (default 30 days).
+fn session_ttl(this: &RouterState) -> u64 {
+    this.settings
+        .session
+        .as_ref()
+        .map(|s| s.ttl)
+        .unwrap_or(lnvps_api_common::DEFAULT_SESSION_TTL_SECS)
+}
+
 /// Resolve the WebAuthn config or 4xx if passkeys are disabled.
 fn webauthn_cfg(this: &RouterState) -> Result<WebauthnConfig, ApiError> {
     this.settings
@@ -254,7 +263,7 @@ async fn register_finish(
         })
         .await?;
 
-    issue_token(&pubkey, uid, cfg.session_ttl)
+    issue_token(&pubkey, uid, session_ttl(&this))
 }
 
 /// Begin a usernameless (discoverable) login.
@@ -335,7 +344,7 @@ async fn login_finish(
         .try_into()
         .map_err(|_| ApiError::internal("Invalid stored pubkey"))?;
 
-    issue_token(&pubkey, used.user_id, cfg.session_ttl)
+    issue_token(&pubkey, used.user_id, session_ttl(&this))
 }
 
 /// List the passkeys registered to the authenticated account.
@@ -485,8 +494,6 @@ mod tests {
             rp_id: "example.com".to_string(),
             rp_origin: "https://example.com".to_string(),
             rp_name: "Example".to_string(),
-            session_secret: "unit-test-secret".to_string(),
-            session_ttl: 3600,
         }
     }
 

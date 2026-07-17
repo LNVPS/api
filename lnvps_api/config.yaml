@@ -53,12 +53,8 @@ captcha:
 # Generic OAuth / OIDC login (optional). When set, users can log in via
 # external identity providers and receive a session JWT that is accepted on
 # authenticated endpoints as `Authorization: Bearer <jwt>` (alongside NIP-98).
+# Requires the shared `session` block below to be set.
 #oauth:
-#  # Strong, stable random secret used to sign session tokens. Changing it
-#  # invalidates all outstanding sessions.
-#  session-secret: "change-me-to-a-long-random-string"
-#  # Session lifetime in seconds (default 30 days).
-#  session-ttl: 2592000
 #  # Optional: after login, redirect the browser here with `#token=<jwt>`.
 #  # When omitted, the callback returns the token as JSON.
 #  success-redirect: "https://app.example.com/oauth/complete"
@@ -104,6 +100,7 @@ captcha:
 # an account and log in with a platform passkey (Face ID / Touch ID / Windows
 # Hello) or a security key, and receive the same session JWT as OAuth
 # (`Authorization: Bearer <jwt>`). Login is usernameless (discoverable).
+# Requires the shared `session` block below to be set.
 #webauthn:
 #  # Relying Party ID: the registrable domain passkeys are bound to. PERMANENT —
 #  # changing it invalidates every registered passkey.
@@ -113,8 +110,12 @@ captcha:
 #  rp-origin: "https://app.example.com"
 #  # Human-friendly name shown in the authenticator prompt.
 #  rp-name: "LNVPS"
-#  # Signs session + challenge tokens. Shares the session token space with
-#  # oauth — if both are set, use the SAME secret.
-#  session-secret: "change-me-to-a-long-random-string"
+# Shared session-token settings. Required whenever `oauth` or `webauthn` is
+# enabled — both issue the same stateless session JWTs. Omit to disable Bearer
+# session auth entirely (Nostr / NIP-98 only).
+#session:
+#  # Strong, stable random secret used to sign session JWTs (and the OAuth CSRF
+#  # `state` / WebAuthn challenge tokens). Changing it invalidates all sessions.
+#  secret: "change-me-to-a-long-random-string"
 #  # Session lifetime in seconds (default 30 days).
-#  session-ttl: 2592000
+#  ttl: 2592000

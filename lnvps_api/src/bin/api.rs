@@ -113,27 +113,21 @@ async fn main() -> Result<(), Error> {
     }
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
-    // Enable session (Bearer JWT) auth for external OAuth logins when configured.
-    if let Some(ref oauth) = settings.oauth {
-        if lnvps_api_common::init_session_secret(oauth.session_secret.as_bytes().to_vec()) {
+    // Enable session (Bearer JWT) auth, shared by OAuth and WebAuthn logins.
+    if let Some(ref session) = settings.session {
+        if lnvps_api_common::init_session_secret(session.secret.as_bytes().to_vec()) {
             info!(
-                "OAuth session auth enabled ({} provider(s))",
-                oauth.providers.len()
+                "Session (Bearer JWT) auth enabled (oauth={}, webauthn={})",
+                settings.oauth.is_some(),
+                settings.webauthn.is_some(),
             );
         } else {
-            warn!("OAuth configured but session secret was empty or already set");
+            warn!("Session secret was empty or already set");
         }
-    }
-
-    // Passkey (WebAuthn) login shares the session token space. Initialise the
-    // signing secret from it too (first non-empty secret wins; if OAuth already
-    // set one they should match).
-    if let Some(ref webauthn) = settings.webauthn {
-        if lnvps_api_common::init_session_secret(webauthn.session_secret.as_bytes().to_vec()) {
-            info!("WebAuthn passkey login enabled (rp_id={})", webauthn.rp_id);
-        } else if settings.oauth.is_none() {
-            warn!("WebAuthn configured but session secret was empty or already set");
-        }
+    } else if settings.oauth.is_some() || settings.webauthn.is_some() {
+        warn!(
+            "oauth/webauthn configured but no [session] secret is set — Bearer login is disabled"
+        );
     }
 
     let nostr_client = if let Some(ref c) = settings.nostr {
