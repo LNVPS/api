@@ -2,7 +2,7 @@ use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
@@ -320,6 +320,180 @@ impl VmProvisioner {
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         // Record the base monthly amount now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
+        let price =
+            PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        li.amount = price.total();
+        self.db.update_subscription_line_item(&li).await?;
+
+        Ok(new_vm)
+    }
+
+    /// Import a VM that already exists on a host but isn't tracked in the
+    /// database (issue #166).
+    ///
+    /// The VM is assigned to `user_id` and billed via the region's custom
+    /// pricing (which is required — import fails if the region has none). The
+    /// VM's current specs (CPU/memory/disk) are captured into a custom template.
+    /// No changes are made on the host; this only creates the database records.
+    ///
+    /// The database VM id is fixed by the host's id mapping (e.g. Proxmox
+    /// `vmid = db_id + 100`) so that all subsequent lifecycle operations target
+    /// the correct host VM.
+    pub async fn import_vm(&self, host_id: u64, host_vm_id: i64, user_id: u64) -> Result<Vm> {
+        let user = self.db.get_user(user_id).await?;
+        let host = self.db.get_host(host_id).await?;
+
+        // Discover the VM on the host
+        let client = get_host_client(&host, &self.provisioner_config)?;
+        let spec = client
+            .list_host_vms()
+            .await?
+            .into_iter()
+            .find(|v| v.host_vm_id == host_vm_id)
+            .ok_or_else(|| anyhow!("VM {} not found on host {}", host_vm_id, host_id))?;
+
+        // The host VM must map to a managed database id
+        let vm_id = spec.mapped_vm_id.ok_or_else(|| {
+            anyhow!(
+                "Host VM {} is outside the managed id range and cannot be imported",
+                host_vm_id
+            )
+        })?;
+
+        // Reject if a live VM already occupies this id
+        if let Ok(existing) = self.db.get_vm(vm_id).await
+            && !existing.deleted
+        {
+            bail!("VM {} is already tracked in the database", vm_id);
+        }
+
+        // Region custom pricing is required for import
+        let pricing = self
+            .db
+            .list_custom_pricing(host.region_id)
+            .await?
+            .into_iter()
+            .find(|p| p.enabled && p.expires.map(|e| e > Utc::now()).unwrap_or(true))
+            .ok_or_else(|| {
+                anyhow!(
+                    "No enabled custom pricing for region {}, cannot import VM",
+                    host.region_id
+                )
+            })?;
+
+        // Pick the host disk backing this VM (match on the storage pool name,
+        // else fall back to the first enabled/available disk).
+        let host_disks = self.db.list_host_disks(host.id).await?;
+        let disk = spec
+            .disk_storage
+            .as_ref()
+            .and_then(|store| host_disks.iter().find(|d| &d.name == store))
+            .or_else(|| host_disks.iter().find(|d| d.enabled))
+            .or_else(|| host_disks.first())
+            .ok_or_else(|| anyhow!("No host disk found for host {}", host.id))?
+            .clone();
+
+        // Placeholder OS image (image_id is a required FK). The imported VM
+        // keeps its real disk; the image is only cosmetic / used on reinstall.
+        let image = self
+            .db
+            .list_os_image()
+            .await?
+            .into_iter()
+            .find(|i| i.enabled)
+            .ok_or_else(|| anyhow!("No OS image available to use as import placeholder"))?;
+
+        // Capture the current specs into a custom template
+        let template = VmCustomTemplate {
+            id: 0,
+            cpu: spec.cpu,
+            memory: spec.memory,
+            disk_size: spec.disk_size,
+            disk_type: disk.kind,
+            disk_interface: disk.interface,
+            pricing_id: pricing.id,
+            cpu_mfg: pricing.cpu_mfg,
+            cpu_arch: pricing.cpu_arch,
+            cpu_features: pricing.cpu_features.clone(),
+            disk_iops_read: pricing.disk_iops_read,
+            disk_iops_write: pricing.disk_iops_write,
+            disk_mbps_read: pricing.disk_mbps_read,
+            disk_mbps_write: pricing.disk_mbps_write,
+            network_mbps: pricing.network_mbps,
+            cpu_limit: pricing.cpu_limit,
+            firewall_rule_limit: None,
+        };
+        let template_id = self.db.insert_custom_vm_template(&template).await?;
+        let region = self.db.get_host_region(host.region_id).await?;
+
+        // Create a subscription for this imported VM (mirrors provision_custom)
+        let subscription = Subscription {
+            id: 0,
+            user_id: user.id,
+            company_id: region.company_id,
+            name: "Imported VM subscription".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: false,
+            is_setup: false,
+            currency: pricing.currency.clone(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: true,
+            external_id: None,
+        };
+        let line_item = SubscriptionLineItem {
+            id: 0,
+            subscription_id: 0,
+            subscription_type: SubscriptionType::Vps,
+            name: pricing.name.clone(),
+            description: None,
+            amount: 0,
+            setup_amount: 0,
+            configuration: None,
+        };
+        let (subscription_id, line_item_ids) = self
+            .db
+            .insert_subscription_with_line_items(&subscription, vec![line_item])
+            .await?;
+        let subscription_line_item_id = line_item_ids[0];
+
+        let new_vm = Vm {
+            id: vm_id,
+            host_id: host.id,
+            user_id: user.id,
+            image_id: image.id,
+            template_id: None,
+            custom_template_id: Some(template_id),
+            subscription_line_item_id,
+            ssh_key_id: None,
+            disk_id: disk.id,
+            mac_address: spec
+                .mac_address
+                .clone()
+                .unwrap_or_else(|| "ff:ff:ff:ff:ff:ff".to_string()),
+            deleted: false,
+            ref_code: None,
+            disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
+        };
+
+        // Insert with the explicit (mapped) id so lifecycle ops target the right host VM
+        self.db.insert_vm_with_id(&new_vm).await?;
+
+        // Name the subscription/line item and record the base monthly amount
+        let mut sub = self.db.get_subscription(subscription_id).await?;
+        sub.name = format!("VM{} subscription", new_vm.id);
+        self.db.update_subscription(&sub).await?;
+
+        let mut li = self
+            .db
+            .get_subscription_line_item(subscription_line_item_id)
+            .await?;
+        li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         let price =
             PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
         li.amount = price.total();
@@ -2426,5 +2600,94 @@ mod tests {
             wrk,
             VmStateCache::new(),
         )?)
+    }
+
+    /// Covers the import flow scenarios. Run as a single test because
+    /// [`DummyVmHost`] discovery is backed by a process-wide registry, so
+    /// splitting these into parallel tests would race on that global state.
+    #[tokio::test]
+    async fn test_import_vm() -> Result<()> {
+        use lnvps_api_common::HostVmSpec;
+
+        fn spec(host_vm_id: i64, mapped: u64) -> HostVmSpec {
+            HostVmSpec {
+                host_vm_id,
+                mapped_vm_id: Some(mapped),
+                name: Some("legacy-vm".to_string()),
+                cpu: 2,
+                memory: 2 * GB,
+                disk_size: 20 * GB,
+                disk_storage: Some("mock-disk".to_string()),
+                mac_address: Some("bc:24:11:aa:bb:cc".to_string()),
+                running: true,
+            }
+        }
+
+        // --- Scenario 1: successful import builds a custom template from specs
+        let db = Arc::new(MockDb::default());
+        insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let (user, _ssh_key) = add_user(&db).await?;
+        crate::host::dummy_host::DummyVmHost::set_host_vms(vec![spec(200, 100)]).await;
+
+        let provisioner = make_provisioner(db.clone());
+        let vm = provisioner.import_vm(1, 200, user.id).await?;
+
+        assert_eq!(vm.id, 100);
+        assert_eq!(vm.user_id, user.id);
+        assert_eq!(vm.host_id, 1);
+        assert_eq!(vm.disk_id, 1);
+        assert_eq!(vm.mac_address, "bc:24:11:aa:bb:cc");
+        assert!(vm.template_id.is_none());
+        let custom_template_id = vm.custom_template_id.expect("custom template set");
+
+        let tmpl = db.get_custom_vm_template(custom_template_id).await?;
+        assert_eq!(tmpl.cpu, 2);
+        assert_eq!(tmpl.memory, 2 * GB);
+        assert_eq!(tmpl.disk_size, 20 * GB);
+        assert_eq!(tmpl.disk_type, DiskType::SSD);
+        assert_eq!(tmpl.disk_interface, DiskInterface::PCIe);
+
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert!(li.amount > 0, "line item should have a priced amount");
+
+        let fetched = db.get_vm(100).await?;
+        assert_eq!(fetched.custom_template_id, Some(custom_template_id));
+
+        // --- Scenario 2: re-importing an already-tracked VM fails
+        let err = provisioner
+            .import_vm(1, 200, user.id)
+            .await
+            .expect_err("re-import must fail");
+        assert!(
+            err.to_string().contains("already tracked"),
+            "unexpected error: {}",
+            err
+        );
+
+        // --- Scenario 3: VM not present on host
+        let err = provisioner
+            .import_vm(1, 9999, user.id)
+            .await
+            .expect_err("import must fail when VM not present on host");
+        assert!(err.to_string().contains("not found"), "unexpected: {}", err);
+
+        // --- Scenario 4: region has no custom pricing
+        let db2 = Arc::new(MockDb::default());
+        let (user2, _k2) = add_user(&db2).await?;
+        crate::host::dummy_host::DummyVmHost::set_host_vms(vec![spec(205, 105)]).await;
+        let provisioner2 = make_provisioner(db2.clone());
+        let err = provisioner2
+            .import_vm(1, 205, user2.id)
+            .await
+            .expect_err("import must fail without custom pricing");
+        assert!(
+            err.to_string().contains("custom pricing"),
+            "unexpected error: {}",
+            err
+        );
+
+        Ok(())
     }
 }

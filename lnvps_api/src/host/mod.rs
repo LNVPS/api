@@ -2,6 +2,7 @@ use crate::settings::ProvisionerConfig;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::future::join_all;
+use lnvps_api_common::HostVmSpec;
 use lnvps_api_common::VmRunningState;
 use lnvps_api_common::retry::OpResult;
 use lnvps_db::{
@@ -29,6 +30,18 @@ pub struct TerminalStream {
 #[async_trait]
 pub trait VmHostClient: Send + Sync {
     async fn get_info(&self) -> OpResult<VmHostInfo>;
+
+    /// List all VMs present on the host, described in host-native terms.
+    ///
+    /// Used for discovering/importing VMs that exist on the host but aren't
+    /// tracked in the database. Defaults to unsupported for hosts that don't
+    /// implement discovery.
+    async fn list_host_vms(&self) -> OpResult<Vec<HostVmSpec>> {
+        use lnvps_api_common::retry::OpError;
+        Err(OpError::Fatal(anyhow!(
+            "VM discovery is not supported on this host type"
+        )))
+    }
 
     /// Download OS image to the host
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()>;

@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipnetwork::IpNetwork;
+use lnvps_api_common::HostVmSpec;
 use lnvps_api_common::JsonApi;
 use lnvps_api_common::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{VmRunningState, VmRunningStates, op_fatal, parse_gateway};
@@ -1279,6 +1280,51 @@ impl VmHostClient for ProxmoxClient {
         }
     }
 
+    async fn list_host_vms(&self) -> OpResult<Vec<HostVmSpec>> {
+        let vms = self.list_vms(&self.node).await?;
+        let mut out = Vec::with_capacity(vms.len());
+        for vm in vms {
+            // Map to the LNVPS db id (vmid = db_id + 100). VMs with vmid < 100
+            // fall outside the managed range and can't be imported.
+            let mapped_vm_id = if vm.vm_id >= 100 {
+                let id: ProxmoxVmId = vm.vm_id.into();
+                Some(id.inner())
+            } else {
+                None
+            };
+
+            // Pull the live config for MAC + backing storage; tolerate failures
+            // so a single unreadable VM doesn't abort discovery.
+            let (mac_address, disk_storage) =
+                match self.get_vm_config(&self.node, vm.vm_id.into()).await {
+                    Ok(cfg) => (
+                        cfg.config.net.as_deref().and_then(parse_mac_from_net),
+                        cfg.config
+                            .scsi_0
+                            .as_deref()
+                            .and_then(parse_storage_from_disk),
+                    ),
+                    Err(e) => {
+                        warn!("Failed to read config for vm {}: {}", vm.vm_id, e);
+                        (None, None)
+                    }
+                };
+
+            out.push(HostVmSpec {
+                host_vm_id: vm.vm_id as i64,
+                mapped_vm_id,
+                name: vm.name.clone(),
+                cpu: vm.cpus.unwrap_or(0),
+                memory: vm.max_mem.unwrap_or(0),
+                disk_size: vm.max_disk.unwrap_or(0),
+                disk_storage,
+                mac_address,
+                running: matches!(vm.status, VmStatus::Running),
+            });
+        }
+        Ok(out)
+    }
+
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
         let iso_storage = self.get_iso_storage(&self.node).await?;
         let files = self.list_storage_files(&self.node, &iso_storage).await?;
@@ -1972,6 +2018,39 @@ impl ProxmoxClient {
 /// Wrap a database vm id
 #[derive(Debug, Copy, Clone, Default)]
 pub struct ProxmoxVmId(u64);
+
+impl ProxmoxVmId {
+    /// The underlying LNVPS database id (host vmid minus the +100 offset).
+    pub fn inner(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Extract the MAC address from a Proxmox `netN` config string, e.g.
+/// `virtio=BC:24:11:00:11:22,bridge=vmbr0,firewall=1` -> `BC:24:11:00:11:22`.
+fn parse_mac_from_net(net: &str) -> Option<String> {
+    net.split(',').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        // The NIC model key (virtio/e1000/...) holds the MAC as its value.
+        if v.split(':').count() == 6 && k != "bridge" {
+            Some(v.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Extract the storage pool from a Proxmox disk config string, e.g.
+/// `local-lvm:vm-1566-disk-0,size=32G` -> `local-lvm`.
+fn parse_storage_from_disk(disk: &str) -> Option<String> {
+    let first = disk.split(',').next()?;
+    let (storage, _) = first.split_once(':')?;
+    if storage.is_empty() {
+        None
+    } else {
+        Some(storage.to_string())
+    }
+}
 
 impl From<ProxmoxVmId> for i32 {
     fn from(val: ProxmoxVmId) -> Self {
@@ -2863,6 +2942,46 @@ mod tests {
         let json = serde_json::to_string(&pve).unwrap();
         assert!(!json.contains("dport"), "json: {json}");
         assert!(!json.contains("proto"), "json: {json}");
+    }
+
+    #[test]
+    fn test_parse_mac_from_net() {
+        assert_eq!(
+            parse_mac_from_net("virtio=BC:24:11:00:11:22,bridge=vmbr0,firewall=1").as_deref(),
+            Some("BC:24:11:00:11:22")
+        );
+        assert_eq!(
+            parse_mac_from_net("e1000=00:15:5D:01:02:03,bridge=vmbr1").as_deref(),
+            Some("00:15:5D:01:02:03")
+        );
+        // No MAC present
+        assert_eq!(parse_mac_from_net("bridge=vmbr0,firewall=1"), None);
+        assert_eq!(parse_mac_from_net(""), None);
+    }
+
+    #[test]
+    fn test_parse_storage_from_disk() {
+        assert_eq!(
+            parse_storage_from_disk("local-lvm:vm-1566-disk-0,size=32G").as_deref(),
+            Some("local-lvm")
+        );
+        assert_eq!(
+            parse_storage_from_disk("ceph:vm-100-disk-0").as_deref(),
+            Some("ceph")
+        );
+        // No storage separator
+        assert_eq!(parse_storage_from_disk("none"), None);
+        assert_eq!(parse_storage_from_disk(""), None);
+    }
+
+    #[test]
+    fn test_proxmox_vm_id_inner_maps_to_db_id() {
+        // Host vmid 1566 -> db id 1466
+        let id: ProxmoxVmId = 1566i32.into();
+        assert_eq!(id.inner(), 1466);
+        // Round trip back to host vmid
+        let host_id: i32 = id.into();
+        assert_eq!(host_id, 1566);
     }
 
     #[test]

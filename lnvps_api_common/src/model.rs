@@ -797,3 +797,31 @@ mod tests {
         assert!(s.contains(r#""ip_range_subscription_id":7"#));
     }
 }
+
+/// A VM discovered directly on a host, described in host-native terms.
+///
+/// Used to import VMs that exist on a host but are not tracked in the database
+/// (see issue #166). `mapped_vm_id` is the LNVPS database id this host VM would
+/// map to (e.g. Proxmox `vmid - 100`), or `None` when the host VM falls outside
+/// the managed id range and therefore can't be imported.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostVmSpec {
+    /// Raw host VM id (e.g. Proxmox vmid)
+    pub host_vm_id: i64,
+    /// LNVPS database id this VM maps to, if within the managed range
+    pub mapped_vm_id: Option<u64>,
+    /// Host-reported VM name
+    pub name: Option<String>,
+    /// Allocated CPU cores
+    pub cpu: u16,
+    /// Allocated memory in bytes
+    pub memory: u64,
+    /// Primary disk size in bytes
+    pub disk_size: u64,
+    /// Storage pool backing the primary disk
+    pub disk_storage: Option<String>,
+    /// Primary NIC MAC address
+    pub mac_address: Option<String>,
+    /// Whether the VM is currently running
+    pub running: bool,
+}

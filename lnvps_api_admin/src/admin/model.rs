@@ -2844,6 +2844,48 @@ pub struct AdminCreateVmRequest {
     pub reason: Option<String>,
 }
 
+/// Request to import an existing host VM into the database (issue #166)
+#[derive(Deserialize)]
+pub struct AdminImportVmRequest {
+    /// Raw host VM id (e.g. Proxmox vmid)
+    pub host_vm_id: i64,
+    /// User the imported VM is assigned to
+    pub user_id: u64,
+    pub reason: Option<String>,
+}
+
+/// A VM present on a host that is not tracked in the database
+#[derive(Serialize)]
+pub struct AdminUnmanagedVmInfo {
+    /// Raw host VM id (e.g. Proxmox vmid)
+    pub host_vm_id: i64,
+    /// Database id this VM would map to on import
+    pub mapped_vm_id: Option<u64>,
+    pub name: Option<String>,
+    pub cpu: u16,
+    pub memory: u64,
+    pub disk_size: u64,
+    pub disk_storage: Option<String>,
+    pub mac_address: Option<String>,
+    pub running: bool,
+}
+
+impl From<lnvps_api_common::HostVmSpec> for AdminUnmanagedVmInfo {
+    fn from(s: lnvps_api_common::HostVmSpec) -> Self {
+        Self {
+            host_vm_id: s.host_vm_id,
+            mapped_vm_id: s.mapped_vm_id,
+            name: s.name,
+            cpu: s.cpu,
+            memory: s.memory,
+            disk_size: s.disk_size,
+            disk_storage: s.disk_storage,
+            mac_address: s.mac_address,
+            running: s.running,
+        }
+    }
+}
+
 // ============================================================================
 // Subscription Models
 // ============================================================================
