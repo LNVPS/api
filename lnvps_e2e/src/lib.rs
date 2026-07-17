@@ -19,5 +19,7 @@ mod lifecycle;
 pub mod lightning;
 pub mod nip98;
 mod rbac;
+pub mod soft_authenticator;
 mod user_api;
+mod webauthn;
 pub mod worker;

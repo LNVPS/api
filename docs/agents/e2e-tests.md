@@ -83,6 +83,8 @@ When secret keys are not set, random keys are generated per process. The admin u
 | `user_api.rs` | Tests for all user-facing API endpoints |
 | `admin_api.rs` | Tests for all admin API endpoints including CRUD lifecycles |
 | `rbac.rs` | RBAC permission tests (no-role, read_only, vm_manager, payment_manager, super_admin) |
+| `webauthn.rs` | Passkey (WebAuthn) signup/login tests: passwordless signup+login and add-passkey-to-Nostr-account+login |
+| `soft_authenticator.rs` | Software WebAuthn authenticator (discoverable/resident-key passkeys) used by `webauthn.rs`; includes an offline round-trip test against webauthn-rs |
 | `lifecycle.rs` | Full end-to-end lifecycle test (see below) |
 
 ### Key design decisions

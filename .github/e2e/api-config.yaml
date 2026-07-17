@@ -17,6 +17,17 @@ nostr:
 encryption:
   key-file: "/tmp/e2e-encryption.key"
   auto-generate: true
+# Passkey (WebAuthn) config for the passkey e2e tests. rp-origin must match the
+# public origin the tests hit (public-url above).
+webauthn:
+  rp-id: "localhost"
+  rp-origin: "http://localhost:8000"
+  rp-name: "LNVPS E2E"
+  require-resident-key: true
+# Shared session JWT settings (required for passkey/OAuth Bearer tokens).
+session:
+  secret: "e2e-session-secret-not-for-production-0123456789abcdef"
+  ttl: 3600
 provisioner:
   proxmox:
     qemu:

@@ -19,3 +19,18 @@ chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio", "macros"] }
 hex = "0.4"
 redis = { version = "1", features = ["tokio-comp"] }
+# Software WebAuthn authenticator for passkey e2e tests. webauthn-rs-proto gives
+# the exact request/response types the API uses; p256/sha2 implement the ES256
+# credential + assertion signing.
+webauthn-rs-proto = "0.5"
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64urlsafedata = "0.5"
+
+[dev-dependencies]
+# Used only to validate the software authenticator offline: register via
+# webauthn-rs-core (as the server does) and verify a discoverable assertion via
+# the high-level webauthn-rs discoverable flow.
+webauthn-rs = { version = "0.5", features = ["conditional-ui", "danger-credential-internals"] }
+webauthn-rs-core = "0.5"

@@ -2996,15 +2996,22 @@ version = "0.4.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "base64urlsafedata",
  "chrono",
  "hex",
  "nostr 0.44.3",
+ "p256",
+ "rand_core 0.6.4",
  "redis",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
+ "webauthn-rs",
+ "webauthn-rs-core",
+ "webauthn-rs-proto",
 ]
 
 [[package]]
