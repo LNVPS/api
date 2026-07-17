@@ -50,3 +50,53 @@ captcha:
 #  message-template-lang: "en"
 #  verify-template: "lnvps_verification"
 #  verify-template-lang: "en"
+# Generic OAuth / OIDC login (optional). When set, users can log in via
+# external identity providers and receive a session JWT that is accepted on
+# authenticated endpoints as `Authorization: Bearer <jwt>` (alongside NIP-98).
+#oauth:
+#  # Strong, stable random secret used to sign session tokens. Changing it
+#  # invalidates all outstanding sessions.
+#  session-secret: "change-me-to-a-long-random-string"
+#  # Session lifetime in seconds (default 30 days).
+#  session-ttl: 2592000
+#  # Optional: after login, redirect the browser here with `#token=<jwt>`.
+#  # When omitted, the callback returns the token as JSON.
+#  success-redirect: "https://app.example.com/oauth/complete"
+#  # Providers are keyed by a stable tag (part of the account identity). Each
+#  # has a `type` selecting the flavor; built-in flavors supply default
+#  # endpoints/scopes so usually only credentials are needed.
+#  providers:
+#    google:
+#      type: google
+#      client-id: "xxxx.apps.googleusercontent.com"
+#      client-secret: "xxxx"
+#    github:
+#      type: github
+#      client-id: "Iv1.xxxx"
+#      client-secret: "xxxx"
+#    facebook:
+#      type: facebook
+#      client-id: "1234567890"
+#      client-secret: "xxxx"
+#    apple:
+#      type: apple
+#      client-id: "com.example.service"   # Services ID
+#      team-id: "ABCDE12345"
+#      key-id: "XYZ1234567"
+#      # PEM contents of the downloaded .p8 key
+#      private-key: |
+#        -----BEGIN PRIVATE KEY-----
+#        MIGTAgEA...
+#        -----END PRIVATE KEY-----
+#      # Requesting name/email switches Apple to a POST (form_post) callback:
+#      #scopes: ["name", "email"]
+#    # Fully generic provider (explicit endpoints required):
+#    #keycloak:
+#    #  type: oidc
+#    #  client-id: "xxxx"
+#    #  client-secret: "xxxx"
+#    #  auth-url: "https://id.example.com/authorize"
+#    #  token-url: "https://id.example.com/token"
+#    #  userinfo-url: "https://id.example.com/userinfo"
+#    #  scopes: ["openid", "email"]
+#    #  subject-field: "sub"

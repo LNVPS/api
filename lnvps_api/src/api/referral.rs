@@ -69,7 +69,10 @@ impl From<Referral> for ApiReferral {
 /// Resolve the commission rate that currently applies to a referrer: their
 /// per-referrer override if set, otherwise the default (primary, lowest-id)
 /// company's `referral_rate`.
-async fn resolve_effective_rate(db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>, referral: &Referral) -> f32 {
+async fn resolve_effective_rate(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    referral: &Referral,
+) -> f32 {
     if let Some(r) = referral.referral_rate {
         return r;
     }
@@ -268,7 +271,7 @@ async fn v1_get_referral(
     auth: Nip98Auth,
     State(this): State<RouterState>,
 ) -> ApiResult<ApiReferralState> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let referral = this
@@ -299,7 +302,7 @@ async fn v1_signup_referral(
     State(this): State<RouterState>,
     Json(req): Json<ApiReferralSignupRequest>,
 ) -> ApiResult<ApiReferral> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     // Check if already enrolled
@@ -357,7 +360,7 @@ async fn v1_update_referral(
     State(this): State<RouterState>,
     Json(req): Json<ApiReferralPatchRequest>,
 ) -> ApiResult<ApiReferral> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let mut referral = this
@@ -398,7 +401,7 @@ async fn v1_update_referral(
 /// first, and paid payout history is retained for accounting (so a referrer who
 /// has ever been paid cannot delete their enrollment).
 async fn v1_delete_referral(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let referral = this
@@ -430,7 +433,7 @@ async fn v1_get_referral_usage(
     State(this): State<RouterState>,
     Query(q): Query<PageQuery>,
 ) -> ApiPaginatedResult<ApiReferralUsage> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let referral = this

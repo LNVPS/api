@@ -362,6 +362,27 @@ impl LNVpsDbBase for MockDb {
         }
     }
 
+    async fn upsert_oauth_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
+        let mut users = self.users.lock().await;
+        if let Some(e) = users.iter().find(|(_k, u)| u.pubkey == *pubkey) {
+            Ok(*e.0)
+        } else {
+            let max = *users.keys().max().unwrap_or(&0);
+            users.insert(
+                max + 1,
+                User {
+                    id: max + 1,
+                    pubkey: pubkey.to_vec(),
+                    account_type: lnvps_db::AccountType::OAuth,
+                    created: Utc::now(),
+                    country_code: Some("USA".to_string()),
+                    ..Default::default()
+                },
+            );
+            Ok(max + 1)
+        }
+    }
+
     async fn get_user(&self, id: u64) -> DbResult<User> {
         let users = self.users.lock().await;
         Ok(users.get(&id).ok_or(anyhow!("no user"))?.clone())
@@ -4428,6 +4449,43 @@ mod tests {
         // Replacing with an empty set clears the cache.
         db.replace_router_bgp_routes(1, &[]).await.unwrap();
         assert!(db.list_router_bgp_routes(1).await.unwrap().is_empty());
+    }
+
+    /// An OAuth user is created with `AccountType::OAuth` and is idempotent on
+    /// the synthetic identity, distinct from Nostr users.
+    #[tokio::test]
+    async fn test_upsert_oauth_user() {
+        use lnvps_db::{AccountType, oauth_pubkey};
+
+        let db = MockDb::default();
+        let pk = oauth_pubkey("google", "subject-123");
+
+        let uid = db.upsert_oauth_user(&pk).await.unwrap();
+        // Idempotent: same identity returns the same user id.
+        assert_eq!(uid, db.upsert_oauth_user(&pk).await.unwrap());
+
+        let user = db.get_user(uid).await.unwrap();
+        assert_eq!(user.account_type, AccountType::OAuth);
+        assert_eq!(user.pubkey, pk.to_vec());
+        // OAuth accounts must not opt into NIP-17 (synthetic key is not a Nostr key).
+        assert!(!user.contact_nip17);
+
+        // A different subject yields a different user.
+        let other = db
+            .upsert_oauth_user(&oauth_pubkey("google", "subject-999"))
+            .await
+            .unwrap();
+        assert_ne!(uid, other);
+    }
+
+    /// `oauth_pubkey` is deterministic and provider/subject sensitive.
+    #[test]
+    fn test_oauth_pubkey_derivation() {
+        use lnvps_db::oauth_pubkey;
+        assert_eq!(oauth_pubkey("a", "b"), oauth_pubkey("a", "b"));
+        assert_ne!(oauth_pubkey("a", "b"), oauth_pubkey("a", "c"));
+        // Provider tag is part of the identity, so `a:bc` != `ab:c`.
+        assert_ne!(oauth_pubkey("a", "bc"), oauth_pubkey("ab", "c"));
     }
 }
 

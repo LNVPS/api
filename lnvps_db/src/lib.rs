@@ -38,6 +38,24 @@ pub fn email_hash(email: &str) -> [u8; 32] {
     out
 }
 
+/// Derive the synthetic 32-byte identity used as the `pubkey` for an external
+/// OAuth/OIDC account: `SHA-256("{provider}:{subject}")`.
+///
+/// This is a stable, opaque identifier — the same `(provider, subject)` always
+/// maps to the same user. It is NOT a real Nostr key; users created this way are
+/// stored with [`model::AccountType::OAuth`].
+pub fn oauth_pubkey(provider: &str, subject: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(provider.as_bytes());
+    hasher.update(b":");
+    hasher.update(subject.as_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("sqlx: {0}")]
@@ -102,6 +120,12 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Insert/Fetch user by pubkey
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64>;
+
+    /// Insert/Fetch an external OAuth/OIDC user by their synthetic identity
+    /// (see [`oauth_pubkey`]). Created accounts are marked
+    /// [`model::AccountType::OAuth`] and do not opt into NIP-17 DMs (their
+    /// `pubkey` is not a real Nostr key).
+    async fn upsert_oauth_user(&self, pubkey: &[u8; 32]) -> DbResult<u64>;
 
     /// Get a user by id
     async fn get_user(&self, id: u64) -> DbResult<User>;

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **2026-07-18** - Generic OAuth / OIDC login (Google, GitHub, Facebook, Apple)
+  - New endpoints `GET /api/v1/oauth/{provider}/login` (redirects to the provider) and `GET`/`POST /api/v1/oauth/{provider}/callback` (exchanges the authorization code, resolves/creates the user and issues a session token). Providers are configured under the new `oauth` config section, each with a `type` of `google`, `github`, `facebook`, `apple`, or generic `oidc`.
+  - Built-in flavors handle each provider's quirks: GitHub's `User-Agent` requirement and numeric `id` subject, Facebook's Graph `me` endpoint, and Sign in with Apple's `id_token`-based subject, dynamically-signed **ES256** client secret, and `form_post` (POST) callback.
+  - After a successful login the API issues a stateless session **JWT**. It is accepted on every existing authenticated endpoint via `Authorization: Bearer <jwt>`, alongside the existing `Authorization: Nostr <event>` (NIP-98) scheme.
+  - On first login the provider's email is synced into the account (marked verified when the provider asserts it) and email notifications are enabled by default, since OAuth accounts have no NIP-17 channel. GitHub's primary verified address is fetched from `/user/emails`; Apple's email comes from the `id_token`. The sync is non-destructive — a user's later email edits are not overwritten — and best-effort (a sync failure never blocks login).
+  - OAuth accounts are stored with a new `account_type` of `oauth` and a synthetic identity (`sha256("{provider}:{subject}")`) in place of a Nostr pubkey. Nostr-only features (NIP-17 DMs, npub display, LIR agreement signing) are gated to native Nostr accounts.
+
 ### Fixed
 
 - **2026-07-18** - Referral commission rate not visible to referrers (user API)

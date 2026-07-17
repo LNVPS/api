@@ -63,6 +63,25 @@ impl LNVpsDbBase for LNVpsDbMysql {
         })
     }
 
+    async fn upsert_oauth_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
+        // account_type=1 (OAuth), contact_nip17=0 — the synthetic pubkey is not
+        // a real Nostr key so NIP-17 DMs must not be attempted.
+        let res = sqlx::query(
+            "insert ignore into users(pubkey,contact_nip17,account_type) values(?,0,1) returning id",
+        )
+        .bind(pubkey.as_slice())
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(match res {
+            None => sqlx::query("select id from users where pubkey = ?")
+                .bind(pubkey.as_slice())
+                .fetch_one(&self.db)
+                .await?
+                .try_get(0)?,
+            Some(res) => res.try_get(0)?,
+        })
+    }
+
     async fn get_user(&self, id: u64) -> DbResult<User> {
         Ok(sqlx::query_as("select * from users where id=?")
             .bind(id)

@@ -20,7 +20,7 @@ pub struct AdminAuth {
 
 impl AdminAuth {
     pub async fn from_nip98_auth(nip98_auth: Nip98Auth, db: &Arc<dyn LNVpsDb>) -> Result<Self> {
-        let pubkey = nip98_auth.event.pubkey.to_bytes();
+        let pubkey = nip98_auth.pubkey();
         let user_id = db.upsert_user(&pubkey).await?;
 
         // Check if user has admin privileges and get their permissions

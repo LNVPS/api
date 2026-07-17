@@ -15,9 +15,9 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionType, Vm, VmHistoryActionType, VmHost, VmHostKind,
-    VmIpAssignment, VmOsImage,
+    AccountType, CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionType, Vm, VmHistoryActionType, VmHost,
+    VmHostKind, VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::{Client, PublicKey, ToBech32};
@@ -880,6 +880,13 @@ impl Worker {
             })
             .collect::<Vec<String>>()
             .join("\n");
+        // Native Nostr accounts get their npub; OAuth accounts have a synthetic
+        // pubkey that isn't a valid Nostr key, so show the account type instead.
+        let npub = if user.account_type == AccountType::Nostr {
+            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
+        } else {
+            format!("{} account", user.account_type)
+        };
         let user_msg = format!(
             "Your VM #{} has been created!\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}\n\nNPUB: {}",
             vm.id,
@@ -888,7 +895,7 @@ impl Worker {
             resources.memory / crate::GB,
             resources.disk_size / crate::GB,
             ip_lines,
-            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
+            npub
         );
         let admin_msg = format!(
             "VM #{} has been created.\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}\n\nUser NPUB: {}",
@@ -898,7 +905,7 @@ impl Worker {
             resources.memory / crate::GB,
             resources.disk_size / crate::GB,
             ip_lines,
-            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
+            npub
         );
         self.queue_notification(vm.user_id, user_msg, Some(format!("[VM{}] Created", vm.id)))
             .await;

@@ -9,13 +9,42 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use url::Url;
 
+/// How a user authenticates / what their `pubkey` represents.
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[repr(u16)]
+pub enum AccountType {
+    /// Native Nostr account. `pubkey` is a real 32-byte schnorr x-only public
+    /// key and can be used for NIP-17 DMs, npub display, event signing, etc.
+    #[default]
+    Nostr = 0,
+    /// External OAuth/OIDC account. `pubkey` is a synthetic
+    /// `sha256("{provider}:{subject}")` identifier used only as an opaque
+    /// primary identity — it is NOT a real Nostr key and must never be treated
+    /// as one (no NIP-17, no npub, no signing).
+    OAuth = 1,
+}
+
+impl Display for AccountType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccountType::Nostr => write!(f, "nostr"),
+            AccountType::OAuth => write!(f, "oauth"),
+        }
+    }
+}
+
 #[derive(FromRow, Clone, Debug, Default)]
 /// Users who buy VM's
 pub struct User {
     /// Unique ID of this user (database generated)
     pub id: u64,
-    /// The nostr public key for this user
+    /// The nostr public key for this user (or a synthetic identifier for
+    /// non-Nostr accounts — see [`User::account_type`]).
     pub pubkey: Vec<u8>,
+    /// Whether this user is a native Nostr account or an external OAuth account.
+    /// Determines whether `pubkey` is a usable Nostr key.
+    #[sqlx(default)]
+    pub account_type: AccountType,
     /// When this user first started using the service (first login)
     pub created: DateTime<Utc>,
     /// Users email address for notifications (encrypted)
