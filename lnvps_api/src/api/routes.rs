@@ -215,6 +215,11 @@ async fn v1_patch_account(
         return ApiData::err("Verify your WhatsApp number before enabling WhatsApp notifications");
     }
 
+    // NIP-17 DMs require a real Nostr key; OAuth accounts have a synthetic pubkey.
+    if req.contact_nip17 && user.account_type != lnvps_db::AccountType::Nostr {
+        return ApiData::err("Nostr DM notifications are only available for Nostr accounts");
+    }
+
     user.contact_nip17 = req.contact_nip17;
     user.contact_email = req.contact_email;
     user.contact_telegram = req.contact_telegram;

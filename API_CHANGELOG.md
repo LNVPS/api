@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - After a successful login the API issues a stateless session **JWT**. It is accepted on every existing authenticated endpoint via `Authorization: Bearer <jwt>`, alongside the existing `Authorization: Nostr <event>` (NIP-98) scheme.
   - On first login the provider's email is synced into the account (marked verified when the provider asserts it) and email notifications are enabled by default, since OAuth accounts have no NIP-17 channel. GitHub's primary verified address is fetched from `/user/emails`; Apple's email comes from the `id_token`. The sync is non-destructive — a user's later email edits are not overwritten — and best-effort (a sync failure never blocks login).
   - OAuth accounts are stored with a new `account_type` of `oauth` and a synthetic identity (`sha256("{provider}:{subject}")`) in place of a Nostr pubkey. Nostr-only features (NIP-17 DMs, npub display, LIR agreement signing) are gated to native Nostr accounts.
+  - `GET /api/v1/account` now returns `account_type` (`nostr` | `oauth`, read-only) so the frontend can hide Nostr-only UI for OAuth users. `PATCH /api/v1/account` rejects enabling `contact_nip17` for OAuth accounts (their pubkey is not a usable Nostr key).
 
 ### Fixed
 

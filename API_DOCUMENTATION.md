@@ -113,6 +113,7 @@ verified when the provider asserts it), so `AccountInfo.email` /
 interface AccountInfo {
   email?: string;
   email_verified?: boolean; // Present when email is set; true if email has been verified
+  account_type: 'nostr' | 'oauth'; // Read-only. 'oauth' accounts have no usable Nostr key — hide npub / NIP-17 UI. Enabling contact_nip17 for an 'oauth' account is rejected.
   contact_nip17: boolean;
   contact_email: boolean;
   country_code?: string; // ISO 3166-1 alpha-3 country code
