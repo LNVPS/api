@@ -1622,7 +1622,10 @@ async fn v1_get_payment_invoice(
         payment: ApiVmPayment,
         invoice_item: ApiInvoiceItem,
         user: AccountPatchRequest,
-        npub: String,
+        /// Billing email shown on the invoice (empty when the account has none).
+        email: String,
+        /// Whether an email is present, so the template can hide the line.
+        has_email: bool,
         total: u64,
         total_formatted: String,
         company: Option<ApiCompany>,
@@ -1735,16 +1738,8 @@ async fn v1_get_payment_invoice(
                 payment: ApiVmPayment::from_subscription_payment(payment, vm_id_for_payment)
                     .map_err(|_| "Failed to parse payment data")?,
                 invoice_item,
-                // Only native Nostr accounts have a real key/npub. OAuth
-                // accounts store a synthetic identifier, so show no npub.
-                npub: if user.account_type == lnvps_db::AccountType::Nostr {
-                    nostr_sdk::PublicKey::from_slice(&user.pubkey)
-                        .map_err(|_| "Invalid pubkey")?
-                        .to_bech32()
-                        .unwrap()
-                } else {
-                    String::new()
-                },
+                email: user.email.as_str().to_string(),
+                has_email: !user.email.is_empty(),
                 user: user.into(),
                 company: company.map(|c| c.into()),
                 upgrade_details,

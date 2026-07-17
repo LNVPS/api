@@ -16,6 +16,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - OAuth accounts are stored with a new `account_type` of `oauth` and a synthetic identity (`sha256("{provider}:{subject}")`) in place of a Nostr pubkey. Nostr-only features (NIP-17 DMs, npub display, LIR agreement signing) are gated to native Nostr accounts.
   - `GET /api/v1/account` now returns `account_type` (`nostr` | `oauth`, read-only) so the frontend can hide Nostr-only UI for OAuth users. `PATCH /api/v1/account` rejects enabling `contact_nip17` for OAuth accounts (their pubkey is not a usable Nostr key).
 
+### Changed
+
+- **2026-07-18** - Drop npub from invoices and VM-created notifications
+  - VM-created notifications (user + admin) no longer include the `NPUB:` line — it was noise and meaningless for OAuth accounts.
+  - The rendered invoice replaces the `Nostr Pubkey` line with the account `Email` (shown only when set), which is a universal identifier across Nostr and OAuth accounts.
+
 ### Fixed
 
 - **2026-07-18** - Referral commission rate not visible to referrers (user API)

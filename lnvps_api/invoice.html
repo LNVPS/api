@@ -270,10 +270,12 @@
             {{#payment.is_upgrade}}Upgrade{{/payment.is_upgrade}}
             {{^payment.is_upgrade}}Renewal{{/payment.is_upgrade}}
         </div>
+        {{#has_email}}
         <div>
-            <b>Nostr Pubkey:</b>
-            {{npub}}
+            <b>Email:</b>
+            {{email}}
         </div>
+        {{/has_email}}
     </div>
     <div class="billing">
         <div class="flex-col">
