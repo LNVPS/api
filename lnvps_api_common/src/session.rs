@@ -148,6 +148,12 @@ struct StateClaims {
     prov: String,
     /// Random nonce (hex).
     nonce: String,
+    /// Optional per-request post-login redirect URL, validated against the
+    /// server allowlist at login time. Round-tripped through the signed state
+    /// so the client cannot tamper with it. Omitted when the login used the
+    /// configured default redirect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect: Option<String>,
     /// Expiry (unix seconds).
     exp: u64,
 }
@@ -157,13 +163,22 @@ pub const DEFAULT_STATE_TTL_SECS: u64 = 600;
 
 /// Issue a signed, short-lived CSRF `state` value binding an OAuth login flow to
 /// a specific provider. Verified on the callback via [`verify_state_token`].
-pub fn issue_state_token(provider: &str, nonce: &str, ttl_secs: u64) -> Result<String> {
+///
+/// `redirect` optionally carries a validated per-request post-login redirect URL
+/// (see the OAuth login handler); pass `None` to use the configured default.
+pub fn issue_state_token(
+    provider: &str,
+    nonce: &str,
+    redirect: Option<&str>,
+    ttl_secs: u64,
+) -> Result<String> {
     let secret = SESSION_SECRET
         .get()
         .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
     let claims = StateClaims {
         prov: provider.to_string(),
         nonce: nonce.to_string(),
+        redirect: redirect.map(|s| s.to_string()),
         exp: now_secs() + ttl_secs,
     };
     let payload = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
@@ -171,8 +186,9 @@ pub fn issue_state_token(provider: &str, nonce: &str, ttl_secs: u64) -> Result<S
     Ok(format!("{payload}.{sig}"))
 }
 
-/// Verify a CSRF `state` value and return the provider tag it was issued for.
-pub fn verify_state_token(token: &str) -> Result<String> {
+/// Verify a CSRF `state` value and return the provider tag it was issued for,
+/// along with the optional per-request redirect URL it carried.
+pub fn verify_state_token(token: &str) -> Result<(String, Option<String>)> {
     let secret = SESSION_SECRET
         .get()
         .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
@@ -192,7 +208,7 @@ pub fn verify_state_token(token: &str) -> Result<String> {
     if now_secs() >= claims.exp {
         bail!("State token expired");
     }
-    Ok(claims.prov)
+    Ok((claims.prov, claims.redirect))
 }
 
 /// Claims wrapping an opaque, server-owned challenge state (e.g. a serialised
@@ -279,8 +295,29 @@ mod tests {
     #[test]
     fn state_token_roundtrip() {
         init_session_secret(b"unit-test-secret".to_vec());
-        let token = issue_state_token("google", "abc123", DEFAULT_STATE_TTL_SECS).unwrap();
-        assert_eq!(verify_state_token(&token).unwrap(), "google");
+
+        // Without a per-request redirect.
+        let token = issue_state_token("google", "abc123", None, DEFAULT_STATE_TTL_SECS).unwrap();
+        assert_eq!(
+            verify_state_token(&token).unwrap(),
+            ("google".to_string(), None)
+        );
+
+        // With a per-request redirect that must round-trip intact.
+        let token = issue_state_token(
+            "github",
+            "abc123",
+            Some("http://localhost:3000/oauth/complete"),
+            DEFAULT_STATE_TTL_SECS,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_state_token(&token).unwrap(),
+            (
+                "github".to_string(),
+                Some("http://localhost:3000/oauth/complete".to_string())
+            )
+        );
     }
 
     #[test]

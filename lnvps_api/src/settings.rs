@@ -120,6 +120,16 @@ pub struct OAuthConfig {
     /// When omitted, the callback returns the token as JSON instead.
     pub success_redirect: Option<String>,
 
+    /// Allowlist of origins/prefixes a login may request a post-login redirect
+    /// to via the `?redirect=<url>` query param on `/oauth/{provider}/login`.
+    /// A requested redirect is accepted when it exactly equals an entry or
+    /// extends one at a path boundary (next char is `/`, `?` or `#`), which
+    /// prevents `http://localhost:3000` from also matching
+    /// `http://localhost:30000.evil`. `success_redirect` is always implicitly
+    /// allowed. Defaults to empty (only `success_redirect` permitted).
+    #[serde(default)]
+    pub allowed_redirects: Vec<String>,
+
     /// Configured identity providers, keyed by a short provider tag (e.g.
     /// `google`, `github`). The tag is part of the synthetic identity
     /// (`sha256("{tag}:{subject}")`) so it must remain stable.

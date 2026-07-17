@@ -75,6 +75,39 @@ function startLogin(provider: 'google' | 'github' | 'facebook' | 'apple') {
 }
 ```
 
+**Per-request return URL (optional).** Pass `?redirect=<url>` on the login
+endpoint to override the server's configured `success-redirect` for this login
+only — useful in local development so the browser lands back on your dev origin:
+
+```typescript
+function startLogin(provider: string) {
+  const redirect = `${window.location.origin}/oauth/complete`;
+  window.location.href =
+    `${API}/api/v1/oauth/${provider}/login?redirect=${encodeURIComponent(redirect)}`;
+}
+```
+
+The requested URL is validated server-side against an allowlist and, once
+accepted, round-tripped through the signed `state` so it cannot be tampered
+with. A URL is accepted when its host is `localhost` (always allowed, for local
+dev), or when it exactly equals / extends at a path boundary the configured
+`success-redirect` or an entry in `allowed-redirects`. Anything else is rejected
+with `400` (this prevents an open-redirect / token-theft hole where
+`?redirect=https://evil.com` would leak the JWT). The provider-registered
+`/callback` URL is never affected.
+
+Server config (`config.yaml`) — allow a dev origin in addition to the default
+success redirect:
+
+```yaml
+oauth:
+  success-redirect: "https://app.lnvps.com/oauth/complete"
+  allowed-redirects:
+    - "http://localhost:3000"
+  providers:
+    # ...
+```
+
 **2. Handle the landing route** (`/oauth/complete`): read the fragment, store the
 token, scrub the URL:
 
@@ -549,6 +582,12 @@ and React example. `{provider}` is one of the enabled tags (`google`, `github`,
 #### Start Login
 - **GET** `/api/v1/oauth/{provider}/login`
 - **Auth**: None
+- **Query**: `redirect` (optional) — per-request post-login return URL,
+  overriding the configured `success-redirect` for this login only. Validated
+  against the allowlist (`localhost` host always allowed; otherwise must match
+  `success-redirect` or an `allowed-redirects` entry exactly or at a path
+  boundary). Rejected with `400` if not allowed. The validated value is signed
+  into `state`, so it cannot be tampered with.
 - **Behavior**: 302 redirect to the provider's consent screen. Navigate the
   browser here (e.g. `window.location.href = ...`).
 

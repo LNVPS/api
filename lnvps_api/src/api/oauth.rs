@@ -52,6 +52,14 @@ struct CallbackParams {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct LoginParams {
+    /// Optional per-request post-login redirect URL. Validated against the
+    /// OAuth `allowed_redirects` allowlist before being round-tripped through
+    /// the signed state.
+    redirect: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct OAuthTokenResponse {
     /// Session JWT to be sent as `Authorization: Bearer <token>`.
@@ -74,12 +82,27 @@ fn callback_uri(public_url: &str, provider: &str) -> String {
 /// Start a login: redirect the browser to the provider's authorization endpoint.
 async fn v1_oauth_login(
     Path(provider): Path<String>,
+    Query(q): Query<LoginParams>,
     State(this): State<RouterState>,
 ) -> Result<Redirect, ApiError> {
-    let (_, provider_cfg) = resolve_provider(&this, &provider)?;
+    let (cfg, provider_cfg) = resolve_provider(&this, &provider)?;
+
+    // Validate an optional per-request post-login redirect against the allowlist.
+    // Rejecting unlisted targets prevents an open-redirect / token-theft hole
+    // (e.g. `?redirect=evil.com` would otherwise leak the JWT).
+    let redirect = match q.redirect.as_deref() {
+        Some(r) => {
+            if is_allowed_redirect(&cfg, r) {
+                Some(r)
+            } else {
+                return Err(ApiError::from(anyhow::anyhow!("Redirect not allowed")));
+            }
+        }
+        None => None,
+    };
 
     let nonce = hex::encode(rand::random::<[u8; 16]>());
-    let state = issue_state_token(&provider, &nonce, DEFAULT_STATE_TTL_SECS)
+    let state = issue_state_token(&provider, &nonce, redirect, DEFAULT_STATE_TTL_SECS)
         .map_err(|e| ApiError::internal(format!("Failed to create state: {}", e)))?;
 
     let redirect_uri = callback_uri(&this.settings.public_url, &provider);
@@ -137,7 +160,7 @@ async fn handle_callback(
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("Missing state")))?;
 
     // Verify CSRF state and that it was issued for this provider.
-    let state_provider = verify_state_token(&state)
+    let (state_provider, state_redirect) = verify_state_token(&state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid state: {}", e)))?;
     if state_provider != provider {
         return Err(ApiError::from(anyhow::anyhow!("State provider mismatch")));
@@ -164,7 +187,12 @@ async fn handle_callback(
         .map_err(|e| ApiError::internal(format!("Failed to issue session: {}", e)))?;
 
     // Redirect to the frontend with the token in the fragment, or return JSON.
-    if let Some(redirect) = cfg_success_redirect(&cfg) {
+    // Prefer the per-request redirect carried (and pre-validated) in the signed
+    // state, falling back to the configured default success redirect.
+    let target_redirect = state_redirect
+        .as_deref()
+        .or_else(|| cfg_success_redirect(&cfg));
+    if let Some(redirect) = target_redirect {
         let sep = if redirect.contains('#') { '&' } else { '#' };
         let url = format!("{}{}token={}", redirect, sep, urlencoding::encode(&token));
         Ok(Redirect::to(&url).into_response())
@@ -208,6 +236,56 @@ fn session_ttl(this: &RouterState) -> u64 {
 
 fn cfg_success_redirect(cfg: &crate::settings::OAuthConfig) -> Option<&str> {
     cfg.success_redirect.as_deref()
+}
+
+/// Extract the host (without port or userinfo) from an absolute URL, if present.
+///
+/// Lightweight, dependency-free: `scheme://[user@]host[:port][/path...]`.
+fn url_host(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop any userinfo (`user:pass@`).
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    // Drop the port. (localhost is never a bracketed IPv6 literal.)
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Whether `requested` is a permitted post-login redirect target.
+///
+/// Any `localhost` URL is always permitted (for local frontend development).
+/// Otherwise accepted when it exactly equals, or extends at a path boundary,
+/// either the configured `success_redirect` (always implicitly allowed) or any
+/// entry in `allowed_redirects`. The boundary check (next char must be `/`, `?`,
+/// `#`, or end-of-string) stops `http://localhost:3000` from also matching
+/// `http://localhost:30000.evil` — which would be an open-redirect / token-theft
+/// hole.
+fn is_allowed_redirect(cfg: &crate::settings::OAuthConfig, requested: &str) -> bool {
+    // Always allow the localhost hostname for local dev.
+    if url_host(requested).is_some_and(|h| h.eq_ignore_ascii_case("localhost")) {
+        return true;
+    }
+
+    let allowed = |prefix: &str| -> bool {
+        if !requested.starts_with(prefix) {
+            return false;
+        }
+        match requested[prefix.len()..].chars().next() {
+            None => true,
+            Some('/') | Some('?') | Some('#') => true,
+            _ => false,
+        }
+    };
+
+    cfg.success_redirect.as_deref().is_some_and(&allowed)
+        || cfg.allowed_redirects.iter().any(|p| allowed(p))
 }
 
 /// Identifying details resolved from a provider after the token exchange.
@@ -509,6 +587,61 @@ fn value_to_string(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_localhost_always_allowed() {
+        // No configured redirects at all.
+        let cfg = crate::settings::OAuthConfig {
+            success_redirect: None,
+            allowed_redirects: vec![],
+            providers: std::collections::HashMap::new(),
+        };
+        assert!(is_allowed_redirect(
+            &cfg,
+            "http://localhost:3000/oauth/complete"
+        ));
+        assert!(is_allowed_redirect(&cfg, "http://localhost"));
+        assert!(is_allowed_redirect(&cfg, "https://localhost:8080/x"));
+        assert!(is_allowed_redirect(&cfg, "http://user@localhost:3000/x"));
+        // A non-localhost host that merely contains "localhost" is not localhost.
+        assert!(!is_allowed_redirect(&cfg, "http://localhost.evil.com/x"));
+        assert!(!is_allowed_redirect(&cfg, "http://notlocalhost/x"));
+    }
+
+    #[test]
+    fn redirect_allowlist_matches_at_boundaries_only() {
+        let cfg = crate::settings::OAuthConfig {
+            success_redirect: Some("https://app.lnvps.com/oauth".to_string()),
+            allowed_redirects: vec!["https://staging.lnvps.com".to_string()],
+            providers: std::collections::HashMap::new(),
+        };
+
+        // Exact match against an allowlist entry.
+        assert!(is_allowed_redirect(&cfg, "https://staging.lnvps.com"));
+        // Path-boundary extensions are allowed.
+        assert!(is_allowed_redirect(
+            &cfg,
+            "https://staging.lnvps.com/oauth/complete"
+        ));
+        assert!(is_allowed_redirect(&cfg, "https://staging.lnvps.com?x=1"));
+        assert!(is_allowed_redirect(&cfg, "https://staging.lnvps.com#frag"));
+        // success_redirect is always implicitly allowed.
+        assert!(is_allowed_redirect(
+            &cfg,
+            "https://app.lnvps.com/oauth/complete"
+        ));
+
+        // Non-boundary extension must be rejected (open-redirect guard).
+        assert!(!is_allowed_redirect(
+            &cfg,
+            "https://staging.lnvps.com.evil.com"
+        ));
+        assert!(!is_allowed_redirect(&cfg, "https://staging.lnvps.evil"));
+        // Unrelated origin rejected.
+        assert!(!is_allowed_redirect(&cfg, "https://evil.com"));
+        // Prefix that isn't a real prefix rejected.
+        assert!(!is_allowed_redirect(&cfg, "https://staging.lnvps.co"));
+    }
 
     /// The Apple client-secret is a well-formed ES256 JWT with the expected
     /// header/claims, signed by the provided P-256 key.

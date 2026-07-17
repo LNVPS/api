@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Per-request OAuth return URL** — `GET /api/v1/oauth/{provider}/login` now accepts an optional `?redirect=<url>` to override the configured `success-redirect` for that login only (e.g. `http://localhost:3000/oauth/complete` in dev). The URL is validated against a new `allowed-redirects` allowlist (`localhost` host always allowed; `success-redirect` always implicitly allowed) and rejected with `400` otherwise, then round-tripped through the signed `state`. See the OAuth login flow in API_DOCUMENTATION.md for details and a `config.yaml` example.
+
 - **2026-07-18** - Passwordless WebAuthn / passkey login
   - New `fetch`-based endpoints `POST /api/v1/webauthn/register/start` + `/register/finish` (creates a passwordless account) and `POST /api/v1/webauthn/login/start` + `/login/finish` (usernameless / discoverable login). Each `start` returns a `challenge` for the browser `navigator.credentials` API plus an opaque signed `state`; the matching `finish` posts back that `state` with the credential and returns a `{ token, token_type, expires_in }` session response.
   - Uses the same stateless session **JWT** as OAuth (`Authorization: Bearer <jwt>`), so passkey users reach every existing authenticated endpoint. Configured under a new `webauthn` config section (`rp-id`, `rp-origin`, `rp-name`); the signing secret lives in the shared `session` block (below).
