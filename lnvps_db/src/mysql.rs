@@ -6,7 +6,7 @@ use crate::{
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
     VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
     VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage,
-    VmTemplate,
+    VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -80,6 +80,67 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .try_get(0)?,
             Some(res) => res.try_get(0)?,
         })
+    }
+
+    async fn upsert_webauthn_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
+        // account_type=2 (Webauthn), contact_nip17=0 — the synthetic pubkey is
+        // not a real Nostr key so NIP-17 DMs must not be attempted.
+        let res = sqlx::query(
+            "insert ignore into users(pubkey,contact_nip17,account_type) values(?,0,2) returning id",
+        )
+        .bind(pubkey.as_slice())
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(match res {
+            None => sqlx::query("select id from users where pubkey = ?")
+                .bind(pubkey.as_slice())
+                .fetch_one(&self.db)
+                .await?
+                .try_get(0)?,
+            Some(res) => res.try_get(0)?,
+        })
+    }
+
+    async fn insert_webauthn_credential(&self, cred: &WebauthnCredential) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "insert into user_webauthn_credentials(user_id,cred_id,passkey,name) values(?,?,?,?) returning id",
+        )
+        .bind(cred.user_id)
+        .bind(&cred.cred_id)
+        .bind(&cred.passkey)
+        .bind(&cred.name)
+        .fetch_one(&self.db)
+        .await?
+        .try_get(0)?)
+    }
+
+    async fn list_webauthn_credentials(&self, user_id: u64) -> DbResult<Vec<WebauthnCredential>> {
+        Ok(
+            sqlx::query_as("select * from user_webauthn_credentials where user_id=?")
+                .bind(user_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_webauthn_credential(&self, cred_id: &[u8]) -> DbResult<WebauthnCredential> {
+        Ok(
+            sqlx::query_as("select * from user_webauthn_credentials where cred_id=?")
+                .bind(cred_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()> {
+        sqlx::query(
+            "update user_webauthn_credentials set passkey=?, last_used=current_timestamp where id=?",
+        )
+        .bind(passkey)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     async fn get_user(&self, id: u64) -> DbResult<User> {

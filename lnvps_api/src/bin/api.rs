@@ -125,6 +125,17 @@ async fn main() -> Result<(), Error> {
         }
     }
 
+    // Passkey (WebAuthn) login shares the session token space. Initialise the
+    // signing secret from it too (first non-empty secret wins; if OAuth already
+    // set one they should match).
+    if let Some(ref webauthn) = settings.webauthn {
+        if lnvps_api_common::init_session_secret(webauthn.session_secret.as_bytes().to_vec()) {
+            info!("WebAuthn passkey login enabled (rp_id={})", webauthn.rp_id);
+        } else if settings.oauth.is_none() {
+            warn!("WebAuthn configured but session secret was empty or already set");
+        }
+    }
+
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
         for r in &c.relays {
@@ -334,7 +345,8 @@ async fn main() -> Result<(), Error> {
             .merge(ip_space_router())
             .merge(referral_router())
             .merge(legal_router())
-            .merge(oauth_router());
+            .merge(oauth_router())
+            .merge(webauthn_router());
 
         #[cfg(feature = "openapi")]
         {

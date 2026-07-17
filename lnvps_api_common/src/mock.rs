@@ -11,7 +11,7 @@ use lnvps_db::{
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
     UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -56,6 +56,7 @@ pub struct MockDb {
     pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
+    pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
 }
 
 impl MockDb {
@@ -332,6 +333,7 @@ impl Default for MockDb {
             router_bgp_sessions: Arc::new(Default::default()),
             router_bgp_routes: Arc::new(Default::default()),
             firewall_rules: Arc::new(Default::default()),
+            webauthn_credentials: Arc::new(Default::default()),
         }
     }
 }
@@ -381,6 +383,65 @@ impl LNVpsDbBase for MockDb {
             );
             Ok(max + 1)
         }
+    }
+
+    async fn upsert_webauthn_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
+        let mut users = self.users.lock().await;
+        if let Some(e) = users.iter().find(|(_k, u)| u.pubkey == *pubkey) {
+            Ok(*e.0)
+        } else {
+            let max = *users.keys().max().unwrap_or(&0);
+            users.insert(
+                max + 1,
+                User {
+                    id: max + 1,
+                    pubkey: pubkey.to_vec(),
+                    account_type: lnvps_db::AccountType::Webauthn,
+                    created: Utc::now(),
+                    country_code: Some("USA".to_string()),
+                    ..Default::default()
+                },
+            );
+            Ok(max + 1)
+        }
+    }
+
+    async fn insert_webauthn_credential(&self, cred: &WebauthnCredential) -> DbResult<u64> {
+        let mut creds = self.webauthn_credentials.lock().await;
+        let max = *creds.keys().max().unwrap_or(&0);
+        let id = max + 1;
+        let mut stored = cred.clone();
+        stored.id = id;
+        stored.created = Utc::now();
+        creds.insert(id, stored);
+        Ok(id)
+    }
+
+    async fn list_webauthn_credentials(&self, user_id: u64) -> DbResult<Vec<WebauthnCredential>> {
+        let creds = self.webauthn_credentials.lock().await;
+        Ok(creds
+            .values()
+            .filter(|c| c.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_webauthn_credential(&self, cred_id: &[u8]) -> DbResult<WebauthnCredential> {
+        let creds = self.webauthn_credentials.lock().await;
+        Ok(creds
+            .values()
+            .find(|c| c.cred_id == cred_id)
+            .ok_or(anyhow!("no credential"))?
+            .clone())
+    }
+
+    async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()> {
+        let mut creds = self.webauthn_credentials.lock().await;
+        if let Some(c) = creds.get_mut(&id) {
+            c.passkey = passkey.to_string();
+            c.last_used = Some(Utc::now());
+        }
+        Ok(())
     }
 
     async fn get_user(&self, id: u64) -> DbResult<User> {

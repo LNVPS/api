@@ -75,6 +75,31 @@ pub struct Settings {
     /// External OAuth/OIDC login support. When omitted, only Nostr (NIP-98)
     /// authentication is available.
     pub oauth: Option<OAuthConfig>,
+
+    /// Passwordless WebAuthn / passkey login. When omitted, passkey endpoints
+    /// are disabled. Issues the same session JWTs as OAuth.
+    pub webauthn: Option<WebauthnConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WebauthnConfig {
+    /// Relying Party ID — the registrable domain passkeys are bound to (e.g.
+    /// `app.lnvps.com`). PERMANENT: changing it invalidates every passkey.
+    pub rp_id: String,
+    /// Relying Party origin — the exact origin the frontend runs on (e.g.
+    /// `https://app.lnvps.com`). Its host must equal or be a subdomain of
+    /// `rp_id`.
+    pub rp_origin: String,
+    /// Human-friendly Relying Party name shown in the authenticator UI.
+    pub rp_name: String,
+    /// Secret used to sign session JWTs + challenge tokens. Shares the session
+    /// token space with OAuth — if both `oauth` and `webauthn` are configured
+    /// they SHOULD use the same secret (the first one initialised wins).
+    pub session_secret: String,
+    /// Session token lifetime in seconds. Defaults to 30 days.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -590,6 +615,7 @@ pub fn mock_settings() -> Settings {
         geoip_database: None,
         referral: None,
         oauth: None,
+        webauthn: None,
     }
 }
 

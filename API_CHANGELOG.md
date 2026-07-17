@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **2026-07-18** - Passwordless WebAuthn / passkey login
+  - New `fetch`-based endpoints `POST /api/v1/webauthn/register/start` + `/register/finish` (creates a passwordless account) and `POST /api/v1/webauthn/login/start` + `/login/finish` (usernameless / discoverable login). Each `start` returns a `challenge` for the browser `navigator.credentials` API plus an opaque signed `state`; the matching `finish` posts back that `state` with the credential and returns a `{ token, token_type, expires_in }` session response.
+  - Uses the same stateless session **JWT** as OAuth (`Authorization: Bearer <jwt>`), so passkey users reach every existing authenticated endpoint. Configured under a new `webauthn` config section (`rp-id`, `rp-origin`, `rp-name`, `session-secret`).
+  - Passkey accounts are stored with a new `account_type` of `webauthn` and a synthetic identity (`sha256("webauthn\\0{user_handle}")`, in a namespace provably disjoint from OAuth). Like OAuth accounts they have no usable Nostr key: NIP-17 DMs, npub display and LIR signing are gated off, and `GET /api/v1/account` reports `account_type: "webauthn"`. Credentials are stored in the new `user_webauthn_credentials` table (one account may register several devices).
+
 - **2026-07-18** - Generic OAuth / OIDC login (Google, GitHub, Facebook, Apple)
   - New endpoints `GET /api/v1/oauth/{provider}/login` (redirects to the provider) and `GET`/`POST /api/v1/oauth/{provider}/callback` (exchanges the authorization code, resolves/creates the user and issues a session token). Providers are configured under the new `oauth` config section, each with a `type` of `google`, `github`, `facebook`, `apple`, or generic `oidc`.
   - Built-in flavors handle each provider's quirks: GitHub's `User-Agent` requirement and numeric `id` subject, Facebook's Graph `me` endpoint, and Sign in with Apple's `id_token`-based subject, dynamically-signed **ES256** client secret, and `form_post` (POST) callback.

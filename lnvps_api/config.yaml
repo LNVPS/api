@@ -100,3 +100,21 @@ captcha:
 #    #  userinfo-url: "https://id.example.com/userinfo"
 #    #  scopes: ["openid", "email"]
 #    #  subject-field: "sub"
+# Passwordless WebAuthn / passkey login (optional). When set, users can create
+# an account and log in with a platform passkey (Face ID / Touch ID / Windows
+# Hello) or a security key, and receive the same session JWT as OAuth
+# (`Authorization: Bearer <jwt>`). Login is usernameless (discoverable).
+#webauthn:
+#  # Relying Party ID: the registrable domain passkeys are bound to. PERMANENT —
+#  # changing it invalidates every registered passkey.
+#  rp-id: "app.example.com"
+#  # The exact origin the frontend runs on (host must equal or be a subdomain of
+#  # rp-id).
+#  rp-origin: "https://app.example.com"
+#  # Human-friendly name shown in the authenticator prompt.
+#  rp-name: "LNVPS"
+#  # Signs session + challenge tokens. Shares the session token space with
+#  # oauth — if both are set, use the SAME secret.
+#  session-secret: "change-me-to-a-long-random-string"
+#  # Session lifetime in seconds (default 30 days).
+#  session-ttl: 2592000

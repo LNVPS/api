@@ -22,6 +22,11 @@ pub enum AccountType {
     /// primary identity — it is NOT a real Nostr key and must never be treated
     /// as one (no NIP-17, no npub, no signing).
     OAuth = 1,
+    /// Passwordless WebAuthn / passkey account. `pubkey` is a synthetic
+    /// `sha256("webauthn:{user_handle}")` identifier derived from the
+    /// credential's user handle — like [`AccountType::OAuth`] it is NOT a real
+    /// Nostr key. The account's login factors live in `user_webauthn_credentials`.
+    Webauthn = 2,
 }
 
 impl Display for AccountType {
@@ -29,6 +34,7 @@ impl Display for AccountType {
         match self {
             AccountType::Nostr => write!(f, "nostr"),
             AccountType::OAuth => write!(f, "oauth"),
+            AccountType::Webauthn => write!(f, "webauthn"),
         }
     }
 }
@@ -152,6 +158,27 @@ pub struct UserSshKey {
     pub user_id: u64,
     pub created: DateTime<Utc>,
     pub key_data: EncryptedString,
+}
+
+/// A registered WebAuthn / passkey credential belonging to a
+/// [`AccountType::Webauthn`] account. One account may have several (e.g. one
+/// per device).
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct WebauthnCredential {
+    pub id: u64,
+    /// Owning user id.
+    pub user_id: u64,
+    /// Raw credential id bytes (unique across all accounts).
+    pub cred_id: Vec<u8>,
+    /// JSON-serialised `webauthn_rs::prelude::Passkey`. This is the source of
+    /// truth for the credential's public key and signature counter; it is
+    /// re-serialised after each successful authentication.
+    pub passkey: String,
+    /// Optional user-facing label for the credential/device.
+    pub name: Option<String>,
+    pub created: DateTime<Utc>,
+    /// When the credential was last used to authenticate.
+    pub last_used: Option<DateTime<Utc>>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
