@@ -74,6 +74,12 @@ pub struct AccountPatchRequest {
     /// Whether the email address has been verified (read-only, ignored on PATCH)
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub email_verified: Option<bool>,
+    /// Account authentication type: `nostr` (native Nostr key) or `oauth`
+    /// (external login; `pubkey` is a synthetic id, not a usable Nostr key).
+    /// Read-only, ignored on PATCH. Use it to hide Nostr-only UI (npub display,
+    /// NIP-17 DM settings) for OAuth accounts.
+    #[serde(skip_deserializing)]
+    pub account_type: String,
     pub contact_nip17: bool,
     pub contact_email: bool,
     #[serde(default)]
@@ -257,6 +263,7 @@ impl From<lnvps_db::User> for AccountPatchRequest {
                 None
             },
             email_verified: has_email.then_some(user.email_verified),
+            account_type: user.account_type.to_string(),
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
             contact_telegram: user.contact_telegram,
@@ -1313,6 +1320,24 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_account_response_exposes_account_type() {
+        let mut user = lnvps_db::User {
+            account_type: lnvps_db::AccountType::Nostr,
+            ..Default::default()
+        };
+        let resp: AccountPatchRequest = user.clone().into();
+        assert_eq!(resp.account_type, "nostr");
+
+        user.account_type = lnvps_db::AccountType::OAuth;
+        let resp: AccountPatchRequest = user.into();
+        assert_eq!(resp.account_type, "oauth");
+
+        // Serialized field is present for the frontend.
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["account_type"], "oauth");
+    }
 
     #[test]
     fn test_from_payment_data_fiat() {

@@ -1075,6 +1075,7 @@ async fn create_users(db: &LNVpsDbMysql) -> Result<Vec<User>> {
         let user = User {
             id: 0, // Will be auto-generated
             pubkey: pubkey_bytes.clone(),
+            account_type: lnvps_db::AccountType::Nostr,
             created,
             email: EncryptedString::new(email.to_string()),
             email_verified: true,

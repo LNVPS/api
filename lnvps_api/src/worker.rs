@@ -20,7 +20,7 @@ use lnvps_db::{
     VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
-use nostr_sdk::{Client, PublicKey, ToBech32};
+use nostr_sdk::Client;
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -881,24 +881,22 @@ impl Worker {
             .collect::<Vec<String>>()
             .join("\n");
         let user_msg = format!(
-            "Your VM #{} has been created!\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}\n\nNPUB: {}",
+            "Your VM #{} has been created!\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}",
             vm.id,
             image,
             resources.cpu,
             resources.memory / crate::GB,
             resources.disk_size / crate::GB,
             ip_lines,
-            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
         );
         let admin_msg = format!(
-            "VM #{} has been created.\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}\n\nUser NPUB: {}",
+            "VM #{} has been created.\n\nOS: {}\nCPU: {} vCPU\nRAM: {} GB\nDisk: {} GB\n{}",
             vm.id,
             image,
             resources.cpu,
             resources.memory / crate::GB,
             resources.disk_size / crate::GB,
             ip_lines,
-            PublicKey::from_slice(&user.pubkey)?.to_bech32()?
         );
         self.queue_notification(vm.user_id, user_msg, Some(format!("[VM{}] Created", vm.id)))
             .await;

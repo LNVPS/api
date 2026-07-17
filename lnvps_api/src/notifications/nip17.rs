@@ -3,7 +3,7 @@
 use super::{Notification, NotificationChannel};
 use async_trait::async_trait;
 use lnvps_api_common::retry::OpError;
-use lnvps_db::User;
+use lnvps_db::{AccountType, User};
 use nostr_sdk::{Client, EventBuilder, PublicKey};
 
 /// Delivers notifications as NIP-17 private direct messages over Nostr.
@@ -24,7 +24,10 @@ impl NotificationChannel for Nip17Channel {
     }
 
     fn wants(&self, user: &User) -> bool {
-        user.contact_nip17
+        // Only native Nostr accounts have a real key to DM. OAuth accounts store
+        // a synthetic `pubkey` that is not a valid Nostr key, so never attempt
+        // NIP-17 for them even if the flag were somehow set.
+        user.contact_nip17 && user.account_type == AccountType::Nostr
     }
 
     async fn send(

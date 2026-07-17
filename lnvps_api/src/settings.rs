@@ -71,6 +71,232 @@ pub struct Settings {
     /// opt-in**: when this section is omitted, commission still accrues and can
     /// be paid manually by admins, but no automatic Lightning payouts are made.
     pub referral: Option<ReferralConfig>,
+
+    /// External OAuth/OIDC login support. When omitted, only Nostr (NIP-98)
+    /// authentication is available.
+    pub oauth: Option<OAuthConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OAuthConfig {
+    /// Secret used to sign stateless session JWTs issued after a successful
+    /// OAuth login (and the short-lived CSRF `state` values). Must be a strong,
+    /// stable random string — changing it invalidates all outstanding sessions.
+    pub session_secret: String,
+
+    /// Session token lifetime in seconds. Defaults to 30 days.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl: u64,
+
+    /// After a successful login the browser is redirected here with the issued
+    /// token appended as `#token=<jwt>` (fragment). Typically your frontend.
+    /// When omitted, the callback returns the token as JSON instead.
+    pub success_redirect: Option<String>,
+
+    /// Configured identity providers, keyed by a short provider tag (e.g.
+    /// `google`, `github`). The tag is part of the synthetic identity
+    /// (`sha256("{tag}:{subject}")`) so it must remain stable.
+    pub providers: std::collections::HashMap<String, OAuthProviderConfig>,
+}
+
+fn default_session_ttl() -> u64 {
+    lnvps_api_common::DEFAULT_SESSION_TTL_SECS
+}
+
+/// How the stable subject id is obtained after the token exchange.
+pub enum SubjectSource {
+    /// GET the userinfo endpoint and read `field` from the JSON response.
+    Userinfo { url: String, field: String },
+    /// Decode the `id_token` returned by the token endpoint and read `sub`
+    /// (used by "Sign in with Apple", which has no userinfo endpoint).
+    IdToken,
+}
+
+/// A configured OAuth/OIDC identity provider. The `type` tag selects a built-in
+/// flavor with sensible default endpoints/scopes and any provider-specific
+/// quirks; `oidc` is a fully generic provider requiring explicit endpoints.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum OAuthProviderConfig {
+    /// Google (OpenID Connect).
+    Google(OAuthCommon),
+    /// GitHub (OAuth2; subject is the numeric user `id`).
+    Github(OAuthCommon),
+    /// Facebook Login (Graph API; subject is the numeric user `id`).
+    Facebook(OAuthCommon),
+    /// Sign in with Apple (subject comes from the `id_token`; client secret is
+    /// a dynamically-signed ES256 JWT).
+    Apple(AppleConfig),
+    /// Fully generic OIDC/OAuth2 provider.
+    Oidc(OAuthCommon),
+}
+
+/// Common fields for standard client-secret providers. Endpoint/scope fields are
+/// optional overrides — built-in flavors supply defaults, `oidc` requires them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct OAuthCommon {
+    /// OAuth2 client id.
+    pub client_id: String,
+    /// OAuth2 client secret.
+    pub client_secret: String,
+    /// Override the authorization endpoint.
+    pub auth_url: Option<String>,
+    /// Override the token endpoint.
+    pub token_url: Option<String>,
+    /// Override the userinfo endpoint.
+    pub userinfo_url: Option<String>,
+    /// Override the requested scopes.
+    pub scopes: Option<Vec<String>>,
+    /// Override the userinfo JSON field used as the stable subject id.
+    pub subject_field: Option<String>,
+}
+
+/// Sign in with Apple configuration. Apple requires the OAuth `client_secret` to
+/// be a short-lived ES256 JWT signed with your private key, so it takes key
+/// material instead of a static secret.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AppleConfig {
+    /// The Services ID (client id / `sub` of the client-secret JWT).
+    pub client_id: String,
+    /// Apple Developer Team ID (`iss` of the client-secret JWT).
+    pub team_id: String,
+    /// The key id of the `.p8` private key (`kid` header of the JWT).
+    pub key_id: String,
+    /// PEM contents of the Apple `.p8` (PKCS#8) private key.
+    pub private_key: String,
+    /// Scopes to request. Requesting `name`/`email` forces Apple's `form_post`
+    /// response mode (the callback arrives as a POST). Defaults to none.
+    pub scopes: Option<Vec<String>>,
+    /// Override the authorization endpoint.
+    pub auth_url: Option<String>,
+    /// Override the token endpoint.
+    pub token_url: Option<String>,
+}
+
+impl OAuthProviderConfig {
+    /// OAuth2 client id sent in the authorization/token requests.
+    pub fn client_id(&self) -> &str {
+        match self {
+            OAuthProviderConfig::Google(c)
+            | OAuthProviderConfig::Github(c)
+            | OAuthProviderConfig::Facebook(c)
+            | OAuthProviderConfig::Oidc(c) => &c.client_id,
+            OAuthProviderConfig::Apple(a) => &a.client_id,
+        }
+    }
+
+    /// The provider authorization endpoint (built-in default or override).
+    pub fn auth_url(&self) -> &str {
+        match self {
+            OAuthProviderConfig::Google(c) => c
+                .auth_url
+                .as_deref()
+                .unwrap_or("https://accounts.google.com/o/oauth2/v2/auth"),
+            OAuthProviderConfig::Github(c) => c
+                .auth_url
+                .as_deref()
+                .unwrap_or("https://github.com/login/oauth/authorize"),
+            OAuthProviderConfig::Facebook(c) => c
+                .auth_url
+                .as_deref()
+                .unwrap_or("https://www.facebook.com/v21.0/dialog/oauth"),
+            OAuthProviderConfig::Apple(a) => a
+                .auth_url
+                .as_deref()
+                .unwrap_or("https://appleid.apple.com/auth/authorize"),
+            OAuthProviderConfig::Oidc(c) => c.auth_url.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// The provider token endpoint (built-in default or override).
+    pub fn token_url(&self) -> &str {
+        match self {
+            OAuthProviderConfig::Google(c) => c
+                .token_url
+                .as_deref()
+                .unwrap_or("https://oauth2.googleapis.com/token"),
+            OAuthProviderConfig::Github(c) => c
+                .token_url
+                .as_deref()
+                .unwrap_or("https://github.com/login/oauth/access_token"),
+            OAuthProviderConfig::Facebook(c) => c
+                .token_url
+                .as_deref()
+                .unwrap_or("https://graph.facebook.com/v21.0/oauth/access_token"),
+            OAuthProviderConfig::Apple(a) => a
+                .token_url
+                .as_deref()
+                .unwrap_or("https://appleid.apple.com/auth/token"),
+            OAuthProviderConfig::Oidc(c) => c.token_url.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// Scopes to request at the authorization endpoint.
+    pub fn scopes(&self) -> Vec<String> {
+        let default: &[&str] = match self {
+            OAuthProviderConfig::Google(_) => &["openid", "email"],
+            OAuthProviderConfig::Github(_) => &["read:user", "user:email"],
+            OAuthProviderConfig::Facebook(_) => &["email"],
+            OAuthProviderConfig::Apple(_) => &[],
+            OAuthProviderConfig::Oidc(_) => &["openid", "email"],
+        };
+        let override_scopes = match self {
+            OAuthProviderConfig::Google(c)
+            | OAuthProviderConfig::Github(c)
+            | OAuthProviderConfig::Facebook(c)
+            | OAuthProviderConfig::Oidc(c) => c.scopes.clone(),
+            OAuthProviderConfig::Apple(a) => a.scopes.clone(),
+        };
+        override_scopes.unwrap_or_else(|| default.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Apple's `name`/`email` scopes require `response_mode=form_post`, which
+    /// makes the callback a POST. Returns the response mode to request, if any.
+    pub fn response_mode(&self) -> Option<&'static str> {
+        match self {
+            OAuthProviderConfig::Apple(_) if !self.scopes().is_empty() => Some("form_post"),
+            _ => None,
+        }
+    }
+
+    /// Whether requests to this provider need a `User-Agent` header (GitHub's
+    /// API rejects requests without one).
+    pub fn needs_user_agent(&self) -> bool {
+        matches!(self, OAuthProviderConfig::Github(_))
+    }
+
+    /// How to obtain the stable subject id after the token exchange.
+    pub fn subject_source(&self) -> SubjectSource {
+        match self {
+            OAuthProviderConfig::Apple(_) => SubjectSource::IdToken,
+            OAuthProviderConfig::Google(c) => SubjectSource::Userinfo {
+                url: c.userinfo_url.clone().unwrap_or_else(|| {
+                    "https://openidconnect.googleapis.com/v1/userinfo".to_string()
+                }),
+                field: c.subject_field.clone().unwrap_or_else(|| "sub".to_string()),
+            },
+            OAuthProviderConfig::Github(c) => SubjectSource::Userinfo {
+                url: c
+                    .userinfo_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.github.com/user".to_string()),
+                field: c.subject_field.clone().unwrap_or_else(|| "id".to_string()),
+            },
+            OAuthProviderConfig::Facebook(c) => SubjectSource::Userinfo {
+                url: c.userinfo_url.clone().unwrap_or_else(|| {
+                    "https://graph.facebook.com/me?fields=id,name,email".to_string()
+                }),
+                field: c.subject_field.clone().unwrap_or_else(|| "id".to_string()),
+            },
+            OAuthProviderConfig::Oidc(c) => SubjectSource::Userinfo {
+                url: c.userinfo_url.clone().unwrap_or_default(),
+                field: c.subject_field.clone().unwrap_or_else(|| "sub".to_string()),
+            },
+        }
+    }
 }
 
 fn default_min_payout_sats() -> u64 {
@@ -363,6 +589,7 @@ pub fn mock_settings() -> Settings {
         captcha: None,
         geoip_database: None,
         referral: None,
+        oauth: None,
     }
 }
 
@@ -389,5 +616,95 @@ mod tests {
         };
         let (kind, _) = mock.to_db_kind_token();
         assert!(matches!(kind, DnsServerKind::MockDns));
+    }
+
+    #[test]
+    fn test_oauth_provider_defaults_and_quirks() {
+        // Google: OIDC defaults, userinfo `sub`.
+        let g: OAuthProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "google",
+            "client-id": "gid",
+            "client-secret": "gsecret",
+        }))
+        .unwrap();
+        assert_eq!(g.client_id(), "gid");
+        assert_eq!(g.auth_url(), "https://accounts.google.com/o/oauth2/v2/auth");
+        assert_eq!(g.scopes(), vec!["openid", "email"]);
+        assert!(!g.needs_user_agent());
+        assert!(g.response_mode().is_none());
+        assert!(matches!(
+            g.subject_source(),
+            SubjectSource::Userinfo { field, .. } if field == "sub"
+        ));
+
+        // GitHub: needs UA, numeric `id` subject.
+        let gh: OAuthProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "github",
+            "client-id": "ghid",
+            "client-secret": "ghsecret",
+        }))
+        .unwrap();
+        assert!(gh.needs_user_agent());
+        assert_eq!(
+            gh.token_url(),
+            "https://github.com/login/oauth/access_token"
+        );
+        assert!(matches!(
+            gh.subject_source(),
+            SubjectSource::Userinfo { field, .. } if field == "id"
+        ));
+
+        // Facebook: Graph me endpoint.
+        let fb: OAuthProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "facebook",
+            "client-id": "fbid",
+            "client-secret": "fbsecret",
+        }))
+        .unwrap();
+        assert!(matches!(
+            fb.subject_source(),
+            SubjectSource::Userinfo { url, .. } if url.contains("graph.facebook.com")
+        ));
+
+        // Apple: id_token subject, no static secret, form_post only with scopes.
+        let apple: OAuthProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "apple",
+            "client-id": "com.example.svc",
+            "team-id": "TEAM",
+            "key-id": "KEY",
+            "private-key": "pem",
+        }))
+        .unwrap();
+        assert!(matches!(apple.subject_source(), SubjectSource::IdToken));
+        assert!(apple.response_mode().is_none()); // no scopes -> query callback
+        assert_eq!(apple.client_id(), "com.example.svc");
+
+        let apple_scoped: OAuthProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "apple",
+            "client-id": "com.example.svc",
+            "team-id": "TEAM",
+            "key-id": "KEY",
+            "private-key": "pem",
+            "scopes": ["name", "email"],
+        }))
+        .unwrap();
+        assert_eq!(apple_scoped.response_mode(), Some("form_post"));
+
+        // Generic OIDC honours explicit overrides.
+        let oidc: OAuthProviderConfig = serde_json::from_value(serde_json::json!({
+            "type": "oidc",
+            "client-id": "oid",
+            "client-secret": "osecret",
+            "auth-url": "https://id.example.com/authorize",
+            "token-url": "https://id.example.com/token",
+            "userinfo-url": "https://id.example.com/userinfo",
+            "subject-field": "uid",
+        }))
+        .unwrap();
+        assert_eq!(oidc.auth_url(), "https://id.example.com/authorize");
+        assert!(matches!(
+            oidc.subject_source(),
+            SubjectSource::Userinfo { field, url } if field == "uid" && url.contains("id.example.com")
+        ));
     }
 }

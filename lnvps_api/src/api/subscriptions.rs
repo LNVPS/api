@@ -43,7 +43,7 @@ async fn v1_list_subscriptions(
     State(this): State<RouterState>,
     Query(q): Query<PageQuery>,
 ) -> ApiPaginatedResult<ApiSubscription> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let limit = q.limit.unwrap_or(50).min(100);
@@ -69,7 +69,7 @@ pub async fn v1_get_subscription(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<ApiSubscription> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let subscription = this.db.get_subscription(id).await?;
@@ -89,7 +89,7 @@ pub async fn v1_list_subscription_payments(
     Path(id): Path<u64>,
     Query(q): Query<PageQuery>,
 ) -> ApiPaginatedResult<ApiSubscriptionPayment> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     // Verify subscription ownership
@@ -121,7 +121,7 @@ async fn v1_update_subscription(
     Path(id): Path<u64>,
     Json(req): Json<ApiUpdateSubscriptionRequest>,
 ) -> ApiResult<ApiSubscription> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let mut subscription = this.db.get_subscription(id).await?;
@@ -160,7 +160,7 @@ async fn v1_create_subscription(
     State(this): State<RouterState>,
     Json(req): Json<ApiCreateSubscriptionRequest>,
 ) -> ApiResult<ApiSubscription> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     // Validate that we have at least one line item
@@ -307,7 +307,7 @@ async fn v1_renew_subscription(
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
 ) -> ApiResult<ApiSubscriptionPayment> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     // Get and verify subscription ownership

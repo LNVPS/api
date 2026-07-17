@@ -155,7 +155,12 @@ async fn v1_generate_lir_agreement_from_subscription(
     use nostr::{EventBuilder, Keys, Kind, Tag, TagKind, TagStandard, ToBech32};
     use nostr_sdk::PublicKey as NostrSdkPublicKey;
 
-    let end_user_pubkey = auth.event.pubkey;
+    // This agreement embeds a Nostr-signed cryptographic proof that references
+    // the end user's Nostr public key, so it is only available to native Nostr
+    // accounts. OAuth accounts have no usable Nostr key.
+    let end_user_pubkey = auth
+        .nostr_pubkey()
+        .ok_or_else(|| ApiError::forbidden("This agreement requires a Nostr account"))?;
     let pubkey_bytes = end_user_pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey_bytes).await?;
     let user = this.db.get_user(uid).await?;

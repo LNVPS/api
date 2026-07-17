@@ -30,7 +30,7 @@ async fn v1_nostr_domains(
     auth: Nip98Auth,
     State(this): State<RouterState>,
 ) -> ApiResult<ApiDomainsResponse> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let domains = this.db.list_domains(uid).await?;
@@ -45,7 +45,7 @@ async fn v1_create_nostr_domain(
     State(this): State<RouterState>,
     Json(data): Json<NameRequest>,
 ) -> ApiResult<ApiNostrDomain> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let mut dom = NostrDomain {
@@ -65,7 +65,7 @@ async fn v1_list_nostr_domain_handles(
     State(this): State<RouterState>,
     Path(dom): Path<u64>,
 ) -> ApiResult<Vec<ApiNostrDomainHandle>> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let domain = this.db.get_domain(dom).await?;
@@ -83,7 +83,7 @@ async fn v1_create_nostr_domain_handle(
     Path(dom): Path<u64>,
     data: Json<HandleRequest>,
 ) -> ApiResult<ApiNostrDomainHandle> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let domain = this.db.get_domain(dom).await?;
@@ -115,7 +115,7 @@ async fn v1_delete_nostr_domain_handle(
     Path(dom): Path<u64>,
     Path(handle): Path<u64>,
 ) -> ApiResult<()> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let domain = this.db.get_domain(dom).await?;

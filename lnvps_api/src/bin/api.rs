@@ -112,6 +112,19 @@ async fn main() -> Result<(), Error> {
         info!("Executed dev_setup.sql");
     }
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+    // Enable session (Bearer JWT) auth for external OAuth logins when configured.
+    if let Some(ref oauth) = settings.oauth {
+        if lnvps_api_common::init_session_secret(oauth.session_secret.as_bytes().to_vec()) {
+            info!(
+                "OAuth session auth enabled ({} provider(s))",
+                oauth.providers.len()
+            );
+        } else {
+            warn!("OAuth configured but session secret was empty or already set");
+        }
+    }
+
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
         for r in &c.relays {
@@ -320,7 +333,8 @@ async fn main() -> Result<(), Error> {
             .merge(subscriptions_router())
             .merge(ip_space_router())
             .merge(referral_router())
-            .merge(legal_router());
+            .merge(legal_router())
+            .merge(oauth_router());
 
         #[cfg(feature = "openapi")]
         {

@@ -161,7 +161,7 @@ async fn v1_patch_account(
     State(this): State<RouterState>,
     req: Json<AccountPatchRequest>,
 ) -> ApiResult<AccountPatchResult> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
@@ -213,6 +213,11 @@ async fn v1_patch_account(
     // WhatsApp notifications require a verified number
     if req.contact_whatsapp && !user.whatsapp_verified {
         return ApiData::err("Verify your WhatsApp number before enabling WhatsApp notifications");
+    }
+
+    // NIP-17 DMs require a real Nostr key; OAuth accounts have a synthetic pubkey.
+    if req.contact_nip17 && user.account_type != lnvps_db::AccountType::Nostr {
+        return ApiData::err("Nostr DM notifications are only available for Nostr accounts");
     }
 
     user.contact_nip17 = req.contact_nip17;
@@ -379,7 +384,7 @@ async fn v1_get_account(
     auth: Nip98Auth,
     State(this): State<RouterState>,
 ) -> ApiResult<AccountPatchRequest> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let user = this.db.get_user(uid).await?;
     let mut rsp: AccountPatchRequest = user.into();
@@ -412,7 +417,7 @@ async fn v1_list_payment_methods(
     auth: Nip98Auth,
     State(this): State<RouterState>,
 ) -> ApiResult<Vec<PaymentMethodResponse>> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let methods = this.db.list_user_payment_methods(uid, None).await?;
     ApiData::ok(methods.into_iter().map(Into::into).collect())
@@ -424,7 +429,7 @@ async fn v1_add_nwc_payment_method(
     State(this): State<RouterState>,
     req: Json<AddNwcPaymentMethodRequest>,
 ) -> ApiResult<PaymentMethodResponse> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let nwc = req.nwc_connection_string.trim().to_string();
@@ -481,7 +486,7 @@ async fn v1_patch_payment_method(
     Path(id): Path<u64>,
     req: Json<PatchPaymentMethodRequest>,
 ) -> ApiResult<PaymentMethodResponse> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     let mut method = this.db.get_user_payment_method(id).await?;
@@ -520,7 +525,7 @@ async fn v1_delete_payment_method(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let method = this.db.get_user_payment_method(id).await?;
     if method.user_id != uid {
@@ -576,7 +581,7 @@ async fn v1_telegram_link(
     let Some(tg) = this.settings.telegram.as_ref() else {
         return ApiData::err("Telegram notifications are not enabled on this server");
     };
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
@@ -592,7 +597,7 @@ async fn v1_telegram_link(
 
 /// Unlink the user's Telegram chat and disable Telegram notifications.
 async fn v1_telegram_unlink(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
@@ -630,7 +635,7 @@ async fn v1_whatsapp_verify(
         return ApiData::err("A valid phone number in international format is required");
     }
 
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
@@ -659,7 +664,7 @@ async fn v1_whatsapp_confirm(
     State(this): State<RouterState>,
     Json(req): Json<WhatsappConfirmRequest>,
 ) -> ApiResult<()> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
@@ -678,7 +683,7 @@ async fn v1_whatsapp_confirm(
 
 /// Remove the user's WhatsApp number and disable WhatsApp notifications.
 async fn v1_whatsapp_unlink(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
@@ -696,7 +701,7 @@ async fn v1_list_vms(
     auth: Nip98Auth,
     State(this): State<RouterState>,
 ) -> ApiResult<Vec<ApiVmStatus>> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vms = this.db.list_user_vms(uid).await?;
     let mut ret = vec![];
@@ -920,7 +925,7 @@ async fn v1_create_custom_vm_order(
     State(this): State<RouterState>,
     Json(req): Json<ApiCustomVmOrder>,
 ) -> ApiResult<ApiVmStatus> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
@@ -959,7 +964,7 @@ async fn v1_list_ssh_keys(
     auth: Nip98Auth,
     State(this): State<RouterState>,
 ) -> ApiResult<Vec<ApiUserSshKey>> {
-    let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let vms = this.db.list_user_vms(uid).await?;
     let ret = this
         .db
@@ -985,7 +990,7 @@ async fn v1_add_ssh_key(
     State(this): State<RouterState>,
     Json(req): Json<CreateSshKey>,
 ) -> ApiResult<ApiUserSshKey> {
-    let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
 
     let pk: PublicKey = req
         .key_data
@@ -1017,7 +1022,7 @@ async fn v1_delete_ssh_key(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
-    let uid = this.db.upsert_user(&auth.event.pubkey.to_bytes()).await?;
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
 
     let ssh_key = this.db.get_user_ssh_key(id).await?;
     if ssh_key.user_id != uid {
@@ -1048,7 +1053,7 @@ async fn v1_create_vm_order(
     State(this): State<RouterState>,
     Json(req): Json<CreateVmRequest>,
 ) -> ApiResult<ApiVmStatus> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
@@ -1351,7 +1356,7 @@ async fn v1_terminal_proxy(
     {
         return Err("Invalid auth event");
     }
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this
         .db
         .upsert_user(&pubkey)
@@ -1498,7 +1503,7 @@ async fn v1_get_payment(
     State(this): State<RouterState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiVmPayment> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let id = if let Ok(i) = hex::decode(&id) {
         i
@@ -1578,7 +1583,7 @@ async fn v1_get_payment_invoice(
     {
         return Err("Invalid auth event");
     }
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this
         .db
         .upsert_user(&pubkey)
@@ -1617,7 +1622,10 @@ async fn v1_get_payment_invoice(
         payment: ApiVmPayment,
         invoice_item: ApiInvoiceItem,
         user: AccountPatchRequest,
-        npub: String,
+        /// Billing email shown on the invoice (empty when the account has none).
+        email: String,
+        /// Whether an email is present, so the template can hide the line.
+        has_email: bool,
         total: u64,
         total_formatted: String,
         company: Option<ApiCompany>,
@@ -1730,10 +1738,8 @@ async fn v1_get_payment_invoice(
                 payment: ApiVmPayment::from_subscription_payment(payment, vm_id_for_payment)
                     .map_err(|_| "Failed to parse payment data")?,
                 invoice_item,
-                npub: nostr_sdk::PublicKey::from_slice(&user.pubkey)
-                    .map_err(|_| "Invalid pubkey")?
-                    .to_bech32()
-                    .unwrap(),
+                email: user.email.as_str().to_string(),
+                has_email: !user.email.is_empty(),
                 user: user.into(),
                 company: company.map(|c| c.into()),
                 upgrade_details,
@@ -1751,7 +1757,7 @@ async fn v1_payment_history(
     Path(id): Path<u64>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Vec<ApiVmPayment>> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
@@ -1780,7 +1786,7 @@ async fn v1_get_vm_history(
     Path(id): Path<u64>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Vec<ApiVmHistory>> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
@@ -1808,7 +1814,7 @@ async fn v1_vm_upgrade_quote(
     Query(q): Query<PaymentMethodQuery>,
     Json(req): Json<ApiVmUpgradeRequest>,
 ) -> ApiResult<ApiVmUpgradeQuote> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
@@ -1857,7 +1863,7 @@ async fn v1_vm_upgrade(
     Query(q): Query<PaymentMethodQuery>,
     Json(req): Json<ApiVmUpgradeRequest>,
 ) -> ApiResult<ApiVmPayment> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
@@ -2092,7 +2098,7 @@ async fn apply_firewall(this: &RouterState, vm_id: u64) -> Result<(), ApiError> 
 }
 
 async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u64, Vm), ApiError> {
-    let pubkey = auth.event.pubkey.to_bytes();
+    let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vm = this.db.get_vm(id).await?;
     if uid != vm.user_id {
