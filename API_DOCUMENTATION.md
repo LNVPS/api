@@ -5,7 +5,7 @@ This document provides comprehensive API specifications for generating TypeScrip
 ## Base Configuration
 
 - **Base URL**: `https://api.lnvps.com` (replace with actual production URL)
-- **Authentication**: NIP-98 (Nostr) authentication required for all authenticated endpoints
+- **Authentication**: either NIP-98 (Nostr) **or** an OAuth session token (see [Authentication](#authentication-types)) on all authenticated endpoints
 - **Content Type**: `application/json`
 - **Error Response Format**: `{ "error": "Error message" }`
 - **Success Response Format**: `{ "data": <response_data> }`
@@ -29,13 +29,81 @@ This document provides comprehensive API specifications for generating TypeScrip
 
 ## Authentication Types
 
+Every authenticated endpoint accepts **either** of two `Authorization` schemes.
+You never mix them on a single request — pick whichever the logged-in user has.
+
 ```typescript
-// All authenticated endpoints require NIP-98 authentication headers
 interface AuthHeaders {
-  'Authorization': string; // Base64 encoded NIP-98 event
+  // Nostr accounts: "Nostr <base64 NIP-98 event>"
+  // OAuth accounts: "Bearer <session JWT>"
+  'Authorization': string;
   'Content-Type': 'application/json';
 }
 ```
+
+- **Nostr (NIP-98)** — `Authorization: Nostr <base64-event>`. Unchanged; used by
+  users who log in with a Nostr key.
+- **OAuth session token** — `Authorization: Bearer <jwt>`. Obtained from the
+  OAuth login flow below. The token is opaque to the frontend: store it and
+  echo it back on every request.
+
+### OAuth login flow (Google / GitHub / Facebook / Apple)
+
+External login is a full-page browser redirect through the provider, ending back
+at your app with a session token. The frontend never sees the provider or the
+authorization code — only the final token.
+
+```
+[React] click "Login with Google"
+   → window.location = `${API}/api/v1/oauth/google/login`
+       → provider consent screen
+           → provider redirects to `${API}/api/v1/oauth/google/callback`  (registered with the provider, NOT your app)
+               → API exchanges the code, creates/updates the account, issues a JWT
+                   → 302 to your configured success-redirect:  `https://app.example.com/oauth/complete#token=<jwt>`
+```
+
+The token is delivered in the URL **fragment** (`#token=…`) so it is never sent
+to or logged by any server. Provider tags are `google`, `github`, `facebook`,
+`apple` (whichever are enabled server-side).
+
+**1. Start login** (plain navigation, not `fetch`):
+
+```typescript
+const API = import.meta.env.VITE_API_URL;
+function startLogin(provider: 'google' | 'github' | 'facebook' | 'apple') {
+  window.location.href = `${API}/api/v1/oauth/${provider}/login`;
+}
+```
+
+**2. Handle the landing route** (`/oauth/complete`): read the fragment, store the
+token, scrub the URL:
+
+```typescript
+const params = new URLSearchParams(window.location.hash.slice(1)); // drop '#'
+const token = params.get('token');
+if (token) {
+  localStorage.setItem('session_token', token);
+  window.history.replaceState({}, '', window.location.pathname); // remove token from history
+  // navigate to your authenticated area
+}
+```
+
+**3. Call authenticated endpoints** with the token:
+
+```typescript
+fetch(`${API}/api/v1/account`, {
+  headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` },
+});
+```
+
+> If the server is configured **without** a `success-redirect`, the callback
+> instead returns JSON `{ "data": { "token": string, "token_type": "Bearer",
+> "expires_in": number } }` — suitable for a popup/`postMessage` flow. The
+> redirect-fragment flow above is recommended for a standard SPA.
+
+On first OAuth login the provider's email is synced into the account (and marked
+verified when the provider asserts it), so `AccountInfo.email` /
+`email_verified` may already be populated for these users.
 
 ## Core Data Types
 
@@ -363,6 +431,28 @@ interface VmUpgradeQuote {
 ```
 
 ## API Endpoints
+
+### OAuth Authentication
+
+These endpoints are **unauthenticated** and drive full-page browser navigation
+(not `fetch`/XHR). See [Authentication](#authentication-types) for the full flow
+and React example. `{provider}` is one of the enabled tags (`google`, `github`,
+`facebook`, `apple`).
+
+#### Start Login
+- **GET** `/api/v1/oauth/{provider}/login`
+- **Auth**: None
+- **Behavior**: 302 redirect to the provider's consent screen. Navigate the
+  browser here (e.g. `window.location.href = ...`).
+
+#### Login Callback
+- **GET/POST** `/api/v1/oauth/{provider}/callback`
+- **Auth**: None
+- **Behavior**: Handled by the provider redirect (POST for Apple `form_post`).
+  On success, either 302-redirects to the server's configured `success-redirect`
+  with the token in the URL fragment (`#token=<jwt>`), or \u2014 if no redirect is
+  configured \u2014 returns `{ "data": { "token": string, "token_type": "Bearer",
+  "expires_in": number } }`. The frontend does not call this directly.
 
 ### Account Management
 
