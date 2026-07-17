@@ -5,7 +5,7 @@ use crate::host::{
 use async_trait::async_trait;
 use chrono::Utc;
 use lnvps_api_common::retry::OpResult;
-use lnvps_api_common::{GB, PB, TB, VmRunningState, VmRunningStates, op_fatal};
+use lnvps_api_common::{GB, HostVmSpec, PB, TB, VmRunningState, VmRunningStates, op_fatal};
 use lnvps_db::{Vm, VmOsImage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -152,10 +152,27 @@ impl DummyVmHost {
             let _ = std::fs::write(STATE_FILE, json);
         }
     }
+
+    /// Set the list of host VMs reported by [`list_host_vms`].
+    ///
+    /// Backed by a process-wide registry so the value survives the fresh
+    /// [`DummyVmHost`] instances that `get_host_client` constructs. Intended for
+    /// exercising VM import/discovery flows.
+    pub async fn set_host_vms(vms: Vec<HostVmSpec>) {
+        *DUMMY_HOST_VMS.lock().await = vms;
+    }
 }
+
+/// Process-wide registry of "host" VMs reported by [`DummyVmHost::list_host_vms`].
+static DUMMY_HOST_VMS: LazyLock<Arc<Mutex<Vec<HostVmSpec>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 
 #[async_trait]
 impl VmHostClient for DummyVmHost {
+    async fn list_host_vms(&self) -> OpResult<Vec<HostVmSpec>> {
+        Ok(DUMMY_HOST_VMS.lock().await.clone())
+    }
+
     async fn get_info(&self) -> OpResult<VmHostInfo> {
         Ok(VmHostInfo {
             cpu: 100,

@@ -810,6 +810,31 @@ impl Worker {
             .expires
     }
 
+    /// Discover VMs present on a host that aren't tracked in the database.
+    ///
+    /// A host VM is "unmanaged" when it maps to a database id (i.e. is within
+    /// the managed id range) that has no live (non-deleted) VM record. Host VMs
+    /// outside the managed range (e.g. Proxmox vmid < 100) can't be imported and
+    /// are omitted.
+    async fn list_unmanaged_vms(&self, host_id: u64) -> Result<Vec<lnvps_api_common::HostVmSpec>> {
+        let host = self.db.get_host(host_id).await?;
+        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let all = client.list_host_vms().await?;
+
+        let mut unmanaged = Vec::new();
+        for spec in all {
+            let Some(mapped) = spec.mapped_vm_id else {
+                // Outside the managed id range, not importable
+                continue;
+            };
+            match self.db.get_vm(mapped).await {
+                Ok(vm) if !vm.deleted => continue, // already tracked
+                _ => unmanaged.push(spec),
+            }
+        }
+        Ok(unmanaged)
+    }
+
     /// Check VM state from hypervisor and update cache
     /// Lifecycle enforcement (stop/delete) is handled by subscription lifecycle handlers.
     async fn check_vm(&self, vm: &Vm) -> Result<()> {
@@ -2278,6 +2303,76 @@ impl Worker {
 
                 return Ok(Some(format!(
                     "VM {} created successfully for user {}",
+                    vm.id, user_id
+                )));
+            }
+            WorkJob::ListUnmanagedVms {
+                host_id,
+                reply_channel,
+            } => {
+                // Discover VMs on the host that aren't tracked in the database
+                // and reply with the JSON list on the requested temp channel.
+                let result = self.list_unmanaged_vms(*host_id).await;
+                let feedback = match &result {
+                    Ok(list) => match serde_json::to_string(list) {
+                        Ok(json) => JobFeedback::create_job_completed_feedback(
+                            reply_channel.clone(),
+                            "ListUnmanagedVms".to_string(),
+                            Some(json),
+                        ),
+                        Err(e) => JobFeedback::create_job_failed_feedback(
+                            reply_channel.clone(),
+                            "ListUnmanagedVms".to_string(),
+                            e.to_string(),
+                        ),
+                    },
+                    Err(e) => JobFeedback::create_job_failed_feedback(
+                        reply_channel.clone(),
+                        "ListUnmanagedVms".to_string(),
+                        e.to_string(),
+                    ),
+                };
+                if let Err(e) = self.feedback.publish(feedback).await {
+                    warn!("Failed to publish ListUnmanagedVms reply: {}", e);
+                }
+                return Ok(Some(match &result {
+                    Ok(list) => format!("Found {} unmanaged VM(s) on host {}", list.len(), host_id),
+                    Err(e) => format!("Discovery failed for host {}: {}", host_id, e),
+                }));
+            }
+            WorkJob::ImportVm {
+                host_id,
+                host_vm_id,
+                user_id,
+                admin_user_id,
+                reason,
+            } => {
+                info!(
+                    "Admin {} importing host VM {} on host {} for user {}",
+                    admin_user_id, host_vm_id, host_id, user_id
+                );
+                let provisioner = self.subscription_handler.vm_provisioner();
+                let vm = provisioner
+                    .import_vm(*host_id, *host_vm_id, *user_id)
+                    .await?;
+
+                let metadata = Some(serde_json::json!({
+                    "admin_user_id": admin_user_id,
+                    "admin_action": true,
+                    "imported": true,
+                    "host_vm_id": host_vm_id,
+                    "reason": reason
+                }));
+                if let Err(e) = self
+                    .vm_history_logger
+                    .log_vm_created(&vm, Some(*user_id), metadata)
+                    .await
+                {
+                    error!("Failed to log VM {} import: {}", vm.id, e);
+                }
+
+                return Ok(Some(format!(
+                    "VM {} imported successfully for user {}",
                     vm.id, user_id
                 )));
             }

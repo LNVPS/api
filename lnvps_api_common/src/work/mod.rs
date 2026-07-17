@@ -111,6 +111,24 @@ pub enum WorkJob {
         payment_method: String,            // "lightning", "revolut", "paypal"
         lightning_invoice: Option<String>, // Required when payment_method is "lightning"
     },
+    /// Discover VMs present on a host that are not tracked in the database and
+    /// publish the resulting list (JSON `Vec<HostVmSpec>`) to a temporary Redis
+    /// pub/sub channel so the admin API can read it synchronously.
+    ListUnmanagedVms {
+        host_id: u64,
+        /// Temporary channel id the worker replies on (via job feedback).
+        reply_channel: String,
+    },
+    /// Import a VM that exists on a host but isn't tracked in the database,
+    /// assigning it to a user and billing it via the region's custom pricing.
+    ImportVm {
+        host_id: u64,
+        /// Raw host VM id (e.g. Proxmox vmid)
+        host_vm_id: i64,
+        user_id: u64,
+        admin_user_id: u64,
+        reason: Option<String>,
+    },
     /// Create a VM for a specific user (admin action)
     CreateVm {
         user_id: u64,
@@ -172,6 +190,9 @@ impl WorkJob {
             Self::CheckVm { .. } => true,
             Self::CheckVms => true,
             Self::CheckSubscriptions => true,
+            // A discovery request is a one-shot read tied to a waiting admin
+            // request; never retry it if it fails.
+            Self::ListUnmanagedVms { .. } => true,
             _ => false,
         }
     }
@@ -197,6 +218,8 @@ impl fmt::Display for WorkJob {
             WorkJob::UnassignVmIp { .. } => write!(f, "UnassignVmIp"),
             WorkJob::UpdateVmIp { .. } => write!(f, "UpdateVmIp"),
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
+            WorkJob::ListUnmanagedVms { .. } => write!(f, "ListUnmanagedVms"),
+            WorkJob::ImportVm { .. } => write!(f, "ImportVm"),
             WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),

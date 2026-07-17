@@ -984,6 +984,36 @@ impl LNVpsDbBase for MockDb {
         Ok(max_id + 1)
     }
 
+    async fn insert_vm_with_id(&self, vm: &Vm) -> DbResult<u64> {
+        let mut vms = self.vms.lock().await;
+        if vm.id == 0 {
+            return Err(DbError::from(anyhow!(
+                "insert_vm_with_id requires a non-zero id"
+            )));
+        }
+        if vms.contains_key(&vm.id) {
+            return Err(DbError::from(anyhow!("VM id {} already exists", vm.id)));
+        }
+
+        // lazy test FK
+        self.get_host(vm.host_id).await?;
+        self.get_user(vm.user_id).await?;
+        self.get_os_image(vm.image_id).await?;
+        if let Some(t) = vm.template_id {
+            self.get_vm_template(t).await?;
+        }
+        if let Some(t) = vm.custom_template_id {
+            self.get_custom_vm_template(t).await?;
+        }
+        if let Some(k) = vm.ssh_key_id {
+            self.get_user_ssh_key(k).await?;
+        }
+        self.get_host_disk(vm.disk_id).await?;
+
+        vms.insert(vm.id, vm.clone());
+        Ok(vm.id)
+    }
+
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(vm) = vms.get_mut(&vm_id) {

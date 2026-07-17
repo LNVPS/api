@@ -1,15 +1,21 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
-use crate::admin::model::{AdminHostDisk, AdminHostInfo, AdminVmHostKind};
+use crate::admin::model::{
+    AdminHostDisk, AdminHostInfo, AdminImportVmRequest, AdminUnmanagedVmInfo, AdminVmHostKind,
+    JobResponse,
+};
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use lnvps_api_common::{
     ApiData, ApiDiskInterface, ApiDiskType, ApiError, ApiPaginatedData, ApiPaginatedResult,
-    ApiResult, PageQuery,
+    ApiResult, JobFeedback, JobFeedbackStatus, PageQuery, WorkFeedback, WorkJob,
 };
 use lnvps_db::{AdminAction, AdminResource};
+use log::info;
 use serde::Deserialize;
+use std::time::Duration;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -30,6 +36,12 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/hosts/{id}/disks/{disk_id}",
             get(admin_get_host_disk).patch(admin_update_host_disk),
         )
+        // VM import (issue #166)
+        .route(
+            "/api/admin/v1/hosts/{id}/vms/unmanaged",
+            get(admin_list_unmanaged_vms),
+        )
+        .route("/api/admin/v1/hosts/{id}/vms/import", post(admin_import_vm))
 }
 
 /// List all VM hosts with pagination
@@ -458,6 +470,100 @@ pub struct AdminHostDiskUpdateRequest {
     pub kind: Option<ApiDiskType>,
     pub interface: Option<ApiDiskInterface>,
     pub enabled: Option<bool>,
+}
+
+/// Discover VMs present on a host that aren't tracked in the database.
+///
+/// The admin service has no direct connection to the host, so this dispatches a
+/// discovery job to the worker and waits for the reply on a temporary Redis
+/// pub/sub channel (see issue #166).
+async fn admin_list_unmanaged_vms(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<AdminUnmanagedVmInfo>> {
+    auth.require_permission(AdminResource::Hosts, AdminAction::View)?;
+
+    // Ensure the host exists before dispatching work
+    let _host = this.db.get_host(id).await?;
+
+    let feedback = this
+        .feedback
+        .as_ref()
+        .ok_or_else(|| ApiError::new("Job feedback service is not available"))?;
+
+    // Temporary reply channel the worker publishes the result on
+    let reply_channel = uuid::Uuid::new_v4().to_string();
+    let channel_name = JobFeedback::channel_name(&reply_channel);
+
+    // Subscribe BEFORE dispatching so we can't miss the reply
+    let mut stream = feedback
+        .subscribe(&channel_name)
+        .await
+        .map_err(|e| ApiError::new(&format!("Failed to subscribe to reply channel: {}", e)))?;
+
+    this.work_commander
+        .send(WorkJob::ListUnmanagedVms {
+            host_id: id,
+            reply_channel: reply_channel.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::new(&format!("Failed to dispatch discovery job: {}", e)))?;
+
+    // Wait for the worker reply (bounded)
+    let msg = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .map_err(|_| ApiError::new("Timed out waiting for host discovery"))?;
+
+    match msg {
+        Some(Ok(fb)) => match fb.status {
+            JobFeedbackStatus::Completed { result: Some(json) } => {
+                let specs: Vec<lnvps_api_common::HostVmSpec> = serde_json::from_str(&json)
+                    .map_err(|e| ApiError::new(&format!("Invalid discovery result: {}", e)))?;
+                ApiData::ok(specs.into_iter().map(AdminUnmanagedVmInfo::from).collect())
+            }
+            JobFeedbackStatus::Failed { error } => {
+                ApiData::err(&format!("Host discovery failed: {}", error))
+            }
+            _ => ApiData::err("Unexpected discovery reply"),
+        },
+        Some(Err(e)) => ApiData::err(&format!("Discovery reply error: {}", e)),
+        None => ApiData::err("Discovery reply channel closed"),
+    }
+}
+
+/// Import an existing host VM into the database, assigning it to a user and
+/// billing via the region's custom pricing (issue #166).
+async fn admin_import_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminImportVmRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Create)?;
+
+    // Validate host and user up front
+    let _host = this.db.get_host(id).await?;
+    let _user = this.db.get_user(req.user_id).await?;
+
+    let job = WorkJob::ImportVm {
+        host_id: id,
+        host_vm_id: req.host_vm_id,
+        user_id: req.user_id,
+        admin_user_id: auth.user_id,
+        reason: req.reason,
+    };
+
+    match this.work_commander.send(job).await {
+        Ok(job_id) => {
+            info!(
+                "VM import job queued (host {}, vmid {}) with stream ID: {}",
+                id, req.host_vm_id, job_id
+            );
+            ApiData::ok(JobResponse { job_id })
+        }
+        Err(e) => ApiData::err(&format!("Failed to queue VM import job: {}", e)),
+    }
 }
 
 #[cfg(test)]

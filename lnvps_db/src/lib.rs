@@ -367,6 +367,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Insert a new VM record
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64>;
 
+    /// Insert a VM record with an explicit id.
+    ///
+    /// Used when importing a pre-existing host VM whose id is fixed by the
+    /// host's VM id mapping (e.g. Proxmox `vmid = db_id + 100`). Fails if the
+    /// id is already taken.
+    async fn insert_vm_with_id(&self, vm: &Vm) -> DbResult<u64>;
+
     /// Delete a VM by id
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()>;
 

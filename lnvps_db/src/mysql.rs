@@ -888,6 +888,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .try_get(0)?)
     }
 
+    async fn insert_vm_with_id(&self, vm: &Vm) -> DbResult<u64> {
+        sqlx::query("insert into vm(id,host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(vm.id)
+            .bind(vm.host_id)
+            .bind(vm.user_id)
+            .bind(vm.image_id)
+            .bind(vm.template_id)
+            .bind(vm.custom_template_id)
+            .bind(vm.subscription_line_item_id)
+            .bind(vm.ssh_key_id)
+            .bind(vm.disk_id)
+            .bind(&vm.mac_address)
+            .bind(&vm.ref_code)
+            .execute(&self.db)
+            .await?;
+        Ok(vm.id)
+    }
+
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
         sqlx::query("update vm set deleted = 1, ssh_key_id = null where id = ?")
             .bind(vm_id)
