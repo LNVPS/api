@@ -3080,7 +3080,7 @@ Returns the referral plus per-currency earned commission, payout history and cou
 
 `earned` is commission (`first payment * effective_rate%`) aggregated per currency.
 
-#### Update Referral (commission override)
+#### Update Referral (code / commission override)
 
 ```
 PATCH /api/admin/v1/referrals/{id}
@@ -3092,6 +3092,11 @@ Body:
 
 ```json
 {
+  "code": "OLDCODE1",
+  // Rename the referral code, or omit to leave unchanged. Used to relink a
+  // user's enrollment to a historical `vm.ref_code` that was tracked before
+  // the user auto-generated their own code. Must be non-empty and not already
+  // in use by another referral.
   "referral_rate": 12.5
   // Set (number, >= 0), clear to company default (null), or omit to leave unchanged
 }

@@ -2938,8 +2938,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
         sqlx::query(
-            "UPDATE referral SET lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
+            "UPDATE referral SET code = ?, lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
         )
+        .bind(&referral.code)
         .bind(&referral.lightning_address)
         .bind(referral.mode)
         .bind(referral.referral_rate)

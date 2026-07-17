@@ -129,6 +129,22 @@ async fn admin_update_referral(
 
     let mut referral = this.db.admin_get_referral(id).await?;
 
+    if let Some(code) = &req.code {
+        let code = code.trim();
+        if code.is_empty() {
+            return ApiData::err("code cannot be empty");
+        }
+        // Reject a code already taken by a different referral enrollment.
+        if code != referral.code {
+            if let Ok(existing) = this.db.get_referral_by_code(code).await {
+                if existing.id != referral.id {
+                    return ApiData::err("code is already in use by another referral");
+                }
+            }
+        }
+        referral.code = code.to_string();
+    }
+
     if let Some(rate) = req.referral_rate {
         if let Some(r) = rate {
             if r < 0.0 {

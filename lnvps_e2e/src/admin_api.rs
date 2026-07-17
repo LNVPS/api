@@ -966,6 +966,70 @@ mod tests {
         );
     }
 
+    /// Renaming a referral code relinks a user's enrollment to a historical
+    /// `vm.ref_code`. Verify the PATCH persists the new code, rejects an empty
+    /// code, and rejects a code already taken by another referral.
+    #[tokio::test]
+    async fn test_admin_update_referral_code() {
+        use nostr::Keys;
+
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+
+        // Two separate referrers, each with their own auto-generated code.
+        let keys_a = Keys::generate();
+        let keys_b = Keys::generate();
+        let user_a = crate::db::ensure_user(&pool, &keys_a).await.unwrap();
+        let user_b = crate::db::ensure_user(&pool, &keys_b).await.unwrap();
+        // Unique, <=20 char codes derived from the random pubkeys.
+        let suffix = hex::encode(keys_a.public_key().to_bytes());
+        let code_a = format!("A{}", &suffix[..7]);
+        let code_b = format!("B{}", &suffix[..7]);
+        let historical = format!("H{}", &suffix[..7]);
+
+        let ref_a = crate::db::insert_referral(&pool, user_a, &code_a, None)
+            .await
+            .unwrap();
+        let ref_b = crate::db::insert_referral(&pool, user_b, &code_b, None)
+            .await
+            .unwrap();
+
+        // Empty code is rejected.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/referrals/{ref_a}"),
+                &serde_json::json!({ "code": "  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A code already used by another referral is rejected.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/referrals/{ref_a}"),
+                &serde_json::json!({ "code": code_b }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Renaming to a free historical code succeeds and persists.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/referrals/{ref_a}"),
+                &serde_json::json!({ "code": historical }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["code"].as_str().unwrap(), historical);
+
+        crate::db::hard_delete_referral(&pool, ref_a).await.unwrap();
+        crate::db::hard_delete_referral(&pool, ref_b).await.unwrap();
+    }
+
     // ========================================================================
     // Payment Methods (Admin)
     // ========================================================================

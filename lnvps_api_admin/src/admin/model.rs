@@ -1956,9 +1956,14 @@ pub struct AdminReferralDetail {
     pub referrals_failed: u64,
 }
 
-/// Update a referral's admin-controlled fields (currently the commission override).
+/// Update a referral's admin-controlled fields (referral code and/or commission override).
 #[derive(Deserialize)]
 pub struct AdminUpdateReferralRequest {
+    /// Rename the referral code. Used to relink a user's enrollment to a
+    /// historical `vm.ref_code` that was tracked before the user auto-generated
+    /// their own code. Omitted leaves it unchanged.
+    #[serde(default)]
+    pub code: Option<String>,
     /// Set (`Some(Some(rate))`) or clear (`Some(None)`) the per-referrer
     /// commission override, as a whole percentage; omitted leaves it unchanged.
     #[serde(

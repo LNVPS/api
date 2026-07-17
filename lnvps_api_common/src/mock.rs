@@ -2479,6 +2479,7 @@ impl LNVpsDbBase for MockDb {
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
         let mut referrals = self.referrals.lock().await;
         if let Some(r) = referrals.get_mut(&referral.id) {
+            r.code = referral.code.clone();
             r.lightning_address = referral.lightning_address.clone();
             r.mode = referral.mode;
             r.referral_rate = referral.referral_rate;
