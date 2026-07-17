@@ -939,7 +939,15 @@ impl ProxmoxClient {
     /// The rule is tagged with a [`USER_FW_MARKER`]-prefixed comment so it can be
     /// identified and re-synced on subsequent applies without disturbing the
     /// always-enforced ipfilter (anti-spoof) rule.
-    fn to_pve_firewall_rule(rule: &lnvps_db::VmFirewallRule) -> VmFirewallRule {
+    /// Convert a database firewall rule into one or more Proxmox rules.
+    ///
+    /// Proxmox rejects `dport` unless `proto` is also set ("'dport' requires
+    /// this property"). A port with an "Any" protocol therefore can't be a
+    /// single rule; instead we expand it into two rules — one for `tcp` and one
+    /// for `udp` — so the port restriction is preserved. All expanded rules
+    /// share the same `lnvps-fw:<id>` comment marker so cleanup still matches
+    /// them as a group.
+    fn to_pve_firewall_rules(rule: &lnvps_db::VmFirewallRule) -> Vec<VmFirewallRule> {
         use lnvps_db::{VmFirewallDirection, VmFirewallProtocol, VmFirewallRuleAction};
 
         let action = match rule.action {
@@ -951,31 +959,42 @@ impl ProxmoxClient {
             VmFirewallDirection::Inbound => VmFirewallRuleType::In,
             VmFirewallDirection::Outbound => VmFirewallRuleType::Out,
         };
-        let proto = match rule.protocol {
-            VmFirewallProtocol::Any => None,
-            VmFirewallProtocol::Tcp => Some("tcp".to_string()),
-            VmFirewallProtocol::Udp => Some("udp".to_string()),
-            VmFirewallProtocol::Icmp => Some("icmp".to_string()),
-        };
-        // Proxmox rejects `dport` unless `proto` is also set
-        // ("'dport' requires this property"). A port only makes sense with a
-        // specific protocol, so drop the port when protocol is Any.
-        let dport = match (proto.is_some(), rule.dst_port_start, rule.dst_port_end) {
-            (true, Some(s), Some(e)) if e != s => Some(format!("{}:{}", s, e)),
-            (true, Some(s), _) => Some(s.to_string()),
-            _ => None,
+        let dport = match (rule.dst_port_start, rule.dst_port_end) {
+            (Some(s), Some(e)) if e != s => Some(format!("{}:{}", s, e)),
+            (Some(s), _) => Some(s.to_string()),
+            (None, _) => None,
         };
 
-        VmFirewallRule {
-            action,
-            rule_type,
-            proto,
-            dport,
-            source: rule.src_cidr.clone(),
-            enable: Some(if rule.enabled { 1 } else { 0 }),
-            comment: Some(format!("{}:{}", USER_FW_MARKER, rule.id)),
-            ..Default::default()
-        }
+        // Determine which protocol(s) this rule maps to. "Any" with a port must
+        // be expanded to tcp + udp (Proxmox has no protocol-less dport); "Any"
+        // without a port stays a single protocol-less rule.
+        let protos: Vec<Option<&str>> = match rule.protocol {
+            VmFirewallProtocol::Any => {
+                if dport.is_some() {
+                    vec![Some("tcp"), Some("udp")]
+                } else {
+                    vec![None]
+                }
+            }
+            VmFirewallProtocol::Tcp => vec![Some("tcp")],
+            VmFirewallProtocol::Udp => vec![Some("udp")],
+            VmFirewallProtocol::Icmp => vec![Some("icmp")],
+        };
+
+        protos
+            .into_iter()
+            .map(|proto| VmFirewallRule {
+                action: action.clone(),
+                rule_type: rule_type.clone(),
+                // Only carry the port when a protocol is present.
+                dport: proto.and(dport.clone()),
+                proto: proto.map(|p| p.to_string()),
+                source: rule.src_cidr.clone(),
+                enable: Some(if rule.enabled { 1 } else { 0 }),
+                comment: Some(format!("{}:{}", USER_FW_MARKER, rule.id)),
+                ..Default::default()
+            })
+            .collect()
     }
 
     fn make_config(&self, value: &FullVmInfo, vendor_snippet: Option<&str>) -> Result<VmConfig> {
@@ -1864,8 +1883,12 @@ impl VmHostClient for ProxmoxClient {
         }
 
         for rule in cfg.firewall_rules.iter().rev() {
-            self.add_vm_firewall_rule(&self.node, vm_id, Self::to_pve_firewall_rule(rule))
-                .await?;
+            // A single db rule may expand to multiple Proxmox rules (e.g. an
+            // "Any" protocol rule with a port -> tcp + udp).
+            for pve_rule in Self::to_pve_firewall_rules(rule) {
+                self.add_vm_firewall_rule(&self.node, vm_id, pve_rule)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -2880,7 +2903,9 @@ mod tests {
             created: Default::default(),
             updated: Default::default(),
         };
-        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
+        let pve = ProxmoxClient::to_pve_firewall_rules(&rule);
+        assert_eq!(pve.len(), 1);
+        let pve = &pve[0];
         assert_eq!(pve.action, VmFirewallAction::ACCEPT);
         assert_eq!(pve.rule_type, VmFirewallRuleType::In);
         assert_eq!(pve.proto.as_deref(), Some("tcp"));
@@ -2891,7 +2916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_pve_firewall_rule_outbound_any_single_port_disabled() {
+    fn test_to_pve_firewall_rule_outbound_any_single_port_expands_to_tcp_udp() {
         let rule = lnvps_db::VmFirewallRule {
             id: 7,
             vm_id: 1,
@@ -2906,21 +2931,54 @@ mod tests {
             created: Default::default(),
             updated: Default::default(),
         };
-        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
-        assert_eq!(pve.action, VmFirewallAction::DROP);
-        assert_eq!(pve.rule_type, VmFirewallRuleType::Out);
-        assert_eq!(pve.proto, None);
-        // Proxmox rejects a dport without a proto, so a port on an "Any"
-        // protocol rule must be dropped (see issue #165).
-        assert_eq!(pve.dport, None);
-        assert_eq!(pve.source, None);
-        assert_eq!(pve.enable, Some(0));
+        // An "Any" protocol rule with a port expands to one tcp + one udp rule,
+        // each carrying the port (Proxmox has no protocol-less dport).
+        let pve = ProxmoxClient::to_pve_firewall_rules(&rule);
+        assert_eq!(pve.len(), 2);
+        assert_eq!(pve[0].proto.as_deref(), Some("tcp"));
+        assert_eq!(pve[1].proto.as_deref(), Some("udp"));
+        for r in &pve {
+            assert_eq!(r.action, VmFirewallAction::DROP);
+            assert_eq!(r.rule_type, VmFirewallRuleType::Out);
+            assert_eq!(r.dport.as_deref(), Some("53"));
+            assert_eq!(r.source, None);
+            assert_eq!(r.enable, Some(0));
+            assert_eq!(r.comment.as_deref(), Some("lnvps-fw:7"));
+        }
     }
 
     #[test]
-    fn test_to_pve_firewall_rule_any_proto_port_range_drops_dport() {
-        // Regression for issue #165: Proxmox returns 400
-        // "'dport' requires this property" when dport is sent without proto.
+    fn test_to_pve_firewall_rule_any_no_port_single_rule() {
+        // "Any" protocol with no port stays a single protocol-less rule so
+        // Proxmox doesn't get a dport without a proto (issue #165).
+        let rule = lnvps_db::VmFirewallRule {
+            id: 8,
+            vm_id: 1,
+            priority: 0,
+            direction: lnvps_db::VmFirewallDirection::Inbound,
+            protocol: lnvps_db::VmFirewallProtocol::Any,
+            action: lnvps_db::VmFirewallRuleAction::Accept,
+            src_cidr: None,
+            dst_port_start: None,
+            dst_port_end: None,
+            enabled: true,
+            created: Default::default(),
+            updated: Default::default(),
+        };
+        let pve = ProxmoxClient::to_pve_firewall_rules(&rule);
+        assert_eq!(pve.len(), 1);
+        assert_eq!(pve[0].proto, None);
+        assert_eq!(pve[0].dport, None);
+        let json = serde_json::to_string(&pve[0]).unwrap();
+        assert!(!json.contains("dport"), "json: {json}");
+        assert!(!json.contains("proto"), "json: {json}");
+    }
+
+    #[test]
+    fn test_to_pve_firewall_rule_any_proto_port_range_expands_to_tcp_udp() {
+        // Issue #165: a port with "Any" protocol must be expanded to tcp + udp
+        // rules rather than dropping the port (Proxmox rejects a protocol-less
+        // dport with 400 "'dport' requires this property").
         let rule = lnvps_db::VmFirewallRule {
             id: 165,
             vm_id: 1,
@@ -2935,13 +2993,17 @@ mod tests {
             created: Default::default(),
             updated: Default::default(),
         };
-        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
-        assert_eq!(pve.proto, None);
-        assert_eq!(pve.dport, None);
-        // The serialized request must contain neither proto nor dport.
-        let json = serde_json::to_string(&pve).unwrap();
-        assert!(!json.contains("dport"), "json: {json}");
-        assert!(!json.contains("proto"), "json: {json}");
+        let pve = ProxmoxClient::to_pve_firewall_rules(&rule);
+        assert_eq!(pve.len(), 2);
+        assert_eq!(pve[0].proto.as_deref(), Some("tcp"));
+        assert_eq!(pve[1].proto.as_deref(), Some("udp"));
+        for r in &pve {
+            assert_eq!(r.dport.as_deref(), Some("80:443"));
+            // Each expanded rule is a valid Proxmox rule (proto set with dport).
+            let json = serde_json::to_string(r).unwrap();
+            assert!(json.contains("dport"), "json: {json}");
+            assert!(json.contains("proto"), "json: {json}");
+        }
     }
 
     #[test]
@@ -3000,8 +3062,9 @@ mod tests {
             created: Default::default(),
             updated: Default::default(),
         };
-        let pve = ProxmoxClient::to_pve_firewall_rule(&rule);
-        assert_eq!(pve.action, VmFirewallAction::REJECT);
+        let pve = ProxmoxClient::to_pve_firewall_rules(&rule);
+        assert_eq!(pve.len(), 1);
+        assert_eq!(pve[0].action, VmFirewallAction::REJECT);
     }
 
     #[test]
