@@ -160,7 +160,7 @@ async fn handle_callback(
         warn!("Failed to sync OAuth email for user {}: {}", uid, e);
     }
 
-    let token = issue_session_token(&pubkey, uid, cfg_session_ttl(&cfg))
+    let token = issue_session_token(&pubkey, uid, session_ttl(this))
         .map_err(|e| ApiError::internal(format!("Failed to issue session: {}", e)))?;
 
     // Redirect to the frontend with the token in the fragment, or return JSON.
@@ -172,7 +172,7 @@ async fn handle_callback(
         let resp = ApiData::ok(OAuthTokenResponse {
             token,
             token_type: "Bearer".to_string(),
-            expires_in: cfg_session_ttl(&cfg),
+            expires_in: session_ttl(this),
         })?;
         Ok(resp.into_response())
     }
@@ -197,8 +197,13 @@ fn resolve_provider(
     Ok((cfg, provider_cfg))
 }
 
-fn cfg_session_ttl(cfg: &crate::settings::OAuthConfig) -> u64 {
-    cfg.session_ttl
+/// Session token lifetime from the shared `[session]` config (default 30 days).
+fn session_ttl(this: &RouterState) -> u64 {
+    this.settings
+        .session
+        .as_ref()
+        .map(|s| s.ttl)
+        .unwrap_or(lnvps_api_common::DEFAULT_SESSION_TTL_SECS)
 }
 
 fn cfg_success_redirect(cfg: &crate::settings::OAuthConfig) -> Option<&str> {

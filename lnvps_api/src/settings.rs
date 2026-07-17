@@ -75,20 +75,46 @@ pub struct Settings {
     /// External OAuth/OIDC login support. When omitted, only Nostr (NIP-98)
     /// authentication is available.
     pub oauth: Option<OAuthConfig>,
+
+    /// Passwordless WebAuthn / passkey login. When omitted, passkey endpoints
+    /// are disabled. Issues the same session JWTs as OAuth.
+    pub webauthn: Option<WebauthnConfig>,
+
+    /// Shared session-token settings. Required when `oauth` or `webauthn` is
+    /// configured — both issue the same stateless session JWTs. When omitted,
+    /// `Bearer` session auth is disabled and only Nostr (NIP-98) auth works.
+    pub session: Option<SessionConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SessionConfig {
+    /// Secret used to sign session JWTs (and the OAuth CSRF `state` / WebAuthn
+    /// challenge tokens). Must be a strong, stable random string — changing it
+    /// invalidates all outstanding sessions.
+    pub secret: String,
+    /// Session token lifetime in seconds. Defaults to 30 days.
+    #[serde(default = "default_session_ttl")]
+    pub ttl: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WebauthnConfig {
+    /// Relying Party ID — the registrable domain passkeys are bound to (e.g.
+    /// `app.lnvps.com`). PERMANENT: changing it invalidates every passkey.
+    pub rp_id: String,
+    /// Relying Party origin — the exact origin the frontend runs on (e.g.
+    /// `https://app.lnvps.com`). Its host must equal or be a subdomain of
+    /// `rp_id`.
+    pub rp_origin: String,
+    /// Human-friendly Relying Party name shown in the authenticator UI.
+    pub rp_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct OAuthConfig {
-    /// Secret used to sign stateless session JWTs issued after a successful
-    /// OAuth login (and the short-lived CSRF `state` values). Must be a strong,
-    /// stable random string — changing it invalidates all outstanding sessions.
-    pub session_secret: String,
-
-    /// Session token lifetime in seconds. Defaults to 30 days.
-    #[serde(default = "default_session_ttl")]
-    pub session_ttl: u64,
-
     /// After a successful login the browser is redirected here with the issued
     /// token appended as `#token=<jwt>` (fragment). Typically your frontend.
     /// When omitted, the callback returns the token as JSON instead.
@@ -590,6 +616,8 @@ pub fn mock_settings() -> Settings {
         geoip_database: None,
         referral: None,
         oauth: None,
+        webauthn: None,
+        session: None,
     }
 }
 

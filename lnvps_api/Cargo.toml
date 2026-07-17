@@ -78,6 +78,10 @@ urlencoding = "2.1"
 rand = "0.9"
 # ES256 signing for the "Sign in with Apple" client-secret JWT (.p8 key).
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+# Passwordless WebAuthn / passkey login. conditional-ui enables discoverable
+# (usernameless) credentials; danger-allow-state-serialisation lets us carry the
+# ceremony state through the client inside a signed challenge token.
+webauthn-rs = { version = "0.5", features = ["conditional-ui", "danger-allow-state-serialisation"] }
 clap = { version = "4.5", features = ["derive"] }
 ssh-key = "0.6"
 lettre = { version = "0.11", features = ["tokio1-native-tls"] }

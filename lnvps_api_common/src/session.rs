@@ -195,9 +195,86 @@ pub fn verify_state_token(token: &str) -> Result<String> {
     Ok(claims.prov)
 }
 
+/// Claims wrapping an opaque, server-owned challenge state (e.g. a serialised
+/// WebAuthn registration/authentication ceremony) so it can round-trip through
+/// the client without server-side storage. The `payload` is signed, so the
+/// client cannot tamper with the challenge; `purpose` prevents a token minted
+/// for one ceremony being replayed into another.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChallengeClaims {
+    /// Ceremony tag, e.g. `webauthn-reg` / `webauthn-auth`.
+    purpose: String,
+    /// Opaque serialised ceremony state (JSON).
+    payload: String,
+    /// Expiry (unix seconds).
+    exp: u64,
+}
+
+/// Default challenge lifetime (5 minutes) — a WebAuthn ceremony round-trip.
+pub const DEFAULT_CHALLENGE_TTL_SECS: u64 = 300;
+
+/// Issue a signed, short-lived token wrapping an opaque ceremony `payload` under
+/// a `purpose` tag. The client echoes it back on the finish step; the server
+/// recovers the exact state via [`verify_challenge_token`]. Tamper-proof
+/// (HS256), so it is safe to hand server-owned challenge state to the client.
+pub fn issue_challenge_token(purpose: &str, payload: &str, ttl_secs: u64) -> Result<String> {
+    let secret = SESSION_SECRET
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
+    let claims = ChallengeClaims {
+        purpose: purpose.to_string(),
+        payload: payload.to_string(),
+        exp: now_secs() + ttl_secs,
+    };
+    let payload_b64 = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+    let sig = sign(payload_b64.as_bytes(), secret);
+    Ok(format!("{payload_b64}.{sig}"))
+}
+
+/// Verify a challenge token, assert its `purpose` matches, check expiry, and
+/// return the wrapped ceremony `payload`.
+pub fn verify_challenge_token(purpose: &str, token: &str) -> Result<String> {
+    let secret = SESSION_SECRET
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
+    let mut parts = token.split('.');
+    let payload_b64 = parts.next().unwrap_or_default();
+    let sig_b64 = parts.next().unwrap_or_default();
+    if payload_b64.is_empty() || sig_b64.is_empty() || parts.next().is_some() {
+        bail!("Malformed challenge token");
+    }
+    let expected_sig = BASE64_URL_SAFE_NO_PAD.decode(sig_b64.as_bytes())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(payload_b64.as_bytes());
+    mac.verify_slice(&expected_sig)
+        .map_err(|_| anyhow::anyhow!("Invalid challenge signature"))?;
+    let claims: ChallengeClaims =
+        serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(payload_b64.as_bytes())?)?;
+    if claims.purpose != purpose {
+        bail!("Challenge purpose mismatch");
+    }
+    if now_secs() >= claims.exp {
+        bail!("Challenge token expired");
+    }
+    Ok(claims.payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_token_roundtrip() {
+        init_session_secret(b"unit-test-secret".to_vec());
+        let token =
+            issue_challenge_token("webauthn-reg", "{\"k\":1}", DEFAULT_CHALLENGE_TTL_SECS).unwrap();
+        assert_eq!(
+            verify_challenge_token("webauthn-reg", &token).unwrap(),
+            "{\"k\":1}"
+        );
+        // Wrong purpose is rejected.
+        assert!(verify_challenge_token("webauthn-auth", &token).is_err());
+    }
 
     #[test]
     fn state_token_roundtrip() {

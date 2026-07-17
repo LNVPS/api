@@ -9,6 +9,7 @@ mod oauth;
 mod referral;
 mod routes;
 mod subscriptions;
+mod webauthn;
 mod webhook;
 
 use crate::settings::Settings;
@@ -29,6 +30,7 @@ pub use routes::routes as main_router;
 use serde::Deserialize;
 use std::sync::Arc;
 pub use subscriptions::router as subscriptions_router;
+pub use webauthn::router as webauthn_router;
 pub use webhook::router as webhook_router;
 
 #[derive(Deserialize)]

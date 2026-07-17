@@ -105,6 +105,60 @@ On first OAuth login the provider's email is synced into the account (and marked
 verified when the provider asserts it), so `AccountInfo.email` /
 `email_verified` may already be populated for these users.
 
+### Passkey (WebAuthn) login
+
+Passwordless login with a platform passkey (Face ID / Touch ID / Windows Hello)
+or a security key. Like OAuth, a passkey **is** the account (`account_type` is
+`oauth`-style synthetic — see the note below) and login yields the same
+`Bearer` session token. Unlike OAuth this is a **`fetch`/XHR flow** driven by the
+browser's `navigator.credentials` API, not a redirect.
+
+Each ceremony is two calls — `start` returns a challenge plus an opaque signed
+`state`; you run the WebAuthn browser API, then post the result back with that
+same `state` to `finish`, which returns the session token.
+
+**Register (new account):**
+
+```typescript
+import { startRegistration } from '@simplewebauthn/browser';
+
+// 1. begin
+const start = await fetch(`${API}/api/v1/webauthn/register/start`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name: 'my device' }), // optional label
+}).then(r => r.json());
+// start.data = { challenge, state }
+
+// 2. run the authenticator (challenge.publicKey per the WebAuthn spec)
+const credential = await startRegistration(start.data.challenge.publicKey);
+
+// 3. finish -> session token
+const done = await fetch(`${API}/api/v1/webauthn/register/finish`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ state: start.data.state, credential }),
+}).then(r => r.json());
+localStorage.setItem('session_token', done.data.token); // { token, token_type, expires_in }
+```
+
+**Login (existing passkey, usernameless):**
+
+```typescript
+import { startAuthentication } from '@simplewebauthn/browser';
+
+const start = await fetch(`${API}/api/v1/webauthn/login/start`, { method: 'POST' })
+  .then(r => r.json()); // { challenge, state }
+const credential = await startAuthentication(start.data.challenge.publicKey);
+const done = await fetch(`${API}/api/v1/webauthn/login/finish`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ state: start.data.state, credential }),
+}).then(r => r.json());
+localStorage.setItem('session_token', done.data.token);
+```
+
+The signed `state` must be round-tripped unchanged and expires after ~5 minutes.
+Passkey accounts are Nostr-less exactly like OAuth accounts — hide npub / NIP-17
+UI for them (they are reported with `account_type` distinct from `nostr`).
+
 ## Core Data Types
 
 ### User Account
@@ -113,7 +167,7 @@ verified when the provider asserts it), so `AccountInfo.email` /
 interface AccountInfo {
   email?: string;
   email_verified?: boolean; // Present when email is set; true if email has been verified
-  account_type: 'nostr' | 'oauth'; // Read-only. 'oauth' accounts have no usable Nostr key — hide npub / NIP-17 UI. Enabling contact_nip17 for an 'oauth' account is rejected.
+  account_type: 'nostr' | 'oauth' | 'webauthn'; // Read-only. Only 'nostr' has a usable Nostr key — hide npub / NIP-17 UI for 'oauth' and 'webauthn'. Enabling contact_nip17 for a non-'nostr' account is rejected.
   contact_nip17: boolean;
   contact_email: boolean;
   country_code?: string; // ISO 3166-1 alpha-3 country code
@@ -432,6 +486,58 @@ interface VmUpgradeQuote {
 ```
 
 ## API Endpoints
+
+### Passkey (WebAuthn) Authentication
+
+Unauthenticated `fetch` endpoints (JSON in/out) for passwordless passkey login.
+See [Authentication](#authentication-types) for the full flow and browser
+examples. Each ceremony is a `start` then `finish` pair; the opaque signed
+`state` from `start` must be posted back to `finish` unchanged.
+
+#### Register Start
+- **POST** `/api/v1/webauthn/register/start`
+- **Auth**: None
+- **Body**: `{ name?: string }` (optional device label)
+- **Response**: `{ challenge: PublicKeyCredentialCreationOptions, state: string }`
+
+#### Register Finish
+- **POST** `/api/v1/webauthn/register/finish`
+- **Auth**: None
+- **Body**: `{ state: string, credential: RegisterPublicKeyCredential, name?: string }`
+- **Response**: `{ token: string, token_type: "Bearer", expires_in: number }` (creates the account)
+
+#### Login Start
+- **POST** `/api/v1/webauthn/login/start`
+- **Auth**: None
+- **Body**: none (usernameless / discoverable)
+- **Response**: `{ challenge: PublicKeyCredentialRequestOptions, state: string }`
+
+#### Login Finish
+- **POST** `/api/v1/webauthn/login/finish`
+- **Auth**: None
+- **Body**: `{ state: string, credential: PublicKeyCredential }`
+- **Response**: `{ token: string, token_type: "Bearer", expires_in: number }`
+
+#### Manage passkeys on the current account
+
+These endpoints are **authenticated** (any scheme — a Nostr, OAuth or passkey
+user can add passkeys to their own account). A passkey added here is stored
+against the current account, so a later discoverable login with it resolves back
+to that same account (its session token then carries the account's real
+identity — e.g. a Nostr user's npub still works).
+
+- **GET** `/api/v1/webauthn/credentials` — list this account's passkeys.
+  Response: `Array<{ id: number, name?: string, created: string, last_used?: string }>`
+- **POST** `/api/v1/webauthn/credentials/start` — begin adding a passkey.
+  Body `{ name?: string }`; Response `{ challenge, state }` (already excludes
+  credentials registered to this account). Run `startRegistration(...)` then:
+- **POST** `/api/v1/webauthn/credentials/finish` — Body
+  `{ state, credential, name? }`; Response is the created
+  `{ id, name?, created, last_used? }` (no session token — you are already
+  logged in).
+- **DELETE** `/api/v1/webauthn/credentials/{id}` — remove a passkey. A pure
+  passkey account (`account_type: "webauthn"`) cannot delete its **only**
+  credential (that would lock the account out).
 
 ### OAuth Authentication
 

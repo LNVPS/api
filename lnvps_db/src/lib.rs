@@ -56,6 +56,27 @@ pub fn oauth_pubkey(provider: &str, subject: &str) -> [u8; 32] {
     out
 }
 
+/// Derive the synthetic 32-byte identity used as the `pubkey` for a passwordless
+/// WebAuthn/passkey account: `SHA-256("webauthn:{user_handle}")`.
+///
+/// The `user_handle` is the stable per-account UUID minted at registration and
+/// stored in the credential (returned by the authenticator during discoverable
+/// login). Like [`oauth_pubkey`] the result is an opaque identity, NOT a real
+/// Nostr key; such accounts are stored with [`model::AccountType::Webauthn`].
+pub fn webauthn_pubkey(user_handle: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // NUL separator (not the `:` used by `oauth_pubkey`) so the webauthn and
+    // oauth identity namespaces are provably disjoint: an OAuth provider tag
+    // cannot contain a NUL byte, so no `(provider, subject)` can collide here.
+    hasher.update(b"webauthn\0");
+    hasher.update(user_handle.as_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("sqlx: {0}")]
@@ -126,6 +147,28 @@ pub trait LNVpsDbBase: Send + Sync {
     /// [`model::AccountType::OAuth`] and do not opt into NIP-17 DMs (their
     /// `pubkey` is not a real Nostr key).
     async fn upsert_oauth_user(&self, pubkey: &[u8; 32]) -> DbResult<u64>;
+
+    /// Insert/Fetch a passwordless WebAuthn/passkey user by their synthetic
+    /// identity (see [`webauthn_pubkey`]). Created accounts are marked
+    /// [`model::AccountType::Webauthn`] and do not opt into NIP-17 DMs.
+    async fn upsert_webauthn_user(&self, pubkey: &[u8; 32]) -> DbResult<u64>;
+
+    /// Store a newly-registered WebAuthn credential; returns the new row id.
+    async fn insert_webauthn_credential(&self, cred: &WebauthnCredential) -> DbResult<u64>;
+
+    /// List all WebAuthn credentials belonging to a user.
+    async fn list_webauthn_credentials(&self, user_id: u64) -> DbResult<Vec<WebauthnCredential>>;
+
+    /// Look up a single WebAuthn credential by its raw credential id.
+    async fn get_webauthn_credential(&self, cred_id: &[u8]) -> DbResult<WebauthnCredential>;
+
+    /// Persist an updated passkey blob (e.g. bumped signature counter) and mark
+    /// the credential as just used.
+    async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()>;
+
+    /// Delete a WebAuthn credential owned by `user_id`. Scoped by user so a
+    /// caller can never remove another account's credential.
+    async fn delete_webauthn_credential(&self, id: u64, user_id: u64) -> DbResult<()>;
 
     /// Get a user by id
     async fn get_user(&self, id: u64) -> DbResult<User>;
@@ -902,5 +945,27 @@ mod tests {
         assert!(DbError::SqlxError(sqlx::Error::RowNotFound).is_row_not_found());
         assert!(!DbError::Unknown.is_row_not_found());
         assert!(!DbError::SqlxError(sqlx::Error::PoolClosed).is_row_not_found());
+    }
+
+    #[test]
+    fn test_webauthn_pubkey_stable_and_distinct() {
+        // Deterministic for the same handle.
+        let a = webauthn_pubkey("11111111-2222-3333-4444-555555555555");
+        let b = webauthn_pubkey("11111111-2222-3333-4444-555555555555");
+        assert_eq!(a, b);
+        // Different handles differ.
+        assert_ne!(a, webauthn_pubkey("00000000-0000-0000-0000-000000000000"));
+        // Namespaced away from oauth identities sharing the same string.
+        assert_ne!(
+            a,
+            oauth_pubkey("webauthn", "11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn test_account_type_display() {
+        assert_eq!(model::AccountType::Nostr.to_string(), "nostr");
+        assert_eq!(model::AccountType::OAuth.to_string(), "oauth");
+        assert_eq!(model::AccountType::Webauthn.to_string(), "webauthn");
     }
 }
