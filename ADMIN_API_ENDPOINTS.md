@@ -427,9 +427,18 @@ Body (optional):
 
 ```json
 {
-  "reason": "string"
+  "reason": "string",
+  "purge": false
 }
 ```
+
+- `reason` — optional admin reason recorded in the VM history audit trail.
+- `purge` — optional. When `true`, permanently deletes the VM and **all** related
+  records (history, firewall rules, IP assignments, and its subscription, line
+  items and payment history) instead of soft-deleting. Requires the
+  `super_admin` role — non-super-admins receive `403`. Intended for removing
+  test VMs. VMs that have never been paid are always purged regardless of this
+  flag.
 
 Response:
 

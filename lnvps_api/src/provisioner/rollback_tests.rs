@@ -147,7 +147,7 @@ mod tests {
         );
 
         // Now clean up and verify cleanup works (this tests the delete_vm rollback)
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         // Verify ARP entry for this VM was removed
         let cleanup_arp_entries = router.list_arp_entry().await?;
@@ -203,7 +203,7 @@ mod tests {
         );
 
         // Delete the VM to trigger cleanup (simulating rollback scenario)
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         // Verify IP assignments are marked deleted
         let ips_after = db.list_vm_ip_assignments(vm.id).await?;
@@ -290,7 +290,7 @@ mod tests {
         );
 
         // Delete the VM
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         // Verify DNS records are removed (count should be back to initial or less)
         {
@@ -358,7 +358,7 @@ mod tests {
         }
 
         // Delete VM
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         // After delete - IPs should be soft-deleted (marked deleted=true)
         let ips_after_delete = db.list_vm_ip_assignments(vm.id).await?;
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(ips.len(), 2, "Should still have exactly 2 IP assignments");
 
         // Cleanup
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         Ok(())
     }
@@ -448,7 +448,7 @@ mod tests {
         );
 
         // Delete and verify cleanup
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         // The ARP entry with this MAC should be gone
         let router = MockRouter::new();
@@ -619,7 +619,7 @@ mod tests {
         assert!(arp_before.iter().any(|e| e.mac_address == mac_address));
 
         // Delete the VM
-        provisioner.delete_vm(vm_id).await?;
+        provisioner.delete_vm(vm_id, false).await?;
 
         // Verify complete cleanup:
         // VM should be soft-deleted (deleted = true), matching production MySQL behavior
@@ -784,7 +784,7 @@ mod tests {
         assert!(!ips_before.is_empty(), "Should have IP assignments");
 
         // Delete should work
-        let result = provisioner.delete_vm(vm_id).await;
+        let result = provisioner.delete_vm(vm_id, false).await;
         assert!(result.is_ok(), "Delete should succeed");
 
         // Verify VM is soft-deleted (matching production MySQL behavior)
@@ -796,6 +796,49 @@ mod tests {
         for ip in ips_after {
             assert!(ip.deleted, "IP should be marked as deleted");
         }
+
+        Ok(())
+    }
+
+    /// A purging delete (`purge = true`, used for never-paid VMs and super-admin
+    /// forced deletions) removes the VM row entirely and hard-deletes its IP
+    /// assignments instead of soft-deleting them.
+    #[tokio::test]
+    async fn test_delete_vm_purge_removes_vm_row() -> Result<()> {
+        clear_mock_state().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        const MOCK_RATE: f32 = 69_420.0;
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+
+        let pipeline = provisioner.spawn_vm_pipeline(vm_id).await?;
+        pipeline.execute().await?;
+        assert!(!db.list_vm_ip_assignments(vm_id).await?.is_empty());
+
+        // Purge the VM.
+        provisioner.delete_vm(vm_id, true).await?;
+
+        // The VM row is gone entirely (not just soft-deleted).
+        assert!(
+            db.get_vm(vm_id).await.is_err(),
+            "VM row should be hard-deleted"
+        );
+        // IP assignments are hard-deleted too.
+        assert!(
+            db.list_vm_ip_assignments(vm_id).await?.is_empty(),
+            "IP assignments should be hard-deleted"
+        );
 
         Ok(())
     }

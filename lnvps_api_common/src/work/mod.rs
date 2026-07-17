@@ -63,6 +63,12 @@ pub enum WorkJob {
         vm_id: u64,
         reason: Option<String>,
         admin_user_id: Option<u64>,
+        /// Permanently purge the VM and all related records (history,
+        /// payments, subscription) from the database instead of soft-deleting.
+        /// Reserved for super-admin forced deletions; never-paid VMs are always
+        /// purged regardless of this flag.
+        #[serde(default)]
+        purge: bool,
     },
     /// Start a VM
     StartVm {

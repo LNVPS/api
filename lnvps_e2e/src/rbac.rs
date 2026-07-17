@@ -193,6 +193,24 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    /// A vm_manager has VM Delete permission but is not a super_admin, so it
+    /// cannot request a permanent purge (`purge = true`). The purge
+    /// authorization is checked before the VM lookup, so a non-existent VM id
+    /// still yields 403 rather than 404.
+    #[tokio::test]
+    async fn test_vm_manager_cannot_purge_vm() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(vm_manager_keys().clone());
+        let body = serde_json::json!({ "purge": true });
+        let resp = client
+            .delete_auth_body("/api/admin/v1/vms/999999999", &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("Only super admins can permanently purge"));
+    }
+
     // ========================================================================
     // super_admin role: full access
     // ========================================================================

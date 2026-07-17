@@ -389,6 +389,11 @@ async fn admin_stop_vm(
 #[serde(default)]
 struct AdminDeleteVmRequest {
     reason: Option<String>,
+    /// Permanently purge the VM and all related records (history, payments,
+    /// subscription) from the database, even if it has payment history.
+    /// Requires the `super_admin` role. Never-paid VMs are always purged
+    /// regardless of this flag.
+    purge: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -415,6 +420,16 @@ async fn admin_delete_vm(
     // Check permission
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Delete)?;
 
+    // Purging a VM with payment history is destructive and irreversible, so it
+    // is restricted to super-admins. Never-paid VMs are purged automatically by
+    // the worker regardless of this flag. Authorize before looking up the VM.
+    let purge = req.purge.unwrap_or(false);
+    if purge && !auth.is_super_admin(&this.db).await? {
+        return Err(ApiError::forbidden(
+            "Only super admins can permanently purge a VM",
+        ));
+    }
+
     // Verify VM exists
     let vm = this.db.get_vm(id).await?;
 
@@ -427,6 +442,7 @@ async fn admin_delete_vm(
         vm_id: id,
         reason: req.reason.clone(),
         admin_user_id: Some(auth.user_id),
+        purge,
     };
 
     match this.work_commander.send(delete_job).await {

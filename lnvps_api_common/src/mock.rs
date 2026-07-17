@@ -1111,6 +1111,41 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn hard_delete_vm(&self, vm_id: u64) -> DbResult<()> {
+        // Resolve the subscription for this VM (via its line item) before removal.
+        let subscription_id = {
+            let vms = self.vms.lock().await;
+            let line_items = self.subscription_line_items.lock().await;
+            vms.get(&vm_id)
+                .and_then(|vm| line_items.get(&vm.subscription_line_item_id))
+                .map(|li| li.subscription_id)
+        };
+
+        self.vms.lock().await.remove(&vm_id);
+        self.vm_history.lock().await.retain(|_, h| h.vm_id != vm_id);
+        self.firewall_rules
+            .lock()
+            .await
+            .retain(|_, r| r.vm_id != vm_id);
+        self.ip_assignments
+            .lock()
+            .await
+            .retain(|_, a| a.vm_id != vm_id);
+
+        if let Some(subscription_id) = subscription_id {
+            self.subscription_payments
+                .lock()
+                .await
+                .retain(|p| p.subscription_id != subscription_id);
+            self.subscription_line_items
+                .lock()
+                .await
+                .retain(|_, li| li.subscription_id != subscription_id);
+            self.subscriptions.lock().await.remove(&subscription_id);
+        }
+        Ok(())
+    }
+
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(v) = vms.get_mut(&vm.id) {
@@ -4024,6 +4059,97 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
         }
+    }
+
+    /// hard_delete_vm removes the VM and every record that references it:
+    /// history, firewall rules, IP assignments, and the VM's subscription along
+    /// with its line items and payment history.
+    #[tokio::test]
+    async fn test_hard_delete_vm_purges_related_records() {
+        use lnvps_db::{
+            VmFirewallDirection, VmFirewallProtocol, VmFirewallRule, VmFirewallRuleAction,
+            VmHistory, VmHistoryActionType, VmIpAssignment,
+        };
+
+        let db = MockDb::default();
+        // subscription_payment inserts validate the owning user exists.
+        db.upsert_user(&[1u8; 32]).await.unwrap();
+
+        // The default MockDb has subscription 1 with Vps line item 1.
+        let vm_id = db
+            .insert_vm(&Vm {
+                ssh_key_id: None,
+                ..MockDb::mock_vm()
+            })
+            .await
+            .unwrap();
+        let sub_id = db.get_subscription_by_line_item_id(1).await.unwrap().id;
+
+        // Related records referencing the VM.
+        db.insert_vm_ip_assignment(&VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id: 1,
+            ip: "10.0.0.5".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.insert_vm_firewall_rule(&VmFirewallRule {
+            id: 0,
+            vm_id,
+            priority: 1,
+            direction: VmFirewallDirection::Inbound,
+            protocol: VmFirewallProtocol::Tcp,
+            action: VmFirewallRuleAction::Accept,
+            src_cidr: None,
+            dst_port_start: Some(22),
+            dst_port_end: None,
+            enabled: true,
+            created: Utc::now(),
+            updated: Utc::now(),
+        })
+        .await
+        .unwrap();
+        db.insert_vm_history(&VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::Created,
+            timestamp: Utc::now(),
+            initiated_by_user: None,
+            previous_state: None,
+            new_state: None,
+            metadata: None,
+            description: None,
+        })
+        .await
+        .unwrap();
+        db.insert_subscription_payment(&make_payment(sub_id, Some(3600)))
+            .await
+            .unwrap();
+
+        // Sanity: everything is present before the purge.
+        assert!(db.get_vm(vm_id).await.is_ok());
+        assert_eq!(db.list_vm_ip_assignments(vm_id).await.unwrap().len(), 1);
+        assert_eq!(db.list_vm_firewall_rules(vm_id).await.unwrap().len(), 1);
+        assert_eq!(db.list_vm_history(vm_id).await.unwrap().len(), 1);
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+
+        db.hard_delete_vm(vm_id).await.unwrap();
+
+        // The VM and every related record are gone.
+        assert!(db.get_vm(vm_id).await.is_err());
+        assert!(db.list_vm_ip_assignments(vm_id).await.unwrap().is_empty());
+        assert!(db.list_vm_firewall_rules(vm_id).await.unwrap().is_empty());
+        assert!(db.list_vm_history(vm_id).await.unwrap().is_empty());
+        assert!(db.get_subscription(sub_id).await.is_err());
+        assert!(
+            db.list_subscription_line_items(sub_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.subscription_payments.lock().await.is_empty());
     }
 
     /// Firewall rule CRUD via the mock DB.
