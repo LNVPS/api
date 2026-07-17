@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **2026-07-18** - Referral commission rate not visible to referrers (user API)
+  - `GET`/`POST`/`PATCH /api/v1/referral` only returned `referral_rate`, the per-referrer override, which is `null` for most referrers (it's admin-set). A referrer with an unset override therefore saw no commission rate even though the default company rate applied. The response now also includes `effective_referral_rate` (whole %): the rate that currently applies — the override when set, otherwise the default (primary) company's `referral_rate`.
+
 ### Added
 
 - **2026-07-18** - Admin referral code renaming

@@ -39,6 +39,12 @@ pub struct ApiReferral {
     /// VM's first payment. `null` means the referred VM's company default rate
     /// (`company.referral_rate`) applies instead.
     pub referral_rate: Option<f32>,
+    /// The commission rate (whole %) that currently applies to this referrer:
+    /// the per-referrer `referral_rate` override when set, otherwise the default
+    /// company's `referral_rate`. Note the rate actually paid on a given
+    /// referral is resolved against the referred VM's own company, so this is
+    /// the headline/default rate for display.
+    pub effective_referral_rate: f32,
     /// When the referral was created
     pub created: chrono::DateTime<Utc>,
 }
@@ -49,10 +55,28 @@ impl From<Referral> for ApiReferral {
             code: r.code,
             lightning_address: r.lightning_address,
             mode: r.mode.to_string(),
+            // Fallback until resolved against the default company rate by the
+            // handler (see `resolve_effective_rate`).
+            effective_referral_rate: r.referral_rate.unwrap_or(0.0),
             referral_rate: r.referral_rate,
             created: r.created,
         }
     }
+}
+
+/// Resolve the commission rate that currently applies to a referrer: their
+/// per-referrer override if set, otherwise the default (primary, lowest-id)
+/// company's `referral_rate`.
+async fn resolve_effective_rate(db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>, referral: &Referral) -> f32 {
+    if let Some(r) = referral.referral_rate {
+        return r;
+    }
+    db.list_companies()
+        .await
+        .ok()
+        .and_then(|c| c.into_iter().next())
+        .map(|c| c.referral_rate)
+        .unwrap_or(0.0)
 }
 
 /// Per-currency earned amount from referrals
@@ -111,6 +135,7 @@ pub struct ApiReferralState {
 impl ApiReferralState {
     fn build(
         referral: Referral,
+        effective_rate: f32,
         usage: Vec<ReferralCostUsage>,
         payouts: Vec<ReferralPayout>,
         referrals_failed: u64,
@@ -126,10 +151,12 @@ impl ApiReferralState {
             .collect();
         earned.sort_by(|a, b| a.currency.cmp(&b.currency));
 
+        let mut referral: ApiReferral = referral.into();
+        referral.effective_referral_rate = effective_rate;
         Self {
             referrals_success: usage.len() as u64,
             referrals_failed,
-            referral: referral.into(),
+            referral,
             earned,
             payouts: payouts.into_iter().map(Into::into).collect(),
         }
@@ -253,8 +280,10 @@ async fn v1_get_referral(
         this.db.count_failed_referrals(&referral.code),
     )?;
 
+    let effective_rate = resolve_effective_rate(&this.db, &referral).await;
     ApiData::ok(ApiReferralState::build(
         referral,
+        effective_rate,
         usage,
         payouts,
         referrals_failed,
@@ -313,7 +342,10 @@ async fn v1_signup_referral(
     let id = this.db.insert_referral(&referral).await?;
     let created = Referral { id, ..referral };
 
-    ApiData::ok(created.into())
+    let effective_rate = resolve_effective_rate(&this.db, &created).await;
+    let mut api: ApiReferral = created.into();
+    api.effective_referral_rate = effective_rate;
+    ApiData::ok(api)
 }
 
 /// Update referral payout options
@@ -351,7 +383,10 @@ async fn v1_update_referral(
     // them. Signup still requires a valid method up-front.
     this.db.update_referral(&referral).await?;
 
-    ApiData::ok(referral.into())
+    let effective_rate = resolve_effective_rate(&this.db, &referral).await;
+    let mut api: ApiReferral = referral.into();
+    api.effective_referral_rate = effective_rate;
+    ApiData::ok(api)
 }
 
 /// Leave the referral program.
@@ -423,6 +458,41 @@ mod tests {
     fn test_generate_referral_code_length() {
         let code = generate_referral_code();
         assert_eq!(code.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_rate_uses_override() {
+        use lnvps_api_common::MockDb;
+        use std::sync::Arc;
+
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::default());
+        let referral = Referral {
+            referral_rate: Some(12.5),
+            ..Default::default()
+        };
+        // Override is set, so the company default is ignored.
+        assert_eq!(resolve_effective_rate(&db, &referral).await, 12.5);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_effective_rate_falls_back_to_company_default() {
+        use lnvps_api_common::MockDb;
+        use std::sync::Arc;
+
+        let mock = MockDb::default();
+        // Give the default (primary) company a 33% referral rate.
+        {
+            let mut companies = mock.companies.lock().await;
+            if let Some(c) = companies.get_mut(&1) {
+                c.referral_rate = 33.0;
+            }
+        }
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(mock);
+        let referral = Referral {
+            referral_rate: None,
+            ..Default::default()
+        };
+        assert_eq!(resolve_effective_rate(&db, &referral).await, 33.0);
     }
 
     #[test]

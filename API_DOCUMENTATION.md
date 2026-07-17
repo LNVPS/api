@@ -848,6 +848,8 @@ interface Referral {
   code: string;                    // 8-character base63 referral code to share
   lightning_address?: string;      // Lightning address for payouts
   use_nwc: boolean;                // Whether to use NWC for payouts
+  referral_rate: number | null;    // Per-referrer commission override (whole %); null = use company default (admin-controlled)
+  effective_referral_rate: number; // The rate that currently applies (whole %): the override if set, else the default company's referral_rate
   created: string;                 // ISO 8601 datetime
 }
 
