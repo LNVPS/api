@@ -518,6 +518,27 @@ examples. Each ceremony is a `start` then `finish` pair; the opaque signed
 - **Body**: `{ state: string, credential: PublicKeyCredential }`
 - **Response**: `{ token: string, token_type: "Bearer", expires_in: number }`
 
+#### Manage passkeys on the current account
+
+These endpoints are **authenticated** (any scheme — a Nostr, OAuth or passkey
+user can add passkeys to their own account). A passkey added here is stored
+against the current account, so a later discoverable login with it resolves back
+to that same account (its session token then carries the account's real
+identity — e.g. a Nostr user's npub still works).
+
+- **GET** `/api/v1/webauthn/credentials` — list this account's passkeys.
+  Response: `Array<{ id: number, name?: string, created: string, last_used?: string }>`
+- **POST** `/api/v1/webauthn/credentials/start` — begin adding a passkey.
+  Body `{ name?: string }`; Response `{ challenge, state }` (already excludes
+  credentials registered to this account). Run `startRegistration(...)` then:
+- **POST** `/api/v1/webauthn/credentials/finish` — Body
+  `{ state, credential, name? }`; Response is the created
+  `{ id, name?, created, last_used? }` (no session token — you are already
+  logged in).
+- **DELETE** `/api/v1/webauthn/credentials/{id}` — remove a passkey. A pure
+  passkey account (`account_type: "webauthn"`) cannot delete its **only**
+  credential (that would lock the account out).
+
 ### OAuth Authentication
 
 These endpoints are **unauthenticated** and drive full-page browser navigation

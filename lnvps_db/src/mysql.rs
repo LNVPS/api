@@ -143,6 +143,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn delete_webauthn_credential(&self, id: u64, user_id: u64) -> DbResult<()> {
+        sqlx::query("delete from user_webauthn_credentials where id=? and user_id=?")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn get_user(&self, id: u64) -> DbResult<User> {
         Ok(sqlx::query_as("select * from users where id=?")
             .bind(id)

@@ -18,18 +18,19 @@
 //! remaining tamper-proof against the client.
 
 use axum::Router;
-use axum::extract::{Json, State};
-use axum::routing::post;
+use axum::extract::{Json, Path, State};
+use axum::routing::{delete, get, post};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use lnvps_api_common::{
-    ApiData, ApiError, ApiResult, DEFAULT_CHALLENGE_TTL_SECS, issue_challenge_token,
+    ApiData, ApiError, ApiResult, DEFAULT_CHALLENGE_TTL_SECS, Nip98Auth, issue_challenge_token,
     issue_session_token, verify_challenge_token,
 };
 use lnvps_db::{WebauthnCredential, webauthn_pubkey};
 
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, DiscoverableAuthentication, DiscoverableKey, Passkey,
+    CreationChallengeResponse, CredentialID, DiscoverableAuthentication, DiscoverableKey, Passkey,
     PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
     RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder,
 };
@@ -39,6 +40,8 @@ use crate::settings::WebauthnConfig;
 
 const PURPOSE_REG: &str = "webauthn-reg";
 const PURPOSE_AUTH: &str = "webauthn-auth";
+/// Registration ceremony for adding a passkey to an already-authenticated account.
+const PURPOSE_CRED_REG: &str = "webauthn-cred-reg";
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -46,6 +49,20 @@ pub fn router() -> Router<RouterState> {
         .route("/api/v1/webauthn/register/finish", post(register_finish))
         .route("/api/v1/webauthn/login/start", post(login_start))
         .route("/api/v1/webauthn/login/finish", post(login_finish))
+        // Manage passkeys on the authenticated account.
+        .route("/api/v1/webauthn/credentials", get(list_credentials))
+        .route(
+            "/api/v1/webauthn/credentials/start",
+            post(add_credential_start),
+        )
+        .route(
+            "/api/v1/webauthn/credentials/finish",
+            post(add_credential_finish),
+        )
+        .route(
+            "/api/v1/webauthn/credentials/{id}",
+            delete(delete_credential),
+        )
 }
 
 /// Session token handed back after a successful passkey register/login. Same
@@ -106,6 +123,36 @@ struct LoginFinishRequest {
     state: String,
     /// The assertion produced by `navigator.credentials.get`.
     credential: PublicKeyCredential,
+}
+
+/// Public view of a registered passkey on the authenticated account.
+#[derive(Serialize)]
+pub struct WebauthnCredentialInfo {
+    pub id: u64,
+    pub name: Option<String>,
+    pub created: DateTime<Utc>,
+    pub last_used: Option<DateTime<Utc>>,
+}
+
+impl From<&WebauthnCredential> for WebauthnCredentialInfo {
+    fn from(c: &WebauthnCredential) -> Self {
+        WebauthnCredentialInfo {
+            id: c.id,
+            name: c.name.clone(),
+            created: c.created,
+            last_used: c.last_used,
+        }
+    }
+}
+
+/// Stable per-account WebAuthn user handle so every passkey a user adds to their
+/// account shares one identity in the authenticator. Derived from the account's
+/// pubkey; login still resolves the account by credential id, so this value is
+/// not security-critical.
+fn account_handle(pubkey: &[u8; 32]) -> Uuid {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&pubkey[..16]);
+    Uuid::from_bytes(b)
 }
 
 /// Build a `Webauthn` instance from the configured relying-party identity.
@@ -291,6 +338,130 @@ async fn login_finish(
     issue_token(&pubkey, used.user_id, cfg.session_ttl)
 }
 
+/// List the passkeys registered to the authenticated account.
+async fn list_credentials(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<Vec<WebauthnCredentialInfo>> {
+    // Passkeys require WebAuthn to be configured at all.
+    webauthn_cfg(&this)?;
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let creds = this.db.list_webauthn_credentials(uid).await?;
+    ApiData::ok(creds.iter().map(WebauthnCredentialInfo::from).collect())
+}
+
+/// Begin adding a passkey to the authenticated account (any account type).
+async fn add_credential_start(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    body: Option<Json<RegisterStartRequest>>,
+) -> ApiResult<RegisterStartResponse> {
+    let cfg = webauthn_cfg(&this)?;
+    let webauthn = build_webauthn(&cfg)?;
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+
+    let name = body
+        .and_then(|b| b.0.name)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "LNVPS user".to_string());
+
+    // Exclude already-registered credentials so the same authenticator cannot be
+    // enrolled twice on this account.
+    let existing = this.db.list_webauthn_credentials(uid).await?;
+    let exclude: Vec<CredentialID> = existing
+        .iter()
+        .map(|c| CredentialID::from(c.cred_id.clone()))
+        .collect();
+
+    let handle = account_handle(&auth.pubkey());
+    let (ccr, reg) = webauthn
+        .start_passkey_registration(handle, &name, &name, Some(exclude))
+        .map_err(|e| ApiError::internal(format!("Failed to start registration: {}", e)))?;
+
+    let token = issue_challenge_token(
+        PURPOSE_CRED_REG,
+        &serde_json::to_string(&reg).map_err(ApiError::internal)?,
+        DEFAULT_CHALLENGE_TTL_SECS,
+    )
+    .map_err(|e| ApiError::internal(format!("Failed to create challenge: {}", e)))?;
+
+    ApiData::ok(RegisterStartResponse {
+        challenge: ccr,
+        state: token,
+    })
+}
+
+/// Complete adding a passkey to the authenticated account and store it.
+async fn add_credential_finish(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Json(req): Json<RegisterFinishRequest>,
+) -> ApiResult<WebauthnCredentialInfo> {
+    let cfg = webauthn_cfg(&this)?;
+    let webauthn = build_webauthn(&cfg)?;
+
+    let state_json = verify_challenge_token(PURPOSE_CRED_REG, &req.state)
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid registration state: {}", e)))?;
+    let reg: PasskeyRegistration = serde_json::from_str(&state_json).map_err(ApiError::internal)?;
+
+    let passkey = webauthn
+        .finish_passkey_registration(&req.credential, &reg)
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Registration failed: {}", e)))?;
+
+    let cred_id = passkey.cred_id().as_ref().to_vec();
+    if this.db.get_webauthn_credential(&cred_id).await.is_ok() {
+        return Err(ApiError::from(anyhow::anyhow!(
+            "Credential already registered"
+        )));
+    }
+
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let passkey_json = serde_json::to_string(&passkey).map_err(ApiError::internal)?;
+    let id = this
+        .db
+        .insert_webauthn_credential(&WebauthnCredential {
+            user_id: uid,
+            cred_id,
+            passkey: passkey_json,
+            name: req.name.filter(|s| !s.trim().is_empty()),
+            ..Default::default()
+        })
+        .await?;
+
+    let created = this
+        .db
+        .list_webauthn_credentials(uid)
+        .await?
+        .iter()
+        .find(|c| c.id == id)
+        .map(WebauthnCredentialInfo::from)
+        .ok_or_else(|| ApiError::internal("Stored credential not found"))?;
+    ApiData::ok(created)
+}
+
+/// Remove a passkey from the authenticated account. A pure passkey account may
+/// not delete its only credential (that would lock the user out permanently).
+async fn delete_credential(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    webauthn_cfg(&this)?;
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let user = this.db.get_user(uid).await?;
+    let creds = this.db.list_webauthn_credentials(uid).await?;
+
+    if !creds.iter().any(|c| c.id == id) {
+        return ApiData::err("Credential not found");
+    }
+    if user.account_type == lnvps_db::AccountType::Webauthn && creds.len() <= 1 {
+        return ApiData::err("Cannot remove your only passkey");
+    }
+
+    this.db.delete_webauthn_credential(id, uid).await?;
+    ApiData::ok(())
+}
+
 /// Issue the session JWT response.
 fn issue_token(pubkey: &[u8; 32], uid: u64, ttl: u64) -> ApiResult<WebauthnTokenResponse> {
     let token = issue_session_token(pubkey, uid, ttl)
@@ -371,5 +542,54 @@ mod tests {
             db.get_webauthn_credential(&cred_id).await.unwrap().passkey,
             "{\"v\":2}"
         );
+    }
+
+    /// A per-account handle is stable for the same pubkey and differs across
+    /// accounts.
+    #[test]
+    fn account_handle_is_stable_per_account() {
+        let a = webauthn_pubkey("handle-a");
+        let b = webauthn_pubkey("handle-b");
+        assert_eq!(account_handle(&a), account_handle(&a));
+        assert_ne!(account_handle(&a), account_handle(&b));
+    }
+
+    /// Deleting a credential is scoped to its owner and removes only that row.
+    #[tokio::test]
+    async fn delete_credential_is_owner_scoped() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let uid = db
+            .upsert_webauthn_user(&webauthn_pubkey("owner"))
+            .await
+            .unwrap();
+        let other = db
+            .upsert_webauthn_user(&webauthn_pubkey("intruder"))
+            .await
+            .unwrap();
+
+        let mk = |user_id: u64, cid: Vec<u8>| WebauthnCredential {
+            user_id,
+            cred_id: cid,
+            passkey: "{}".to_string(),
+            ..Default::default()
+        };
+        let id1 = db
+            .insert_webauthn_credential(&mk(uid, vec![1]))
+            .await
+            .unwrap();
+        let id2 = db
+            .insert_webauthn_credential(&mk(uid, vec![2]))
+            .await
+            .unwrap();
+
+        // Another account cannot delete our credential.
+        db.delete_webauthn_credential(id1, other).await.unwrap();
+        assert_eq!(db.list_webauthn_credentials(uid).await.unwrap().len(), 2);
+
+        // Owner can delete their own; only that row is removed.
+        db.delete_webauthn_credential(id1, uid).await.unwrap();
+        let left = db.list_webauthn_credentials(uid).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, id2);
     }
 }

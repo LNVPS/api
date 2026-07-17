@@ -444,6 +444,12 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn delete_webauthn_credential(&self, id: u64, user_id: u64) -> DbResult<()> {
+        let mut creds = self.webauthn_credentials.lock().await;
+        creds.retain(|_, c| !(c.id == id && c.user_id == user_id));
+        Ok(())
+    }
+
     async fn get_user(&self, id: u64) -> DbResult<User> {
         let users = self.users.lock().await;
         Ok(users.get(&id).ok_or(anyhow!("no user"))?.clone())

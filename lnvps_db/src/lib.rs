@@ -166,6 +166,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// the credential as just used.
     async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()>;
 
+    /// Delete a WebAuthn credential owned by `user_id`. Scoped by user so a
+    /// caller can never remove another account's credential.
+    async fn delete_webauthn_credential(&self, id: u64, user_id: u64) -> DbResult<()>;
+
     /// Get a user by id
     async fn get_user(&self, id: u64) -> DbResult<User>;
 
