@@ -1,4 +1,4 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-use lnvps_api_common::{ApiData, ApiError, ApiResult, Nip98Auth};
+use lnvps_api_common::{
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
+};
 use lnvps_db::{Referral, ReferralCostUsage, ReferralPayout, ReferralPayoutMode};
 
 use crate::api::RouterState;
@@ -163,11 +165,12 @@ impl ApiReferralState {
     }
 }
 
-/// A single referred VM and the commission earned from its first payment.
+/// A single referred VM's first payment and the commission earned from it.
+///
+/// The referred VM's id is intentionally omitted so a referrer cannot map
+/// their commission back to specific customers' VMs.
 #[derive(Serialize)]
 pub struct ApiReferralUsage {
-    /// The referred VM's id.
-    pub vm_id: u64,
     /// When the first paid payment was made.
     pub created: chrono::DateTime<Utc>,
     /// The referred VM's first payment amount (smallest currency unit).
@@ -425,7 +428,8 @@ async fn v1_delete_referral(auth: Nip98Auth, State(this): State<RouterState>) ->
 async fn v1_get_referral_usage(
     auth: Nip98Auth,
     State(this): State<RouterState>,
-) -> ApiResult<Vec<ApiReferralUsage>> {
+    Query(q): Query<PageQuery>,
+) -> ApiPaginatedResult<ApiReferralUsage> {
     let pubkey = auth.event.pubkey.to_bytes();
     let uid = this.db.upsert_user(&pubkey).await?;
 
@@ -435,11 +439,15 @@ async fn v1_get_referral_usage(
         .await
         .map_err(|_| ApiError::not_found("Not enrolled in referral program"))?;
 
-    let usage = this.db.list_referral_usage(&referral.code).await?;
+    let limit = q.limit.unwrap_or(50).min(100);
+    let offset = q.offset.unwrap_or(0);
+    let (usage, total) = this
+        .db
+        .list_referral_usage_paginated(&referral.code, limit, offset)
+        .await?;
     let out: Vec<ApiReferralUsage> = usage
         .into_iter()
         .map(|u| ApiReferralUsage {
-            vm_id: u.vm_id,
             created: u.created,
             amount: u.amount,
             commission: u.commission(),
@@ -447,7 +455,7 @@ async fn v1_get_referral_usage(
             currency: u.currency,
         })
         .collect();
-    ApiData::ok(out)
+    ApiPaginatedData::ok(out, total, limit, offset)
 }
 
 #[cfg(test)]
@@ -458,6 +466,20 @@ mod tests {
     fn test_generate_referral_code_length() {
         let code = generate_referral_code();
         assert_eq!(code.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_list_referral_usage_paginated_empty() {
+        use lnvps_api_common::MockDb;
+        use std::sync::Arc;
+
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::default());
+        let (rows, total) = db
+            .list_referral_usage_paginated("no-such-code", 50, 0)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
     }
 
     #[tokio::test]

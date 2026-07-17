@@ -2586,6 +2586,22 @@ impl LNVpsDbBase for MockDb {
         Ok(result)
     }
 
+    async fn list_referral_usage_paginated(
+        &self,
+        code: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<ReferralCostUsage>, u64)> {
+        let all = self.list_referral_usage(code).await?;
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
         let vms = self.vms.lock().await;
         let line_items = self.subscription_line_items.lock().await;

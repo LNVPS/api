@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **2026-07-18** - Referral program: leave + per-VM usage (user API)
   - `DELETE /api/v1/referral` lets a referrer leave the program. Blocked (409) while a payout is pending, or when paid payout history exists (retained for accounting).
-  - `GET /api/v1/referral/usage` returns a per-referred-VM breakdown: `vm_id`, `created`, `amount` (the VM's first payment), `currency`, `effective_rate`, and `commission`.
+  - `GET /api/v1/referral/usage` returns a **paginated** per-referred-VM breakdown (query params `limit` default 50/max 100, `offset` default 0; response is `{ data, total, limit, offset }`). Each row has `created`, `amount` (the VM's first payment), `currency`, `effective_rate`, and `commission`. The referred VM's id is intentionally not exposed so a referrer cannot map commission back to specific customers' VMs.
 
 - **2026-07-18** - Automated referral commission payouts
   - A new opt-in worker job pays referrers their accrued **BTC** commission over Lightning. For each referrer whose owed commission (earned minus already paid/reserved) clears a configurable threshold, it reserves a payout, fetches a BOLT11 invoice (LNURL-pay for a `lightning_address` referrer, or NWC `make_invoice` for an `nwc` referrer), pays it from the node, and records the preimage. Non-BTC (fiat) commission is not auto-paid and is left for manual admin payout. Enabled by adding a `referral` config section (`min-payout-sats`, default 1000); when omitted, automated payouts are disabled. `GET /api/v1/referral` payout records now include `pre_image` (hex, once settled).

@@ -826,6 +826,15 @@ pub trait LNVpsDbBase: Send + Sync {
     /// This is the basis for computing earned amounts (per currency).
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>>;
 
+    /// Database-paginated variant of [`list_referral_usage`]. Returns a page of
+    /// rows (ordered most recent first) plus the total row count for the code.
+    async fn list_referral_usage_paginated(
+        &self,
+        code: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<ReferralCostUsage>, u64)>;
+
     /// Count VMs that used this referral code but have never made a paid subscription payment.
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 }

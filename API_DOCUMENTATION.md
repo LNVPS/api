@@ -958,9 +958,10 @@ interface ReferralPatchRequest {
 - **Error**: `409` while a payout is still pending, or when paid payout history exists (retained for accounting).
 
 #### Get Per-VM Referral Usage
-- **GET** `/api/v1/referral/usage`
+- **GET** `/api/v1/referral/usage?limit={limit}&offset={offset}`
 - **Auth**: Required
-- **Response**: `ReferralUsage[]` — one row per referred VM that made a first payment (most recent first)
+- **Query Params**: `limit` (optional, default 50, max 100), `offset` (optional, default 0)
+- **Response**: `PaginatedResponse<ReferralUsage>` — one row per referred VM that made a first payment (most recent first)
 - **Error**: `404` if not enrolled
 
 **Response Types:**
@@ -990,7 +991,8 @@ interface ReferralPayout {
 }
 
 interface ReferralUsage {
-  vm_id: number;         // The referred VM
+  // Note: the referred VM's id is intentionally NOT exposed, so a referrer
+  // cannot map commission back to specific customers' VMs.
   created: string;       // ISO 8601 datetime of that VM's first paid payment
   amount: number;        // The referred VM's first payment amount (smallest currency unit)
   currency: string;      // Currency of the payment / commission

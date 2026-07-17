@@ -695,6 +695,40 @@ mod tests {
             ref_state["data"]["referrals_success"], earned
         );
 
+        // Per-VM usage endpoint is paginated and must NOT expose vm ids.
+        let usage = json_ok(
+            referrer
+                .get_auth("/api/v1/referral/usage?limit=10&offset=0")
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            usage["total"].as_u64().unwrap(),
+            1,
+            "Usage total should equal the number of successful referrals"
+        );
+        assert_eq!(usage["limit"].as_u64().unwrap(), 10);
+        assert_eq!(usage["offset"].as_u64().unwrap(), 0);
+        let rows = usage["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "One referred VM made a first payment");
+        assert!(
+            rows[0].get("vm_id").is_none(),
+            "Usage rows must not expose the referred VM id"
+        );
+        assert!(rows[0]["commission"].as_u64().is_some());
+        // A page past the end returns no rows but the same total.
+        let empty_page = json_ok(
+            referrer
+                .get_auth("/api/v1/referral/usage?limit=10&offset=10")
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(empty_page["total"].as_u64().unwrap(), 1);
+        assert!(empty_page["data"].as_array().unwrap().is_empty());
+        eprintln!("Referral usage pagination verified");
+
         // Admin referral report should include this VM
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let resp = admin

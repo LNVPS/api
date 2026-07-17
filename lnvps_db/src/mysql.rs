@@ -3039,6 +3039,70 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_referral_usage_paginated(
+        &self,
+        code: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<ReferralCostUsage>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT v.id as vm_id,
+                    v.ref_code,
+                    sp.created,
+                    sp.amount,
+                    sp.currency,
+                    sp.rate,
+                    c.base_currency,
+                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
+             FROM vm v
+             JOIN (
+                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
+                 FROM subscription_payment sp2
+                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+                     AND sli2.subscription_type = 3
+                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+                 WHERE sp2.is_paid = 1
+             ) sp ON v.id = sp.vm_id AND sp.rn = 1
+             JOIN vm_host vh ON v.host_id = vh.id
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON vhr.company_id = c.id
+             LEFT JOIN referral r ON r.code = v.ref_code
+             WHERE v.ref_code = ?
+             ORDER BY sp.created DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(code)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        // Total row count mirrors the same joins/filters as the page query.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM vm v
+             JOIN (
+                 SELECT v2.id as vm_id,
+                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
+                 FROM subscription_payment sp2
+                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+                     AND sli2.subscription_type = 3
+                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+                 WHERE sp2.is_paid = 1
+             ) sp ON v.id = sp.vm_id AND sp.rn = 1
+             JOIN vm_host vh ON v.host_id = vh.id
+             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN company c ON vhr.company_id = c.id
+             WHERE v.ref_code = ?",
+        )
+        .bind(code)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok((rows, total as u64))
+    }
+
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm v
