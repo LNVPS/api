@@ -2567,10 +2567,21 @@ impl LNVpsDbBase for MockDb {
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
         let mut referrals = self.referrals.lock().await;
         if let Some(r) = referrals.get_mut(&referral.id) {
+            let old_code = r.code.clone();
             r.code = referral.code.clone();
             r.lightning_address = referral.lightning_address.clone();
             r.mode = referral.mode;
             r.referral_rate = referral.referral_rate;
+            // Cascade a code rename onto VMs that recorded the old code so
+            // historical referral attribution is preserved.
+            if old_code != referral.code {
+                let mut vms = self.vms.lock().await;
+                for vm in vms.values_mut() {
+                    if vm.ref_code.as_deref() == Some(old_code.as_str()) {
+                        vm.ref_code = Some(referral.code.clone());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -3648,6 +3659,70 @@ mod tests {
         let rest = db.list_all_referrals().await.unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].code, "BBB");
+    }
+
+    /// Renaming a referral code re-points existing VMs that recorded the old
+    /// code so historical attribution is preserved.
+    #[tokio::test]
+    async fn test_update_referral_cascades_vm_ref_code() {
+        use lnvps_db::{Referral, ReferralPayoutMode};
+
+        let db = MockDb::default();
+        let referral = Referral {
+            id: 0,
+            user_id: 1,
+            code: "OLDCODE".to_string(),
+            lightning_address: Some("a@b.com".to_string()),
+            mode: ReferralPayoutMode::LightningAddress,
+            referral_rate: None,
+            created: Utc::now(),
+        };
+        let ref_id = db.insert_referral(&referral).await.unwrap();
+
+        // Two VMs used this referral's code; one used a different code.
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(
+                1,
+                Vm {
+                    id: 1,
+                    ref_code: Some("OLDCODE".to_string()),
+                    ..MockDb::mock_vm()
+                },
+            );
+            vms.insert(
+                2,
+                Vm {
+                    id: 2,
+                    ref_code: Some("OLDCODE".to_string()),
+                    ..MockDb::mock_vm()
+                },
+            );
+            vms.insert(
+                3,
+                Vm {
+                    id: 3,
+                    ref_code: Some("OTHER".to_string()),
+                    ..MockDb::mock_vm()
+                },
+            );
+        }
+
+        // Rename the referral code.
+        let updated = Referral {
+            id: ref_id,
+            code: "NEWCODE".to_string(),
+            ..referral.clone()
+        };
+        db.update_referral(&updated).await.unwrap();
+
+        // The enrollment and both matching VMs now carry the new code; the
+        // unrelated VM is untouched.
+        assert_eq!(db.get_referral_by_code("NEWCODE").await.unwrap().id, ref_id);
+        let vms = db.vms.lock().await;
+        assert_eq!(vms[&1].ref_code.as_deref(), Some("NEWCODE"));
+        assert_eq!(vms[&2].ref_code.as_deref(), Some("NEWCODE"));
+        assert_eq!(vms[&3].ref_code.as_deref(), Some("OTHER"));
     }
 
     /// admin_list_referrals (pagination + code search) and admin_get_referral.

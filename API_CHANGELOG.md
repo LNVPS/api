@@ -36,7 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - **2026-07-18** - Admin referral code renaming
-  - `PATCH /api/admin/v1/referrals/{id}` now accepts an optional `code` to rename a referral enrollment's code. This relinks a user's enrollment to a historical `vm.ref_code` that was tracked (used by referred VMs) before the user auto-generated their own code, so the existing usage/earnings attribute to that referrer. The new code must be non-empty and not already in use by another referral (409-style validation error otherwise). Requires `referral::update`.
+  - `PATCH /api/admin/v1/referrals/{id}` now accepts an optional `code` to rename a referral enrollment's code. Renaming **cascades**: every existing VM that recorded the old code at ordering time (`vm.ref_code`) is re-pointed to the new code in the same transaction, so all prior usage/earnings stay attributed to that referrer (e.g. when assigning a user a custom vanity code without losing their existing referrals). This also relinks a user's enrollment to a historical `vm.ref_code` that was tracked before the user auto-generated their own code. The new code must be non-empty and not already in use by another referral (409-style validation error otherwise). Requires `referral::update`.
 
 - **2026-07-18** - Referral program: leave + per-VM usage (user API)
   - `DELETE /api/v1/referral` lets a referrer leave the program. Blocked (409) while a payout is pending, or when paid payout history exists (retained for accounting).

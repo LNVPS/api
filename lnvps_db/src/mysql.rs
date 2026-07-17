@@ -3026,6 +3026,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_referral(&self, referral: &Referral) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+
+        // Read the current code so we can cascade a rename onto the VMs that
+        // recorded it at ordering time, preserving historical attribution.
+        let old_code: Option<String> = sqlx::query_scalar("SELECT code FROM referral WHERE id = ?")
+            .bind(referral.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
         sqlx::query(
             "UPDATE referral SET code = ?, lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
         )
@@ -3034,8 +3043,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .bind(referral.id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+
+        // If the code changed, re-point every VM that used the old code so its
+        // referral usage/commission stays attributed to this enrollment.
+        if let Some(old_code) = old_code {
+            if old_code != referral.code {
+                sqlx::query("UPDATE vm SET ref_code = ? WHERE ref_code = ?")
+                    .bind(&referral.code)
+                    .bind(&old_code)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 

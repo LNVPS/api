@@ -866,7 +866,11 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Insert a new referral entry
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64>;
 
-    /// Update an existing referral entry
+    /// Update an existing referral entry.
+    ///
+    /// If the `code` changes, every VM that recorded the previous code at
+    /// ordering time is re-pointed to the new code (in the same transaction),
+    /// preserving that referral's historical usage/commission attribution.
     async fn update_referral(&self, referral: &Referral) -> DbResult<()>;
 
     /// Delete a referral enrollment (used when a user leaves the program). The
