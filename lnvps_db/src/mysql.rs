@@ -3820,6 +3820,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.geo_country_code,
                 u.geo_ip,
                 u.geo_updated,
+                u.account_type,
                 EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
@@ -3916,6 +3917,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.geo_country_code,
                 u.geo_ip,
                 u.geo_updated,
+                u.account_type,
                 EXISTS(SELECT 1 FROM user_payment_method pm WHERE pm.user_id = u.id AND pm.provider = 'nwc' AND pm.enabled = 1) as has_nwc,
                 COALESCE(vm_stats.vm_count, 0) as vm_count,
                 CASE WHEN admin_roles.user_id IS NOT NULL THEN 1 ELSE 0 END as is_admin
