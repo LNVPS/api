@@ -1490,7 +1490,10 @@ mod tests {
         crate::worker::trigger_check_vms().await.unwrap();
         eprintln!("[cleanup] Published CheckVms job");
 
-        // Poll the admin API until vm.deleted = true (up to 30 s).
+        // Poll the admin API until the VM is gone (up to 30 s).
+        // Never-paid VMs are hard-deleted, so the row is removed entirely and the
+        // admin GET returns a non-OK status. (We also treat a soft-delete flag as
+        // "deleted" for robustness.)
         let deleted = poll_until(30, 500, || {
             let admin = admin.clone();
             async move {
@@ -1498,6 +1501,10 @@ mod tests {
                     .get_auth(&format!("/api/admin/v1/vms/{unpaid_vm_id}"))
                     .await
                     .unwrap();
+                if r.status() != reqwest::StatusCode::OK {
+                    // Row hard-deleted (purged).
+                    return true;
+                }
                 let body: serde_json::Value =
                     serde_json::from_str(&r.text().await.unwrap()).unwrap();
                 body["data"]["deleted"].as_bool().unwrap_or(false)
@@ -1507,9 +1514,9 @@ mod tests {
 
         assert!(
             deleted,
-            "Unpaid VM {unpaid_vm_id} should be deleted by check_vms within 30 s"
+            "Unpaid VM {unpaid_vm_id} should be purged by check_vms within 30 s"
         );
-        eprintln!("[cleanup] Unpaid VM {unpaid_vm_id} deleted by worker ✓");
+        eprintln!("[cleanup] Unpaid VM {unpaid_vm_id} purged by worker ✓");
 
         // After deletion the user should no longer see the VM.
         let list_after = json_ok(user.get_auth("/api/v1/vm").await.unwrap()).await;
