@@ -30,13 +30,24 @@ alter table user_payment_method
     add constraint fk_user_payment_method_user foreign key (user_id) references users (id) on delete cascade;
 
 -- referral chain: users -> referral -> referral_payout
--- These FKs were created without an explicit name, so MariaDB/InnoDB assigned
--- the deterministic <table>_ibfk_1 name (each table has exactly one FK).
-alter table referral drop foreign key referral_ibfk_1;
+-- These FKs were created WITHOUT an explicit name, so the auto-generated
+-- constraint name is server-version dependent (e.g. `referral_ibfk_1` on some
+-- MySQL/MariaDB versions, something else on others). Resolve the real name
+-- from information_schema and drop it dynamically so the migration works on
+-- any server version, then re-add the FK with an explicit name + cascade.
+set @fk_referral := (select constraint_name from information_schema.KEY_COLUMN_USAGE
+    where table_schema = database() and table_name = 'referral'
+    and referenced_table_name = 'users' limit 1);
+set @sql := concat('alter table referral drop foreign key `', @fk_referral, '`');
+prepare stmt from @sql; execute stmt; deallocate prepare stmt;
 alter table referral
     add constraint fk_referral_user foreign key (user_id) references users (id) on delete cascade;
 
-alter table referral_payout drop foreign key referral_payout_ibfk_1;
+set @fk_referral_payout := (select constraint_name from information_schema.KEY_COLUMN_USAGE
+    where table_schema = database() and table_name = 'referral_payout'
+    and referenced_table_name = 'referral' limit 1);
+set @sql := concat('alter table referral_payout drop foreign key `', @fk_referral_payout, '`');
+prepare stmt from @sql; execute stmt; deallocate prepare stmt;
 alter table referral_payout
     add constraint fk_referral_payout_referral foreign key (referral_id) references referral (id) on delete cascade;
 
