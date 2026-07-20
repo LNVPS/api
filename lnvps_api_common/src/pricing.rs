@@ -820,7 +820,8 @@ impl PricingEngine {
         }
     }
 
-    async fn get_ticker(
+    /// Current exchange rate between two currencies (passthrough when equal).
+    pub async fn get_ticker(
         &self,
         base_currency: Currency,
         target_currency: Currency,

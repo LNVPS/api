@@ -111,6 +111,11 @@ feature), now available on crates.io as `payments-rs = 0.4.1`.
 - [x] Registered in `listen_all_payments` (provider passed from `bin/api.rs`).
 - [x] 8 watcher tests: exact/partial deposits, replay de-dupe, unknown address,
       address-reuse renewal, listen loop, stream error.
+- [x] Rate is **re-calculated at tx discovery** (review feedback): time credited =
+      `time_value × received_msat × rate_now / (expected_msat × rate_quoted)`;
+      the quote only fixes the price in the subscription currency, never the BTC
+      rate. Current rate is recorded on the settled payment. BTC-denominated subs
+      reduce to the plain msat ratio. `PricingEngine::get_ticker` made pub.
 
 ### Increment 5 — API surface + docs (S)
 - [x] `ApiPaymentMethod::OnChain` / `ApiPaymentData::OnChain { address }` exposed.
