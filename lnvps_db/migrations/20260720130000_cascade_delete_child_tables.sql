@@ -10,49 +10,54 @@
 -- Financial/audit/soft-deleted tables (vm, subscription, subscription_payment,
 -- vm_history, vm_ip_assignment, vm_firewall_rule) are deliberately left with
 -- RESTRICT and continue to be cleaned up explicitly.
+--
+-- NOTE: each FK is dropped and re-added in TWO separate ALTER statements. A
+-- combined `drop foreign key X, add constraint X ...` in a single ALTER fails
+-- on InnoDB (MySQL & MariaDB) with errno 121 "duplicate key" because the old
+-- constraint name still exists while the new one with the same name is added.
 
 -- users -> owned children
+alter table user_ssh_key drop foreign key fk_ssh_key_user;
 alter table user_ssh_key
-    drop foreign key fk_ssh_key_user,
     add constraint fk_ssh_key_user foreign key (user_id) references users (id) on delete cascade;
 
+alter table user_webauthn_credentials drop foreign key fk_webauthn_cred_user;
 alter table user_webauthn_credentials
-    drop foreign key fk_webauthn_cred_user,
     add constraint fk_webauthn_cred_user foreign key (user_id) references users (id) on delete cascade;
 
+alter table user_payment_method drop foreign key fk_user_payment_method_user;
 alter table user_payment_method
-    drop foreign key fk_user_payment_method_user,
     add constraint fk_user_payment_method_user foreign key (user_id) references users (id) on delete cascade;
 
 -- referral chain: users -> referral -> referral_payout
 -- These FKs were created without an explicit name, so MariaDB/InnoDB assigned
 -- the deterministic <table>_ibfk_1 name (each table has exactly one FK).
+alter table referral drop foreign key referral_ibfk_1;
 alter table referral
-    drop foreign key referral_ibfk_1,
     add constraint fk_referral_user foreign key (user_id) references users (id) on delete cascade;
 
+alter table referral_payout drop foreign key referral_payout_ibfk_1;
 alter table referral_payout
-    drop foreign key referral_payout_ibfk_1,
     add constraint fk_referral_payout_referral foreign key (referral_id) references referral (id) on delete cascade;
 
 -- router -> cached tunnel/BGP inventory (discovery caches, safe to drop)
+alter table router_tunnel drop foreign key fk_router_tunnel_router;
 alter table router_tunnel
-    drop foreign key fk_router_tunnel_router,
     add constraint fk_router_tunnel_router foreign key (router_id) references router (id) on delete cascade;
 
+alter table router_tunnel_traffic drop foreign key fk_router_tunnel_traffic_router;
 alter table router_tunnel_traffic
-    drop foreign key fk_router_tunnel_traffic_router,
     add constraint fk_router_tunnel_traffic_router foreign key (router_id) references router (id) on delete cascade;
 
+alter table router_bgp_session drop foreign key fk_router_bgp_session_router;
 alter table router_bgp_session
-    drop foreign key fk_router_bgp_session_router,
     add constraint fk_router_bgp_session_router foreign key (router_id) references router (id) on delete cascade;
 
+alter table router_bgp_route drop foreign key fk_router_bgp_route_router;
 alter table router_bgp_route
-    drop foreign key fk_router_bgp_route_router,
     add constraint fk_router_bgp_route_router foreign key (router_id) references router (id) on delete cascade;
 
 -- vm_custom_pricing -> pricing disks (pure child; vm_custom_template keeps RESTRICT)
+alter table vm_custom_pricing_disk drop foreign key fk_custom_pricing_disk;
 alter table vm_custom_pricing_disk
-    drop foreign key fk_custom_pricing_disk,
     add constraint fk_custom_pricing_disk foreign key (pricing_id) references vm_custom_pricing (id) on delete cascade;
