@@ -4013,6 +4013,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_create_vm_os_image_request_accepts_new_distros() {
+        for name in ["almalinux", "rockylinux", "alpine", "nixos"] {
+            let json = format!(
+                r#"{{"distribution":"{name}","flavour":"server","version":"9","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2"}}"#
+            );
+            let req: CreateVmOsImageRequest = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
+            assert!(req.to_vm_os_image().is_ok());
+        }
+    }
+
+    #[test]
     fn test_api_os_distribution_to_db_covers_new_distros() {
         for (api, db) in [
             (ApiOsDistribution::AlmaLinux, OsDistribution::AlmaLinux),
