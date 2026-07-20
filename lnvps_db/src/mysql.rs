@@ -758,6 +758,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn count_vms_by_os_image(&self) -> DbResult<Vec<(u64, u64)>> {
+        Ok(sqlx::query_as(
+            "SELECT image_id, COUNT(*) FROM vm WHERE deleted = 0 GROUP BY image_id",
+        )
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()> {
         sqlx::query(
             "UPDATE vm_os_image SET distribution=?, flavour=?, version=?, enabled=?, release_date=?, url=?, default_username=?, sha2=?, sha2_url=? WHERE id=?"
@@ -4233,6 +4241,38 @@ impl AdminDb for LNVpsDbMysql {
             total_memory_bytes: row.3.unwrap_or(0),
             total_ip_assignments: row.4 as u64,
         })
+    }
+
+    async fn admin_transfer_vm(&self, vm_id: u64, new_user_id: u64) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+
+        // Resolve the subscription linked to this VM so we can move billing too
+        let sub_id: (u64,) = sqlx::query_as(
+            "SELECT s.id FROM subscription s \
+             JOIN subscription_line_item sli ON sli.subscription_id = s.id \
+             JOIN vm v ON v.subscription_line_item_id = sli.id \
+             WHERE v.id = ?",
+        )
+        .bind(vm_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Move VM ownership and drop the old owner's ssh key reference
+        sqlx::query("UPDATE vm SET user_id = ?, ssh_key_id = NULL WHERE id = ?")
+            .bind(new_user_id)
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Move subscription ownership so renewals bill the new account
+        sqlx::query("UPDATE subscription SET user_id = ? WHERE id = ?")
+            .bind(new_user_id)
+            .bind(sub_id.0)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn admin_list_vm_os_images(

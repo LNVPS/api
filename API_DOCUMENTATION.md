@@ -355,6 +355,7 @@ interface VmOsImage {
   version: string;
   release_date: string; // ISO 8601 datetime
   default_username?: string;
+  popularity: number; // fraction (0.0–1.0) of active VMs using this image
 }
 
 interface UserSshKey {
@@ -855,8 +856,9 @@ interface PatchPaymentMethodRequest {
 #### Reinstall VM
 - **PATCH** `/api/v1/vm/{id}/re-install`
 - **Auth**: Required
+- **Body** (optional): `{ "image_id": number }` — switch the VM to a different OS image as part of the re-install. When omitted, the VM is reinstalled with its current image.
 - **Response**: `null`
-- **Errors**: `402 Payment Required` if the VM is expired (renew it first); `403 Forbidden` if the VM is not yours; `404 Not Found` if the VM does not exist.
+- **Errors**: `402 Payment Required` if the VM is expired (renew it first); `403 Forbidden` if the VM is not yours or the chosen image is not available; `404 Not Found` if the VM or image does not exist.
 
 #### VM Serial Console (WebSocket)
 - **WebSocket** `/api/v1/vm/{id}/console`

@@ -2590,6 +2590,7 @@ pub enum AdminVmHistoryActionType {
     StateChanged,
     PaymentReceived,
     ConfigurationChanged,
+    Transferred,
 }
 
 impl From<VmHistoryActionType> for AdminVmHistoryActionType {
@@ -2608,6 +2609,7 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             VmHistoryActionType::ConfigurationChanged => {
                 AdminVmHistoryActionType::ConfigurationChanged
             }
+            VmHistoryActionType::Transferred => AdminVmHistoryActionType::Transferred,
         }
     }
 }

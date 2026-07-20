@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Transfer a VM to another user (admin)** — new `POST /api/admin/v1/vms/{id}/transfer` (`virtual_machines::update`) reassigns a VM to another user account, e.g. for account recovery (issue #178). It atomically moves the VM and its billing subscription to the target `user_id` and clears the old owner's SSH key from the VM. The change is recorded in VM history as a new `transferred` action. Rejects deleted VMs, self-transfers (`409`) and unknown target users (`404`). Body: `{ user_id, reason? }`.
+
+- **Change OS during re-install** — `PATCH /api/v1/vm/{id}/re-install` now accepts an optional `{ image_id }` body to switch the VM to a different OS image as part of the re-install (issue #177). When omitted, the VM is reinstalled with its current image (unchanged behaviour). The chosen image must exist and be enabled, and the change is recorded in VM history.
+
+- **OS image popularity** — `GET /api/v1/image` now returns a `popularity` field for each OS image: the fraction (0.0–1.0) of active VMs currently using that image (issue #70).
+
 - **Delete (purge) a user (admin)** — new `DELETE /api/admin/v1/users/{id}` (`users::delete`) permanently removes a user and all of their associated data (soft-deleted VMs and their history/IP/firewall rows and 1:1 custom templates, SSH keys, subscriptions and payments, referral records, Nostr domains, passkeys and saved payment methods) in a single transaction. Rejected if the user still has any live (non-deleted) VMs — those must be deleted first so hypervisor resources are released. Admins cannot delete their own account.
 
 - **Manage user passkeys (admin)** — new admin endpoints to view and revoke a user's WebAuthn passkeys.

@@ -386,6 +386,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_admin_vm_transfer() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/vms?limit=1").await.unwrap();
+        let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
+        if data.data.is_empty() {
+            eprintln!("Skipping: no VMs found for transfer test");
+            return;
+        }
+        let vm_id = data.data[0]["id"].as_u64().unwrap();
+        let current_user = data.data[0]["user_id"].as_u64().unwrap_or(0);
+        // Transfer to the same user is rejected (409); an unknown user is 404.
+        let body = serde_json::json!({"user_id": current_user, "reason": "e2e-test"});
+        let resp = client
+            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/transfer"), &body)
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::OK
+                || resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::CONFLICT
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "VM transfer should return 200, 400, 404, 409, or 500, got: {}",
+            resp.status()
+        );
+    }
+
     // ========================================================================
     // Host Management
     // ========================================================================

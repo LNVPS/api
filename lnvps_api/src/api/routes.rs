@@ -806,10 +806,29 @@ async fn v1_patch_vm(
 /// List available VM OS images
 async fn v1_list_vm_images(State(this): State<RouterState>) -> ApiResult<Vec<ApiVmOsImage>> {
     let images = this.db.list_os_image().await?;
+
+    // Compute popularity as the fraction of active VMs using each image
+    let counts: HashMap<u64, u64> = this
+        .db
+        .count_vms_by_os_image()
+        .await?
+        .into_iter()
+        .collect();
+    let total: u64 = counts.values().sum();
+
     let ret = images
         .into_iter()
         .filter(|i| i.enabled)
-        .map(|i| i.into())
+        .map(|i| {
+            let count = counts.get(&i.id).copied().unwrap_or(0);
+            let mut image: ApiVmOsImage = i.into();
+            image.popularity = if total > 0 {
+                count as f32 / total as f32
+            } else {
+                0.0
+            };
+            image
+        })
         .collect();
     ApiData::ok(ret)
 }
@@ -1246,13 +1265,22 @@ async fn v1_restart_vm(
     ApiData::ok(())
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ReinstallRequest {
+    /// Optionally switch to a different OS image during the reinstall
+    image_id: Option<u64>,
+}
+
 /// Re-install a VM
 async fn v1_reinstall_vm(
     auth: Nip98Auth,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
+    body: Option<Json<ReinstallRequest>>,
 ) -> ApiResult<()> {
-    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, mut vm) = get_user_vm(&auth, &this, id).await?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
 
     // Reject re-install on an expired VM. The VM may already be stopped/removed
     // on the host, so running the reinstall pipeline would fail with a 500.
@@ -1270,6 +1298,21 @@ async fn v1_reinstall_vm(
     }
 
     let old_image_id = vm.image_id;
+
+    // Optionally switch to a different OS image. Persist the change before
+    // loading FullVmInfo so the reinstall pipeline provisions the new image.
+    if let Some(new_image_id) = req.image_id
+        && new_image_id != old_image_id
+    {
+        let image = this.db.get_os_image(new_image_id).await?;
+        if !image.enabled {
+            return Err(ApiError::forbidden("OS image is not available"));
+        }
+        vm.image_id = new_image_id;
+        this.db.update_vm(&vm).await?;
+    }
+    let new_image_id = vm.image_id;
+
     let host = this.db.get_host(vm.host_id).await?;
     let client = get_host_client(&host, &this.settings.provisioner)?;
     let info = FullVmInfo::load(vm.id, this.db.clone()).await?;
@@ -1319,9 +1362,9 @@ async fn v1_reinstall_vm(
         .execute()
         .await?;
 
-    // Log VM reinstall (assuming same image ID for now)
+    // Log VM reinstall (records image change if the user switched images)
     this.history
-        .log_vm_reinstalled(id, Some(uid), old_image_id, old_image_id, None)
+        .log_vm_reinstalled(id, Some(uid), old_image_id, new_image_id, None)
         .await
         .ok();
 

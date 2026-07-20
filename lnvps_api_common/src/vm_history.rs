@@ -276,6 +276,33 @@ impl VmHistoryLogger {
         Ok(())
     }
 
+    pub async fn log_vm_transferred(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        old_user_id: u64,
+        new_user_id: u64,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::Transferred,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: serialize_json_to_bytes(Some(json!({"user_id": old_user_id}))),
+            new_state: serialize_json_to_bytes(Some(json!({"user_id": new_user_id}))),
+            metadata: serialize_json_to_bytes(metadata),
+            description: Some(format!(
+                "VM {} was transferred from user {} to user {}",
+                vm_id, old_user_id, new_user_id
+            )),
+        };
+
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
+
     pub async fn log_vm_state_changed(
         &self,
         vm_id: u64,
@@ -626,6 +653,23 @@ mod tests {
             serde_json::from_slice(history[0].new_state.as_ref().unwrap()).unwrap();
         assert_eq!(prev["image_id"], 1);
         assert_eq!(next["image_id"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_log_vm_transferred() {
+        let logger = make_logger();
+        logger
+            .log_vm_transferred(16, Some(9), 3, 7, None)
+            .await
+            .unwrap();
+        let history = logger.db.list_vm_history(16).await.unwrap();
+        assert_eq!(history[0].action_type.to_string(), "transferred");
+        let prev: serde_json::Value =
+            serde_json::from_slice(history[0].previous_state.as_ref().unwrap()).unwrap();
+        let next: serde_json::Value =
+            serde_json::from_slice(history[0].new_state.as_ref().unwrap()).unwrap();
+        assert_eq!(prev["user_id"], 3);
+        assert_eq!(next["user_id"], 7);
     }
 
     #[tokio::test]

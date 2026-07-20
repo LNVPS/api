@@ -303,6 +303,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List available OS images
     async fn list_os_image(&self) -> DbResult<Vec<VmOsImage>>;
 
+    /// Count active (non-deleted) VMs grouped by OS image id
+    async fn count_vms_by_os_image(&self) -> DbResult<Vec<(u64, u64)>>;
+
     /// Update an OS image (sha2, sha2_url, and other fields)
     async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()>;
 

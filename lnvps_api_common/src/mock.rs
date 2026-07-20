@@ -878,6 +878,15 @@ impl LNVpsDbBase for MockDb {
         Ok(os_images.values().filter(|i| i.enabled).cloned().collect())
     }
 
+    async fn count_vms_by_os_image(&self) -> DbResult<Vec<(u64, u64)>> {
+        let vms = self.vms.lock().await;
+        let mut counts: HashMap<u64, u64> = HashMap::new();
+        for vm in vms.values().filter(|v| !v.deleted) {
+            *counts.entry(vm.image_id).or_insert(0) += 1;
+        }
+        Ok(counts.into_iter().collect())
+    }
+
     async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()> {
         let mut os_images = self.os_images.lock().await;
         os_images.insert(image.id, image.clone());
@@ -3119,6 +3128,14 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_get_region_stats(&self, _region_id: u64) -> DbResult<RegionStats> {
         todo!()
     }
+    async fn admin_transfer_vm(&self, vm_id: u64, new_user_id: u64) -> DbResult<()> {
+        let mut vms = self.vms.lock().await;
+        let vm = vms.get_mut(&vm_id).ok_or(anyhow!("no vm"))?;
+        vm.user_id = new_user_id;
+        vm.ssh_key_id = None;
+        Ok(())
+    }
+
     async fn admin_list_vm_os_images(
         &self,
         _limit: u64,
@@ -3817,6 +3834,77 @@ impl LNVPSNostrDb for MockDb {
 mod tests {
     use super::*;
     use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+
+    #[tokio::test]
+    async fn test_count_vms_by_os_image() {
+        let db = MockDb::default();
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(
+                1,
+                Vm {
+                    id: 1,
+                    image_id: 1,
+                    ..MockDb::mock_vm()
+                },
+            );
+            vms.insert(
+                2,
+                Vm {
+                    id: 2,
+                    image_id: 1,
+                    ..MockDb::mock_vm()
+                },
+            );
+            vms.insert(
+                3,
+                Vm {
+                    id: 3,
+                    image_id: 2,
+                    ..MockDb::mock_vm()
+                },
+            );
+            vms.insert(
+                4,
+                Vm {
+                    id: 4,
+                    image_id: 2,
+                    deleted: true,
+                    ..MockDb::mock_vm()
+                },
+            );
+        }
+
+        let counts: HashMap<u64, u64> =
+            db.count_vms_by_os_image().await.unwrap().into_iter().collect();
+        assert_eq!(counts.get(&1), Some(&2));
+        assert_eq!(counts.get(&2), Some(&1)); // deleted VM excluded
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn test_admin_transfer_vm() {
+        use lnvps_db::AdminDb;
+
+        let db = MockDb::default();
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(
+                1,
+                Vm {
+                    id: 1,
+                    user_id: 1,
+                    ssh_key_id: Some(5),
+                    ..MockDb::mock_vm()
+                },
+            );
+        }
+
+        db.admin_transfer_vm(1, 42).await.unwrap();
+        let vm = db.get_vm(1).await.unwrap();
+        assert_eq!(vm.user_id, 42);
+        assert_eq!(vm.ssh_key_id, None);
+    }
 
     /// list_all_referrals + delete_referral base-trait methods.
     #[tokio::test]
