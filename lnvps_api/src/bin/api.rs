@@ -26,7 +26,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
+
+/// CORS layer for the public API.
+///
+/// Auth is carried in the `Authorization` header (NIP-98 / JWT), never cookies,
+/// so credentials are NOT needed. We therefore return `Access-Control-Allow-
+/// Origin: *` rather than reflecting the request origin. Reflecting the origin
+/// (as `very_permissive` does) breaks Tor/Brave, which send `Origin: null` on
+/// cross-site requests: a `null` allow-origin combined with allow-credentials
+/// is rejected by browsers. A wildcard origin with no credentials works for
+/// clearnet, `.onion`, and `null` origins alike.
+///
+/// Headers are MIRRORED rather than wildcarded because a literal `*` in
+/// `Access-Control-Allow-Headers` does not cover `Authorization`.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any)
+}
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -373,7 +393,7 @@ async fn main() -> Result<(), Error> {
             if let Err(e) = axum::serve(
                 listener,
                 router
-                    .layer(CorsLayer::very_permissive())
+                    .layer(cors_layer())
                     .with_state(RouterState {
                         db,
                         state: status,

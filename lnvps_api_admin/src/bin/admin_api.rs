@@ -15,7 +15,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::net::TcpSocket;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
+
+/// CORS layer for the admin API.
+///
+/// Auth is carried in the `Authorization` header (NIP-98 / JWT), never cookies,
+/// so credentials are NOT needed. Returning `Access-Control-Allow-Origin: *`
+/// (rather than reflecting the origin like `very_permissive`) keeps Tor/Brave
+/// working, which send `Origin: null` on cross-site requests — a `null`
+/// allow-origin plus allow-credentials is rejected by browsers. Headers are
+/// mirrored because a literal `*` does not cover `Authorization`.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any)
+}
 
 #[derive(Parser)]
 #[clap(about, version, author)]
@@ -89,7 +105,7 @@ async fn main() -> Result<(), Error> {
         exchange,
         feedback,
     );
-    axum::serve(listener, router.layer(CorsLayer::very_permissive())).await?;
+    axum::serve(listener, router.layer(cors_layer())).await?;
 
     Ok(())
 }
