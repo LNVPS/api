@@ -129,6 +129,13 @@ pub trait AdminDb: Send + Sync {
     /// Get comprehensive region statistics
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats>;
 
+    /// Transfer ownership of a VM to another user account.
+    ///
+    /// Atomically updates the VM's `user_id` and its subscription's `user_id`
+    /// so billing follows the new owner. Clears the VM's `ssh_key_id` because
+    /// the old owner's key does not belong to the new account.
+    async fn admin_transfer_vm(&self, vm_id: u64, new_user_id: u64) -> DbResult<()>;
+
     // VM OS Image management methods
     /// List all VM OS images with pagination
     async fn admin_list_vm_os_images(

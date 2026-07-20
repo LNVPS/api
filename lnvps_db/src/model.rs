@@ -1599,6 +1599,7 @@ pub enum VmHistoryActionType {
     StateChanged = 8,
     PaymentReceived = 9,
     ConfigurationChanged = 10,
+    Transferred = 11,
 }
 
 impl Display for VmHistoryActionType {
@@ -1615,6 +1616,7 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::StateChanged => write!(f, "state_changed"),
             VmHistoryActionType::PaymentReceived => write!(f, "payment_received"),
             VmHistoryActionType::ConfigurationChanged => write!(f, "configuration_changed"),
+            VmHistoryActionType::Transferred => write!(f, "transferred"),
         }
     }
 }
@@ -1635,6 +1637,7 @@ impl FromStr for VmHistoryActionType {
             "state_changed" => Ok(VmHistoryActionType::StateChanged),
             "payment_received" => Ok(VmHistoryActionType::PaymentReceived),
             "configuration_changed" => Ok(VmHistoryActionType::ConfigurationChanged),
+            "transferred" => Ok(VmHistoryActionType::Transferred),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }

@@ -49,6 +49,7 @@ mod tests {
         distribution: String,
         flavour: String,
         version: String,
+        popularity: f32,
     }
 
     #[derive(Debug, Deserialize)]
@@ -180,6 +181,9 @@ mod tests {
             assert!(img.id > 0);
             assert!(!img.distribution.is_empty());
             assert!(!img.version.is_empty());
+            let _ = img.flavour;
+            // popularity is a fraction in [0, 1]
+            assert!(img.popularity >= 0.0 && img.popularity <= 1.0);
         }
     }
 

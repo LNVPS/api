@@ -28,6 +28,7 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_patch_vm)
                 .delete(admin_delete_vm),
         )
+        .route("/api/admin/v1/vms/{id}/transfer", post(admin_transfer_vm))
         .route("/api/admin/v1/vms/{id}/start", post(admin_start_vm))
         .route("/api/admin/v1/vms/{id}/stop", post(admin_stop_vm))
         .route("/api/admin/v1/vms/{id}/extend", put(admin_extend_vm))
@@ -315,6 +316,64 @@ async fn admin_patch_vm(
     ApiData::ok(JobResponse {
         job_id: String::new(),
     })
+}
+
+#[derive(Deserialize)]
+struct AdminTransferVmRequest {
+    /// The user account to transfer this VM to
+    user_id: u64,
+    reason: Option<String>,
+}
+
+/// Transfer a VM to another user account
+async fn admin_transfer_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminTransferVmRequest>,
+) -> ApiResult<()> {
+    // Check permission
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+
+    // Verify VM exists
+    let vm = this.db.get_vm(id).await?;
+
+    if vm.deleted {
+        return Err(ApiError::conflict("Cannot transfer a deleted VM"));
+    }
+
+    let old_user_id = vm.user_id;
+
+    if req.user_id == old_user_id {
+        return Err(ApiError::conflict("VM already belongs to this user"));
+    }
+
+    // Verify the target user exists
+    let _user = this.db.get_user(req.user_id).await?;
+
+    // Atomically move VM + subscription ownership
+    this.db.admin_transfer_vm(id, req.user_id).await?;
+
+    // Log the transfer in VM history
+    let vm_history_logger = VmHistoryLogger::new(this.db.clone());
+    let metadata = Some(serde_json::json!({
+        "admin_user_id": auth.user_id,
+        "admin_action": true,
+        "reason": req.reason,
+    }));
+    if let Err(e) = vm_history_logger
+        .log_vm_transferred(id, Some(auth.user_id), old_user_id, req.user_id, metadata)
+        .await
+    {
+        error!("Failed to log VM {} transfer: {}", id, e);
+    }
+
+    info!(
+        "Admin {} transferred VM {} from user {} to user {}",
+        auth.user_id, id, old_user_id, req.user_id
+    );
+
+    ApiData::ok(())
 }
 
 /// Start a VM

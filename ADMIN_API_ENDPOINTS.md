@@ -8,7 +8,8 @@ Admin API request/response format reference for LLM consumption.
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
 **VmRunningStates**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
 **AdminVmHistoryActionType**: `"created"`, `"started"`, `"stopped"`, `"restarted"`, `"deleted"`, `"expired"`,
-`"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`
+`"renewed"`, `"reinstalled"`, `"state_changed"`, `"payment_received"`, `"configuration_changed"`,
+`"transferred"`
 **AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`, `"stripe"`
 **VmHostKind**: `"proxmox"`, `"libvirt"`
 **CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
@@ -350,6 +351,34 @@ Response:
 **Asynchronous Processing:** This endpoint dispatches a `CreateVm` work job for distributed processing. The operation
 returns immediately with a job ID. The VM creation is handled by the provisioner and includes full audit logging with
 admin action metadata.
+
+#### Transfer VM
+
+```
+POST /api/admin/v1/vms/{id}/transfer
+```
+
+Required Permission: `virtual_machines::update`
+
+Transfers ownership of a VM to another user account (e.g. for account recovery).
+Atomically moves the VM and its billing subscription to the target user and
+clears the old owner's SSH key from the VM. The transfer is recorded in VM
+history.
+
+Request body:
+
+```json
+{
+  "user_id": 456,
+  "reason": "Account recovery"
+}
+```
+
+- `user_id` (required) — the target user account id.
+- `reason` (optional) — free-text reason recorded in the audit log.
+
+Returns `409` if the VM is deleted or already belongs to the target user, and
+`404` if the target user does not exist.
 
 #### Start VM
 

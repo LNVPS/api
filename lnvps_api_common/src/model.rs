@@ -590,6 +590,9 @@ pub struct ApiVmOsImage {
     pub version: String,
     pub release_date: DateTime<Utc>,
     pub default_username: Option<String>,
+    /// Popularity of this image expressed as a fraction (0.0â1.0) of all
+    /// active VMs currently using it
+    pub popularity: f32,
 }
 
 impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
@@ -601,6 +604,7 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
             version: image.version,
             release_date: image.release_date,
             default_username: image.default_username,
+            popularity: 0.0,
         }
     }
 }
