@@ -3552,6 +3552,17 @@ pub struct SanitizedLndConfig {
     pub macaroon_path: String,
 }
 
+/// Sanitized on-chain config (nothing secret, mirrors OnChainProviderConfig)
+#[derive(Serialize)]
+pub struct SanitizedOnChainConfig {
+    pub url: String,
+    pub cert_path: String,
+    pub macaroon_path: String,
+    pub address_type: String,
+    pub account: Option<String>,
+    pub min_confirmations: u32,
+}
+
 /// Sanitized Bitvora config (hides token and webhook_secret)
 #[derive(Serialize)]
 pub struct SanitizedBitvoraConfig {
@@ -3601,7 +3612,7 @@ pub enum SanitizedProviderConfig {
     Revolut(SanitizedRevolutConfig),
     Stripe(SanitizedStripeConfig),
     Paypal(SanitizedPaypalConfig),
-    OnChain(SanitizedLndConfig),
+    OnChain(SanitizedOnChainConfig),
 }
 
 impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
@@ -3647,10 +3658,13 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                 })
             }
             lnvps_db::ProviderConfig::OnChain(cfg) => {
-                SanitizedProviderConfig::OnChain(SanitizedLndConfig {
+                SanitizedProviderConfig::OnChain(SanitizedOnChainConfig {
                     url: cfg.url.clone(),
                     cert_path: cfg.cert_path.display().to_string(),
                     macaroon_path: cfg.macaroon_path.display().to_string(),
+                    address_type: format!("{:?}", cfg.address_type),
+                    account: cfg.account.clone(),
+                    min_confirmations: cfg.min_confirmations,
                 })
             }
         }

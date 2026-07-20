@@ -60,12 +60,17 @@ pub struct OnChainPaymentHandler {
 }
 
 /// Scale `value` by `received / expected` (u128 intermediate, no overflow).
+///
+/// Only used by the no-VM quote-scaling fallback in [`OnChainPaymentHandler::regenerate`];
+/// remove once subscription-level amount→cost pricing exists (issue #181).
 fn pro_rate(value: u64, received: u64, expected: u64) -> u64 {
     debug_assert!(expected > 0);
     (value as u128 * received as u128 / expected as u128) as u64
 }
 
 /// Scale `value` by an arbitrary ratio, flooring to whole units.
+///
+/// Only used by the no-VM quote-scaling fallback; see [`pro_rate`].
 fn pro_rate_f64(value: u64, ratio: f64) -> u64 {
     (value as f64 * ratio).floor() as u64
 }
@@ -212,15 +217,14 @@ impl OnChainPaymentHandler {
         if payment.is_paid {
             return Ok(());
         }
-        // Deposits to deleted VMs are held; Confirmed sends the admin alert.
+        // Deposits to deleted VMs are ignored; Confirmed sends the admin alert.
         if let Ok(vm) = self
             .db
             .get_vm_by_subscription(payment.subscription_id)
             .await
+            && vm.deleted
         {
-            if vm.deleted {
-                return Ok(());
-            }
+            return Ok(());
         }
         self.regenerate(&mut payment, amount_msat).await?;
         info!(
@@ -324,12 +328,11 @@ impl OnChainPaymentHandler {
             .db
             .get_vm_by_subscription(payment.subscription_id)
             .await
+            && vm.deleted
         {
-            if vm.deleted {
-                return self
-                    .notify_deleted_vm_deposit(payment, vm.id, address, &key, amount_msat)
-                    .await;
-            }
+            return self
+                .notify_deleted_vm_deposit(payment, vm.id, address, &key, amount_msat)
+                .await;
         }
 
         if !payment.is_paid {

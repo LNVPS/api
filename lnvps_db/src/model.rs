@@ -2413,10 +2413,13 @@ mod tests {
 
     #[test]
     fn test_provider_config_onchain() {
-        let config = ProviderConfig::OnChain(LndConfig {
+        let config = ProviderConfig::OnChain(OnChainProviderConfig {
             url: "https://localhost:10009".to_string(),
             cert_path: "/tls.cert".into(),
             macaroon_path: "/admin.macaroon".into(),
+            address_type: OnChainAddressType::TaprootPubkey,
+            account: Some("deposits".to_string()),
+            min_confirmations: 3,
         });
         assert_eq!(config.provider_type(), "onchain");
         assert_eq!(config.payment_method(), PaymentMethod::OnChain);
@@ -2442,9 +2445,29 @@ mod tests {
         );
         assert_eq!(pmc.provider_type, "onchain");
         let parsed = pmc.get_provider_config().expect("config round-trips");
-        assert_eq!(parsed.as_onchain().unwrap().url, "https://localhost:10009");
+        let oc = parsed.as_onchain().unwrap();
+        assert_eq!(oc.url, "https://localhost:10009");
+        assert_eq!(oc.address_type, OnChainAddressType::TaprootPubkey);
+        assert_eq!(oc.account.as_deref(), Some("deposits"));
+        assert_eq!(oc.min_confirmations, 3);
         pmc.set_provider_config(parsed);
         assert_eq!(pmc.provider_type, "onchain");
+    }
+
+    #[test]
+    fn test_onchain_provider_config_defaults() {
+        // Old configs without the new fields deserialize with defaults
+        let json = serde_json::json!({
+            "type": "onchain",
+            "url": "https://localhost:10009",
+            "cert_path": "/tls.cert",
+            "macaroon_path": "/admin.macaroon"
+        });
+        let cfg: ProviderConfig = serde_json::from_value(json).unwrap();
+        let oc = cfg.as_onchain().unwrap();
+        assert_eq!(oc.address_type, OnChainAddressType::WitnessPubkeyHash);
+        assert_eq!(oc.account, None);
+        assert_eq!(oc.min_confirmations, 1);
     }
 }
 
@@ -2540,6 +2563,43 @@ pub struct StripeProviderConfig {
     pub webhook_secret: String,
 }
 
+/// On-chain receive-address type (mirrors LND's supported families)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnChainAddressType {
+    /// Pay-to-witness-public-key-hash (`p2wkh`, bech32)
+    #[default]
+    WitnessPubkeyHash,
+    /// Nested pay-to-witness-public-key-hash (`np2wkh`, base58)
+    NestedPubkeyHash,
+    /// Pay-to-taproot (`p2tr`, bech32m)
+    TaprootPubkey,
+}
+
+/// On-chain Bitcoin provider configuration (LND wallet backend)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OnChainProviderConfig {
+    /// LND gRPC API URL
+    pub url: String,
+    /// Path to TLS certificate
+    pub cert_path: PathBuf,
+    /// Path to macaroon file
+    pub macaroon_path: PathBuf,
+    /// Type of receive address to derive
+    #[serde(default)]
+    pub address_type: OnChainAddressType,
+    /// Optional wallet account name (`None` uses the default account)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Confirmations required before a deposit is settled
+    #[serde(default = "default_min_confirmations")]
+    pub min_confirmations: u32,
+}
+
+fn default_min_confirmations() -> u32 {
+    1
+}
+
 /// PayPal provider configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaypalProviderConfig {
@@ -2566,8 +2626,9 @@ pub enum ProviderConfig {
     Stripe(StripeProviderConfig),
     /// PayPal fiat payment configuration
     Paypal(PaypalProviderConfig),
-    /// On-chain Bitcoin payment configuration (reuses the LND wallet backend)
-    OnChain(LndConfig),
+    /// On-chain Bitcoin payment configuration (LND wallet backend)
+    #[serde(rename = "onchain")]
+    OnChain(OnChainProviderConfig),
 }
 
 impl ProviderConfig {
@@ -2635,7 +2696,7 @@ impl ProviderConfig {
     }
 
     /// Get on-chain config if this is an on-chain provider
-    pub fn as_onchain(&self) -> Option<&LndConfig> {
+    pub fn as_onchain(&self) -> Option<&OnChainProviderConfig> {
         match self {
             ProviderConfig::OnChain(cfg) => Some(cfg),
             _ => None,

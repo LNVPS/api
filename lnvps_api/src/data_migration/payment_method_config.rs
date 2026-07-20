@@ -2,8 +2,8 @@ use crate::data_migration::DataMigration;
 use crate::settings::{LightningConfig, Settings};
 use anyhow::Result;
 use lnvps_db::{
-    BitvoraConfig, LNVpsDb, LndConfig, PaymentMethod, PaymentMethodConfig, ProviderConfig,
-    RevolutProviderConfig,
+    BitvoraConfig, LNVpsDb, LndConfig, OnChainAddressType, OnChainProviderConfig, PaymentMethod,
+    PaymentMethodConfig, ProviderConfig, RevolutProviderConfig,
 };
 use log::info;
 use std::future::Future;
@@ -80,6 +80,27 @@ impl DataMigration for PaymentMethodConfigMigration {
 
                     db.insert_payment_method_config(&payment_config).await?;
                     info!("Migrated LND Lightning config for company {}", company_id);
+                    migrated_count += 1;
+
+                    // On-chain payments reuse the same LND wallet; seed a
+                    // config with defaults so it is manageable in the admin UI
+                    let onchain_config = ProviderConfig::OnChain(OnChainProviderConfig {
+                        url: url.clone(),
+                        cert_path: PathBuf::from(cert),
+                        macaroon_path: PathBuf::from(macaroon),
+                        address_type: OnChainAddressType::default(),
+                        account: None,
+                        min_confirmations: 1,
+                    });
+                    let payment_config = PaymentMethodConfig::new_with_config(
+                        company_id,
+                        PaymentMethod::OnChain,
+                        "LND On-chain".to_string(),
+                        true,
+                        onchain_config,
+                    );
+                    db.insert_payment_method_config(&payment_config).await?;
+                    info!("Migrated LND on-chain config for company {}", company_id);
                     migrated_count += 1;
                 }
                 LightningConfig::Bitvora {

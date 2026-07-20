@@ -123,6 +123,19 @@ feature), now available on crates.io as `payments-rs = 0.4.1`.
       now carry `vout` (payments-rs commit f107f04, published as **0.5.0** on
       crates.io); workspace dep bumped to 0.5.0.
 
+### Increment 6 — dedicated DB config + factory (review feedback)
+- [x] `OnChainProviderConfig` (url/cert/macaroon + `address_type`, `account`,
+      `min_confirmations` with serde defaults) replaces the reused `LndConfig` in
+      `ProviderConfig::OnChain`; serde tag fixed to `onchain` (was snake_cased to
+      `on_chain`, inconsistent with `provider_type()`).
+- [x] Factory: `create_onchain_provider` + `get_onchain_provider_for_company`
+      (feature-gated `onchain`), mapping `OnChainAddressType` → `LndAddressType`.
+- [x] Data migration seeds an `OnChain` config from the YAML LND section.
+- [x] Admin `SanitizedOnChainConfig` exposes the new fields.
+- [ ] Runtime still builds the provider from YAML settings (hardcoded 1-conf/p2wkh)
+      — completing the factory→runtime integration is issue #182 (Lightning has the
+      same gap; the factory is currently dead code at runtime).
+
 ### Increment 5 — API surface + docs (S)
 - [x] `ApiPaymentMethod::OnChain` / `ApiPaymentData::OnChain { address }` exposed.
 - [x] `API_CHANGELOG.md` updated (Unreleased).
