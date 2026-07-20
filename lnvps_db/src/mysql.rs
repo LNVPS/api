@@ -760,7 +760,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn count_vms_by_os_image(&self) -> DbResult<Vec<(u64, u64)>> {
         Ok(sqlx::query_as(
-            "SELECT image_id, COUNT(*) FROM vm WHERE deleted = 0 GROUP BY image_id",
+            "SELECT image_id, CAST(COUNT(*) AS UNSIGNED) FROM vm WHERE deleted = 0 GROUP BY image_id",
         )
         .fetch_all(&self.db)
         .await?)
