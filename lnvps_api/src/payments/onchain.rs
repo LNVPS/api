@@ -13,31 +13,38 @@
 //! # Delivery / de-duplication
 //!
 //! The provider stream is at-least-once and replayable; exactly-once
-//! accounting is achieved by storing the **txid** in `external_id` (unique
-//! index) and skipping any update whose txid is already recorded.
+//! accounting is achieved by storing the deposit's **outpoint**
+//! (`{txid}:{vout}`) in `external_id` (unique index) and skipping any update
+//! whose outpoint is already settled. The txid alone is not enough: one
+//! transaction can pay several watched addresses at once — each output is a
+//! distinct deposit that must settle its own payment.
 //!
-//! # Pro-rating (issue #109)
+//! # Pricing (issue #109)
 //!
-//! On-chain funds can arrive at any time and for any amount. Deposits are
-//! never rejected, and the exchange rate is **always re-calculated when the
-//! transaction is discovered** — the original quote only fixes the price in
-//! the subscription's currency, never the BTC rate:
+//! On-chain funds can arrive at any time and for any amount; deposits are
+//! never rejected. The quote on the pending payment is **discarded** when the
+//! deposit is discovered: pricing (`time_value`, `tax`, `processing_fee`,
+//! `rate`) is re-generated from the received amount at the rates current at
+//! discovery, exactly like an LNURL top-up (`PricingEngine::get_cost_by_amount`).
 //!
-//! - A deposit for a pending payment settles it. `time_value` is scaled by
-//!   the *value* that arrived, measured at the current rate:
-//!   `received_msat * rate_now / (expected_msat * rate_quoted)`. For
-//!   BTC-denominated subscriptions this reduces to `received / expected`.
+//! - The re-generation happens at `Detected` (0-conf, first sight of the tx),
+//!   so time-to-confirm never matters to the customer. `Confirmed` then just
+//!   settles. If the `Detected` event was never seen (e.g. the tx confirmed
+//!   while the watcher was down), pricing is generated at confirmation
+//!   instead — the moment we discover it.
 //! - A deposit to an address whose payment already settled (address reuse)
-//!   automatically inserts a **new** pro-rated renewal payment, priced the
-//!   same way at the current rate.
+//!   automatically inserts a **new** renewal payment, priced the same way.
+//! - Subscriptions without a VM have no amount→cost pricing; they fall back
+//!   to scaling the original quote by the value received at the current rate.
 
 use crate::subscription::SubscriptionHandler;
 use anyhow::{Result, bail, ensure};
 use chrono::Utc;
 use futures::StreamExt;
+use lnvps_api_common::CostResult;
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
-use log::{debug, error, info, warn};
-use payments_rs::currency::Currency;
+use log::{debug, error, info};
+use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::onchain::{ChainPaymentUpdate, OnChainProvider};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -57,6 +64,14 @@ fn pro_rate(value: u64, received: u64, expected: u64) -> u64 {
 /// Scale `value` by an arbitrary ratio, flooring to whole units.
 fn pro_rate_f64(value: u64, ratio: f64) -> u64 {
     (value as f64 * ratio).floor() as u64
+}
+
+/// Unique key for one deposit: the standard outpoint notation `{txid}:{vout}`.
+///
+/// One transaction can pay multiple watched addresses (one output each), so
+/// the txid alone does not identify a deposit.
+fn deposit_key(txid: &str, vout: u32) -> String {
+    format!("{}:{}", txid, vout)
 }
 
 impl OnChainPaymentHandler {
@@ -84,129 +99,210 @@ impl OnChainPaymentHandler {
             .max_by_key(|p| p.created))
     }
 
-    /// How much of the quoted *value* arrived, measured at the **current**
-    /// exchange rate, plus that rate.
-    ///
-    /// The quote fixed a price in the subscription's currency; the BTC rate is
-    /// never locked in. `received_msat * rate_now / (expected_msat *
-    /// rate_quoted)` — for BTC-denominated subscriptions (rate 1:1) this is
-    /// just `received / expected`.
-    async fn value_ratio(
-        &self,
-        payment: &SubscriptionPayment,
-        amount_msat: u64,
-        expected: u64,
-    ) -> Result<(f64, f32)> {
+    /// Current BTC exchange rate for the payment's subscription currency.
+    async fn current_rate(&self, payment: &SubscriptionPayment) -> Result<f32> {
         let sub = self.db.get_subscription(payment.subscription_id).await?;
         let sub_currency = Currency::from_str(&sub.currency)
             .map_err(|e| anyhow::anyhow!("Invalid subscription currency: {}", e))?;
-        let rate_now = self
+        Ok(self
             .sub_handler
             .pricing_engine()
             .get_ticker(Currency::BTC, sub_currency)
             .await?
-            .rate;
-        ensure!(
-            payment.rate > 0.0,
-            "Payment {} has invalid quoted rate",
-            hex::encode(&payment.id)
-        );
-        let ratio =
-            (amount_msat as f64 * rate_now as f64) / (expected as f64 * payment.rate as f64);
-        Ok((ratio, rate_now))
+            .rate)
     }
 
-    /// Handle a confirmed deposit of `amount_msat` to `address` in tx `txid`.
-    async fn handle_deposit(&self, address: &str, txid: &str, amount_msat: u64) -> Result<()> {
-        // De-dupe: the stream is at-least-once, a known txid was already handled.
+    /// Re-generate a payment's pricing from the gross msats received, at the
+    /// rates current right now. The original quote is discarded.
+    ///
+    /// VM-backed subscriptions price through the pricing engine exactly like
+    /// LNURL top-ups. Subscriptions without a VM have no amount→cost pricing
+    /// and fall back to scaling the original quote by the value received.
+    async fn regenerate(&self, payment: &mut SubscriptionPayment, gross_msat: u64) -> Result<()> {
+        match self
+            .db
+            .get_vm_by_subscription(payment.subscription_id)
+            .await
+        {
+            Ok(vm) => {
+                // The engine prices from the net amount and adds tax on top;
+                // split the gross deposit using the frozen tax rate.
+                let tax_pct = payment.tax_rate.unwrap_or(0.0) as f64;
+                let net = (gross_msat as f64 / (1.0 + tax_pct / 100.0)).floor() as u64;
+                let cost = self
+                    .sub_handler
+                    .pricing_engine()
+                    .get_cost_by_amount(
+                        vm.id,
+                        CurrencyAmount::millisats(net),
+                        PaymentMethod::OnChain,
+                    )
+                    .await?;
+                let p = match cost {
+                    CostResult::New(p) => p,
+                    CostResult::Existing(_) => bail!("Unexpected existing cost result"),
+                };
+                payment.time_value = Some(p.time_value);
+                payment.rate = p.rate.rate;
+                // Components always sum to exactly what arrived
+                payment.tax = p.tax.min(gross_msat);
+                payment.processing_fee = p.processing_fee.min(gross_msat - payment.tax);
+                payment.amount = gross_msat - payment.tax - payment.processing_fee;
+            }
+            Err(_) => {
+                // No VM: scale the original quote by the value received at
+                // the current rate.
+                let expected = payment.amount + payment.tax + payment.processing_fee;
+                ensure!(
+                    expected > 0,
+                    "Payment {} has zero expected amount",
+                    hex::encode(&payment.id)
+                );
+                ensure!(
+                    payment.rate > 0.0,
+                    "Payment {} has invalid quoted rate",
+                    hex::encode(&payment.id)
+                );
+                let rate_now = self.current_rate(payment).await?;
+                let ratio =
+                    (gross_msat as f64 * rate_now as f64) / (expected as f64 * payment.rate as f64);
+                payment.tax = pro_rate(payment.tax, gross_msat, expected);
+                payment.processing_fee = pro_rate(payment.processing_fee, gross_msat, expected);
+                payment.amount = gross_msat - payment.tax - payment.processing_fee;
+                payment.time_value = payment.time_value.map(|tv| pro_rate_f64(tv, ratio));
+                payment.rate = rate_now;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a deposit **first seen** in the mempool (0-conf `Detected`).
+    ///
+    /// Re-generates the pending payment's pricing from the received amount at
+    /// the current rate and tags it with the deposit key (`external_id`), so
+    /// settlement at `Confirmed` needs no further pricing — time to confirm
+    /// does not matter to the customer.
+    async fn handle_detected(
+        &self,
+        address: &str,
+        txid: &str,
+        vout: u32,
+        amount_msat: u64,
+    ) -> Result<()> {
+        let key = deposit_key(txid, vout);
+        // Already priced or settled (replayed event)
         if self
             .db
-            .get_subscription_payment_by_ext_id(txid)
+            .get_subscription_payment_by_ext_id(&key)
             .await
             .is_ok()
         {
-            debug!("Skipping already processed deposit {}", txid);
             return Ok(());
         }
-
-        let Some(payment) = self.payment_for_address(address).await? else {
-            debug!("Deposit {} to unknown address {}, ignoring", txid, address);
+        let Some(mut payment) = self.payment_for_address(address).await? else {
             return Ok(());
         };
-
-        let expected = payment.amount + payment.tax + payment.processing_fee;
-        if expected == 0 {
-            bail!(
-                "Payment {} has zero expected amount, cannot pro-rate deposit {}",
-                hex::encode(&payment.id),
-                txid
-            );
+        // Address-reuse deposits are handled at confirmation; only a pending
+        // payment is re-priced here.
+        if payment.is_paid {
+            return Ok(());
         }
+        self.regenerate(&mut payment, amount_msat).await?;
+        info!(
+            "Deposit {} detected: priced payment {} at rate {} for {} msat ({}s)",
+            key,
+            hex::encode(&payment.id),
+            payment.rate,
+            amount_msat,
+            payment.time_value.unwrap_or(0)
+        );
+        payment.external_id = Some(key);
+        self.db.update_subscription_payment(&payment).await?;
+        Ok(())
+    }
 
-        // The BTC rate is always re-calculated when the tx is discovered; the
-        // quote only fixed the price in the subscription's currency.
-        let (ratio, rate_now) = self.value_ratio(&payment, amount_msat, expected).await?;
+    /// Handle a confirmed deposit of `amount_msat` to `address` in tx `txid`.
+    async fn handle_deposit(
+        &self,
+        address: &str,
+        txid: &str,
+        vout: u32,
+        amount_msat: u64,
+    ) -> Result<()> {
+        // De-dupe: the stream is at-least-once, a settled (txid, address)
+        // deposit was already handled. An *unpaid* match is the pending
+        // payment priced at Detected.
+        let key = deposit_key(txid, vout);
+        let priced = match self.db.get_subscription_payment_by_ext_id(&key).await {
+            Ok(p) if p.is_paid => {
+                debug!("Skipping already processed deposit {}", key);
+                return Ok(());
+            }
+            Ok(p) => Some(p),
+            Err(_) => None,
+        };
+
+        let already_priced = priced.is_some();
+        let payment = match priced {
+            Some(p) => p,
+            None => match self.payment_for_address(address).await? {
+                Some(p) => p,
+                None => {
+                    debug!("Deposit {} to unknown address {}, ignoring", txid, address);
+                    return Ok(());
+                }
+            },
+        };
 
         if !payment.is_paid {
-            // Settle the pending payment, crediting the time the received
-            // value actually buys at the current rate.
             let mut payment = payment;
+            // Price now unless Detected already did (and for the same gross
+            // amount — a replaced tx could change the output value).
+            let priced_gross = payment.amount + payment.tax + payment.processing_fee;
+            if !already_priced || priced_gross != amount_msat {
+                self.regenerate(&mut payment, amount_msat).await?;
+            }
             info!(
-                "Settling on-chain payment {}: received {} msat (expected {} msat), value ratio {:.4}",
+                "Settling on-chain payment {}: {} msat at rate {} ({}s)",
                 hex::encode(&payment.id),
                 amount_msat,
-                expected,
-                ratio
+                payment.rate,
+                payment.time_value.unwrap_or(0)
             );
-            // Split what arrived proportionally between net/tax/fee so the
-            // components always sum to the received amount.
-            payment.tax = pro_rate(payment.tax, amount_msat, expected);
-            payment.processing_fee = pro_rate(payment.processing_fee, amount_msat, expected);
-            payment.amount = amount_msat - payment.tax - payment.processing_fee;
-            payment.time_value = payment.time_value.map(|tv| pro_rate_f64(tv, ratio));
-            payment.rate = rate_now;
-            payment.external_id = Some(txid.to_string());
+            payment.external_id = Some(key);
             self.db.update_subscription_payment(&payment).await?;
             self.sub_handler.complete_payment(&payment).await?;
         } else {
-            // Address reuse after settlement: insert a new pro-rated renewal
-            // payment based on the original quote (issue #109).
-            let Some(time_value) = payment.time_value else {
-                warn!(
-                    "Deposit {} to settled payment {} without time_value, cannot pro-rate",
-                    txid,
-                    hex::encode(&payment.id)
-                );
-                return Ok(());
-            };
+            // Address reuse after settlement: insert a new renewal payment,
+            // priced from the received amount (issue #109).
             info!(
-                "New deposit {} of {} msat to settled address of payment {}, creating pro-rated renewal (value ratio {:.4})",
+                "New deposit {} of {} msat to settled address of payment {}, creating renewal",
                 txid,
                 amount_msat,
-                hex::encode(&payment.id),
-                ratio
+                hex::encode(&payment.id)
             );
-            let tax = pro_rate(payment.tax, amount_msat, expected);
-            let processing_fee = pro_rate(payment.processing_fee, amount_msat, expected);
             let new_id: [u8; 32] = rand::random();
-            let renewal = SubscriptionPayment {
+            let mut renewal = SubscriptionPayment {
                 id: new_id.to_vec(),
                 subscription_id: payment.subscription_id,
                 user_id: payment.user_id,
                 created: Utc::now(),
                 expires: Utc::now(),
-                amount: amount_msat - tax - processing_fee,
+                // Seed pricing from the settled payment; regenerate below
+                // overwrites it (and uses it as the quote reference for the
+                // no-VM fallback).
+                amount: payment.amount,
                 currency: payment.currency.clone(),
                 payment_method: PaymentMethod::OnChain,
                 payment_type: SubscriptionPaymentType::Renewal,
                 external_data: address.into(),
-                external_id: Some(txid.to_string()),
+                external_id: Some(key),
                 is_paid: false,
-                rate: rate_now,
-                time_value: Some(pro_rate_f64(time_value, ratio)),
+                rate: payment.rate,
+                time_value: payment.time_value,
                 metadata: None,
-                tax,
-                processing_fee,
+                tax: payment.tax,
+                processing_fee: payment.processing_fee,
                 paid_at: None,
                 tax_rate: payment.tax_rate,
                 tax_country_code: payment.tax_country_code.clone(),
@@ -214,6 +310,7 @@ impl OnChainPaymentHandler {
                 tax_evidence: payment.tax_evidence.clone(),
                 tax_breakdown: payment.tax_breakdown.clone(),
             };
+            self.regenerate(&mut renewal, amount_msat).await?;
             self.db.insert_subscription_payment(&renewal).await?;
             self.sub_handler.complete_payment(&renewal).await?;
         }
@@ -222,32 +319,44 @@ impl OnChainPaymentHandler {
 
     pub async fn listen(&mut self) -> Result<()> {
         info!("Listening for on-chain deposits");
-        // Subscribe from the start; the txid de-dupe above makes replaying
-        // history harmless (at-least-once -> exactly-once).
+        // Subscribe from the start; the deposit-key de-dupe above makes
+        // replaying history harmless (at-least-once -> exactly-once).
         let mut stream = self.provider.subscribe_payments(None).await?;
         while let Some(update) = stream.next().await {
             match update {
                 ChainPaymentUpdate::Confirmed {
                     address,
                     txid,
+                    vout,
                     amount_msat,
                     ..
                 } => {
-                    if let Err(e) = self.handle_deposit(&address, &txid, amount_msat).await {
+                    if let Err(e) = self
+                        .handle_deposit(&address, &txid, vout, amount_msat)
+                        .await
+                    {
                         error!("onchain deposit error for {}: {}", txid, e);
                     }
                 }
                 ChainPaymentUpdate::Detected {
                     address,
                     txid,
+                    vout,
                     amount_msat,
                     confirmations,
                     ..
                 } => {
                     debug!(
-                        "Detected deposit {} of {} msat to {} ({} confs)",
-                        txid, amount_msat, address, confirmations
+                        "Detected deposit {}:{} of {} msat to {} ({} confs)",
+                        txid, vout, amount_msat, address, confirmations
                     );
+                    // Price the payment at first sight of the tx
+                    if let Err(e) = self
+                        .handle_detected(&address, &txid, vout, amount_msat)
+                        .await
+                    {
+                        error!("onchain detect error for {}: {}", txid, e);
+                    }
                 }
                 ChainPaymentUpdate::Error(e) => bail!("onchain stream error: {}", e),
             }
@@ -263,7 +372,8 @@ mod tests {
     use crate::settings::mock_settings;
     use anyhow::Result;
     use lnvps_api_common::{
-        ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate, Ticker, VmStateCache,
+        ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate, NewPaymentInfo,
+        Ticker, VmStateCache,
     };
     use lnvps_db::{
         IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionType, Vm,
@@ -274,37 +384,28 @@ mod tests {
     const TAX: u64 = 100_000;
     const EXPECTED: u64 = AMOUNT + TAX;
     const TIME_VALUE: u64 = 86_400;
+    const RATE: f32 = 100_000.0;
 
-    /// DB with a VM + subscription and one unpaid on-chain payment for [`ADDRESS`].
-    async fn setup() -> Result<(
-        Arc<MockDb>,
-        Arc<MockOnChainProvider>,
-        OnChainPaymentHandler,
-        SubscriptionPayment,
-    )> {
-        // BTC-denominated: value ratio is the plain msat ratio
-        setup_with("BTC", 1.0, None).await
-    }
-
-    /// Like [`setup`] but with an explicit subscription currency, quoted rate
-    /// on the pending payment, and current exchange rate.
+    /// Build DB + handler with a subscription and one unpaid on-chain payment
+    /// for [`ADDRESS`]. `with_vm` links a VM (template 1 / cost plan 1 from
+    /// MockDb) so pricing regenerates through the engine; without it the
+    /// watcher uses the quote-scaling fallback.
     async fn setup_with(
-        currency: &str,
+        with_vm: bool,
         quoted_rate: f32,
-        current_rate: Option<f32>,
+        current_rate: f32,
     ) -> Result<(
         Arc<MockDb>,
         Arc<MockOnChainProvider>,
         OnChainPaymentHandler,
         SubscriptionPayment,
+        Arc<MockExchangeRate>,
     )> {
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
         let provider = Arc::new(MockOnChainProvider::default());
         let rates = Arc::new(MockExchangeRate::default());
-        if let Some(r) = current_rate {
-            rates.set_rate(Ticker::btc_rate(currency)?, r).await;
-        }
+        rates.set_rate(Ticker::btc_rate("EUR")?, current_rate).await;
 
         let pubkey: [u8; 32] = [1u8; 32];
         let user_id = db.upsert_user(&pubkey).await?;
@@ -330,7 +431,7 @@ mod tests {
                     expires: None,
                     is_active: false,
                     is_setup: false,
-                    currency: currency.to_string(),
+                    currency: "EUR".to_string(),
                     interval_amount: 1,
                     interval_type: IntervalType::Month,
                     setup_fee: 0,
@@ -350,21 +451,23 @@ mod tests {
             )
             .await?;
 
-        db.insert_vm(&Vm {
-            id: 0,
-            host_id: 1,
-            user_id,
-            image_id: 1,
-            template_id: Some(1),
-            custom_template_id: None,
-            subscription_line_item_id: line_item_ids[0],
-            ssh_key_id: Some(ssh_key_id),
-            disk_id: 1,
-            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
-            deleted: false,
-            ..Default::default()
-        })
-        .await?;
+        if with_vm {
+            db.insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id,
+                image_id: 1,
+                template_id: Some(1),
+                custom_template_id: None,
+                subscription_line_item_id: line_item_ids[0],
+                ssh_key_id: Some(ssh_key_id),
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                deleted: false,
+                ..Default::default()
+            })
+            .await?;
+        }
 
         let payment = SubscriptionPayment {
             id: vec![42u8; 32],
@@ -398,13 +501,24 @@ mod tests {
             db.clone(),
             node,
             provider.clone(),
-            rates,
+            rates.clone(),
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
         )?;
         let handler = OnChainPaymentHandler::new(provider.clone(), db.clone(), sub);
 
+        Ok((db, provider, handler, payment, rates))
+    }
+
+    /// VM-backed setup at [`RATE`].
+    async fn setup() -> Result<(
+        Arc<MockDb>,
+        Arc<MockOnChainProvider>,
+        OnChainPaymentHandler,
+        SubscriptionPayment,
+    )> {
+        let (db, provider, handler, payment, _rates) = setup_with(true, RATE, RATE).await?;
         Ok((db, provider, handler, payment))
     }
 
@@ -418,6 +532,40 @@ mod tests {
             .expect("payment")
     }
 
+    /// What the pricing engine would generate for `gross` msats right now.
+    async fn engine_price(
+        handler: &OnChainPaymentHandler,
+        sub_id: u64,
+        gross: u64,
+    ) -> Result<NewPaymentInfo> {
+        let vm = handler.db.get_vm_by_subscription(sub_id).await?;
+        match handler
+            .sub_handler
+            .pricing_engine()
+            .get_cost_by_amount(
+                vm.id,
+                CurrencyAmount::millisats(gross),
+                PaymentMethod::OnChain,
+            )
+            .await?
+        {
+            CostResult::New(p) => Ok(p),
+            CostResult::Existing(_) => bail!("unexpected existing"),
+        }
+    }
+
+    /// The engine's time_value depends on Utc::now(); allow a small drift
+    /// between the expectation call and the watcher's own call.
+    fn assert_close(a: u64, b: u64) {
+        assert!(
+            a.abs_diff(b) <= 5,
+            "expected {} ≈ {} (diff {})",
+            a,
+            b,
+            a.abs_diff(b)
+        );
+    }
+
     #[test]
     fn test_pro_rate() {
         assert_eq!(pro_rate(TIME_VALUE, EXPECTED, EXPECTED), TIME_VALUE);
@@ -426,43 +574,59 @@ mod tests {
         assert_eq!(pro_rate(0, EXPECTED, EXPECTED), 0);
         // u128 intermediate: no overflow on large values
         assert_eq!(pro_rate(u64::MAX, 1000, 1000), u64::MAX);
+        assert_eq!(pro_rate_f64(100, 1.5), 150);
+        assert_eq!(pro_rate_f64(100, 0.333), 33);
     }
 
-    /// Exact deposit settles the pending payment untouched.
+    #[test]
+    fn test_deposit_key() {
+        // standard outpoint notation; txid alone is not the key
+        assert_eq!(deposit_key("tx1", 0), "tx1:0");
+        assert_ne!(deposit_key("tx1", 0), deposit_key("tx1", 1));
+    }
+
+    /// A confirmed deposit settles the pending payment with pricing
+    /// re-generated by the engine (quote discarded).
     #[tokio::test]
-    async fn test_exact_deposit_settles_payment() -> Result<()> {
+    async fn test_deposit_settles_with_engine_pricing() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        handler.handle_deposit(ADDRESS, "tx1", EXPECTED).await?;
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
 
         let p = get_payment(&db, &payment.id).await;
         assert!(p.is_paid);
-        assert_eq!(p.external_id.as_deref(), Some("tx1"));
-        assert_eq!(p.amount, AMOUNT);
-        assert_eq!(p.tax, TAX);
-        assert_eq!(p.time_value, Some(TIME_VALUE));
+        assert_eq!(p.external_id, Some(deposit_key("tx1", 0)));
+        assert_eq!(p.rate, expect.rate.rate);
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        // components sum to exactly what arrived
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED);
         Ok(())
     }
 
-    /// Partial deposit is pro-rated: amount/tax/time all scale by received/expected.
+    /// Half the deposit buys half the time (engine pricing is linear).
     #[tokio::test]
-    async fn test_partial_deposit_pro_rates() -> Result<()> {
+    async fn test_partial_deposit_buys_less_time() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        handler.handle_deposit(ADDRESS, "tx1", EXPECTED / 2).await?;
+        let expect_full = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED / 2)
+            .await?;
 
         let p = get_payment(&db, &payment.id).await;
         assert!(p.is_paid);
-        assert_eq!(p.tax, TAX / 2);
-        assert_eq!(p.amount, EXPECTED / 2 - TAX / 2);
-        assert_eq!(p.time_value, Some(TIME_VALUE / 2));
+        assert_close(p.time_value.unwrap(), expect_full.time_value / 2);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED / 2);
         Ok(())
     }
 
-    /// A replayed txid must not settle or create anything (at-least-once stream).
+    /// A replayed deposit must not settle or create anything.
     #[tokio::test]
-    async fn test_duplicate_txid_skipped() -> Result<()> {
+    async fn test_duplicate_deposit_skipped() -> Result<()> {
         let (db, _provider, handler, _payment) = setup().await?;
-        handler.handle_deposit(ADDRESS, "tx1", EXPECTED).await?;
-        handler.handle_deposit(ADDRESS, "tx1", EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
 
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
         Ok(())
@@ -473,7 +637,7 @@ mod tests {
     async fn test_unknown_address_ignored() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
         handler
-            .handle_deposit("bcrt1qunknown", "tx1", EXPECTED)
+            .handle_deposit("bcrt1qunknown", "tx1", 0, EXPECTED)
             .await?;
 
         let p = get_payment(&db, &payment.id).await;
@@ -482,19 +646,23 @@ mod tests {
         Ok(())
     }
 
-    /// A deposit to an already-settled address inserts a new pro-rated renewal.
+    /// A deposit to an already-settled address inserts a new renewal payment
+    /// priced from the received amount.
     #[tokio::test]
     async fn test_address_reuse_inserts_renewal() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        handler.handle_deposit(ADDRESS, "tx1", EXPECTED).await?;
-        // half the original amount arrives later at the same address
-        handler.handle_deposit(ADDRESS, "tx2", EXPECTED / 2).await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED / 2).await?;
+        handler
+            .handle_deposit(ADDRESS, "tx2", 0, EXPECTED / 2)
+            .await?;
 
         let payments = db.subscription_payments.lock().await.clone();
         assert_eq!(payments.len(), 2);
         let renewal = payments
             .iter()
-            .find(|p| p.external_id.as_deref() == Some("tx2"))
+            .find(|p| p.external_id == Some(deposit_key("tx2", 0)))
             .expect("renewal payment");
         assert!(renewal.is_paid);
         assert_ne!(renewal.id, payment.id);
@@ -502,20 +670,94 @@ mod tests {
         assert_eq!(renewal.payment_method, PaymentMethod::OnChain);
         assert_eq!(renewal.subscription_id, payment.subscription_id);
         assert_eq!(renewal.external_data.as_str(), ADDRESS);
-        assert_eq!(renewal.tax, TAX / 2);
-        assert_eq!(renewal.amount, EXPECTED / 2 - TAX / 2);
-        assert_eq!(renewal.time_value, Some(TIME_VALUE / 2));
+        assert_close(renewal.time_value.unwrap(), expect.time_value);
+        assert_eq!(
+            renewal.amount + renewal.tax + renewal.processing_fee,
+            EXPECTED / 2
+        );
         Ok(())
     }
 
-    /// listen() drains scripted updates: Confirmed settles, Detected is ignored.
+    /// Pricing is generated when the tx is first seen (`Detected`): later
+    /// rate moves before confirmation do not change the credited time.
     #[tokio::test]
-    async fn test_listen_processes_confirmed_updates() -> Result<()> {
+    async fn test_detected_locks_pricing() -> Result<()> {
+        let (db, _provider, handler, payment, rates) = setup_with(true, RATE, RATE).await?;
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        // Tx first seen: payment re-priced in place and tagged
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let p = get_payment(&db, &payment.id).await;
+        assert!(!p.is_paid);
+        assert_eq!(p.external_id, Some(deposit_key("tx1", 0)));
+        assert_eq!(p.rate, expect.rate.rate);
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        let locked_time = p.time_value.unwrap();
+
+        // Rate halves before the tx confirms -> the locked pricing stays
+        rates.set_rate(Ticker::btc_rate("EUR")?, RATE / 2.0).await;
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?; // replay, no-op
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.rate, expect.rate.rate);
+        assert_eq!(p.time_value, Some(locked_time));
+        Ok(())
+    }
+
+    /// One transaction paying two watched addresses settles both payments:
+    /// deposits are keyed by (txid, address), not txid alone.
+    #[tokio::test]
+    async fn test_same_txid_two_addresses() -> Result<()> {
+        const ADDRESS2: &str = "bcrt1qtestaddr1";
+        let (db, _provider, handler, payment) = setup().await?;
+        // Second pending payment for another address
+        let mut payment2 = payment.clone();
+        payment2.id = vec![43u8; 32];
+        payment2.external_data = ADDRESS2.into();
+        db.insert_subscription_payment(&payment2).await?;
+
+        // Both outputs of the same tx
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS2, "tx1", 1, EXPECTED).await?;
+
+        let p1 = get_payment(&db, &payment.id).await;
+        let p2 = get_payment(&db, &payment2.id).await;
+        assert!(p1.is_paid);
+        assert!(p2.is_paid);
+        assert_eq!(p1.external_id, Some(deposit_key("tx1", 0)));
+        assert_eq!(p2.external_id, Some(deposit_key("tx1", 1)));
+        assert_ne!(p1.external_id, p2.external_id);
+        Ok(())
+    }
+
+    /// Subscriptions without a VM fall back to scaling the original quote by
+    /// value at the current rate.
+    #[tokio::test]
+    async fn test_no_vm_fallback_scales_quote() -> Result<()> {
+        // Quoted at 100k EUR/BTC; rate doubled by discovery -> same msats are
+        // worth twice the quoted value -> twice the time.
+        let (db, _provider, handler, payment, _rates) = setup_with(false, RATE, RATE * 2.0).await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.time_value, Some(TIME_VALUE * 2));
+        assert_eq!(p.rate, RATE * 2.0);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED);
+        Ok(())
+    }
+
+    /// listen() drains scripted updates: Detected prices, Confirmed settles.
+    #[tokio::test]
+    async fn test_listen_processes_updates() -> Result<()> {
         let (db, provider, mut handler, payment) = setup().await?;
         provider.updates.lock().await.extend([
             ChainPaymentUpdate::Detected {
                 address: ADDRESS.to_string(),
                 txid: "tx1".to_string(),
+                vout: 0,
                 amount_msat: EXPECTED,
                 confirmations: 0,
                 label: None,
@@ -523,6 +765,7 @@ mod tests {
             ChainPaymentUpdate::Confirmed {
                 address: ADDRESS.to_string(),
                 txid: "tx1".to_string(),
+                vout: 0,
                 amount_msat: EXPECTED,
                 confirmations: 1,
                 label: None,
@@ -532,39 +775,7 @@ mod tests {
 
         let p = get_payment(&db, &payment.id).await;
         assert!(p.is_paid);
-        assert_eq!(p.external_id.as_deref(), Some("tx1"));
-        Ok(())
-    }
-
-    /// The BTC rate is re-calculated when the tx is discovered: a fiat quote
-    /// paid in full in msat terms credits time by *value* at the current rate.
-    #[tokio::test]
-    async fn test_fiat_quote_repriced_at_current_rate() -> Result<()> {
-        // Quoted at 100k EUR/BTC; by discovery the rate doubled to 200k, so
-        // the same msats are worth twice the quoted value -> twice the time.
-        let (db, _provider, handler, payment) =
-            setup_with("EUR", 100_000.0, Some(200_000.0)).await?;
-        handler.handle_deposit(ADDRESS, "tx1", EXPECTED).await?;
-
-        let p = get_payment(&db, &payment.id).await;
-        assert!(p.is_paid);
-        assert_eq!(p.time_value, Some(TIME_VALUE * 2));
-        assert_eq!(p.rate, 200_000.0, "current rate recorded on the payment");
-        // msat components are unchanged (full msat amount arrived)
-        assert_eq!(p.amount, AMOUNT);
-        assert_eq!(p.tax, TAX);
-
-        // Address reuse is also priced at the (new) current rate
-        handler.handle_deposit(ADDRESS, "tx2", EXPECTED / 2).await?;
-        let payments = db.subscription_payments.lock().await.clone();
-        let renewal = payments
-            .iter()
-            .find(|p| p.external_id.as_deref() == Some("tx2"))
-            .expect("renewal payment");
-        // reference payment now has rate 200k and time 2*TIME_VALUE; half the
-        // msats at the same rate -> half its time
-        assert_eq!(renewal.time_value, Some(TIME_VALUE));
-        assert_eq!(renewal.rate, 200_000.0);
+        assert_eq!(p.external_id, Some(deposit_key("tx1", 0)));
         Ok(())
     }
 

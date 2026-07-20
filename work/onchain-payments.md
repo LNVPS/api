@@ -111,11 +111,17 @@ feature), now available on crates.io as `payments-rs = 0.4.1`.
 - [x] Registered in `listen_all_payments` (provider passed from `bin/api.rs`).
 - [x] 8 watcher tests: exact/partial deposits, replay de-dupe, unknown address,
       address-reuse renewal, listen loop, stream error.
-- [x] Rate is **re-calculated at tx discovery** (review feedback): time credited =
-      `time_value × received_msat × rate_now / (expected_msat × rate_quoted)`;
-      the quote only fixes the price in the subscription currency, never the BTC
-      rate. Current rate is recorded on the settled payment. BTC-denominated subs
-      reduce to the plain msat ratio. `PricingEngine::get_ticker` made pub.
+- [x] Pricing is **re-generated at tx discovery** (review feedback, superseding the
+      earlier scaling approach): `Detected` (0-conf) discards the quote and re-prices
+      the pending payment from the received amount via
+      `PricingEngine::get_cost_by_amount` — the same path as LNURL top-ups — then
+      tags it with the deposit key; `Confirmed` just settles. Fallback for
+      subscriptions without a VM (no amount→cost API): scale the quote by value at
+      the current rate. `PricingEngine::get_ticker` made pub.
+- [x] Deposits keyed by the standard outpoint `{txid}:{vout}`. Required exposing
+      the output index in payments-rs: `ChainPaymentUpdate::{Detected,Confirmed}`
+      now carry `vout` (payments-rs commit f107f04, published as **0.5.0** on
+      crates.io); workspace dep bumped to 0.5.0.
 
 ### Increment 5 — API surface + docs (S)
 - [x] `ApiPaymentMethod::OnChain` / `ApiPaymentData::OnChain { address }` exposed.
