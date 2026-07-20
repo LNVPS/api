@@ -516,6 +516,16 @@ impl LNVpsDbBase for MockDb {
                 .collect()
         };
 
+        // Collect the per-VM custom templates (1:1 with their VM) so they can be
+        // removed alongside the VMs.
+        let custom_template_ids: Vec<u64> = {
+            let vms = self.vms.lock().await;
+            vms.values()
+                .filter(|v| v.user_id == id)
+                .filter_map(|v| v.custom_template_id)
+                .collect()
+        };
+
         // Remove VM child records.
         self.ip_assignments
             .lock()
@@ -530,8 +540,12 @@ impl LNVpsDbBase for MockDb {
             .await
             .retain(|_, h| !user_vm_ids.contains(&h.vm_id));
 
-        // Remove the VMs and the user's other owned records.
+        // Remove the VMs, their 1:1 custom templates, and the user's other records.
         self.vms.lock().await.retain(|_, v| v.user_id != id);
+        self.custom_template
+            .lock()
+            .await
+            .retain(|tid, _| !custom_template_ids.contains(tid));
         self.user_ssh_keys
             .lock()
             .await
@@ -4752,6 +4766,14 @@ mod tests {
                 key_data: "ssh-ed25519 AAAA".into(),
             },
         );
+        db.custom_template.lock().await.insert(
+            55,
+            VmCustomTemplate {
+                id: 55,
+                pricing_id: 1,
+                ..Default::default()
+            },
+        );
         {
             let mut vms = db.vms.lock().await;
             vms.insert(
@@ -4760,6 +4782,7 @@ mod tests {
                     id: 100,
                     user_id: uid,
                     deleted: false,
+                    custom_template_id: Some(55),
                     ..MockDb::mock_vm()
                 },
             );
@@ -4776,6 +4799,8 @@ mod tests {
         assert!(db.get_user(uid).await.is_err());
         assert!(db.vms.lock().await.get(&100).is_none());
         assert!(db.user_ssh_keys.lock().await.get(&10).is_none());
+        // The 1:1 custom template is purged with its VM.
+        assert!(db.custom_template.lock().await.get(&55).is_none());
     }
 }
 

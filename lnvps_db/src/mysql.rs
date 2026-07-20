@@ -253,11 +253,29 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&mut *tx)
             .await?;
 
-        // Remove the VMs themselves, then the SSH keys they referenced.
+        // Capture the per-VM custom templates before removing the VMs. A
+        // vm_custom_template row exists 1:1 with the VM that owns it, so once the
+        // VM is gone the template must go too (its region-level vm_custom_pricing
+        // is shared config and is left untouched).
+        let custom_template_ids: Vec<u64> = sqlx::query_scalar(
+            "select custom_template_id from vm where user_id = ? and custom_template_id is not null",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Remove the VMs themselves, then their custom templates and the SSH keys
+        // they referenced.
         sqlx::query("delete from vm where user_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        for template_id in custom_template_ids {
+            sqlx::query("delete from vm_custom_template where id = ?")
+                .bind(template_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("delete from user_ssh_key where user_id = ?")
             .bind(id)
             .execute(&mut *tx)

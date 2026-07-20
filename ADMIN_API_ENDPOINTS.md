@@ -104,9 +104,9 @@ DELETE /api/admin/v1/users/{id}
 Required Permission: `users::delete`
 
 Permanently purges a user and all of their associated data (soft-deleted VMs and
-their history/IP/firewall records, SSH keys, subscriptions and payments, referral
-records, Nostr domains, passkeys and saved payment methods). This action is
-irreversible.
+their history/IP/firewall records and 1:1 custom templates, SSH keys,
+subscriptions and payments, referral records, Nostr domains, passkeys and saved
+payment methods). This action is irreversible.
 
 The request is rejected if the user still has any live (non-deleted) VMs — delete
 those first so the hypervisor resources are released. Admins cannot delete their
