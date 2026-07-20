@@ -461,6 +461,67 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: when the spawn pipeline fails *after* IPs/MAC were allocated,
+    /// the `ip_allocation` rollback must reset the VM's MAC back to the
+    /// unassigned placeholder and remove the generated (v)MAC — otherwise the VM
+    /// is left with a MAC but no IP (the OVH prod symptom).
+    #[tokio::test]
+    async fn test_mac_reset_when_pipeline_rolls_back() -> Result<()> {
+        use lnvps_api_common::retry::OpError;
+
+        clear_mock_state().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        let _dns = Arc::new(MockDnsServer::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        // Build the real spawn pipeline, then append a step that always fails so
+        // every completed step (including ip_allocation) is rolled back.
+        let pipeline = provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .step("force_fail", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("boom"))) })
+            });
+        let res = pipeline.execute().await;
+        assert!(res.is_err(), "pipeline should fail on the forced step");
+
+        // VM MAC must be reset (not left as the generated vMAC).
+        let vm_after = db.get_vm(vm.id).await?;
+        assert_eq!(
+            vm_after.mac_address, "ff:ff:ff:ff:ff:ff",
+            "VM MAC should be reset to the unassigned placeholder after rollback"
+        );
+
+        // No IP assignments should remain.
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        assert!(
+            ips.is_empty(),
+            "IP assignments should be rolled back, got {:?}",
+            ips
+        );
+
+        // The generated (v)MAC / ARP entry must be gone from the router.
+        let router = MockRouter::new();
+        let arp = router.list_arp_entry().await?;
+        assert!(
+            arp.is_empty(),
+            "router ARP/vMAC entries should be cleaned up, got {:?}",
+            arp
+        );
+
+        Ok(())
+    }
+
     /// Test the delete_vm pipeline executes all cleanup steps
     #[tokio::test]
     async fn test_delete_vm_pipeline_complete_cleanup() -> Result<()> {

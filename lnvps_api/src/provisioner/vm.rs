@@ -18,7 +18,7 @@ use lnvps_db::{
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
     SubscriptionType, Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
@@ -27,6 +27,11 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Placeholder MAC for a VM that has no network assignment yet. A real MAC is
+/// generated during spawn; on rollback the VM is reset back to this so we never
+/// leave a VM with a MAC but no IP.
+pub(crate) const UNASSIGNED_MAC: &str = "ff:ff:ff:ff:ff:ff";
 
 /// Main provisioner class for LNVPS (VMs)
 #[derive(Clone)]
@@ -972,20 +977,39 @@ impl SpawnVmContext {
     }
 
     async fn rollback_assign_ips(&mut self) -> OpResult<()> {
-        for ip in &self.info.ips {
-            let range = self
-                .info
-                .ranges
-                .iter()
-                .find(|r| r.id == ip.ip_range_id)
-                .context("Missing range in collection")?;
-            // rollback MAC assignment if remotely assigned
-            if let Some(mac) = self.generated_mac.as_ref()
-                && let Some(arp_id) = mac.id.as_ref()
-                && let Some(router) = self.get_range_router(range).await?
-            {
-                router.remove_arp_entry(arp_id).await?;
+        // The router-generated vMAC is a single remote resource (tied to the v4
+        // address), not one-per-IP. Remove it exactly once and tolerate a
+        // missing entry so rollback always completes. Previously this looped
+        // over every IP and re-removed the same vMAC — with v4+v6 that meant a
+        // second removal of an already-deleted entry, which the real OVH client
+        // reports as a hard error and aborts the rollback.
+        if let Some(arp_id) = self.generated_mac.as_ref().and_then(|m| m.id.clone()) {
+            // Find the router from whichever assigned range has one.
+            let mut router = None;
+            for ip in &self.info.ips {
+                if let Some(range) = self.info.ranges.iter().find(|r| r.id == ip.ip_range_id)
+                    && let Some(r) = self.get_range_router(range).await?
+                {
+                    router = Some(r);
+                    break;
+                }
             }
+            if let Some(router) = router
+                && let Err(e) = router.remove_arp_entry(&arp_id).await
+            {
+                warn!(
+                    "Failed to remove vMAC {} during rollback (continuing): {}",
+                    arp_id, e
+                );
+            }
+        }
+
+        // Reset the VM's MAC back to the unassigned placeholder. The forward
+        // step persisted the generated MAC to the DB, so without this the VM
+        // would be left with a MAC but no IP assignment.
+        if self.info.vm.mac_address != UNASSIGNED_MAC {
+            self.info.vm.mac_address = UNASSIGNED_MAC.to_string();
+            self.db.update_vm(&self.info.vm).await?;
         }
         Ok(())
     }
