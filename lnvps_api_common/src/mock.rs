@@ -1213,7 +1213,14 @@ impl LNVpsDbBase for MockDb {
                 ))
             })?;
         drop(items);
-        self.get_vm_by_line_item(line_item_id).await
+        // Mirror the MySQL impl: unlike get_vm_by_line_item, this does NOT
+        // filter deleted VMs (callers such as the on-chain watcher need to
+        // see deleted VMs to hold deposits for manual resolution).
+        let vms = self.vms.lock().await;
+        vms.values()
+            .find(|v| v.subscription_line_item_id == line_item_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VM not found for line item {}", line_item_id).into())
     }
 
     async fn list_vm_subscription_payments(

@@ -41,9 +41,9 @@ use crate::subscription::SubscriptionHandler;
 use anyhow::{Result, bail, ensure};
 use chrono::Utc;
 use futures::StreamExt;
-use lnvps_api_common::CostResult;
+use lnvps_api_common::{CostResult, WorkJob};
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::onchain::{ChainPaymentUpdate, OnChainProvider};
 use std::str::FromStr;
@@ -53,6 +53,10 @@ pub struct OnChainPaymentHandler {
     provider: Arc<dyn OnChainProvider>,
     db: Arc<dyn LNVpsDb>,
     sub_handler: SubscriptionHandler,
+    /// Deposits to deleted VMs already reported to admins (in-memory only:
+    /// these deposits are ignored database-wise and handled out of band, this
+    /// set just stops stream replays from re-notifying within one process).
+    reported_deposits: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Scale `value` by `received / expected` (u128 intermediate, no overflow).
@@ -84,6 +88,7 @@ impl OnChainPaymentHandler {
             provider,
             db,
             sub_handler,
+            reported_deposits: Default::default(),
         }
     }
 
@@ -207,6 +212,16 @@ impl OnChainPaymentHandler {
         if payment.is_paid {
             return Ok(());
         }
+        // Deposits to deleted VMs are held; Confirmed sends the admin alert.
+        if let Ok(vm) = self
+            .db
+            .get_vm_by_subscription(payment.subscription_id)
+            .await
+        {
+            if vm.deleted {
+                return Ok(());
+            }
+        }
         self.regenerate(&mut payment, amount_msat).await?;
         info!(
             "Deposit {} detected: priced payment {} at rate {} for {} msat ({}s)",
@@ -218,6 +233,54 @@ impl OnChainPaymentHandler {
         );
         payment.external_id = Some(key);
         self.db.update_subscription_payment(&payment).await?;
+        Ok(())
+    }
+
+    /// Notify the admins about a deposit that arrived for a deleted VM.
+    ///
+    /// Database-wise the deposit is ignored — nothing is settled or recorded.
+    /// The sender is expected to contact support so it can be resolved out of
+    /// band.
+    async fn notify_deleted_vm_deposit(
+        &self,
+        payment: SubscriptionPayment,
+        vm_id: u64,
+        address: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        if !self.reported_deposits.lock().await.insert(key.to_string()) {
+            debug!("Deposit {} for deleted VM {} already reported", key, vm_id);
+            return Ok(());
+        }
+        warn!(
+            "Deposit {} of {} msat arrived for deleted VM {} (payment {}), notifying admins",
+            key,
+            amount_msat,
+            vm_id,
+            hex::encode(&payment.id)
+        );
+        if let Err(e) = self
+            .sub_handler
+            .work_commander()
+            .send(WorkJob::SendAdminNotification {
+                title: Some(format!("[VM{}] On-chain deposit to deleted VM", vm_id)),
+                message: format!(
+                    "An on-chain deposit of {} sats (outpoint {}) arrived for deleted VM #{} (user {}).\n\
+                     Receive address: {}\n\
+                     The deposit has NOT been credited. The sender is expected to \
+                     contact support so it can be resolved out of band.",
+                    amount_msat / 1000,
+                    key,
+                    vm_id,
+                    payment.user_id,
+                    address
+                ),
+            })
+            .await
+        {
+            warn!("Failed to queue admin notification for deposit {}: {}", key, e);
+        }
         Ok(())
     }
 
@@ -253,6 +316,21 @@ impl OnChainPaymentHandler {
                 }
             },
         };
+
+        // A deposit for a deleted VM is ignored database-wise: just alert the
+        // admins — the sender is expected to contact support so it can be
+        // resolved out of band.
+        if let Ok(vm) = self
+            .db
+            .get_vm_by_subscription(payment.subscription_id)
+            .await
+        {
+            if vm.deleted {
+                return self
+                    .notify_deleted_vm_deposit(payment, vm.id, address, &key, amount_msat)
+                    .await;
+            }
+        }
 
         if !payment.is_paid {
             let mut payment = payment;
@@ -378,6 +456,7 @@ mod tests {
     use lnvps_db::{
         IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionType, Vm,
     };
+    use std::time::Duration;
 
     const ADDRESS: &str = "bcrt1qtestaddr0";
     const AMOUNT: u64 = 1_000_000;
@@ -776,6 +855,58 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert!(p.is_paid);
         assert_eq!(p.external_id, Some(deposit_key("tx1", 0)));
+        Ok(())
+    }
+
+    /// A deposit for a deleted VM is ignored database-wise; the admins are
+    /// notified (once per deposit within a process) — the sender is expected
+    /// to contact support so it can be resolved out of band.
+    #[tokio::test]
+    async fn test_deleted_vm_deposit_notifies_admin() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        // Delete the VM
+        for vm in db.vms.lock().await.values_mut() {
+            vm.deleted = true;
+        }
+
+        // Detected: silently ignored (no pricing/tagging), no notification
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let p = get_payment(&db, &payment.id).await;
+        assert_eq!(p.external_id, None);
+
+        // Confirmed: nothing touched in the database, one admin notification
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let p = get_payment(&db, &payment.id).await;
+        assert!(!p.is_paid, "payment must be untouched");
+        assert_eq!(p.external_id, None);
+        assert_eq!(p.metadata, None);
+        assert_eq!(p.time_value, payment.time_value);
+        assert_eq!(p.rate, payment.rate);
+
+        let jobs = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0].job {
+            WorkJob::SendAdminNotification { title, message } => {
+                assert!(title.as_deref().unwrap_or("").contains("deleted VM"));
+                assert!(message.contains("tx1:0"));
+                assert!(message.contains(ADDRESS));
+            }
+            other => panic!("expected SendAdminNotification, got {:?}", other),
+        }
+
+        // Replayed Confirmed: no second notification
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let no_job = tokio::time::timeout(
+            Duration::from_millis(50),
+            handler.sub_handler.work_commander().recv(),
+        )
+        .await;
+        assert!(no_job.is_err(), "replay must not re-notify admins");
+
+        // A second distinct deposit to the same address notifies again
+        handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
+        let jobs = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(jobs.len(), 1);
         Ok(())
     }
 
