@@ -492,7 +492,9 @@ async fn admin_delete_vm(
     // Verify VM exists
     let vm = this.db.get_vm(id).await?;
 
-    if vm.deleted {
+    // An already-deleted VM can still be purged (that is the whole point of a
+    // purge). Only reject a plain delete of an already-deleted VM.
+    if vm.deleted && !purge {
         return Err(ApiError::conflict("VM is already deleted"));
     }
 
