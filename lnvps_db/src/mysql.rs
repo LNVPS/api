@@ -263,8 +263,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_all(&mut *tx)
         .await?;
 
-        // Remove the VMs themselves, then their custom templates and the SSH keys
-        // they referenced.
+        // Remove the VMs themselves, then their per-VM custom templates.
         sqlx::query("delete from vm where user_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -275,13 +274,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query("delete from user_ssh_key where user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
 
         // Billing: payments before subscriptions (line items + IP-space rows
-        // cascade from subscription/line item deletion).
+        // cascade from subscription/line item deletion). subscription_payment has
+        // no cascade from users, so it must be cleared explicitly.
         sqlx::query("delete from subscription_payment where user_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -291,34 +287,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&mut *tx)
             .await?;
 
-        // Referral program: payouts before the referral row.
-        sqlx::query(
-            "delete from referral_payout where referral_id in (select id from referral where user_id = ?)",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("delete from referral where user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Nostr domains (handles cascade), passkeys and saved payment methods.
+        // Nostr domains (handles cascade). nostr_domain.owner_id has no ON DELETE
+        // CASCADE, so it must be cleared explicitly.
         sqlx::query("delete from nostr_domain where owner_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("delete from user_webauthn_credentials where user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from user_payment_method where user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
 
-        // Finally the user row itself. Admin role assignments cascade on user_id
-        // and null out where this user was the assigner.
+        // Finally the user row itself. The following children cascade on delete
+        // (see 20260720130000_cascade_delete_child_tables.sql) and no longer need
+        // explicit cleanup: user_ssh_key, user_webauthn_credentials,
+        // user_payment_method, referral -> referral_payout. Admin role
+        // assignments cascade on user_id and null out where this user was the
+        // assigner.
         sqlx::query("delete from users where id = ?")
             .bind(id)
             .execute(&mut *tx)
