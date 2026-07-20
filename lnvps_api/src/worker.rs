@@ -1107,7 +1107,9 @@ impl Worker {
                 continue;
             }
             info!("Deleting unpaid VM {}", vm.id);
-            if let Err(e) = provisioner.delete_vm(vm.id).await {
+            // Never-paid (new) VMs carry no customer data, so purge them entirely
+            // rather than leaving a soft-deleted row and orphaned subscription.
+            if let Err(e) = provisioner.delete_vm(vm.id, true).await {
                 error!("Failed to delete unpaid VM {}: {}", vm.id, e);
                 self.queue_admin_notification(
                     format!("Failed to delete unpaid VM {}:\n{}", vm.id, e),
@@ -2095,31 +2097,49 @@ impl Worker {
                 vm_id,
                 reason,
                 admin_user_id,
+                purge,
             } => {
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
                     return Ok(None);
                 }
 
+                // A VM that has never had its first (purchase) payment confirmed
+                // carries no customer data, so purge it entirely. Super-admins
+                // can also force a purge of any VM (including paid ones) via the
+                // `purge` flag.
+                let ever_paid = self
+                    .db
+                    .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+                    .await
+                    .map(|s| s.is_setup)
+                    .unwrap_or(false);
+                let hard_delete = *purge || !ever_paid;
+
                 // Delete the VM via provisioner
                 let provisioner = self.subscription_handler.vm_provisioner();
-                provisioner.delete_vm(*vm_id).await?;
+                provisioner.delete_vm(*vm_id, hard_delete).await?;
 
-                // Log VM deletion
-                let metadata = if let Some(admin_id) = admin_user_id {
-                    Some(serde_json::json!({
-                        "admin_user_id": admin_id,
-                        "admin_action": true
-                    }))
-                } else {
-                    Some(serde_json::json!({
-                        "admin_action": true
-                    }))
-                };
+                // A hard delete removes the VM row (and its history), so logging
+                // a vm_history entry afterwards would fail the foreign key.
+                // Only record deletion history for soft-deleted VMs.
+                if !hard_delete {
+                    // Log VM deletion
+                    let metadata = if let Some(admin_id) = admin_user_id {
+                        Some(serde_json::json!({
+                            "admin_user_id": admin_id,
+                            "admin_action": true
+                        }))
+                    } else {
+                        Some(serde_json::json!({
+                            "admin_action": true
+                        }))
+                    };
 
-                self.vm_history_logger
-                    .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
-                    .await?;
+                    self.vm_history_logger
+                        .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
+                        .await?;
+                }
 
                 // Send notifications
                 let reason_text = reason.as_deref().unwrap_or("Admin requested deletion");
@@ -3274,10 +3294,12 @@ mod tests {
         let worker = setup_worker(db.clone()).await?;
         worker.check_vms().await?;
 
-        // VM should be soft-deleted
+        // Never-paid VMs are purged entirely, not just soft-deleted.
         let vms = db.vms.lock().await;
-        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(false);
-        assert!(deleted, "Unpaid VM older than 1 hour should be deleted");
+        assert!(
+            !vms.contains_key(&vm_id),
+            "Unpaid VM older than 1 hour should be purged"
+        );
         Ok(())
     }
 
@@ -3383,12 +3405,11 @@ mod tests {
         let worker = setup_worker(db.clone()).await?;
         worker.check_vms().await?;
 
-        // VM should be soft-deleted because the only payment is expired.
+        // VM should be purged because the only payment is expired.
         let vms = db.vms.lock().await;
-        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(false);
         assert!(
-            deleted,
-            "Unpaid VM with only an expired payment should still be deleted"
+            !vms.contains_key(&vm_id),
+            "Unpaid VM with only an expired payment should still be purged"
         );
         Ok(())
     }

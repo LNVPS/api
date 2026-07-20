@@ -44,6 +44,21 @@ impl AdminAuth {
         })
     }
 
+    /// Check whether the authenticated admin holds the `super_admin` role.
+    ///
+    /// Permissions alone can't express "super admin only" actions (a custom role
+    /// could be granted the same permission tuples), so destructive operations
+    /// like permanently purging a paid VM are gated on the role by name.
+    pub async fn is_super_admin(&self, db: &Arc<dyn LNVpsDb>) -> Result<bool> {
+        let role_ids = db.get_user_roles(self.user_id).await?;
+        for role_id in role_ids {
+            if db.get_role(role_id).await?.name == "super_admin" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Check if the authenticated admin has a specific permission
     pub fn has_permission(&self, resource: AdminResource, action: AdminAction) -> bool {
         self.permissions.contains(&Permission { resource, action })

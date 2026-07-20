@@ -377,6 +377,18 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a VM by id
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()>;
 
+    /// Permanently delete a VM and all of its related records from the database.
+    ///
+    /// Unlike [`delete_vm`](Self::delete_vm) (which soft-deletes by setting
+    /// `deleted = 1`), this removes the VM row entirely along with every entity
+    /// that references it: `vm_history`, `vm_firewall_rule`, `vm_ip_assignment`,
+    /// and the VM's own `subscription` (its `subscription_line_item` rows and
+    /// `subscription_payment` history). Intended for purging never-paid (new)
+    /// VMs and for super-admin forced deletions of test VMs. This is
+    /// irreversible and discards payment history, so callers must gate it
+    /// appropriately.
+    async fn hard_delete_vm(&self, vm_id: u64) -> DbResult<()>;
+
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
 

@@ -249,7 +249,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             return Ok(());
         }
 
-        if let Err(e) = self.provisioner.delete_vm(vm_id).await {
+        if let Err(e) = self.provisioner.delete_vm(vm_id, false).await {
             warn!("Failed to delete expired VM {}: {}", vm_id, e);
         } else {
             if let Err(e) = self

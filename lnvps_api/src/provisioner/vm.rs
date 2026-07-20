@@ -673,8 +673,17 @@ impl VmProvisioner {
             ))
     }
 
-    /// Delete a VM and its associated resources
-    pub async fn delete_vm(&self, vm_id: u64) -> OpResult<()> {
+    /// Delete a VM and its associated resources.
+    ///
+    /// When `purge` is set the VM is permanently removed from the database along
+    /// with all of its related records (history, firewall rules, IP
+    /// assignments, and its subscription + payment history) via
+    /// [`LNVpsDb::hard_delete_vm`]. Otherwise the VM is soft-deleted
+    /// (`deleted = 1`), matching production behaviour for paid VMs.
+    ///
+    /// Callers pass `purge = true` for never-paid (new) VMs and super-admin
+    /// forced deletions so that they leave nothing behind in the database.
+    pub async fn delete_vm(&self, vm_id: u64, purge: bool) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
@@ -684,8 +693,14 @@ impl VmProvisioner {
             .step("delete_ips", |ctx| {
                 Box::pin(ctx.2.delete_all_ip_assignments(vm_id))
             })
-            .step("delete_vm_db", |ctx| {
-                Box::pin(async { Ok(ctx.0.delete_vm(vm_id).await?) })
+            .step("delete_vm_db", move |ctx| {
+                Box::pin(async move {
+                    if purge {
+                        Ok(ctx.0.hard_delete_vm(vm_id).await?)
+                    } else {
+                        Ok(ctx.0.delete_vm(vm_id).await?)
+                    }
+                })
             });
         pipeline.execute().await?;
         Ok(())
@@ -1231,7 +1246,7 @@ mod tests {
         }
 
         // now expire
-        provisioner.delete_vm(vm.id).await?;
+        provisioner.delete_vm(vm.id, false).await?;
 
         // test arp/dns is removed
         let arp = router.list_arp_entry().await?;

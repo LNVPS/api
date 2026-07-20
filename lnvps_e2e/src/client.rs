@@ -145,6 +145,28 @@ impl TestClient {
         Ok(resp)
     }
 
+    /// Make an authenticated DELETE request with a JSON body.
+    pub async fn delete_auth_body(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> anyhow::Result<Response> {
+        let keys = self
+            .keys
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No keys configured for authenticated request"))?;
+        let url = self.url(path);
+        let auth = make_nip98_auth(keys, &url, "DELETE")?;
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", auth)
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp)
+    }
+
     /// Make an authenticated PUT request with JSON body.
     pub async fn put_auth(
         &self,

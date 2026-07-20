@@ -240,7 +240,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // Delete VM child records for every VM owned by the user (incl. soft-deleted).
         for child in [
             "delete from vm_ip_assignment where vm_id in (select id from vm where user_id = ?)",
-            "delete from vm_payment where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_firewall_rule where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_history where vm_id in (select id from vm where user_id = ?)",
         ] {
@@ -1019,6 +1018,58 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm_id)
             .execute(&self.db)
             .await?;
+        Ok(())
+    }
+
+    async fn hard_delete_vm(&self, vm_id: u64) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+
+        // Resolve the VM's subscription (via its line item) before we delete the
+        // VM row, so we can clean up the subscription and its payment history.
+        let subscription_id: Option<u64> = sqlx::query_scalar(
+            "select li.subscription_id from vm v \
+             join subscription_line_item li on li.id = v.subscription_line_item_id \
+             where v.id = ?",
+        )
+        .bind(vm_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // Remove rows that reference the VM directly.
+        sqlx::query("delete from vm_history where vm_id = ?")
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from vm_firewall_rule where vm_id = ?")
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from vm_ip_assignment where vm_id = ?")
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Delete the VM row itself (frees the FK to subscription_line_item).
+        sqlx::query("delete from vm where id = ?")
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Delete the VM's subscription. subscription_payment has no ON DELETE
+        // CASCADE so it must be cleared first; subscription_line_item does
+        // cascade, so deleting the subscription removes the line items.
+        if let Some(subscription_id) = subscription_id {
+            sqlx::query("delete from subscription_payment where subscription_id = ?")
+                .bind(subscription_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("delete from subscription where id = ?")
+                .bind(subscription_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
