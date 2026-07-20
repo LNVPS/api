@@ -1,4 +1,90 @@
+use std::sync::OnceLock;
+use std::time::Duration;
+
 use anyhow::{Result, bail};
+
+/// User-Agent sent with all checksum-related HTTP requests.
+///
+/// Some CDNs (e.g. CloudFront in front of cloud.centos.org) return 403 for
+/// requests without a User-Agent header, which reqwest omits by default.
+const USER_AGENT: &str = concat!("lnvps/", env!("CARGO_PKG_VERSION"));
+
+/// Maximum size of a downloaded SHASUMS file (1 MiB).  Prevents accidentally
+/// slurping a large binary into memory if a probed candidate URL resolves to
+/// something that is not a checksum file.
+const MAX_SUMS_FILE_SIZE: u64 = 1024 * 1024;
+
+/// Shared HTTP client with a User-Agent, timeouts and redirect following.
+fn http_client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(10))
+        // Generous: some distro mirrors are slow to answer HEAD on large
+        // files; this only needs to bound indefinite hangs.
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Fetch the body of a SHASUMS file, enforcing [`MAX_SUMS_FILE_SIZE`].
+///
+/// Returns `Ok(None)` if the server definitively reports the file as absent
+/// (404 Not Found), and `Err` for any other failure (network error, other
+/// HTTP error status, or file too large).
+async fn fetch_sums_text(url: &str) -> Result<Option<String>> {
+    let resp = http_client()?.get(url).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let mut resp = resp.error_for_status()?;
+    if let Some(len) = resp.content_length()
+        && len > MAX_SUMS_FILE_SIZE
+    {
+        bail!("Checksum file at {} is too large ({} bytes)", url, len);
+    }
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if (body.len() + chunk.len()) as u64 > MAX_SUMS_FILE_SIZE {
+            bail!(
+                "Checksum file at {} exceeds {} bytes",
+                url,
+                MAX_SUMS_FILE_SIZE
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// Fetch a SHASUMS file and look up `filename`.
+///
+/// - `Ok(Some(entry))` — checksum found
+/// - `Ok(None)` — file definitively absent (404) or `filename` not listed
+/// - `Err(_)` — transient/other failure (network error, 5xx, too large)
+async fn try_fetch_checksum(sha2_url: &str, filename: &str) -> Result<Option<ShasumEntry>> {
+    let Some(body) = fetch_sums_text(sha2_url).await? else {
+        return Ok(None);
+    };
+    let entries = parse_shasum_file(&body);
+    if let Some(e) = find_checksum(&entries, filename) {
+        return Ok(Some(e.clone()));
+    }
+    // Digest-only sidecar files (e.g. Alpine's `<image>.qcow2.sha512`) contain
+    // a bare hash with no filename.  If the file holds exactly one such entry,
+    // attribute it to the requested filename.
+    let mut bare = entries.iter().filter(|e| e.filename.is_empty());
+    if let (Some(e), None) = (bare.next(), bare.next()) {
+        let mut e = e.clone();
+        e.filename = filename.to_owned();
+        return Ok(Some(e));
+    }
+    Ok(None)
+}
 
 /// A single entry parsed from a SHASUMS-style file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +138,12 @@ impl ShasumAlgorithm {
 /// SHA512 (<filename>) = <checksum>
 /// ```
 ///
+/// **Digest-only** (per-file sidecars, e.g. Alpine's `<image>.sha512`):
+/// ```text
+/// <checksum>
+/// ```
+/// These entries have an empty `filename`.
+///
 /// Lines that are blank, start with `#`, or do not match any known format
 /// are silently skipped.
 pub fn parse_shasum_file(content: &str) -> Vec<ShasumEntry> {
@@ -61,7 +153,10 @@ pub fn parse_shasum_file(content: &str) -> Vec<ShasumEntry> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(entry) = parse_bsd_line(line).or_else(|| parse_gnu_line(line)) {
+        if let Some(entry) = parse_bsd_line(line)
+            .or_else(|| parse_gnu_line(line))
+            .or_else(|| parse_bare_digest_line(line))
+        {
             entries.push(entry);
         }
     }
@@ -89,14 +184,8 @@ pub fn find_checksum<'a>(entries: &'a [ShasumEntry], filename: &str) -> Option<&
 /// Returns an error if the URL cannot be fetched or the filename is not
 /// present in the file.
 pub async fn fetch_checksum_for_file(sha2_url: &str, filename: &str) -> Result<ShasumEntry> {
-    let body = reqwest::get(sha2_url)
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let entries = parse_shasum_file(&body);
-    match find_checksum(&entries, filename) {
-        Some(e) => Ok(e.clone()),
+    match try_fetch_checksum(sha2_url, filename).await? {
+        Some(e) => Ok(e),
         None => bail!("Checksum for '{}' not found in {}", filename, sha2_url),
     }
 }
@@ -107,12 +196,9 @@ pub async fn fetch_checksum_for_file(sha2_url: &str, filename: &str) -> Result<S
 /// returns the URL of the last response after all redirects have been followed.
 /// If the request fails the original `url` is returned unchanged.
 pub async fn resolve_redirect(url: &str) -> String {
-    // reqwest follows redirects by default (up to 10).  The final response URL
+    // The client follows redirects (up to 10).  The final response URL
     // is the resolved location after all hops.
-    let client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
+    let client = match http_client() {
         Ok(c) => c,
         Err(_) => return url.to_owned(),
     };
@@ -150,11 +236,23 @@ const CANDIDATE_SUMS_FILES: &[&str] = &[
     "SHA256SUMS",
     "SHA512SUMS.txt",
     "SHA256SUMS.txt",
+    // CentOS / Fedora cloud images use a BSD-format "CHECKSUM" file
+    "CHECKSUM",
 ];
 
 /// Per-file sidecar extensions appended directly to the image filename
 /// (e.g. `foo.qcow2.SHA256`).  Ordered from strongest to weakest.
-const CANDIDATE_SIDECAR_EXTS: &[&str] = &[".SHA512", ".SHA256", ".sha512", ".sha256"];
+const CANDIDATE_SIDECAR_EXTS: &[&str] = &[
+    ".SHA512",
+    ".SHA256",
+    ".sha512",
+    ".sha256",
+    // CentOS cloud images publish e.g. `<image>.qcow2.SHA256SUM`
+    ".SHA512SUM",
+    ".SHA256SUM",
+    // Rocky Linux publishes e.g. `<image>.qcow2.CHECKSUM` (BSD format)
+    ".CHECKSUM",
+];
 
 /// Given an image download URL and its filename, attempt to locate and fetch a
 /// checksum by probing:
@@ -175,19 +273,41 @@ pub async fn probe_checksum_from_image_url(
         }
     };
 
-    // 1. Shared SHASUMS files in the same directory
-    for candidate in CANDIDATE_SUMS_FILES {
-        let sums_url = format!("{}{}", base, candidate);
-        if let Ok(entry) = fetch_checksum_for_file(&sums_url, filename).await {
-            return Some((entry, sums_url));
-        }
-    }
+    // Candidate URLs in priority order: shared SUMS files, then sidecars.
+    let candidates: Vec<String> = CANDIDATE_SUMS_FILES
+        .iter()
+        .map(|c| format!("{}{}", base, c))
+        .chain(
+            CANDIDATE_SIDECAR_EXTS
+                .iter()
+                .map(|e| format!("{}{}", image_url, e)),
+        )
+        .collect();
 
-    // 2. Per-file sidecar: <image_url>.<EXT>
-    for ext in CANDIDATE_SIDECAR_EXTS {
-        let sums_url = format!("{}{}", image_url, ext);
-        if let Ok(entry) = fetch_checksum_for_file(&sums_url, filename).await {
-            return Some((entry, sums_url));
+    // Fetch candidates with limited concurrency (politer to mirrors than a
+    // full burst), then pick the first hit in priority order.  Transient
+    // failures are logged so a valid source is not silently skipped.
+    //
+    // Each future owns its data (no borrows across await) so the combined
+    // future stays `Send` regardless of caller lifetimes.
+    use futures::StreamExt;
+    let results: Vec<(String, Result<Option<ShasumEntry>>)> =
+        futures::stream::iter(candidates.into_iter().map(|url| {
+            let filename = filename.to_owned();
+            async move {
+                let result = try_fetch_checksum(&url, &filename).await;
+                (url, result)
+            }
+        }))
+        .buffered(4)
+        .collect()
+        .await;
+
+    for (url, result) in results {
+        match result {
+            Ok(Some(entry)) => return Some((entry, url)),
+            Ok(None) => {}
+            Err(e) => log::warn!("Failed to fetch checksum candidate {}: {}", url, e),
         }
     }
 
@@ -218,6 +338,22 @@ fn parse_gnu_line(line: &str) -> Option<ShasumEntry> {
     })
 }
 
+/// Parse a digest-only line: `<checksum>` with no filename.
+///
+/// Used by per-file sidecars that contain just the bare hash (e.g. Alpine's
+/// `<image>.qcow2.sha512`).  The resulting entry has an empty `filename`.
+fn parse_bare_digest_line(line: &str) -> Option<ShasumEntry> {
+    if !line.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let algorithm = ShasumAlgorithm::from_hex_len(line.len())?;
+    Some(ShasumEntry {
+        algorithm,
+        checksum: line.to_lowercase(),
+        filename: String::new(),
+    })
+}
+
 /// Parse a BSD/RPM line: `SHA256 (<filename>) = <checksum>`
 fn parse_bsd_line(line: &str) -> Option<ShasumEntry> {
     // Must start with a known algorithm prefix
@@ -231,7 +367,8 @@ fn parse_bsd_line(line: &str) -> Option<ShasumEntry> {
     };
     // rest should be `(<filename>) = <checksum>`
     let rest = rest.trim();
-    let inner = rest.strip_prefix('(')?.split_once(')')?;
+    // Split on the *last* `)` so filenames containing parentheses parse correctly
+    let inner = rest.strip_prefix('(')?.rsplit_once(')')?;
     let filename = inner.0.trim();
     let checksum = inner.1.trim().strip_prefix('=')?.trim();
     if !checksum.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -306,6 +443,33 @@ mod tests {
         let entries = parse_shasum_file(content);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].algorithm, ShasumAlgorithm::Sha512);
+    }
+
+    // ---- Digest-only sidecar format ----------------------------------------
+
+    #[test]
+    fn test_bare_digest_sha512() {
+        let content = "bb509092cda3548c11bc48a2168ce950d654b50db006e98939c06a5d86487f4e53cbb7954fafbba9ab5c8098008a9f304421ffc3397b0bc1d87b6aa309239b98\n";
+        let entries = parse_shasum_file(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].algorithm, ShasumAlgorithm::Sha512);
+        assert!(entries[0].filename.is_empty());
+    }
+
+    #[test]
+    fn test_bare_digest_rejects_invalid() {
+        // Not hex
+        assert!(parse_bare_digest_line("zz09861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4fa3c2b").is_none());
+        // Wrong length
+        assert!(parse_bare_digest_line("deadbeef").is_none());
+    }
+
+    #[test]
+    fn test_bsd_filename_with_parens() {
+        let content = "SHA256 (image (1).qcow2) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4fa3c2b\n";
+        let entries = parse_shasum_file(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].filename, "image (1).qcow2");
     }
 
     // ---- Comment / blank lines ---------------------------------------------
@@ -394,6 +558,148 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     }
 
     // ---- Network test against real Debian SHA512SUMS -----------------------
+
+    /// Regression test: cloud.centos.org sits behind CloudFront which returns
+    /// 403 for requests without a User-Agent header (reqwest's default).
+    #[tokio::test]
+    async fn test_fetch_checksum_centos_requires_user_agent() -> anyhow::Result<()> {
+        let url = "https://cloud.centos.org/centos/9-stream/x86_64/images/CHECKSUM";
+        let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
+
+        let entry = fetch_checksum_for_file(url, filename).await?;
+
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        assert_eq!(entry.checksum.len(), 64);
+        Ok(())
+    }
+
+    /// Alpine publishes a digest-only `.sha512` sidecar (bare hash, no filename).
+    #[tokio::test]
+    async fn test_probe_checksum_alpine_bare_sidecar() -> anyhow::Result<()> {
+        let image_url = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2";
+        let filename = "nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2";
+
+        let result = probe_checksum_from_image_url(image_url, filename).await;
+        let (entry, sums_url) = result.expect("should find bare-digest sidecar");
+
+        assert!(
+            sums_url.ends_with(".sha512") || sums_url.ends_with(".sha256"),
+            "unexpected sums_url: {sums_url}"
+        );
+        assert_eq!(entry.filename, filename);
+        Ok(())
+    }
+
+    /// Rocky Linux publishes a per-file `.CHECKSUM` sidecar (BSD format).
+    #[tokio::test]
+    async fn test_fetch_checksum_rocky_checksum_sidecar() -> anyhow::Result<()> {
+        let url = "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2.CHECKSUM";
+        let filename = "Rocky-9-GenericCloud.latest.x86_64.qcow2";
+
+        let entry = fetch_checksum_for_file(url, filename).await?;
+
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        Ok(())
+    }
+
+    /// Spawn a local HTTP server that serves an over-sized body.
+    ///
+    /// - `/with-length` — advertises a 10 MiB `Content-Length`
+    /// - `/no-length` — streams ~2 MiB with connection-close framing (no length)
+    async fn spawn_large_file_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let with_length = req.starts_with("GET /with-length");
+                    let header = if with_length {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                            10 * 1024 * 1024
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let chunk = vec![b'a'; 64 * 1024];
+                    // 2 MiB of body — more than MAX_SUMS_FILE_SIZE
+                    for _ in 0..32 {
+                        if sock.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A response advertising Content-Length > cap is rejected before download.
+    #[tokio::test]
+    async fn test_fetch_checksum_rejects_large_content_length() {
+        let addr = spawn_large_file_server().await;
+        let url = format!("http://{}/with-length", addr);
+        let err = fetch_checksum_for_file(&url, "whatever.qcow2")
+            .await
+            .expect_err("should refuse to download a huge file");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A response without Content-Length is aborted once the cap is exceeded.
+    #[tokio::test]
+    async fn test_fetch_checksum_rejects_large_unbounded_body() {
+        let addr = spawn_large_file_server().await;
+        let url = format!("http://{}/no-length", addr);
+        let err = fetch_checksum_for_file(&url, "whatever.qcow2")
+            .await
+            .expect_err("should abort an unbounded body at the cap");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CentOS 10-stream publishes a per-file `.SHA256SUM` sidecar (BSD format).
+    #[tokio::test]
+    async fn test_fetch_checksum_centos_sha256sum_sidecar() -> anyhow::Result<()> {
+        let url = "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2.SHA256SUM";
+        let filename = "CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2";
+
+        let entry = fetch_checksum_for_file(url, filename).await?;
+
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        assert_eq!(entry.checksum.len(), 64);
+        Ok(())
+    }
+
+    /// CentOS uses a shared "CHECKSUM" file which must be probed automatically.
+    #[tokio::test]
+    async fn test_probe_checksum_centos_image_url() -> anyhow::Result<()> {
+        let image_url = "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
+        let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
+
+        let result = probe_checksum_from_image_url(image_url, filename).await;
+        let (entry, sums_url) = result.expect("should find CHECKSUM file");
+
+        assert!(sums_url.ends_with("/CHECKSUM"), "unexpected sums_url: {sums_url}");
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_fetch_checksum_debian_bookworm() -> anyhow::Result<()> {
