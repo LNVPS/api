@@ -1405,6 +1405,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn delete_orphaned_custom_vm_templates(&self) -> DbResult<u64> {
+        // `custom_template_id IS NOT NULL` in the subquery keeps `NOT IN` from
+        // being poisoned by NULLs (which would make it match no rows).
+        let res = sqlx::query(
+            "delete from vm_custom_template \
+             where id not in (select custom_template_id from vm where custom_template_id is not null)",
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn list_custom_pricing_disk(
         &self,
         pricing_id: u64,

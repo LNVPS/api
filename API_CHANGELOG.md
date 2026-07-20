@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **DNS is now best-effort during VM provisioning** — forward (A/AAAA) and reverse (PTR) DNS records are convenience only and no longer block or roll back a deploy. Previously a reverse-DNS failure (notably OVH rejecting a PTR with a `4xx` until the forward name resolves — a fatal, non-retried error) tore down the whole pipeline and destroyed the freshly-created VM. Now such failures are logged and the deploy proceeds; the VM keeps its IPs and MAC. Any records that failed to create are reconciled automatically on the periodic VM check (and can still be forced via the existing DNS patch job).
 
+### Fixed
+
+- **Clean up orphaned custom templates** — a startup data migration now deletes `vm_custom_template` rows not referenced by any VM. Custom templates are 1:1 with their VM, but historical hard-deletes could leave orphans behind. The migration is idempotent (a no-op once clean).
+
 ### Added
 
 - **Delete (purge) a user (admin)** — new `DELETE /api/admin/v1/users/{id}` (`users::delete`) permanently removes a user and all of their associated data (soft-deleted VMs and their history/IP/firewall rows and 1:1 custom templates, SSH keys, subscriptions and payments, referral records, Nostr domains, passkeys and saved payment methods) in a single transaction. Rejected if the user still has any live (non-deleted) VMs — those must be deleted first so hypervisor resources are released. Admins cannot delete their own account.

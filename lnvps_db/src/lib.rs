@@ -478,6 +478,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update custom vm template
     async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()>;
 
+    /// Delete `vm_custom_template` rows not referenced by any VM.
+    ///
+    /// A custom template exists 1:1 with the VM that owns it, so any row with no
+    /// referencing VM is an orphan (e.g. left behind by a historical hard-delete)
+    /// and safe to remove. Returns the number of rows deleted.
+    async fn delete_orphaned_custom_vm_templates(&self) -> DbResult<u64>;
+
     /// Return the list of disk prices for a given custom pricing model
     async fn list_custom_pricing_disk(&self, pricing_id: u64)
     -> DbResult<Vec<VmCustomPricingDisk>>;

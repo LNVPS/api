@@ -1406,6 +1406,17 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn delete_orphaned_custom_vm_templates(&self) -> DbResult<u64> {
+        let referenced: std::collections::HashSet<u64> = {
+            let vms = self.vms.lock().await;
+            vms.values().filter_map(|v| v.custom_template_id).collect()
+        };
+        let mut t = self.custom_template.lock().await;
+        let before = t.len();
+        t.retain(|id, _| referenced.contains(id));
+        Ok((before - t.len()) as u64)
+    }
+
     async fn list_custom_pricing_disk(
         &self,
         pricing_id: u64,
@@ -4801,6 +4812,46 @@ mod tests {
         assert!(db.user_ssh_keys.lock().await.get(&10).is_none());
         // The 1:1 custom template is purged with its VM.
         assert!(db.custom_template.lock().await.get(&55).is_none());
+    }
+
+    /// Orphaned custom templates (not referenced by any VM) are removed; ones
+    /// still linked to a VM are kept.
+    #[tokio::test]
+    async fn test_delete_orphaned_custom_vm_templates() {
+        let db = MockDb::default();
+        {
+            let mut t = db.custom_template.lock().await;
+            for id in [61u64, 62, 63] {
+                t.insert(
+                    id,
+                    VmCustomTemplate {
+                        id,
+                        pricing_id: 1,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        // Only template 62 is referenced by a live VM.
+        db.vms.lock().await.insert(
+            200,
+            Vm {
+                id: 200,
+                custom_template_id: Some(62),
+                ..MockDb::mock_vm()
+            },
+        );
+
+        let deleted = db.delete_orphaned_custom_vm_templates().await.unwrap();
+        assert_eq!(deleted, 2);
+        let t = db.custom_template.lock().await;
+        assert!(t.get(&61).is_none());
+        assert!(t.get(&62).is_some());
+        assert!(t.get(&63).is_none());
+
+        // Idempotent: a second run deletes nothing.
+        drop(t);
+        assert_eq!(db.delete_orphaned_custom_vm_templates().await.unwrap(), 0);
     }
 }
 
