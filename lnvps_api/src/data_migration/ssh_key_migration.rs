@@ -20,7 +20,11 @@ impl SshKeyMigration {
 }
 
 impl DataMigration for SshKeyMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "SSH key migration"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         let settings = self.settings.clone();
         Box::pin(async move {
@@ -29,13 +33,11 @@ impl DataMigration for SshKeyMigration {
                 Some(proxmox) => match &proxmox.ssh {
                     Some(ssh) => ssh.clone(),
                     None => {
-                        info!("No SSH config in proxmox settings, skipping SSH key migration");
-                        return Ok(());
+                        return Ok("no SSH config in proxmox settings, skipped".to_string());
                     }
                 },
                 None => {
-                    info!("No proxmox config found, skipping SSH key migration");
-                    return Ok(());
+                    return Ok("no proxmox config found, skipped".to_string());
                 }
             };
 
@@ -67,12 +69,7 @@ impl DataMigration for SshKeyMigration {
                 migrated_count += 1;
             }
 
-            info!(
-                "SSH key migration completed: {} hosts updated",
-                migrated_count
-            );
-
-            Ok(())
+            Ok(format!("migrated SSH key to {migrated_count} host(s)"))
         })
     }
 }

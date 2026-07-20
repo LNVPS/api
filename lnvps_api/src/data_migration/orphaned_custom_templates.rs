@@ -1,7 +1,6 @@
 use crate::data_migration::DataMigration;
 use anyhow::Result;
 use lnvps_db::LNVpsDb;
-use log::info;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,14 +22,15 @@ impl OrphanedCustomTemplatesMigration {
 }
 
 impl DataMigration for OrphanedCustomTemplatesMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "orphaned custom templates cleanup"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         Box::pin(async move {
             let deleted = db.delete_orphaned_custom_vm_templates().await?;
-            if deleted > 0 {
-                info!("Deleted {deleted} orphaned vm_custom_template row(s)");
-            }
-            Ok(())
+            Ok(format!("deleted {deleted} orphaned vm_custom_template row(s)"))
         })
     }
 }

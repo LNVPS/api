@@ -1146,6 +1146,24 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn list_deleted_never_paid_vm_ids(&self) -> DbResult<Vec<u64>> {
+        let vms = self.vms.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| v.deleted)
+            .filter(|v| {
+                line_items
+                    .get(&v.subscription_line_item_id)
+                    .and_then(|li| subscriptions.get(&li.subscription_id))
+                    .map(|s| !s.is_setup)
+                    .unwrap_or(false)
+            })
+            .map(|v| v.id)
+            .collect())
+    }
+
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(v) = vms.get_mut(&vm.id) {
@@ -4150,6 +4168,40 @@ mod tests {
                 .is_empty()
         );
         assert!(db.subscription_payments.lock().await.is_empty());
+    }
+
+    /// list_deleted_never_paid_vm_ids returns only soft-deleted VMs whose
+    /// subscription was never paid (is_setup = false).
+    #[tokio::test]
+    async fn test_list_deleted_never_paid_vm_ids() {
+        let db = MockDb::default();
+        db.upsert_user(&[1u8; 32]).await.unwrap();
+
+        // Default subscription 1 is not set up (never paid).
+        let vm_id = db
+            .insert_vm(&Vm {
+                ssh_key_id: None,
+                ..MockDb::mock_vm()
+            })
+            .await
+            .unwrap();
+
+        // Live (non-deleted) never-paid VM is not returned.
+        assert!(db.list_deleted_never_paid_vm_ids().await.unwrap().is_empty());
+
+        // Soft-delete it -> now eligible for purge.
+        db.delete_vm(vm_id).await.unwrap();
+        assert_eq!(
+            db.list_deleted_never_paid_vm_ids().await.unwrap(),
+            vec![vm_id]
+        );
+
+        // Mark the subscription as paid -> no longer eligible (preserve history).
+        {
+            let mut subs = db.subscriptions.lock().await;
+            subs.get_mut(&1).unwrap().is_setup = true;
+        }
+        assert!(db.list_deleted_never_paid_vm_ids().await.unwrap().is_empty());
     }
 
     /// Firewall rule CRUD via the mock DB.

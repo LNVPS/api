@@ -1054,6 +1054,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn list_deleted_never_paid_vm_ids(&self) -> DbResult<Vec<u64>> {
+        Ok(sqlx::query_scalar(
+            "select v.id from vm v \
+             join subscription_line_item li on li.id = v.subscription_line_item_id \
+             join subscription s on s.id = li.subscription_id \
+             where v.deleted = 1 and s.is_setup = 0",
+        )
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
             "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=?,fw_policy_in=?,fw_policy_out=? where id=?",

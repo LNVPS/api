@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Clean up orphaned custom templates** — a startup data migration now deletes `vm_custom_template` rows not referenced by any VM. Custom templates are 1:1 with their VM, but historical hard-deletes could leave orphans behind. The migration is idempotent (a no-op once clean).
 
+- **Purge historical never-paid soft-deleted VMs** — a startup data migration now hard-deletes VMs that were soft-deleted (`deleted = 1`) while their subscription was never paid (`is_setup = 0`), along with their `vm_history`, `vm_firewall_rule`, `vm_ip_assignment` and orphaned subscription. Never-paid VMs are purged going forward by the worker, but the worker skips already soft-deleted rows so older ones lingered. Ever-paid VMs are left untouched to preserve payment history. Idempotent (a no-op once clean).
+
+- **Data migrations now log their progress** — each startup data migration logs when it starts and a summary of what it did (e.g. "purged 3 of 3 never-paid soft-deleted VM(s)"), so no-op runs are no longer silent.
+
+- **Cascade-delete owned child tables** — added `ON DELETE CASCADE` to pure owned-child tables (SSH keys, passkeys, saved payment methods, referrals/payouts, cached router tunnel/BGP inventory, custom pricing disks). Fixes latent FK-violation failures when deleting a router with cached inventory or a referral with payouts, and simplifies user purges.
+
 ### Added
 
 - **Delete (purge) a user (admin)** — new `DELETE /api/admin/v1/users/{id}` (`users::delete`) permanently removes a user and all of their associated data (soft-deleted VMs and their history/IP/firewall rows and 1:1 custom templates, SSH keys, subscriptions and payments, referral records, Nostr domains, passkeys and saved payment methods) in a single transaction. Rejected if the user still has any live (non-deleted) VMs — those must be deleted first so hypervisor resources are released. Admins cannot delete their own account.

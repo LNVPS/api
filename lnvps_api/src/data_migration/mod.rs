@@ -5,6 +5,7 @@ use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::data_migration::orphaned_custom_templates::OrphanedCustomTemplatesMigration;
 use crate::data_migration::payment_method_config::PaymentMethodConfigMigration;
+use crate::data_migration::purge_never_paid_deleted_vms::PurgeNeverPaidDeletedVmsMigration;
 use crate::data_migration::ssh_key_migration::SshKeyMigration;
 use crate::provisioner::VmProvisioner;
 use crate::settings::Settings;
@@ -22,11 +23,17 @@ mod encryption_migration;
 mod ip6_init;
 mod orphaned_custom_templates;
 mod payment_method_config;
+mod purge_never_paid_deleted_vms;
 mod ssh_key_migration;
 
 /// Basic data migration to run at startup
 pub trait DataMigration: Send + Sync {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+    /// Human-readable name, logged when the migration runs.
+    fn name(&self) -> &'static str;
+
+    /// Run the migration, returning a human-readable summary of what it did
+    /// (e.g. "purged 3 VM(s)" or "no changes").
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 }
 
 pub async fn run_data_migrations(
@@ -65,10 +72,16 @@ pub async fn run_data_migrations(
     // Clean up orphaned per-VM custom templates (1:1 with their VM)
     migrations.push(Box::new(OrphanedCustomTemplatesMigration::new(db.clone())));
 
+    // Purge historical never-paid soft-deleted VMs (back-fills the never-paid
+    // hard-delete for VMs soft-deleted before that behaviour existed)
+    migrations.push(Box::new(PurgeNeverPaidDeletedVmsMigration::new(db.clone())));
+
     info!("Running {} data migrations", migrations.len());
     for migration in migrations {
-        if let Err(e) = migration.migrate().await {
-            error!("Error running data migration: {}", e);
+        info!("Running data migration: {}", migration.name());
+        match migration.migrate().await {
+            Ok(summary) => info!("Data migration '{}': {}", migration.name(), summary),
+            Err(e) => error!("Error running data migration '{}': {}", migration.name(), e),
         }
     }
 

@@ -21,12 +21,17 @@ impl Ip6InitDataMigration {
 }
 
 impl DataMigration for Ip6InitDataMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "IPv6 initialisation"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> {
         let db = self.db.clone();
         let provisioner = self.provisioner.clone();
         Box::pin(async move {
             let net = NetworkProvisioner::new(db.clone());
             let vms = db.list_vms().await?;
+            let mut assigned = 0u64;
             for vm in vms {
                 // Skip expired VMs — check subscription expiry
                 let sub_active = db
@@ -60,6 +65,7 @@ impl DataMigration for Ip6InitDataMigration {
                     let ips_pick = net.pick_ip_for_region(host.region_id).await?;
                     if let Some(mut v6) = ips_pick.ip6 {
                         info!("Assigning ip {} to vm {}", v6.ip, vm.id);
+                        assigned += 1;
                         let mut assignment =
                             VmProvisioner::v6_to_allocation(&mut v6, vm.id, &vm.mac_address)?;
                         provisioner
@@ -70,7 +76,7 @@ impl DataMigration for Ip6InitDataMigration {
                     }
                 }
             }
-            Ok(())
+            Ok(format!("assigned IPv6 to {assigned} VM(s)"))
         })
     }
 }

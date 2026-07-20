@@ -22,13 +22,16 @@ impl EncryptionDataMigration {
 }
 
 impl DataMigration for EncryptionDataMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "encryption migration"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         Box::pin(async move {
             // Only run migration if encryption is configured
             if !Self::is_encryption_available() {
-                info!("Encryption not configured, skipping encryption migration");
-                return Ok(());
+                return Ok("encryption not configured, skipped".to_string());
             }
 
             info!("Starting encryption data migration");
@@ -108,12 +111,9 @@ impl DataMigration for EncryptionDataMigration {
                 }
             }
 
-            info!(
-                "Encryption migration completed: {} users/hosts, {} SSH keys, {} routers",
-                total_encrypted, ssh_keys_encrypted, routers_encrypted
-            );
-
-            Ok(())
+            Ok(format!(
+                "encrypted {total_encrypted} users/hosts, {ssh_keys_encrypted} SSH keys, {routers_encrypted} routers"
+            ))
         })
     }
 }

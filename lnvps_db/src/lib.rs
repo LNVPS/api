@@ -389,6 +389,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// appropriately.
     async fn hard_delete_vm(&self, vm_id: u64) -> DbResult<()>;
 
+    /// List ids of soft-deleted VMs whose subscription was never paid
+    /// (`vm.deleted = 1` and `subscription.is_setup = 0`).
+    ///
+    /// These carry no customer or payment data and are safe to purge entirely.
+    /// Used by the startup cleanup that back-fills the never-paid purge for VMs
+    /// that were soft-deleted before hard-deletion was introduced.
+    async fn list_deleted_never_paid_vm_ids(&self) -> DbResult<Vec<u64>>;
+
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
 

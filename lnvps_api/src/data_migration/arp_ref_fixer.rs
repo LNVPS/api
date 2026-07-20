@@ -18,7 +18,11 @@ impl ArpRefFixerDataMigration {
 }
 
 impl DataMigration for ArpRefFixerDataMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "ARP reference fixer"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         Box::pin(async move {
             info!("Starting ARP reference fixer migration");
@@ -94,11 +98,7 @@ impl DataMigration for ArpRefFixerDataMigration {
                 }
             }
 
-            info!(
-                "ARP reference fixer migration completed, fixed {} references",
-                fixed_count
-            );
-            Ok(())
+            Ok(format!("fixed {fixed_count} ARP reference(s)"))
         })
     }
 }

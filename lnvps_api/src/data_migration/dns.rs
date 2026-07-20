@@ -254,7 +254,11 @@ impl DnsDataMigration {
 }
 
 impl DataMigration for DnsDataMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "DNS records sync"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         let cloudflare = self.cloudflare.clone();
         Box::pin(async move {
@@ -263,7 +267,7 @@ impl DataMigration for DnsDataMigration {
             }
             Self::migrate_ovh(&db).await?;
             Self::backfill_records(&db).await?;
-            Ok(())
+            Ok("DNS servers migrated and records backfilled".to_string())
         })
     }
 }

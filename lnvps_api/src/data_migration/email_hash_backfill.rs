@@ -17,7 +17,11 @@ impl EmailHashBackfillMigration {
 }
 
 impl DataMigration for EmailHashBackfillMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "email hash backfill"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         Box::pin(async move {
             // Find all users with an email but no email_hash yet
@@ -28,8 +32,7 @@ impl DataMigration for EmailHashBackfillMigration {
                 .await?;
 
             if rows.is_empty() {
-                info!("No users need email_hash backfill");
-                return Ok(());
+                return Ok("no users need email_hash backfill".to_string());
             }
 
             info!("Backfilling email_hash for {} users", rows.len());
@@ -71,12 +74,9 @@ impl DataMigration for EmailHashBackfillMigration {
                 }
             }
 
-            info!(
-                "Email hash backfill complete: {} updated, {} skipped",
-                updated, skipped
-            );
-
-            Ok(())
+            Ok(format!(
+                "email_hash backfill: {updated} updated, {skipped} skipped"
+            ))
         })
     }
 }

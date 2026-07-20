@@ -23,7 +23,11 @@ impl PaymentMethodConfigMigration {
 }
 
 impl DataMigration for PaymentMethodConfigMigration {
-    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    fn name(&self) -> &'static str {
+        "payment method config migration"
+    }
+
+    fn migrate(&self) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
         let db = self.db.clone();
         let settings = self.settings.clone();
         Box::pin(async move {
@@ -32,11 +36,10 @@ impl DataMigration for PaymentMethodConfigMigration {
             // Check if any payment method configs already exist
             let existing_configs = db.list_payment_method_configs().await?;
             if !existing_configs.is_empty() {
-                info!(
-                    "Payment method configs already exist ({} found), skipping migration",
+                return Ok(format!(
+                    "configs already exist ({} found), skipped",
                     existing_configs.len()
-                );
-                return Ok(());
+                ));
             }
 
             // Get the first company to assign configs to
@@ -131,12 +134,9 @@ impl DataMigration for PaymentMethodConfigMigration {
                 migrated_count += 1;
             }
 
-            info!(
-                "Payment method config migration completed: {} configs migrated for company {}",
-                migrated_count, company_id
-            );
-
-            Ok(())
+            Ok(format!(
+                "migrated {migrated_count} payment method config(s) for company {company_id}"
+            ))
         })
     }
 }
