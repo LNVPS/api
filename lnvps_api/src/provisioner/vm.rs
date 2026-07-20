@@ -584,12 +584,23 @@ impl VmProvisioner {
                     })
                 },
             )
+            // DNS is best-effort: forward (A/AAAA) and reverse (PTR) records are
+            // convenience only and must never fail/tear down an otherwise
+            // healthy deploy. In particular OVH rejects a PTR with a 4xx (fatal,
+            // no retry) until the forward name resolves — the classic
+            // chicken-and-egg — which previously destroyed the VM. On failure we
+            // log and continue; any missing records are reconciled later.
             .step_with_rollback(
                 "dns_forward",
                 |ctx| {
                     Box::pin(async move {
                         for ip in &mut ctx.info.ips {
-                            ctx.network.update_forward_ip_dns(ip).await?;
+                            if let Err(e) = ctx.network.update_forward_ip_dns(ip).await {
+                                warn!(
+                                    "Forward DNS for {} failed (continuing, will reconcile later): {}",
+                                    ip.ip, e
+                                );
+                            }
                         }
                         Ok(())
                     })
@@ -610,7 +621,12 @@ impl VmProvisioner {
                 |ctx| {
                     Box::pin(async move {
                         for ip in &mut ctx.info.ips {
-                            ctx.network.update_reverse_ip_dns(ip).await?;
+                            if let Err(e) = ctx.network.update_reverse_ip_dns(ip).await {
+                                warn!(
+                                    "Reverse DNS for {} failed (continuing, will reconcile later): {}",
+                                    ip.ip, e
+                                );
+                            }
                         }
                         Ok(())
                     })

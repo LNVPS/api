@@ -522,6 +522,63 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: DNS is best-effort. A reverse (PTR) DNS failure — the classic
+    /// OVH "forward not resolvable yet" 4xx — must NOT roll back / destroy the
+    /// VM. The deploy should succeed with IPs + MAC intact and the reverse ref
+    /// left unset for later reconciliation.
+    #[tokio::test]
+    async fn test_reverse_dns_failure_does_not_block_deploy() -> Result<()> {
+        clear_mock_state().await;
+        MockDnsServer::reset().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        setup_db_with_static_arp(&db).await?;
+
+        // Make reverse (PTR) records fail on the DNS provider.
+        MockDnsServer::fail_on_kind("PTR").await;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
+        let res = pipeline.execute().await;
+        MockDnsServer::clear_failures().await;
+        assert!(
+            res.is_ok(),
+            "reverse DNS failure must not block the deploy: {:?}",
+            res.err()
+        );
+
+        // VM keeps its MAC and IP assignments.
+        let vm_after = db.get_vm(vm.id).await?;
+        assert_ne!(
+            vm_after.mac_address, "ff:ff:ff:ff:ff:ff",
+            "VM should keep its assigned MAC"
+        );
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        assert!(
+            !ips.is_empty(),
+            "IP assignments should be saved despite reverse DNS failure"
+        );
+
+        // Forward DNS was set; reverse was skipped (to be reconciled later).
+        let v4 = ips.iter().find(|i| i.ip.contains('.')).expect("v4 ip");
+        assert!(
+            v4.dns_forward_ref.is_some(),
+            "forward DNS should have been created"
+        );
+        assert!(
+            v4.dns_reverse_ref.is_none(),
+            "reverse DNS ref should be unset after a best-effort failure"
+        );
+        Ok(())
+    }
+
     /// Test the delete_vm pipeline executes all cleanup steps
     #[tokio::test]
     async fn test_delete_vm_pipeline_complete_cleanup() -> Result<()> {

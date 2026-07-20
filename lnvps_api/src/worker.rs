@@ -849,7 +849,61 @@ impl Worker {
             &vm,
         )
         .await?;
+        self.reconcile_vm_dns(vm).await;
         Ok(())
+    }
+
+    /// Best-effort reconciliation of missing DNS records for a VM's IPs.
+    ///
+    /// DNS is best-effort during spawn (a failed forward/reverse record must not
+    /// block or tear down a deploy — notably OVH rejects a PTR until the forward
+    /// name resolves). VMs whose records failed to create then self-heal here on
+    /// the periodic VM check. For healthy VMs (all refs present) this is a cheap
+    /// no-op that makes no provider API calls.
+    async fn reconcile_vm_dns(&self, vm: &Vm) {
+        let provisioner = self.subscription_handler.vm_provisioner();
+        let network = &provisioner.network;
+
+        let mut ips = match self.db.list_vm_ip_assignments(vm.id).await {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("[dns-reconcile] failed to list ips for vm {}: {}", vm.id, e);
+                return;
+            }
+        };
+        for a in &mut ips {
+            let range = match self.db.get_ip_range(a.ip_range_id).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let want_fwd = range.forward_dns_server_id.is_some() && a.dns_forward_ref.is_none();
+            let want_rev = range.reverse_dns_server_id.is_some() && a.dns_reverse_ref.is_none();
+            if !want_fwd && !want_rev {
+                continue;
+            }
+
+            let mut changed = false;
+            if want_fwd {
+                match network.update_forward_ip_dns(a).await {
+                    Ok(_) => changed = true,
+                    Err(e) => warn!("[dns-reconcile] forward failed for {}: {}", a.ip, e),
+                }
+            }
+            if want_rev {
+                match network.update_reverse_ip_dns(a).await {
+                    Ok(_) => changed = true,
+                    Err(e) => warn!("[dns-reconcile] reverse failed for {}: {}", a.ip, e),
+                }
+            }
+            if changed
+                && let Err(e) = self.db.update_vm_ip_assignment(a).await
+            {
+                warn!(
+                    "[dns-reconcile] failed to persist dns refs for {}: {}",
+                    a.ip, e
+                );
+            }
+        }
     }
 
     /// Check multiple VMs on a single host using bulk API
@@ -870,6 +924,8 @@ impl Worker {
                 &vm,
             )
             .await?;
+            // Self-heal any DNS records that failed to create during spawn.
+            self.reconcile_vm_dns(vm).await;
         }
         Ok(())
     }

@@ -4667,6 +4667,9 @@ use crate::retry::{OpError, OpResult};
 #[derive(Clone)]
 pub struct MockDnsServer {
     pub zones: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>>,
+    /// When set, `add_record` fails for records whose kind matches (e.g. "PTR",
+    /// "A", "AAAA") or "*" for all. Used to simulate DNS provider failures.
+    fail_kind: Arc<Mutex<Option<String>>>,
 }
 
 pub struct MockDnsEntry {
@@ -4688,20 +4691,42 @@ impl MockDnsServer {
         thread_local! {
             static TL_ZONES: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            static TL_FAIL: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         }
         Self {
             zones: TL_ZONES.with(|z| z.clone()),
+            fail_kind: TL_FAIL.with(|f| f.clone()),
         }
+    }
+
+    /// Make `add_record` fail for records of the given kind ("A", "AAAA",
+    /// "PTR") or "*" for all kinds.
+    pub async fn fail_on_kind(kind: &str) {
+        *Self::new().fail_kind.lock().await = Some(kind.to_string());
+    }
+
+    /// Clear any injected DNS failure.
+    pub async fn clear_failures() {
+        *Self::new().fail_kind.lock().await = None;
     }
 
     pub async fn reset() {
         Self::new().zones.lock().await.clear();
+        *Self::new().fail_kind.lock().await = None;
     }
 }
 
 #[async_trait]
 impl crate::dns::DnsServer for MockDnsServer {
     async fn add_record(&self, record: &BasicRecord) -> OpResult<BasicRecord> {
+        if let Some(k) = self.fail_kind.lock().await.as_ref()
+            && (k == "*" || *k == record.kind.to_string())
+        {
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Injected DNS failure for {} record",
+                record.kind
+            )));
+        }
         let zone_id = record
             .zone
             .as_id()
