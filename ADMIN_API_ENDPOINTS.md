@@ -14,7 +14,8 @@ Admin API request/response format reference for LLM consumption.
 **VmHostKind**: `"proxmox"`, `"libvirt"`
 **CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
 **ApiOsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
-`"redhatenterprise"`
+`"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
+`"voidlinux"`
 **IpRangeAllocationMode**: `"random"`, `"sequential"`, `"slaac_eui64"`
 **NetworkAccessPolicyKind**: `"static_arp"`
 **RouterKind**: `"mikrotik"`, `"ovh_additional_ip"`, `"linux_ssh"`
@@ -1415,7 +1416,7 @@ Body:
 ```json
 {
   "distribution": "ubuntu",
-  // ApiOsDistribution enum: "ubuntu", "debian", "centos", "fedora", "freebsd", "opensuse", "archlinux", "redhatenterprise"
+  // ApiOsDistribution enum: "ubuntu", "debian", "centos", "fedora", "freebsd", "opensuse", "archlinux", "redhatenterprise", "almalinux", "rockylinux", "alpine", "nixos", "openbsd", "netbsd", "gentoo", "voidlinux"
   "flavour": "string",
   // e.g., "server", "desktop"
   "version": "string",
@@ -1446,7 +1447,7 @@ Body (all optional):
 ```json
 {
   "distribution": "debian",
-  // ApiOsDistribution enum: "ubuntu", "debian", "centos", "fedora", "freebsd", "opensuse", "archlinux", "redhatenterprise"
+  // ApiOsDistribution enum: "ubuntu", "debian", "centos", "fedora", "freebsd", "opensuse", "archlinux", "redhatenterprise", "almalinux", "rockylinux", "alpine", "nixos", "openbsd", "netbsd", "gentoo", "voidlinux"
   "flavour": "string",
   "version": "string",
   "enabled": boolean,
@@ -4156,7 +4157,7 @@ The RBAC system uses the following permission format: `resource::action`
 {
   "id": number,
   "distribution": "debian",
-  // ApiOsDistribution enum: "ubuntu", "debian", "centos", "fedora", "freebsd", "opensuse", "archlinux", "redhatenterprise"
+  // ApiOsDistribution enum: "ubuntu", "debian", "centos", "fedora", "freebsd", "opensuse", "archlinux", "redhatenterprise", "almalinux", "rockylinux", "alpine", "nixos", "openbsd", "netbsd", "gentoo", "voidlinux"
   "flavour": "string",
   "version": "string",
   "enabled": boolean,

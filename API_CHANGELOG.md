@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **New OS distributions** — the `OsDistribution` / `ApiOsDistribution` enum now includes `almalinux`, `rockylinux`, `alpine`, `nixos`, `openbsd`, `netbsd`, `gentoo`, and `voidlinux`. Affects `GET /api/v1/image`, VM status responses, and the admin VM OS image endpoints (`GET/POST/PATCH /api/admin/v1/vm_os_image`).
+
 ### Changed
 
 - **DNS is now best-effort during VM provisioning** — forward (A/AAAA) and reverse (PTR) DNS records are convenience only and no longer block or roll back a deploy. Previously a reverse-DNS failure (notably OVH rejecting a PTR with a `4xx` until the forward name resolves — a fatal, non-retried error) tore down the whole pipeline and destroyed the freshly-created VM. Now such failures are logged and the deploy proceeds; the VM keeps its IPs and MAC. Any records that failed to create are reconciled automatically on the periodic VM check (and can still be forced via the existing DNS patch job).

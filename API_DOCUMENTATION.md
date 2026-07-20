@@ -17,7 +17,8 @@ This document provides comprehensive API specifications for generating TypeScrip
 **VmState**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
 **CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
 **OsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
-`"redhatenterprise"`
+`"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
+`"voidlinux"`
 **CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
 **CpuArch**: `"unknown"`, `"x86_64"`, `"arm64"`
 **CpuFeature**: `"SSE"`, `"SSE2"`, `"SSE3"`, `"SSSE3"`, `"SSE4_1"`, `"SSE4_2"`, `"AVX"`, `"AVX2"`, `"FMA"`, `"F16C"`,
@@ -350,7 +351,7 @@ interface CustomTemplateDiskParam {
 ```typescript
 interface VmOsImage {
   id: number;
-  distribution: 'ubuntu' | 'debian' | 'centos' | 'fedora' | 'freebsd' | 'opensuse' | 'archlinux' | 'redhatenterprise';
+  distribution: 'ubuntu' | 'debian' | 'centos' | 'fedora' | 'freebsd' | 'opensuse' | 'archlinux' | 'redhatenterprise' | 'almalinux' | 'rockylinux' | 'alpine' | 'nixos' | 'openbsd' | 'netbsd' | 'gentoo' | 'voidlinux';
   flavour: string;
   version: string;
   release_date: string; // ISO 8601 datetime

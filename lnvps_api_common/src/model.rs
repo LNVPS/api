@@ -550,6 +550,14 @@ pub enum ApiOsDistribution {
     OpenSUSE = 5,
     ArchLinux = 6,
     RedHatEnterprise = 7,
+    AlmaLinux = 8,
+    RockyLinux = 9,
+    Alpine = 10,
+    NixOS = 11,
+    OpenBSD = 12,
+    NetBSD = 13,
+    Gentoo = 14,
+    VoidLinux = 15,
 }
 
 impl From<lnvps_db::OsDistribution> for ApiOsDistribution {
@@ -563,6 +571,14 @@ impl From<lnvps_db::OsDistribution> for ApiOsDistribution {
             lnvps_db::OsDistribution::OpenSUSE => Self::OpenSUSE,
             lnvps_db::OsDistribution::ArchLinux => Self::ArchLinux,
             lnvps_db::OsDistribution::RedHatEnterprise => Self::RedHatEnterprise,
+            lnvps_db::OsDistribution::AlmaLinux => Self::AlmaLinux,
+            lnvps_db::OsDistribution::RockyLinux => Self::RockyLinux,
+            lnvps_db::OsDistribution::Alpine => Self::Alpine,
+            lnvps_db::OsDistribution::NixOS => Self::NixOS,
+            lnvps_db::OsDistribution::OpenBSD => Self::OpenBSD,
+            lnvps_db::OsDistribution::NetBSD => Self::NetBSD,
+            lnvps_db::OsDistribution::Gentoo => Self::Gentoo,
+            lnvps_db::OsDistribution::VoidLinux => Self::VoidLinux,
         }
     }
 }
@@ -578,6 +594,14 @@ impl From<ApiOsDistribution> for lnvps_db::OsDistribution {
             ApiOsDistribution::OpenSUSE => Self::OpenSUSE,
             ApiOsDistribution::ArchLinux => Self::ArchLinux,
             ApiOsDistribution::RedHatEnterprise => Self::RedHatEnterprise,
+            ApiOsDistribution::AlmaLinux => Self::AlmaLinux,
+            ApiOsDistribution::RockyLinux => Self::RockyLinux,
+            ApiOsDistribution::Alpine => Self::Alpine,
+            ApiOsDistribution::NixOS => Self::NixOS,
+            ApiOsDistribution::OpenBSD => Self::OpenBSD,
+            ApiOsDistribution::NetBSD => Self::NetBSD,
+            ApiOsDistribution::Gentoo => Self::Gentoo,
+            ApiOsDistribution::VoidLinux => Self::VoidLinux,
         }
     }
 }
@@ -782,6 +806,37 @@ impl ApiSubscriptionLineItemResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_os_distribution_roundtrip_with_db() {
+        let all = [
+            lnvps_db::OsDistribution::Ubuntu,
+            lnvps_db::OsDistribution::Debian,
+            lnvps_db::OsDistribution::CentOS,
+            lnvps_db::OsDistribution::Fedora,
+            lnvps_db::OsDistribution::FreeBSD,
+            lnvps_db::OsDistribution::OpenSUSE,
+            lnvps_db::OsDistribution::ArchLinux,
+            lnvps_db::OsDistribution::RedHatEnterprise,
+            lnvps_db::OsDistribution::AlmaLinux,
+            lnvps_db::OsDistribution::RockyLinux,
+            lnvps_db::OsDistribution::Alpine,
+            lnvps_db::OsDistribution::NixOS,
+            lnvps_db::OsDistribution::OpenBSD,
+            lnvps_db::OsDistribution::NetBSD,
+            lnvps_db::OsDistribution::Gentoo,
+            lnvps_db::OsDistribution::VoidLinux,
+        ];
+        for d in all {
+            let api = ApiOsDistribution::from(d);
+            let back = lnvps_db::OsDistribution::from(api);
+            assert_eq!(d, back);
+            // Serialized (lowercase) form must parse back via the DB FromStr
+            let json = serde_json::to_string(&api).unwrap();
+            let name = json.trim_matches('"');
+            assert_eq!(name.parse::<lnvps_db::OsDistribution>().unwrap(), d);
+        }
+    }
 
     #[test]
     fn test_vps_serialization_includes_type_tag() {

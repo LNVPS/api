@@ -705,6 +705,14 @@ pub enum OsDistribution {
     OpenSUSE = 5,
     ArchLinux = 6,
     RedHatEnterprise = 7,
+    AlmaLinux = 8,
+    RockyLinux = 9,
+    Alpine = 10,
+    NixOS = 11,
+    OpenBSD = 12,
+    NetBSD = 13,
+    Gentoo = 14,
+    VoidLinux = 15,
 }
 
 impl FromStr for OsDistribution {
@@ -720,6 +728,14 @@ impl FromStr for OsDistribution {
             "opensuse" => Ok(OsDistribution::OpenSUSE),
             "archlinux" => Ok(OsDistribution::ArchLinux),
             "redhatenterprise" => Ok(OsDistribution::RedHatEnterprise),
+            "almalinux" => Ok(OsDistribution::AlmaLinux),
+            "rockylinux" => Ok(OsDistribution::RockyLinux),
+            "alpine" => Ok(OsDistribution::Alpine),
+            "nixos" => Ok(OsDistribution::NixOS),
+            "openbsd" => Ok(OsDistribution::OpenBSD),
+            "netbsd" => Ok(OsDistribution::NetBSD),
+            "gentoo" => Ok(OsDistribution::Gentoo),
+            "voidlinux" => Ok(OsDistribution::VoidLinux),
             _ => Err(anyhow!("unknown distribution {}", s)),
         }
     }
@@ -736,6 +752,14 @@ impl Display for OsDistribution {
             OsDistribution::OpenSUSE => write!(f, "OpenSuse"),
             OsDistribution::ArchLinux => write!(f, "Arch Linux"),
             OsDistribution::RedHatEnterprise => write!(f, "Red Hat Enterprise"),
+            OsDistribution::AlmaLinux => write!(f, "AlmaLinux"),
+            OsDistribution::RockyLinux => write!(f, "Rocky Linux"),
+            OsDistribution::Alpine => write!(f, "Alpine"),
+            OsDistribution::NixOS => write!(f, "NixOS"),
+            OsDistribution::OpenBSD => write!(f, "OpenBSD"),
+            OsDistribution::NetBSD => write!(f, "NetBSD"),
+            OsDistribution::Gentoo => write!(f, "Gentoo"),
+            OsDistribution::VoidLinux => write!(f, "Void Linux"),
         }
     }
 }
@@ -2171,6 +2195,39 @@ impl InternetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_os_distribution_from_str_and_display() {
+        let all = [
+            ("ubuntu", OsDistribution::Ubuntu, "Ubuntu"),
+            ("debian", OsDistribution::Debian, "Debian"),
+            ("centos", OsDistribution::CentOS, "CentOs"),
+            ("fedora", OsDistribution::Fedora, "Fedora"),
+            ("freebsd", OsDistribution::FreeBSD, "FreeBSD"),
+            ("opensuse", OsDistribution::OpenSUSE, "OpenSuse"),
+            ("archlinux", OsDistribution::ArchLinux, "Arch Linux"),
+            (
+                "redhatenterprise",
+                OsDistribution::RedHatEnterprise,
+                "Red Hat Enterprise",
+            ),
+            ("almalinux", OsDistribution::AlmaLinux, "AlmaLinux"),
+            ("rockylinux", OsDistribution::RockyLinux, "Rocky Linux"),
+            ("alpine", OsDistribution::Alpine, "Alpine"),
+            ("nixos", OsDistribution::NixOS, "NixOS"),
+            ("openbsd", OsDistribution::OpenBSD, "OpenBSD"),
+            ("netbsd", OsDistribution::NetBSD, "NetBSD"),
+            ("gentoo", OsDistribution::Gentoo, "Gentoo"),
+            ("voidlinux", OsDistribution::VoidLinux, "Void Linux"),
+        ];
+        for (s, d, display) in all {
+            assert_eq!(OsDistribution::from_str(s).unwrap(), d);
+            // Case-insensitive
+            assert_eq!(OsDistribution::from_str(&s.to_uppercase()).unwrap(), d);
+            assert_eq!(d.to_string(), display);
+        }
+        assert!(OsDistribution::from_str("templeos").is_err());
+    }
 
     #[test]
     fn test_referral_payout_mode_roundtrip() {

@@ -1413,6 +1413,14 @@ fn api_os_distribution_to_db(api_distribution: ApiOsDistribution) -> OsDistribut
         ApiOsDistribution::OpenSUSE => OsDistribution::OpenSUSE,
         ApiOsDistribution::ArchLinux => OsDistribution::ArchLinux,
         ApiOsDistribution::RedHatEnterprise => OsDistribution::RedHatEnterprise,
+        ApiOsDistribution::AlmaLinux => OsDistribution::AlmaLinux,
+        ApiOsDistribution::RockyLinux => OsDistribution::RockyLinux,
+        ApiOsDistribution::Alpine => OsDistribution::Alpine,
+        ApiOsDistribution::NixOS => OsDistribution::NixOS,
+        ApiOsDistribution::OpenBSD => OsDistribution::OpenBSD,
+        ApiOsDistribution::NetBSD => OsDistribution::NetBSD,
+        ApiOsDistribution::Gentoo => OsDistribution::Gentoo,
+        ApiOsDistribution::VoidLinux => OsDistribution::VoidLinux,
     }
 }
 
@@ -4003,6 +4011,22 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_os_distribution_to_db_covers_new_distros() {
+        for (api, db) in [
+            (ApiOsDistribution::AlmaLinux, OsDistribution::AlmaLinux),
+            (ApiOsDistribution::RockyLinux, OsDistribution::RockyLinux),
+            (ApiOsDistribution::Alpine, OsDistribution::Alpine),
+            (ApiOsDistribution::NixOS, OsDistribution::NixOS),
+            (ApiOsDistribution::OpenBSD, OsDistribution::OpenBSD),
+            (ApiOsDistribution::NetBSD, OsDistribution::NetBSD),
+            (ApiOsDistribution::Gentoo, OsDistribution::Gentoo),
+            (ApiOsDistribution::VoidLinux, OsDistribution::VoidLinux),
+        ] {
+            assert_eq!(api_os_distribution_to_db(api), db);
+        }
+    }
 
     #[test]
     fn test_vm_template_update_cpu_mfg_can_be_unset_with_null() {
