@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **On-chain payment config now imported on existing deployments** — the payment method config data migration skipped entirely when *any* config already existed, so deployments that had already imported their LND Lightning config never got the newer LND on-chain config seeded. The migration now checks per payment method (Lightning / OnChain / Revolut) and imports only the missing ones.
 - **OS image checksum discovery hardened** — checksum (`SHASUMS`) fetching now sends a `User-Agent` header (some CDNs, e.g. CloudFront in front of `cloud.centos.org`, return 403 without one), enforces connect/request timeouts and a 1 MiB download cap, probes additional file conventions (`CHECKSUM`, `.SHA256SUM`/`.SHA512SUM`, Rocky's `.CHECKSUM`), parses digest-only sidecar files (e.g. Alpine's `.sha512`), handles filenames containing parentheses in BSD-format lines, and logs (instead of silently ignoring) transient errors while probing. Affects checksum auto-discovery used by admin VM OS image management.
 - **Clean up orphaned custom templates** — a startup data migration now deletes `vm_custom_template` rows not referenced by any VM. Custom templates are 1:1 with their VM, but historical hard-deletes could leave orphans behind. The migration is idempotent (a no-op once clean).
 
