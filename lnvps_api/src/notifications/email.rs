@@ -23,6 +23,23 @@ pub async fn send_email(
     plain_message: &str,
     html_message: Option<&str>,
 ) -> Result<(), OpError<anyhow::Error>> {
+    send_email_with_reply_to(smtp, to, None, subject, plain_message, html_message).await
+}
+
+/// Send an email via SMTP, optionally setting a `Reply-To` header.
+///
+/// Behaves like [`send_email`] but additionally sets the `Reply-To` header to
+/// `reply_to` when provided. This is useful for support/contact emails so
+/// replies are directed at the original sender rather than the SMTP `from`
+/// address.
+pub async fn send_email_with_reply_to(
+    smtp: &SmtpConfig,
+    to: &str,
+    reply_to: Option<&str>,
+    subject: &str,
+    plain_message: &str,
+    html_message: Option<&str>,
+) -> Result<(), OpError<anyhow::Error>> {
     #[derive(serde::Serialize)]
     struct EmailData {
         message: String,
@@ -46,6 +63,12 @@ pub async fn send_email(
     if let Some(f) = &smtp.from {
         b = b.from(
             f.parse()
+                .map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?,
+        );
+    }
+    if let Some(rt) = reply_to {
+        b = b.reply_to(
+            rt.parse()
                 .map_err(|e: lettre::address::AddressError| OpError::Fatal(e.into()))?,
         );
     }

@@ -14,7 +14,7 @@ mod nip17;
 mod telegram;
 mod whatsapp;
 
-pub use email::{EmailChannel, send_email};
+pub use email::{EmailChannel, send_email, send_email_with_reply_to};
 pub use nip17::Nip17Channel;
 pub use telegram::{TelegramBot, TelegramChannel, TelegramClient};
 pub use whatsapp::{WhatsAppChannel, WhatsAppClient, normalize_number};

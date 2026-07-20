@@ -1,10 +1,11 @@
 use crate::api::RouterState;
+use crate::notifications::send_email_with_reply_to;
 use crate::settings::CaptchaConfig;
 use anyhow::Result;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiResult, WorkJob};
+use lnvps_api_common::{ApiData, ApiResult};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -97,8 +98,8 @@ async fn v1_submit_contact_form(
         }
     }
 
-    // Format the message for the admin
-    let admin_message = format!(
+    // Format the message for the support inbox
+    let support_message = format!(
         "New Contact Form Submission\n\
         \n\
         Name: {}\n\
@@ -122,17 +123,37 @@ async fn v1_submit_contact_form(
         req.email
     );
 
-    // Queue notification to all admins
-    if let Err(e) = state
-        .work_sender
-        .send(WorkJob::SendAdminNotification {
-            message: admin_message,
-            title: Some(format!("Contact Form: {}", req.subject)),
-        })
-        .await
+    // Deliver the support email to the company's support inbox. The sender's
+    // email is set as the Reply-To header (with their name) so replies go
+    // straight back to them.
+    let Some(smtp) = &state.settings.smtp else {
+        log::error!("Cannot send contact form: SMTP is not configured");
+        return ApiData::err("Contact form is not available");
+    };
+    let support_email = match state.db.list_companies().await {
+        Ok(companies) => companies.into_iter().find_map(|c| c.email),
+        Err(e) => {
+            log::error!("Failed to load company for contact form: {}", e);
+            None
+        }
+    };
+    let Some(support_email) = support_email else {
+        log::error!("Cannot send contact form: no company email configured");
+        return ApiData::err("Contact form is not available");
+    };
+    let reply_to = format!("{} <{}>", req.name.trim(), req.email.trim());
+    if let Err(e) = send_email_with_reply_to(
+        smtp,
+        &support_email,
+        Some(&reply_to),
+        &format!("Contact Form: {}", req.subject),
+        &support_message,
+        None,
+    )
+    .await
     {
-        log::error!("Failed to queue admin notification: {}", e);
-        return ApiData::err("Failed to send notification");
+        log::error!("Failed to send contact form email: {}", e);
+        return ApiData::err("Failed to send message");
     }
 
     ApiData::ok(())
