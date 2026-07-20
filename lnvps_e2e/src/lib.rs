@@ -18,6 +18,7 @@ pub mod db;
 mod lifecycle;
 pub mod lightning;
 pub mod nip98;
+pub mod onchain;
 mod rbac;
 pub mod soft_authenticator;
 mod user_api;

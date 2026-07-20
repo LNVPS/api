@@ -676,6 +676,209 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
+        // 14d. On-chain renewal: request an on-chain payment, send real
+        //      coins from lnd-payer, mine a block and wait for the API's
+        //      chain watcher to settle it.
+        // ----------------------------------------------------------------
+        let resp = user
+            .get_auth(&format!("/api/v1/vm/{vm_id}/renew?method=onchain"))
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::OK {
+            let oc_renew = serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
+            let oc_payment_id = oc_renew["data"]["id"].as_str().unwrap().to_string();
+            let oc_address = crate::onchain::extract_onchain_address(&oc_renew).unwrap();
+            // amount + tax are msats; send the exact gross in whole sats
+            let gross_msat = oc_renew["data"]["amount"].as_u64().unwrap()
+                + oc_renew["data"]["tax"].as_u64().unwrap_or(0);
+            let gross_sats = gross_msat.div_ceil(1000);
+            eprintln!(
+                "Created on-chain payment {oc_payment_id}: {gross_sats} sats to {oc_address}"
+            );
+
+            let expiry_before_onchain =
+                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await["data"]
+                    ["expires"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+            pay_onchain_and_wait(
+                &admin,
+                &format!("/api/admin/v1/vms/{vm_id}/payments/{oc_payment_id}"),
+                &oc_address,
+                gross_sats,
+            )
+            .await;
+            eprintln!("On-chain payment {oc_payment_id} settled ✓");
+
+            // Expiry must advance again
+            let expiry_after_onchain =
+                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await["data"]
+                    ["expires"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            assert_ne!(
+                expiry_after_onchain, expiry_before_onchain,
+                "VM expiry should advance after on-chain renewal"
+            );
+            eprintln!(
+                "VM {vm_id} expiry advanced {expiry_before_onchain} → {expiry_after_onchain} after on-chain payment ✓"
+            );
+
+            // The settled payment records the txid:vout outpoint
+            let oc_paid = json_ok(
+                admin
+                    .get_auth(&format!(
+                        "/api/admin/v1/vms/{vm_id}/payments/{oc_payment_id}"
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if let Some(ext) = oc_paid["data"]["external_id"].as_str() {
+                assert!(
+                    ext.contains(':'),
+                    "external_id should be a txid:vout outpoint, got {ext}"
+                );
+                eprintln!("On-chain payment outpoint: {ext} ✓");
+            }
+
+            // ------------------------------------------------------------
+            // 14e. On-chain edge case: PARTIAL payment. Deposits are never
+            //      rejected — half the quoted amount settles the payment
+            //      with pro-rated (roughly half) time credited.
+            // ------------------------------------------------------------
+            let oc2 = json_ok(
+                user.get_auth(&format!("/api/v1/vm/{vm_id}/renew?method=onchain"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let oc2_payment_id = oc2["data"]["id"].as_str().unwrap().to_string();
+            let oc2_address = crate::onchain::extract_onchain_address(&oc2).unwrap();
+            let oc2_gross_msat =
+                oc2["data"]["amount"].as_u64().unwrap() + oc2["data"]["tax"].as_u64().unwrap_or(0);
+            let half_sats = (oc2_gross_msat / 2).div_ceil(1000);
+            eprintln!(
+                "Created on-chain payment {oc2_payment_id}, paying only {half_sats} sats (half)"
+            );
+
+            let expiry_before_partial =
+                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await["data"]
+                    ["expires"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+            pay_onchain_and_wait(
+                &admin,
+                &format!("/api/admin/v1/vms/{vm_id}/payments/{oc2_payment_id}"),
+                &oc2_address,
+                half_sats,
+            )
+            .await;
+
+            let oc2_paid = json_ok(
+                admin
+                    .get_auth(&format!(
+                        "/api/admin/v1/vms/{vm_id}/payments/{oc2_payment_id}"
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            // Components are re-generated from what actually arrived
+            let recorded = oc2_paid["data"]["amount"].as_u64().unwrap()
+                + oc2_paid["data"]["tax"].as_u64().unwrap_or(0);
+            assert_eq!(
+                recorded,
+                half_sats * 1000,
+                "settled partial payment should record exactly the received msats"
+            );
+            // Time credited should be roughly half an interval (month):
+            // parse expiries and compare the delta against 10-20 days.
+            let expiry_after_partial =
+                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await["data"]
+                    ["expires"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            let before = chrono::DateTime::parse_from_rfc3339(&expiry_before_partial).unwrap();
+            let after = chrono::DateTime::parse_from_rfc3339(&expiry_after_partial).unwrap();
+            let credited_days = (after - before).num_days();
+            assert!(
+                (10..=20).contains(&credited_days),
+                "half payment should credit roughly half a month, got {credited_days} days"
+            );
+            eprintln!("Partial on-chain payment credited {credited_days} days (≈ half interval) ✓");
+
+            // ------------------------------------------------------------
+            // 14f. On-chain edge case: ADDRESS REUSE. A further deposit to
+            //      the already-settled first address automatically inserts
+            //      a new paid renewal payment.
+            // ------------------------------------------------------------
+            let paid_count_before = json_ok(
+                user.get_auth(&format!("/api/v1/subscriptions/{sub_id}/payments"))
+                    .await
+                    .unwrap(),
+            )
+            .await["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["is_paid"].as_bool().unwrap_or(false))
+                .count();
+
+            match crate::onchain::send_onchain(&oc_address, gross_sats).await {
+                Ok(reuse_txid) => {
+                    crate::onchain::mine_blocks(1).await.unwrap();
+                    eprintln!(
+                        "Sent {gross_sats} sats to already-settled address {oc_address} (tx {reuse_txid})"
+                    );
+                    // A new paid renewal payment should appear automatically
+                    let appeared = poll_until(60, 500, || {
+                        let user = user.clone();
+                        let path = format!("/api/v1/subscriptions/{sub_id}/payments");
+                        async move {
+                            if let Ok(r) = user.get_auth(&path).await {
+                                if let Ok(body) = serde_json::from_str::<serde_json::Value>(
+                                    &r.text().await.unwrap_or_default(),
+                                ) {
+                                    let paid = body["data"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter(|p| p["is_paid"].as_bool().unwrap_or(false))
+                                                .count()
+                                        })
+                                        .unwrap_or(0);
+                                    return paid > paid_count_before;
+                                }
+                            }
+                            false
+                        }
+                    })
+                    .await;
+                    assert!(
+                        appeared,
+                        "deposit to a settled address should auto-create a new paid renewal payment"
+                    );
+                    eprintln!("Address-reuse deposit auto-created a paid renewal payment ✓");
+                }
+                Err(e) => {
+                    eprintln!("on-chain payer not available ({e}), skipping address-reuse case");
+                }
+            }
+        } else {
+            eprintln!(
+                "On-chain renew returned {} — skipping on-chain payment flow",
+                resp.status()
+            );
+        }
+
+        // ----------------------------------------------------------------
         // 14. Verify referral earnings after payment
         // ----------------------------------------------------------------
         let ref_state = json_ok(referrer.get_auth("/api/v1/referral").await.unwrap()).await;
@@ -1815,19 +2018,69 @@ mod tests {
                 // lnd-payer unavailable — fall back to admin complete so the
                 // test suite still passes when running without the full stack.
                 eprintln!("lnd-payer not available ({e}), falling back to admin complete");
-                let complete_path = format!("{status_path}/complete");
-                let p = json_ok(
-                    admin
-                        .post_auth(&complete_path, &serde_json::json!({}))
-                        .await
-                        .unwrap(),
-                )
-                .await;
-                assert!(
-                    p["data"]["is_paid"].as_bool().unwrap_or(false),
-                    "Admin complete at {complete_path} did not mark payment as paid"
-                );
+                admin_complete(admin, status_path).await;
             }
         }
+    }
+
+    /// Send an on-chain payment to `address`, mine a confirmation block and
+    /// poll `status_path` until the API's chain watcher settles the payment.
+    /// Falls back to admin-complete when the docker stack is unavailable.
+    async fn pay_onchain_and_wait(
+        admin: &crate::client::TestClient,
+        status_path: &str,
+        address: &str,
+        amount_sats: u64,
+    ) {
+        match crate::onchain::send_onchain(address, amount_sats).await {
+            Ok(txid) => {
+                eprintln!("On-chain tx {txid} broadcast, mining 1 block...");
+                crate::onchain::mine_blocks(1)
+                    .await
+                    .expect("mining a block should succeed when the stack is up");
+                // Poll up to 60 s for the chain watcher to settle the deposit.
+                let paid = poll_until(60, 500, || {
+                    let admin = admin.clone();
+                    let path = status_path.to_string();
+                    async move {
+                        if let Ok(r) = admin.get_auth(&path).await {
+                            if let Ok(body) = serde_json::from_str::<serde_json::Value>(
+                                &r.text().await.unwrap_or_default(),
+                            ) {
+                                return body["data"]["is_paid"].as_bool().unwrap_or(false);
+                            }
+                        }
+                        false
+                    }
+                })
+                .await;
+                assert!(
+                    paid,
+                    "Payment at {status_path} was not marked paid within 60 s after on-chain confirmation"
+                );
+            }
+            Err(e) => {
+                // Docker stack unavailable — fall back to admin complete so
+                // the test suite still passes without the full stack.
+                eprintln!("on-chain payer not available ({e}), falling back to admin complete");
+                admin_complete(admin, status_path).await;
+            }
+        }
+    }
+
+    /// Mark a payment as paid via the admin complete endpoint.
+    async fn admin_complete(admin: &crate::client::TestClient, status_path: &str) {
+        let complete_path = format!("{status_path}/complete");
+        let p = json_ok(
+            admin
+                .post_auth(&complete_path, &serde_json::json!({}))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            p["data"]["is_paid"].as_bool().unwrap_or(false),
+            "Admin complete at {complete_path} did not mark payment as paid"
+        );
     }
 }

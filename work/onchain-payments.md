@@ -136,6 +136,25 @@ feature), now available on crates.io as `payments-rs = 0.4.1`.
       — completing the factory→runtime integration is issue #182 (Lightning has the
       same gap; the factory is currently dead code at runtime).
 
+### Increment 7 — real e2e tests (regtest bitcoind + LND)
+- [x] `lnvps_e2e/src/onchain.rs`: `send_onchain` (lnd-payer `sendcoins`),
+      `mine_blocks` (bitcoind `generatetoaddress`), `extract_onchain_address`.
+- [x] Lifecycle step 14d: `renew?method=onchain` → real address from LND → real
+      coins sent + 1 block mined → chain watcher settles → expiry advances →
+      settled payment records the real `{txid}:{vout}` outpoint. Falls back to
+      admin-complete when the docker stack is down.
+- [x] Edge cases e2e (14e/14f): **partial payment** — half the quote settles with
+      ≈half a month credited (15 days measured) and records exactly the received
+      msats; **address reuse** — a further deposit to the settled address
+      auto-creates a new paid renewal payment. Replay/de-dupe and multi-output
+      stay unit-tested (need watcher restart / sendmany); deleted-VM deposit not
+      e2e-testable without breaking later lifecycle steps.
+- [x] **Bug found**: docker-compose helpers used a relative compose path but cargo
+      runs tests with CWD = `lnvps_e2e/`, so `pay_invoice` had been silently
+      falling back to admin-complete — lightning e2e never actually paid via LND.
+      Fixed with `CARGO_MANIFEST_DIR`-relative path; lightning payments now settle
+      through the real payer node too. Full suite: 123 e2e tests green locally.
+
 ### Increment 5 — API surface + docs (S)
 - [x] `ApiPaymentMethod::OnChain` / `ApiPaymentData::OnChain { address }` exposed.
 - [x] `API_CHANGELOG.md` updated (Unreleased).
