@@ -154,6 +154,90 @@ impl PaymentMethodFactory {
         }
     }
 
+    /// Create an on-chain payment provider from a PaymentMethodConfig
+    ///
+    /// Returns an error if the config is not for the OnChain payment method,
+    /// is disabled, or the provider type is not supported.
+    #[cfg(feature = "onchain")]
+    pub async fn create_onchain_provider(
+        &self,
+        config: &PaymentMethodConfig,
+    ) -> Result<Arc<dyn payments_rs::onchain::OnChainProvider>> {
+        use lnvps_db::OnChainAddressType;
+        use payments_rs::onchain::{LndAddressType, LndOnChainConfig, LndOnChainProvider};
+
+        if config.payment_method != PaymentMethod::OnChain {
+            bail!(
+                "Cannot create on-chain provider from {:?} config",
+                config.payment_method
+            );
+        }
+        if !config.enabled {
+            bail!("Payment method config '{}' is disabled", config.name);
+        }
+        let provider_config = config
+            .get_provider_config()
+            .context("Failed to parse provider config")?;
+        match provider_config {
+            ProviderConfig::OnChain(cfg) => {
+                let address_type = match cfg.address_type {
+                    OnChainAddressType::WitnessPubkeyHash => LndAddressType::WitnessPubkeyHash,
+                    OnChainAddressType::NestedPubkeyHash => LndAddressType::NestedPubkeyHash,
+                    OnChainAddressType::TaprootPubkey => LndAddressType::TaprootPubkey,
+                };
+                let provider = LndOnChainProvider::new(
+                    &cfg.url,
+                    &cfg.cert_path,
+                    &cfg.macaroon_path,
+                    LndOnChainConfig {
+                        address_type,
+                        account: cfg.account.clone(),
+                        min_confirmations: cfg.min_confirmations,
+                    },
+                )
+                .await
+                .context("Failed to create LND on-chain provider")?;
+                Ok(Arc::new(provider))
+            }
+            other => bail!(
+                "Unsupported on-chain provider type: {}",
+                other.provider_type()
+            ),
+        }
+    }
+
+    /// Get the on-chain payment provider for a company
+    #[cfg(feature = "onchain")]
+    pub async fn get_onchain_provider_for_company(
+        &self,
+        company_id: u64,
+    ) -> Result<Option<Arc<dyn payments_rs::onchain::OnChainProvider>>> {
+        match self
+            .db
+            .get_payment_method_config_for_company(company_id, PaymentMethod::OnChain)
+            .await
+        {
+            Ok(config) => {
+                if config.enabled {
+                    match self.create_onchain_provider(&config).await {
+                        Ok(provider) => Ok(Some(provider)),
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to create on-chain provider from config '{}': {}",
+                                config.name,
+                                e
+                            );
+                            Ok(None)
+                        }
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => Ok(None), // No config found for company
+        }
+    }
+
     /// Get the Lightning node configuration for a company
     pub async fn get_lightning_node_for_company(
         &self,
@@ -342,6 +426,106 @@ mod tests {
             ),
             Ok(_) => panic!("Expected error for wrong payment method"),
         }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "onchain")]
+    fn make_onchain_config(enabled: bool, company_id: u64) -> PaymentMethodConfig {
+        use lnvps_db::{OnChainAddressType, OnChainProviderConfig};
+        PaymentMethodConfig::new_with_config(
+            company_id,
+            PaymentMethod::OnChain,
+            "Test OnChain".to_string(),
+            enabled,
+            ProviderConfig::OnChain(OnChainProviderConfig {
+                url: "https://localhost:10009".to_string(),
+                cert_path: PathBuf::from("/path/to/cert"),
+                macaroon_path: PathBuf::from("/path/to/macaroon"),
+                address_type: OnChainAddressType::WitnessPubkeyHash,
+                account: None,
+                min_confirmations: 3,
+            }),
+        )
+    }
+
+    #[cfg(feature = "onchain")]
+    #[tokio::test]
+    async fn test_create_onchain_provider_wrong_method_fails() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let factory = PaymentMethodFactory::new(db);
+
+        // Wrong method
+        let config = make_revolut_config(true, 1);
+        let result = factory.create_onchain_provider(&config).await;
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string().contains("Cannot create on-chain provider"))
+                .unwrap_or(false),
+            "expected wrong-method error, got {:?}",
+            result.err()
+        );
+
+        // Disabled config
+        let config = make_onchain_config(false, 1);
+        let result = factory.create_onchain_provider(&config).await;
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string().contains("disabled"))
+                .unwrap_or(false),
+            "expected disabled error, got {:?}",
+            result.err()
+        );
+
+        // Wrong provider type inside an OnChain method config
+        let mut config = make_onchain_config(true, 1);
+        config.set_provider_config(ProviderConfig::Lnd(LndConfig {
+            url: "https://localhost:8080".to_string(),
+            cert_path: PathBuf::from("/path/to/cert"),
+            macaroon_path: PathBuf::from("/path/to/macaroon"),
+        }));
+        let result = factory.create_onchain_provider(&config).await;
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string().contains("Unsupported on-chain provider"))
+                .unwrap_or(false),
+            "expected unsupported-provider error, got {:?}",
+            result.err()
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "onchain")]
+    #[tokio::test]
+    async fn test_get_onchain_provider_for_company() -> Result<()> {
+        // LndOnChainProvider::new requires a process-level rustls provider
+        payments_rs::lightning::setup_crypto_provider();
+        let db = Arc::new(MockDb::default());
+
+        // No config -> None
+        let factory = PaymentMethodFactory::new(db.clone());
+        assert!(factory.get_onchain_provider_for_company(1).await?.is_none());
+
+        // Disabled config -> None
+        {
+            let mut configs = db.payment_method_configs.lock().await;
+            configs.insert(1, make_onchain_config(false, 1));
+        }
+        assert!(factory.get_onchain_provider_for_company(1).await?.is_none());
+
+        // Enabled config with unreachable node -> None (create fails, logged)
+        {
+            let mut configs = db.payment_method_configs.lock().await;
+            configs.insert(1, make_onchain_config(true, 1));
+        }
+        assert!(factory.get_onchain_provider_for_company(1).await?.is_none());
 
         Ok(())
     }

@@ -30,7 +30,9 @@ impl DataMigration for OrphanedCustomTemplatesMigration {
         let db = self.db.clone();
         Box::pin(async move {
             let deleted = db.delete_orphaned_custom_vm_templates().await?;
-            Ok(format!("deleted {deleted} orphaned vm_custom_template row(s)"))
+            Ok(format!(
+                "deleted {deleted} orphaned vm_custom_template row(s)"
+            ))
         })
     }
 }

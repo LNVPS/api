@@ -1049,7 +1049,7 @@ impl SpawnVmContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::{MockDnsServer, MockNode, MockRouter};
+    use crate::mocks::{MockDnsServer, MockNode, MockOnChainProvider, MockRouter};
     use crate::settings::mock_settings;
     use crate::subscription::{
         SubscriptionHandler, SubscriptionLineItemHandler, VmLineItemHandler,
@@ -1140,6 +1140,7 @@ mod tests {
             settings,
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             rates.clone(),
             lnvps_api_common::VatClient::new(),
             wrk.clone(),
@@ -1365,6 +1366,7 @@ mod tests {
             mock_settings(),
             db.clone(),
             node,
+            Arc::new(MockOnChainProvider::default()),
             rates,
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -2650,6 +2652,7 @@ mod tests {
             mock_settings(),
             db.clone(),
             node,
+            Arc::new(MockOnChainProvider::default()),
             rates,
             lnvps_api_common::VatClient::new(),
             wrk,

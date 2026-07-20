@@ -28,6 +28,7 @@ use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
+use payments_rs::onchain::{NewAddressRequest, OnChainProvider};
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -106,6 +107,7 @@ pub struct SubscriptionHandler {
     tx: Arc<dyn WorkCommander>,
 
     node: Arc<dyn LightningNode>,
+    onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
 
     pe: PricingEngine,
@@ -120,6 +122,7 @@ impl SubscriptionHandler {
         settings: Settings,
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
+        onchain: Arc<dyn OnChainProvider>,
         rates: Arc<dyn ExchangeRateService>,
         vat: VatClient,
         tx: Arc<dyn WorkCommander>,
@@ -132,6 +135,7 @@ impl SubscriptionHandler {
             db,
             tx,
             node,
+            onchain,
             vm_state_cache,
             saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
         })
@@ -151,6 +155,26 @@ impl SubscriptionHandler {
 
     pub fn db(&self) -> Arc<dyn LNVpsDb> {
         self.db.clone()
+    }
+
+    /// Derive a fresh on-chain receive address for a new payment.
+    ///
+    /// Returns the address string to store in `external_data`.
+    async fn new_onchain_address(
+        &self,
+        amount_msat: u64,
+        memo: String,
+        label: String,
+    ) -> Result<String> {
+        let resp = self
+            .onchain
+            .new_address(NewAddressRequest {
+                amount: CurrencyAmount::millisats(amount_msat),
+                memo: Some(memo),
+                label: Some(label),
+            })
+            .await?;
+        Ok(resp.address)
     }
 
     #[cfg(test)]
@@ -714,6 +738,64 @@ impl SubscriptionHandler {
                     tax_breakdown: tax_breakdown.clone(),
                 }
             }
+            PaymentMethod::OnChain => {
+                ensure!(
+                    converted_currency == Currency::BTC,
+                    "On-chain payment must be in BTC"
+                );
+                // On-chain payments need time for the tx to be broadcast and
+                // confirmed; hold the quoted rate for longer than Lightning.
+                const ONCHAIN_EXPIRE: u64 = 3600;
+                let invoice_amount = round_msat_to_sat(converted_amount + tax);
+                let desc = match payment_type {
+                    SubscriptionPaymentType::Purchase => {
+                        format!("Subscription purchase: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Renewal => {
+                        format!("Subscription renewal: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Upgrade => {
+                        format!("Subscription upgrade: {}", subscription.name)
+                    }
+                };
+
+                let new_id: [u8; 32] = rand::random();
+                let address = self
+                    .new_onchain_address(invoice_amount, desc, hex::encode(new_id))
+                    .await?;
+
+                SubscriptionPayment {
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id: subscription.user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(ONCHAIN_EXPIRE)),
+                    amount: converted_amount,
+                    currency: converted_currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: address.into(),
+                    // txid is not known until the payment arrives; the chain
+                    // watcher fills this in when the deposit is seen.
+                    external_id: None,
+                    is_paid: false,
+                    rate,
+                    time_value: if time_value > 0 {
+                        Some(time_value)
+                    } else {
+                        None
+                    },
+                    metadata: None,
+                    tax,
+                    processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                }
+            }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
             PaymentMethod::Stripe => bail!("Stripe not implemented"),
         };
@@ -889,6 +971,49 @@ impl SubscriptionHandler {
                             payment_type,
                             external_data: raw_data.into(),
                             external_id: Some(external_id),
+                            is_paid: false,
+                            rate: p.rate.rate,
+                            time_value: Some(p.time_value),
+                            metadata,
+                            tax: p.tax,
+                            processing_fee: p.processing_fee,
+                            paid_at: None,
+                            tax_rate: tax_summary.rate,
+                            tax_country_code: tax_summary.country_code.clone(),
+                            tax_treatment: tax_summary.treatment.clone(),
+                            tax_evidence: tax_evidence.clone(),
+                            tax_breakdown: tax_breakdown.clone(),
+                        }
+                    }
+                    PaymentMethod::OnChain => {
+                        ensure!(
+                            p.currency == Currency::BTC,
+                            "Cannot create on-chain payments for non-BTC currency"
+                        );
+                        const ONCHAIN_EXPIRE: u64 = 3600;
+                        let total_amount = round_msat_to_sat(p.amount + p.tax);
+                        info!(
+                            "Creating on-chain address for vm {vm_id} for {} sats",
+                            total_amount / 1000
+                        );
+                        let new_id: [u8; 32] = rand::random();
+                        let address = self
+                            .new_onchain_address(total_amount, desc, hex::encode(new_id))
+                            .await?;
+                        SubscriptionPayment {
+                            id: new_id.to_vec(),
+                            subscription_id,
+                            user_id: vm.user_id,
+                            created: Utc::now(),
+                            expires: Utc::now().add(Duration::from_secs(ONCHAIN_EXPIRE)),
+                            amount: p.amount,
+                            currency: p.currency.to_string(),
+                            payment_method: method,
+                            payment_type,
+                            external_data: address.into(),
+                            // txid is filled in by the chain watcher when the
+                            // deposit is seen.
+                            external_id: None,
                             is_paid: false,
                             rate: p.rate.rate,
                             time_value: Some(p.time_value),
@@ -1128,7 +1253,7 @@ impl SubscriptionHandler {
 #[cfg(all(test, feature = "revolut"))]
 mod revolut_autorenew_tests {
     use super::*;
-    use crate::mocks::MockNode;
+    use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use config::{Config, File};
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
@@ -1242,6 +1367,7 @@ mod revolut_autorenew_tests {
             settings,
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             Arc::new(MockExchangeRate::default()),
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -1266,7 +1392,7 @@ mod revolut_autorenew_tests {
 #[cfg(test)]
 mod revolut_offline_tests {
     use super::*;
-    use crate::mocks::MockNode;
+    use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
     use lnvps_db::{
@@ -1415,6 +1541,7 @@ mod revolut_offline_tests {
             mock_settings(),
             db.clone(),
             node,
+            Arc::new(MockOnChainProvider::default()),
             rates,
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -1484,6 +1611,7 @@ mod revolut_offline_tests {
             mock_settings(),
             db.clone(),
             node,
+            Arc::new(MockOnChainProvider::default()),
             Arc::new(MockExchangeRate::default()),
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -1509,6 +1637,76 @@ mod revolut_offline_tests {
         assert!(breakdown.is_array());
         let ev = payment.tax_evidence.expect("evidence present");
         assert_eq!(ev["declared_country"], "DEU");
+    }
+
+    /// An on-chain renewal derives a fresh receive address from the provider and
+    /// stores it in `external_data`; the txid (`external_id`) stays empty until
+    /// the chain watcher sees the deposit.
+    #[tokio::test]
+    async fn renew_subscription_onchain_derives_address() {
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let user_id = db.upsert_user(&[22u8; 32]).await.unwrap();
+
+        // BTC-denominated subscription so an on-chain renewal needs no FX.
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 100_000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            onchain.clone(),
+            Arc::new(MockExchangeRate::default()),
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+
+        let payment = sub
+            .renew_subscription(sub_id, PaymentMethod::OnChain, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(payment.payment_method, PaymentMethod::OnChain);
+        assert!(!payment.is_paid);
+        assert_eq!(payment.external_id, None, "txid unknown until deposit");
+        // The stored external_data is the address derived from the provider
+        let addresses = onchain.addresses.lock().await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(payment.external_data.as_str(), addresses[0]);
     }
 
     #[tokio::test]

@@ -1,10 +1,12 @@
 use crate::payments::invoice::NodeInvoiceHandler;
+use crate::payments::onchain::OnChainPaymentHandler;
 use crate::settings::Settings;
 use crate::subscription::SubscriptionHandler;
 use anyhow::Result;
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
 use log::{error, info, warn};
 use payments_rs::lightning::LightningNode;
+use payments_rs::onchain::OnChainProvider;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 mod invoice;
+mod onchain;
 #[cfg(feature = "revolut")]
 mod revolut;
 #[cfg(feature = "stripe")]
@@ -24,6 +27,7 @@ mod stripe;
 pub async fn listen_all_payments(
     settings: &Settings,
     node: Arc<dyn LightningNode>,
+    onchain: Arc<dyn OnChainProvider>,
     db: Arc<dyn LNVpsDb>,
     sub_handler: SubscriptionHandler,
 ) -> Result<Vec<JoinHandle<()>>> {
@@ -33,6 +37,16 @@ pub async fn listen_all_payments(
         loop {
             if let Err(e) = handler.listen().await {
                 error!("invoice-error: {}", e);
+            }
+            sleep(Duration::from_secs(10)).await;
+        }
+    }));
+
+    let mut onchain_handler = OnChainPaymentHandler::new(onchain, db.clone(), sub_handler.clone());
+    ret.push(tokio::spawn(async move {
+        loop {
+            if let Err(e) = onchain_handler.listen().await {
+                error!("onchain-error: {}", e);
             }
             sleep(Duration::from_secs(10)).await;
         }

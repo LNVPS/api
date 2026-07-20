@@ -808,12 +808,7 @@ async fn v1_list_vm_images(State(this): State<RouterState>) -> ApiResult<Vec<Api
     let images = this.db.list_os_image().await?;
 
     // Compute popularity as the fraction of active VMs using each image
-    let counts: HashMap<u64, u64> = this
-        .db
-        .count_vms_by_os_image()
-        .await?
-        .into_iter()
-        .collect();
+    let counts: HashMap<u64, u64> = this.db.count_vms_by_os_image().await?.into_iter().collect();
     let total: u64 = counts.values().sum();
 
     let ret = images
@@ -1534,6 +1529,7 @@ fn parse_currencies(codes: &[String]) -> Vec<ApiCurrency> {
 fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
     match method {
         PaymentMethod::Lightning => vec![ApiCurrency::BTC],
+        PaymentMethod::OnChain => vec![ApiCurrency::BTC],
         PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
@@ -2385,7 +2381,10 @@ mod tests {
 
         for info in &result {
             match info.name {
-                ApiPaymentMethod::Lightning | ApiPaymentMethod::NWC | ApiPaymentMethod::LNURL => {
+                ApiPaymentMethod::Lightning
+                | ApiPaymentMethod::NWC
+                | ApiPaymentMethod::LNURL
+                | ApiPaymentMethod::OnChain => {
                     assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
                 }
                 ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {

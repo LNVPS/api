@@ -1474,6 +1474,8 @@ pub enum PaymentMethod {
     Revolut,
     Paypal,
     Stripe,
+    /// On-chain Bitcoin payments
+    OnChain,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -1491,6 +1493,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Revolut => write!(f, "Revolut"),
             PaymentMethod::Paypal => write!(f, "PayPal"),
             PaymentMethod::Stripe => write!(f, "Stripe"),
+            PaymentMethod::OnChain => write!(f, "OnChain"),
         }
     }
 }
@@ -1504,6 +1507,7 @@ impl FromStr for PaymentMethod {
             "revolut" => Ok(PaymentMethod::Revolut),
             "paypal" => Ok(PaymentMethod::Paypal),
             "stripe" => Ok(PaymentMethod::Stripe),
+            "onchain" => Ok(PaymentMethod::OnChain),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -2391,6 +2395,80 @@ mod tests {
             assert_eq!(parsed, arch);
         }
     }
+
+    #[test]
+    fn test_payment_method_roundtrip() {
+        for (s, m) in [
+            ("lightning", PaymentMethod::Lightning),
+            ("revolut", PaymentMethod::Revolut),
+            ("paypal", PaymentMethod::Paypal),
+            ("stripe", PaymentMethod::Stripe),
+            ("onchain", PaymentMethod::OnChain),
+        ] {
+            assert_eq!(PaymentMethod::from_str(s).unwrap(), m);
+        }
+        assert_eq!(PaymentMethod::OnChain.to_string(), "OnChain");
+        assert!(PaymentMethod::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn test_provider_config_onchain() {
+        let config = ProviderConfig::OnChain(OnChainProviderConfig {
+            url: "https://localhost:10009".to_string(),
+            cert_path: "/tls.cert".into(),
+            macaroon_path: "/admin.macaroon".into(),
+            address_type: OnChainAddressType::TaprootPubkey,
+            account: Some("deposits".to_string()),
+            min_confirmations: 3,
+        });
+        assert_eq!(config.provider_type(), "onchain");
+        assert_eq!(config.payment_method(), PaymentMethod::OnChain);
+        assert!(config.as_onchain().is_some());
+        assert!(config.as_lnd().is_none());
+        assert!(
+            ProviderConfig::Lnd(LndConfig {
+                url: "".to_string(),
+                cert_path: "".into(),
+                macaroon_path: "".into(),
+            })
+            .as_onchain()
+            .is_none()
+        );
+
+        // serde round-trip via PaymentMethodConfig helpers
+        let mut pmc = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::OnChain,
+            "onchain".to_string(),
+            true,
+            config,
+        );
+        assert_eq!(pmc.provider_type, "onchain");
+        let parsed = pmc.get_provider_config().expect("config round-trips");
+        let oc = parsed.as_onchain().unwrap();
+        assert_eq!(oc.url, "https://localhost:10009");
+        assert_eq!(oc.address_type, OnChainAddressType::TaprootPubkey);
+        assert_eq!(oc.account.as_deref(), Some("deposits"));
+        assert_eq!(oc.min_confirmations, 3);
+        pmc.set_provider_config(parsed);
+        assert_eq!(pmc.provider_type, "onchain");
+    }
+
+    #[test]
+    fn test_onchain_provider_config_defaults() {
+        // Old configs without the new fields deserialize with defaults
+        let json = serde_json::json!({
+            "type": "onchain",
+            "url": "https://localhost:10009",
+            "cert_path": "/tls.cert",
+            "macaroon_path": "/admin.macaroon"
+        });
+        let cfg: ProviderConfig = serde_json::from_value(json).unwrap();
+        let oc = cfg.as_onchain().unwrap();
+        assert_eq!(oc.address_type, OnChainAddressType::WitnessPubkeyHash);
+        assert_eq!(oc.account, None);
+        assert_eq!(oc.min_confirmations, 1);
+    }
 }
 
 /// Available IP Space - Inventory of IP ranges available for sale
@@ -2485,6 +2563,43 @@ pub struct StripeProviderConfig {
     pub webhook_secret: String,
 }
 
+/// On-chain receive-address type (mirrors LND's supported families)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnChainAddressType {
+    /// Pay-to-witness-public-key-hash (`p2wkh`, bech32)
+    #[default]
+    WitnessPubkeyHash,
+    /// Nested pay-to-witness-public-key-hash (`np2wkh`, base58)
+    NestedPubkeyHash,
+    /// Pay-to-taproot (`p2tr`, bech32m)
+    TaprootPubkey,
+}
+
+/// On-chain Bitcoin provider configuration (LND wallet backend)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OnChainProviderConfig {
+    /// LND gRPC API URL
+    pub url: String,
+    /// Path to TLS certificate
+    pub cert_path: PathBuf,
+    /// Path to macaroon file
+    pub macaroon_path: PathBuf,
+    /// Type of receive address to derive
+    #[serde(default)]
+    pub address_type: OnChainAddressType,
+    /// Optional wallet account name (`None` uses the default account)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Confirmations required before a deposit is settled
+    #[serde(default = "default_min_confirmations")]
+    pub min_confirmations: u32,
+}
+
+fn default_min_confirmations() -> u32 {
+    1
+}
+
 /// PayPal provider configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaypalProviderConfig {
@@ -2511,6 +2626,9 @@ pub enum ProviderConfig {
     Stripe(StripeProviderConfig),
     /// PayPal fiat payment configuration
     Paypal(PaypalProviderConfig),
+    /// On-chain Bitcoin payment configuration (LND wallet backend)
+    #[serde(rename = "onchain")]
+    OnChain(OnChainProviderConfig),
 }
 
 impl ProviderConfig {
@@ -2522,6 +2640,7 @@ impl ProviderConfig {
             ProviderConfig::Revolut(_) => "revolut",
             ProviderConfig::Stripe(_) => "stripe",
             ProviderConfig::Paypal(_) => "paypal",
+            ProviderConfig::OnChain(_) => "onchain",
         }
     }
 
@@ -2532,6 +2651,7 @@ impl ProviderConfig {
             ProviderConfig::Revolut(_) => PaymentMethod::Revolut,
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
+            ProviderConfig::OnChain(_) => PaymentMethod::OnChain,
         }
     }
 
@@ -2571,6 +2691,14 @@ impl ProviderConfig {
     pub fn as_paypal(&self) -> Option<&PaypalProviderConfig> {
         match self {
             ProviderConfig::Paypal(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get on-chain config if this is an on-chain provider
+    pub fn as_onchain(&self) -> Option<&OnChainProviderConfig> {
+        match self {
+            ProviderConfig::OnChain(cfg) => Some(cfg),
             _ => None,
         }
     }

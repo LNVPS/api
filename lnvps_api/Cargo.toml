@@ -26,6 +26,7 @@ default = [
     "proxmox",
     "linux-ssh",
     "lnd",
+    "onchain",
     "cloudflare",
     "ovh",
     "revolut",
@@ -44,6 +45,8 @@ nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
 proxmox = ["dep:ssh2", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
+# On-chain Bitcoin payments (LND wallet backend)
+onchain = ["payments-rs/method-lnd-onchain"]
 # bitvora is disabled - service has been shut down
 bitvora = ["payments-rs/method-bitvora"]
 cloudflare = []

@@ -96,7 +96,7 @@ impl NodeInvoiceHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::MockNode;
+    use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::provisioner::VmProvisioner;
     use crate::settings::mock_settings;
     use crate::subscription::SubscriptionHandler;
@@ -218,6 +218,7 @@ mod tests {
             mock_settings(),
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             Arc::new(MockExchangeRate::default()),
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -371,6 +372,7 @@ mod tests {
             mock_settings(),
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             Arc::new(MockExchangeRate::default()),
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -546,6 +548,7 @@ mod tests {
             mock_settings(),
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             rates,
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),

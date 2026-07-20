@@ -757,6 +757,15 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         external_id: &str,
     ) -> DbResult<SubscriptionPayment>;
+    /// List all payments made with a given payment method.
+    ///
+    /// Used by the on-chain watcher to correlate incoming deposits back to
+    /// payments by receive address (stored encrypted in `external_data`, so
+    /// the match must happen in memory).
+    async fn list_subscription_payments_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,

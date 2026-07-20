@@ -9,7 +9,10 @@
 const PAYER_SERVICE: &str = "lnd-payer";
 
 /// Docker compose file used by the E2E environment.
-const COMPOSE_FILE: &str = "docker-compose.e2e.yaml";
+///
+/// Resolved relative to the workspace root: cargo runs tests with the crate
+/// directory as CWD, where a relative path would not resolve.
+const COMPOSE_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker-compose.e2e.yaml");
 
 /// Pay a BOLT11 invoice using the `lnd-payer` node.
 ///

@@ -163,6 +163,7 @@ async fn main() -> Result<(), Error> {
 
     let exchange = make_exchange_service(&settings.redis);
     let node = settings.get_node().await?;
+    let onchain = settings.get_onchain().await?;
 
     // Optional IP -> country geolocation for VAT place-of-supply evidence.
     let geoip: Option<Arc<dyn CountryResolver>> = match &settings.geoip_database {
@@ -223,6 +224,7 @@ async fn main() -> Result<(), Error> {
         settings.clone(),
         db.clone(),
         node.clone(),
+        onchain.clone(),
         exchange.clone(),
         vat.clone(),
         work_commander.clone(),
@@ -288,7 +290,14 @@ async fn main() -> Result<(), Error> {
     // API replica (or move LND settlement to the worker) to avoid double work.
     if mode.contains(&ExecMode::Api) {
         tasks.extend(
-            listen_all_payments(&settings, node.clone(), db.clone(), sub_handler.clone()).await?,
+            listen_all_payments(
+                &settings,
+                node.clone(),
+                onchain.clone(),
+                db.clone(),
+                sub_handler.clone(),
+            )
+            .await?,
         );
     }
 
@@ -392,18 +401,16 @@ async fn main() -> Result<(), Error> {
         tasks.push(tokio::spawn(async move {
             if let Err(e) = axum::serve(
                 listener,
-                router
-                    .layer(cors_layer())
-                    .with_state(RouterState {
-                        db,
-                        state: status,
-                        sub_handler,
-                        history: vm_history,
-                        settings,
-                        rates: exchange,
-                        work_sender: worker.commander(),
-                        geoip: geoip.clone(),
-                    }),
+                router.layer(cors_layer()).with_state(RouterState {
+                    db,
+                    state: status,
+                    sub_handler,
+                    history: vm_history,
+                    settings,
+                    rates: exchange,
+                    work_sender: worker.commander(),
+                    geoip: geoip.clone(),
+                }),
             )
             .await
             {

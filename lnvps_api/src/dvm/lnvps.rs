@@ -164,7 +164,7 @@ impl DVMHandler for LnvpsDvm {
 mod tests {
     use super::*;
     use crate::dvm::parse_job_request;
-    use crate::mocks::MockNode;
+    use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use lnvps_api_common::{
         ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate, Ticker,
@@ -227,6 +227,7 @@ mod tests {
             settings,
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             exch.clone(),
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),

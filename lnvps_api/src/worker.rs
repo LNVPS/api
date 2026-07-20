@@ -895,9 +895,7 @@ impl Worker {
                     Err(e) => warn!("[dns-reconcile] reverse failed for {}: {}", a.ip, e),
                 }
             }
-            if changed
-                && let Err(e) = self.db.update_vm_ip_assignment(a).await
-            {
+            if changed && let Err(e) = self.db.update_vm_ip_assignment(a).await {
                 warn!(
                     "[dns-reconcile] failed to persist dns refs for {}: {}",
                     a.ip, e
@@ -3136,7 +3134,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::MockNode;
+    use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use crate::subscription::SubscriptionHandler;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
@@ -3160,6 +3158,7 @@ mod tests {
             settings.clone(),
             db.clone(),
             node.clone(),
+            Arc::new(MockOnChainProvider::default()),
             rates,
             lnvps_api_common::VatClient::new(),
             work_commander.clone(),
