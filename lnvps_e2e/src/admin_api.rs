@@ -225,6 +225,33 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Purge a freshly-created user via `DELETE /api/admin/v1/users/{id}` and
+    /// confirm the account is gone afterwards.
+    #[tokio::test]
+    async fn test_admin_delete_user() {
+        use nostr::Keys;
+
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+
+        // A throwaway user with no VMs is safe to purge.
+        let keys = Keys::generate();
+        let user_id = crate::db::ensure_user(&pool, &keys).await.unwrap();
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/users/{user_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The user no longer exists.
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/users/{user_id}"))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
     // ========================================================================
     // VM Management
     // ========================================================================

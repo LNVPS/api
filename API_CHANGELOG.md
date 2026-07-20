@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Delete (purge) a user (admin)** — new `DELETE /api/admin/v1/users/{id}` (`users::delete`) permanently removes a user and all of their associated data (soft-deleted VMs and their history/IP/firewall rows, SSH keys, subscriptions and payments, referral records, Nostr domains, passkeys and saved payment methods) in a single transaction. Rejected if the user still has any live (non-deleted) VMs — those must be deleted first so hypervisor resources are released. Admins cannot delete their own account.
+
 - **Manage user passkeys (admin)** — new admin endpoints to view and revoke a user's WebAuthn passkeys.
   - `GET /api/admin/v1/users/{id}/passkeys` (`users::view`) lists a user's registered passkeys (id, optional device `name`, hex `cred_id`, `created`, `last_used`). Credential material is never exposed.
   - `DELETE /api/admin/v1/users/{id}/passkeys/{passkey_id}` (`users::update`) revokes a single passkey. Returns `404` if the passkey doesn't belong to the user, and refuses (`400`) to remove the **last** passkey of a passwordless (`webauthn`) account to avoid locking the user out.

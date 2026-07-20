@@ -21,7 +21,9 @@ pub fn router() -> Router<RouterState> {
         )
         .route(
             "/api/admin/v1/users/{id}",
-            get(admin_get_user).patch(admin_update_user),
+            get(admin_get_user)
+                .patch(admin_update_user)
+                .delete(admin_delete_user),
         )
 }
 
@@ -56,6 +58,31 @@ async fn admin_get_user(
         .unwrap_or(0);
 
     ApiData::ok(result)
+}
+
+/// Permanently delete (purge) a user and all of their associated data.
+///
+/// Refuses to proceed while the user still has live VMs — those must be deleted
+/// first so hypervisor resources are released. Requires the `Delete` permission
+/// on the `Users` resource.
+async fn admin_delete_user(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    auth.require_permission(AdminResource::Users, AdminAction::Delete)?;
+
+    // Ensure the user exists before attempting to purge.
+    let user = this.db.get_user(id).await?;
+
+    // Prevent an admin from purging their own account.
+    if user.id == auth.user_id {
+        return ApiData::err("You cannot delete your own account");
+    }
+
+    this.db.delete_user(user.id).await?;
+
+    ApiData::ok(())
 }
 
 #[derive(Deserialize)]

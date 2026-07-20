@@ -215,10 +215,100 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn delete_user(&self, _id: u64) -> DbResult<()> {
-        Err(DbError::Source(
-            anyhow!("Deleting users is not supported").into_boxed_dyn_error(),
-        ))
+    /// Permanently purge a user and all of their associated data.
+    ///
+    /// Refuses to proceed while the user still has any non-deleted (live) VM —
+    /// those must be deleted first so the hypervisor resources are torn down.
+    /// Soft-deleted VM rows and every other user-owned record are removed inside
+    /// a single transaction in foreign-key-safe order.
+    async fn delete_user(&self, id: u64) -> DbResult<()> {
+        // Guard: never purge a user who still has live VMs.
+        let active_vms: i64 =
+            sqlx::query_scalar("select count(*) from vm where user_id = ? and deleted = 0")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?;
+        if active_vms > 0 {
+            return Err(DbError::Source(
+                anyhow!("Cannot delete user with {active_vms} active VM(s); delete the VMs first")
+                    .into_boxed_dyn_error(),
+            ));
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        // Delete VM child records for every VM owned by the user (incl. soft-deleted).
+        for child in [
+            "delete from vm_ip_assignment where vm_id in (select id from vm where user_id = ?)",
+            "delete from vm_payment where vm_id in (select id from vm where user_id = ?)",
+            "delete from vm_firewall_rule where vm_id in (select id from vm where user_id = ?)",
+            "delete from vm_history where vm_id in (select id from vm where user_id = ?)",
+        ] {
+            sqlx::query(child).bind(id).execute(&mut *tx).await?;
+        }
+
+        // Detach audit history the user initiated on other users' VMs.
+        sqlx::query("update vm_history set initiated_by_user = null where initiated_by_user = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Remove the VMs themselves, then the SSH keys they referenced.
+        sqlx::query("delete from vm where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from user_ssh_key where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Billing: payments before subscriptions (line items + IP-space rows
+        // cascade from subscription/line item deletion).
+        sqlx::query("delete from subscription_payment where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from subscription where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Referral program: payouts before the referral row.
+        sqlx::query(
+            "delete from referral_payout where referral_id in (select id from referral where user_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("delete from referral where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Nostr domains (handles cascade), passkeys and saved payment methods.
+        sqlx::query("delete from nostr_domain where owner_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from user_webauthn_credentials where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from user_payment_method where user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Finally the user row itself. Admin role assignments cascade on user_id
+        // and null out where this user was the assigner.
+        sqlx::query("delete from users where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn get_user_by_email_verify_token(&self, token: &str) -> DbResult<User> {

@@ -502,8 +502,82 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn delete_user(&self, id: u64) -> DbResult<()> {
-        let mut users = self.users.lock().await;
-        users.remove(&id);
+        // Guard: refuse to purge a user with live (non-deleted) VMs.
+        let user_vm_ids: Vec<u64> = {
+            let vms = self.vms.lock().await;
+            if vms.values().any(|v| v.user_id == id && !v.deleted) {
+                return Err(DbError::Other(anyhow!(
+                    "Cannot delete user with active VM(s); delete the VMs first"
+                )));
+            }
+            vms.values()
+                .filter(|v| v.user_id == id)
+                .map(|v| v.id)
+                .collect()
+        };
+
+        // Remove VM child records.
+        self.ip_assignments
+            .lock()
+            .await
+            .retain(|_, a| !user_vm_ids.contains(&a.vm_id));
+        self.firewall_rules
+            .lock()
+            .await
+            .retain(|_, r| !user_vm_ids.contains(&r.vm_id));
+        self.vm_history
+            .lock()
+            .await
+            .retain(|_, h| !user_vm_ids.contains(&h.vm_id));
+
+        // Remove the VMs and the user's other owned records.
+        self.vms.lock().await.retain(|_, v| v.user_id != id);
+        self.user_ssh_keys
+            .lock()
+            .await
+            .retain(|_, k| k.user_id != id);
+        self.user_payment_methods
+            .lock()
+            .await
+            .retain(|_, m| m.user_id != id);
+        self.subscription_payments
+            .lock()
+            .await
+            .retain(|p| p.user_id != id);
+        let removed_subs: Vec<u64> = {
+            let mut subs = self.subscriptions.lock().await;
+            let ids: Vec<u64> = subs
+                .values()
+                .filter(|s| s.user_id == id)
+                .map(|s| s.id)
+                .collect();
+            subs.retain(|_, s| s.user_id != id);
+            ids
+        };
+        self.subscription_line_items
+            .lock()
+            .await
+            .retain(|_, li| !removed_subs.contains(&li.subscription_id));
+        let removed_refs: Vec<u64> = {
+            let mut refs = self.referrals.lock().await;
+            let ids: Vec<u64> = refs
+                .values()
+                .filter(|r| r.user_id == id)
+                .map(|r| r.id)
+                .collect();
+            refs.retain(|_, r| r.user_id != id);
+            ids
+        };
+        self.referral_payouts
+            .lock()
+            .await
+            .retain(|p| !removed_refs.contains(&p.referral_id));
+        self.webauthn_credentials
+            .lock()
+            .await
+            .retain(|_, c| c.user_id != id);
+
+        self.users.lock().await.remove(&id);
         Ok(())
     }
 
@@ -4658,6 +4732,50 @@ mod tests {
         assert_ne!(oauth_pubkey("a", "b"), oauth_pubkey("a", "c"));
         // Provider tag is part of the identity, so `a:bc` != `ab:c`.
         assert_ne!(oauth_pubkey("a", "bc"), oauth_pubkey("ab", "c"));
+    }
+
+    /// Purging a user removes the account and cascades to their owned records,
+    /// but only once no live VMs remain.
+    #[tokio::test]
+    async fn test_delete_user_purges_and_guards() {
+        let db = MockDb::default();
+        let uid = db.upsert_user(&[7u8; 32]).await.unwrap();
+
+        // Give the user an SSH key and a soft-deleted + a live VM.
+        db.user_ssh_keys.lock().await.insert(
+            10,
+            UserSshKey {
+                id: 10,
+                name: "k".to_string(),
+                user_id: uid,
+                created: Utc::now(),
+                key_data: "ssh-ed25519 AAAA".into(),
+            },
+        );
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(
+                100,
+                Vm {
+                    id: 100,
+                    user_id: uid,
+                    deleted: false,
+                    ..MockDb::mock_vm()
+                },
+            );
+        }
+
+        // Refuses while a live VM exists.
+        assert!(db.delete_user(uid).await.is_err());
+        assert!(db.get_user(uid).await.is_ok());
+
+        // Soft-delete the VM, then purge succeeds.
+        db.vms.lock().await.get_mut(&100).unwrap().deleted = true;
+        db.delete_user(uid).await.unwrap();
+
+        assert!(db.get_user(uid).await.is_err());
+        assert!(db.vms.lock().await.get(&100).is_none());
+        assert!(db.user_ssh_keys.lock().await.get(&10).is_none());
     }
 }
 
