@@ -403,6 +403,9 @@ impl ApiVmPayment {
         let is_upgrade = value.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade;
         let data = match &value.payment_method {
             PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
+            PaymentMethod::OnChain => ApiPaymentData::OnChain {
+                address: value.external_data.into(),
+            },
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
                 struct RevolutData {
@@ -482,6 +485,11 @@ pub enum ApiPaymentData {
         /// Stripe checkout session ID
         session_id: String,
     },
+    /// On-chain bitcoin payment
+    OnChain {
+        /// Bitcoin receive address
+        address: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,6 +502,7 @@ pub enum ApiPaymentMethod {
     Stripe,
     NWC,
     LNURL,
+    OnChain,
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {
@@ -503,6 +512,7 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Revolut => ApiPaymentMethod::Revolut,
             PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
             PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
+            PaymentMethod::OnChain => ApiPaymentMethod::OnChain,
         }
     }
 }
@@ -1082,6 +1092,9 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             PaymentMethod::Lightning => {
                 ApiPaymentData::Lightning(payment.external_data.clone().into())
             }
+            PaymentMethod::OnChain => ApiPaymentData::OnChain {
+                address: payment.external_data.clone().into(),
+            },
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
                 struct RevolutData {

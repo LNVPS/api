@@ -2670,6 +2670,7 @@ pub enum AdminPaymentMethod {
     Revolut,
     Paypal,
     Stripe,
+    OnChain,
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -2679,6 +2680,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Revolut => AdminPaymentMethod::Revolut,
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
             PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
+            PaymentMethod::OnChain => AdminPaymentMethod::OnChain,
         }
     }
 }
@@ -3513,6 +3515,7 @@ pub enum AdminPaymentMethodType {
     Revolut,
     Paypal,
     Stripe,
+    OnChain,
 }
 
 impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
@@ -3522,6 +3525,7 @@ impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
             lnvps_db::PaymentMethod::Revolut => AdminPaymentMethodType::Revolut,
             lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
             lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
+            lnvps_db::PaymentMethod::OnChain => AdminPaymentMethodType::OnChain,
         }
     }
 }
@@ -3533,6 +3537,7 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
             AdminPaymentMethodType::Revolut => lnvps_db::PaymentMethod::Revolut,
             AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
             AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
+            AdminPaymentMethodType::OnChain => lnvps_db::PaymentMethod::OnChain,
         }
     }
 }
@@ -3596,6 +3601,7 @@ pub enum SanitizedProviderConfig {
     Revolut(SanitizedRevolutConfig),
     Stripe(SanitizedStripeConfig),
     Paypal(SanitizedPaypalConfig),
+    OnChain(SanitizedLndConfig),
 }
 
 impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
@@ -3638,6 +3644,13 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     client_id: cfg.client_id.clone(),
                     mode: cfg.mode.clone(),
                     has_client_secret: !cfg.client_secret.is_empty(),
+                })
+            }
+            lnvps_db::ProviderConfig::OnChain(cfg) => {
+                SanitizedProviderConfig::OnChain(SanitizedLndConfig {
+                    url: cfg.url.clone(),
+                    cert_path: cfg.cert_path.display().to_string(),
+                    macaroon_path: cfg.macaroon_path.display().to_string(),
                 })
             }
         }

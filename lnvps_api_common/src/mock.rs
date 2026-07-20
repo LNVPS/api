@@ -2255,6 +2255,18 @@ impl LNVpsDbBase for MockDb {
             .context("Subscription payment not found")?)
     }
 
+    async fn list_subscription_payments_by_method(
+        &self,
+        method: lnvps_db::PaymentMethod,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        Ok(payments
+            .iter()
+            .filter(|p| p.payment_method == method)
+            .cloned()
+            .collect())
+    }
+
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,
@@ -2311,8 +2323,23 @@ impl LNVpsDbBase for MockDb {
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         let mut payments = self.subscription_payments.lock().await;
         if let Some(p) = payments.iter_mut().find(|p| p.id == payment.id) {
+            // Mirror the MySQL impl: update every column that query writes
+            p.subscription_id = payment.subscription_id;
+            p.user_id = payment.user_id;
+            p.created = payment.created;
+            p.expires = payment.expires;
+            p.amount = payment.amount;
+            p.currency = payment.currency.clone();
+            p.payment_method = payment.payment_method;
+            p.payment_type = payment.payment_type;
+            p.external_data = payment.external_data.clone();
+            p.external_id = payment.external_id.clone();
             p.is_paid = payment.is_paid;
-            p.paid_at = payment.paid_at;
+            p.rate = payment.rate;
+            p.tax = payment.tax;
+            p.processing_fee = payment.processing_fee;
+            p.time_value = payment.time_value;
+            p.metadata = payment.metadata.clone();
             Ok(())
         } else {
             Err(anyhow!("Subscription payment not found").into())
@@ -3875,8 +3902,12 @@ mod tests {
             );
         }
 
-        let counts: HashMap<u64, u64> =
-            db.count_vms_by_os_image().await.unwrap().into_iter().collect();
+        let counts: HashMap<u64, u64> = db
+            .count_vms_by_os_image()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(counts.get(&1), Some(&2));
         assert_eq!(counts.get(&2), Some(&1)); // deleted VM excluded
     }
@@ -4275,7 +4306,12 @@ mod tests {
             .unwrap();
 
         // Live (non-deleted) never-paid VM is not returned.
-        assert!(db.list_deleted_never_paid_vm_ids().await.unwrap().is_empty());
+        assert!(
+            db.list_deleted_never_paid_vm_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Soft-delete it -> now eligible for purge.
         db.delete_vm(vm_id).await.unwrap();
@@ -4289,7 +4325,12 @@ mod tests {
             let mut subs = db.subscriptions.lock().await;
             subs.get_mut(&1).unwrap().is_setup = true;
         }
-        assert!(db.list_deleted_never_paid_vm_ids().await.unwrap().is_empty());
+        assert!(
+            db.list_deleted_never_paid_vm_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Firewall rule CRUD via the mock DB.

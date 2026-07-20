@@ -2,6 +2,7 @@ use anyhow::Result;
 use lnvps_api_common::RedisConfig;
 use payments_rs::fiat::FiatPaymentService;
 use payments_rs::lightning::LightningNode;
+use payments_rs::onchain::OnChainProvider;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -590,6 +591,38 @@ impl Settings {
                 "/api/v1/webhook/bitvora",
             ))),
             _ => anyhow::bail!("Unsupported lightning config!"),
+        }
+    }
+
+    /// Build the on-chain payment provider from the configured LND node.
+    ///
+    /// On-chain payments reuse the same LND wallet as the Lightning node, so
+    /// this is required in the same way [`Self::get_node`] is: any backend
+    /// that cannot receive on-chain payments is an error.
+    pub async fn get_onchain(&self) -> Result<Arc<dyn OnChainProvider>> {
+        match &self.lightning {
+            #[cfg(feature = "onchain")]
+            LightningConfig::LND {
+                url,
+                cert,
+                macaroon,
+            } => {
+                use payments_rs::onchain::{LndAddressType, LndOnChainConfig, LndOnChainProvider};
+                Ok(Arc::new(
+                    LndOnChainProvider::new(
+                        url,
+                        cert,
+                        macaroon,
+                        LndOnChainConfig {
+                            address_type: LndAddressType::WitnessPubkeyHash,
+                            account: None,
+                            min_confirmations: 1,
+                        },
+                    )
+                    .await?,
+                ))
+            }
+            _ => anyhow::bail!("Unsupported lightning config for on-chain payments!"),
         }
     }
 }

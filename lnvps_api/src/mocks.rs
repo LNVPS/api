@@ -35,6 +35,9 @@ use payments_rs::lightning::{
     AddInvoiceRequest, AddInvoiceResponse, InvoiceUpdate, LightningNode, PayInvoiceRequest,
     PayInvoiceResponse,
 };
+use payments_rs::onchain::{
+    ChainPaymentUpdate, NewAddressRequest, NewAddressResponse, OnChainProvider, PaymentCursor,
+};
 use ssh2::HashType::Sha256;
 use std::collections::HashMap;
 use std::ops::Add;
@@ -407,5 +410,38 @@ impl LightningNode for MockNode {
         from_payment_hash: Option<Vec<u8>>,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = InvoiceUpdate> + Send>>> {
         todo!()
+    }
+}
+
+/// Mock on-chain provider, mirrors [`MockNode`] for on-chain payments.
+///
+/// Derives unique fake bech32-style addresses and records every request.
+/// Chain updates can be pushed by tests via [`MockOnChainProvider::updates`].
+#[derive(Clone, Debug, Default)]
+pub struct MockOnChainProvider {
+    /// Addresses handed out so far, in order.
+    pub addresses: Arc<Mutex<Vec<String>>>,
+    /// Scripted chain updates returned from `subscribe_payments`.
+    pub updates: Arc<Mutex<Vec<ChainPaymentUpdate>>>,
+}
+
+#[async_trait]
+impl OnChainProvider for MockOnChainProvider {
+    async fn new_address(&self, req: NewAddressRequest) -> anyhow::Result<NewAddressResponse> {
+        let mut addresses = self.addresses.lock().await;
+        let address = format!("bcrt1qmock{:08}", addresses.len());
+        addresses.push(address.clone());
+        Ok(NewAddressResponse {
+            address,
+            label: req.label,
+        })
+    }
+
+    async fn subscribe_payments(
+        &self,
+        _from: Option<PaymentCursor>,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = ChainPaymentUpdate> + Send>>> {
+        let updates = self.updates.lock().await.clone();
+        Ok(Box::pin(futures::stream::iter(updates)))
     }
 }

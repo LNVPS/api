@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **On-chain Bitcoin payments** (issue #109) — VMs and subscriptions can now be paid on-chain. A new `onchain` payment method is accepted wherever a payment method is selected (e.g. `GET /api/v1/vm/{id}/renew?method=onchain`); the payment's `data` field returns `{ "onchain": { "address": "bc1…" } }` with a freshly derived receive address (BTC only). The txid is recorded on the payment (`external_id`) once the deposit confirms. Deposits are never rejected: partial, late and over-payments are pro-rated at the quoted rate, and any further deposit to an already-settled address automatically creates a new pro-rated renewal payment. Admin payment-method configs accept a new `onchain` provider type (reuses the LND wallet of the Lightning backend).
+
 - **Transfer a VM to another user (admin)** — new `POST /api/admin/v1/vms/{id}/transfer` (`virtual_machines::update`) reassigns a VM to another user account, e.g. for account recovery (issue #178). It atomically moves the VM and its billing subscription to the target `user_id` and clears the old owner's SSH key from the VM. The change is recorded in VM history as a new `transferred` action. Rejects deleted VMs, self-transfers (`409`) and unknown target users (`404`). Body: `{ user_id, reason? }`.
 
 - **Change OS during re-install** — `PATCH /api/v1/vm/{id}/re-install` now accepts an optional `{ image_id }` body to switch the VM to a different OS image as part of the re-install (issue #177). When omitted, the VM is reinstalled with its current image (unchanged behaviour). The chosen image must exist and be enabled, and the change is recorded in VM history.

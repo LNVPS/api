@@ -1474,6 +1474,8 @@ pub enum PaymentMethod {
     Revolut,
     Paypal,
     Stripe,
+    /// On-chain Bitcoin payments
+    OnChain,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -1491,6 +1493,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Revolut => write!(f, "Revolut"),
             PaymentMethod::Paypal => write!(f, "PayPal"),
             PaymentMethod::Stripe => write!(f, "Stripe"),
+            PaymentMethod::OnChain => write!(f, "OnChain"),
         }
     }
 }
@@ -1504,6 +1507,7 @@ impl FromStr for PaymentMethod {
             "revolut" => Ok(PaymentMethod::Revolut),
             "paypal" => Ok(PaymentMethod::Paypal),
             "stripe" => Ok(PaymentMethod::Stripe),
+            "onchain" => Ok(PaymentMethod::OnChain),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -2391,6 +2395,57 @@ mod tests {
             assert_eq!(parsed, arch);
         }
     }
+
+    #[test]
+    fn test_payment_method_roundtrip() {
+        for (s, m) in [
+            ("lightning", PaymentMethod::Lightning),
+            ("revolut", PaymentMethod::Revolut),
+            ("paypal", PaymentMethod::Paypal),
+            ("stripe", PaymentMethod::Stripe),
+            ("onchain", PaymentMethod::OnChain),
+        ] {
+            assert_eq!(PaymentMethod::from_str(s).unwrap(), m);
+        }
+        assert_eq!(PaymentMethod::OnChain.to_string(), "OnChain");
+        assert!(PaymentMethod::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn test_provider_config_onchain() {
+        let config = ProviderConfig::OnChain(LndConfig {
+            url: "https://localhost:10009".to_string(),
+            cert_path: "/tls.cert".into(),
+            macaroon_path: "/admin.macaroon".into(),
+        });
+        assert_eq!(config.provider_type(), "onchain");
+        assert_eq!(config.payment_method(), PaymentMethod::OnChain);
+        assert!(config.as_onchain().is_some());
+        assert!(config.as_lnd().is_none());
+        assert!(
+            ProviderConfig::Lnd(LndConfig {
+                url: "".to_string(),
+                cert_path: "".into(),
+                macaroon_path: "".into(),
+            })
+            .as_onchain()
+            .is_none()
+        );
+
+        // serde round-trip via PaymentMethodConfig helpers
+        let mut pmc = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::OnChain,
+            "onchain".to_string(),
+            true,
+            config,
+        );
+        assert_eq!(pmc.provider_type, "onchain");
+        let parsed = pmc.get_provider_config().expect("config round-trips");
+        assert_eq!(parsed.as_onchain().unwrap().url, "https://localhost:10009");
+        pmc.set_provider_config(parsed);
+        assert_eq!(pmc.provider_type, "onchain");
+    }
 }
 
 /// Available IP Space - Inventory of IP ranges available for sale
@@ -2511,6 +2566,8 @@ pub enum ProviderConfig {
     Stripe(StripeProviderConfig),
     /// PayPal fiat payment configuration
     Paypal(PaypalProviderConfig),
+    /// On-chain Bitcoin payment configuration (reuses the LND wallet backend)
+    OnChain(LndConfig),
 }
 
 impl ProviderConfig {
@@ -2522,6 +2579,7 @@ impl ProviderConfig {
             ProviderConfig::Revolut(_) => "revolut",
             ProviderConfig::Stripe(_) => "stripe",
             ProviderConfig::Paypal(_) => "paypal",
+            ProviderConfig::OnChain(_) => "onchain",
         }
     }
 
@@ -2532,6 +2590,7 @@ impl ProviderConfig {
             ProviderConfig::Revolut(_) => PaymentMethod::Revolut,
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
+            ProviderConfig::OnChain(_) => PaymentMethod::OnChain,
         }
     }
 
@@ -2571,6 +2630,14 @@ impl ProviderConfig {
     pub fn as_paypal(&self) -> Option<&PaypalProviderConfig> {
         match self {
             ProviderConfig::Paypal(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get on-chain config if this is an on-chain provider
+    pub fn as_onchain(&self) -> Option<&LndConfig> {
+        match self {
+            ProviderConfig::OnChain(cfg) => Some(cfg),
             _ => None,
         }
     }

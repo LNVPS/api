@@ -2496,6 +2496,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_subscription_payments_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM subscription_payment WHERE payment_method = ?")
+                .bind(method as u16)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,

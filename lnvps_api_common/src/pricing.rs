@@ -1214,7 +1214,7 @@ impl PricingEngine {
         method: PaymentMethod,
     ) -> Result<ConvertedCurrencyAmount> {
         Ok(match (list_price.currency(), method) {
-            (c, PaymentMethod::Lightning) if c != Currency::BTC => {
+            (c, PaymentMethod::Lightning | PaymentMethod::OnChain) if c != Currency::BTC => {
                 // convert to BTC if price is not already in bitcoin
                 let ticker = self.get_ticker(Currency::BTC, c).await?;
                 let mut converted = ticker.convert_with_rate(list_price)?;
@@ -1222,7 +1222,7 @@ impl PricingEngine {
                 converted.amount = round_to_sat(converted.amount);
                 converted
             }
-            (c, PaymentMethod::Lightning) if c == Currency::BTC => {
+            (c, PaymentMethod::Lightning | PaymentMethod::OnChain) if c == Currency::BTC => {
                 // pass-through price as BTC, rounded to nearest satoshi
                 ConvertedCurrencyAmount {
                     amount: round_to_sat(list_price),
