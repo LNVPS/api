@@ -17,6 +17,7 @@ mod hosts;
 mod ip_ranges;
 mod ip_space;
 mod model;
+mod passkeys;
 mod payment_methods;
 mod referrals;
 mod regions;
@@ -51,6 +52,7 @@ pub fn admin_router(
     Router::new()
         .merge(docs::router())
         .merge(users::router())
+        .merge(passkeys::router())
         .merge(bulk_message::router())
         .merge(vms::router())
         .merge(hosts::router())

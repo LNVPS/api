@@ -83,7 +83,9 @@ GET /api/admin/v1/users/{id}
 
 Required Permission: `users::view`
 
-Returns complete user information including VM count and admin status.
+Returns complete user information including VM count, admin status, `account_type`
+(`nostr`, `oauth` or `webauthn`) and `passkey_count` (number of registered
+passkeys).
 
 #### Update User
 
@@ -92,6 +94,57 @@ PATCH /api/admin/v1/users/{id}
 ```
 
 Required Permission: `users::update`
+
+#### List User Passkeys
+
+```
+GET /api/admin/v1/users/{id}/passkeys
+```
+
+Required Permission: `users::view`
+
+Lists the WebAuthn passkeys (credentials) registered to a user. Credential
+material is never returned — only metadata needed to identify and revoke a
+device.
+
+Response:
+
+```json
+{
+  "data": [
+    {
+      "id": 42,
+      "name": "iPhone",
+      "cred_id": "a1b2c3…",
+      "created": "2026-07-20T00:00:00Z",
+      "last_used": "2026-07-21T09:30:00Z"
+    }
+  ]
+}
+```
+
+- `id`: passkey database id (used to revoke it)
+- `name`: optional user-facing device label
+- `cred_id`: hex-encoded raw credential id
+- `created`: registration time
+- `last_used`: last authentication time (null if never used)
+
+Returns `404` if the user does not exist.
+
+#### Revoke User Passkey
+
+```
+DELETE /api/admin/v1/users/{id}/passkeys/{passkey_id}
+```
+
+Required Permission: `users::update`
+
+Revokes a single passkey from a user's account.
+
+- Returns `404` if the passkey does not belong to the user.
+- Refuses (`400`) to remove the **last** passkey of a passwordless
+  (`webauthn`) account, since that would permanently lock the user out. Add
+  another login factor first, or leave at least one passkey.
 
 #### Bulk Message Active Customers
 

@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Manage user passkeys (admin)** — new admin endpoints to view and revoke a user's WebAuthn passkeys.
+  - `GET /api/admin/v1/users/{id}/passkeys` (`users::view`) lists a user's registered passkeys (id, optional device `name`, hex `cred_id`, `created`, `last_used`). Credential material is never exposed.
+  - `DELETE /api/admin/v1/users/{id}/passkeys/{passkey_id}` (`users::update`) revokes a single passkey. Returns `404` if the passkey doesn't belong to the user, and refuses (`400`) to remove the **last** passkey of a passwordless (`webauthn`) account to avoid locking the user out.
+  - `GET /api/admin/v1/users/{id}` now also returns `account_type` (`nostr` | `oauth` | `webauthn`) and `passkey_count`.
+
 - **Import existing host VMs (admin)** — new admin endpoints to adopt VMs that exist on a host but aren't tracked in the database (issue #166).
   - `GET /api/admin/v1/hosts/{id}/vms/unmanaged` lists VMs present on the host with no matching database record (returns host vmid, mapped database id, name, CPU/memory/disk specs, storage, MAC, running state). The admin service dispatches a discovery job to the worker and reads the reply over a temporary Redis pub/sub channel.
   - `POST /api/admin/v1/hosts/{id}/vms/import` (`{ host_vm_id, user_id, reason? }`) imports one VM: it is assigned to `user_id` and billed via the region's **custom pricing** (required — import fails if the region has none), capturing the VM's current CPU/memory/disk specs into a custom template. Currently supports Proxmox hosts. Returns a `job_id`.

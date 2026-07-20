@@ -47,6 +47,14 @@ async fn admin_get_user(
     let vms = this.db.list_user_vms(result.id).await.unwrap_or_default();
     result.vm_count = vms.len() as u64;
 
+    // Number of registered passkeys (WebAuthn credentials)
+    result.passkey_count = this
+        .db
+        .list_webauthn_credentials(result.id)
+        .await
+        .map(|c| c.len() as u64)
+        .unwrap_or(0);
+
     ApiData::ok(result)
 }
 

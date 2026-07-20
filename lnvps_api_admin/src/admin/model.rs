@@ -438,6 +438,11 @@ pub struct AdminUserInfo {
     pub last_login: Option<DateTime<Utc>>,
     pub is_admin: bool,
     pub has_nwc: bool,
+    /// Account type: `nostr`, `oauth` or `webauthn`.
+    pub account_type: String,
+    /// Number of registered passkeys (WebAuthn credentials). Populated on the
+    /// single-user detail endpoint; 0 in list responses.
+    pub passkey_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -545,6 +550,9 @@ impl From<lnvps_db::User> for AdminUserInfo {
             is_admin: false,
             // Computed via a DB lookup (AdminUserInfo path); default false here.
             has_nwc: false,
+            account_type: user.account_type.to_string(),
+            // Populated by the handler (single-user detail) when needed.
+            passkey_count: 0,
         }
     }
 }
@@ -579,6 +587,8 @@ impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
             last_login: None,
             is_admin: user.is_admin,
             has_nwc: user.has_nwc,
+            account_type: user.user_info.account_type.to_string(),
+            passkey_count: 0,
         }
     }
 }
