@@ -240,7 +240,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // Delete VM child records for every VM owned by the user (incl. soft-deleted).
         for child in [
             "delete from vm_ip_assignment where vm_id in (select id from vm where user_id = ?)",
-            "delete from vm_payment where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_firewall_rule where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_history where vm_id in (select id from vm where user_id = ?)",
         ] {
