@@ -1,4 +1,4 @@
-use crate::host::{FullVmInfo, get_host_client};
+use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::notifications::{Notification, NotificationChannel, build_channels, send_email};
 use crate::provisioner::VmProvisioner;
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig, WhatsAppConfig};
@@ -2527,24 +2527,20 @@ impl Worker {
         }
 
         let hosts = self.db.list_hosts().await?;
-        for host in &hosts {
-            let client = match get_host_client(host, &self.settings.provisioner_config) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to get client for host {}: {}", host.name, e);
-                    continue;
-                }
-            };
-            for image in &images {
-                info!("Checking image {} on host {}", image.url, host.name);
-                if let Err(e) = client.download_os_image(image).await {
-                    warn!(
-                        "Failed to download image {} on host {}: {}",
-                        image.url, host.name, e
-                    );
-                }
-            }
-        }
+        let clients: Vec<(String, Arc<dyn VmHostClient>)> = hosts
+            .iter()
+            .filter_map(
+                |host| match get_host_client(host, &self.settings.provisioner_config) {
+                    Ok(c) => Some((host.name.clone(), c)),
+                    Err(e) => {
+                        warn!("Failed to get client for host {}: {}", host.name, e);
+                        None
+                    }
+                },
+            )
+            .collect();
+
+        download_images_on_hosts(clients, &images).await;
         Ok(())
     }
 
@@ -3131,6 +3127,30 @@ impl Worker {
     }
 }
 
+/// Download `images` on every host concurrently.
+///
+/// Hosts run in parallel (each host is an independent hypervisor with its own
+/// network/storage), while images on a single host are downloaded sequentially
+/// to avoid saturating that host's storage backend.  Failures are logged and
+/// do not abort other hosts or images.
+pub(crate) async fn download_images_on_hosts(
+    clients: Vec<(String, Arc<dyn VmHostClient>)>,
+    images: &[VmOsImage],
+) {
+    let tasks = clients.into_iter().map(|(host_name, client)| async move {
+        for image in images {
+            info!("Checking image {} on host {}", image.url, host_name);
+            if let Err(e) = client.download_os_image(image).await {
+                warn!(
+                    "Failed to download image {} on host {}: {}",
+                    image.url, host_name, e
+                );
+            }
+        }
+    });
+    futures::future::join_all(tasks).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3142,6 +3162,173 @@ mod tests {
         LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType,
         UserSshKey, Vm,
     };
+
+    mod download_parallel {
+        use super::*;
+        use crate::host::dummy_host::DummyVmHost;
+        use async_trait::async_trait;
+        use lnvps_api_common::retry::OpResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// Wraps DummyVmHost, tracking concurrency of download_os_image calls.
+        struct ConcurrencyTrackingHost {
+            inner: DummyVmHost,
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+            downloads: Arc<AtomicUsize>,
+        }
+
+        impl ConcurrencyTrackingHost {
+            fn new(
+                active: Arc<AtomicUsize>,
+                max_active: Arc<AtomicUsize>,
+                downloads: Arc<AtomicUsize>,
+            ) -> Self {
+                Self {
+                    inner: DummyVmHost::new(),
+                    active,
+                    max_active,
+                    downloads,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl VmHostClient for ConcurrencyTrackingHost {
+            async fn get_info(&self) -> OpResult<crate::host::VmHostInfo> {
+                self.inner.get_info().await
+            }
+
+            async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
+                let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                self.downloads.fetch_add(1, Ordering::SeqCst);
+                self.inner.download_os_image(image).await
+            }
+
+            async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
+                self.inner.generate_mac(vm).await
+            }
+
+            async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
+                self.inner.start_vm(vm).await
+            }
+
+            async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
+                self.inner.stop_vm(vm).await
+            }
+
+            async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
+                self.inner.reset_vm(vm).await
+            }
+
+            async fn create_vm(&self, req: &crate::host::FullVmInfo) -> OpResult<()> {
+                self.inner.create_vm(req).await
+            }
+
+            async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
+                self.inner.delete_vm(vm).await
+            }
+
+            async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
+                self.inner.unlink_primary_disk(vm).await
+            }
+
+            async fn import_template_disk(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
+                self.inner.import_template_disk(cfg).await
+            }
+
+            async fn resize_disk(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
+                self.inner.resize_disk(cfg).await
+            }
+
+            async fn get_vm_state(&self, vm: &Vm) -> OpResult<lnvps_api_common::VmRunningState> {
+                self.inner.get_vm_state(vm).await
+            }
+
+            async fn get_all_vm_states(
+                &self,
+            ) -> OpResult<Vec<(u64, lnvps_api_common::VmRunningState)>> {
+                self.inner.get_all_vm_states().await
+            }
+
+            async fn configure_vm(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
+                self.inner.configure_vm(cfg).await
+            }
+
+            async fn patch_firewall(&self, cfg: &crate::host::FullVmInfo) -> OpResult<()> {
+                self.inner.patch_firewall(cfg).await
+            }
+
+            async fn get_time_series_data(
+                &self,
+                vm: &Vm,
+                series: crate::host::TimeSeries,
+            ) -> OpResult<Vec<crate::host::TimeSeriesData>> {
+                self.inner.get_time_series_data(vm, series).await
+            }
+
+            async fn connect_terminal(&self, vm: &Vm) -> OpResult<crate::host::TerminalStream> {
+                self.inner.connect_terminal(vm).await
+            }
+        }
+
+        /// Regression: image downloads must run in parallel across hosts
+        /// (previously hosts were processed strictly sequentially).
+        #[tokio::test]
+        async fn test_download_images_parallel_across_hosts() {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let downloads = Arc::new(AtomicUsize::new(0));
+
+            let clients: Vec<(String, Arc<dyn VmHostClient>)> = (0..3)
+                .map(|i| {
+                    (
+                        format!("host-{i}"),
+                        Arc::new(ConcurrencyTrackingHost::new(
+                            active.clone(),
+                            max_active.clone(),
+                            downloads.clone(),
+                        )) as Arc<dyn VmHostClient>,
+                    )
+                })
+                .collect();
+
+            let img = |id: u64, url: &str| VmOsImage {
+                id,
+                distribution: lnvps_db::OsDistribution::Debian,
+                flavour: "server".to_string(),
+                version: "12".to_string(),
+                enabled: true,
+                release_date: Utc::now(),
+                url: url.to_string(),
+                default_username: None,
+                sha2: None,
+                sha2_url: None,
+            };
+            let images = vec![
+                img(1, "https://example.com/a.qcow2"),
+                img(2, "https://example.com/b.qcow2"),
+            ];
+
+            download_images_on_hosts(clients, &images).await;
+
+            // 3 hosts x 2 images
+            assert_eq!(downloads.load(Ordering::SeqCst), 6);
+            // Hosts overlap: at some point more than one download was active
+            assert!(
+                max_active.load(Ordering::SeqCst) >= 2,
+                "downloads did not overlap across hosts (max_active = {})",
+                max_active.load(Ordering::SeqCst)
+            );
+            // Images per host are sequential: never more than one per host,
+            // so the max possible is the number of hosts
+            assert!(max_active.load(Ordering::SeqCst) <= 3);
+        }
+    }
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
