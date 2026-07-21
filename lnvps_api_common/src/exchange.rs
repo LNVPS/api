@@ -158,39 +158,51 @@ pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<Curren
     ret
 }
 
-/// Fiat currencies (besides the EUR base) we pull FX rates for.
-const FX_CURRENCIES: &[Currency] = &[
-    Currency::USD,
-    Currency::GBP,
-    Currency::CAD,
-    Currency::CHF,
-    Currency::AUD,
-    Currency::JPY,
-];
-
-/// Fetch fiat FX rates (base EUR) from frankfurter.app (ECB reference rates,
-/// free, no API key). Returns `Ticker(EUR, X)` rates where the value is the
-/// amount of `X` per 1 EUR. These complement the BTC prices from mempool so
-/// arbitrary fiat<->fiat pairs can be resolved (directly or via a EUR cross).
-pub async fn fetch_fiat_fx_rates() -> Result<Vec<TickerRate>> {
-    let symbols = FX_CURRENCIES
+/// Fetch fiat FX rates for `base` against each of `symbols` from frankfurter.app
+/// (ECB reference rates, free, no API key). Returns `Ticker(base, X)` rates
+/// where the value is the amount of `X` per 1 unit of `base`.
+///
+/// The `base` is the caller's currency of interest (a company's billing
+/// currency), never a hardcoded value. BTC is skipped — BTC prices come from
+/// mempool.space, not an FX feed.
+pub async fn fetch_fiat_fx_rates(base: Currency, symbols: &[Currency]) -> Result<Vec<TickerRate>> {
+    let symbol_list = symbols
         .iter()
+        .filter(|c| **c != base && **c != Currency::BTC)
         .map(|c| c.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let url = format!("https://api.frankfurter.app/latest?base=EUR&symbols={symbols}");
+    if base == Currency::BTC || symbol_list.is_empty() {
+        return Ok(vec![]);
+    }
+    let url = format!("https://api.frankfurter.app/latest?base={base}&symbols={symbol_list}");
     let rsp = reqwest::get(&url).await?.text().await?;
     let parsed: FrankfurterRates = serde_json::from_str(&rsp)?;
     let mut ret = Vec::new();
-    for cur in FX_CURRENCIES {
+    for cur in symbols {
         if let Some(rate) = parsed.rates.get(&cur.to_string()) {
             ret.push(TickerRate {
-                ticker: Ticker(Currency::EUR, *cur),
+                ticker: Ticker(base, *cur),
                 rate: *rate,
             });
         }
     }
     Ok(ret)
+}
+
+/// Fetch fiat FX rates covering every ordered pair among `currencies` (each
+/// currency as a base against all the others). Errors for individual bases are
+/// logged and skipped. Use this to keep direct rates between the set of
+/// currencies actually in use (e.g. distinct company billing currencies).
+pub async fn fetch_fx_for_currencies(currencies: &[Currency]) -> Vec<TickerRate> {
+    let mut ret = Vec::new();
+    for base in currencies {
+        match fetch_fiat_fx_rates(*base, currencies).await {
+            Ok(mut fx) => ret.append(&mut fx),
+            Err(e) => error!("Failed to fetch fiat FX for base {}: {}", base, e),
+        }
+    }
+    ret
 }
 
 #[derive(Clone, Default)]
@@ -249,12 +261,6 @@ impl ExchangeRateService for InMemoryRateCache {
                 ticker: Ticker(Currency::BTC, Currency::JPY),
                 rate: jpy,
             });
-        }
-
-        // Also pull fiat FX (base EUR) so fiat<->fiat pairs are resolvable.
-        match fetch_fiat_fx_rates().await {
-            Ok(mut fx) => ret.append(&mut fx),
-            Err(e) => error!("Failed to fetch fiat FX rates: {}", e),
         }
 
         Ok(ret)
@@ -396,24 +402,7 @@ impl RedisExchangeRateService {
                 .await?;
         }
 
-        // Also pull fiat FX (base EUR) so fiat<->fiat pairs are resolvable.
-        match fetch_fiat_fx_rates().await {
-            Ok(fx) => {
-                for ticker_rate in fx {
-                    let _: () = conn
-                        .set_ex(
-                            self.ticker_key(&ticker_rate.ticker),
-                            ticker_rate.rate,
-                            self.cache_ttl.as_secs(),
-                        )
-                        .await?;
-                    ret.push(ticker_rate);
-                }
-            }
-            Err(e) => error!("Failed to fetch fiat FX rates: {}", e),
-        }
-
-        trace!("Fetched and cached {} rates", ret.len());
+        trace!("Fetched and cached {} rates from mempool.space", ret.len());
         Ok(ret)
     }
 }
@@ -518,6 +507,43 @@ mod tests {
         assert!(!f.can_convert(Currency::USD));
         assert!(f.can_convert(Currency::EUR));
         assert!(f.can_convert(Currency::BTC));
+    }
+
+    #[tokio::test]
+    async fn fx_fetch_noop_cases() {
+        // No symbols -> no request, empty result
+        assert!(
+            fetch_fiat_fx_rates(Currency::USD, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Only self / BTC symbols -> filtered out -> empty
+        assert!(
+            fetch_fiat_fx_rates(Currency::EUR, &[Currency::EUR, Currency::BTC])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // BTC base is never fetched via FX
+        assert!(
+            fetch_fiat_fx_rates(Currency::BTC, &[Currency::USD])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A single currency has no pairs to fetch
+        assert!(fetch_fx_for_currencies(&[Currency::EUR]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fx_fetch_real_pair_uses_requested_base() -> Result<()> {
+        // Hits frankfurter.app (ECB). base=EUR must yield a Ticker(EUR, USD).
+        let rates = fetch_fiat_fx_rates(Currency::EUR, &[Currency::USD]).await?;
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].ticker, Ticker(Currency::EUR, Currency::USD));
+        assert!(rates[0].rate > 0.0);
+        Ok(())
     }
 
     /// Regression: conversions must be integer-precise, not lose a unit to f32.

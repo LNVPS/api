@@ -303,8 +303,10 @@ async fn main() -> Result<(), Error> {
 
     // refresh rates every 1min
     let rates = exchange.clone();
+    let rates_db = db.clone();
     tasks.push(tokio::spawn(async move {
         loop {
+            // BTC prices (mempool.space) for all supported fiat currencies
             match rates.fetch_rates().await {
                 Ok(z) => {
                     for r in z {
@@ -313,6 +315,28 @@ async fn main() -> Result<(), Error> {
                 }
                 Err(e) => error!("Failed to fetch rates: {}", e),
             }
+
+            // Fiat FX rates between the distinct company billing currencies.
+            // Only needed when companies bill in more than one fiat currency;
+            // otherwise every conversion is fiat<->BTC (covered above).
+            match rates_db.list_companies().await {
+                Ok(companies) => {
+                    let mut bases: Vec<payments_rs::currency::Currency> = companies
+                        .iter()
+                        .filter_map(|c| c.base_currency.parse().ok())
+                        .filter(|c| *c != payments_rs::currency::Currency::BTC)
+                        .collect();
+                    bases.sort_by_key(|c| c.to_string());
+                    bases.dedup();
+                    if bases.len() > 1 {
+                        for r in lnvps_api_common::fetch_fx_for_currencies(&bases).await {
+                            rates.set_rate(r.ticker, r.rate).await;
+                        }
+                    }
+                }
+                Err(e) => error!("Failed to list companies for FX rates: {}", e),
+            }
+
             tokio::time::sleep(Duration::from_secs(120)).await;
         }
     }));
