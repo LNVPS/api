@@ -438,6 +438,7 @@ impl ApiVmPayment {
             PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
             PaymentMethod::OnChain => ApiPaymentData::OnChain {
                 address: value.external_data.into(),
+                outpoint: value.external_id.clone(),
             },
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
@@ -531,6 +532,13 @@ pub enum ApiPaymentData {
     OnChain {
         /// Bitcoin receive address
         address: String,
+        /// Outpoint (`"{txid}:{vout}"`) of the detected deposit. Set as soon as a
+        /// deposit is first seen in the mempool (0-conf), before it confirms, so
+        /// clients can show "payment received, waiting for confirmation". `None`
+        /// while no deposit has been seen yet (still waiting for payment). Once
+        /// `is_paid` is true the deposit has confirmed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outpoint: Option<String>,
     },
 }
 
@@ -1136,6 +1144,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             }
             PaymentMethod::OnChain => ApiPaymentData::OnChain {
                 address: payment.external_data.clone().into(),
+                outpoint: payment.external_id.clone(),
             },
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
@@ -1375,6 +1384,67 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On-chain payment data exposes the deposit outpoint (`{txid}:{vout}`) once
+    /// a deposit is seen (external_id set), before confirmation, and omits it
+    /// while no deposit has arrived.
+    #[test]
+    fn test_onchain_payment_exposes_outpoint_at_detect_time() {
+        let base = lnvps_db::SubscriptionPayment {
+            id: vec![1u8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::OnChain,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: "bc1qexampleaddr".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+        };
+
+        // No deposit seen yet -> waiting for payment, no outpoint.
+        let waiting = ApiVmPayment::from_subscription_payment(base.clone(), 1).unwrap();
+        match &waiting.data {
+            ApiPaymentData::OnChain { outpoint, address } => {
+                assert_eq!(address, "bc1qexampleaddr");
+                assert!(outpoint.is_none());
+            }
+            _ => panic!("expected onchain data"),
+        }
+        assert!(!waiting.is_paid);
+        // outpoint omitted from JSON while None.
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert!(json["data"]["onchain"].get("outpoint").is_none());
+
+        // Deposit detected (0-conf): external_id set, still unpaid -> full
+        // `{txid}:{vout}` outpoint present.
+        let detected = lnvps_db::SubscriptionPayment {
+            external_id: Some("abc123def:0".to_string()),
+            ..base
+        };
+        let recv = ApiVmPayment::from_subscription_payment(detected, 1).unwrap();
+        match recv.data {
+            ApiPaymentData::OnChain { outpoint, .. } => {
+                assert_eq!(outpoint.as_deref(), Some("abc123def:0"));
+            }
+            _ => panic!("expected onchain data"),
+        }
+        assert!(!recv.is_paid, "still waiting for confirmation");
+    }
 
     #[test]
     fn test_account_response_exposes_account_type() {

@@ -413,7 +413,7 @@ interface VmPayment {
 
 type PaymentData = 
   | { lightning: string } // Lightning Network invoice
-  | { onchain: { address: string } } // On-chain Bitcoin receive address (BTC only); txid is recorded on the payment's external_id once confirmed
+  | { onchain: { address: string; outpoint?: string } } // On-chain Bitcoin receive address (BTC only). `outpoint` ("{txid}:{vout}") is set as soon as a deposit is seen in the mempool (0-conf), before it confirms, so the UI can show "received, waiting for confirmation"; absent until a deposit is detected. Confirmed once is_paid is true
   | { revolut: { token: string } } // Revolut payment token
   | { stripe: { session_id: string } }; // Stripe checkout session
 
