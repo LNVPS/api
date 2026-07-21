@@ -154,6 +154,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             tax_id: Some("US123456789".to_string()),
             base_currency: "USD".to_string(),
             referral_rate: 0.0,
+            max_prepay_days: 0,
             address_2: None,
         },
         Company {
@@ -170,6 +171,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             tax_id: Some("GB987654321".to_string()),
             base_currency: "GBP".to_string(),
             referral_rate: 0.0,
+            max_prepay_days: 0,
             address_2: None,
         },
         Company {
@@ -186,6 +188,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             tax_id: Some("DE555777999".to_string()),
             base_currency: "EUR".to_string(),
             referral_rate: 0.0,
+            max_prepay_days: 0,
             address_2: None,
         },
     ];

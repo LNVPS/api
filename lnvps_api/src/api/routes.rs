@@ -713,6 +713,7 @@ async fn v1_list_vms(
                 vm,
                 this.state.get_state(vm_id).await,
                 this.settings.delete_after,
+                this.settings.max_prepay_days,
             )
             .await?,
         );
@@ -734,6 +735,7 @@ async fn v1_get_vm(
             vm,
             this.state.get_state(id).await,
             this.settings.delete_after,
+            this.settings.max_prepay_days,
         )
         .await?,
     )
@@ -970,7 +972,7 @@ async fn v1_create_custom_vm_order(
         .await
         .ok();
 
-    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after).await?)
+    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after, this.settings.max_prepay_days).await?)
 }
 
 /// List user SSH keys
@@ -1100,7 +1102,7 @@ async fn v1_create_vm_order(
         .await
         .ok();
 
-    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after).await?)
+    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after, this.settings.max_prepay_days).await?)
 }
 
 /// Renew(Extend) a VM
@@ -1771,7 +1773,7 @@ async fn v1_get_payment_invoice(
             &PaymentInfo {
                 year: now.year(),
                 current_date: now,
-                vm: vm_to_status(&this.db, vm, None, this.settings.delete_after)
+                vm: vm_to_status(&this.db, vm, None, this.settings.delete_after, this.settings.max_prepay_days)
                     .await
                     .map_err(|_| "Failed to get VM state")?,
                 total: payment.amount + payment.tax + payment.processing_fee,

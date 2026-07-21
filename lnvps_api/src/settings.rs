@@ -31,6 +31,13 @@ pub struct Settings {
     /// Number of days after an expired VM is deleted (monthly/yearly billing)
     pub delete_after: u16,
 
+    /// Global default for the maximum number of days a subscription may be
+    /// prepaid/renewed in advance. Used when a company's own `max_prepay_days`
+    /// is `0` (unset). Bounds both a single large renewal and repeated
+    /// back-to-back renewals. Defaults to 365 (one year).
+    #[serde(default = "default_max_prepay_days")]
+    pub max_prepay_days: u16,
+
     /// SMTP settings for sending emails
     pub smtp: Option<SmtpConfig>,
 
@@ -627,6 +634,11 @@ impl Settings {
     }
 }
 
+/// Default global maximum prepay window (days) when unspecified in config.
+pub fn default_max_prepay_days() -> u16 {
+    365
+}
+
 #[cfg(test)]
 pub fn mock_settings() -> Settings {
     Settings {
@@ -656,6 +668,7 @@ pub fn mock_settings() -> Settings {
             libvirt: None,
         },
         delete_after: 0,
+        max_prepay_days: default_max_prepay_days(),
         smtp: None,
         dns: Some(DnsServerConfig {
             forward_zone_id: "mock-forward-zone-id".to_string(),

@@ -1857,6 +1857,9 @@ pub struct AdminCompanyInfo {
     /// Default referral commission for VMs sold by this company, as a whole
     /// percentage of a referred VM's first payment (0 = disabled).
     pub referral_rate: f32,
+    /// Maximum number of days a subscription may be prepaid/renewed in advance
+    /// (0 = inherit the global default).
+    pub max_prepay_days: u16,
     pub region_count: u64, // Number of regions assigned to this company
 }
 
@@ -1875,6 +1878,8 @@ pub struct CreateCompanyRequest {
     pub base_currency: Option<String>, // 3-letter ISO currency code (default: EUR)
     /// Default referral commission %, whole percentage (default 0).
     pub referral_rate: Option<f32>,
+    /// Maximum prepay/renewal window in days (0 = inherit the global default).
+    pub max_prepay_days: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -1892,6 +1897,8 @@ pub struct UpdateCompanyRequest {
     pub base_currency: Option<String>, // 3-letter ISO currency code
     /// Default referral commission %, whole percentage.
     pub referral_rate: Option<f32>,
+    /// Maximum prepay/renewal window in days (0 = inherit the global default).
+    pub max_prepay_days: Option<u16>,
 }
 
 impl From<lnvps_db::Company> for AdminCompanyInfo {
@@ -1911,6 +1918,7 @@ impl From<lnvps_db::Company> for AdminCompanyInfo {
             email: company.email,
             base_currency: company.base_currency,
             referral_rate: company.referral_rate,
+            max_prepay_days: company.max_prepay_days,
             region_count: 0, // Will be filled by handler
         }
     }

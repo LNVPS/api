@@ -278,6 +278,7 @@ impl Default for MockDb {
                         email: None,
                         base_currency: "EUR".to_string(),
                         referral_rate: 0.0,
+                        max_prepay_days: 0,
                     },
                 );
                 companies
@@ -4644,7 +4645,7 @@ mod tests {
 
         let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
         let vm = db.get_vm(1).await.unwrap();
-        let res = vm_to_status(&db, vm, None, 0).await;
+        let res = vm_to_status(&db, vm, None, 0, 365).await;
         assert!(res.is_err(), "expected error, not a panic");
     }
 
@@ -4671,14 +4672,44 @@ mod tests {
 
         // Not sunsetting -> field is None.
         let vm = db.get_vm(1).await.unwrap();
-        let status = vm_to_status(&db, vm.clone(), None, 0).await.unwrap();
+        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
         assert!(status.host_sunset_date.is_none());
 
         // Sunset host 1 -> field surfaces the date.
         let sunset = Utc::now() + chrono::Duration::days(30);
         mdb.hosts.lock().await.get_mut(&1).unwrap().sunset_date = Some(sunset);
-        let status = vm_to_status(&db, vm, None, 0).await.unwrap();
+        let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
         assert_eq!(status.host_sunset_date, Some(sunset));
+    }
+
+    /// vm_to_status surfaces the effective prepay window: the global default
+    /// when the company has none, and the company override when set.
+    #[tokio::test]
+    async fn test_vm_to_status_surfaces_max_prepay_days() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{LNVpsDb, UserSshKey};
+
+        let mdb = MockDb::default();
+        mdb.vms.lock().await.insert(1, MockDb::mock_vm());
+        mdb.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(mdb.clone());
+
+        // Company default is 0 -> inherits the global default passed in.
+        let vm = db.get_vm(1).await.unwrap();
+        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        assert_eq!(status.max_prepay_days, 365);
+
+        // Company override wins over the global default.
+        mdb.companies.lock().await.get_mut(&1).unwrap().max_prepay_days = 90;
+        let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
+        assert_eq!(status.max_prepay_days, 90);
     }
 
     /// Regression: paying the SAME payment twice (e.g. duplicate webhook / replayed

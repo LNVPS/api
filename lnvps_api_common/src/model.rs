@@ -248,6 +248,11 @@ pub struct ApiVmStatus {
     /// sunset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_sunset_date: Option<DateTime<Utc>>,
+    /// Maximum number of days this VM may be prepaid/renewed in advance. A
+    /// renewal is rejected once it would push `expires` beyond `now +
+    /// max_prepay_days`. Clients should cap the renewal interval selector
+    /// accordingly (given `expires` and the subscription's interval length).
+    pub max_prepay_days: u16,
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -282,6 +287,7 @@ pub async fn vm_to_status(
     vm: Vm,
     state: Option<VmRunningState>,
     delete_after: u16,
+    max_prepay_days_default: u16,
 ) -> Result<ApiVmStatus> {
     let image = db.get_os_image(vm.image_id).await?;
     let ssh_key: ApiUserSshKey = match vm.ssh_key_id {
@@ -305,7 +311,7 @@ pub async fn vm_to_status(
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
-    let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on) = match db
+    let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on, max_prepay_days) = match db
         .get_subscription_by_line_item_id(vm.subscription_line_item_id)
         .await
     {
@@ -317,15 +323,23 @@ pub async fn vm_to_status(
                 let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
                 expires.checked_add_days(Days::new(grace as u64))
             });
+            // Effective prepay window: the company override when set, else the
+            // global default. Surfaced so the client can cap the renewal
+            // interval selector to what the server will accept.
+            let max_prepay_days = match db.get_company(sub.company_id).await {
+                Ok(c) if c.max_prepay_days > 0 => c.max_prepay_days,
+                _ => max_prepay_days_default,
+            };
             (
                 Some(sub.id),
                 sub.created,
                 sub.expires,
                 sub.auto_renewal_enabled,
                 deleting_on,
+                max_prepay_days,
             )
         }
-        Err(_) => (None, Utc::now(), None, false, None),
+        Err(_) => (None, Utc::now(), None, false, None, max_prepay_days_default),
     };
 
     Ok(ApiVmStatus {
@@ -352,6 +366,7 @@ pub async fn vm_to_status(
         // Surface the host's sunset date so clients can warn users on VMs that
         // must be migrated before the host is decommissioned.
         host_sunset_date: db.get_host(vm.host_id).await.ok().and_then(|h| h.sunset_date),
+        max_prepay_days,
     })
 }
 

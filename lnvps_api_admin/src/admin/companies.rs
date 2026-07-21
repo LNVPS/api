@@ -157,6 +157,7 @@ async fn admin_create_company(
             .filter(|s| !s.is_empty()),
         base_currency,
         referral_rate: req.referral_rate.unwrap_or(0.0).max(0.0),
+        max_prepay_days: req.max_prepay_days.unwrap_or(0),
     };
 
     let company_id = this.db.admin_create_company(&company).await?;
@@ -272,6 +273,9 @@ async fn admin_update_company(
             return ApiData::err("referral_rate cannot be negative");
         }
         company.referral_rate = rate;
+    }
+    if let Some(days) = req.max_prepay_days {
+        company.max_prepay_days = days;
     }
 
     // Update company in database

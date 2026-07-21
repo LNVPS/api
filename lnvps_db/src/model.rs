@@ -1606,6 +1606,11 @@ pub struct Company {
     /// per-referrer override. `0` disables commission for this company.
     #[sqlx(default)]
     pub referral_rate: f32,
+    /// Maximum number of days a subscription may be prepaid/renewed in advance.
+    /// A renewal is rejected once it would push the subscription expiry beyond
+    /// `now + max_prepay_days`. `0` means "inherit the global default".
+    #[sqlx(default)]
+    pub max_prepay_days: u16,
 }
 
 #[derive(Clone, Debug, Default)]

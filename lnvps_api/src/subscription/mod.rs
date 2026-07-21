@@ -115,6 +115,9 @@ pub struct SubscriptionHandler {
     vm_state_cache: VmStateCache,
     /// How long [`Self::collect_saved_payment`] polls for settlement.
     saved_payment_settle_timeout: Duration,
+    /// Global default cap (days) on how far in advance a subscription may be
+    /// prepaid/renewed. Used when a company's own `max_prepay_days` is 0.
+    max_prepay_days: u16,
 }
 
 impl SubscriptionHandler {
@@ -128,6 +131,7 @@ impl SubscriptionHandler {
         tx: Arc<dyn WorkCommander>,
         vm_state_cache: VmStateCache,
     ) -> Result<Self> {
+        let max_prepay_days = settings.max_prepay_days;
         Ok(Self {
             revolut: settings.get_revolut()?,
             pe: PricingEngine::new(db.clone(), rates, vat),
@@ -138,6 +142,7 @@ impl SubscriptionHandler {
             onchain,
             vm_state_cache,
             saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
+            max_prepay_days,
         })
     }
 
@@ -543,6 +548,33 @@ impl SubscriptionHandler {
         let vm_amount: u64 = vm_payment_infos.iter().map(|p| p.amount).sum();
         // time_value: sum of all VM intervals (non-VM items don't extend expiry)
         let time_value: u64 = vm_payment_infos.iter().map(|p| p.time_value).sum();
+
+        // Enforce the maximum prepay window: a renewal must not push the
+        // subscription expiry beyond `now + max_prepay_days`. This bounds both a
+        // single oversized `intervals` request and repeated back-to-back
+        // renewals (once expiry is ~max_prepay_days out, further renewals are
+        // rejected until real time passes). The per-company value overrides the
+        // global default; `0` inherits the global default.
+        if time_value > 0 {
+            let company = self.db.get_company(subscription.company_id).await?;
+            let max_prepay_days = if company.max_prepay_days > 0 {
+                company.max_prepay_days
+            } else {
+                self.max_prepay_days
+            };
+            if max_prepay_days > 0 {
+                let now = Utc::now();
+                let base = subscription.expires.unwrap_or(now).max(now);
+                let projected_expiry =
+                    base + chrono::Duration::seconds(time_value as i64);
+                let horizon = now + chrono::Duration::days(max_prepay_days as i64);
+                ensure!(
+                    projected_expiry <= horizon,
+                    "Cannot renew more than {} days in advance. Please renew for a shorter period.",
+                    max_prepay_days
+                );
+            }
+        }
         // Use the rate from the first VM item if available, else from non-VM conversion
         let rate = vm_payment_infos
             .first()
@@ -2049,12 +2081,21 @@ mod sunset_tests {
         })
         .await
         .unwrap();
+        // VM template pricing is EUR-denominated; a Lightning renewal needs a
+        // BTC/EUR rate to convert.
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
         let sub = SubscriptionHandler::new(
             mock_settings(),
             db.clone(),
             node,
             Arc::new(MockOnChainProvider::default()),
-            Arc::new(MockExchangeRate::default()),
+            rates,
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
             VmStateCache::new(),
@@ -2097,6 +2138,43 @@ mod sunset_tests {
             assert!(
                 !e.to_string().contains("sunset"),
                 "unexpected sunset error: {e}"
+            );
+        }
+    }
+
+    /// A renewal that would push expiry beyond the company's prepay window is
+    /// rejected — this bounds repeated back-to-back renewals, not just a single
+    /// oversized `intervals` request.
+    #[tokio::test]
+    async fn prepay_capped_by_company_setting() {
+        let (db, sub, sub_id) = setup_vps_sub().await;
+        // Tighten this company's window so even a single month renewal (~30 days)
+        // exceeds it.
+        db.companies.lock().await.get_mut(&1).unwrap().max_prepay_days = 5;
+        let err = sub
+            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
+            .await
+            .expect_err("renewal beyond the prepay window must be rejected");
+        assert!(
+            err.to_string().contains("days in advance"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A renewal that fits within the company's prepay window is not rejected by
+    /// the prepay guard.
+    #[tokio::test]
+    async fn prepay_allowed_within_window() {
+        let (db, sub, sub_id) = setup_vps_sub().await;
+        // Generous window so a single month renewal fits comfortably.
+        db.companies.lock().await.get_mut(&1).unwrap().max_prepay_days = 3650;
+        let res = sub
+            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
+            .await;
+        if let Err(e) = res {
+            assert!(
+                !e.to_string().contains("days in advance"),
+                "unexpected prepay error: {e}"
             );
         }
     }

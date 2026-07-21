@@ -4789,8 +4789,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_company(&self, company: &Company) -> DbResult<u64> {
         let result = sqlx::query(
-            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency, referral_rate)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)"#,
+            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency, referral_rate, max_prepay_days)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)"#,
         )
         .bind(&company.name)
         .bind(&company.address_1)
@@ -4804,6 +4804,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.email)
             .bind(&company.base_currency)
         .bind(company.referral_rate)
+        .bind(company.max_prepay_days)
         .execute(&self.db)
         .await?;
 
@@ -4814,7 +4815,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"UPDATE company SET 
                name = ?, address_1 = ?, address_2 = ?, city = ?, state = ?, 
-               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?, referral_rate = ?
+               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?, referral_rate = ?, max_prepay_days = ?
                WHERE id = ?"#,
         )
         .bind(&company.name)
@@ -4829,6 +4830,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.email)
         .bind(&company.base_currency)
         .bind(company.referral_rate)
+        .bind(company.max_prepay_days)
         .bind(company.id)
         .execute(&self.db)
         .await?;
