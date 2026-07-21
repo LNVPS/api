@@ -459,7 +459,12 @@ mod tests {
     #[test]
     fn test_bare_digest_rejects_invalid() {
         // Not hex
-        assert!(parse_bare_digest_line("zz09861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4fa3c2b").is_none());
+        assert!(
+            parse_bare_digest_line(
+                "zz09861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4fa3c2b"
+            )
+            .is_none()
+        );
         // Wrong length
         assert!(parse_bare_digest_line("deadbeef").is_none());
     }
@@ -696,7 +701,10 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
         let result = probe_checksum_from_image_url(image_url, filename).await;
         let (entry, sums_url) = result.expect("should find CHECKSUM file");
 
-        assert!(sums_url.ends_with("/CHECKSUM"), "unexpected sums_url: {sums_url}");
+        assert!(
+            sums_url.ends_with("/CHECKSUM"),
+            "unexpected sums_url: {sums_url}"
+        );
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
         Ok(())
     }

@@ -419,6 +419,8 @@ interface PaymentMethod {
   processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
   processing_fee_base?: number; // Base amount in smallest currency units (cents for fiat, millisats for BTC)
   processing_fee_currency?: string; // Currency for the base fee (e.g., "EUR")
+  min_amount?: number; // Minimum processable amount in smallest currency units; payments below this are rejected for this method
+  min_amount_currency?: string; // Currency for min_amount (e.g., "EUR")
 }
 ```
 

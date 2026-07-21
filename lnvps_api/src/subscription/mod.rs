@@ -577,6 +577,20 @@ impl SubscriptionHandler {
         let converted_amount = total_amount;
         let converted_currency = payment_currency;
 
+        // Reject payments below the method's configured minimum (gross = net + tax
+        // + processing fee). Prevents uneconomic small charges (e.g. Revolut's
+        // flat 20c base fee dominating a tiny payment).
+        self.pe
+            .enforce_min_amount(
+                subscription.company_id,
+                method,
+                CurrencyAmount::from_u64(
+                    converted_currency,
+                    converted_amount + tax + processing_fee,
+                ),
+            )
+            .await?;
+
         // Generate payment based on method
         let subscription_payment = match method {
             PaymentMethod::Lightning => {

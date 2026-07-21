@@ -145,6 +145,31 @@ async fn admin_update_payment_method(
         .into());
     }
 
+    // Handle currency first so we can validate the min amount against it
+    if let Some(currency) = &request.min_amount_currency {
+        config.min_amount_currency = currency.as_ref().map(|s| s.trim().to_uppercase());
+    }
+    if let Some(min) = request.min_amount {
+        config.min_amount = match (min, &config.min_amount_currency) {
+            (Some(amount), Some(_)) => Some(amount),
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(anyhow::anyhow!(
+                    "Minimum amount currency is required when minimum amount is set"
+                )
+                .into());
+            }
+        };
+    }
+
+    // Validate that if min amount is set, currency must also be set
+    if config.min_amount.is_some() && config.min_amount_currency.is_none() {
+        return Err(anyhow::anyhow!(
+            "Minimum amount currency is required when minimum amount is set"
+        )
+        .into());
+    }
+
     // Update supported currencies if provided
     if let Some(currencies) = &request.supported_currencies {
         config.supported_currencies = lnvps_db::CommaSeparated::new(

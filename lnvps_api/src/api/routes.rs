@@ -1488,6 +1488,8 @@ fn build_payment_methods_response(
                 processing_fee_rate: config.processing_fee_rate,
                 processing_fee_base: config.processing_fee_base,
                 processing_fee_currency: config.processing_fee_currency,
+                min_amount: config.min_amount,
+                min_amount_currency: config.min_amount_currency,
             }
         })
         .collect();
@@ -1501,6 +1503,8 @@ fn build_payment_methods_response(
             processing_fee_rate: None,
             processing_fee_base: None,
             processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
         });
         ret.push(ApiPaymentInfo {
             name: ApiPaymentMethod::LNURL,
@@ -1509,6 +1513,8 @@ fn build_payment_methods_response(
             processing_fee_rate: None,
             processing_fee_base: None,
             processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
         });
     }
 
@@ -2202,6 +2208,8 @@ mod tests {
             processing_fee_rate: fee_rate,
             processing_fee_base: fee_base,
             processing_fee_currency: fee_currency.map(String::from),
+            min_amount: None,
+            min_amount_currency: None,
             supported_currencies: lnvps_db::CommaSeparated::new(
                 supported_currencies.into_iter().map(String::from).collect(),
             ),
