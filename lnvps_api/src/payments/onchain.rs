@@ -925,4 +925,157 @@ mod tests {
         assert!(handler.listen().await.is_err());
         Ok(())
     }
+
+    /// An over-payment buys proportionally more time (engine pricing is linear).
+    #[tokio::test]
+    async fn test_overpayment_buys_more_time() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let expect_full = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED * 2)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_close(p.time_value.unwrap(), expect_full.time_value * 2);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED * 2);
+        Ok(())
+    }
+
+    /// RBF before confirmation: a fee-bumped replacement is a *new* txid to the
+    /// same address. Because deposits are correlated by address, the pending
+    /// payment is re-pointed to the replacement's outpoint and re-priced from
+    /// the replacement's amount; the confirmation of the replacement then
+    /// settles it. Exactly one payment exists throughout.
+    #[tokio::test]
+    async fn test_rbf_replacement_repoints_and_reprices() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+
+        // Original tx seen (0-conf).
+        handler.handle_detected(ADDRESS, "txA", 0, EXPECTED).await?;
+        let p = get_payment(&db, &payment.id).await;
+        assert_eq!(p.external_id, Some(deposit_key("txA", 0)));
+        assert!(!p.is_paid);
+
+        // Fee-bumped replacement (new txid) to the SAME address, different
+        // output value -> re-point + re-price, still unpaid.
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED * 2).await?;
+        handler
+            .handle_detected(ADDRESS, "txB", 0, EXPECTED * 2)
+            .await?;
+        let p = get_payment(&db, &payment.id).await;
+        assert!(!p.is_paid);
+        assert_eq!(
+            p.external_id,
+            Some(deposit_key("txB", 0)),
+            "stale outpoint abandoned for the replacement"
+        );
+        assert_close(p.time_value.unwrap(), expect.time_value);
+
+        // Only the replacement confirms (A and B conflict on the same inputs).
+        handler
+            .handle_deposit(ADDRESS, "txB", 0, EXPECTED * 2)
+            .await?;
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.external_id, Some(deposit_key("txB", 0)));
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        assert_eq!(
+            db.subscription_payments.lock().await.len(),
+            1,
+            "RBF must not create extra payments"
+        );
+        Ok(())
+    }
+
+    /// Reorg/RBF where the watcher never saw the replacement's `Detected` (it
+    /// was down): a `Confirmed` for a txid different from the one recorded at
+    /// detection still settles the pending payment (address-keyed), abandoning
+    /// the stale outpoint. No renewal is spawned.
+    #[tokio::test]
+    async fn test_confirm_different_txid_than_detected_settles() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+
+        // Detected on txA, then a different tx (txB) is what actually confirms.
+        handler.handle_detected(ADDRESS, "txA", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "txB", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(
+            p.external_id,
+            Some(deposit_key("txB", 0)),
+            "settled outpoint is the tx that actually confirmed"
+        );
+        assert_eq!(
+            db.subscription_payments.lock().await.len(),
+            1,
+            "must settle in place, not spawn a renewal"
+        );
+        Ok(())
+    }
+
+    /// Defensive re-price: if a deposit is priced at `Detected` and the same
+    /// outpoint later `Confirms` with a *different* gross amount, pricing is
+    /// regenerated from the confirmed amount (the `Detected` quote is not
+    /// trusted blindly).
+    #[tokio::test]
+    async fn test_confirm_amount_mismatch_reprices() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let expect_half = engine_price(&handler, payment.subscription_id, EXPECTED / 2).await?;
+
+        // Same outpoint confirms with half the amount -> re-price to the
+        // amount that actually arrived.
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED / 2)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_close(p.time_value.unwrap(), expect_half.time_value);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED / 2);
+        Ok(())
+    }
+
+    /// A `Detected` deposit to an already-settled address is ignored: address
+    /// reuse only creates a renewal at `Confirmed`, never at first sight.
+    #[tokio::test]
+    async fn test_detected_to_settled_address_ignored() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+
+        // A new deposit to the same (settled) address is first seen -> no-op.
+        handler.handle_detected(ADDRESS, "tx2", 0, EXPECTED).await?;
+        assert_eq!(
+            db.subscription_payments.lock().await.len(),
+            1,
+            "Detected must not create a renewal for a settled address"
+        );
+        // The original settled payment is untouched.
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.external_id, Some(deposit_key("tx1", 0)));
+        Ok(())
+    }
+
+    /// Replaying the same `Confirmed` after settlement must not extend the
+    /// subscription again or create a duplicate payment (outpoint de-dupe).
+    #[tokio::test]
+    async fn test_replayed_confirm_is_idempotent() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let first = get_payment(&db, &payment.id).await;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let again = get_payment(&db, &payment.id).await;
+
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        assert_eq!(first.time_value, again.time_value);
+        assert_eq!(first.external_id, again.external_id);
+        Ok(())
+    }
 }
