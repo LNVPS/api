@@ -3346,6 +3346,7 @@ mod tests {
             db.clone(),
             node.clone(),
             Arc::new(MockOnChainProvider::default()),
+            None,
             rates,
             lnvps_api_common::VatClient::new(),
             work_commander.clone(),

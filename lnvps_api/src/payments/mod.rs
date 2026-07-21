@@ -1,3 +1,5 @@
+#[cfg(any(feature = "revolut", feature = "stripe"))]
+use crate::payment_factory::PaymentMethodFactory;
 use crate::payments::invoice::NodeInvoiceHandler;
 use crate::payments::onchain::OnChainPaymentHandler;
 use crate::settings::Settings;
@@ -52,13 +54,18 @@ pub async fn listen_all_payments(
         }
     }));
 
+    // Fiat settlement listeners load their per-company configs through the
+    // PaymentMethodFactory so all payment-config access goes through one place.
+    #[cfg(any(feature = "revolut", feature = "stripe"))]
+    let factory = PaymentMethodFactory::new(db.clone());
+
     #[cfg(feature = "revolut")]
     {
         use crate::payments::revolut::RevolutPaymentHandler;
 
         // Load all Revolut payment configs from database
-        let revolut_configs = db
-            .list_payment_method_configs()
+        let revolut_configs = factory
+            .load_configs()
             .await?
             .into_iter()
             .filter(|c| c.payment_method == PaymentMethod::Revolut && c.enabled)
@@ -99,8 +106,8 @@ pub async fn listen_all_payments(
     {
         use crate::payments::stripe::StripePaymentHandler;
 
-        let stripe_configs = db
-            .list_payment_method_configs()
+        let stripe_configs = factory
+            .load_configs()
             .await?
             .into_iter()
             .filter(|c| c.payment_method == PaymentMethod::Stripe && c.enabled)

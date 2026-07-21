@@ -1,11 +1,6 @@
-use anyhow::Result;
 use lnvps_api_common::RedisConfig;
-use payments_rs::fiat::FiatPaymentService;
-use payments_rs::lightning::LightningNode;
-use payments_rs::onchain::OnChainProvider;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -18,9 +13,6 @@ pub struct Settings {
 
     /// Public URL mapping to this service
     pub public_url: String,
-
-    /// Lightning node config for creating LN payments
-    pub lightning: LightningConfig,
 
     /// Readonly mode, don't spawn any VM's
     pub read_only: bool,
@@ -54,9 +46,6 @@ pub struct Settings {
 
     /// WhatsApp Cloud API config for sending notifications
     pub whatsapp: Option<WhatsAppConfig>,
-
-    /// Config for accepting revolut payments
-    pub revolut: Option<payments_rs::fiat::RevolutConfig>,
 
     /// public host of lnvps_nostr service
     pub nostr_address_host: Option<String>,
@@ -377,22 +366,6 @@ pub enum CaptchaConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LightningConfig {
-    #[serde(rename = "lnd")]
-    LND {
-        url: String,
-        cert: PathBuf,
-        macaroon: PathBuf,
-    },
-    #[serde(rename_all = "kebab-case")]
-    Bitvora {
-        token: String,
-        webhook_secret: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NostrConfig {
     pub relays: Vec<String>,
     pub nsec: String,
@@ -567,73 +540,6 @@ pub struct EncryptionConfig {
     pub auto_generate: bool,
 }
 
-impl Settings {
-    pub fn get_revolut(&self) -> Result<Option<Arc<dyn FiatPaymentService>>> {
-        match &self.revolut {
-            #[cfg(feature = "revolut")]
-            Some(c) => Ok(Some(Arc::new(payments_rs::fiat::RevolutApi::new(
-                c.clone(),
-            )?))),
-            _ => Ok(None),
-        }
-    }
-
-    pub async fn get_node(&self) -> Result<Arc<dyn LightningNode>> {
-        match &self.lightning {
-            #[cfg(feature = "lnd")]
-            LightningConfig::LND {
-                url,
-                cert,
-                macaroon,
-            } => Ok(Arc::new(
-                payments_rs::lightning::LndNode::new(url, cert, macaroon).await?,
-            )),
-            #[cfg(feature = "bitvora")]
-            LightningConfig::Bitvora {
-                token,
-                webhook_secret,
-            } => Ok(Arc::new(payments_rs::lightning::BitvoraNode::new(
-                token,
-                webhook_secret,
-                "/api/v1/webhook/bitvora",
-            ))),
-            _ => anyhow::bail!("Unsupported lightning config!"),
-        }
-    }
-
-    /// Build the on-chain payment provider from the configured LND node.
-    ///
-    /// On-chain payments reuse the same LND wallet as the Lightning node, so
-    /// this is required in the same way [`Self::get_node`] is: any backend
-    /// that cannot receive on-chain payments is an error.
-    pub async fn get_onchain(&self) -> Result<Arc<dyn OnChainProvider>> {
-        match &self.lightning {
-            #[cfg(feature = "onchain")]
-            LightningConfig::LND {
-                url,
-                cert,
-                macaroon,
-            } => {
-                use payments_rs::onchain::{LndAddressType, LndOnChainConfig, LndOnChainProvider};
-                Ok(Arc::new(
-                    LndOnChainProvider::new(
-                        url,
-                        cert,
-                        macaroon,
-                        LndOnChainConfig {
-                            address_type: LndAddressType::WitnessPubkeyHash,
-                            account: None,
-                            min_confirmations: 1,
-                        },
-                    )
-                    .await?,
-                ))
-            }
-            _ => anyhow::bail!("Unsupported lightning config for on-chain payments!"),
-        }
-    }
-}
-
 /// Default global maximum prepay window (days) when unspecified in config.
 pub fn default_max_prepay_days() -> u16 {
     365
@@ -645,11 +551,6 @@ pub fn mock_settings() -> Settings {
         listen: None,
         db: "".to_string(),
         public_url: "http://localhost:8000".to_string(),
-        lightning: LightningConfig::LND {
-            url: "".to_string(),
-            cert: Default::default(),
-            macaroon: Default::default(),
-        },
         read_only: false,
         provisioner: ProvisionerConfig {
             proxmox: Some(ProxmoxConfig {
@@ -677,7 +578,6 @@ pub fn mock_settings() -> Settings {
         nostr: None,
         telegram: None,
         whatsapp: None,
-        revolut: None,
         nostr_address_host: None,
         redis: None,
         encryption: None,

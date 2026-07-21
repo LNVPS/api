@@ -4,7 +4,6 @@ use crate::data_migration::email_hash_backfill::EmailHashBackfillMigration;
 use crate::data_migration::encryption_migration::EncryptionDataMigration;
 use crate::data_migration::ip6_init::Ip6InitDataMigration;
 use crate::data_migration::orphaned_custom_templates::OrphanedCustomTemplatesMigration;
-use crate::data_migration::payment_method_config::PaymentMethodConfigMigration;
 use crate::data_migration::purge_never_paid_deleted_vms::PurgeNeverPaidDeletedVmsMigration;
 use crate::data_migration::ssh_key_migration::SshKeyMigration;
 use crate::provisioner::VmProvisioner;
@@ -22,7 +21,6 @@ mod email_hash_backfill;
 mod encryption_migration;
 mod ip6_init;
 mod orphaned_custom_templates;
-mod payment_method_config;
 mod purge_never_paid_deleted_vms;
 mod ssh_key_migration;
 
@@ -56,12 +54,6 @@ pub async fn run_data_migrations(
     }
 
     migrations.push(Box::new(ArpRefFixerDataMigration::new(db.clone())));
-
-    // Migrate payment method config from YAML to database
-    migrations.push(Box::new(PaymentMethodConfigMigration::new(
-        db.clone(),
-        settings.clone(),
-    )));
 
     // Migrate SSH key from proxmox config to database
     migrations.push(Box::new(SshKeyMigration::new(db.clone(), settings.clone())));
