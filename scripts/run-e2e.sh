@@ -213,29 +213,12 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Start user API
-# ---------------------------------------------------------------------------
-echo "=== Starting user API ==="
-LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api -- --config "$TMP_API_CONFIG" \
-    > /tmp/lnvps-e2e-api.log 2>&1 &
-echo $! > "$API_PID_FILE"
-
-for i in $(seq 1 90); do
-    if curl -sf "${LNVPS_API_URL:-http://localhost:8000}/" >/dev/null 2>&1; then
-        echo "User API ready after ${i}s"
-        break
-    fi
-    if [[ "$i" -eq 90 ]]; then
-        echo "ERROR: User API failed to start within 90s" >&2
-        echo "--- User API log ---" >&2
-        tail -30 /tmp/lnvps-e2e-api.log >&2
-        exit 1
-    fi
-    sleep 1
-done
-
-# ---------------------------------------------------------------------------
-# 7. Start admin API
+# 6. Start admin API
+#
+# The admin API runs the database schema migrations on startup (and, unlike the
+# user API, does not build any payment providers). We start it first so the
+# schema exists before we seed the payment_method_config rows the user API
+# needs.
 # ---------------------------------------------------------------------------
 echo "=== Starting admin API ==="
 LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api_admin --bin lnvps_api_admin -- --config "$TMP_ADMIN_CONFIG" \
@@ -257,7 +240,54 @@ for i in $(seq 1 90); do
 done
 
 # ---------------------------------------------------------------------------
-# 8. Run E2E tests
+# 7. Seed payment providers into the database
+#
+# Payment providers are now sourced exclusively from the `payment_method_config`
+# table (there is no YAML fallback). The user API refuses to start without an
+# enabled Lightning + on-chain config for the default company, so seed both to
+# point at the docker-compose LND node. Idempotent (skips if already present).
+# ---------------------------------------------------------------------------
+echo "=== Seeding payment_method_config (LND Lightning + OnChain) ==="
+LND_URL="https://localhost:10009"
+LND_CERT="/tmp/e2e-lnd/tls.cert"
+LND_MACAROON="/tmp/e2e-lnd/data/chain/bitcoin/regtest/admin.macaroon"
+SEED_SQL="USE \`${DB_NAME}\`;
+SET @cid = (SELECT MIN(id) FROM company);
+INSERT INTO payment_method_config (company_id, payment_method, name, enabled, provider_type, config)
+SELECT @cid, 0, 'E2E LND', 1, 'lnd', '{\"type\":\"lnd\",\"url\":\"${LND_URL}\",\"cert_path\":\"${LND_CERT}\",\"macaroon_path\":\"${LND_MACAROON}\"}'
+WHERE NOT EXISTS (SELECT 1 FROM payment_method_config WHERE company_id = @cid AND payment_method = 0);
+INSERT INTO payment_method_config (company_id, payment_method, name, enabled, provider_type, config)
+SELECT @cid, 4, 'E2E LND OnChain', 1, 'onchain', '{\"type\":\"onchain\",\"url\":\"${LND_URL}\",\"cert_path\":\"${LND_CERT}\",\"macaroon_path\":\"${LND_MACAROON}\",\"address_type\":\"witness_pubkey_hash\",\"min_confirmations\":1}'
+WHERE NOT EXISTS (SELECT 1 FROM payment_method_config WHERE company_id = @cid AND payment_method = 4);"
+if ! mysql_exec "$SEED_SQL"; then
+    echo "ERROR: failed to seed payment_method_config" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Start user API
+# ---------------------------------------------------------------------------
+echo "=== Starting user API ==="
+LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api -- --config "$TMP_API_CONFIG" \
+    > /tmp/lnvps-e2e-api.log 2>&1 &
+echo $! > "$API_PID_FILE"
+
+for i in $(seq 1 90); do
+    if curl -sf "${LNVPS_API_URL:-http://localhost:8000}/" >/dev/null 2>&1; then
+        echo "User API ready after ${i}s"
+        break
+    fi
+    if [[ "$i" -eq 90 ]]; then
+        echo "ERROR: User API failed to start within 90s" >&2
+        echo "--- User API log ---" >&2
+        tail -30 /tmp/lnvps-e2e-api.log >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+# ---------------------------------------------------------------------------
+# 9. Run E2E tests
 # ---------------------------------------------------------------------------
 echo "=== Running E2E tests ==="
 TEST_CMD="cargo test -p lnvps_e2e -- --test-threads=1"

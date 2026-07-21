@@ -3,6 +3,7 @@ use clap::{Parser, ValueEnum};
 use config::{Config, File};
 use lnvps_api::data_migration::run_data_migrations;
 use lnvps_api::dvm::start_dvms;
+use lnvps_api::payment_factory::PaymentMethodFactory;
 use lnvps_api::payments::listen_all_payments;
 use lnvps_api::settings::Settings;
 use lnvps_api::worker::Worker;
@@ -162,8 +163,59 @@ async fn main() -> Result<(), Error> {
     };
 
     let exchange = make_exchange_service(&settings.redis);
-    let node = settings.get_node().await?;
-    let onchain = settings.get_onchain().await?;
+
+    // Payment providers are sourced exclusively from the database
+    // `payment_method_config` rows (per-company config). There is no YAML
+    // fallback: providers must be configured in the database (via the admin
+    // API), otherwise startup fails.
+    //
+    // NOTE: the runtime still uses a single *global* node/on-chain provider
+    // selected from the default (first) company. True per-company provider
+    // routing is tracked as future work (see issue #182); the data model
+    // already carries `company_id` end-to-end, but the settlement handlers and
+    // SubscriptionHandler resolve one provider set for the whole process.
+    let factory = PaymentMethodFactory::new(db.clone());
+    let default_company_id = db
+        .list_companies()
+        .await?
+        .into_iter()
+        .next()
+        .map(|c| c.id)
+        .ok_or_else(|| {
+            Error::msg("No companies found in database; cannot resolve payment providers")
+        })?;
+
+    let node = factory
+        .get_lightning_node_for_company(default_company_id)
+        .await?
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "No enabled Lightning payment_method_config for company {default_company_id}; \
+                 configure one via the admin API"
+            ))
+        })?;
+    info!("Using Lightning node from payment_method_config (company {default_company_id})");
+
+    #[cfg(feature = "onchain")]
+    let onchain = factory
+        .get_onchain_provider_for_company(default_company_id)
+        .await?
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "No enabled on-chain payment_method_config for company {default_company_id}; \
+                 configure one via the admin API"
+            ))
+        })?;
+    #[cfg(feature = "onchain")]
+    info!("Using on-chain provider from payment_method_config (company {default_company_id})");
+
+    // The global Revolut service (if any) used by SubscriptionHandler for
+    // saved-card / off-session charges. Absent when no company has an enabled
+    // Revolut config.
+    let revolut = factory
+        .get_revolut_for_company(default_company_id)
+        .await
+        .unwrap_or(None);
 
     // Optional IP -> country geolocation for VAT place-of-supply evidence.
     let geoip: Option<Arc<dyn CountryResolver>> = match &settings.geoip_database {
@@ -225,6 +277,7 @@ async fn main() -> Result<(), Error> {
         db.clone(),
         node.clone(),
         onchain.clone(),
+        revolut.clone(),
         exchange.clone(),
         vat.clone(),
         work_commander.clone(),

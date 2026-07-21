@@ -1,9 +1,8 @@
 db: "mysql://root:root@localhost:3376/lnvps"
-lightning:
-  lnd:
-    url: "https://127.0.0.1:10003"
-    cert: "/home/kieran/.polar/networks/1/volumes/lnd/alice/tls.cert"
-    macaroon: "/home/kieran/.polar/networks/1/volumes/lnd/alice/data/chain/bitcoin/regtest/admin.macaroon"
+# Payment providers (Lightning node, on-chain wallet, Revolut, ...) are no
+# longer configured here. They are stored in the database `payment_method_config`
+# table (per company) and managed via the admin API
+# (POST/PATCH /api/admin/v1/payment_method_configs).
 delete-after: 3
 # Global default maximum prepay/renewal window in days. A renewal is rejected
 # once it would push a subscription's expiry beyond now + this many days. Used

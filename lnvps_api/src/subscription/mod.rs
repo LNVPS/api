@@ -121,11 +121,13 @@ pub struct SubscriptionHandler {
 }
 
 impl SubscriptionHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         settings: Settings,
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
         onchain: Arc<dyn OnChainProvider>,
+        revolut: Option<Arc<dyn FiatPaymentService>>,
         rates: Arc<dyn ExchangeRateService>,
         vat: VatClient,
         tx: Arc<dyn WorkCommander>,
@@ -133,7 +135,7 @@ impl SubscriptionHandler {
     ) -> Result<Self> {
         let max_prepay_days = settings.max_prepay_days;
         Ok(Self {
-            revolut: settings.get_revolut()?,
+            revolut,
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             db,
@@ -1365,8 +1367,9 @@ mod revolut_autorenew_tests {
         let payment_method_id = std::env::var("REVOLUT_TEST_PM")
             .expect("set REVOLUT_TEST_PM to a saved sandbox payment method id");
 
-        let mut settings = mock_settings();
-        settings.revolut = Some(revolut);
+        let settings = mock_settings();
+        let revolut_service: Arc<dyn FiatPaymentService> =
+            Arc::new(payments_rs::fiat::RevolutApi::new(revolut)?);
 
         let db = Arc::new(MockDb::default());
         let node = Arc::new(MockNode::default());
@@ -1427,6 +1430,7 @@ mod revolut_autorenew_tests {
             db.clone(),
             node.clone(),
             Arc::new(MockOnChainProvider::default()),
+            Some(revolut_service),
             Arc::new(MockExchangeRate::default()),
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -1601,6 +1605,7 @@ mod revolut_offline_tests {
             db.clone(),
             node,
             Arc::new(MockOnChainProvider::default()),
+            None,
             rates,
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -1671,6 +1676,7 @@ mod revolut_offline_tests {
             db.clone(),
             node,
             Arc::new(MockOnChainProvider::default()),
+            None,
             Arc::new(MockExchangeRate::default()),
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -1747,6 +1753,7 @@ mod revolut_offline_tests {
             db.clone(),
             node,
             onchain.clone(),
+            None,
             Arc::new(MockExchangeRate::default()),
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),
@@ -2095,6 +2102,7 @@ mod sunset_tests {
             db.clone(),
             node,
             Arc::new(MockOnChainProvider::default()),
+            None,
             rates,
             VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),

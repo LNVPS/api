@@ -583,6 +583,7 @@ mod tests {
             db.clone(),
             node,
             provider.clone(),
+            None,
             rates.clone(),
             lnvps_api_common::VatClient::new(),
             Arc::new(ChannelWorkCommander::new()),

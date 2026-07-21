@@ -8,7 +8,7 @@ use lnvps_api_common::{
     RedisWorkCommander, RedisWorkFeedback, VmStateCache, WorkCommander, WorkJob, WorkJobMessage,
     make_exchange_service,
 };
-use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
+use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
 use log::info;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -68,6 +68,7 @@ async fn main() -> Result<(), Error> {
 
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;
+    db.migrate().await?;
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
     // Initialize VM state cache
