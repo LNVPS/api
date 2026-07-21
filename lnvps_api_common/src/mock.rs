@@ -48,6 +48,7 @@ pub struct MockDb {
     pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
     pub ip_range_subscriptions: Arc<Mutex<HashMap<u64, IpRangeSubscription>>>,
+    pub available_ip_space: Arc<Mutex<HashMap<u64, AvailableIpSpace>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -327,6 +328,7 @@ impl Default for MockDb {
             })),
             subscription_payments: Arc::new(Default::default()),
             ip_range_subscriptions: Arc::new(Default::default()),
+            available_ip_space: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
@@ -2430,7 +2432,13 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn list_available_ip_space(&self) -> DbResult<Vec<AvailableIpSpace>> {
-        todo!()
+        Ok(self
+            .available_ip_space
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect())
     }
 
     async fn list_available_ip_space_paginated(
@@ -2445,7 +2453,12 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn get_available_ip_space(&self, id: u64) -> DbResult<AvailableIpSpace> {
-        todo!()
+        self.available_ip_space
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| DbError::from(anyhow!("available_ip_space {} not found", id)))
     }
 
     async fn get_available_ip_space_by_cidr(&self, cidr: &str) -> DbResult<AvailableIpSpace> {
@@ -2453,7 +2466,16 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn insert_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<u64> {
-        todo!()
+        let mut m = self.available_ip_space.lock().await;
+        let id = if space.id == 0 {
+            m.keys().max().copied().unwrap_or(0) + 1
+        } else {
+            space.id
+        };
+        let mut s = space.clone();
+        s.id = id;
+        m.insert(id, s);
+        Ok(id)
     }
 
     async fn update_available_ip_space(&self, space: &AvailableIpSpace) -> DbResult<()> {
@@ -4707,7 +4729,12 @@ mod tests {
         assert_eq!(status.max_prepay_days, 365);
 
         // Company override wins over the global default.
-        mdb.companies.lock().await.get_mut(&1).unwrap().max_prepay_days = 90;
+        mdb.companies
+            .lock()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .max_prepay_days = 90;
         let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
         assert_eq!(status.max_prepay_days, 90);
     }
@@ -4884,6 +4911,7 @@ mod tests {
             available_ip_space_id: 1,
             created: Utc::now(),
             cidr: "192.0.2.0/24".to_string(),
+            origin_asn: None,
             is_active: true,
             started_at: Utc::now(),
             ended_at: None,

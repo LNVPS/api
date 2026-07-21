@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 mod ip_range;
 mod vm;
 
-use crate::provisioner::VmProvisioner;
+use crate::provisioner::{IpRangeProvisioner, VmProvisioner};
 use crate::settings::Settings;
 pub use ip_range::IpRangeLineItemHandler;
 use lnvps_api_common::VmStateCache;
@@ -112,6 +112,7 @@ pub struct SubscriptionHandler {
 
     pe: PricingEngine,
     vm_provisioner: VmProvisioner,
+    ip_range_provisioner: IpRangeProvisioner,
     vm_state_cache: VmStateCache,
     /// How long [`Self::collect_saved_payment`] polls for settlement.
     saved_payment_settle_timeout: Duration,
@@ -138,6 +139,7 @@ impl SubscriptionHandler {
             revolut,
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
+            ip_range_provisioner: IpRangeProvisioner::new(db.clone(), tx.clone()),
             db,
             tx,
             node,
@@ -194,6 +196,18 @@ impl SubscriptionHandler {
         self.saved_payment_settle_timeout = d;
     }
 
+    /// Set (or clear) the origin ASN on an IP-range allocation, reconciling its
+    /// IRR route object + RPKI ROA. Backs the user-facing PATCH endpoint.
+    pub async fn configure_ip_range_origin_asn(
+        &self,
+        ip_sub_id: u64,
+        origin_asn: Option<u32>,
+    ) -> Result<()> {
+        self.ip_range_provisioner
+            .configure_origin_asn(ip_sub_id, origin_asn)
+            .await
+    }
+
     pub async fn make_line_item_handler(
         &self,
         li: &SubscriptionLineItem,
@@ -213,8 +227,8 @@ impl SubscriptionHandler {
                 ))
             }
             SubscriptionType::IpRange => Ok(Box::new(IpRangeLineItemHandler::new(
-                self.db.clone(),
-                self.tx.clone(),
+                self.ip_range_provisioner.clone(),
+                li.id,
             ))),
             other => {
                 bail!("No line item handler implemented for subscription type {other:?}")
@@ -567,8 +581,7 @@ impl SubscriptionHandler {
             if max_prepay_days > 0 {
                 let now = Utc::now();
                 let base = subscription.expires.unwrap_or(now).max(now);
-                let projected_expiry =
-                    base + chrono::Duration::seconds(time_value as i64);
+                let projected_expiry = base + chrono::Duration::seconds(time_value as i64);
                 let horizon = now + chrono::Duration::days(max_prepay_days as i64);
                 ensure!(
                     projected_expiry <= horizon,
@@ -2158,7 +2171,12 @@ mod sunset_tests {
         let (db, sub, sub_id) = setup_vps_sub().await;
         // Tighten this company's window so even a single month renewal (~30 days)
         // exceeds it.
-        db.companies.lock().await.get_mut(&1).unwrap().max_prepay_days = 5;
+        db.companies
+            .lock()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .max_prepay_days = 5;
         let err = sub
             .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
             .await
@@ -2175,7 +2193,12 @@ mod sunset_tests {
     async fn prepay_allowed_within_window() {
         let (db, sub, sub_id) = setup_vps_sub().await;
         // Generous window so a single month renewal fits comfortably.
-        db.companies.lock().await.get_mut(&1).unwrap().max_prepay_days = 3650;
+        db.companies
+            .lock()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .max_prepay_days = 3650;
         let res = sub
             .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
             .await;

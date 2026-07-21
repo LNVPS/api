@@ -2576,6 +2576,11 @@ pub struct IpRangeSubscription {
     pub available_ip_space_id: u64,
     pub created: DateTime<Utc>,
     pub cidr: String,
+    /// The origin AS number the customer announces this prefix from. Mutable
+    /// operational state (a re-home re-issues the route object + ROA); `None`
+    /// until the customer configures it, in which case no registry objects
+    /// exist yet.
+    pub origin_asn: Option<u32>,
     pub is_active: bool,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,

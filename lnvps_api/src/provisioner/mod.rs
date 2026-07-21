@@ -1,3 +1,4 @@
+mod ip_range;
 mod vm;
 mod vm_network;
 
@@ -10,6 +11,7 @@ mod integration_retry_tests;
 #[cfg(test)]
 mod rollback_tests;
 
+pub use ip_range::*;
 pub use lnvps_api_common::{HostCapacityService, NetworkProvisioner, PricingEngine};
 pub use vm::*;
 pub use vm_network::*;

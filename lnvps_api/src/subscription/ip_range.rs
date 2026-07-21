@@ -1,54 +1,46 @@
+//! Subscription-lifecycle adapter for IP-range line items.
+//!
+//! Thin glue that maps the [`SubscriptionLineItemHandler`] lifecycle onto the
+//! [`IpRangeProvisioner`] domain layer (mirroring how [`super::VmLineItemHandler`]
+//! delegates to [`crate::provisioner::VmProvisioner`]). All allocation and LIR
+//! registry logic lives in the provisioner.
+
+use crate::provisioner::IpRangeProvisioner;
 use crate::subscription::SubscriptionLineItemHandler;
 use anyhow::Result;
 use async_trait::async_trait;
-use lnvps_api_common::{WorkCommander, WorkJob};
-use lnvps_db::{LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment};
+use lnvps_db::{Subscription, SubscriptionLineItem, SubscriptionPayment};
 use log::info;
-use std::sync::Arc;
 
 pub struct IpRangeLineItemHandler {
-    db: Arc<dyn LNVpsDb>,
-    tx: Arc<dyn WorkCommander>,
+    provisioner: IpRangeProvisioner,
+    /// The line item this handler fulfils.
+    line_item_id: u64,
 }
 
 impl IpRangeLineItemHandler {
-    pub fn new(db: Arc<dyn LNVpsDb>, tx: Arc<dyn WorkCommander>) -> Self {
-        Self { db, tx }
+    pub fn new(provisioner: IpRangeProvisioner, line_item_id: u64) -> Self {
+        Self {
+            provisioner,
+            line_item_id,
+        }
     }
 }
 
 #[async_trait]
 impl SubscriptionLineItemHandler for IpRangeLineItemHandler {
-    async fn on_payment(&self, _payment: &SubscriptionPayment) -> Result<()> {
-        // Trigger the lifecycle worker to pick up the new expiry and activate the allocation
-        self.tx.send(WorkJob::CheckSubscriptions).await?;
-        Ok(())
+    async fn on_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+        self.provisioner
+            .allocate_on_payment(self.line_item_id, payment)
+            .await
     }
 
     async fn on_expired(&self, sub: &Subscription, line_item: &SubscriptionLineItem) -> Result<()> {
-        // Deactivate the ip_range_subscription row(s) linked to this line item
         info!(
             "IP range line item {} subscription {} expired — deactivating allocation",
             line_item.id, sub.id
         );
-        let ip_subs = self
-            .db
-            .list_ip_range_subscriptions_by_line_item(line_item.id)
-            .await?;
-        for mut ips in ip_subs {
-            if ips.is_active {
-                ips.is_active = false;
-                ips.ended_at = Some(chrono::Utc::now());
-                if let Err(e) = self.db.update_ip_range_subscription(&ips).await {
-                    log::warn!(
-                        "Failed to deactivate ip_range_subscription {}: {}",
-                        ips.id,
-                        e
-                    );
-                }
-            }
-        }
-        Ok(())
+        self.provisioner.deactivate_line_item(line_item).await
     }
 
     async fn on_grace_period_exceeded(

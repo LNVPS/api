@@ -3019,11 +3019,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         subscription: &IpRangeSubscription,
     ) -> DbResult<u64> {
         let result = sqlx::query(
-            "INSERT INTO ip_range_subscription (subscription_line_item_id, available_ip_space_id, cidr, is_active, started_at, ended_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO ip_range_subscription (subscription_line_item_id, available_ip_space_id, cidr, origin_asn, is_active, started_at, ended_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(subscription.subscription_line_item_id)
         .bind(subscription.available_ip_space_id)
         .bind(&subscription.cidr)
+        .bind(subscription.origin_asn)
         .bind(subscription.is_active)
         .bind(subscription.started_at)
         .bind(subscription.ended_at)
@@ -3039,11 +3040,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         subscription: &IpRangeSubscription,
     ) -> DbResult<()> {
         sqlx::query(
-            "UPDATE ip_range_subscription SET subscription_line_item_id = ?, available_ip_space_id = ?, cidr = ?, is_active = ?, started_at = ?, ended_at = ?, metadata = ? WHERE id = ?"
+            "UPDATE ip_range_subscription SET subscription_line_item_id = ?, available_ip_space_id = ?, cidr = ?, origin_asn = ?, is_active = ?, started_at = ?, ended_at = ?, metadata = ? WHERE id = ?"
         )
         .bind(subscription.subscription_line_item_id)
         .bind(subscription.available_ip_space_id)
         .bind(&subscription.cidr)
+        .bind(subscription.origin_asn)
         .bind(subscription.is_active)
         .bind(subscription.started_at)
         .bind(subscription.ended_at)

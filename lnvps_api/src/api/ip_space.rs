@@ -1,14 +1,81 @@
 use crate::api::RouterState;
-use crate::api::model::ApiAvailableIpSpace;
+use crate::api::model::{ApiAvailableIpSpace, ApiIpRangeSubscription, ApiUpdateIpRangeRequest};
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
+};
 
 pub fn router() -> Router<RouterState> {
     Router::new()
         .route("/api/v1/ip_space", get(v1_list_ip_space))
         .route("/api/v1/ip_space/{id}", get(v1_get_ip_space))
+        .route(
+            "/api/v1/ip_range/{id}",
+            get(v1_get_ip_range).patch(v1_update_ip_range),
+        )
+}
+
+// ============================================================================
+// IP Range Allocation Endpoints (Owner - Auth Required)
+// ============================================================================
+
+/// Resolve an IP-range allocation, enforcing that `uid` owns it.
+async fn owned_ip_range(
+    this: &RouterState,
+    uid: u64,
+    id: u64,
+) -> Result<lnvps_db::IpRangeSubscription, ApiError> {
+    let sub = this.db.get_ip_range_subscription(id).await?;
+    let li = this
+        .db
+        .get_subscription_line_item(sub.subscription_line_item_id)
+        .await?;
+    let parent = this.db.get_subscription(li.subscription_id).await?;
+    if parent.user_id != uid {
+        return Err(ApiError::forbidden("Access denied: not your IP range"));
+    }
+    Ok(sub)
+}
+
+/// Get one of the caller's IP-range allocations.
+async fn v1_get_ip_range(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiIpRangeSubscription> {
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let sub = owned_ip_range(&this, uid, id).await?;
+    ApiData::ok(ApiIpRangeSubscription::from_subscription_with_space(this.db.as_ref(), sub).await?)
+}
+
+/// Update one of the caller's IP-range allocations.
+///
+/// Currently supports setting/clearing the origin ASN, which reconciles the
+/// prefix's IRR route object and RPKI ROA.
+async fn v1_update_ip_range(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<ApiUpdateIpRangeRequest>,
+) -> ApiResult<ApiIpRangeSubscription> {
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    // Ownership check (also 404s unknown ids).
+    owned_ip_range(&this, uid, id).await?;
+
+    if let Some(origin_asn) = req.origin_asn {
+        this.sub_handler
+            .configure_ip_range_origin_asn(id, origin_asn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to configure origin ASN: {}", e))?;
+    }
+
+    let updated = this.db.get_ip_range_subscription(id).await?;
+    ApiData::ok(
+        ApiIpRangeSubscription::from_subscription_with_space(this.db.as_ref(), updated).await?,
+    )
 }
 
 // ============================================================================

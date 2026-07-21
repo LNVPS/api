@@ -1318,6 +1318,9 @@ impl From<lnvps_db::IpSpacePricing> for ApiIpSpacePricing {
 pub struct ApiIpRangeSubscription {
     pub id: u64,
     pub cidr: String,
+    /// Origin AS number the prefix is authorised for; `None` until the customer
+    /// configures it.
+    pub origin_asn: Option<u32>,
     pub is_active: bool,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -1334,6 +1337,7 @@ impl ApiIpRangeSubscription {
         Ok(Self {
             id: sub.id,
             cidr: sub.cidr,
+            origin_asn: sub.origin_asn,
             is_active: sub.is_active,
             started_at: sub.started_at,
             ended_at: sub.ended_at,
@@ -1360,6 +1364,27 @@ pub struct ApiCreateSubscriptionRequest {
 pub struct ApiUpdateSubscriptionRequest {
     /// Toggle automatic renewal of the subscription.
     pub auto_renewal_enabled: Option<bool>,
+}
+
+/// User-facing IP-range allocation update. Only fields present are modified.
+#[derive(Deserialize)]
+pub struct ApiUpdateIpRangeRequest {
+    /// The origin AS number to authorise the prefix for. Tri-state: omit the
+    /// field to leave it unchanged, send `null` to clear it (withdrawing the
+    /// route object / ROA), or send a number to set/re-home it.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub origin_asn: Option<Option<u32>>,
+}
+
+/// Deserialize a present-but-possibly-null field into `Some(inner)` while a
+/// missing field stays `None`, giving a three-way distinction (absent / null /
+/// value).
+fn deserialize_double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
 }
 
 #[derive(Deserialize)]
