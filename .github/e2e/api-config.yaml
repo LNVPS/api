@@ -1,9 +1,6 @@
 db: "mysql://root:root@localhost:3377/lnvps"
-lightning:
-  lnd:
-    url: "https://localhost:10009"
-    cert: "/tmp/e2e-lnd/tls.cert"
-    macaroon: "/tmp/e2e-lnd/data/chain/bitcoin/regtest/admin.macaroon"
+# Payment providers (LND Lightning + on-chain) are seeded into the
+# payment_method_config table by scripts/run-e2e.sh, not configured here.
 delete-after: 3
 public-url: "http://localhost:8000"
 read-only: true
