@@ -940,6 +940,10 @@ pub struct AdminHostInfo {
     pub ssh_user: Option<String>,
     /// Whether SSH key is configured (key itself is not exposed)
     pub ssh_key_configured: bool,
+    /// When set, the host is being sunset: disabled for new provisioning and
+    /// renewals are capped at this date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sunset_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Serialize)]
@@ -1061,6 +1065,7 @@ impl AdminHostInfo {
             },
             ssh_user: host.ssh_user,
             ssh_key_configured,
+            sunset_date: host.sunset_date,
         }
     }
 
@@ -1113,6 +1118,7 @@ impl AdminHostInfo {
             },
             ssh_user: host.ssh_user,
             ssh_key_configured,
+            sunset_date: host.sunset_date,
         }
     }
 
@@ -1171,6 +1177,7 @@ impl AdminHostInfo {
             },
             ssh_user: capacity.host.ssh_user.clone(),
             ssh_key_configured,
+            sunset_date: capacity.host.sunset_date,
         }
     }
 
@@ -1229,6 +1236,7 @@ impl AdminHostInfo {
             },
             ssh_user: admin_host.host.ssh_user,
             ssh_key_configured,
+            sunset_date: admin_host.host.sunset_date,
         }
     }
 
@@ -1297,6 +1305,7 @@ impl AdminHostInfo {
                     },
                     ssh_user: capacity.host.ssh_user.clone(),
                     ssh_key_configured,
+                    sunset_date: capacity.host.sunset_date,
                 }
             }
             Err(_) => {

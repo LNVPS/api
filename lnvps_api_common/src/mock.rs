@@ -204,6 +204,7 @@ impl Default for MockDb {
                 mtu: None,
                 ssh_user: None,
                 ssh_key: None,
+                sunset_date: None,
             },
         );
         let mut host_disks = HashMap::new();

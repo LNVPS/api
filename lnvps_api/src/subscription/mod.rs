@@ -451,6 +451,19 @@ impl SubscriptionHandler {
         for item in &line_items {
             if item.subscription_type == SubscriptionType::Vps {
                 let vm = self.db.get_vm_by_line_item(item.id).await?;
+                // Block renewals on a host that is being sunset once the VM's
+                // current expiry has reached the sunset date. Users can renew
+                // right up to the deadline, then must migrate to another host.
+                let host = self.db.get_host(vm.host_id).await?;
+                if let Some(sunset_date) = host.sunset_date {
+                    let current_expiry = subscription.expires.unwrap_or_else(Utc::now);
+                    ensure!(
+                        current_expiry < sunset_date,
+                        "Host {} is being decommissioned (sunset {}). This VM cannot be renewed further - please migrate your data to another VM before then.",
+                        host.name,
+                        sunset_date.format("%Y-%m-%d")
+                    );
+                }
                 match self
                     .pe
                     .get_vm_cost_for_intervals(vm.id, method, intervals)
@@ -1968,5 +1981,123 @@ mod revolut_offline_tests {
             .await
             .unwrap();
         assert!(!got.is_paid);
+    }
+}
+
+#[cfg(test)]
+mod sunset_tests {
+    use super::*;
+    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::settings::mock_settings;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{
+        IntervalType, LNVpsDbBase, PaymentMethod, Subscription, SubscriptionLineItem,
+        SubscriptionType, Vm,
+    };
+
+    /// Build a VPS subscription + VM on host 1, then mark host 1 as sunset in the
+    /// past so the VM's (empty) expiry has already reached the sunset date.
+    async fn setup_vps_sub() -> (Arc<MockDb>, SubscriptionHandler, u64) {
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let user_id = db.upsert_user(&[5u8; 32]).await.unwrap();
+        let (sub_id, line_item_ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "BTC".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::Vps,
+                    name: "vm renewal".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+        db.insert_vm(&Vm {
+            id: 0,
+            host_id: 1,
+            user_id,
+            image_id: 1,
+            template_id: Some(1),
+            custom_template_id: None,
+            subscription_line_item_id: line_item_ids[0],
+            ssh_key_id: None,
+            disk_id: 1,
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+            deleted: false,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            Arc::new(MockOnChainProvider::default()),
+            Arc::new(MockExchangeRate::default()),
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        (db, sub, sub_id)
+    }
+
+    /// Renewing a VM whose host is being sunset (and whose expiry has already
+    /// reached the sunset date) is rejected.
+    #[tokio::test]
+    async fn renewal_blocked_when_host_sunset_reached() {
+        let (db, sub, sub_id) = setup_vps_sub().await;
+        // Sunset host 1 in the past; subscription expiry is None -> treated as now,
+        // which is >= the sunset date, so renewals must be blocked.
+        {
+            let mut hosts = db.hosts.lock().await;
+            hosts.get_mut(&1).unwrap().sunset_date = Some(Utc::now() - chrono::Duration::days(1));
+        }
+        let err = sub
+            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
+            .await
+            .expect_err("renewal on a reached-sunset host must fail");
+        assert!(
+            err.to_string().contains("sunset"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A host that is not sunsetting renews normally (no sunset error surfaces).
+    #[tokio::test]
+    async fn renewal_allowed_when_host_not_sunset() {
+        let (db, sub, sub_id) = setup_vps_sub().await;
+        // No sunset date set -> the sunset guard must not fire. The renewal may
+        // still succeed or fail for pricing reasons, but never with a sunset error.
+        let res = sub
+            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
+            .await;
+        if let Err(e) = res {
+            assert!(
+                !e.to_string().contains("sunset"),
+                "unexpected sunset error: {e}"
+            );
+        }
     }
 }

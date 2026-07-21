@@ -410,6 +410,7 @@ mod tests {
                 mtu: None,
                 ssh_user: None,
                 ssh_key: None,
+                sunset_date: None,
             },
             disk: VmHostDisk {
                 id: 1,

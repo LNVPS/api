@@ -596,6 +596,10 @@ pub struct VmHost {
     pub ssh_user: Option<String>,
     /// SSH private key for running host utilities (encrypted, PEM format)
     pub ssh_key: Option<EncryptedString>,
+    /// When set, the host is being "sunset": setting this date also forces the
+    /// host `enabled = false` (so it takes no new VMs), and renewals are blocked
+    /// once a VM's expiry reaches this date.
+    pub sunset_date: Option<DateTime<Utc>>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

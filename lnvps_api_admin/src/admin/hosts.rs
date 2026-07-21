@@ -5,6 +5,7 @@ use crate::admin::model::{
     JobResponse,
 };
 use axum::extract::{Path, Query, State};
+use chrono::{DateTime, Utc};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
@@ -165,6 +166,16 @@ async fn admin_update_host(
     if let Some(ssh_key) = &req.ssh_key {
         host.ssh_key = ssh_key.clone().map(|k| k.into());
     }
+    if let Some(sunset_date) = req.sunset_date {
+        host.sunset_date = sunset_date;
+        // Setting a sunset date decommissions the host: force it disabled so it
+        // takes no new VMs. Existing VMs keep running and can still be renewed
+        // (up to the sunset date). Clearing the date leaves `enabled` untouched
+        // so the operator re-enables explicitly.
+        if sunset_date.is_some() {
+            host.enabled = false;
+        }
+    }
 
     // Save changes
     this.db.update_host(&host).await?;
@@ -225,7 +236,13 @@ async fn admin_create_host(
             .collect::<Vec<_>>()
             .into(),
         memory: req.memory,
-        enabled: req.enabled.unwrap_or(true),
+        // A host created with a sunset date is decommissioned from the start:
+        // force it disabled so it takes no new VMs.
+        enabled: if req.sunset_date.is_some() {
+            false
+        } else {
+            req.enabled.unwrap_or(true)
+        },
         api_token: req.api_token.clone().into(),
         load_cpu: req.load_cpu.unwrap_or(1.0),
         load_memory: req.load_memory.unwrap_or(1.0),
@@ -234,6 +251,7 @@ async fn admin_create_host(
         mtu: req.mtu,
         ssh_user: req.ssh_user.clone(),
         ssh_key: req.ssh_key.clone().map(|k| k.into()),
+        sunset_date: req.sunset_date,
     };
 
     // Create host in database
@@ -298,6 +316,14 @@ pub struct AdminHostUpdateRequest {
     /// SSH private key for running host utilities (PEM format)
     /// Use `None` to keep existing, use `Some(None)` to clear
     pub ssh_key: Option<Option<String>>,
+    /// Sunset date for the host. While set, the host is effectively disabled for
+    /// new provisioning and renewals are blocked once a VM's expiry reaches this
+    /// date. Use `Some(None)` or `null` to clear (un-sunset the host).
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub sunset_date: Option<Option<DateTime<Utc>>>,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +353,9 @@ pub struct AdminHostCreateRequest {
     pub ssh_user: Option<String>,
     /// SSH private key for running host utilities (PEM format)
     pub ssh_key: Option<String>,
+    /// Sunset date for the host. While set, the host is effectively disabled for
+    /// new provisioning and renewals are blocked once a VM's expiry reaches this date.
+    pub sunset_date: Option<DateTime<Utc>>,
 }
 
 /// List host disks

@@ -619,6 +619,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 mtu: row.get("mtu"),
                 ssh_user: row.get("ssh_user"),
                 ssh_key: row.get("ssh_key"),
+                sunset_date: row.get("sunset_date"),
             };
 
             let region = VmHostRegion {
@@ -646,7 +647,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "UPDATE vm_host SET kind = ?, region_id = ?, name = ?, ip = ?, cpu = ?, \
              cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, memory = ?, enabled = ?, \
              api_token = ?, load_cpu = ?, load_memory = ?, load_disk = ?, vlan_id = ?, \
-             mtu = ?, ssh_user = ?, ssh_key = ? WHERE id = ?",
+             mtu = ?, ssh_user = ?, ssh_key = ?, sunset_date = ? WHERE id = ?",
         )
         .bind(&host.kind)
         .bind(host.region_id)
@@ -666,6 +667,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(host.mtu)
         .bind(&host.ssh_user)
         .bind(&host.ssh_key)
+        .bind(host.sunset_date)
         .bind(host.id)
         .execute(&self.db)
         .await?;
@@ -676,7 +678,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let result = sqlx::query(
             "INSERT INTO vm_host (kind, region_id, name, ip, cpu, cpu_mfg, cpu_arch, \
              cpu_features, memory, enabled, api_token, load_cpu, load_memory, load_disk, \
-             vlan_id, mtu, ssh_user, ssh_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             vlan_id, mtu, ssh_user, ssh_key, sunset_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&host.kind)
         .bind(host.region_id)
@@ -696,6 +698,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(host.mtu)
         .bind(&host.ssh_user)
         .bind(&host.ssh_key)
+        .bind(host.sunset_date)
         .execute(&self.db)
         .await?;
         Ok(result.last_insert_id())

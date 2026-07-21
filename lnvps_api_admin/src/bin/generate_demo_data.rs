@@ -372,6 +372,7 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result<Vec
             mtu: None,
             ssh_user: None,
             ssh_key: None,
+            sunset_date: None,
         };
 
         let id = db.create_host(&host).await?;
