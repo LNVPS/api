@@ -5,7 +5,7 @@ use log::{error, info, trace};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use redis::{AsyncCommands, Client as RedisClient};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::ops::Sub;
 use std::sync::Arc;
@@ -138,23 +138,48 @@ pub trait ExchangeRateService: Send + Sync {
 }
 
 /// Get alternative prices based on a source price
+/// Convert `source` into every other supported currency we have a rate path for.
+///
+/// Two passes are used:
+/// 1. **Direct** — any rate touching the source currency (e.g. `source -> BTC`
+///    and any direct fiat FX such as `EUR -> USD`).
+/// 2. **Cross** — hop through each direct result (chiefly `source -> BTC -> fiat`)
+///    to reach currencies we have no direct rate for.
+///
+/// Results are de-duplicated per target currency, **preferring a direct rate**
+/// over a BTC round-trip: ECB fiat FX is more accurate for fiat<->fiat than
+/// hopping through BTC, and the source's BTC counterpart comes from the direct
+/// pass anyway. The source currency itself is never included.
 pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<CurrencyAmount> {
-    let mut ret: Vec<CurrencyAmount> = rates
+    // Pass 1: direct conversions from the source currency.
+    let direct: Vec<CurrencyAmount> = rates
         .iter()
         .filter_map(|r| r.convert(source).ok())
+        .filter(|c| c.currency() != source.currency())
         .collect();
 
-    let mut ret2 = vec![];
+    // Pass 2: cross conversions via each direct result.
+    let mut cross = vec![];
     for y in rates.iter() {
-        for x in ret.iter() {
+        for x in direct.iter() {
             if let Ok(r1) = y.convert(*x)
                 && r1.currency() != source.currency()
             {
-                ret2.push(r1);
+                cross.push(r1);
             }
         }
     }
-    ret.append(&mut ret2);
+
+    // De-duplicate per target currency, keeping the first occurrence. Direct
+    // results are considered before cross results, so a direct fiat FX rate wins
+    // over the BTC round-trip for the same currency.
+    let mut seen = HashSet::new();
+    let mut ret = Vec::new();
+    for amount in direct.into_iter().chain(cross) {
+        if seen.insert(amount.currency()) {
+            ret.push(amount);
+        }
+    }
     ret
 }
 
@@ -564,5 +589,42 @@ mod tests {
             f.convert(CurrencyAmount::millisats(1_000_000)).unwrap(),
             CurrencyAmount::from_u64(Currency::EUR, 100)
         );
+    }
+
+    /// alt_prices yields at most one entry per target currency, never repeats the
+    /// source, and prefers a direct fiat FX rate over the BTC round-trip.
+    #[test]
+    fn alt_prices_dedups_and_prefers_direct_fx() {
+        // BTC priced in both EUR and USD, plus a direct EUR/USD FX rate. Without
+        // dedup, USD would appear twice (direct EUR->USD and EUR->BTC->USD).
+        let rates = vec![
+            TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::EUR),
+                rate: 100_000.0,
+            },
+            TickerRate {
+                ticker: Ticker(Currency::BTC, Currency::USD),
+                rate: 110_000.0,
+            },
+            // Direct FX: 1 EUR = 1.20 USD. (Note the BTC cross implies ~1.10.)
+            TickerRate {
+                ticker: Ticker(Currency::EUR, Currency::USD),
+                rate: 1.20,
+            },
+        ];
+
+        let out = alt_prices(&rates, CurrencyAmount::from_u64(Currency::EUR, 100));
+
+        // One entry per currency, no source (EUR), no duplicates.
+        let mut currencies: Vec<Currency> = out.iter().map(|c| c.currency()).collect();
+        currencies.sort_by_key(|c| c.to_string());
+        assert_eq!(currencies, vec![Currency::BTC, Currency::USD]);
+
+        // USD came from the direct FX rate (1.20), not the BTC round-trip (~1.10).
+        let usd = out
+            .iter()
+            .find(|c| c.currency() == Currency::USD)
+            .unwrap();
+        assert_eq!(*usd, CurrencyAmount::from_u64(Currency::USD, 120));
     }
 }

@@ -50,6 +50,39 @@ impl ApiTemplatesResponse {
     }
 }
 
+/// Price for a custom VM order. Mirrors the template listing by including the
+/// same price converted to the other supported currencies in `other_price`.
+#[derive(Serialize)]
+pub struct ApiCustomVmPrice {
+    pub currency: ApiCurrency,
+    pub amount: u64,
+    /// The same price converted to other supported currencies.
+    pub other_price: Vec<ApiPrice>,
+}
+
+impl ApiCustomVmPrice {
+    /// Build from a base [`CurrencyAmount`], expanding conversions to the other
+    /// supported currencies via the exchange rates.
+    pub async fn from_amount(
+        amount: CurrencyAmount,
+        rates: &Arc<dyn ExchangeRateService>,
+    ) -> Result<Self> {
+        let rate_list = rates.list_rates().await?;
+        let other_price = alt_prices(&rate_list, amount)
+            .into_iter()
+            .map(|p| ApiPrice {
+                currency: p.currency().into(),
+                amount: p.value(),
+            })
+            .collect();
+        Ok(Self {
+            currency: amount.currency().into(),
+            amount: amount.value(),
+            other_price,
+        })
+    }
+}
+
 // Models that are only used in lnvps_api (moved from common)
 
 #[derive(Serialize, Deserialize)]

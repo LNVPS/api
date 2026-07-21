@@ -242,6 +242,8 @@ interface VmStatus {
   auto_renewal_enabled: boolean; // Whether automatic renewal via NWC is enabled for this VM
   deleting_on?: string; // ISO 8601 datetime — date the VM will be deleted if not renewed (expiry + dynamic grace period); null/omitted for VMs not yet paid
   subscription_id?: number; // The subscription this VM is billed under; renew via /api/v1/subscriptions/{id}/renew. null/omitted if never paid
+  host_sunset_date?: string; // ISO 8601 datetime — set when the VM's host is being decommissioned; migrate before this date. Renewals are blocked once expires reaches it. Omitted when the host is not being sunset
+  max_prepay_days: number; // Max days this VM may be prepaid/renewed in advance. A renewal is rejected once it would push `expires` beyond now + max_prepay_days; cap the renewal interval selector accordingly
 }
 
 interface VmRunningState {
@@ -297,6 +299,12 @@ interface VmCostPlan {
 interface Price {
   currency: 'BTC' | 'EUR' | 'USD';
   amount: number; // Amount in smallest currency units (cents for fiat, millisats for BTC)
+}
+
+interface CustomVmPrice {
+  currency: 'BTC' | 'EUR' | 'USD';
+  amount: number; // Base price in smallest currency units
+  other_price: Price[]; // The same price converted to other supported currencies
 }
 
 interface VmHostRegion {
@@ -405,6 +413,7 @@ interface VmPayment {
 
 type PaymentData = 
   | { lightning: string } // Lightning Network invoice
+  | { onchain: { address: string } } // On-chain Bitcoin receive address (BTC only); txid is recorded on the payment's external_id once confirmed
   | { revolut: { token: string } } // Revolut payment token
   | { stripe: { session_id: string } }; // Stripe checkout session
 
@@ -413,7 +422,7 @@ interface PaymentType {
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  name: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   metadata: Record<string, string>;
   currencies: ('BTC' | 'EUR' | 'USD')[];
   processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
@@ -462,7 +471,7 @@ interface SubscriptionPayment {
   created: string; // ISO 8601 datetime
   expires: string; // ISO 8601 datetime
   amount: Price; // Total payment amount
-  payment_method: 'lightning' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  payment_method: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   payment_type: 'Purchase' | 'Renewal' | 'Upgrade';
   is_paid: boolean;
   paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
@@ -962,7 +971,7 @@ the full firewall ruleset on the host.
 - **POST** `/api/v1/vm/custom-template/price`
 - **Auth**: None
 - **Body**: `CustomVmRequest`
-- **Response**: `Price`
+- **Response**: `CustomVmPrice` (base `{ currency, amount }` plus `other_price[]` with the same quote converted to the other supported currencies)
 
 ### Payment Management
 
@@ -975,10 +984,10 @@ the full firewall ruleset on the host.
 - **GET** `/api/v1/vm/{id}/renew?method={payment_method}&intervals={count}`
 - **Auth**: Required
 - **Query Params**: 
-  - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal' | 'nwc')
+  - `method`: Optional payment method ('lightning' | 'onchain' | 'revolut' | 'paypal' | 'nwc')
   - `intervals`: Optional number of billing intervals to renew (default: 1). For example, if the VM has a monthly billing cycle, `intervals=3` would generate a payment for 3 months.
 - **Response**: `VmPayment`
-- **Description**: Generates a payment invoice to extend the VM's expiration. The payment amount is calculated based on the VM's cost plan and the number of intervals requested. If `method=nwc` is specified and the user has a valid NWC connection string configured, the payment will be automatically processed via Nostr Wallet Connect.
+- **Description**: Generates a payment invoice to extend the VM's expiration. The payment amount is calculated based on the VM's cost plan and the number of intervals requested. If `method=nwc` is specified and the user has a valid NWC connection string configured, the payment will be automatically processed via Nostr Wallet Connect. A renewal is **rejected** if it would push the VM's expiry beyond `now + max_prepay_days` (see `VmStatus.max_prepay_days`) or beyond the host's sunset date (see `VmStatus.host_sunset_date`); cap the `intervals` selector to what fits.
 
 #### Get Payment Status
 - **GET** `/api/v1/payment/{payment_id}`

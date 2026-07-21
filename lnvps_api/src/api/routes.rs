@@ -20,7 +20,7 @@ use std::str::FromStr;
 
 use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
 use lnvps_api_common::{
-    ApiCurrency, ApiData, ApiError, ApiPrice, ApiResult, ApiUserSshKey, ApiVmOsImage,
+    ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage,
     ApiVmTemplate, ClientIp, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig, VatClient,
     WorkJob,
 };
@@ -31,7 +31,8 @@ use lnvps_db::{
 
 use crate::api::model::{
     AccountPatchRequest, AccountPatchResult, AccountTaxInfo, AddNwcPaymentMethodRequest,
-    ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmRequest, ApiInvoiceItem,
+    ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
+    ApiInvoiceItem,
     ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule,
     ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
     CreateVmFirewallRule, CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy,
@@ -914,7 +915,7 @@ async fn v1_list_vm_templates(State(this): State<RouterState>) -> ApiResult<ApiT
 async fn v1_custom_template_calc(
     State(this): State<RouterState>,
     Json(req): Json<ApiCustomVmRequest>,
-) -> ApiResult<ApiPrice> {
+) -> ApiResult<ApiCustomVmPrice> {
     // create a fake template from the request to generate the price
     let template: VmCustomTemplate = req.into();
 
@@ -923,10 +924,9 @@ async fn v1_custom_template_calc(
 
     let price = PricingEngine::get_custom_vm_cost_amount(&this.db, 0, &template).await?;
     let amount = CurrencyAmount::from_u64(price.currency, price.total());
-    ApiData::ok(ApiPrice {
-        currency: price.currency.into(),
-        amount: amount.value(),
-    })
+    // Include conversions to the other supported currencies, like the template
+    // listing's `other_price`.
+    ApiData::ok(ApiCustomVmPrice::from_amount(amount, &this.rates).await?)
 }
 
 /// Create a new VM order
