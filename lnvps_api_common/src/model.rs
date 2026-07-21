@@ -242,6 +242,12 @@ pub struct ApiVmStatus {
     /// subscription (`/api/v1/subscriptions/{id}/renew`). `None` if the VM has
     /// no subscription record yet (never paid).
     pub subscription_id: Option<u64>,
+    /// When the host this VM runs on is being decommissioned ("sunset"), this is
+    /// the date by which the VM must be migrated elsewhere. Renewals are blocked
+    /// once the VM's expiry reaches this date. `None` when the host is not being
+    /// sunset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_sunset_date: Option<DateTime<Utc>>,
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -343,6 +349,9 @@ pub async fn vm_to_status(
         auto_renewal_enabled: sub_auto_renewal,
         deleting_on,
         subscription_id: sub_id,
+        // Surface the host's sunset date so clients can warn users on VMs that
+        // must be migrated before the host is decommissioned.
+        host_sunset_date: db.get_host(vm.host_id).await.ok().and_then(|h| h.sunset_date),
     })
 }
 

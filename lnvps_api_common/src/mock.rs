@@ -4648,6 +4648,39 @@ mod tests {
         assert!(res.is_err(), "expected error, not a panic");
     }
 
+    /// vm_to_status surfaces the host's sunset date on VMs whose host is being
+    /// decommissioned, and omits it otherwise.
+    #[tokio::test]
+    async fn test_vm_to_status_surfaces_host_sunset_date() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{LNVpsDb, UserSshKey};
+
+        let mdb = MockDb::default();
+        mdb.vms.lock().await.insert(1, MockDb::mock_vm());
+        mdb.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Share the same underlying Arc-backed state (MockDb: Clone).
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(mdb.clone());
+
+        // Not sunsetting -> field is None.
+        let vm = db.get_vm(1).await.unwrap();
+        let status = vm_to_status(&db, vm.clone(), None, 0).await.unwrap();
+        assert!(status.host_sunset_date.is_none());
+
+        // Sunset host 1 -> field surfaces the date.
+        let sunset = Utc::now() + chrono::Duration::days(30);
+        mdb.hosts.lock().await.get_mut(&1).unwrap().sunset_date = Some(sunset);
+        let status = vm_to_status(&db, vm, None, 0).await.unwrap();
+        assert_eq!(status.host_sunset_date, Some(sunset));
+    }
+
     /// Regression: paying the SAME payment twice (e.g. duplicate webhook / replayed
     /// settle event) must extend the subscription only once. Before the idempotency
     /// guard, the second call double-credited the subscription with free time.
