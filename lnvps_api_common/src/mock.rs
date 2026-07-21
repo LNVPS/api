@@ -3,15 +3,16 @@ use anyhow::{Context, anyhow};
 use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface,
-    DiskType, DnsServer, DnsServerKind, IntervalType, IpRange, IpRangeAllocationMode,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain, NostrDomainHandle,
-    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
-    ReferralPayout, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    AccessPolicy, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch,
+    CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType,
+    IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
+    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
+    ReferralCostUsage, ReferralPayout, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate,
+    WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -49,6 +50,7 @@ pub struct MockDb {
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
     pub ip_range_subscriptions: Arc<Mutex<HashMap<u64, IpRangeSubscription>>>,
     pub available_ip_space: Arc<Mutex<HashMap<u64, AvailableIpSpace>>>,
+    pub asn_subscriptions: Arc<Mutex<HashMap<u64, AsnSubscription>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -329,6 +331,7 @@ impl Default for MockDb {
             subscription_payments: Arc::new(Default::default()),
             ip_range_subscriptions: Arc::new(Default::default()),
             available_ip_space: Arc::new(Default::default()),
+            asn_subscriptions: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
@@ -2678,6 +2681,119 @@ impl LNVpsDbBase for MockDb {
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         let mut ip_subs = self.ip_range_subscriptions.lock().await;
         ip_subs.remove(&id);
+        Ok(())
+    }
+
+    // ASN Subscriptions
+    async fn list_asn_subscriptions_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>> {
+        let subs = self.asn_subscriptions.lock().await;
+        Ok(subs
+            .values()
+            .filter(|s| s.subscription_line_item_id == subscription_line_item_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_asn_subscriptions_by_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>> {
+        let subs = self.asn_subscriptions.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        Ok(subs
+            .values()
+            .filter(|s| {
+                line_items
+                    .get(&s.subscription_line_item_id)
+                    .map(|li| li.subscription_id == subscription_id)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_asn_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<AsnSubscription>> {
+        let subs = self.asn_subscriptions.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subs
+            .values()
+            .filter(|s| {
+                line_items
+                    .get(&s.subscription_line_item_id)
+                    .and_then(|li| subscriptions.get(&li.subscription_id))
+                    .map(|sub| sub.user_id == user_id)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_asn_subscriptions_paginated(
+        &self,
+        status: Option<AsnSubscriptionStatus>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AsnSubscription>, u64)> {
+        let subs = self.asn_subscriptions.lock().await;
+        let mut all: Vec<AsnSubscription> = subs
+            .values()
+            .filter(|s| status.map(|st| s.status == st).unwrap_or(true))
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = all.len() as u64;
+        let page = all
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
+    async fn get_asn_subscription(&self, id: u64) -> DbResult<AsnSubscription> {
+        self.asn_subscriptions
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| DbError::from(anyhow!("asn_subscription {} not found", id)))
+    }
+
+    async fn get_asn_subscription_by_asn(&self, asn: u32) -> DbResult<AsnSubscription> {
+        self.asn_subscriptions
+            .lock()
+            .await
+            .values()
+            .find(|s| s.asn == Some(asn))
+            .cloned()
+            .ok_or_else(|| DbError::from(anyhow!("asn_subscription for AS{} not found", asn)))
+    }
+
+    async fn insert_asn_subscription(&self, subscription: &AsnSubscription) -> DbResult<u64> {
+        let mut subs = self.asn_subscriptions.lock().await;
+        let id = if subscription.id == 0 {
+            subs.keys().max().copied().unwrap_or(0) + 1
+        } else {
+            subscription.id
+        };
+        let mut s = subscription.clone();
+        s.id = id;
+        subs.insert(id, s);
+        Ok(id)
+    }
+
+    async fn update_asn_subscription(&self, subscription: &AsnSubscription) -> DbResult<()> {
+        let mut subs = self.asn_subscriptions.lock().await;
+        subs.insert(subscription.id, subscription.clone());
+        Ok(())
+    }
+
+    async fn delete_asn_subscription(&self, id: u64) -> DbResult<()> {
+        self.asn_subscriptions.lock().await.remove(&id);
         Ok(())
     }
 
@@ -5259,6 +5375,111 @@ mod tests {
         // Idempotent: a second run deletes nothing.
         drop(t);
         assert_eq!(db.delete_orphaned_custom_vm_templates().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_asn_subscription_crud() {
+        use lnvps_db::{AsnSubscription, AsnSubscriptionStatus, InternetRegistry};
+        let db = MockDb::default();
+
+        // Seed a line item + subscription so the by-subscription/by-user joins resolve.
+        db.subscriptions.lock().await.insert(
+            1,
+            Subscription {
+                id: 1,
+                user_id: 7,
+                company_id: 1,
+                name: "s".to_string(),
+                description: None,
+                created: Utc::now(),
+                expires: None,
+                is_active: true,
+                is_setup: true,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: IntervalType::Month,
+                setup_fee: 0,
+                auto_renewal_enabled: false,
+                external_id: None,
+            },
+        );
+        db.subscription_line_items.lock().await.insert(
+            50,
+            SubscriptionLineItem {
+                id: 50,
+                subscription_id: 1,
+                subscription_type: lnvps_db::SubscriptionType::AsnSponsoring,
+                name: "ASN".to_string(),
+                description: None,
+                amount: 1000,
+                setup_amount: 0,
+                configuration: None,
+            },
+        );
+
+        // Insert a pending request.
+        let id = db
+            .insert_asn_subscription(&AsnSubscription {
+                id: 0,
+                subscription_line_item_id: 50,
+                registry: InternetRegistry::RIPE,
+                asn: None,
+                status: AsnSubscriptionStatus::Requested,
+                created: Utc::now(),
+                assigned_at: None,
+                is_active: true,
+                ended_at: None,
+                aut_num_ref: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        // Lookups by the various keys.
+        assert_eq!(
+            db.get_asn_subscription(id).await.unwrap().status,
+            AsnSubscriptionStatus::Requested
+        );
+        assert_eq!(
+            db.list_asn_subscriptions_by_line_item(50)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.list_asn_subscriptions_by_subscription(1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.list_asn_subscriptions_by_user(7).await.unwrap().len(), 1);
+        let (pending, total) = db
+            .list_asn_subscriptions_paginated(Some(AsnSubscriptionStatus::Requested), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((pending.len(), total), (1, 1));
+        // Filtering by a different status excludes it.
+        assert_eq!(
+            db.list_asn_subscriptions_paginated(Some(AsnSubscriptionStatus::Assigned), 10, 0)
+                .await
+                .unwrap()
+                .1,
+            0
+        );
+
+        // Assign the ASN.
+        let mut sub = db.get_asn_subscription(id).await.unwrap();
+        sub.asn = Some(64500);
+        sub.status = AsnSubscriptionStatus::Assigned;
+        sub.assigned_at = Some(Utc::now());
+        db.update_asn_subscription(&sub).await.unwrap();
+        assert_eq!(db.get_asn_subscription_by_asn(64500).await.unwrap().id, id);
+
+        // Delete.
+        db.delete_asn_subscription(id).await.unwrap();
+        assert!(db.get_asn_subscription(id).await.is_err());
     }
 }
 

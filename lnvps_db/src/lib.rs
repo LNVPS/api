@@ -853,6 +853,30 @@ pub trait LNVpsDbBase: Send + Sync {
     ) -> DbResult<()>;
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()>;
 
+    // ASN Subscriptions
+    async fn list_asn_subscriptions_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>>;
+    async fn list_asn_subscriptions_by_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>>;
+    async fn list_asn_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<AsnSubscription>>;
+    /// List ASN subscriptions with optional status filter and DB-level
+    /// pagination (admin views). Returns (rows, total_count).
+    async fn list_asn_subscriptions_paginated(
+        &self,
+        status: Option<AsnSubscriptionStatus>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AsnSubscription>, u64)>;
+    async fn get_asn_subscription(&self, id: u64) -> DbResult<AsnSubscription>;
+    async fn get_asn_subscription_by_asn(&self, asn: u32) -> DbResult<AsnSubscription>;
+    async fn insert_asn_subscription(&self, subscription: &AsnSubscription) -> DbResult<u64>;
+    async fn update_asn_subscription(&self, subscription: &AsnSubscription) -> DbResult<()>;
+    async fn delete_asn_subscription(&self, id: u64) -> DbResult<()>;
+
     // ========================================================================
     // Payment Method Configuration
     // ========================================================================

@@ -1,12 +1,12 @@
 use crate::{
-    AccessPolicy, AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
-    PaymentType, Referral, ReferralCostUsage, ReferralPayout, RegionStats, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostRegion, VmIpAssignment, VmOsImage,
-    VmTemplate, WebauthnCredential,
+    AccessPolicy, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError,
+    DbResult, DnsServer, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
+    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
+    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
+    VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -3059,6 +3059,147 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn delete_ip_range_subscription(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM ip_range_subscription WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // ASN Subscriptions
+    // ========================================================================
+
+    async fn list_asn_subscriptions_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM asn_subscription WHERE subscription_line_item_id = ?")
+                .bind(subscription_line_item_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_asn_subscriptions_by_subscription(
+        &self,
+        subscription_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT a.* FROM asn_subscription a
+             INNER JOIN subscription_line_item sli ON a.subscription_line_item_id = sli.id
+             WHERE sli.subscription_id = ?",
+        )
+        .bind(subscription_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_asn_subscriptions_by_user(&self, user_id: u64) -> DbResult<Vec<AsnSubscription>> {
+        Ok(sqlx::query_as(
+            "SELECT a.* FROM asn_subscription a
+             INNER JOIN subscription_line_item sli ON a.subscription_line_item_id = sli.id
+             INNER JOIN subscription s ON sli.subscription_id = s.id
+             WHERE s.user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_asn_subscriptions_paginated(
+        &self,
+        status: Option<AsnSubscriptionStatus>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AsnSubscription>, u64)> {
+        let extra = if status.is_some() {
+            "WHERE status = ?"
+        } else {
+            "WHERE 1=1"
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM asn_subscription {}", extra);
+        let data_sql = format!(
+            "SELECT * FROM asn_subscription {} ORDER BY id DESC LIMIT ? OFFSET ?",
+            extra
+        );
+
+        let mut count_q = sqlx::query_scalar(&count_sql);
+        if let Some(s) = status {
+            count_q = count_q.bind(s);
+        }
+        let total: i64 = count_q.fetch_one(&self.db).await?;
+
+        let mut data_q = sqlx::query_as(&data_sql);
+        if let Some(s) = status {
+            data_q = data_q.bind(s);
+        }
+        data_q = data_q.bind(limit).bind(offset);
+        let rows = data_q.fetch_all(&self.db).await?;
+
+        Ok((rows, total as u64))
+    }
+
+    async fn get_asn_subscription(&self, id: u64) -> DbResult<AsnSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM asn_subscription WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_asn_subscription_by_asn(&self, asn: u32) -> DbResult<AsnSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM asn_subscription WHERE asn = ?")
+                .bind(asn)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_asn_subscription(&self, subscription: &AsnSubscription) -> DbResult<u64> {
+        let result = sqlx::query(
+            "INSERT INTO asn_subscription (subscription_line_item_id, registry, asn, status, assigned_at, is_active, ended_at, aut_num_ref, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(subscription.subscription_line_item_id)
+        .bind(subscription.registry)
+        .bind(subscription.asn)
+        .bind(subscription.status)
+        .bind(subscription.assigned_at)
+        .bind(subscription.is_active)
+        .bind(subscription.ended_at)
+        .bind(&subscription.aut_num_ref)
+        .bind(&subscription.metadata)
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.last_insert_id())
+    }
+
+    async fn update_asn_subscription(&self, subscription: &AsnSubscription) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE asn_subscription SET subscription_line_item_id = ?, registry = ?, asn = ?, status = ?, assigned_at = ?, is_active = ?, ended_at = ?, aut_num_ref = ?, metadata = ? WHERE id = ?"
+        )
+        .bind(subscription.subscription_line_item_id)
+        .bind(subscription.registry)
+        .bind(subscription.asn)
+        .bind(subscription.status)
+        .bind(subscription.assigned_at)
+        .bind(subscription.is_active)
+        .bind(subscription.ended_at)
+        .bind(&subscription.aut_num_ref)
+        .bind(&subscription.metadata)
+        .bind(subscription.id)
+        .execute(&self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn delete_asn_subscription(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM asn_subscription WHERE id = ?")
             .bind(id)
             .execute(&self.db)
             .await?;

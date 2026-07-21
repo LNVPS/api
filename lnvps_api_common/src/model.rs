@@ -311,36 +311,37 @@ pub async fn vm_to_status(
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
-    let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on, max_prepay_days) = match db
-        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-        .await
-    {
-        Ok(sub) => {
-            // Deletion happens once `expires + grace_period` has passed; the grace
-            // period is dynamic (subscription-age based), so surface the resulting
-            // date rather than a fixed offset.
-            let deleting_on = sub.expires.and_then(|expires| {
-                let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
-                expires.checked_add_days(Days::new(grace as u64))
-            });
-            // Effective prepay window: the company override when set, else the
-            // global default. Surfaced so the client can cap the renewal
-            // interval selector to what the server will accept.
-            let max_prepay_days = match db.get_company(sub.company_id).await {
-                Ok(c) if c.max_prepay_days > 0 => c.max_prepay_days,
-                _ => max_prepay_days_default,
-            };
-            (
-                Some(sub.id),
-                sub.created,
-                sub.expires,
-                sub.auto_renewal_enabled,
-                deleting_on,
-                max_prepay_days,
-            )
-        }
-        Err(_) => (None, Utc::now(), None, false, None, max_prepay_days_default),
-    };
+    let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on, max_prepay_days) =
+        match db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+        {
+            Ok(sub) => {
+                // Deletion happens once `expires + grace_period` has passed; the grace
+                // period is dynamic (subscription-age based), so surface the resulting
+                // date rather than a fixed offset.
+                let deleting_on = sub.expires.and_then(|expires| {
+                    let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
+                    expires.checked_add_days(Days::new(grace as u64))
+                });
+                // Effective prepay window: the company override when set, else the
+                // global default. Surfaced so the client can cap the renewal
+                // interval selector to what the server will accept.
+                let max_prepay_days = match db.get_company(sub.company_id).await {
+                    Ok(c) if c.max_prepay_days > 0 => c.max_prepay_days,
+                    _ => max_prepay_days_default,
+                };
+                (
+                    Some(sub.id),
+                    sub.created,
+                    sub.expires,
+                    sub.auto_renewal_enabled,
+                    deleting_on,
+                    max_prepay_days,
+                )
+            }
+            Err(_) => (None, Utc::now(), None, false, None, max_prepay_days_default),
+        };
 
     Ok(ApiVmStatus {
         id: vm.id,
@@ -365,7 +366,11 @@ pub async fn vm_to_status(
         subscription_id: sub_id,
         // Surface the host's sunset date so clients can warn users on VMs that
         // must be migrated before the host is decommissioned.
-        host_sunset_date: db.get_host(vm.host_id).await.ok().and_then(|h| h.sunset_date),
+        host_sunset_date: db
+            .get_host(vm.host_id)
+            .await
+            .ok()
+            .and_then(|h| h.sunset_date),
         max_prepay_days,
     })
 }
@@ -797,6 +802,9 @@ pub enum ApiSubscriptionLineItemResource {
     /// An IP range allocation.
     #[serde(rename = "ip_range")]
     IpRange { ip_range_subscription_id: u64 },
+    /// A sponsored AS number.
+    #[serde(rename = "asn")]
+    Asn { asn_subscription_id: u64 },
 }
 
 impl ApiSubscriptionLineItemResource {
@@ -822,7 +830,15 @@ impl ApiSubscriptionLineItemResource {
                 .map(|sub| Self::IpRange {
                     ip_range_subscription_id: sub.id,
                 }),
-            SubscriptionType::AsnSponsoring | SubscriptionType::DnsHosting => None,
+            SubscriptionType::AsnSponsoring => db
+                .list_asn_subscriptions_by_line_item(line_item.id)
+                .await
+                .ok()
+                .and_then(|subs| subs.into_iter().next())
+                .map(|sub| Self::Asn {
+                    asn_subscription_id: sub.id,
+                }),
+            SubscriptionType::DnsHosting => None,
         }
     }
 }

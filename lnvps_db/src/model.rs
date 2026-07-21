@@ -2587,6 +2587,66 @@ pub struct IpRangeSubscription {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// Lifecycle status of a sponsored ASN request.
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AsnSubscriptionStatus {
+    /// Sponsorship request filed with the RIR, awaiting assignment.
+    #[default]
+    Requested = 0,
+    /// The RIR assigned the AS number.
+    Assigned = 1,
+    /// The request failed or was withdrawn.
+    Failed = 2,
+}
+
+impl Display for AsnSubscriptionStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsnSubscriptionStatus::Requested => write!(f, "requested"),
+            AsnSubscriptionStatus::Assigned => write!(f, "assigned"),
+            AsnSubscriptionStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl FromStr for AsnSubscriptionStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "requested" | "pending" => Ok(AsnSubscriptionStatus::Requested),
+            "assigned" | "active" => Ok(AsnSubscriptionStatus::Assigned),
+            "failed" | "withdrawn" => Ok(AsnSubscriptionStatus::Failed),
+            _ => Err(anyhow!("unknown ASN subscription status: {}", s)),
+        }
+    }
+}
+
+/// ASN Subscription - a sponsored AS number sold to a user via a subscription.
+///
+/// Unlike an IP range, the AS number is a unique registry resource assigned by
+/// the RIR (an async, admin-in-the-loop process), so `asn` is `None` until
+/// assigned and `status` tracks the request lifecycle.
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct AsnSubscription {
+    pub id: u64,
+    pub subscription_line_item_id: u64,
+    /// Registry the ASN is (to be) sponsored under.
+    pub registry: InternetRegistry,
+    /// The assigned AS number; `None` until the RIR assigns it.
+    pub asn: Option<u32>,
+    pub status: AsnSubscriptionStatus,
+    pub created: DateTime<Utc>,
+    /// When the RIR assigned the number (`None` while pending).
+    pub assigned_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Primary key of the created `aut-num` whois object, once created.
+    pub aut_num_ref: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
 /// Lightning provider configuration - LND
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LndConfig {
