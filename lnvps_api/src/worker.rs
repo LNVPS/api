@@ -15,9 +15,9 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionType, Vm, VmHistoryActionType, VmHost, VmHostKind,
-    VmIpAssignment, VmOsImage,
+    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, PaymentMethod, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType, Vm,
+    VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::Client;
@@ -54,6 +54,19 @@ fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
         _ => HOST_INFO_BINARY_NAME_X86_64, // Default to x86_64
     };
     Some(exe_dir.join(binary_name))
+}
+
+/// Whether an unpaid payment should still block deletion of a never-paid VM.
+///
+/// A payment blocks deletion while its invoice is unexpired, but also — for
+/// on-chain payments — once a deposit has been detected in the mempool
+/// (`external_id` holds the deposit outpoint `{txid}:{vout}`): confirmation
+/// can land well after the 1h quote expiry, and purging the VM in that window
+/// would lose the customer's payment (issue #194).
+fn payment_blocks_unpaid_vm_deletion(p: &SubscriptionPayment, now: DateTime<Utc>) -> bool {
+    !p.is_paid
+        && (p.expires > now
+            || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))
 }
 
 /// Extract hostname/IP from a URL or return the input if it's already a plain host
@@ -1090,16 +1103,19 @@ impl Worker {
                 info!("VM {} was paid since last check, skipping deletion", vm.id);
                 continue;
             }
-            // Skip deletion if there are still pending (unexpired) payments outstanding.
+            // Skip deletion if there are still pending (unexpired) payments
+            // outstanding, or an on-chain deposit was detected in the mempool
+            // but has not confirmed yet (issue #194).
+            let now = Utc::now();
             if self
                 .db
-                .list_pending_vm_subscription_payments(vm.id)
+                .list_vm_subscription_payments(vm.id)
                 .await
-                .map(|p| !p.is_empty())
+                .map(|ps| ps.iter().any(|p| payment_blocks_unpaid_vm_deletion(p, now)))
                 .unwrap_or(false)
             {
                 info!(
-                    "VM {} has pending unpaid payments, skipping deletion",
+                    "VM {} has pending or detected unpaid payments, skipping deletion",
                     vm.id
                 );
                 continue;
@@ -3599,6 +3615,114 @@ mod tests {
             "Unpaid VM with only an expired payment should still be purged"
         );
         Ok(())
+    }
+
+    /// Regression (#194): an unpaid VM (older than 1 hour) whose on-chain payment quote has
+    /// expired must NOT be purged when a deposit was already detected in the mempool
+    /// (`external_id` holds the deposit outpoint) — confirmation may simply be slow.
+    #[tokio::test]
+    async fn test_check_vms_skips_unpaid_vm_with_detected_onchain_deposit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+
+        // Expired on-chain payment whose deposit was seen in the mempool (external_id set).
+        let mut payment = make_subscription_payment(
+            subscription_id,
+            user_id,
+            old,
+            old.add(TimeDelta::hours(1)),
+            3,
+        );
+        payment.payment_method = lnvps_db::PaymentMethod::OnChain;
+        payment.external_id = Some("aabbccdd:0".to_string());
+        db.insert_subscription_payment(&payment).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        let vms = db.vms.lock().await;
+        let deleted = vms.get(&vm_id).map(|v| v.deleted).unwrap_or(true);
+        assert!(
+            !deleted,
+            "Unpaid VM with a detected (unconfirmed) on-chain deposit must not be purged"
+        );
+        Ok(())
+    }
+
+    /// An unpaid VM (older than 1 hour) with an expired on-chain payment and NO detected
+    /// deposit must still be purged — the #194 guard only holds VMs with a mempool sighting.
+    #[tokio::test]
+    async fn test_check_vms_deletes_unpaid_vm_with_expired_undetected_onchain_payment() -> Result<()>
+    {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+
+        let mut payment = make_subscription_payment(
+            subscription_id,
+            user_id,
+            old,
+            old.add(TimeDelta::hours(1)),
+            4,
+        );
+        payment.payment_method = lnvps_db::PaymentMethod::OnChain;
+        db.insert_subscription_payment(&payment).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        let vms = db.vms.lock().await;
+        assert!(
+            !vms.contains_key(&vm_id),
+            "Unpaid VM with an expired on-chain payment and no detected deposit should be purged"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_payment_blocks_unpaid_vm_deletion() {
+        let now = Utc::now();
+        let base = make_subscription_payment(
+            1,
+            1,
+            now.sub(TimeDelta::hours(2)),
+            now.sub(TimeDelta::hours(1)),
+            5,
+        );
+
+        // Expired lightning payment: does not block.
+        assert!(!payment_blocks_unpaid_vm_deletion(&base, now));
+
+        // Unexpired payment: blocks.
+        let mut p = base.clone();
+        p.expires = now.add(TimeDelta::minutes(10));
+        assert!(payment_blocks_unpaid_vm_deletion(&p, now));
+
+        // Expired on-chain with detected deposit: blocks (#194).
+        let mut p = base.clone();
+        p.payment_method = lnvps_db::PaymentMethod::OnChain;
+        p.external_id = Some("txid:0".to_string());
+        assert!(payment_blocks_unpaid_vm_deletion(&p, now));
+
+        // Expired on-chain without detected deposit: does not block.
+        let mut p = base.clone();
+        p.payment_method = lnvps_db::PaymentMethod::OnChain;
+        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+
+        // Expired lightning with external_id (not on-chain): does not block.
+        let mut p = base.clone();
+        p.external_id = Some("abc".to_string());
+        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+
+        // Paid payment never blocks, even with detected deposit.
+        let mut p = base.clone();
+        p.payment_method = lnvps_db::PaymentMethod::OnChain;
+        p.external_id = Some("txid:0".to_string());
+        p.is_paid = true;
+        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
     }
 
     /// Drain all currently-queued work jobs without blocking, returning the count of
