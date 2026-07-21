@@ -375,11 +375,24 @@ impl PricingEngine {
             // Same currency, use directly
             base
         } else {
-            // TODO: Implement proper currency conversion for the base fee
-            // For now, use the base fee value as-is in the transaction currency
-            // This is a simplification - in production, this should use the
-            // exchange rate service to convert the fee to the target currency
-            base
+            // Convert the flat base fee into the transaction currency using the
+            // exchange service (resolving a cross-rate path if needed). If no
+            // path is available, fall back to the raw value in the tx currency.
+            match self
+                .convert_currency(CurrencyAmount::from_u64(base_fee_currency, base), currency)
+                .await
+            {
+                Ok(converted) => converted.value(),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to convert processing fee base {} -> {}: {}; using raw value",
+                        base_fee_currency,
+                        currency,
+                        e
+                    );
+                    base
+                }
+            }
         };
 
         // Gross-up the flat base fee too — the provider takes their percentage cut on the
@@ -391,6 +404,57 @@ impl PricingEngine {
         };
 
         percentage_fee + base_fee
+    }
+
+    /// Enforce the configured minimum processable amount for a payment method.
+    ///
+    /// `gross` is the total the provider will actually process (net + tax +
+    /// processing fee) in `gross.currency()`. If the method's config has a
+    /// `min_amount` set, it is converted into the gross currency and compared;
+    /// amounts below the minimum are rejected. Lightning has no minimum.
+    pub async fn enforce_min_amount(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        gross: CurrencyAmount,
+    ) -> Result<()> {
+        if method == PaymentMethod::Lightning {
+            return Ok(());
+        }
+        let config = match self
+            .db
+            .get_payment_method_config_for_company(company_id, method)
+            .await
+        {
+            Ok(c) => c,
+            // No config -> nothing to enforce (fee calc logs this case already)
+            Err(_) => return Ok(()),
+        };
+        let (Some(min_raw), Some(min_currency_str)) =
+            (config.min_amount, config.min_amount_currency.as_deref())
+        else {
+            return Ok(());
+        };
+        if min_raw == 0 {
+            return Ok(());
+        }
+        let min_currency = Currency::from_str(min_currency_str)
+            .map_err(|_| anyhow!("Invalid min_amount_currency '{}'", min_currency_str))?;
+        // Convert the configured minimum into the gross currency (resolving a
+        // cross-rate path if there is no direct pair).
+        let min_in_gross = self
+            .convert_currency(
+                CurrencyAmount::from_u64(min_currency, min_raw),
+                gross.currency(),
+            )
+            .await?;
+        ensure!(
+            gross.value() >= min_in_gross.value(),
+            "Amount is below the minimum for this payment method ({} {})",
+            min_in_gross.value_f32(),
+            gross.currency()
+        );
+        Ok(())
     }
 
     /// Get amount of time a certain currency amount will extend a vm in seconds
@@ -839,6 +903,55 @@ impl PricingEngine {
                 target_currency
             )
         }
+    }
+
+    /// Find a rate that can convert between `a` and `b` in either stored
+    /// direction (rates are registered canonically, e.g. `BTC/EUR`, while
+    /// [`TickerRate::convert`] handles both directions).
+    async fn find_rate(&self, a: Currency, b: Currency) -> Option<TickerRate> {
+        if a == b {
+            return Some(TickerRate::passthrough(a));
+        }
+        if let Ok(t) = self.get_ticker(a, b).await {
+            return Some(t);
+        }
+        self.get_ticker(b, a).await.ok()
+    }
+
+    /// Convert `source` into `target`, resolving a path through available rates.
+    ///
+    /// Resolution order: passthrough, a direct/inverse pair, then a cross rate
+    /// via an intermediary (BTC, then EUR). This lets arbitrary fiat<->fiat and
+    /// fiat<->BTC pairs convert using the BTC prices and fiat FX rates fetched
+    /// into the exchange service.
+    pub async fn convert_currency(
+        &self,
+        source: CurrencyAmount,
+        target: Currency,
+    ) -> Result<CurrencyAmount> {
+        if source.currency() == target {
+            return Ok(source);
+        }
+        if let Some(rate) = self.find_rate(source.currency(), target).await {
+            return rate.convert(source);
+        }
+        for mid in [Currency::BTC, Currency::EUR] {
+            if mid == source.currency() || mid == target {
+                continue;
+            }
+            if let (Some(first), Some(second)) = (
+                self.find_rate(source.currency(), mid).await,
+                self.find_rate(mid, target).await,
+            ) {
+                let intermediate = first.convert(source)?;
+                return second.convert(intermediate);
+            }
+        }
+        bail!(
+            "No conversion path from {} to {}",
+            source.currency(),
+            target
+        )
     }
 
     pub fn next_template_expire(base_expiry: DateTime<Utc>, cost_plan: &VmCostPlan) -> u64 {
@@ -3373,6 +3486,178 @@ mod tests {
         let d = pe.determine_tax(10, 10000, 1).await?;
         assert_eq!(d.country_code.as_deref(), Some("IRL"));
         assert_eq!(d.amount, 2300);
+        Ok(())
+    }
+
+    async fn add_revolut_min_amount_config(db: &MockDb, min_amount: u64, min_currency: &str) {
+        use lnvps_db::{ProviderConfig, RevolutProviderConfig};
+        let mut configs = db.payment_method_configs.lock().await;
+        let mut config = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::Revolut,
+            "Revolut".to_string(),
+            true,
+            ProviderConfig::Revolut(RevolutProviderConfig {
+                url: "https://api.revolut.com".to_string(),
+                token: "test-token".to_string(),
+                api_version: "2024-09-01".to_string(),
+                public_key: "pk_test".to_string(),
+                webhook_secret: None,
+            }),
+        );
+        config.id = 1;
+        config.min_amount = Some(min_amount);
+        config.min_amount_currency = Some(min_currency.to_string());
+        configs.insert(1, config);
+    }
+
+    #[tokio::test]
+    async fn min_amount_rejects_below_and_allows_at_or_above() -> Result<()> {
+        let db = MockDb::default();
+        add_revolut_min_amount_config(&db, 100, "EUR").await; // €1.00 minimum
+        let pe = make_pe(Arc::new(db)).await;
+
+        // Below the minimum -> rejected
+        assert!(
+            pe.enforce_min_amount(
+                1,
+                PaymentMethod::Revolut,
+                CurrencyAmount::from_u64(Currency::EUR, 99)
+            )
+            .await
+            .is_err()
+        );
+        // At the minimum -> allowed
+        assert!(
+            pe.enforce_min_amount(
+                1,
+                PaymentMethod::Revolut,
+                CurrencyAmount::from_u64(Currency::EUR, 100)
+            )
+            .await
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn min_amount_lightning_always_allowed() -> Result<()> {
+        let db = MockDb::default();
+        let pe = make_pe(Arc::new(db)).await;
+        assert!(
+            pe.enforce_min_amount(1, PaymentMethod::Lightning, CurrencyAmount::millisats(1))
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn min_amount_no_config_or_unset_is_allowed() -> Result<()> {
+        // No config at all
+        let pe = make_pe(Arc::new(MockDb::default())).await;
+        assert!(
+            pe.enforce_min_amount(
+                1,
+                PaymentMethod::Revolut,
+                CurrencyAmount::from_u64(Currency::EUR, 1)
+            )
+            .await
+            .is_ok()
+        );
+        // Config present but no min_amount set
+        let db = MockDb::default();
+        add_revolut_processing_fee_config(&db).await;
+        let pe = make_pe(Arc::new(db)).await;
+        assert!(
+            pe.enforce_min_amount(
+                1,
+                PaymentMethod::Revolut,
+                CurrencyAmount::from_u64(Currency::EUR, 1)
+            )
+            .await
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn convert_currency_cross_via_btc() -> Result<()> {
+        // Only BTC prices available: EUR and USD. USD->EUR must cross via BTC.
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 100_000.0).await; // 100k EUR/BTC
+        rates.set_rate(Ticker::btc_rate("USD")?, 120_000.0).await; // 120k USD/BTC
+        let pe = PricingEngine::new(db, rates, VatClient::new());
+
+        // $120.00 -> BTC (0.001) -> EUR (€100.00 = 10000 cents)
+        let out = pe
+            .convert_currency(
+                CurrencyAmount::from_u64(Currency::USD, 12_000),
+                Currency::EUR,
+            )
+            .await?;
+        assert_eq!(out.currency(), Currency::EUR);
+        assert_eq!(out.value(), 10_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn convert_currency_direct_fiat_fx() -> Result<()> {
+        // Direct fiat FX pair EUR/USD available (as fetched from frankfurter).
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates
+            .set_rate(Ticker(Currency::EUR, Currency::USD), 1.10)
+            .await;
+        let pe = PricingEngine::new(db, rates, VatClient::new());
+
+        // €10.00 -> $11.00
+        let out = pe
+            .convert_currency(
+                CurrencyAmount::from_u64(Currency::EUR, 1_000),
+                Currency::USD,
+            )
+            .await?;
+        assert_eq!(out.value(), 1_100);
+        // Inverse direction resolves too: $11.00 -> €10.00
+        let back = pe
+            .convert_currency(
+                CurrencyAmount::from_u64(Currency::USD, 1_100),
+                Currency::EUR,
+            )
+            .await?;
+        assert_eq!(back.value(), 1_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn min_amount_converts_across_currencies() -> Result<()> {
+        // Minimum configured in EUR, charge in BTC. 1 BTC = 100,000 EUR (MOCK_RATE).
+        let db = MockDb::default();
+        add_revolut_min_amount_config(&db, 100, "EUR").await; // €1.00
+        // make_pe already registers BTC/EUR at MOCK_RATE (100,000 EUR/BTC)
+        let pe = make_pe(Arc::new(db)).await;
+
+        // €1.00 at 100,000 EUR/BTC = 1e-5 BTC = 1,000,000 millisats.
+        assert!(
+            pe.enforce_min_amount(
+                1,
+                PaymentMethod::Revolut,
+                CurrencyAmount::millisats(999_999)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            pe.enforce_min_amount(
+                1,
+                PaymentMethod::Revolut,
+                CurrencyAmount::millisats(1_000_000)
+            )
+            .await
+            .is_ok()
+        );
         Ok(())
     }
 }

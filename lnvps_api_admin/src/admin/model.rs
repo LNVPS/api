@@ -3698,6 +3698,11 @@ pub struct AdminPaymentMethodConfigInfo {
     pub processing_fee_base: Option<u64>,
     /// Currency for the processing fee base
     pub processing_fee_currency: Option<String>,
+    /// Minimum processable amount in smallest currency units (cents for fiat,
+    /// millisats for BTC). Payments below this are rejected for this method.
+    pub min_amount: Option<u64>,
+    /// Currency for the minimum amount
+    pub min_amount_currency: Option<String>,
     /// Supported currency codes (e.g., ["EUR", "USD"])
     pub supported_currencies: Vec<String>,
     pub created: DateTime<Utc>,
@@ -3720,6 +3725,8 @@ impl From<lnvps_db::PaymentMethodConfig> for AdminPaymentMethodConfigInfo {
             processing_fee_rate: config.processing_fee_rate,
             processing_fee_base: config.processing_fee_base,
             processing_fee_currency: config.processing_fee_currency,
+            min_amount: config.min_amount,
+            min_amount_currency: config.min_amount_currency,
             supported_currencies: config.supported_currencies.into_inner(),
             created: config.created,
             modified: config.modified,
@@ -3740,6 +3747,10 @@ pub struct CreatePaymentMethodConfigRequest {
     /// Processing fee base in smallest currency units (cents for fiat, millisats for BTC)
     pub processing_fee_base: Option<u64>,
     pub processing_fee_currency: Option<String>,
+    /// Minimum processable amount in smallest currency units (cents for fiat,
+    /// millisats for BTC)
+    pub min_amount: Option<u64>,
+    pub min_amount_currency: Option<String>,
     /// Supported currency codes (e.g., ["EUR", "USD"])
     pub supported_currencies: Option<Vec<String>>,
 }
@@ -3757,6 +3768,13 @@ impl CreatePaymentMethodConfigRequest {
             ));
         }
 
+        // Validate that if min amount is set, currency must also be set
+        if self.min_amount.is_some() && self.min_amount_currency.is_none() {
+            return Err(anyhow!(
+                "Minimum amount currency is required when minimum amount is set"
+            ));
+        }
+
         let mut payment_config = lnvps_db::PaymentMethodConfig::new_with_config(
             self.company_id,
             self.config.payment_method(),
@@ -3768,6 +3786,11 @@ impl CreatePaymentMethodConfigRequest {
         payment_config.processing_fee_base = self.processing_fee_base;
         payment_config.processing_fee_currency = self
             .processing_fee_currency
+            .as_ref()
+            .map(|s| s.trim().to_uppercase());
+        payment_config.min_amount = self.min_amount;
+        payment_config.min_amount_currency = self
+            .min_amount_currency
             .as_ref()
             .map(|s| s.trim().to_uppercase());
         if let Some(currencies) = &self.supported_currencies {
@@ -3803,6 +3826,18 @@ pub struct UpdatePaymentMethodConfigRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub processing_fee_currency: Option<Option<String>>,
+    /// Minimum processable amount in smallest currency units (cents for fiat,
+    /// millisats for BTC)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub min_amount: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub min_amount_currency: Option<Option<String>>,
     /// Supported currency codes (e.g., ["EUR", "USD"])
     pub supported_currencies: Option<Vec<String>>,
 }

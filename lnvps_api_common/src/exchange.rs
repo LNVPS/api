@@ -80,22 +80,35 @@ impl TickerRate {
         currency == self.ticker.0 || currency == self.ticker.1
     }
 
-    /// Convert from the source currency into the target currency
+    /// Convert from the source currency into the target currency.
+    ///
+    /// The math is done in `f64` on the integer smallest-unit values (cents /
+    /// milli-sats) and only rounded to `u64` at the end. Routing through
+    /// `f32`/`value_f32()` (as an earlier version did) lost precision — e.g.
+    /// €1.00 at 100,000 EUR/BTC produced 999,999 msat instead of 1,000,000.
     pub fn convert(&self, source: CurrencyAmount) -> Result<CurrencyAmount> {
         ensure!(
             self.can_convert(source.currency()),
             "Cant convert, currency doesnt match"
         );
-        if source.currency() == self.ticker.0 {
-            Ok(CurrencyAmount::from_f32(
-                self.ticker.1,
-                source.value_f32() * self.rate,
-            ))
+        let rate = self.rate as f64;
+        let (target, factor) = if source.currency() == self.ticker.0 {
+            (self.ticker.1, rate)
         } else {
-            Ok(CurrencyAmount::from_f32(
-                self.ticker.0,
-                source.value_f32() / self.rate,
-            ))
+            (self.ticker.0, 1.0 / rate)
+        };
+        let src_standard = source.value() as f64 / Self::scale(source.currency());
+        let dst_standard = src_standard * factor;
+        let dst_smallest = (dst_standard * Self::scale(target)).round() as u64;
+        Ok(CurrencyAmount::from_u64(target, dst_smallest))
+    }
+
+    /// Number of smallest units per standard unit for a currency, matching
+    /// `payments_rs` (BTC = 1e11 milli-sats, all fiat = 100 cents).
+    fn scale(currency: Currency) -> f64 {
+        match currency {
+            Currency::BTC => 1.0e11,
+            _ => 100.0,
         }
     }
 
@@ -142,6 +155,53 @@ pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<Curren
         }
     }
     ret.append(&mut ret2);
+    ret
+}
+
+/// Fetch fiat FX rates for `base` against each of `symbols` from frankfurter.app
+/// (ECB reference rates, free, no API key). Returns `Ticker(base, X)` rates
+/// where the value is the amount of `X` per 1 unit of `base`.
+///
+/// The `base` is the caller's currency of interest (a company's billing
+/// currency), never a hardcoded value. BTC is skipped — BTC prices come from
+/// mempool.space, not an FX feed.
+pub async fn fetch_fiat_fx_rates(base: Currency, symbols: &[Currency]) -> Result<Vec<TickerRate>> {
+    let symbol_list = symbols
+        .iter()
+        .filter(|c| **c != base && **c != Currency::BTC)
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if base == Currency::BTC || symbol_list.is_empty() {
+        return Ok(vec![]);
+    }
+    let url = format!("https://api.frankfurter.app/latest?base={base}&symbols={symbol_list}");
+    let rsp = reqwest::get(&url).await?.text().await?;
+    let parsed: FrankfurterRates = serde_json::from_str(&rsp)?;
+    let mut ret = Vec::new();
+    for cur in symbols {
+        if let Some(rate) = parsed.rates.get(&cur.to_string()) {
+            ret.push(TickerRate {
+                ticker: Ticker(base, *cur),
+                rate: *rate,
+            });
+        }
+    }
+    Ok(ret)
+}
+
+/// Fetch fiat FX rates covering every ordered pair among `currencies` (each
+/// currency as a base against all the others). Errors for individual bases are
+/// logged and skipped. Use this to keep direct rates between the set of
+/// currencies actually in use (e.g. distinct company billing currencies).
+pub async fn fetch_fx_for_currencies(currencies: &[Currency]) -> Vec<TickerRate> {
+    let mut ret = Vec::new();
+    for base in currencies {
+        match fetch_fiat_fx_rates(*base, currencies).await {
+            Ok(mut fx) => ret.append(&mut fx),
+            Err(e) => error!("Failed to fetch fiat FX for base {}: {}", base, e),
+        }
+    }
     ret
 }
 
@@ -400,6 +460,12 @@ impl ExchangeRateService for RedisExchangeRateService {
 }
 
 #[derive(Deserialize)]
+struct FrankfurterRates {
+    #[serde(default)]
+    pub rates: HashMap<String, f32>,
+}
+
+#[derive(Deserialize)]
 struct MempoolRates {
     #[serde(rename = "USD")]
     pub usd: Option<f32>,
@@ -425,23 +491,78 @@ mod tests {
     #[test]
     fn convert() {
         let ticker = Ticker::btc_rate("EUR").unwrap();
-        let f = TickerRate {
-            ticker: ticker,
-            rate: RATE,
-        };
+        let f = TickerRate { ticker, rate: RATE };
 
+        // €5.00 / 95,000 = 5.263157894...e-5 BTC = 5,263,157.89 msat -> 5,263,158
         assert_eq!(
-            f.convert(CurrencyAmount::from_f32(Currency::EUR, 5.0))
+            f.convert(CurrencyAmount::from_u64(Currency::EUR, 500))
                 .unwrap(),
-            CurrencyAmount::from_f32(Currency::BTC, 5.0 / RATE)
+            CurrencyAmount::millisats(5_263_158)
         );
+        // 0.001 BTC * 95,000 = €95.00 = 9500 cents
         assert_eq!(
-            f.convert(CurrencyAmount::from_f32(Currency::BTC, 0.001))
-                .unwrap(),
-            CurrencyAmount::from_f32(Currency::EUR, RATE * 0.001)
+            f.convert(CurrencyAmount::millisats(100_000_000)).unwrap(),
+            CurrencyAmount::from_u64(Currency::EUR, 9500)
         );
         assert!(!f.can_convert(Currency::USD));
         assert!(f.can_convert(Currency::EUR));
         assert!(f.can_convert(Currency::BTC));
+    }
+
+    #[tokio::test]
+    async fn fx_fetch_noop_cases() {
+        // No symbols -> no request, empty result
+        assert!(
+            fetch_fiat_fx_rates(Currency::USD, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Only self / BTC symbols -> filtered out -> empty
+        assert!(
+            fetch_fiat_fx_rates(Currency::EUR, &[Currency::EUR, Currency::BTC])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // BTC base is never fetched via FX
+        assert!(
+            fetch_fiat_fx_rates(Currency::BTC, &[Currency::USD])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A single currency has no pairs to fetch
+        assert!(fetch_fx_for_currencies(&[Currency::EUR]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fx_fetch_real_pair_uses_requested_base() -> Result<()> {
+        // Hits frankfurter.app (ECB). base=EUR must yield a Ticker(EUR, USD).
+        let rates = fetch_fiat_fx_rates(Currency::EUR, &[Currency::USD]).await?;
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].ticker, Ticker(Currency::EUR, Currency::USD));
+        assert!(rates[0].rate > 0.0);
+        Ok(())
+    }
+
+    /// Regression: conversions must be integer-precise, not lose a unit to f32.
+    #[test]
+    fn convert_precise_no_f32_loss() {
+        let f = TickerRate {
+            ticker: Ticker::btc_rate("EUR").unwrap(),
+            rate: 100_000.0,
+        };
+        // €1.00 at 100,000 EUR/BTC = exactly 1e-5 BTC = 1,000,000 msat
+        assert_eq!(
+            f.convert(CurrencyAmount::from_u64(Currency::EUR, 100))
+                .unwrap(),
+            CurrencyAmount::millisats(1_000_000)
+        );
+        // Round-trip back to EUR is exact
+        assert_eq!(
+            f.convert(CurrencyAmount::millisats(1_000_000)).unwrap(),
+            CurrencyAmount::from_u64(Currency::EUR, 100)
+        );
     }
 }

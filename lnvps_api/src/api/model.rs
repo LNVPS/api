@@ -467,6 +467,15 @@ pub struct ApiPaymentInfo {
     /// Currency for the processing fee base
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processing_fee_currency: Option<String>,
+
+    /// Minimum processable amount in smallest units of `min_amount_currency`
+    /// (cents for fiat, millisats for BTC). Payments below this are rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_amount: Option<u64>,
+
+    /// Currency for `min_amount`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_amount_currency: Option<String>,
 }
 
 /// Payment data related to the payment method

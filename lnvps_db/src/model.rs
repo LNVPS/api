@@ -2785,6 +2785,12 @@ pub struct PaymentMethodConfig {
     pub processing_fee_base: Option<u64>,
     /// Currency for the processing fee base
     pub processing_fee_currency: Option<String>,
+    /// Minimum processable amount in the smallest unit of `min_amount_currency`
+    /// (cents for fiat, millisats for BTC). `None` (or 0) means no minimum.
+    /// Payments whose gross total is below this are rejected for this method.
+    pub min_amount: Option<u64>,
+    /// Currency for `min_amount`
+    pub min_amount_currency: Option<String>,
     /// Supported currency codes (e.g., "EUR", "USD", "BTC")
     /// Empty means use default currencies based on payment method type
     pub supported_currencies: CommaSeparated<String>,
@@ -2831,6 +2837,8 @@ impl PaymentMethodConfig {
             processing_fee_rate: None,
             processing_fee_base: None,
             processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
             supported_currencies: CommaSeparated::default(),
             created: Utc::now(),
             modified: Utc::now(),

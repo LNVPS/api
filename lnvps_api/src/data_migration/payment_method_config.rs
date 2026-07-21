@@ -38,9 +38,8 @@ impl DataMigration for PaymentMethodConfigMigration {
             // "any config exists" check would prevent newly added methods
             // (e.g. on-chain) from ever being imported on existing deployments.
             let existing_configs = db.list_payment_method_configs().await?;
-            let has_method = |m: PaymentMethod| {
-                existing_configs.iter().any(|c| c.payment_method == m)
-            };
+            let has_method =
+                |m: PaymentMethod| existing_configs.iter().any(|c| c.payment_method == m);
 
             let need_lightning = !has_method(PaymentMethod::Lightning);
             // On-chain is only seeded from an LND wallet
