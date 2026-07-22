@@ -53,7 +53,8 @@ pub struct Settings {
     /// Redis configuration for shared VM state cache
     pub redis: Option<RedisConfig>,
 
-    /// Database encryption configuration
+    /// Database encryption configuration (fallback when the
+    /// `LNVPS_ENCRYPTION_KEY` environment variable is not set)
     pub encryption: Option<EncryptionConfig>,
 
     /// Captcha config
@@ -540,6 +541,9 @@ pub struct EncryptionConfig {
     pub auto_generate: bool,
 }
 
+/// Environment variable holding the hex-encoded database encryption key
+pub const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
+
 /// Default global maximum prepay window (days) when unspecified in config.
 pub fn default_max_prepay_days() -> u16 {
     365
@@ -550,6 +554,7 @@ pub fn mock_settings() -> Settings {
     Settings {
         listen: None,
         db: "".to_string(),
+        encryption: None,
         public_url: "http://localhost:8000".to_string(),
         read_only: false,
         provisioner: ProvisionerConfig {
@@ -580,7 +585,6 @@ pub fn mock_settings() -> Settings {
         whatsapp: None,
         nostr_address_host: None,
         redis: None,
-        encryption: None,
         captcha: None,
         geoip_database: None,
         referral: None,

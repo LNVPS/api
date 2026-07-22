@@ -186,12 +186,15 @@ async fn main() -> Result<()> {
         builder.build()?.try_deserialize()?
     };
 
-    if let Some(ref encryption_config) = settings.encryption {
+    if let Ok(hex_key) = std::env::var(lnvps_api::settings::ENCRYPTION_KEY_ENV) {
+        EncryptionContext::init_from_hex(&hex_key)?;
+        info!("Database encryption initialized from environment");
+    } else if let Some(ref encryption_config) = settings.encryption {
         EncryptionContext::init_from_file(
             &encryption_config.key_file,
             encryption_config.auto_generate,
         )?;
-        info!("Database encryption initialized");
+        info!("Database encryption initialized from key file");
     }
 
     let db = LNVpsDbMysql::new(&settings.db).await?;

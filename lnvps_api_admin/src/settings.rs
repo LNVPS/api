@@ -14,7 +14,8 @@ pub struct Settings {
     /// Redis configuration for shared VM state cache
     pub redis: Option<RedisConfig>,
 
-    /// Database encryption configuration
+    /// Database encryption configuration (fallback when the
+    /// `LNVPS_ENCRYPTION_KEY` environment variable is not set)
     pub encryption: Option<EncryptionConfig>,
 }
 
@@ -26,3 +27,6 @@ pub struct EncryptionConfig {
     /// Automatically generate key if file doesn't exist
     pub auto_generate: bool,
 }
+
+/// Environment variable holding the hex-encoded database encryption key
+pub const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";

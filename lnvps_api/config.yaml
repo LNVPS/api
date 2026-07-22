@@ -18,6 +18,9 @@ read-only: false
 redis:
   url: "redis://localhost:6398"
   ttl: 30
+# Database field encryption. The LNVPS_ENCRYPTION_KEY environment variable
+# (hex-encoded 32-byte key) takes precedence; the key file below is used as a
+# fallback when that variable is not set.
 encryption:
   key-file: "encryption.key"
   auto-generate: true

@@ -2976,6 +2976,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "hex",
  "log 0.4.32",
  "serde",
  "serde_json",

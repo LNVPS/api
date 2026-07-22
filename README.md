@@ -216,13 +216,31 @@ When configured, exchange rates, VM state cache, and the work queue all use Redi
 
 ### Database field encryption (optional)
 
-```yaml
-encryption:
-  key-file: "/etc/lnvps/encryption.key"
-  auto-generate: true   # generate key if absent
-```
+The encryption key can be supplied two ways (the environment variable takes
+precedence):
+
+1. **Environment variable** — `LNVPS_ENCRYPTION_KEY`, a hex-encoded 32-byte key
+   (64 hex characters):
+   ```bash
+   export LNVPS_ENCRYPTION_KEY=$(openssl rand -hex 32)
+   ```
+2. **Key file** — configured in `config.yaml`, used as a fallback when the
+   environment variable is not set:
+   ```yaml
+   encryption:
+     key-file: "/etc/lnvps/encryption.key"
+     auto-generate: true   # generate key if absent
+   ```
+
+When neither is provided, field encryption is disabled and values are
+stored/read as plaintext.
 
 Encrypted fields: SSH key material, NWC connection strings, email addresses, host API tokens.
+
+Ciphertexts use the format `ENC1:<key-id>:<base64(nonce||ciphertext)>`. The
+embedded key id (first 4 bytes of SHA-256 of the key) identifies which key
+encrypted a value, enabling future key rotation. Legacy `ENC:` values written
+before key ids are still decrypted transparently.
 
 ### Taxes (VAT)
 

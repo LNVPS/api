@@ -5,6 +5,7 @@ use aes_gcm::{
 };
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -15,14 +16,50 @@ static ENCRYPTION_CONTEXT: OnceLock<EncryptionContext> = OnceLock::new();
 /// Encryption context that holds the cipher instance
 pub struct EncryptionContext {
     cipher: Aes256Gcm,
+    /// Identifier for the key currently in use, derived from the key material.
+    /// Stored in versioned ciphertexts so the correct key can be selected
+    /// during future key rotation.
+    key_id: String,
+}
+
+/// Current ciphertext format version
+const FORMAT_VERSION: u8 = 1;
+
+/// Derive a short, non-secret identifier for a key: first 4 bytes of
+/// SHA-256(key) as lowercase hex. Identifies a key without revealing it.
+fn derive_key_id(key: &Key<Aes256Gcm>) -> String {
+    let hash = Sha256::digest(key);
+    hash[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl EncryptionContext {
+    /// Initialize the global encryption context with a hex-encoded key
+    /// (64 hex chars = 32 bytes). Typically sourced from an environment
+    /// variable via the config file.
+    pub fn init_from_hex(hex_key: &str) -> Result<()> {
+        let key = decode_hex_key(hex_key)?;
+        Self::init_with_key(key)
+    }
+
+    /// Initialize from hex key, ignoring if already initialized
+    pub fn try_init_from_hex(hex_key: &str) -> Result<()> {
+        if ENCRYPTION_CONTEXT.get().is_some() {
+            Ok(())
+        } else {
+            Self::init_from_hex(hex_key)
+        }
+    }
+
     /// Initialize the global encryption context with a key from file
     pub fn init_from_file<P: AsRef<Path>>(key_file: P, auto_generate: bool) -> Result<()> {
         let key = load_or_generate_key(key_file, auto_generate)?;
+        Self::init_with_key(key)
+    }
+
+    fn init_with_key(key: Key<Aes256Gcm>) -> Result<()> {
         let cipher = Aes256Gcm::new(&key);
-        let context = EncryptionContext { cipher };
+        let key_id = derive_key_id(&key);
+        let context = EncryptionContext { cipher, key_id };
 
         ENCRYPTION_CONTEXT
             .set(context)
@@ -58,14 +95,34 @@ impl EncryptionContext {
         let mut result = nonce.to_vec();
         result.extend(&ciphertext);
 
-        // Prefix with "ENC:" to clearly identify encrypted values
-        Ok(format!("ENC:{}", STANDARD.encode(result)))
+        // Versioned format: ENC1:<key-id>:<base64(nonce || ciphertext)>
+        // The key id allows selecting the correct key when rotating keys.
+        Ok(format!(
+            "ENC{}:{}:{}",
+            FORMAT_VERSION,
+            self.key_id,
+            STANDARD.encode(result)
+        ))
     }
 
-    /// Decrypt a prefixed base64-encoded encrypted string
+    /// Decrypt an encrypted string, supporting both the current versioned
+    /// format (`ENC1:<key-id>:<data>`) and the legacy unversioned `ENC:<data>`
+    /// format written before key ids existed.
     pub fn decrypt(&self, encrypted_data: &str) -> Result<String> {
-        // Check if the data has the "ENC:" prefix
-        let base64_data = if let Some(stripped) = encrypted_data.strip_prefix("ENC:") {
+        let base64_data = if let Some(rest) = encrypted_data.strip_prefix("ENC1:") {
+            let (key_id, data) = rest
+                .split_once(':')
+                .ok_or_else(|| anyhow!("Malformed ENC1 ciphertext: missing key id separator"))?;
+            if key_id != self.key_id {
+                bail!(
+                    "Ciphertext was encrypted with key id '{}' but the loaded key has id '{}'",
+                    key_id,
+                    self.key_id
+                );
+            }
+            data
+        } else if let Some(stripped) = encrypted_data.strip_prefix("ENC:") {
+            // Legacy format: no key id, assume the loaded key
             stripped
         } else {
             bail!("String is not encrypted, cant decrypt")
@@ -91,10 +148,29 @@ impl EncryptionContext {
         String::from_utf8(plaintext).map_err(|e| anyhow!("Invalid UTF-8 in decrypted data: {}", e))
     }
 
-    /// Check if a string is encrypted (has the ENC: prefix)
+    /// Check if a string is encrypted (has an `ENC:`/`ENC1:` prefix)
     pub fn is_encrypted(data: &str) -> bool {
+        data.starts_with("ENC:") || data.starts_with("ENC1:")
+    }
+
+    /// Check if a string uses the legacy unversioned format and should be
+    /// re-encrypted to embed the key id
+    pub fn is_legacy_format(data: &str) -> bool {
         data.starts_with("ENC:")
     }
+}
+
+/// Decode a hex-encoded 32-byte encryption key
+fn decode_hex_key(hex_key: &str) -> Result<Key<Aes256Gcm>> {
+    let key_bytes =
+        hex::decode(hex_key.trim()).map_err(|e| anyhow!("Invalid hex in encryption key: {}", e))?;
+    if key_bytes.len() != 32 {
+        bail!(
+            "Invalid encryption key: expected 32 bytes (64 hex chars), got {}",
+            key_bytes.len()
+        );
+    }
+    Ok(*Key::<Aes256Gcm>::from_slice(&key_bytes))
 }
 
 /// Load encryption key from file, or generate one if it doesn't exist and auto_generate is true
@@ -155,18 +231,20 @@ fn load_or_generate_key<P: AsRef<Path>>(
 mod tests {
     use super::*;
 
-    fn create_test_cipher() -> Result<Aes256Gcm> {
+    fn create_test_context() -> Result<EncryptionContext> {
         let mut rng = OsRng;
         let mut new_key: [u8; 32] = [0; 32];
         rng.fill_bytes(&mut new_key);
-        Ok(Aes256Gcm::new_from_slice(new_key.as_slice())?)
+        let key = *Key::<Aes256Gcm>::from_slice(&new_key);
+        let cipher = Aes256Gcm::new(&key);
+        let key_id = derive_key_id(&key);
+        Ok(EncryptionContext { cipher, key_id })
     }
 
     #[test]
     fn test_local_encryption_roundtrip() {
         // Test encryption/decryption without using global state
-        let cipher = create_test_cipher().unwrap();
-        let context = EncryptionContext { cipher };
+        let context = create_test_context().unwrap();
 
         let plaintext = "Hello, World!";
         let encrypted = context.encrypt(plaintext).unwrap();
@@ -178,8 +256,7 @@ mod tests {
     #[test]
     fn test_local_different_encryptions_produce_different_results() {
         // Test that multiple encryptions of same data produce different results
-        let cipher = create_test_cipher().unwrap();
-        let context = EncryptionContext { cipher };
+        let context = create_test_context().unwrap();
 
         let plaintext = "Same message";
         let encrypted1 = context.encrypt(plaintext).unwrap();
@@ -196,7 +273,90 @@ mod tests {
     #[test]
     fn test_is_encrypted_detection() {
         assert!(EncryptionContext::is_encrypted("ENC:some_base64_data"));
+        assert!(EncryptionContext::is_encrypted(
+            "ENC1:deadbeef:some_base64_data"
+        ));
         assert!(!EncryptionContext::is_encrypted("plain_text_data"));
         assert!(!EncryptionContext::is_encrypted(""));
+    }
+
+    #[test]
+    fn test_versioned_format_contains_key_id() {
+        let context = create_test_context().unwrap();
+        let encrypted = context.encrypt("secret").unwrap();
+
+        assert!(encrypted.starts_with("ENC1:"));
+        assert!(encrypted.starts_with(&format!("ENC1:{}:", context.key_id)));
+        assert_eq!(context.key_id.len(), 8); // 4 bytes as hex
+    }
+
+    #[test]
+    fn test_derive_key_id_is_stable() {
+        let key = *Key::<Aes256Gcm>::from_slice(&[42u8; 32]);
+        assert_eq!(derive_key_id(&key), derive_key_id(&key));
+        let other_key = *Key::<Aes256Gcm>::from_slice(&[43u8; 32]);
+        assert_ne!(derive_key_id(&key), derive_key_id(&other_key));
+    }
+
+    #[test]
+    fn test_decrypt_legacy_format() {
+        // Decrypt a ciphertext written in the legacy `ENC:<base64>` format
+        let context = create_test_context().unwrap();
+        let plaintext = "legacy secret";
+
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = context
+            .cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .unwrap();
+        let mut blob = nonce.to_vec();
+        blob.extend(&ciphertext);
+        let legacy = format!("ENC:{}", STANDARD.encode(blob));
+
+        assert!(EncryptionContext::is_legacy_format(&legacy));
+        assert!(!EncryptionContext::is_legacy_format(
+            &context.encrypt(plaintext).unwrap()
+        ));
+        assert_eq!(context.decrypt(&legacy).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_wrong_key_id_fails() {
+        let context = create_test_context().unwrap();
+        let other = create_test_context().unwrap();
+        let encrypted = context.encrypt("secret").unwrap();
+
+        let err = other.decrypt(&encrypted).unwrap_err();
+        assert!(err.to_string().contains("encrypted with key id"));
+    }
+
+    #[test]
+    fn test_decode_hex_key() {
+        let key = decode_hex_key(&"ab".repeat(32)).unwrap();
+        assert_eq!(key.as_slice(), &[0xabu8; 32]);
+        // Uppercase hex is accepted
+        assert!(decode_hex_key(&"AB".repeat(32)).is_ok());
+        // Wrong length
+        assert!(decode_hex_key("abcd").is_err());
+        // Invalid hex characters
+        assert!(decode_hex_key(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn test_init_from_hex_key_id_matches() {
+        // A hex key must produce the same context (and key id) as the raw key
+        let hex_key = "42".repeat(32);
+        let raw = *Key::<Aes256Gcm>::from_slice(&[0x42u8; 32]);
+        assert_eq!(
+            derive_key_id(&decode_hex_key(&hex_key).unwrap()),
+            derive_key_id(&raw)
+        );
+    }
+
+    #[test]
+    fn test_decrypt_malformed_enc1_fails() {
+        let context = create_test_context().unwrap();
+        let err = context.decrypt("ENC1:nokeyid").unwrap_err();
+        assert!(err.to_string().contains("Malformed ENC1"));
     }
 }
