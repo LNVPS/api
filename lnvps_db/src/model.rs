@@ -787,16 +787,43 @@ pub struct VmOsImage {
     pub sha2_url: Option<String>,
 }
 
+/// Compression extensions recognised on OS image URLs. Files ending with one
+/// of these are downloaded compressed and decompressed on the host before use.
+pub const OS_IMAGE_COMPRESSION_EXTENSIONS: &[&str] =
+    &["xz", "lzma", "zst", "zstd", "gz", "bz2", "lzo"];
+
 impl VmOsImage {
-    /// The filename as it will be stored on the host (original extension replaced with `.img`).
+    /// The compression algorithm (lower-case extension) if the image URL points
+    /// to a compressed file (e.g. `.xz`, `.zst`, `.gz`, `.bz2`, `.lzo`).
+    ///
+    /// Returns `None` for uncompressed images.
+    pub fn compression(&self) -> Option<String> {
+        let name = self.url_filename().ok()?;
+        let ext = std::path::Path::new(&name)
+            .extension()?
+            .to_str()?
+            .to_lowercase();
+        if OS_IMAGE_COMPRESSION_EXTENSIONS.contains(&ext.as_str()) {
+            Some(ext)
+        } else {
+            None
+        }
+    }
+
+    /// The filename as it will be stored on the host (original extension, and any
+    /// compression extension, replaced with `.img`).
+    ///
+    /// Examples:
+    /// - `foo.qcow2` -> `foo.img`
+    /// - `foo.qcow2.xz` -> `foo.img`
     pub fn filename(&self) -> Result<String> {
-        let u: Url = self.url.parse()?;
-        let mut name: PathBuf = u
-            .path_segments()
-            .ok_or(anyhow!("Invalid URL"))?
-            .next_back()
-            .ok_or(anyhow!("Invalid URL"))?
-            .parse()?;
+        let url_name = self.url_filename()?;
+        let mut name = PathBuf::from(&url_name);
+        // Strip a compression extension first (e.g. foo.qcow2.xz -> foo.qcow2)
+        // before replacing the remaining extension with `.img`.
+        if self.compression().is_some() {
+            name.set_extension("");
+        }
         name.set_extension("img");
         Ok(name.to_string_lossy().to_string())
     }
@@ -2236,6 +2263,52 @@ mod tests {
             assert_eq!(d.to_string(), display);
         }
         assert!(OsDistribution::from_str("templeos").is_err());
+    }
+
+    fn os_image(url: &str) -> VmOsImage {
+        VmOsImage {
+            id: 1,
+            distribution: OsDistribution::Ubuntu,
+            flavour: "server".to_string(),
+            version: "24.04".to_string(),
+            enabled: true,
+            release_date: Utc::now(),
+            url: url.to_string(),
+            default_username: None,
+            sha2: None,
+            sha2_url: None,
+        }
+    }
+
+    #[test]
+    fn test_os_image_compression_and_filename() {
+        // Uncompressed images
+        let img = os_image("https://example.com/images/foo.qcow2");
+        assert_eq!(img.compression(), None);
+        assert_eq!(img.url_filename().unwrap(), "foo.qcow2");
+        assert_eq!(img.filename().unwrap(), "foo.img");
+
+        let img = os_image("https://example.com/images/foo.img");
+        assert_eq!(img.compression(), None);
+        assert_eq!(img.filename().unwrap(), "foo.img");
+
+        // Compressed images: every supported extension is detected and stripped
+        for ext in OS_IMAGE_COMPRESSION_EXTENSIONS {
+            let img = os_image(&format!("https://example.com/images/foo.qcow2.{ext}"));
+            assert_eq!(img.compression().as_deref(), Some(*ext));
+            assert_eq!(img.url_filename().unwrap(), format!("foo.qcow2.{ext}"));
+            assert_eq!(img.filename().unwrap(), "foo.img");
+        }
+
+        // Uppercase extension is normalised
+        let img = os_image("https://example.com/images/foo.qcow2.XZ");
+        assert_eq!(img.compression().as_deref(), Some("xz"));
+        assert_eq!(img.filename().unwrap(), "foo.img");
+
+        // Unknown extension is not treated as compression
+        let img = os_image("https://example.com/images/foo.raw");
+        assert_eq!(img.compression(), None);
+        assert_eq!(img.filename().unwrap(), "foo.img");
     }
 
     #[test]

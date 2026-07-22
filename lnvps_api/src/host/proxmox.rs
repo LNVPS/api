@@ -1349,13 +1349,23 @@ impl VmHostClient for ProxmoxClient {
         let files = self.list_storage_files(&self.node, &iso_storage).await?;
 
         info!("Downloading image {} on {}", image.url, &self.node);
-        // storage_name: how Proxmox stores the file (e.g. foo.img)
-        // url_name: the original filename from the URL, used in SHASUMS (e.g. foo.qcow2)
+        // storage_name: how the final (usable) image is stored on the host (e.g. foo.img)
+        // url_name:     the original filename from the URL, used in SHASUMS
+        //               (e.g. foo.qcow2 or, when compressed, foo.qcow2.xz)
+        // download_name: the filename we download to the host. For compressed
+        //               images this is the compressed file (url_name); it is
+        //               decompressed into storage_name afterwards.
+        let compression = image.compression();
         let storage_name = image.filename()?;
         let url_name = image.url_filename()?;
+        let download_name = if compression.is_some() {
+            url_name.clone()
+        } else {
+            storage_name.clone()
+        };
 
         // Resolve the expected checksum from sha2_url if present.
-        // This is used only for SSH-based verification of already-present files;
+        // This is used only for SSH-based verification of the downloaded file;
         // we do NOT pass it to the Proxmox download-url API because that has proven
         // unreliable and causes download failures on the client side.
         let expected_sha2 = if let Some(sha2_url) = &image.sha2_url {
@@ -1387,6 +1397,18 @@ impl VmHostClient for ProxmoxClient {
             .any(|v| v.vol_id.ends_with(&format!("iso/{storage_name}")));
 
         if already_present {
+            // For compressed images the stored file is the *decompressed* `.img`,
+            // whose checksum differs from the SHASUMS entry (which covers the
+            // compressed artifact). We therefore cannot re-verify it here, so we
+            // trust its presence and skip the re-download.
+            if compression.is_some() {
+                info!(
+                    "Compressed image already decompressed on host as {}, skipping download",
+                    storage_name
+                );
+                return Ok(());
+            }
+
             // If we have an expected checksum, verify the stored file via SSH
             let stale = if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm)
             {
@@ -1447,53 +1469,70 @@ impl VmHostClient for ProxmoxClient {
         // Do not include checksum/checksum-algorithm in the download-url request.
         // Proxmox's built-in hash verification has proven buggy and causes download
         // failures. Integrity is verified separately via SSH after the download
-        // completes (see verify_image_checksum).
+        // completes (see verify_image_checksum). Proxmox's own decompression is
+        // likewise unreliable (historically ISO-only), so compressed images are
+        // downloaded as-is and decompressed by us over SSH afterwards.
         let t_download = self
             .download_image(DownloadUrlRequest {
                 content: StorageContent::ISO,
                 node: self.node.clone(),
                 storage: iso_storage.clone(),
                 url: resolved_url,
-                filename: storage_name.clone(),
+                filename: download_name.clone(),
                 checksum: None,
                 checksum_algorithm: None,
             })
             .await?;
         self.wait_for_task(&t_download).await?;
 
-        // Verify the freshly-downloaded file via SSH to confirm integrity.
+        // Verify the freshly-downloaded file via SSH to confirm integrity. This
+        // runs against download_name (the compressed artifact for compressed
+        // images), matching the SHASUMS entry.
         if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm) {
             match self
-                .verify_image_checksum(&storage_name, &iso_storage, expected, algo)
+                .verify_image_checksum(&download_name, &iso_storage, expected, algo)
                 .await
             {
                 Ok(true) => {
-                    info!("Post-download checksum verified for {}", storage_name);
+                    info!("Post-download checksum verified for {}", download_name);
                 }
                 Ok(false) => {
                     // Delete the corrupt file so the next run re-downloads it.
                     warn!(
                         "Post-download checksum mismatch for {}, deleting corrupt file",
-                        storage_name
+                        download_name
                     );
                     if let Err(e) = self
-                        .delete_storage_file(&self.node, &iso_storage, &storage_name)
+                        .delete_storage_file(&self.node, &iso_storage, &download_name)
                         .await
                     {
-                        warn!("Failed to delete corrupt image {}: {}", storage_name, e);
+                        warn!("Failed to delete corrupt image {}: {}", download_name, e);
                     }
                     return Err(OpError::Fatal(anyhow::anyhow!(
                         "Checksum mismatch after download of {}",
-                        storage_name
+                        download_name
                     )));
                 }
                 Err(e) => {
                     warn!(
                         "Could not verify post-download checksum for {}: {}",
-                        storage_name, e
+                        download_name, e
                     );
                 }
             }
+        }
+
+        // Decompress compressed images into the final storage_name and remove
+        // the compressed source. Must happen after checksum verification.
+        if let Some(algo) = &compression {
+            info!(
+                "Decompressing {} ({}) -> {} on {}",
+                download_name, algo, storage_name, &self.node
+            );
+            self.decompress_image(algo, &download_name, &storage_name)
+                .await
+                .map_err(OpError::Fatal)?;
+            info!("Decompressed image available as {}", storage_name);
         }
 
         Ok(())
@@ -2011,6 +2050,63 @@ impl ProxmoxClient {
             .to_lowercase();
         let expected_lower = expected.to_lowercase();
         Ok(actual == expected_lower)
+    }
+
+    /// Decompress a downloaded compressed image on the host via SSH.
+    ///
+    /// Reads `compressed` (e.g. `foo.qcow2.xz`) from the ISO storage directory,
+    /// streams it through the appropriate decompressor into a temporary file,
+    /// atomically moves the result to `output` (e.g. `foo.img`) and removes the
+    /// compressed source. Using a temp file + `mv` ensures a failed or partial
+    /// decompression never leaves a truncated image at the final path.
+    pub async fn decompress_image(
+        &self,
+        compression: &str,
+        compressed: &str,
+        output: &str,
+    ) -> Result<()> {
+        let ssh_cfg = match &self.ssh {
+            Some(s) => s,
+            None => anyhow::bail!("SSH not configured, cannot decompress image"),
+        };
+
+        // Proxmox stores ISOs under /var/lib/vz/template/iso/ by default,
+        // matching verify_image_checksum and import_disk_image.
+        let dir = "/var/lib/vz/template/iso";
+        let src = format!("{dir}/{compressed}");
+        let dst = format!("{dir}/{output}");
+        let tmp = format!("{dst}.tmp");
+
+        // `-d` decompress, `-c` write to stdout. All of these ship with, or are
+        // readily available on, a standard Proxmox VE host.
+        let tool = match compression {
+            "xz" | "lzma" => "xz -dc",
+            "zst" | "zstd" => "zstd -dc",
+            "gz" => "gzip -dc",
+            "bz2" => "bzip2 -dc",
+            "lzo" => "lzop -dc",
+            other => anyhow::bail!("Unsupported compression algorithm: {other}"),
+        };
+        let cmd = format!("{tool} '{src}' > '{tmp}' && mv -f '{tmp}' '{dst}' && rm -f '{src}'");
+
+        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
+        let ssh_user = ssh_cfg.user.clone();
+        let ssh_key = ssh_cfg.key.clone();
+
+        let mut ssh = SshClient::new()?;
+        ssh.connect((host.as_str(), 22), &ssh_user, &ssh_key)
+            .await?;
+        let (exit_code, output) = ssh.execute(&cmd).await?;
+        if exit_code != 0 {
+            // Best-effort cleanup of any partial temp file.
+            let _ = ssh.execute(&format!("rm -f '{tmp}'")).await;
+            anyhow::bail!(
+                "Decompression failed (exit {}): {}",
+                exit_code,
+                output.trim()
+            );
+        }
+        Ok(())
     }
 
     /// Delete a storage file on the Proxmox node
