@@ -65,28 +65,120 @@ impl IpRangeProvisioner {
         self
     }
 
-    /// Allocate a CIDR for a line item on its first (purchase) payment.
+    /// Fulfil an IP-range line item after a payment completed.
     ///
     /// Idempotent: a line item that already has an active allocation is treated
-    /// as a renewal and left untouched. The origin ASN is configured later by
-    /// the customer (see [`Self::configure_origin_asn`]), so no registry objects
-    /// are created here.
+    /// as a renewal and left untouched; an expired line item's previous
+    /// allocation is reactivated when its CIDR is still free; otherwise a fresh
+    /// CIDR is carved out. The origin ASN is configured by the customer (see
+    /// [`Self::configure_origin_asn`]), so no registry objects are created for
+    /// fresh allocations here.
+    ///
+    /// `CheckSubscriptions` is dispatched on **every** outcome — including
+    /// fulfilment failure — because the payment is already committed as paid by
+    /// the caller and the worker must reconcile subscription state regardless.
     pub async fn allocate_on_payment(
+        &self,
+        line_item_id: u64,
+        payment: &SubscriptionPayment,
+    ) -> Result<()> {
+        let res = self.fulfil_on_payment(line_item_id, payment).await;
+        if let Err(e) = self.tx.send(WorkJob::CheckSubscriptions).await {
+            warn!(
+                "Failed to dispatch CheckSubscriptions for line item {}: {}",
+                line_item_id, e
+            );
+        }
+        res
+    }
+
+    /// The fulfilment logic behind [`Self::allocate_on_payment`].
+    async fn fulfil_on_payment(
         &self,
         line_item_id: u64,
         payment: &SubscriptionPayment,
     ) -> Result<()> {
         let li = self.db.get_subscription_line_item(line_item_id).await?;
 
-        // Idempotent: an active allocation already exists → this is a renewal.
         let existing = self
             .db
             .list_ip_range_subscriptions_by_line_item(li.id)
             .await?;
+        // An active allocation already exists → this is a plain renewal.
         if existing.iter().any(|s| s.is_active) {
             return Ok(());
         }
 
+        // Expired-then-renewed: prefer giving the customer their previous
+        // CIDR back over carving a new one.
+        if let Some(prev) = existing.into_iter().max_by_key(|s| s.created)
+            && self.try_reactivate(prev).await?
+        {
+            return Ok(());
+        }
+
+        self.allocate_fresh(&li, payment).await
+    }
+
+    /// Reactivate a previously-deactivated allocation if its CIDR is still
+    /// free in the space. Re-creates registry objects (route object / ROA) for
+    /// the allocation's configured origin ASN, if any. Returns `false` when
+    /// the CIDR was re-allocated to someone else (or is unparsable) and a
+    /// fresh allocation should be made instead.
+    async fn try_reactivate(&self, mut prev: IpRangeSubscription) -> Result<bool> {
+        let cidr: IpNetwork = match prev.cidr.parse() {
+            Ok(c) => c,
+            Err(_) => return Ok(false),
+        };
+        let (active, _) = self
+            .db
+            .list_ip_range_subscriptions_by_space_paginated(
+                prev.available_ip_space_id,
+                None,
+                Some(true),
+                100_000,
+                0,
+            )
+            .await?;
+        let (ps, pe) = net_bounds(&cidr);
+        let clash = active
+            .iter()
+            .filter_map(|s| s.cidr.parse::<IpNetwork>().ok())
+            .filter(|t| t.is_ipv4() == cidr.is_ipv4())
+            .any(|t| {
+                let (ts, te) = net_bounds(&t);
+                ps <= te && ts <= pe
+            });
+        if clash {
+            info!(
+                "Previous allocation {} for line item {} is no longer free — allocating fresh",
+                prev.cidr, prev.subscription_line_item_id
+            );
+            return Ok(false);
+        }
+        prev.is_active = true;
+        prev.ended_at = None;
+        self.db.update_ip_range_subscription(&prev).await?;
+        info!(
+            "Reactivated allocation {} for line item {}",
+            prev.cidr, prev.subscription_line_item_id
+        );
+        // Re-create registry objects for the configured origin ASN (no-op
+        // when none is set; they were torn down on deactivation).
+        let space = self
+            .db
+            .get_available_ip_space(prev.available_ip_space_id)
+            .await?;
+        self.fulfil_registry(&space, &mut prev).await?;
+        Ok(true)
+    }
+
+    /// Carve a fresh CIDR out of the line item's configured IP space.
+    async fn allocate_fresh(
+        &self,
+        li: &SubscriptionLineItem,
+        payment: &SubscriptionPayment,
+    ) -> Result<()> {
         let cfg: IpRangeLineItemConfig = match &li.configuration {
             Some(v) => serde_json::from_value(v.clone())
                 .with_context(|| format!("parse config for line item {}", li.id))?,
@@ -138,8 +230,6 @@ impl IpRangeProvisioner {
             metadata: None,
         };
         self.db.insert_ip_range_subscription(&ips).await?;
-
-        self.tx.send(WorkJob::CheckSubscriptions).await?;
         Ok(())
     }
 
@@ -712,6 +802,129 @@ mod tests {
         assert!(!subs[0].is_active);
         assert_eq!(reg.deleted.lock().unwrap().len(), 1);
         assert_eq!(rpki.removed.lock().unwrap().len(), 1);
+        Ok(())
+    }
+
+    /// Bounded receive so a missing dispatch fails the test instead of
+    /// hanging the suite.
+    async fn recv_timeout(
+        tx: &ChannelWorkCommander,
+    ) -> Result<Vec<lnvps_api_common::WorkJobMessage>> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), tx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("no work job dispatched within 5s"))?
+    }
+
+    /// Regression (suite hang): `allocate_on_payment` must dispatch
+    /// `CheckSubscriptions` on **every** outcome — fresh allocation, plain
+    /// renewal and fulfilment failure — because the payment is already
+    /// committed as paid by the caller. After c97d2f8 only the fresh-allocation
+    /// path dispatched, hanging `test_complete_non_vm_renewal_dispatches_check_subscriptions`.
+    #[tokio::test]
+    async fn test_allocate_on_payment_always_dispatches_check_subscriptions() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let li_id = seed_line_item(&db).await;
+        let tx = Arc::new(ChannelWorkCommander::default());
+        let prov = IpRangeProvisioner::new(db.clone(), tx.clone());
+
+        // Fresh allocation dispatches.
+        prov.allocate_on_payment(li_id, &payment(1)).await?;
+        let jobs = recv_timeout(&tx).await?;
+        assert!(matches!(jobs[0].job, WorkJob::CheckSubscriptions));
+
+        // Plain renewal (active allocation exists) dispatches.
+        prov.allocate_on_payment(li_id, &payment(1)).await?;
+        let jobs = recv_timeout(&tx).await?;
+        assert!(matches!(jobs[0].job, WorkJob::CheckSubscriptions));
+
+        // Fulfilment failure (no configuration) still dispatches.
+        let li2 = SubscriptionLineItem {
+            id: 501,
+            subscription_id: 1,
+            subscription_type: SubscriptionType::IpRange,
+            name: "no config".to_string(),
+            description: None,
+            amount: 1000,
+            setup_amount: 0,
+            configuration: None,
+        };
+        db.subscription_line_items
+            .lock()
+            .await
+            .insert(li2.id, li2.clone());
+        assert!(prov.allocate_on_payment(li2.id, &payment(1)).await.is_err());
+        let jobs = recv_timeout(&tx).await?;
+        assert!(matches!(jobs[0].job, WorkJob::CheckSubscriptions));
+        Ok(())
+    }
+
+    /// An expired line item that renews gets its previous CIDR **reactivated**
+    /// (same row, same subnet) and its registry objects re-created — not a new
+    /// subnet carved out.
+    #[tokio::test]
+    async fn test_renewal_reactivates_previous_allocation() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let li_id = seed_line_item(&db).await;
+        let reg = Arc::new(CapturingRegistry::default());
+        let rpki = Arc::new(CapturingRpki::default());
+        let prov = provisioner(db.clone(), Some(reg.clone()), Some(rpki.clone()));
+
+        prov.allocate_on_payment(li_id, &payment(1)).await?;
+        let id = db.list_ip_range_subscriptions_by_line_item(li_id).await?[0].id;
+        prov.configure_origin_asn(id, Some(3333)).await?;
+
+        // Expire → deactivated, registry objects torn down.
+        let li = db.get_subscription_line_item(li_id).await?;
+        prov.deactivate_line_item(&li).await?;
+
+        // Renewal payment reactivates the same allocation.
+        prov.allocate_on_payment(li_id, &payment(1)).await?;
+        let subs = db.list_ip_range_subscriptions_by_line_item(li_id).await?;
+        assert_eq!(subs.len(), 1, "must reuse the existing row, not add one");
+        assert!(subs[0].is_active);
+        assert!(subs[0].ended_at.is_none());
+        assert_eq!(subs[0].cidr, "192.0.2.0/26");
+        assert_eq!(subs[0].origin_asn, Some(3333));
+        // Registry objects re-created for the configured ASN.
+        assert_eq!(reg.created.lock().unwrap().len(), 2);
+        assert_eq!(rpki.added.lock().unwrap().len(), 2);
+        Ok(())
+    }
+
+    /// If the previous CIDR was re-allocated to another customer while the
+    /// line item was expired, renewal falls back to carving a fresh subnet.
+    #[tokio::test]
+    async fn test_renewal_allocates_fresh_when_previous_cidr_taken() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let li_id = seed_line_item(&db).await;
+        let prov = provisioner(db.clone(), None, None);
+
+        prov.allocate_on_payment(li_id, &payment(1)).await?;
+        let li = db.get_subscription_line_item(li_id).await?;
+        prov.deactivate_line_item(&li).await?;
+
+        // Another line item takes the freed 192.0.2.0/26.
+        let li2 = SubscriptionLineItem {
+            id: 501,
+            configuration: li.configuration.clone(),
+            ..li.clone()
+        };
+        db.subscription_line_items
+            .lock()
+            .await
+            .insert(li2.id, li2.clone());
+        prov.allocate_on_payment(li2.id, &payment(2)).await?;
+        assert_eq!(
+            db.list_ip_range_subscriptions_by_line_item(li2.id).await?[0].cidr,
+            "192.0.2.0/26"
+        );
+
+        // Renewing the original line item must NOT steal the CIDR back.
+        prov.allocate_on_payment(li_id, &payment(1)).await?;
+        let subs = db.list_ip_range_subscriptions_by_line_item(li_id).await?;
+        let active: Vec<_> = subs.iter().filter(|s| s.is_active).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].cidr, "192.0.2.64/26");
         Ok(())
     }
 }

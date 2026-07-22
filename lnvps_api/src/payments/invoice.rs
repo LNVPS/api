@@ -398,8 +398,15 @@ mod tests {
         assert!(p.is_paid, "payment should be marked paid");
         drop(payments);
 
-        // CheckSubscriptions should be dispatched (not CheckVm)
-        let jobs = sub.work_commander().recv().await?;
+        // CheckSubscriptions should be dispatched (not CheckVm). Bound the
+        // wait so a dispatch regression fails the test instead of hanging the
+        // whole suite (recv() on ChannelWorkCommander never times out).
+        let jobs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sub.work_commander().recv(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("no work job dispatched within 5s"))??;
         assert_eq!(jobs.len(), 1, "expected exactly one work job");
         assert!(
             matches!(&jobs[0].job, WorkJob::CheckSubscriptions),
