@@ -780,6 +780,8 @@ pub struct VmOsImage {
     pub release_date: DateTime<Utc>,
     /// URL location of cloud image
     pub url: String,
+    /// CPU architecture this image targets (x86_64 / arm64)
+    pub cpu_arch: CpuArch,
     pub default_username: Option<String>,
     /// SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
     pub sha2: Option<String>,
@@ -2274,6 +2276,7 @@ mod tests {
             enabled: true,
             release_date: Utc::now(),
             url: url.to_string(),
+            cpu_arch: CpuArch::X86_64,
             default_username: None,
             sha2: None,
             sha2_url: None,

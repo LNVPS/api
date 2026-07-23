@@ -1425,6 +1425,8 @@ Body:
   "release_date": "string (ISO 8601)",
   "url": "string",
   // URL to the cloud image
+   "cpu_arch": "string (optional)",
+   // CPU architecture (e.g. "x86_64", "arm64"). Defaults to "x86_64" when omitted.
    "default_username": "string (optional)",
    // Default SSH username
    "sha2": "string (optional)",
@@ -1453,6 +1455,8 @@ Body (all optional):
   "enabled": boolean,
   "release_date": "string (ISO 8601)",
   "url": "string",
+   "cpu_arch": "string | null",
+   // CPU architecture (e.g. "x86_64", "arm64"); send null to reset to unspecified
    "default_username": "string",
    "sha2": "string (optional)",
    // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification

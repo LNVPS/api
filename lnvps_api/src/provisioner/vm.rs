@@ -14,10 +14,31 @@ use lnvps_api_common::{
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
-    IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType,
+    CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType,
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
     SubscriptionType, Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
 };
+
+/// Ensure an OS image's CPU architecture is compatible with the target
+/// template's architecture.
+///
+/// A `CpuArch::Unknown` on either side means "unspecified/any" and is always
+/// accepted (keeps legacy images/templates working). Two concrete, differing
+/// architectures (e.g. an x86_64 image on an arm64 template) are rejected so
+/// an incompatible image can never be provisioned onto a host.
+fn ensure_image_arch_compatible(image_arch: CpuArch, template_arch: CpuArch) -> Result<()> {
+    if matches!(image_arch, CpuArch::Unknown) || matches!(template_arch, CpuArch::Unknown) {
+        return Ok(());
+    }
+    if image_arch != template_arch {
+        bail!(
+            "OS image architecture ({}) is not compatible with the template architecture ({})",
+            image_arch,
+            template_arch
+        );
+    }
+    Ok(())
+}
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
@@ -105,6 +126,7 @@ impl VmProvisioner {
         if !image.enabled {
             bail!("Cant create VM from disabled os image");
         }
+        ensure_image_arch_compatible(image.cpu_arch, template.cpu_arch)?;
 
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
@@ -226,6 +248,7 @@ impl VmProvisioner {
         if !image.enabled {
             bail!("Cant create VM from disabled os image");
         }
+        ensure_image_arch_compatible(image.cpu_arch, template.cpu_arch)?;
 
         // Reject out-of-range specs at order time (pricing itself no longer
         // validates, so existing/grandfathered VMs can still be priced/renewed).
@@ -1111,6 +1134,24 @@ impl SpawnVmContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_arch_compat_matching_and_any() {
+        // Exact match
+        assert!(ensure_image_arch_compatible(CpuArch::X86_64, CpuArch::X86_64).is_ok());
+        assert!(ensure_image_arch_compatible(CpuArch::ARM64, CpuArch::ARM64).is_ok());
+        // Unknown on either side == "any"
+        assert!(ensure_image_arch_compatible(CpuArch::Unknown, CpuArch::ARM64).is_ok());
+        assert!(ensure_image_arch_compatible(CpuArch::X86_64, CpuArch::Unknown).is_ok());
+        assert!(ensure_image_arch_compatible(CpuArch::Unknown, CpuArch::Unknown).is_ok());
+    }
+
+    #[test]
+    fn image_arch_compat_mismatch_rejected() {
+        assert!(ensure_image_arch_compatible(CpuArch::X86_64, CpuArch::ARM64).is_err());
+        assert!(ensure_image_arch_compatible(CpuArch::ARM64, CpuArch::X86_64).is_err());
+    }
+
     use crate::mocks::{MockDnsServer, MockNode, MockOnChainProvider, MockRouter};
     use crate::settings::mock_settings;
     use crate::subscription::{
