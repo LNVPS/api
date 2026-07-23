@@ -1975,6 +1975,22 @@ impl ProxmoxClient {
         Ok(entry.checksum)
     }
 
+    /// Run a shell command on the Proxmox node over SSH.
+    ///
+    /// Delegates to [`SshClient::run_command`], which performs the blocking
+    /// libssh2 connect + exec on a dedicated blocking thread. This is important
+    /// for long-running commands (image downloads, decompression): doing the
+    /// blocking SSH I/O directly on an async worker thread would stall the entire
+    /// tokio runtime for the command's full duration.
+    async fn ssh_run(&self, command: String) -> Result<(i32, String)> {
+        let ssh_cfg = match &self.ssh {
+            Some(s) => s,
+            None => anyhow::bail!("SSH not configured"),
+        };
+        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
+        SshClient::run_command(host, 22, ssh_cfg.user.clone(), ssh_cfg.key.clone(), command).await
+    }
+
     /// Verify an already-downloaded image's checksum via SSH by running the appropriate
     /// sum utility on the Proxmox node.  Returns `true` if the checksum matches.
     pub async fn verify_image_checksum(
@@ -1984,11 +2000,6 @@ impl ProxmoxClient {
         expected: &str,
         algorithm: &str,
     ) -> Result<bool> {
-        let ssh_cfg = match &self.ssh {
-            Some(s) => s,
-            None => anyhow::bail!("SSH not configured, cannot verify checksum"),
-        };
-
         // Proxmox stores ISOs under /var/lib/vz/template/iso/ by default
         let iso_path = format!("/var/lib/vz/template/iso/{filename}");
         let cmd = match algorithm {
@@ -1996,14 +2007,7 @@ impl ProxmoxClient {
             other => anyhow::bail!("Unknown checksum algorithm: {other}"),
         };
 
-        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
-        let ssh_user = ssh_cfg.user.clone();
-        let ssh_key = ssh_cfg.key.clone();
-
-        let mut ssh = SshClient::new()?;
-        ssh.connect((host.as_str(), 22), &ssh_user, &ssh_key)
-            .await?;
-        let (exit_code, output) = ssh.execute(&cmd).await?;
+        let (exit_code, output) = self.ssh_run(cmd).await?;
         if exit_code != 0 {
             anyhow::bail!("Checksum command failed (exit {}): {}", exit_code, output);
         }
@@ -2026,11 +2030,6 @@ impl ProxmoxClient {
     /// truncated file at the final path. Used for compressed images, whose real
     /// filename (e.g. `foo.qcow2.xz`) Proxmox's download-url API rejects.
     pub async fn download_image_ssh(&self, url: &str, filename: &str) -> Result<()> {
-        let ssh_cfg = match &self.ssh {
-            Some(s) => s,
-            None => anyhow::bail!("SSH not configured, cannot download image"),
-        };
-
         let dir = "/var/lib/vz/template/iso";
         let dst = format!("{dir}/{filename}");
         let tmp = format!("{dst}.part");
@@ -2045,17 +2044,10 @@ impl ProxmoxClient {
              fi && mv -f '{tmp}' '{dst}'"
         );
 
-        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
-        let ssh_user = ssh_cfg.user.clone();
-        let ssh_key = ssh_cfg.key.clone();
-
-        let mut ssh = SshClient::new()?;
-        ssh.connect((host.as_str(), 22), &ssh_user, &ssh_key)
-            .await?;
-        let (exit_code, output) = ssh.execute(&cmd).await?;
+        let (exit_code, output) = self.ssh_run(cmd).await?;
         if exit_code != 0 {
             // Best-effort cleanup of any partial download.
-            let _ = ssh.execute(&format!("rm -f '{tmp}'")).await;
+            let _ = self.ssh_run(format!("rm -f '{tmp}'")).await;
             anyhow::bail!("Download failed (exit {}): {}", exit_code, output.trim());
         }
         Ok(())
@@ -2074,11 +2066,6 @@ impl ProxmoxClient {
         compressed: &str,
         output: &str,
     ) -> Result<()> {
-        let ssh_cfg = match &self.ssh {
-            Some(s) => s,
-            None => anyhow::bail!("SSH not configured, cannot decompress image"),
-        };
-
         // Proxmox stores ISOs under /var/lib/vz/template/iso/ by default,
         // matching verify_image_checksum and import_disk_image.
         let dir = "/var/lib/vz/template/iso";
@@ -2098,17 +2085,10 @@ impl ProxmoxClient {
         };
         let cmd = format!("{tool} '{src}' > '{tmp}' && mv -f '{tmp}' '{dst}' && rm -f '{src}'");
 
-        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
-        let ssh_user = ssh_cfg.user.clone();
-        let ssh_key = ssh_cfg.key.clone();
-
-        let mut ssh = SshClient::new()?;
-        ssh.connect((host.as_str(), 22), &ssh_user, &ssh_key)
-            .await?;
-        let (exit_code, output) = ssh.execute(&cmd).await?;
+        let (exit_code, output) = self.ssh_run(cmd).await?;
         if exit_code != 0 {
             // Best-effort cleanup of any partial temp file.
-            let _ = ssh.execute(&format!("rm -f '{tmp}'")).await;
+            let _ = self.ssh_run(format!("rm -f '{tmp}'")).await;
             anyhow::bail!(
                 "Decompression failed (exit {}): {}",
                 exit_code,

@@ -3153,18 +3153,36 @@ pub(crate) async fn download_images_on_hosts(
     clients: Vec<(String, Arc<dyn VmHostClient>)>,
     images: &[VmOsImage],
 ) {
-    let tasks = clients.into_iter().map(|(host_name, client)| async move {
-        for image in images {
-            info!("Checking image {} on host {}", image.url, host_name);
-            if let Err(e) = client.download_os_image(image).await {
-                warn!(
-                    "Failed to download image {} on host {}: {}",
-                    image.url, host_name, e
-                );
-            }
+    // Spawn each host on its own task rather than combining them with
+    // `join_all`. Host image downloads run over SSH (wget/decompress/checksum),
+    // and `SshClient::execute` performs *blocking* socket I/O for the full
+    // duration of each command. Under `join_all` all host futures share a single
+    // task, so one host's blocking download stalls every other host (serialising
+    // them). Independent tasks let the multi-threaded runtime run the blocking
+    // downloads concurrently across worker threads. Images on a single host are
+    // still processed sequentially to avoid saturating that host's storage.
+    let tasks: Vec<_> = clients
+        .into_iter()
+        .map(|(host_name, client)| {
+            let images = images.to_vec();
+            tokio::spawn(async move {
+                for image in &images {
+                    info!("Checking image {} on host {}", image.url, host_name);
+                    if let Err(e) = client.download_os_image(image).await {
+                        warn!(
+                            "Failed to download image {} on host {}: {}",
+                            image.url, host_name, e
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in tasks {
+        if let Err(e) = t.await {
+            warn!("Image download task panicked: {}", e);
         }
-    });
-    futures::future::join_all(tasks).await;
+    }
 }
 
 #[cfg(test)]

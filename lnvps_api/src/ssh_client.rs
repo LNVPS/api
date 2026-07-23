@@ -63,6 +63,50 @@ impl SshClient {
         self.session.set_blocking(blocking);
     }
 
+    /// Connect and run a single command entirely on a blocking thread.
+    ///
+    /// libssh2 I/O is synchronous and blocking; running it directly inside an
+    /// async task (as [`connect`](Self::connect) + [`execute`](Self::execute)
+    /// do) stalls the tokio worker thread for the whole duration of the command.
+    /// For long-running commands — image downloads, decompression — that freezes
+    /// the entire runtime. This helper performs the connect + exec on a dedicated
+    /// blocking thread (via `spawn_blocking`) using a synchronous
+    /// [`std::net::TcpStream`], so the async runtime keeps making progress.
+    pub async fn run_command(
+        host: String,
+        port: u16,
+        username: String,
+        key: PathBuf,
+        command: String,
+    ) -> Result<(i32, String)> {
+        tokio::task::spawn_blocking(move || -> Result<(i32, String)> {
+            let tcp = std::net::TcpStream::connect((host.as_str(), port))?;
+            let mut session = ssh2::Session::new()?;
+            session.set_tcp_stream(tcp);
+            session.handshake()?;
+            session.userauth_pubkey_file(&username, None, &key, None)?;
+
+            let mut channel = session.channel_session()?;
+            channel.exec(&command)?;
+            let mut s = String::new();
+            channel.read_to_string(&mut s)?;
+            // Drain stderr and fold it into the output on failure (see `execute`).
+            let mut err = String::new();
+            channel.stderr().read_to_string(&mut err)?;
+            channel.wait_close()?;
+            let code = channel.exit_status()?;
+            if code != 0 && !err.trim().is_empty() {
+                if !s.is_empty() && !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push_str("stderr: ");
+                s.push_str(err.trim_end());
+            }
+            Ok((code, s))
+        })
+        .await?
+    }
+
     pub async fn execute(&mut self, command: &str) -> Result<(i32, String)> {
         info!("Executing command: {}", command);
         let mut channel = self.session.channel_session()?;
