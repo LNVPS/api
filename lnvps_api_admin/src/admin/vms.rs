@@ -660,13 +660,13 @@ struct AdminExtendAllVmsResult {
     failed: u64,
 }
 
-/// Extend all currently non-expired VMs by `days` in a single request.
+/// Extend all active VMs by `days` in a single request.
 ///
-/// Only active VMs — non-deleted VMs whose subscription has a concrete future
-/// expiry — are candidates. Deleted, never-paid (`expires = null`), and
-/// already-expired VMs are filtered out at the database level (`list_active_vms`),
-/// since this endpoint is for granting extra time to active customers (e.g.
-/// compensating downtime), not for reviving dead VMs.
+/// "Active" means non-deleted VMs whose subscription has been set up (paid at
+/// least once) — this **includes currently-expired VMs** so an admin can
+/// revive a lapsed customer VM, e.g. to compensate for downtime. Never-paid
+/// pending orders (`is_setup = 0`) and deleted VMs are filtered out at the
+/// database level (`list_active_vms`).
 async fn admin_extend_all_vms(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -684,8 +684,9 @@ async fn admin_extend_all_vms(
         return ApiData::err("Cannot extend by more than 365 days");
     }
 
-    // Fetch only the VMs we intend to extend (non-deleted, non-expired) — the
-    // DB does the filtering so we don't pull the whole fleet into memory.
+    // Fetch only the VMs we intend to extend (non-deleted, set-up — expired
+    // included) — the DB does the filtering so we don't pull the whole fleet
+    // (incl. never-paid orders) into memory.
     let vms = this.db.list_active_vms().await?;
 
     let mut extended = 0u64;

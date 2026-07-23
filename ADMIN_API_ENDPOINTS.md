@@ -571,7 +571,7 @@ Body:
 }
 ```
 
-#### Extend All Non-Expired VMs
+#### Extend All Active VMs
 
 ```
 POST /api/admin/v1/vms/extend-all
@@ -579,7 +579,7 @@ POST /api/admin/v1/vms/extend-all
 
 Required Permission: `virtual_machines::bulk_update` (a fleet-wide action, granted only to `super_admin` by default)
 
-Extends every currently **non-expired** VM by the given number of days in a single request (e.g. to compensate customers for downtime). Only active VMs — non-deleted VMs whose subscription has a concrete future expiry — are extended; deleted VMs, never-paid VMs (`expires = null`), and already-expired VMs are excluded at the database level and never fetched. Each extended VM is logged to its history and re-synced via a `SpawnVm` job, exactly like the single-VM extend.
+Extends every **active** VM by the given number of days in a single request (e.g. to compensate customers for downtime). "Active" means non-deleted VMs whose subscription has been set up (paid at least once) — this **includes currently-expired VMs**, so an admin can revive a lapsed VM. Never-paid pending orders and deleted VMs are excluded at the database level and never fetched. Each extended VM is logged to its history and re-synced via a `SpawnVm` job, exactly like the single-VM extend.
 
 Body:
 

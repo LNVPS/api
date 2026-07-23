@@ -1048,7 +1048,8 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn list_active_vms(&self) -> DbResult<Vec<Vm>> {
-        // Active VMs: non-deleted with a concrete future subscription expiry.
+        // Active VMs: non-deleted whose subscription has been set up (paid at
+        // least once), regardless of current expiry (expired VMs included).
         let vm_list: Vec<Vm> = {
             let vms = self.vms.lock().await;
             vms.values().filter(|v| !v.deleted).cloned().collect()
@@ -1064,7 +1065,7 @@ impl LNVpsDbBase for MockDb {
             if let Some(sid) = sub_id {
                 let subs = self.subscriptions.lock().await;
                 if let Some(sub) = subs.get(&sid) {
-                    if sub.expires.map(|e| e > Utc::now()).unwrap_or(false) {
+                    if sub.is_setup {
                         active.push(vm);
                     }
                 }
@@ -5515,8 +5516,15 @@ mod tests {
         use lnvps_db::Vm;
         let db = MockDb::default();
 
-        // Helper to seed a VM + line item + subscription with the given expiry.
-        async fn seed(db: &MockDb, id: u64, expires: Option<chrono::DateTime<Utc>>, deleted: bool) {
+        // Helper to seed a VM + line item + subscription with the given expiry
+        // and setup state.
+        async fn seed(
+            db: &MockDb,
+            id: u64,
+            expires: Option<chrono::DateTime<Utc>>,
+            is_setup: bool,
+            deleted: bool,
+        ) {
             db.subscriptions.lock().await.insert(
                 id,
                 Subscription {
@@ -5527,8 +5535,8 @@ mod tests {
                     description: None,
                     created: Utc::now(),
                     expires,
-                    is_active: true,
-                    is_setup: true,
+                    is_active: is_setup,
+                    is_setup,
                     currency: "EUR".to_string(),
                     interval_amount: 1,
                     interval_type: IntervalType::Month,
@@ -5562,10 +5570,11 @@ mod tests {
         }
 
         let now = Utc::now();
-        seed(&db, 1, Some(now + chrono::Duration::days(10)), false).await; // active
-        seed(&db, 2, Some(now - chrono::Duration::days(1)), false).await; // expired
-        seed(&db, 3, None, false).await; // never-paid (null expiry)
-        seed(&db, 4, Some(now + chrono::Duration::days(10)), true).await; // deleted
+        // (expires, is_setup, deleted)
+        seed(&db, 1, Some(now + chrono::Duration::days(10)), true, false).await; // paid, future
+        seed(&db, 2, Some(now - chrono::Duration::days(1)), true, false).await; // paid, expired
+        seed(&db, 3, None, false, false).await; // never-paid pending order
+        seed(&db, 4, Some(now + chrono::Duration::days(10)), true, true).await; // deleted
 
         let mut active: Vec<u64> = db
             .list_active_vms()
@@ -5575,10 +5584,11 @@ mod tests {
             .map(|v| v.id)
             .collect();
         active.sort();
+        // Includes the expired-but-paid VM (2); excludes never-paid (3) and deleted (4).
         assert_eq!(
             active,
-            vec![1],
-            "only the non-deleted future-expiry VM is active"
+            vec![1, 2],
+            "active = non-deleted, set-up VMs (incl. expired)"
         );
     }
 }
