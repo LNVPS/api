@@ -432,27 +432,6 @@ impl ProxmoxClient {
         Ok(Some(vol_ref))
     }
 
-    /// Download an image to the host disk
-    pub async fn download_image(&self, req: DownloadUrlRequest) -> OpResult<TaskId> {
-        let api = &self.api;
-        let node_clone = req.node.clone();
-
-        let rsp: ResponseBase<String> = api
-            .post(
-                &format!(
-                    "/api2/json/nodes/{}/storage/{}/download-url",
-                    req.node, req.storage
-                ),
-                &req,
-            )
-            .await?;
-
-        Ok(TaskId {
-            id: rsp.data,
-            node: node_clone,
-        })
-    }
-
     pub async fn import_disk_image(&self, req: ImportDiskImageRequest) -> OpResult<()> {
         // import the disk
         // TODO: find a way to avoid using SSH
@@ -1353,8 +1332,13 @@ impl VmHostClient for ProxmoxClient {
         // url_name:     the original filename from the URL, used in SHASUMS
         //               (e.g. foo.qcow2 or, when compressed, foo.qcow2.xz)
         // download_name: the filename we download to the host. For compressed
-        //               images this is the compressed file (url_name); it is
-        //               decompressed into storage_name afterwards.
+        //               images this is the real compressed file (url_name), which
+        //               we fetch directly on the host over SSH (wget/curl) and then
+        //               decompress into storage_name. We bypass Proxmox's
+        //               download-url API for compressed images because it validates
+        //               the filename extension against the ISO content type and only
+        //               accepts `.iso`/`.img` (a `.qcow2.xz` name is rejected with
+        //               "wrong file extension").
         let compression = image.compression();
         let storage_name = image.filename()?;
         let url_name = image.url_filename()?;
@@ -1455,35 +1439,16 @@ impl VmHostClient for ProxmoxClient {
             }
         }
 
-        // Resolve any HTTP redirects before handing the URL to Proxmox.
-        // Proxmox's download-url API does not always follow redirects itself,
-        // so we probe for the final location here and pass that instead.
-        let resolved_url = lnvps_api_common::shasum::resolve_redirect(&image.url).await;
-        if resolved_url != image.url {
-            info!(
-                "Resolved redirect for image {}: {} -> {}",
-                storage_name, image.url, resolved_url
-            );
-        }
-
-        // Do not include checksum/checksum-algorithm in the download-url request.
-        // Proxmox's built-in hash verification has proven buggy and causes download
-        // failures. Integrity is verified separately via SSH after the download
-        // completes (see verify_image_checksum). Proxmox's own decompression is
-        // likewise unreliable (historically ISO-only), so compressed images are
-        // downloaded as-is and decompressed by us over SSH afterwards.
-        let t_download = self
-            .download_image(DownloadUrlRequest {
-                content: StorageContent::ISO,
-                node: self.node.clone(),
-                storage: iso_storage.clone(),
-                url: resolved_url,
-                filename: download_name.clone(),
-                checksum: None,
-                checksum_algorithm: None,
-            })
-            .await?;
-        self.wait_for_task(&t_download).await?;
+        // Fetch the image directly on the host over SSH (wget/curl). We no longer
+        // use Proxmox's download-url API at all: it rejects compressed filenames
+        // (`.qcow2.xz` -> "wrong file extension"), does not reliably follow
+        // redirects, and its built-in checksum verification has proven broken.
+        // wget/curl follow redirects natively; integrity is verified via SSH
+        // below (see verify_image_checksum) and compressed images are decompressed
+        // by us afterwards.
+        self.download_image_ssh(&image.url, &download_name)
+            .await
+            .map_err(OpError::Fatal)?;
 
         // Verify the freshly-downloaded file via SSH to confirm integrity. This
         // runs against download_name (the compressed artifact for compressed
@@ -2052,6 +2017,50 @@ impl ProxmoxClient {
         Ok(actual == expected_lower)
     }
 
+    /// Download a URL directly onto the host over SSH into the ISO storage dir.
+    ///
+    /// Fetches `url` into `filename` under `/var/lib/vz/template/iso/` using
+    /// `wget` (falling back to `curl`), both of which follow HTTP redirects
+    /// natively. The download goes to a `.part` temp file that is atomically
+    /// moved into place on success, so an interrupted download never leaves a
+    /// truncated file at the final path. Used for compressed images, whose real
+    /// filename (e.g. `foo.qcow2.xz`) Proxmox's download-url API rejects.
+    pub async fn download_image_ssh(&self, url: &str, filename: &str) -> Result<()> {
+        let ssh_cfg = match &self.ssh {
+            Some(s) => s,
+            None => anyhow::bail!("SSH not configured, cannot download image"),
+        };
+
+        let dir = "/var/lib/vz/template/iso";
+        let dst = format!("{dir}/{filename}");
+        let tmp = format!("{dst}.part");
+        // Prefer wget; fall back to curl. `-fL`/redirect-following ensures CDN
+        // redirects (common for release mirrors) are handled on the host.
+        let cmd = format!(
+            "mkdir -p '{dir}' && \
+             if command -v wget >/dev/null 2>&1; then \
+                 wget -q -O '{tmp}' '{url}'; \
+             else \
+                 curl -fLsS -o '{tmp}' '{url}'; \
+             fi && mv -f '{tmp}' '{dst}'"
+        );
+
+        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
+        let ssh_user = ssh_cfg.user.clone();
+        let ssh_key = ssh_cfg.key.clone();
+
+        let mut ssh = SshClient::new()?;
+        ssh.connect((host.as_str(), 22), &ssh_user, &ssh_key)
+            .await?;
+        let (exit_code, output) = ssh.execute(&cmd).await?;
+        if exit_code != 0 {
+            // Best-effort cleanup of any partial download.
+            let _ = ssh.execute(&format!("rm -f '{tmp}'")).await;
+            anyhow::bail!("Download failed (exit {}): {}", exit_code, output.trim());
+        }
+        Ok(())
+    }
+
     /// Decompress a downloaded compressed image on the host via SSH.
     ///
     /// Reads `compressed` (e.g. `foo.qcow2.xz`) from the ISO storage directory,
@@ -2419,19 +2428,6 @@ impl NodeStorage {
 
 #[derive(Debug, Deserialize)]
 pub struct NodeDisk {}
-
-#[derive(Debug, Serialize)]
-pub struct DownloadUrlRequest {
-    pub content: StorageContent,
-    pub node: String,
-    pub storage: String,
-    pub url: String,
-    pub filename: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checksum: Option<String>,
-    #[serde(rename = "checksum-algorithm", skip_serializing_if = "Option::is_none")]
-    pub checksum_algorithm: Option<String>,
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StorageContentEntry {
