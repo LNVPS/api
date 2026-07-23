@@ -258,6 +258,13 @@ async fn admin_get_vm(
 struct AdminPatchVmRequest {
     /// Set the disabled state of the VM
     disabled: Option<bool>,
+    /// Set/clear the admin-only notes on the VM. `Some(Some(..))` sets the
+    /// notes, `Some(None)` clears them, omitted leaves them unchanged.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    admin_notes: Option<Option<String>>,
 }
 
 /// Patch (update) a VM
@@ -278,6 +285,7 @@ async fn admin_patch_vm(
     }
 
     let mut needs_reconfigure = false;
+    let mut needs_save = false;
 
     // Handle disabled state change
     if let Some(disabled) = req.disabled {
@@ -285,6 +293,23 @@ async fn admin_patch_vm(
             vm.disabled = disabled;
             needs_reconfigure = true;
         }
+    }
+
+    // Handle admin notes change (DB-only metadata, no host reconfigure needed)
+    if let Some(admin_notes) = &req.admin_notes
+        && vm.admin_notes != *admin_notes
+    {
+        vm.admin_notes = admin_notes.clone();
+        needs_save = true;
+    }
+
+    // Notes-only change: persist without reconfiguring the VM on the host.
+    if needs_save && !needs_reconfigure {
+        this.db.update_vm(&vm).await?;
+        info!("Admin {} updated VM {} admin_notes", auth.user_id, id);
+        return ApiData::ok(JobResponse {
+            job_id: String::new(),
+        });
     }
 
     if needs_reconfigure {
@@ -972,4 +997,31 @@ async fn admin_complete_vm_payment(
         vm_id,
         base_currency,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_patch_vm_request_admin_notes_nullable() {
+        // Set notes
+        let req: AdminPatchVmRequest =
+            serde_json::from_str(r#"{"admin_notes": "abusive user"}"#).unwrap();
+        assert_eq!(req.admin_notes, Some(Some("abusive user".to_string())));
+
+        // Clear notes (explicit null)
+        let req: AdminPatchVmRequest = serde_json::from_str(r#"{"admin_notes": null}"#).unwrap();
+        assert_eq!(req.admin_notes, Some(None));
+
+        // Omitted => leave unchanged
+        let req: AdminPatchVmRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req.admin_notes, None);
+
+        // Coexists with disabled
+        let req: AdminPatchVmRequest =
+            serde_json::from_str(r#"{"disabled": true, "admin_notes": "x"}"#).unwrap();
+        assert_eq!(req.disabled, Some(true));
+        assert_eq!(req.admin_notes, Some(Some("x".to_string())));
+    }
 }

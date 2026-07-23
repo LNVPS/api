@@ -1309,6 +1309,8 @@ pub struct Vm {
     pub fw_policy_in: Option<VmFirewallPolicy>,
     /// Default outbound firewall policy (None = inherit host default / accept)
     pub fw_policy_out: Option<VmFirewallPolicy>,
+    /// Free-form admin-only notes about this VM (not exposed to the customer)
+    pub admin_notes: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

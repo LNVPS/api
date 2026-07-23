@@ -686,6 +686,9 @@ pub struct AdminVmInfo {
     pub deleted: bool,
     pub ref_code: Option<String>,
     pub disabled: bool,
+    /// Free-form admin-only notes about this VM (not exposed to the customer)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_notes: Option<String>,
     /// Subscription linked to this VM (includes line items and payment count)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription: Option<AdminSubscriptionInfo>,
@@ -860,6 +863,7 @@ impl AdminVmInfo {
             deleted,
             ref_code,
             disabled: vm.disabled,
+            admin_notes: vm.admin_notes.clone(),
             subscription,
         })
     }

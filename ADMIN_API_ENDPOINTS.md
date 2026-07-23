@@ -429,7 +429,8 @@ Body (all optional):
 
 ```json
 {
-  "disabled": boolean  // Enable/disable the VM
+  "disabled": boolean,  // Enable/disable the VM
+  "admin_notes": "string | null"  // Set admin-only notes; null clears them, omit to leave unchanged
 }
 ```
 
@@ -443,7 +444,7 @@ Response:
 }
 ```
 
-**Note:** The `disabled` field allows admins to disable a VM without deleting it. When the disabled state changes, a reconfigure job is dispatched to update the VM on the host (e.g., setting `link_down=1` on the network interface). The `job_id` will be empty if no changes were made.
+**Note:** The `disabled` field allows admins to disable a VM without deleting it. When the disabled state changes, a reconfigure job is dispatched to update the VM on the host (e.g., setting `link_down=1` on the network interface). The `job_id` will be empty if no changes were made. The `admin_notes` field is free-form admin-only metadata (returned as `admin_notes` on the VM info responses, never exposed to the customer API); updating it alone persists immediately without dispatching a reconfigure job (empty `job_id`).
 
 #### Delete VM
 
