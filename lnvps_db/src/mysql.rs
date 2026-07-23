@@ -1079,7 +1079,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vm(&self, vm: &Vm) -> DbResult<()> {
         sqlx::query(
-            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=?,fw_policy_in=?,fw_policy_out=? where id=?",
+            "update vm set image_id=?,template_id=?,custom_template_id=?,subscription_line_item_id=?,ssh_key_id=?,disk_id=?,mac_address=?,disabled=?,fw_policy_in=?,fw_policy_out=?,admin_notes=? where id=?",
         )
             .bind(vm.image_id)
             .bind(vm.template_id)
@@ -1091,6 +1091,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.disabled)
             .bind(vm.fw_policy_in)
             .bind(vm.fw_policy_out)
+            .bind(&vm.admin_notes)
             .bind(vm.id)
             .execute(&self.db)
             .await?;

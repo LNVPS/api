@@ -203,6 +203,7 @@ mod tests {
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
+            admin_notes: None,
         };
 
         assert_eq!(failing_host.start_failures_remaining(), 2);
@@ -249,6 +250,7 @@ mod tests {
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
+            admin_notes: None,
         };
 
         assert_eq!(failing_host.stop_failures_remaining(), 1);
@@ -290,6 +292,7 @@ mod tests {
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
+            admin_notes: None,
         };
 
         assert_eq!(failing_host.delete_failures_remaining(), 1);
