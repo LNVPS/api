@@ -361,8 +361,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List expired VM's
     async fn list_expired_vms(&self) -> DbResult<Vec<Vm>>;
 
-    /// List active (non-deleted, non-expired) VM's — those whose subscription
-    /// has a concrete future expiry.
+    /// List active VM's — non-deleted VM's whose subscription has been set up
+    /// (paid at least once). Includes VM's that are currently **expired** (a
+    /// real customer VM that has lapsed but not yet been purged); excludes
+    /// never-paid pending orders (`is_setup = 0`) and deleted VM's.
     async fn list_active_vms(&self) -> DbResult<Vec<Vm>>;
 
     /// List VM's owned by a specific user
