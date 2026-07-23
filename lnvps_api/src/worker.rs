@@ -2334,9 +2334,15 @@ impl Worker {
                             )
                             .await
                             .ok();
-                        if let Err(e) = self.work_commander.send(WorkJob::CheckVm { vm_id: *vm_id }).await
+                        if let Err(e) = self
+                            .work_commander
+                            .send(WorkJob::CheckVm { vm_id: *vm_id })
+                            .await
                         {
-                            warn!("Failed to queue CheckVm after reinstall of VM {}: {}", vm_id, e);
+                            warn!(
+                                "Failed to queue CheckVm after reinstall of VM {}: {}",
+                                vm_id, e
+                            );
                         }
                         JobFeedback::create_job_completed_feedback(
                             reply_channel.clone(),
@@ -2351,7 +2357,10 @@ impl Worker {
                     ),
                 };
                 if let Err(e) = self.feedback.publish(feedback).await {
-                    warn!("Failed to publish ReinstallVm reply for VM {}: {}", vm_id, e);
+                    warn!(
+                        "Failed to publish ReinstallVm reply for VM {}: {}",
+                        vm_id, e
+                    );
                 }
                 return Ok(Some(match &result {
                     Ok(()) => format!("VM {} reinstalled successfully", vm_id),
