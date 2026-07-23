@@ -1055,6 +1055,7 @@ impl ProxmoxClient {
             boot: Some("order=scsi0".to_string()),
             cores: Some(vm_resources.cpu as i32),
             memory: Some((vm_resources.memory / crate::MB).to_string()),
+            balloon: self.config.balloon_mb(vm_resources.memory / crate::MB),
             scsi_hw: Some("virtio-scsi-pci".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
@@ -2800,6 +2801,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
 
@@ -2816,6 +2818,8 @@ mod tests {
         assert_eq!(vm.cpu, Some(q_cfg.cpu));
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
+        // No balloon floor configured => no balloon key
+        assert_eq!(vm.balloon, None);
         assert_eq!(vm.on_boot, Some(true));
         assert!(vm.net.as_ref().unwrap().contains("tag=100"));
         assert!(vm.net.as_ref().unwrap().contains("firewall=1"));
@@ -2826,6 +2830,31 @@ mod tests {
                     .to_string()
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_balloon_floor() -> Result<()> {
+        let cfg = mock_full_vm();
+        let template = cfg.template.clone().unwrap();
+        let memory_mb = template.memory / MB;
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: Some(90),
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
+
+        let vm = p.make_config(&cfg, None)?;
+        // Full memory is still the sold amount; balloon is the 90% floor.
+        assert_eq!(vm.memory, Some(memory_mb.to_string()));
+        assert_eq!(vm.balloon, Some((memory_mb * 90 / 100) as i32));
         Ok(())
     }
 
@@ -2854,6 +2883,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
@@ -2921,6 +2951,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
 
@@ -2949,6 +2980,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
 
@@ -3167,6 +3199,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
 
@@ -3209,6 +3242,7 @@ mod tests {
             cpu: "host".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
@@ -3268,6 +3302,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
         let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
@@ -3328,6 +3363,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
         let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
@@ -3385,6 +3421,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         }
     }

@@ -501,8 +501,31 @@ pub struct QemuConfig {
     pub kvm: bool,
     /// CPU architecture
     pub arch: String,
+    /// Auto-ballooning floor as a percentage of the VM's sold RAM.
+    ///
+    /// When set (1..=99), created/reconfigured VMs carry a `balloon` value of
+    /// `memory_mb * balloon_min_pct / 100`, guaranteeing the guest at least
+    /// that percentage of its RAM while allowing Proxmox auto-ballooning to
+    /// reclaim the remainder under host memory pressure (a pressure-relief
+    /// valve against host OOM-kills). Unset / `0` / `>= 100` leaves the
+    /// `balloon` key out, which disables dynamic ballooning (current default).
+    pub balloon_min_pct: Option<u8>,
     /// Firewall configuration options
     pub firewall_config: Option<FirewallConfig>,
+}
+
+impl QemuConfig {
+    /// Compute the Proxmox `balloon` value (in MB) for a VM with the given
+    /// sold memory, honouring [`QemuConfig::balloon_min_pct`].
+    ///
+    /// Returns `None` (no `balloon` key, i.e. dynamic ballooning disabled)
+    /// when the floor is unset, `0`, or `>= 100`.
+    pub fn balloon_mb(&self, memory_mb: u64) -> Option<i32> {
+        match self.balloon_min_pct {
+            Some(pct) if (1..100).contains(&pct) => Some((memory_mb * pct as u64 / 100) as i32),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -566,6 +589,7 @@ pub fn mock_settings() -> Settings {
                     cpu: "kvm64".to_string(),
                     kvm: false,
                     arch: "x86_64".to_string(),
+                    balloon_min_pct: None,
                     firewall_config: None,
                 },
                 ssh: None,
@@ -598,6 +622,37 @@ pub fn mock_settings() -> Settings {
 mod tests {
     use super::*;
     use lnvps_db::DnsServerKind;
+
+    fn qemu_with_balloon(pct: Option<u8>) -> QemuConfig {
+        QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "host".to_string(),
+            kvm: false,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: pct,
+            firewall_config: None,
+        }
+    }
+
+    #[test]
+    fn test_balloon_mb_floor() {
+        // Configured floor: balloon = memory * pct / 100
+        assert_eq!(qemu_with_balloon(Some(90)).balloon_mb(4096), Some(3686));
+        assert_eq!(qemu_with_balloon(Some(50)).balloon_mb(2048), Some(1024));
+        assert_eq!(qemu_with_balloon(Some(1)).balloon_mb(2048), Some(20));
+        assert_eq!(qemu_with_balloon(Some(99)).balloon_mb(1000), Some(990));
+    }
+
+    #[test]
+    fn test_balloon_mb_disabled_cases() {
+        // Unset / 0 / >= 100 => no balloon key (dynamic ballooning disabled)
+        assert_eq!(qemu_with_balloon(None).balloon_mb(4096), None);
+        assert_eq!(qemu_with_balloon(Some(0)).balloon_mb(4096), None);
+        assert_eq!(qemu_with_balloon(Some(100)).balloon_mb(4096), None);
+        assert_eq!(qemu_with_balloon(Some(150)).balloon_mb(4096), None);
+    }
 
     #[test]
     fn test_dns_config_to_db_kind_token() {
