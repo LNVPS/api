@@ -26,7 +26,7 @@ use lnvps_api_common::{
     VatClient, WorkJob,
 };
 use lnvps_db::{
-    LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    CpuArch, LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmHostRegion,
 };
 
@@ -807,7 +807,41 @@ async fn v1_patch_vm(
 }
 
 /// List available VM OS images
-async fn v1_list_vm_images(State(this): State<RouterState>) -> ApiResult<Vec<ApiVmOsImage>> {
+/// Query parameters for the OS image listing.
+#[derive(serde::Deserialize)]
+struct ImageListQuery {
+    /// Optional CPU architecture filter (e.g. `x86_64`, `amd64`, `arm64`,
+    /// `aarch64`). When set, only images matching that architecture (plus
+    /// architecture-agnostic images) are returned.
+    arch: Option<String>,
+}
+
+/// Whether an image with `image_arch` should be included given an optional
+/// requested-architecture `filter`.
+///
+/// `None` filter includes everything. Architecture-agnostic images
+/// (`CpuArch::Unknown`) always match so they remain deployable on any host.
+fn image_matches_arch(image_arch: CpuArch, filter: Option<CpuArch>) -> bool {
+    match filter {
+        Some(arch) => image_arch == arch || matches!(image_arch, CpuArch::Unknown),
+        None => true,
+    }
+}
+
+async fn v1_list_vm_images(
+    State(this): State<RouterState>,
+    Query(q): Query<ImageListQuery>,
+) -> ApiResult<Vec<ApiVmOsImage>> {
+    // Parse the optional architecture filter up-front so a bad value is a clear
+    // 400 rather than silently returning everything.
+    let arch_filter = match &q.arch {
+        Some(s) => Some(
+            s.parse::<CpuArch>()
+                .map_err(|_| ApiError::bad_request(format!("Invalid cpu architecture: {}", s)))?,
+        ),
+        None => None,
+    };
+
     let images = this.db.list_os_image().await?;
 
     // Compute popularity as the fraction of active VMs using each image
@@ -817,6 +851,9 @@ async fn v1_list_vm_images(State(this): State<RouterState>) -> ApiResult<Vec<Api
     let ret = images
         .into_iter()
         .filter(|i| i.enabled)
+        // Architecture filter: keep images matching the requested arch, plus
+        // architecture-agnostic images (`Unknown` = any).
+        .filter(|i| image_matches_arch(i.cpu_arch, arch_filter))
         .map(|i| {
             let count = counts.get(&i.id).copied().unwrap_or(0);
             let mut image: ApiVmOsImage = i.into();
@@ -2585,6 +2622,21 @@ mod tests {
         // Mixed payment: summary rate/country are null but tax was charged.
         let (label, _rc, _oos, _note) = invoice_vat_display(None, 500, None, None, true);
         assert_eq!(label.as_deref(), Some("VAT"));
+    }
+
+    #[test]
+    fn image_arch_filter_matches() {
+        // No filter => everything matches
+        assert!(image_matches_arch(CpuArch::X86_64, None));
+        assert!(image_matches_arch(CpuArch::ARM64, None));
+        assert!(image_matches_arch(CpuArch::Unknown, None));
+
+        // Concrete filter => exact match or architecture-agnostic image
+        assert!(image_matches_arch(CpuArch::X86_64, Some(CpuArch::X86_64)));
+        assert!(image_matches_arch(CpuArch::Unknown, Some(CpuArch::X86_64)));
+        assert!(!image_matches_arch(CpuArch::ARM64, Some(CpuArch::X86_64)));
+        assert!(image_matches_arch(CpuArch::ARM64, Some(CpuArch::ARM64)));
+        assert!(!image_matches_arch(CpuArch::X86_64, Some(CpuArch::ARM64)));
     }
 
     #[test]
