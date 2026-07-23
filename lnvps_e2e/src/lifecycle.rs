@@ -582,6 +582,78 @@ mod tests {
         eprintln!("Admin can list subscription {sub_id} payments ✓");
 
         // ----------------------------------------------------------------
+        // 14b-bis. LNURL-pay top-up: hit the (unauthenticated) LNURL callback
+        //      for a real amount, pay the returned bolt11, and verify the VM
+        //      expiry advances. Exercises the amount→time pricing path
+        //      (input is the gross paid amount).
+        // ----------------------------------------------------------------
+        {
+            let expiry_before_lnurl =
+                json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await["data"]
+                    ["expires"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+
+            // LNURL callback returns { pr, routes } directly (not the payment
+            // envelope) and must not carry a `hodl_invoice` field (issue #197).
+            let amount_msat = 2_000_000u64; // 2000 sats
+            let cb = user
+                .get(&format!(
+                    "/api/v1/vm/{vm_id}/renew-lnurlp?amount={amount_msat}"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                cb.status(),
+                StatusCode::OK,
+                "LNURL callback should return 200 for a valid VM"
+            );
+            let cb_body: Value = serde_json::from_str(&cb.text().await.unwrap()).unwrap();
+            assert!(
+                cb_body.get("hodl_invoice").is_none(),
+                "LNURL response must not contain hodl_invoice"
+            );
+            let pr = cb_body["pr"]
+                .as_str()
+                .expect("LNURL response must contain a `pr` bolt11 invoice")
+                .to_string();
+
+            // LNURL top-ups have no client-visible payment id; the LN watcher
+            // settles server-side, so poll the VM expiry instead.
+            match crate::lightning::pay_invoice(&pr).await {
+                Ok(()) => {
+                    let advanced = poll_until(30, 300, || {
+                        let user = user.clone();
+                        let before = expiry_before_lnurl.clone();
+                        async move {
+                            if let Ok(r) = user.get_auth(&format!("/api/v1/vm/{vm_id}")).await
+                                && let Ok(b) = serde_json::from_str::<Value>(
+                                    &r.text().await.unwrap_or_default(),
+                                )
+                            {
+                                return b["data"]["expires"]
+                                    .as_str()
+                                    .map(|s| s != before)
+                                    .unwrap_or(false);
+                            }
+                            false
+                        }
+                    })
+                    .await;
+                    assert!(
+                        advanced,
+                        "VM expiry should advance after an LNURL top-up payment"
+                    );
+                    eprintln!("LNURL top-up settled and advanced VM {vm_id} expiry ✓");
+                }
+                Err(e) => {
+                    eprintln!("lnd-payer not available ({e}), skipping LNURL settlement assertion");
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
         // 14c. Second renewal via the subscription endpoint directly
         //      (verifies that /api/v1/subscriptions/{id}/renew works
         //       independently of the VM-renew shortcut)

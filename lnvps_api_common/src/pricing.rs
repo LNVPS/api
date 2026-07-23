@@ -307,20 +307,22 @@ impl PricingEngine {
             .expires
     }
 
-    /// Calculate processing fee for a payment based on payment method and amount.
-    /// `amount` must be the gross charge the provider actually processes, i.e.
-    /// net + tax (the fee is added on top of that). Returns the processing fee in
-    /// the same currency as the amount. Queries the database for fee configuration.
-    pub async fn calculate_processing_fee(
+    /// Processing-fee parameters for `company_id`/`method`, expressed in
+    /// `currency`: `(rate_fraction, base_raw)` where `rate_fraction` is the
+    /// percentage rate as a `0.0..1.0` fraction and `base_raw` is the flat base
+    /// fee converted into `currency` (NOT yet grossed up).
+    ///
+    /// Returns `(0.0, 0)` when the method has no fee (e.g. Lightning) or has no
+    /// enabled fee configuration.
+    async fn processing_fee_params(
         &self,
         company_id: u64,
         method: PaymentMethod,
         currency: Currency,
-        amount: u64,
-    ) -> u64 {
+    ) -> (f64, u64) {
         // Lightning has no processing fees (peer-to-peer network)
         if method == PaymentMethod::Lightning {
-            return 0;
+            return (0.0, 0);
         }
 
         // Try to get fee config from database
@@ -337,7 +339,7 @@ impl PricingEngine {
                     method,
                     e
                 );
-                return 0;
+                return (0.0, 0);
             }
         };
 
@@ -346,19 +348,13 @@ impl PricingEngine {
             || config.processing_fee_rate.is_none()
             || config.processing_fee_base.is_none()
         {
-            return 0;
+            return (0.0, 0);
         }
 
         let rate = config.processing_fee_rate.unwrap_or(0.0);
         let base = config.processing_fee_base.unwrap_or(0);
         let base_currency_str = config.processing_fee_currency.as_deref().unwrap_or("");
-
-        // Gross-up: solve for fee such that (amount + fee) * (1 - rate) = amount
-        // => fee = amount * rate / (1 - rate)
-        // This ensures we net exactly `amount` after the provider deducts their cut.
         let rate_fraction = rate as f64 / 100.0;
-        let percentage_fee =
-            ((amount as f64) * rate_fraction / (1.0 - rate_fraction)).ceil() as u64;
 
         // Get base fee, converting currency if needed
         let base_fee_currency = Currency::from_str(base_currency_str).unwrap_or_else(|_| {
@@ -371,7 +367,7 @@ impl PricingEngine {
             }
             currency
         });
-        let base_fee_raw = if base_fee_currency == currency {
+        let base_raw = if base_fee_currency == currency {
             // Same currency, use directly
             base
         } else {
@@ -395,15 +391,67 @@ impl PricingEngine {
             }
         };
 
+        (rate_fraction, base_raw)
+    }
+
+    /// Calculate processing fee for a payment based on payment method and amount.
+    /// `amount` must be the gross charge the provider actually processes, i.e.
+    /// net + tax (the fee is added on top of that). Returns the processing fee in
+    /// the same currency as the amount. Queries the database for fee configuration.
+    pub async fn calculate_processing_fee(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        currency: Currency,
+        amount: u64,
+    ) -> u64 {
+        let (rate_fraction, base_raw) = self
+            .processing_fee_params(company_id, method, currency)
+            .await;
+        if rate_fraction <= 0.0 && base_raw == 0 {
+            return 0;
+        }
+
+        // Gross-up: solve for fee such that (amount + fee) * (1 - rate) = amount
+        // => fee = amount * rate / (1 - rate)
+        // This ensures we net exactly `amount` after the provider deducts their cut.
+        let percentage_fee =
+            ((amount as f64) * rate_fraction / (1.0 - rate_fraction)).ceil() as u64;
+
         // Gross-up the flat base fee too — the provider takes their percentage cut on the
         // entire order total, so a flat fee of X must be sent as X / (1 - rate) to net X.
         let base_fee = if rate_fraction > 0.0 {
-            (base_fee_raw as f64 / (1.0 - rate_fraction)).ceil() as u64
+            (base_raw as f64 / (1.0 - rate_fraction)).ceil() as u64
         } else {
-            base_fee_raw
+            base_raw
         };
 
         percentage_fee + base_fee
+    }
+
+    /// Back out the **net** amount from a **gross** amount actually received
+    /// (net + tax + processing fee), removing both the tax (at `tax_pct`) and
+    /// the method's processing fee. This is the inverse of the amount→cost
+    /// build-up (`net → tax on top → fee on top`), and is needed wherever the
+    /// received amount is the gross total rather than a net quote — e.g. an
+    /// on-chain deposit, which always arrives as the gross amount.
+    ///
+    /// Derivation: `gross = (net·(1+t) + base_raw) / (1 − r)`, so
+    /// `net = (gross·(1 − r) − base_raw) / (1 + t)`.
+    pub async fn net_from_gross(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        currency: Currency,
+        tax_pct: f32,
+        gross: u64,
+    ) -> u64 {
+        let (rate_fraction, base_raw) = self
+            .processing_fee_params(company_id, method, currency)
+            .await;
+        let t = tax_pct.max(0.0) as f64 / 100.0;
+        let net = ((gross as f64) * (1.0 - rate_fraction) - base_raw as f64) / (1.0 + t);
+        net.max(0.0).floor() as u64
     }
 
     /// Enforce the configured minimum processable amount for a payment method.
@@ -457,7 +505,13 @@ impl PricingEngine {
         Ok(())
     }
 
-    /// Get amount of time a certain currency amount will extend a vm in seconds
+    /// Turn an amount **actually paid** into VM extension time.
+    ///
+    /// `input` is the **gross** amount the customer paid (net + tax + processing
+    /// fee) — e.g. the sats a wallet sent for an LNURL top-up, or an on-chain
+    /// deposit. The net (time-buying) amount is backed out by removing tax and
+    /// the method's processing fee, and `amount`/`tax`/`processing_fee` on the
+    /// result sum to exactly `input`.
     pub async fn get_cost_by_amount(
         &self,
         vm_id: u64,
@@ -475,8 +529,19 @@ impl PricingEngine {
 
         ensure!(cost.currency == input.currency(), "Invalid currency");
 
-        // scale cost
-        let scale = input.value() as f64 / cost.amount as f64;
+        // `input` is the gross paid amount; back out the net that buys time by
+        // removing tax and the processing fee.
+        let tax_rate = self
+            .determine_tax(vm.user_id, input.value(), company_id)
+            .await?
+            .rate;
+        let net = self
+            .net_from_gross(company_id, method, cost.currency, tax_rate, input.value())
+            .await;
+        ensure!(net > 0, "Paid amount too small after tax/fees");
+
+        // scale cost from the net amount
+        let scale = net as f64 / cost.amount as f64;
         let new_time = (cost.time_value as f64 * scale).floor() as u64;
         ensure!(new_time > 0, "Extend time is less than 1 second");
 
@@ -488,25 +553,116 @@ impl PricingEngine {
             .await
             .unwrap_or_else(Utc::now)
             .max(Utc::now());
-        let tax_details = self
-            .determine_tax(vm.user_id, input.value(), company_id)
-            .await?;
-        // Processing fee applies to the gross amount (net + tax): the payment
-        // provider takes their cut on the entire charged total.
-        let processing_fee = self
-            .calculate_processing_fee(
-                company_id,
-                method,
-                cost.currency,
-                input.value() + tax_details.amount,
-            )
-            .await;
+        let tax_details = self.determine_tax(vm.user_id, net, company_id).await?;
+        // The fee is whatever remains after net + tax, so the components sum to
+        // exactly the gross paid.
+        let processing_fee = input.value().saturating_sub(net + tax_details.amount);
         Ok(CostResult::New(NewPaymentInfo {
-            amount: input.value(),
+            amount: net,
             currency: cost.currency,
             time_value: new_time,
             new_expiry: vm_expires.add(TimeDelta::seconds(new_time as i64)),
             rate: cost.rate,
+            tax: tax_details.amount,
+            tax_details,
+            processing_fee,
+        }))
+    }
+
+    /// Turn an arbitrary paid amount into time for a **subscription**, priced
+    /// from the subscription's line-item amounts and billing interval.
+    ///
+    /// This is the subscription-level equivalent of [`Self::get_cost_by_amount`]
+    /// (which only prices VM-backed subscriptions). It sums the per-interval
+    /// price of all line items (in the subscription's base currency), converts
+    /// that to the payment method currency, then scales the interval's time by
+    /// `net / interval_cost` — with the same tax determination and
+    /// processing-fee handling as the VM path.
+    ///
+    /// `input` is the **gross** amount actually paid (net + tax + processing
+    /// fee), matching [`Self::get_cost_by_amount`]; the net that buys time is
+    /// backed out by removing tax and fee, and the result components sum to
+    /// exactly `input`.
+    pub async fn get_subscription_cost_by_amount(
+        &self,
+        subscription_id: u64,
+        input: CurrencyAmount,
+        method: PaymentMethod,
+    ) -> Result<CostResult> {
+        let subscription = self.db.get_subscription(subscription_id).await?;
+        let line_items = self
+            .db
+            .list_subscription_line_items(subscription_id)
+            .await?;
+        ensure!(!line_items.is_empty(), "Subscription has no line items");
+
+        let subscription_currency = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+
+        // Per-interval list price of all line items, in the subscription's base
+        // currency.
+        let interval_cost: u64 = line_items.iter().map(|li| li.amount).sum();
+        ensure!(interval_cost > 0, "Subscription has zero interval cost");
+
+        // Convert the per-interval list price into the payment method currency,
+        // so it can be compared against `input` and yields the rate to record.
+        let list_price = CurrencyAmount::from_u64(subscription_currency, interval_cost);
+        let converted = self.get_amount_and_rate(list_price, method).await?;
+        ensure!(
+            converted.amount.currency() == input.currency(),
+            "Invalid currency"
+        );
+        ensure!(
+            converted.amount.value() > 0,
+            "Converted interval cost is zero"
+        );
+
+        // `input` is the gross paid amount; back out the net that buys time by
+        // removing tax and the processing fee.
+        let tax_rate = self
+            .determine_tax(subscription.user_id, input.value(), subscription.company_id)
+            .await?
+            .rate;
+        let net = self
+            .net_from_gross(
+                subscription.company_id,
+                method,
+                converted.amount.currency(),
+                tax_rate,
+                input.value(),
+            )
+            .await;
+        ensure!(net > 0, "Paid amount too small after tax/fees");
+
+        let interval_seconds = Self::cost_plan_interval_to_seconds(
+            subscription.interval_type,
+            subscription.interval_amount,
+        ) as u64;
+
+        // Scale the interval's time by the net paid relative to one interval.
+        let scale = net as f64 / converted.amount.value() as f64;
+        let new_time = (interval_seconds as f64 * scale).floor() as u64;
+        ensure!(new_time > 0, "Extend time is less than 1 second");
+
+        // Clamp the base to now for already-expired subscriptions, matching the
+        // VM path — otherwise paid time is added onto a past expiry.
+        let base = subscription
+            .expires
+            .unwrap_or_else(Utc::now)
+            .max(Utc::now());
+        let tax_details = self
+            .determine_tax(subscription.user_id, net, subscription.company_id)
+            .await?;
+        // The fee is whatever remains after net + tax, so the components sum to
+        // exactly the gross paid.
+        let processing_fee = input.value().saturating_sub(net + tax_details.amount);
+
+        Ok(CostResult::New(NewPaymentInfo {
+            amount: net,
+            currency: converted.amount.currency(),
+            time_value: new_time,
+            new_expiry: base.add(TimeDelta::seconds(new_time as i64)),
+            rate: converted.rate,
             tax: tax_details.amount,
             tax_details,
             processing_fee,
@@ -1740,6 +1896,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_cost_by_amount() -> Result<()> {
+        use lnvps_db::{Subscription, SubscriptionLineItem, SubscriptionType};
+
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        let user_id = db.upsert_user(&[9u8; 32]).await?;
+        let (sub_id, _li) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "ip range".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "ip".to_string(),
+                    description: None,
+                    amount: 1000, // €10.00 / month
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        // Full month price in msats: €10 / 100000 EUR/BTC * 1e11 = 10_000_000 msat
+        let mo_price = (10.0f64 / MOCK_RATE as f64 * 1.0e11) as u64;
+
+        // Pay half a month's price -> ~half the interval's time.
+        let paid = mo_price / 2;
+        let price = pe
+            .get_subscription_cost_by_amount(
+                sub_id,
+                CurrencyAmount::millisats(paid),
+                PaymentMethod::Lightning,
+            )
+            .await?;
+        match price {
+            CostResult::New(p) => {
+                assert_eq!(p.amount, paid);
+                assert_eq!(p.tax, 0);
+                let expect_time = (SECONDS_PER_MONTH * 0.5) as u64;
+                assert!(
+                    p.time_value.abs_diff(expect_time) <= 2,
+                    "time {} ~ {}",
+                    p.time_value,
+                    expect_time
+                );
+            }
+            _ => bail!("unexpected existing cost result"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_cost_by_amount_treats_input_as_gross() -> Result<()> {
+        use lnvps_db::{Subscription, SubscriptionLineItem, SubscriptionType};
+
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        // Taxed customer (IE) with an EU seller (IE) -> 23% VAT.
+        let user_id = db.upsert_user(&[7u8; 32]).await?;
+        {
+            let mut u = db.users.lock().await;
+            u.get_mut(&user_id).unwrap().country_code = Some("IRL".to_string());
+        }
+        db.companies.lock().await.get_mut(&1).unwrap().country_code = Some("IRL".to_string());
+
+        let (sub_id, _li) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "ip range".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "ip".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let taxes = VatClient::with_rates(HashMap::from([(CountryCode::IRL, 23.0)]));
+        let pe = PricingEngine::new(db.clone(), rates, taxes);
+
+        // `input` is the GROSS the customer paid. Lightning has no fee, so the
+        // net + tax must sum back to exactly the paid amount (the tax is taken
+        // *out* of the paid amount, not added on top).
+        let gross = 1_230_000u64; // msats
+        let price = pe
+            .get_subscription_cost_by_amount(
+                sub_id,
+                CurrencyAmount::millisats(gross),
+                PaymentMethod::Lightning,
+            )
+            .await?;
+        match price {
+            CostResult::New(p) => {
+                assert_eq!(
+                    p.amount + p.tax + p.processing_fee,
+                    gross,
+                    "components must sum to the gross paid"
+                );
+                assert!(p.tax > 0, "tax must be backed out of the gross");
+                assert_eq!(p.processing_fee, 0, "lightning has no fee");
+                let expect_net = (gross as f64 / 1.23).floor() as u64;
+                assert!(
+                    p.amount.abs_diff(expect_net) <= 2,
+                    "net {} should be ~{}",
+                    p.amount,
+                    expect_net
+                );
+            }
+            _ => bail!("unexpected existing cost result"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net_from_gross_removes_tax_and_fee() -> Result<()> {
+        let db = MockDb::default();
+        add_revolut_processing_fee_config(&db).await; // 2.8% + €0.20 base
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(
+            db.clone(),
+            Arc::new(MockExchangeRate::new()),
+            VatClient::new(),
+        );
+
+        // Lightning has no fee: net = gross / (1 + tax).
+        assert_eq!(
+            pe.net_from_gross(1, PaymentMethod::Lightning, Currency::BTC, 20.0, 1_200_000)
+                .await,
+            1_000_000
+        );
+        // No fee, no tax: net == gross.
+        assert_eq!(
+            pe.net_from_gross(1, PaymentMethod::Lightning, Currency::EUR, 0.0, 5000)
+                .await,
+            5000
+        );
+
+        // Revolut: build a gross from a known net (+ its fee), then recover the
+        // net. The old tax-only split would have over-stated the net by the fee.
+        let net0 = 10_000u64; // €100.00, no VAT config -> tax 0
+        let fee = pe
+            .calculate_processing_fee(1, PaymentMethod::Revolut, Currency::EUR, net0)
+            .await;
+        assert!(fee > 0, "expected a non-zero Revolut fee");
+        let gross = net0 + fee;
+        let recovered = pe
+            .net_from_gross(1, PaymentMethod::Revolut, Currency::EUR, 0.0, gross)
+            .await;
+        assert!(
+            recovered.abs_diff(net0) <= 2,
+            "recovered {} should be ~{} (gross {}, fee {})",
+            recovered,
+            net0,
+            gross,
+            fee
+        );
+        // Tax-only removal would wrongly keep the fee in the net.
+        assert!(
+            recovered < gross,
+            "net must be below gross when a fee applies"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn standard_pricing() -> Result<()> {
         let db = MockDb::default();
         let rates = Arc::new(MockExchangeRate::new());
@@ -1834,6 +2199,42 @@ mod tests {
                 assert_eq!(0, payment_info.tax);
                 assert_eq!(payment_info.amount, 1000);
                 assert_eq!(0, payment_info.processing_fee);
+            }
+            _ => bail!("??"),
+        }
+
+        // from amount, taxed customer (vm 2 = IE, 23% VAT). The paid amount is
+        // the GROSS, so tax must be taken *out* of it and the credited time must
+        // reflect the NET, not the full amount paid.
+        let gross = 1_230_000u64; // net 1_000_000 + 23% VAT 230_000
+        let price = pe
+            .get_cost_by_amount(
+                2,
+                CurrencyAmount::millisats(gross),
+                PaymentMethod::Lightning,
+            )
+            .await?;
+        match price {
+            CostResult::New(p) => {
+                // components sum to exactly the gross paid
+                assert_eq!(p.amount + p.tax + p.processing_fee, gross);
+                assert_eq!(p.processing_fee, 0, "lightning has no processing fee");
+                assert_eq!(p.amount, 1_000_000, "net = gross / 1.23");
+                assert_eq!(p.tax, 230_000, "23% VAT backed out of the gross");
+                // Time is scaled by the NET amount.
+                let net_time = (next_expire as f64 * (p.amount as f64 / mo_price as f64)) as u64;
+                assert_eq!(
+                    p.time_value, net_time,
+                    "time must be credited from the net, not the gross"
+                );
+                // ...and strictly less than if the gross had (wrongly) been used.
+                let gross_time = (next_expire as f64 * (gross as f64 / mo_price as f64)) as u64;
+                assert!(
+                    p.time_value < gross_time,
+                    "a taxed top-up must credit net-based time ({}), not gross-based ({})",
+                    p.time_value,
+                    gross_time
+                );
             }
             _ => bail!("??"),
         }

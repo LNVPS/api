@@ -34,19 +34,19 @@
 //!   instead — the moment we discover it.
 //! - A deposit to an address whose payment already settled (address reuse)
 //!   automatically inserts a **new** renewal payment, priced the same way.
-//! - Subscriptions without a VM have no amount→cost pricing; they fall back
-//!   to scaling the original quote by the value received at the current rate.
+//! - Subscriptions without a VM are priced from their line-item amounts and
+//!   billing interval (`PricingEngine::get_subscription_cost_by_amount`), so
+//!   every payment is re-generated uniformly from current line-item pricing.
 
 use crate::subscription::SubscriptionHandler;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::StreamExt;
 use lnvps_api_common::{CostResult, WorkJob};
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
 use log::{debug, error, info, warn};
-use payments_rs::currency::{Currency, CurrencyAmount};
+use payments_rs::currency::CurrencyAmount;
 use payments_rs::onchain::{ChainPaymentUpdate, OnChainProvider};
-use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct OnChainPaymentHandler {
@@ -57,22 +57,6 @@ pub struct OnChainPaymentHandler {
     /// these deposits are ignored database-wise and handled out of band, this
     /// set just stops stream replays from re-notifying within one process).
     reported_deposits: tokio::sync::Mutex<std::collections::HashSet<String>>,
-}
-
-/// Scale `value` by `received / expected` (u128 intermediate, no overflow).
-///
-/// Only used by the no-VM quote-scaling fallback in [`OnChainPaymentHandler::regenerate`];
-/// remove once subscription-level amount→cost pricing exists (issue #181).
-fn pro_rate(value: u64, received: u64, expected: u64) -> u64 {
-    debug_assert!(expected > 0);
-    (value as u128 * received as u128 / expected as u128) as u64
-}
-
-/// Scale `value` by an arbitrary ratio, flooring to whole units.
-///
-/// Only used by the no-VM quote-scaling fallback; see [`pro_rate`].
-fn pro_rate_f64(value: u64, ratio: f64) -> u64 {
-    (value as f64 * ratio).floor() as u64
 }
 
 /// Unique key for one deposit: the standard outpoint notation `{txid}:{vout}`.
@@ -109,80 +93,57 @@ impl OnChainPaymentHandler {
             .max_by_key(|p| p.created))
     }
 
-    /// Current BTC exchange rate for the payment's subscription currency.
-    async fn current_rate(&self, payment: &SubscriptionPayment) -> Result<f32> {
-        let sub = self.db.get_subscription(payment.subscription_id).await?;
-        let sub_currency = Currency::from_str(&sub.currency)
-            .map_err(|e| anyhow::anyhow!("Invalid subscription currency: {}", e))?;
-        Ok(self
-            .sub_handler
-            .pricing_engine()
-            .get_ticker(Currency::BTC, sub_currency)
-            .await?
-            .rate)
-    }
-
     /// Re-generate a payment's pricing from the gross msats received, at the
     /// rates current right now. The original quote is discarded.
     ///
-    /// VM-backed subscriptions price through the pricing engine exactly like
-    /// LNURL top-ups. Subscriptions without a VM have no amount→cost pricing
-    /// and fall back to scaling the original quote by the value received.
+    /// Both VM-backed and non-VM subscriptions price through the pricing engine
+    /// exactly like an LNURL top-up: VMs via [`PricingEngine::get_cost_by_amount`],
+    /// other subscriptions via [`PricingEngine::get_subscription_cost_by_amount`]
+    /// (from their line-item amounts and billing interval).
+    ///
+    /// [`PricingEngine::get_cost_by_amount`]: lnvps_api_common::PricingEngine::get_cost_by_amount
+    /// [`PricingEngine::get_subscription_cost_by_amount`]: lnvps_api_common::PricingEngine::get_subscription_cost_by_amount
     async fn regenerate(&self, payment: &mut SubscriptionPayment, gross_msat: u64) -> Result<()> {
-        match self
+        let engine = self.sub_handler.pricing_engine();
+
+        // The received on-chain amount is always the **gross** deposit
+        // (net + tax + processing fee). The pricing engine takes the gross paid
+        // amount directly and backs out the net (removing tax + fee); the
+        // returned components sum to exactly what arrived.
+        //
+        // VM-backed subscriptions price from the VM's template/custom pricing;
+        // everything else prices from the subscription's line items.
+        let gross = CurrencyAmount::millisats(gross_msat);
+        let cost = match self
             .db
             .get_vm_by_subscription(payment.subscription_id)
             .await
         {
             Ok(vm) => {
-                // The engine prices from the net amount and adds tax on top;
-                // split the gross deposit using the frozen tax rate.
-                let tax_pct = payment.tax_rate.unwrap_or(0.0) as f64;
-                let net = (gross_msat as f64 / (1.0 + tax_pct / 100.0)).floor() as u64;
-                let cost = self
-                    .sub_handler
-                    .pricing_engine()
-                    .get_cost_by_amount(
-                        vm.id,
-                        CurrencyAmount::millisats(net),
-                        PaymentMethod::OnChain,
-                    )
-                    .await?;
-                let p = match cost {
-                    CostResult::New(p) => p,
-                    CostResult::Existing(_) => bail!("Unexpected existing cost result"),
-                };
-                payment.time_value = Some(p.time_value);
-                payment.rate = p.rate.rate;
-                // Components always sum to exactly what arrived
-                payment.tax = p.tax.min(gross_msat);
-                payment.processing_fee = p.processing_fee.min(gross_msat - payment.tax);
-                payment.amount = gross_msat - payment.tax - payment.processing_fee;
+                engine
+                    .get_cost_by_amount(vm.id, gross, PaymentMethod::OnChain)
+                    .await?
             }
             Err(_) => {
-                // No VM: scale the original quote by the value received at
-                // the current rate.
-                let expected = payment.amount + payment.tax + payment.processing_fee;
-                ensure!(
-                    expected > 0,
-                    "Payment {} has zero expected amount",
-                    hex::encode(&payment.id)
-                );
-                ensure!(
-                    payment.rate > 0.0,
-                    "Payment {} has invalid quoted rate",
-                    hex::encode(&payment.id)
-                );
-                let rate_now = self.current_rate(payment).await?;
-                let ratio =
-                    (gross_msat as f64 * rate_now as f64) / (expected as f64 * payment.rate as f64);
-                payment.tax = pro_rate(payment.tax, gross_msat, expected);
-                payment.processing_fee = pro_rate(payment.processing_fee, gross_msat, expected);
-                payment.amount = gross_msat - payment.tax - payment.processing_fee;
-                payment.time_value = payment.time_value.map(|tv| pro_rate_f64(tv, ratio));
-                payment.rate = rate_now;
+                engine
+                    .get_subscription_cost_by_amount(
+                        payment.subscription_id,
+                        gross,
+                        PaymentMethod::OnChain,
+                    )
+                    .await?
             }
-        }
+        };
+        let p = match cost {
+            CostResult::New(p) => p,
+            CostResult::Existing(_) => bail!("Unexpected existing cost result"),
+        };
+        payment.time_value = Some(p.time_value);
+        payment.rate = p.rate.rate;
+        // Components sum to exactly what arrived (fee is the remainder).
+        payment.amount = p.amount;
+        payment.tax = p.tax;
+        payment.processing_fee = p.processing_fee;
         Ok(())
     }
 
@@ -637,6 +598,28 @@ mod tests {
         }
     }
 
+    /// Price a net amount through the subscription (non-VM) pricing path, for
+    /// asserting the watcher's re-generated pricing.
+    async fn engine_price_sub(
+        handler: &OnChainPaymentHandler,
+        sub_id: u64,
+        net: u64,
+    ) -> Result<NewPaymentInfo> {
+        match handler
+            .sub_handler
+            .pricing_engine()
+            .get_subscription_cost_by_amount(
+                sub_id,
+                CurrencyAmount::millisats(net),
+                PaymentMethod::OnChain,
+            )
+            .await?
+        {
+            CostResult::New(p) => Ok(p),
+            CostResult::Existing(_) => bail!("unexpected existing"),
+        }
+    }
+
     /// The engine's time_value depends on Utc::now(); allow a small drift
     /// between the expectation call and the watcher's own call.
     fn assert_close(a: u64, b: u64) {
@@ -647,18 +630,6 @@ mod tests {
             b,
             a.abs_diff(b)
         );
-    }
-
-    #[test]
-    fn test_pro_rate() {
-        assert_eq!(pro_rate(TIME_VALUE, EXPECTED, EXPECTED), TIME_VALUE);
-        assert_eq!(pro_rate(TIME_VALUE, EXPECTED / 2, EXPECTED), TIME_VALUE / 2);
-        assert_eq!(pro_rate(TIME_VALUE, EXPECTED * 2, EXPECTED), TIME_VALUE * 2);
-        assert_eq!(pro_rate(0, EXPECTED, EXPECTED), 0);
-        // u128 intermediate: no overflow on large values
-        assert_eq!(pro_rate(u64::MAX, 1000, 1000), u64::MAX);
-        assert_eq!(pro_rate_f64(100, 1.5), 150);
-        assert_eq!(pro_rate_f64(100, 0.333), 33);
     }
 
     #[test]
@@ -818,16 +789,21 @@ mod tests {
     /// Subscriptions without a VM fall back to scaling the original quote by
     /// value at the current rate.
     #[tokio::test]
-    async fn test_no_vm_fallback_scales_quote() -> Result<()> {
-        // Quoted at 100k EUR/BTC; rate doubled by discovery -> same msats are
-        // worth twice the quoted value -> twice the time.
-        let (db, _provider, handler, payment, _rates) = setup_with(false, RATE, RATE * 2.0).await?;
+    async fn test_no_vm_prices_from_line_items() -> Result<()> {
+        // No VM: the quote is discarded and pricing is re-generated from the
+        // subscription's line-item amounts + billing interval, not from a
+        // quote-scaling fallback.
+        let (db, _provider, handler, payment, _rates) = setup_with(false, RATE, RATE).await?;
+        // tax_rate is None -> net == gross.
+        let expect = engine_price_sub(&handler, payment.subscription_id, EXPECTED).await?;
+
         handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
 
         let p = get_payment(&db, &payment.id).await;
         assert!(p.is_paid);
-        assert_eq!(p.time_value, Some(TIME_VALUE * 2));
-        assert_eq!(p.rate, RATE * 2.0);
+        assert_eq!(p.rate, expect.rate.rate);
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        // Components always sum to exactly what arrived.
         assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED);
         Ok(())
     }
