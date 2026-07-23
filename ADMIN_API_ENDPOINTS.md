@@ -5607,6 +5607,7 @@ All fields except `webhook_secret` are required when creating:
 | `revolut`     | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
 | `stripe`      | stripe         | `secret_key`, `publishable_key`, `webhook_secret`                     |
 | `paypal`      | paypal         | `client_id`, `client_secret`, `mode`                                  |
+| `onchain`     | onchain        | `url`, `cert_path`, `macaroon_path` (`address_type`, `account`, `min_confirmations` optional) |
 
 ### PartialProviderConfig (Tagged Union) - For Updates
 
@@ -5620,6 +5621,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 | `revolut`     | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`      | `secret_key`, `publishable_key`, `webhook_secret`             |
 | `paypal`      | `client_id`, `client_secret`, `mode`                          |
+| `onchain`     | `url`, `cert_path`, `macaroon_path`, `address_type`, `account` (null clears), `min_confirmations` |
 
 ### Notes
 
@@ -5630,6 +5632,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 - `revolut` - Revolut Business API
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API
+- `onchain` - On-chain Bitcoin payments (LND wallet backend). `address_type` is one of `witness_pubkey_hash`, `nested_pubkey_hash`, `taproot_pubkey`.
 
 **Multiple Configurations:**
 A company can have multiple payment method configurations for the same payment method type. This allows keeping disabled
