@@ -656,19 +656,17 @@ struct AdminExtendAllVmsRequest {
 struct AdminExtendAllVmsResult {
     /// Number of VMs that were extended
     extended: u64,
-    /// Number of VMs skipped because they are expired, never-paid, or deleted
-    skipped: u64,
     /// Number of VMs that errored during extension (see server logs)
     failed: u64,
 }
 
 /// Extend all currently non-expired VMs by `days` in a single request.
 ///
-/// A VM is considered non-expired (and thus extended) when its subscription
-/// has a concrete `expires` in the future. Deleted VMs, never-paid VMs
-/// (`expires = null`), and already-expired VMs are skipped — this endpoint is
-/// for granting extra time to active customers (e.g. compensating downtime),
-/// not for reviving dead VMs.
+/// Only active VMs — non-deleted VMs whose subscription has a concrete future
+/// expiry — are candidates. Deleted, never-paid (`expires = null`), and
+/// already-expired VMs are filtered out at the database level (`list_active_vms`),
+/// since this endpoint is for granting extra time to active customers (e.g.
+/// compensating downtime), not for reviving dead VMs.
 async fn admin_extend_all_vms(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -686,43 +684,14 @@ async fn admin_extend_all_vms(
         return ApiData::err("Cannot extend by more than 365 days");
     }
 
-    let now = Utc::now();
-    let vms = this.db.list_vms().await?;
+    // Fetch only the VMs we intend to extend (non-deleted, non-expired) — the
+    // DB does the filtering so we don't pull the whole fleet into memory.
+    let vms = this.db.list_active_vms().await?;
 
     let mut extended = 0u64;
-    let mut skipped = 0u64;
     let mut failed = 0u64;
 
     for vm in vms {
-        if vm.deleted {
-            skipped += 1;
-            continue;
-        }
-
-        // Only extend VMs that are currently non-expired (concrete future expiry).
-        let sub = match this
-            .db
-            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-            .await
-        {
-            Ok(sub) => sub,
-            Err(e) => {
-                error!(
-                    "Failed to load subscription for VM {} during bulk extend: {}",
-                    vm.id, e
-                );
-                failed += 1;
-                continue;
-            }
-        };
-        match sub.expires {
-            Some(exp) if exp > now => {}
-            _ => {
-                skipped += 1;
-                continue;
-            }
-        }
-
         match extend_vm_by_days(
             &this,
             auth.user_id,
@@ -742,15 +711,11 @@ async fn admin_extend_all_vms(
     }
 
     info!(
-        "Admin {} bulk-extended {} VM(s) by {} days ({} skipped, {} failed)",
-        auth.user_id, extended, req.days, skipped, failed
+        "Admin {} bulk-extended {} VM(s) by {} days ({} failed)",
+        auth.user_id, extended, req.days, failed
     );
 
-    ApiData::ok(AdminExtendAllVmsResult {
-        extended,
-        skipped,
-        failed,
-    })
+    ApiData::ok(AdminExtendAllVmsResult { extended, failed })
 }
 
 /// List VM history with pagination
