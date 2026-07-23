@@ -50,6 +50,8 @@ mod tests {
         flavour: String,
         version: String,
         popularity: f32,
+        #[serde(default)]
+        cpu_arch: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -185,6 +187,30 @@ mod tests {
             // popularity is a fraction in [0, 1]
             assert!(img.popularity >= 0.0 && img.popularity <= 1.0);
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_vm_images_arch_filter() {
+        let client = user_client_no_auth();
+
+        // Valid arch filter: all returned images must be that arch (or agnostic).
+        let resp = client.get("/api/v1/image?arch=x86_64").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let data: ApiData<Vec<OsImage>> = parse_data(resp).await.unwrap();
+        for img in &data.data {
+            // cpu_arch is omitted for agnostic images; when present it must match.
+            if let Some(arch) = &img.cpu_arch {
+                assert_eq!(arch, "x86_64", "arch filter must exclude non-x86_64 images");
+            }
+        }
+
+        // aarch64 alias is accepted.
+        let resp = client.get("/api/v1/image?arch=aarch64").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Invalid arch => 400.
+        let resp = client.get("/api/v1/image?arch=sparc").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

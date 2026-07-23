@@ -966,6 +966,8 @@ the full firewall ruleset on the host.
 #### List OS Images
 - **GET** `/api/v1/image`
 - **Auth**: None
+- **Query Params**:
+  - `arch`: Optional CPU architecture filter (`x86_64`/`amd64`, `arm64`/`aarch64`). When set, only images of that architecture — plus architecture-agnostic images — are returned. An unrecognised value returns `400`.
 - **Response**: `VmOsImage[]`
 
 #### Calculate Custom VM Price
