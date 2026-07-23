@@ -1,14 +1,27 @@
 ## LNVPS
 
-A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optionally fiat) to provision and renew virtual machines on Proxmox or LibVirt hypervisors.
+A VPS hosting platform. Customers provision and renew virtual machines on
+Proxmox or LibVirt hypervisors, paying through pluggable payment providers
+(Bitcoin Lightning, Bitcoin on-chain, or fiat via Revolut). The backend is a
+Rust workspace: a user-facing API + background worker, an admin API, and a set
+of supporting services (Nostr identity, AI support agent, health monitoring, a
+Kubernetes operator, and an eBPF firewall).
+
+> **Payment providers are configured in the database, not in YAML.** Provider
+> credentials are stored per company in `payment_method_config` rows and managed
+> through the admin API (`POST`/`PATCH /api/admin/v1/payment_method_configs`).
+> Startup fails if no enabled payment provider exists for the default company.
+> There are no `lightning:` / `revolut:` YAML sections.
 
 ## Features
 
-- **Payments**
-  - Bitcoin Lightning via [LND](https://github.com/lightningnetwork/lnd)
+- **Payments** (providers configured in the DB via the admin API)
+  - Lightning via [LND](https://github.com/lightningnetwork/lnd)
+  - Bitcoin on-chain deposits (configurable confirmations, address type, account)
   - Fiat via [RevolutPay](https://www.revolut.com/business/revolut-pay/)
   - [LNURL-pay](https://github.com/lnurl/luds/blob/luds/06.md) for VM renewal (scan-to-pay)
   - [Nostr Wallet Connect (NIP-47)](https://github.com/nostr-protocol/nips/blob/master/47.md) for fully automatic renewal
+  - Referral program with optional automated commission payouts
 - **VM Backends**
   - Proxmox (production-ready)
   - LibVirt (WIP)
@@ -17,6 +30,16 @@ A Bitcoin-powered VPS platform. Customers pay with Bitcoin Lightning (or optiona
   - OVH Additional IP virtual MAC management
   - Cloudflare API — forward A/AAAA and reverse PTR records
   - Route-server management — BGP session, tunnel (GRE/VXLAN/WireGuard) and default-route visibility/control across RouterOS and Linux (BIRD/Pathvector over SSH) routers
+- **Authentication**
+  - [Nostr NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) HTTP auth
+  - OAuth/OIDC login (Google, GitHub, Facebook, Sign in with Apple, generic OIDC)
+  - Passwordless WebAuthn / passkeys
+  - Stateless session JWTs (shared by OAuth and passkey login)
+- **Notifications**
+  - Email (SMTP)
+  - Nostr NIP-17 direct messages
+  - Telegram bot
+  - WhatsApp Cloud API
 - **Nostr integration**
   - NIP-17 direct-message notifications
   - NIP-05 identity server (`lnvps_nostr`)
@@ -89,312 +112,59 @@ The eBPF crates (`lnvps_ebpf`, `lnvps_fw_common`, `lnvps_fw_service`) live in th
 ## Development Environment
 
 ```bash
-docker compose up -d
+docker compose up -d      # reads docker-compose.yaml
 # Starts: MariaDB on :3376, Redis on :6398, Krill (RPKI) on :3000
 ```
 
-## Config Reference
+## Quick Start
 
-### Core (`lnvps_api`)
+1. Start the dev dependencies (MariaDB, Redis, Krill):
 
-```yaml
-# MySQL connection string (required)
-db: "mysql://root:root@localhost:3376/lnvps"
-
-# Public base URL used in webhook callbacks (required)
-public-url: "https://api.example.com"
-
-# HTTP listen address (default: 0.0.0.0:8000)
-listen: "0.0.0.0:8000"
-
-# Days after VM expiry before hard deletion
-delete-after: 3
-
-# Prevent VM creation/deletion
-read-only: false
-```
-
-### Lightning node (exactly one required)
-
-```yaml
-lightning:
-  lnd:
-    url: "https://127.0.0.1:10003"
-    cert: "$HOME/.lnd/tls.cert"
-    macaroon: "$HOME/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
-```
-
-### Provisioner (VM backend)
-
-```yaml
-provisioner:
-  proxmox:
-    qemu:
-      machine: "q35"
-      os-type: "l26"
-      bridge: "vmbr0"
-      cpu: "kvm64"
-      kvm: false
-      arch: "x86_64"
-      # Per-NIC Proxmox firewall (optional)
-      firewall-config:
-        dhcp: true
-        enable: true
-        ip-filter: true
-        mac-filter: true
-        ndp: true
-        policy-in: "DROP"    # ACCEPT | REJECT | DROP
-        policy-out: "ACCEPT"
-    # SSH access for host-side CLI commands (optional)
-    ssh:
-      key: "/root/.ssh/id_ed25519"
-      user: "root"
-    # MAC prefix for generated NICs (default: bc:24:11)
-    mac-prefix: "bc:24:11"
-
-  # LibVirt (WIP)
-  libvirt:
-    qemu:
-      machine: "q35"
-      os-type: "l26"
-      bridge: "vmbr0"
-      cpu: "kvm64"
-      kvm: false
-```
-
-### Revolut fiat payments (optional)
-
-```yaml
-revolut:
-  url: "https://merchant.revolut.com"
-  token: "my-revolut-api-token"
-  api-version: "2024-09-01"
-  public-key: "my-revolut-public-key"
-```
-
-### SMTP notifications (optional)
-
-```yaml
-smtp:
-  admin: 1                    # user ID to receive system alerts (optional)
-  server: "smtp.gmail.com"
-  from: "LNVPS <no-reply@example.com>"   # optional
-  username: "no-reply@example.com"
-  password: "mypassword123"
-```
-
-### Nostr notifications — NIP-17 (optional)
-
-```yaml
-nostr:
-  relays:
-    - "wss://relay.snort.social"
-    - "wss://relay.damus.io"
-    - "wss://nos.lol"
-  nsec: "nsec1234xxx"
-```
-
-### DNS — Cloudflare (optional)
-
-```yaml
-dns:
-  # Zone ID for forward A/AAAA records (created as vm-<vmid>.<zone>)
-  forward-zone-id: "my-cloudflare-zone-id"
-  api:
-    cloudflare:
-      token: "my-api-token"
-```
-
-### Redis (optional — enables horizontal scaling)
-
-```yaml
-redis:
-  url: "redis://localhost:6379"
-```
-
-When configured, exchange rates, VM state cache, and the work queue all use Redis.
-
-### Database field encryption (optional)
-
-The encryption key can be supplied two ways (the environment variable takes
-precedence):
-
-1. **Environment variable** — `LNVPS_ENCRYPTION_KEY`, a hex-encoded 32-byte key
-   (64 hex characters):
    ```bash
-   export LNVPS_ENCRYPTION_KEY=$(openssl rand -hex 32)
+   docker compose up -d
    ```
-2. **Key file** — configured in `config.yaml`, used as a fallback when the
-   environment variable is not set:
+
+2. Create a minimal `config.yaml`:
+
    ```yaml
-   encryption:
-     key-file: "/etc/lnvps/encryption.key"
-     auto-generate: true   # generate key if absent
+   db: "mysql://root:root@localhost:3376/lnvps"
+   public-url: "http://localhost:8000"
+   listen: "0.0.0.0:8000"
+   read-only: false
+   delete-after: 3
+
+   provisioner:
+     proxmox:
+       qemu:
+         machine: "q35"
+         os-type: "l26"
+         bridge: "vmbr0"
+         cpu: "kvm64"
+         kvm: false
+         arch: "x86_64"
+       ssh:
+         key: "/root/.ssh/id_ed25519"
+         user: "root"
    ```
 
-When neither is provided, field encryption is disabled and values are
-stored/read as plaintext.
+3. Run the API + worker:
 
-Encrypted fields: SSH key material, NWC connection strings, email addresses, host API tokens.
+   ```bash
+   cargo run -p lnvps_api -- --config config.yaml
+   ```
 
-Ciphertexts use the format `ENC1:<key-id>:<base64(nonce||ciphertext)>`. The
-embedded key id (first 4 bytes of SHA-256 of the key) identifies which key
-encrypted a value, enabling future key rotation. Legacy `ENC:` values written
-before key ids are still decrypted transparently.
+4. Add a payment provider. Providers (Lightning, on-chain, Revolut) are **not**
+   in the YAML — configure at least one via the admin API
+   (`POST /api/admin/v1/payment_method_configs`), or startup will refuse to
+   provision VMs. See the [config reference](docs/config.md) for details.
 
-### Taxes (VAT)
+## Configuration
 
-This implements **EU VAT only**. The seller's country is taken from the
-company's own VAT number (`tax_id`) when set — that number is the company's VIES
-registration and identifies the country it is registered in — otherwise from the
-company's `country_code`. EU VAT applies only when that country is in the EU VAT
-area; if it is outside the list (e.g. a US company), no tax is applied here —
-other tax systems (such as US sales tax) are not handled.
+Every service is configured with a YAML file (the AI agent reads `settings.yaml`
+from its working directory). The snippet above is the bare minimum for
+`lnvps_api`. Everything else — auth (OAuth/passkeys), notifications (SMTP, Nostr,
+Telegram, WhatsApp), DNS, Redis, field encryption, VAT, captcha — is optional.
 
-When the seller is in the EU, standard rates for all member states are fetched
-from an external source at startup and refreshed daily (cached in-memory by the
-shared `VatClient`). The rate applied to a payment is then determined from the
-seller's country and the customer:
-
-- **B2B** with a stored (VIES-validated) VAT number: same country as seller →
-  domestic VAT; another EU country → reverse charge (0%); outside the EU → out
-  of scope (0%).
-- **B2C**: place of supply is taken from the self-declared country, falling back
-  to the IP-derived country. EU → that country's destination rate (OSS); non-EU
-  → out of scope (0%).
-- **Undetermined** (no country evidence): the seller's domestic rate is applied
-  conservatively when the seller is in the EU, otherwise out of scope.
-
-IP geolocation (for the fallback location signal) requires the optional
-`geoip-database` setting pointing at a MaxMind GeoLite2/GeoIP2 Country `.mmdb`.
-EU VAT numbers are validated against the VIES service before being stored.
-
-Until the first successful rate refresh (or if the rate source is unreachable),
-no rates are known and VAT falls back to 0%.
-
-> **Disclaimer:** This VAT handling is an automated, best-effort determination
-> from the available evidence and configuration — it is **not tax or legal
-> advice** and makes no guarantee of compliance in any jurisdiction. Rates and
-> validation come from third-party sources that may lag official changes. The
-> operator is solely responsible for confirming the correct VAT/OSS treatment
-> for their business and should have it reviewed by a qualified tax professional.
-
-### Nostr address host (optional)
-
-```yaml
-# Enables NIP-05 routing under this hostname
-nostr-address-host: "nostr.example.com"
-```
-
-### Captcha (optional)
-
-```yaml
-captcha:
-  turnstile:
-    secret-key: "my-cloudflare-turnstile-secret"
-```
-
----
-
-### `lnvps_nostr` config
-
-Standalone NIP-05 identity server. Reads domain/handle records from the shared database.
-
-```yaml
-db: "mysql://root:root@localhost:3376/lnvps"
-listen: "0.0.0.0:8001"
-```
-
----
-
-### `lnvps_operator` config (Kubernetes)
-
-Reconciles Kubernetes `Ingress` and cert-manager `Certificate` objects for Nostr domains.
-
-```yaml
-db: "mysql://root:root@localhost:3376/lnvps"
-namespace: "default"
-reconcile-interval: 60        # seconds
-error-retry-interval: 30
-service-name: "lnvps-nostr"
-port-name: "http"
-cluster-issuer: "letsencrypt-prod"
-ingress-class: "nginx"
-annotations:
-  nginx.ingress.kubernetes.io/ssl-redirect: "true"
-```
-
----
-
-### `lnvps_health` config
-
-Network health monitoring daemon. Runs TCP MSS/PMTU probes, DNS checks, exposes Prometheus metrics, and sends email alerts.
-
-```yaml
-interval-secs: 600           # check interval
-alert-cooldown-secs: 3600    # minimum time between repeated alerts
-
-metrics:
-  enabled: true
-  bind: "127.0.0.1:9090"    # Prometheus scrape endpoint (/metrics)
-
-smtp:
-  host: "smtp.gmail.com"
-  port: 587
-  username: "alerts@example.com"
-  password: "password"
-  from: "alerts@example.com"
-  to: "admin@example.com"
-
-mss-checks:
-  - name: "My Server"
-    host: "server1.example.com"
-    port: 443
-    expected-mss: 1460
-    expected-mss-v6: 1440    # optional, defaults to expected-mss - 20
-```
-
-```bash
-./lnvps_health --config config.yaml         # run continuously
-./lnvps_health --config config.yaml --once  # run once and exit
-```
-
----
-
-### `lnvps_agent` config
-
-AI support agent. Watches an email inbox (IMAP IDLE) and/or Nostr kind-1 mentions, and answers
-support requests using an OpenAI-compatible LLM with tools that call the LNVPS APIs. Config is loaded from a `settings.yaml` file in the working directory; all keys can also be overridden with
-`LNVPS_AGENT__*` environment variables.
-
-```yaml
-listen: "0.0.0.0:8080"                       # agent HTTP server (default)
-admin-api-url: "https://api.example.com"     # LNVPS admin API base URL (required)
-user-api-url: "https://api.example.com"      # LNVPS user API base URL (required)
-nsec: "nsec1234xxx"                           # signs NIP-98 auth events / Nostr ops (required)
-system-prompt: "You are LNVPS support..."    # optional system prompt override
-conversation-history-path: "/var/lib/lnvps-agent"  # optional history store dir
-
-openai:                                       # OpenAI-compatible LLM (required)
-  base-url: "http://localhost:11434/v1"      # e.g. Ollama, or https://api.openai.com/v1
-  api-key: "sk-..."                          # optional (not needed for Ollama)
-  model: "gpt-4o"
-  max-tokens: 2048
-
-email:                                        # email channel (optional)
-  imap-server: "imap.gmail.com:993"
-  imap-username: "support@example.com"
-  imap-password: "app-password"
-  imap-mailbox: "INBOX"                       # optional
-  smtp-server: "smtp.gmail.com:587"
-  smtp-username: "support@example.com"
-  smtp-password: "app-password"
-  smtp-from: "support@example.com"
-  smtp-from-name: "LNVPS Support"            # optional
-
-kind1:                                        # Nostr kind-1 mention channel (optional)
-  relays:
-    - "wss://relay.damus.io"
-  mention-pubkeys: []                          # hex pubkeys to watch; defaults to the bot's own
-  poll-interval-secs: 30
-```
+See **[docs/config.md](docs/config.md)** for the full reference, including the
+standalone `lnvps_nostr`, `lnvps_operator`, `lnvps_health`, and `lnvps_agent`
+services.
