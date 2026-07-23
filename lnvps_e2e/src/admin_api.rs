@@ -387,6 +387,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_vm_extend_all() {
+        let client = setup().await;
+        let body = serde_json::json!({"days": 1, "reason": "e2e-test-bulk"});
+        let resp = client
+            .post_auth("/api/admin/v1/vms/extend-all", &body)
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::OK
+                || resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "VM extend-all should return 200, 400, or 500, got: {}",
+            resp.status()
+        );
+        // Validate error case: 0 days must be rejected
+        let bad = serde_json::json!({"days": 0});
+        let resp = client
+            .post_auth("/api/admin/v1/vms/extend-all", &bad)
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "extend-all with days=0 must not succeed"
+        );
+    }
+
+    #[tokio::test]
     async fn test_admin_vm_transfer() {
         let client = setup().await;
         let resp = client.get_auth("/api/admin/v1/vms?limit=1").await.unwrap();

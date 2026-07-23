@@ -22,6 +22,7 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/vms",
             get(admin_list_vms).post(admin_create_vm),
         )
+        .route("/api/admin/v1/vms/extend-all", post(admin_extend_all_vms))
         .route(
             "/api/admin/v1/vms/{id}",
             get(admin_get_vm)
@@ -544,6 +545,70 @@ async fn admin_delete_vm(
 }
 
 /// Extend a VM's expiration date
+/// Extend a single VM's subscription by `days`, log the change to VM history,
+/// and dispatch a `SpawnVm` job. Shared by the single-VM and bulk endpoints.
+///
+/// Returns the new expiry. The VM must already have been verified as
+/// non-deleted by the caller.
+async fn extend_vm_by_days(
+    this: &RouterState,
+    admin_user_id: u64,
+    vm_id: u64,
+    line_item_id: u64,
+    days: u32,
+    reason: Option<String>,
+) -> anyhow::Result<DateTime<Utc>> {
+    // Extend the subscription expiry (single source of truth, use shortcut function)
+    let mut sub = this
+        .db
+        .get_subscription_by_line_item_id(line_item_id)
+        .await?;
+    let old_expires = sub.expires.unwrap_or(Utc::now());
+    let new_expires = old_expires + Days::new(days as u64);
+    sub.expires = Some(new_expires);
+    // Granting paid time marks the subscription as set up and active, otherwise the
+    // worker's unpaid-VM cleanup (which keys off `is_setup`) would delete this VM
+    // despite the admin having extended it.
+    sub.is_setup = true;
+    sub.is_active = true;
+    this.db.update_subscription(&sub).await?;
+
+    // Log the extension in VM history
+    let vm_history_logger = VmHistoryLogger::new(this.db.clone());
+    let metadata = Some(serde_json::json!({
+        "admin_user_id": admin_user_id,
+        "admin_action": true
+    }));
+
+    if let Err(e) = vm_history_logger
+        .log_vm_extended(
+            vm_id,
+            Some(admin_user_id),
+            old_expires,
+            new_expires,
+            days,
+            reason,
+            metadata,
+        )
+        .await
+    {
+        error!("Failed to log VM {} extension: {}", vm_id, e);
+    }
+
+    info!(
+        "Admin {} extended VM {} by {} days until {}",
+        admin_user_id, vm_id, days, new_expires
+    );
+
+    // Trigger SpawnVm so the worker provisions the VM if it has never been
+    // spawned (mac == ff:ff:ff:ff:ff:ff) or syncs its state if it already has.
+    if let Err(e) = this.work_commander.send(WorkJob::SpawnVm { vm_id }).await {
+        error!("Failed to queue SpawnVm job for VM {}: {}", vm_id, e);
+    }
+
+    Ok(new_expires)
+}
+
 async fn admin_extend_vm(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -554,7 +619,7 @@ async fn admin_extend_vm(
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     // Verify VM exists
-    let mut vm = this.db.get_vm(id).await?;
+    let vm = this.db.get_vm(id).await?;
 
     if vm.deleted {
         return Err(ApiError::conflict("Cannot extend a deleted VM"));
@@ -568,59 +633,124 @@ async fn admin_extend_vm(
         return ApiData::err("Cannot extend by more than 365 days");
     }
 
-    // Extend the subscription expiry (single source of truth, use shortcut function)
-    let mut sub = this
-        .db
-        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-        .await?;
-    let old_expires = sub.expires.unwrap_or(Utc::now());
-    let new_expires = old_expires + Days::new(req.days as u64);
-    sub.expires = Some(new_expires);
-    // Granting paid time marks the subscription as set up and active, otherwise the
-    // worker's unpaid-VM cleanup (which keys off `is_setup`) would delete this VM
-    // despite the admin having extended it.
-    sub.is_setup = true;
-    sub.is_active = true;
-    this.db.update_subscription(&sub).await?;
+    extend_vm_by_days(
+        &this,
+        auth.user_id,
+        id,
+        vm.subscription_line_item_id,
+        req.days,
+        req.reason.clone(),
+    )
+    .await?;
 
-    // Log the extension in VM history
-    let vm_history_logger = VmHistoryLogger::new(this.db.clone());
-    let metadata = Some(serde_json::json!({
-        "admin_user_id": auth.user_id,
-        "admin_action": true
-    }));
+    ApiData::ok(())
+}
 
-    if let Err(e) = vm_history_logger
-        .log_vm_extended(
-            id,
-            Some(auth.user_id),
-            old_expires,
-            new_expires,
+#[derive(Deserialize)]
+struct AdminExtendAllVmsRequest {
+    days: u32,
+    reason: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct AdminExtendAllVmsResult {
+    /// Number of VMs that were extended
+    extended: u64,
+    /// Number of VMs skipped because they are expired, never-paid, or deleted
+    skipped: u64,
+    /// Number of VMs that errored during extension (see server logs)
+    failed: u64,
+}
+
+/// Extend all currently non-expired VMs by `days` in a single request.
+///
+/// A VM is considered non-expired (and thus extended) when its subscription
+/// has a concrete `expires` in the future. Deleted VMs, never-paid VMs
+/// (`expires = null`), and already-expired VMs are skipped — this endpoint is
+/// for granting extra time to active customers (e.g. compensating downtime),
+/// not for reviving dead VMs.
+async fn admin_extend_all_vms(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminExtendAllVmsRequest>,
+) -> ApiResult<AdminExtendAllVmsResult> {
+    // Fleet-wide mutation: gated behind the dedicated bulk_update permission so
+    // it can be granted independently of ordinary single-VM edits.
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::BulkUpdate)?;
+
+    // Validate days (reasonable limits)
+    if req.days == 0 {
+        return ApiData::err("Must extend by at least 1 day");
+    }
+    if req.days > 365 {
+        return ApiData::err("Cannot extend by more than 365 days");
+    }
+
+    let now = Utc::now();
+    let vms = this.db.list_vms().await?;
+
+    let mut extended = 0u64;
+    let mut skipped = 0u64;
+    let mut failed = 0u64;
+
+    for vm in vms {
+        if vm.deleted {
+            skipped += 1;
+            continue;
+        }
+
+        // Only extend VMs that are currently non-expired (concrete future expiry).
+        let sub = match this
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+        {
+            Ok(sub) => sub,
+            Err(e) => {
+                error!(
+                    "Failed to load subscription for VM {} during bulk extend: {}",
+                    vm.id, e
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        match sub.expires {
+            Some(exp) if exp > now => {}
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        match extend_vm_by_days(
+            &this,
+            auth.user_id,
+            vm.id,
+            vm.subscription_line_item_id,
             req.days,
             req.reason.clone(),
-            metadata,
         )
         .await
-    {
-        error!("Failed to log VM {} extension: {}", id, e);
+        {
+            Ok(_) => extended += 1,
+            Err(e) => {
+                error!("Failed to extend VM {} during bulk extend: {}", vm.id, e);
+                failed += 1;
+            }
+        }
     }
 
     info!(
-        "Admin {} extended VM {} by {} days until {}",
-        auth.user_id, id, req.days, new_expires
+        "Admin {} bulk-extended {} VM(s) by {} days ({} skipped, {} failed)",
+        auth.user_id, extended, req.days, skipped, failed
     );
 
-    // Trigger SpawnVm so the worker provisions the VM if it has never been
-    // spawned (mac == ff:ff:ff:ff:ff:ff) or syncs its state if it already has.
-    if let Err(e) = this
-        .work_commander
-        .send(WorkJob::SpawnVm { vm_id: id })
-        .await
-    {
-        error!("Failed to queue SpawnVm job for VM {}: {}", id, e);
-    }
-
-    ApiData::ok(())
+    ApiData::ok(AdminExtendAllVmsResult {
+        extended,
+        skipped,
+        failed,
+    })
 }
 
 /// List VM history with pagination

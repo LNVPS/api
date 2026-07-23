@@ -571,6 +571,39 @@ Body:
 }
 ```
 
+#### Extend All Non-Expired VMs
+
+```
+POST /api/admin/v1/vms/extend-all
+```
+
+Required Permission: `virtual_machines::bulk_update` (a fleet-wide action, granted only to `super_admin` by default)
+
+Extends every currently **non-expired** VM by the given number of days in a single request (e.g. to compensate customers for downtime). A VM is extended only when its subscription has a concrete future expiry; deleted VMs, never-paid VMs (`expires = null`), and already-expired VMs are skipped. Each extended VM is logged to its history and re-synced via a `SpawnVm` job, exactly like the single-VM extend.
+
+Body:
+
+```json
+{
+  "days": 30,
+  // Required: 1-365
+  "reason": "string"
+  // Optional
+}
+```
+
+Response:
+
+```json
+{
+  "data": {
+    "extended": 42,  // VMs extended
+    "skipped": 7,    // VMs skipped (expired / never-paid / deleted)
+    "failed": 0      // VMs that errored during extension (see server logs)
+  }
+}
+```
+
 #### List VM History
 
 ```
@@ -3646,6 +3679,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `view` - Read/view resources
 - `update` - Modify existing resources
 - `delete` - Delete resources
+- `bulk_update` - Fleet-wide mutation across many resources at once (e.g. `virtual_machines::bulk_update` for extend-all); granted separately from `update`
 
 ### Example Permissions:
 
