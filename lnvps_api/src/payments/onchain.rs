@@ -104,15 +104,16 @@ impl OnChainPaymentHandler {
     /// [`PricingEngine::get_cost_by_amount`]: lnvps_api_common::PricingEngine::get_cost_by_amount
     /// [`PricingEngine::get_subscription_cost_by_amount`]: lnvps_api_common::PricingEngine::get_subscription_cost_by_amount
     async fn regenerate(&self, payment: &mut SubscriptionPayment, gross_msat: u64) -> Result<()> {
-        // The engine prices from the net amount and adds tax on top; split the
-        // gross deposit using the frozen tax rate.
-        let tax_pct = payment.tax_rate.unwrap_or(0.0) as f64;
-        let net = (gross_msat as f64 / (1.0 + tax_pct / 100.0)).floor() as u64;
-        let net_amount = CurrencyAmount::millisats(net);
         let engine = self.sub_handler.pricing_engine();
 
+        // The received on-chain amount is always the **gross** deposit
+        // (net + tax + processing fee). The pricing engine takes the gross paid
+        // amount directly and backs out the net (removing tax + fee); the
+        // returned components sum to exactly what arrived.
+        //
         // VM-backed subscriptions price from the VM's template/custom pricing;
         // everything else prices from the subscription's line items.
+        let gross = CurrencyAmount::millisats(gross_msat);
         let cost = match self
             .db
             .get_vm_by_subscription(payment.subscription_id)
@@ -120,14 +121,14 @@ impl OnChainPaymentHandler {
         {
             Ok(vm) => {
                 engine
-                    .get_cost_by_amount(vm.id, net_amount, PaymentMethod::OnChain)
+                    .get_cost_by_amount(vm.id, gross, PaymentMethod::OnChain)
                     .await?
             }
             Err(_) => {
                 engine
                     .get_subscription_cost_by_amount(
                         payment.subscription_id,
-                        net_amount,
+                        gross,
                         PaymentMethod::OnChain,
                     )
                     .await?
@@ -139,10 +140,10 @@ impl OnChainPaymentHandler {
         };
         payment.time_value = Some(p.time_value);
         payment.rate = p.rate.rate;
-        // Components always sum to exactly what arrived
-        payment.tax = p.tax.min(gross_msat);
-        payment.processing_fee = p.processing_fee.min(gross_msat - payment.tax);
-        payment.amount = gross_msat - payment.tax - payment.processing_fee;
+        // Components sum to exactly what arrived (fee is the remainder).
+        payment.amount = p.amount;
+        payment.tax = p.tax;
+        payment.processing_fee = p.processing_fee;
         Ok(())
     }
 
