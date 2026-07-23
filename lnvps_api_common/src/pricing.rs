@@ -2203,6 +2203,42 @@ mod tests {
             _ => bail!("??"),
         }
 
+        // from amount, taxed customer (vm 2 = IE, 23% VAT). The paid amount is
+        // the GROSS, so tax must be taken *out* of it and the credited time must
+        // reflect the NET, not the full amount paid.
+        let gross = 1_230_000u64; // net 1_000_000 + 23% VAT 230_000
+        let price = pe
+            .get_cost_by_amount(
+                2,
+                CurrencyAmount::millisats(gross),
+                PaymentMethod::Lightning,
+            )
+            .await?;
+        match price {
+            CostResult::New(p) => {
+                // components sum to exactly the gross paid
+                assert_eq!(p.amount + p.tax + p.processing_fee, gross);
+                assert_eq!(p.processing_fee, 0, "lightning has no processing fee");
+                assert_eq!(p.amount, 1_000_000, "net = gross / 1.23");
+                assert_eq!(p.tax, 230_000, "23% VAT backed out of the gross");
+                // Time is scaled by the NET amount.
+                let net_time = (next_expire as f64 * (p.amount as f64 / mo_price as f64)) as u64;
+                assert_eq!(
+                    p.time_value, net_time,
+                    "time must be credited from the net, not the gross"
+                );
+                // ...and strictly less than if the gross had (wrongly) been used.
+                let gross_time = (next_expire as f64 * (gross as f64 / mo_price as f64)) as u64;
+                assert!(
+                    p.time_value < gross_time,
+                    "a taxed top-up must credit net-based time ({}), not gross-based ({})",
+                    p.time_value,
+                    gross_time
+                );
+            }
+            _ => bail!("??"),
+        }
+
         Ok(())
     }
 
