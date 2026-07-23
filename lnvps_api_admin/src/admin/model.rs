@@ -3939,6 +3939,23 @@ pub struct PartialPaypalConfig {
     pub mode: Option<String>,
 }
 
+/// Partial on-chain (LND wallet) config for updates
+#[derive(Deserialize)]
+pub struct PartialOnChainConfig {
+    pub url: Option<String>,
+    pub cert_path: Option<std::path::PathBuf>,
+    pub macaroon_path: Option<std::path::PathBuf>,
+    pub address_type: Option<lnvps_db::OnChainAddressType>,
+    /// Wallet account name: `Some(Some(x))` sets it, `Some(None)` clears it back
+    /// to the default account, omitted leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub account: Option<Option<String>>,
+    pub min_confirmations: Option<u32>,
+}
+
 /// Partial provider configuration for updates - only provided fields will be updated
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -3948,6 +3965,8 @@ pub enum PartialProviderConfig {
     Revolut(PartialRevolutConfig),
     Stripe(PartialStripeConfig),
     Paypal(PartialPaypalConfig),
+    #[serde(rename = "onchain")]
+    OnChain(PartialOnChainConfig),
 }
 
 impl PartialProviderConfig {
@@ -4018,6 +4037,27 @@ impl PartialProviderConfig {
                     mode: partial.mode.unwrap_or_else(|| existing.mode.clone()),
                 }))
             }
+            (PartialProviderConfig::OnChain(partial), ProviderConfig::OnChain(existing)) => {
+                Ok(ProviderConfig::OnChain(lnvps_db::OnChainProviderConfig {
+                    url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                    cert_path: partial
+                        .cert_path
+                        .unwrap_or_else(|| existing.cert_path.clone()),
+                    macaroon_path: partial
+                        .macaroon_path
+                        .unwrap_or_else(|| existing.macaroon_path.clone()),
+                    address_type: partial.address_type.unwrap_or(existing.address_type),
+                    // `account` is nullable: omitted keeps the existing value,
+                    // `Some(None)` clears it to the default account.
+                    account: match partial.account {
+                        Some(v) => v,
+                        None => existing.account.clone(),
+                    },
+                    min_confirmations: partial
+                        .min_confirmations
+                        .unwrap_or(existing.min_confirmations),
+                }))
+            }
             _ => Err(anyhow!(
                 "Cannot change provider type during update. Create a new config instead."
             )),
@@ -4032,6 +4072,7 @@ impl PartialProviderConfig {
             PartialProviderConfig::Revolut(_) => "revolut",
             PartialProviderConfig::Stripe(_) => "stripe",
             PartialProviderConfig::Paypal(_) => "paypal",
+            PartialProviderConfig::OnChain(_) => "onchain",
         }
     }
 }
@@ -4096,6 +4137,76 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_partial_provider_config_deserializes_onchain() {
+        // Regression: `type: "onchain"` previously failed with
+        // "unknown variant `onchain`" so on-chain payment method configs could
+        // not be PATCHed (e.g. to set a minimum amount).
+        let json = r#"{"type":"onchain","min_confirmations":2}"#;
+        let cfg: PartialProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.provider_type(), "onchain");
+        match cfg {
+            PartialProviderConfig::OnChain(p) => assert_eq!(p.min_confirmations, Some(2)),
+            _ => panic!("expected OnChain variant"),
+        }
+    }
+
+    #[test]
+    fn test_partial_onchain_merge_updates_only_provided_fields() {
+        use lnvps_db::{OnChainAddressType, OnChainProviderConfig, ProviderConfig};
+        use std::path::PathBuf;
+
+        let existing = ProviderConfig::OnChain(OnChainProviderConfig {
+            url: "https://old:10009".to_string(),
+            cert_path: PathBuf::from("/old/tls.cert"),
+            macaroon_path: PathBuf::from("/old/admin.macaroon"),
+            address_type: OnChainAddressType::WitnessPubkeyHash,
+            account: Some("orders".to_string()),
+            min_confirmations: 1,
+        });
+
+        // Only change the URL + confirmations; everything else is preserved.
+        let partial: PartialProviderConfig = serde_json::from_str(
+            r#"{"type":"onchain","url":"https://new:10009","min_confirmations":3}"#,
+        )
+        .unwrap();
+        let merged = partial.merge_with(&existing).unwrap();
+        match merged {
+            ProviderConfig::OnChain(c) => {
+                assert_eq!(c.url, "https://new:10009");
+                assert_eq!(c.min_confirmations, 3);
+                assert_eq!(c.cert_path, PathBuf::from("/old/tls.cert"));
+                assert_eq!(c.address_type, OnChainAddressType::WitnessPubkeyHash);
+                assert_eq!(c.account, Some("orders".to_string()));
+            }
+            _ => panic!("expected OnChain"),
+        }
+
+        // `account: null` clears it to the default account.
+        let clear: PartialProviderConfig =
+            serde_json::from_str(r#"{"type":"onchain","account":null}"#).unwrap();
+        match clear.merge_with(&existing).unwrap() {
+            ProviderConfig::OnChain(c) => assert_eq!(c.account, None),
+            _ => panic!("expected OnChain"),
+        }
+    }
+
+    #[test]
+    fn test_partial_provider_config_rejects_type_change() {
+        use lnvps_db::{LndConfig, ProviderConfig};
+        use std::path::PathBuf;
+
+        let existing = ProviderConfig::Lnd(LndConfig {
+            url: "https://lnd:10009".to_string(),
+            cert_path: PathBuf::from("/tls.cert"),
+            macaroon_path: PathBuf::from("/admin.macaroon"),
+        });
+        // Cannot morph an LND config into an on-chain one via update.
+        let partial: PartialProviderConfig =
+            serde_json::from_str(r#"{"type":"onchain","url":"https://x:10009"}"#).unwrap();
+        assert!(partial.merge_with(&existing).is_err());
+    }
 
     #[test]
     fn test_create_vm_os_image_request_accepts_new_distros() {
