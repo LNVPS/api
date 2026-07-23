@@ -20,6 +20,7 @@ pub use ip_space::router as ip_space_router;
 pub use legal::router as legal_router;
 use lnvps_api_common::{
     CountryResolver, ExchangeRateService, VmHistoryLogger, VmStateCache, WorkCommander,
+    WorkFeedback,
 };
 use lnvps_db::LNVpsDb;
 #[cfg(feature = "nostr-domain")]
@@ -66,6 +67,10 @@ pub struct RouterState {
     pub settings: Settings,
     pub rates: Arc<dyn ExchangeRateService>,
     pub work_sender: Arc<dyn WorkCommander>,
+    /// Job feedback pub/sub used to wait for worker-driven operations (e.g. VM
+    /// reinstall). `None` when no feedback service is configured (dev/tests
+    /// without Redis), in which case such operations run inline instead.
+    pub feedback: Option<Arc<dyn WorkFeedback>>,
     /// Resolves client IPs to a country for VAT place-of-supply evidence.
     /// `None` when no geolocation database is configured.
     pub geoip: Option<Arc<dyn CountryResolver>>,

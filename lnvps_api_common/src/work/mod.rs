@@ -135,6 +135,22 @@ pub enum WorkJob {
         admin_user_id: u64,
         reason: Option<String>,
     },
+    /// Re-install a VM: stop it, wipe & re-import the primary disk from its
+    /// current image template, then start it again. Runs on the worker so it is
+    /// serialised with spawn (avoiding a reinstall racing an in-flight spawn).
+    /// The worker publishes the outcome on `reply_channel` so the API can wait
+    /// for the result before responding to the user.
+    ReinstallVm {
+        vm_id: u64,
+        /// The user who triggered the reinstall (for history logging).
+        user_id: Option<u64>,
+        /// Image id already in effect on the VM (recorded in history).
+        old_image_id: u64,
+        /// Image the VM was reinstalled with (recorded in history).
+        new_image_id: u64,
+        /// Temporary channel id the worker replies on (via job feedback).
+        reply_channel: String,
+    },
     /// Create a VM for a specific user (admin action)
     CreateVm {
         user_id: u64,
@@ -199,6 +215,9 @@ impl WorkJob {
             // A discovery request is a one-shot read tied to a waiting admin
             // request; never retry it if it fails.
             Self::ListUnmanagedVms { .. } => true,
+            // A reinstall is a one-shot action tied to a waiting user request;
+            // don't let the worker silently retry it later.
+            Self::ReinstallVm { .. } => true,
             _ => false,
         }
     }
@@ -225,6 +244,7 @@ impl fmt::Display for WorkJob {
             WorkJob::UpdateVmIp { .. } => write!(f, "UpdateVmIp"),
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
             WorkJob::ListUnmanagedVms { .. } => write!(f, "ListUnmanagedVms"),
+            WorkJob::ReinstallVm { .. } => write!(f, "ReinstallVm"),
             WorkJob::ImportVm { .. } => write!(f, "ImportVm"),
             WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),

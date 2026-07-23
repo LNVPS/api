@@ -2303,6 +2303,61 @@ impl Worker {
             } => {
                 self.configure_vm(*vm_id, *admin_user_id).await?;
             }
+            WorkJob::ReinstallVm {
+                vm_id,
+                user_id,
+                old_image_id,
+                new_image_id,
+                reply_channel,
+            } => {
+                // Run the reinstall pipeline (stop → wipe → import → start) on the
+                // provisioner and report the outcome on the reply channel so the
+                // waiting API request can respond to the user. Running here (rather
+                // than inline in the web request) serialises reinstall with spawn
+                // and other host operations, preventing the reinstall-vs-spawn race.
+                let result = self
+                    .subscription_handler
+                    .vm_provisioner()
+                    .reinstall_vm(*vm_id)
+                    .await;
+
+                let feedback = match &result {
+                    Ok(()) => {
+                        // Record history + refresh cached state only on success.
+                        self.vm_history_logger
+                            .log_vm_reinstalled(
+                                *vm_id,
+                                *user_id,
+                                *old_image_id,
+                                *new_image_id,
+                                None,
+                            )
+                            .await
+                            .ok();
+                        if let Err(e) = self.work_commander.send(WorkJob::CheckVm { vm_id: *vm_id }).await
+                        {
+                            warn!("Failed to queue CheckVm after reinstall of VM {}: {}", vm_id, e);
+                        }
+                        JobFeedback::create_job_completed_feedback(
+                            reply_channel.clone(),
+                            "ReinstallVm".to_string(),
+                            None,
+                        )
+                    }
+                    Err(e) => JobFeedback::create_job_failed_feedback(
+                        reply_channel.clone(),
+                        "ReinstallVm".to_string(),
+                        e.to_string(),
+                    ),
+                };
+                if let Err(e) = self.feedback.publish(feedback).await {
+                    warn!("Failed to publish ReinstallVm reply for VM {}: {}", vm_id, e);
+                }
+                return Ok(Some(match &result {
+                    Ok(()) => format!("VM {} reinstalled successfully", vm_id),
+                    Err(e) => format!("VM {} reinstall failed: {}", vm_id, e),
+                }));
+            }
             WorkJob::ApplyVmFirewall { vm_id } => {
                 self.apply_vm_firewall(*vm_id).await?;
             }

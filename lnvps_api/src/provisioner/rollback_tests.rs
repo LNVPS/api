@@ -895,4 +895,52 @@ mod tests {
 
         Ok(())
     }
+
+    /// A reinstall of a spawned VM runs the stop → unlink → import → start
+    /// pipeline against the host and completes successfully.
+    #[tokio::test]
+    async fn test_reinstall_vm_succeeds() -> Result<()> {
+        clear_mock_state().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        let _dns = Arc::new(MockDnsServer::new());
+        const MOCK_RATE: f32 = 69_420.0;
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        // Spawn the VM first so it exists on the (mock) host.
+        let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
+        pipeline.execute().await?;
+
+        // Reinstall should complete without error.
+        provisioner.reinstall_vm(vm.id).await?;
+
+        Ok(())
+    }
+
+    /// A read-only provisioner must refuse to re-install.
+    #[tokio::test]
+    async fn test_reinstall_vm_read_only_rejected() -> Result<()> {
+        clear_mock_state().await;
+        let mut settings = mock_settings();
+        settings.read_only = true;
+        let db = Arc::new(MockDb::default());
+
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let err = provisioner.reinstall_vm(1).await;
+        assert!(err.is_err(), "reinstall in read-only mode must be rejected");
+
+        Ok(())
+    }
 }

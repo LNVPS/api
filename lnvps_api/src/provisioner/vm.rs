@@ -706,6 +706,68 @@ impl VmProvisioner {
         Ok(())
     }
 
+    /// Re-install a VM: stop it, wipe & re-import the primary disk from the
+    /// current image template, then start it again. This is the pipeline that
+    /// previously ran inline in the web API request; it now lives here so it can
+    /// be driven from the worker (serialised with spawn, avoiding races).
+    ///
+    /// `FullVmInfo` is loaded fresh so any image change persisted by the caller
+    /// is reflected in the imported template.
+    pub async fn reinstall_vm(&self, vm_id: u64) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant re-install VM's in read-only mode");
+        }
+
+        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        let host_client = get_host_client(&info.host, &self.provisioner_config)?;
+
+        struct ReinstallContext {
+            vm_id: u64,
+            client: Arc<dyn VmHostClient>,
+            info: FullVmInfo,
+        }
+
+        let ctx = ReinstallContext {
+            vm_id,
+            client: host_client,
+            info,
+        };
+
+        Pipeline::new(ctx)
+            .with_retry_policy(Self::retry_policy())
+            .step("stop_vm", |ctx| {
+                Box::pin(async move {
+                    info!("Stopping VM {} for reinstall", ctx.vm_id);
+                    ctx.client.stop_vm(&ctx.info.vm).await
+                })
+            })
+            .step("unlink_disk", |ctx| {
+                Box::pin(async move {
+                    info!("Unlinking disk for VM {}", ctx.vm_id);
+                    ctx.client.unlink_primary_disk(&ctx.info.vm).await
+                })
+            })
+            .step("import_template_disk", |ctx| {
+                Box::pin(async move {
+                    // import_template_disk already imports AND resizes the primary
+                    // disk to the template size; a separate resize step here would
+                    // ask Proxmox to resize to the same size, which it rejects as a
+                    // disallowed shrink and surfaces as a 500 (see issue #142).
+                    info!("Importing template disk for VM {}", ctx.vm_id);
+                    ctx.client.import_template_disk(&ctx.info).await
+                })
+            })
+            .step("start_vm", |ctx| {
+                Box::pin(async move {
+                    info!("Starting VM {} after reinstall", ctx.vm_id);
+                    ctx.client.start_vm(&ctx.info.vm).await
+                })
+            })
+            .execute()
+            .await?;
+        Ok(())
+    }
+
     /// Start a VM
     pub async fn start_vm(&self, vm_id: u64) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;

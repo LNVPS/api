@@ -5,6 +5,7 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{any, delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, Utc};
+use futures::StreamExt;
 use futures::future::join_all;
 use isocountry::CountryCode;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
@@ -17,12 +18,12 @@ use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
+use std::time::Duration;
 
-use lnvps_api_common::retry::{OpError, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage,
-    ApiVmTemplate, ClientIp, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig, VatClient,
-    WorkJob,
+    ApiVmTemplate, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails,
+    UpgradeConfig, VatClient, WorkJob,
 };
 use lnvps_db::{
     LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
@@ -1279,16 +1280,18 @@ async fn v1_reinstall_vm(
     let (uid, mut vm) = get_user_vm(&auth, &this, id).await?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Reject re-install on an expired VM. The VM may already be stopped/removed
-    // on the host, so running the reinstall pipeline would fail with a 500.
-    // The expiry is authoritative on the VM's subscription.
-    let vm_expires = this
+    // Reject re-install only on a *genuinely* expired VM (a concrete expiry in
+    // the past). Such a VM may already be stopped/removed on the host, so
+    // running the reinstall pipeline would fail with a 500. A subscription with
+    // no expiry yet (e.g. a freshly provisioned VM whose payment expiry hasn't
+    // propagated) is treated as active — matching the client, which shows such
+    // a VM as new — rather than blocked with a misleading "renew first" error.
+    // A missing/failed subscription lookup surfaces as an error, not "expired".
+    let subscription = this
         .db
         .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-        .await
-        .ok()
-        .and_then(|s| s.expires);
-    if is_vm_expired(vm_expires, Utc::now()) {
+        .await?;
+    if is_vm_expired(subscription.expires, Utc::now()) {
         return Err(ApiError::payment_required(
             "Cannot re-install an expired VM, please renew it first",
         ));
@@ -1310,65 +1313,69 @@ async fn v1_reinstall_vm(
     }
     let new_image_id = vm.image_id;
 
-    let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
-    let info = FullVmInfo::load(vm.id, this.db.clone()).await?;
-
-    struct ReinstallContext {
-        vm_id: u64,
-        client: std::sync::Arc<dyn crate::host::VmHostClient>,
-        info: FullVmInfo,
-    }
-
-    let ctx = ReinstallContext {
-        vm_id: vm.id,
-        client,
-        info,
+    // Without a real job-feedback service (dev/tests without Redis) run the
+    // reinstall pipeline inline so behaviour is unchanged. In production the
+    // work is dispatched to the worker (below), which serialises it with spawn
+    // and avoids a reinstall racing an in-flight spawn.
+    let Some(feedback) = this.feedback.clone() else {
+        this.sub_handler
+            .vm_provisioner()
+            .reinstall_vm(vm.id)
+            .await?;
+        this.history
+            .log_vm_reinstalled(id, Some(uid), old_image_id, new_image_id, None)
+            .await
+            .ok();
+        this.work_sender
+            .send(WorkJob::CheckVm { vm_id: id })
+            .await?;
+        return ApiData::ok(());
     };
 
-    Pipeline::new(ctx)
-        .with_retry_policy(RetryPolicy::default())
-        .step("stop_vm", |ctx| {
-            Box::pin(async move {
-                info!("Stopping VM {} for reinstall", ctx.vm_id);
-                ctx.client.stop_vm(&ctx.info.vm).await
-            })
-        })
-        .step("unlink_disk", |ctx| {
-            Box::pin(async move {
-                info!("Unlinking disk for VM {}", ctx.vm_id);
-                ctx.client.unlink_primary_disk(&ctx.info.vm).await
-            })
-        })
-        .step("import_template_disk", |ctx| {
-            Box::pin(async move {
-                // import_template_disk already imports AND resizes the primary
-                // disk to the template size; a separate resize step here would
-                // ask Proxmox to resize to the same size, which it rejects as a
-                // disallowed shrink and surfaces as a 500 (see issue #142).
-                info!("Importing template disk for VM {}", ctx.vm_id);
-                ctx.client.import_template_disk(&ctx.info).await
-            })
-        })
-        .step("start_vm", |ctx| {
-            Box::pin(async move {
-                info!("Starting VM {} after reinstall", ctx.vm_id);
-                ctx.client.start_vm(&ctx.info.vm).await
-            })
-        })
-        .execute()
-        .await?;
+    // Temporary reply channel the worker publishes the reinstall result on.
+    let reply_channel = format!("reinstall-{}-{:032x}", vm.id, rand::random::<u128>());
+    let channel_name = JobFeedback::channel_name(&reply_channel);
 
-    // Log VM reinstall (records image change if the user switched images)
-    this.history
-        .log_vm_reinstalled(id, Some(uid), old_image_id, new_image_id, None)
+    // Subscribe BEFORE dispatching so we can't miss the reply.
+    let mut stream = feedback
+        .subscribe(&channel_name)
         .await
-        .ok();
+        .map_err(|e| ApiError::new(format!("Failed to subscribe to reply channel: {e}")))?;
 
     this.work_sender
-        .send(WorkJob::CheckVm { vm_id: id })
+        .send(WorkJob::ReinstallVm {
+            vm_id: vm.id,
+            user_id: Some(uid),
+            old_image_id,
+            new_image_id,
+            reply_channel,
+        })
         .await?;
-    ApiData::ok(())
+
+    // Wait for the worker to finish (bounded). A reinstall re-imports the primary
+    // disk, which can take a while on large disks. If it exceeds the bound we
+    // return success and let the job keep running (a CheckVm refreshes cached
+    // state) rather than surfacing an error for an operation still in progress.
+    match tokio::time::timeout(Duration::from_secs(180), stream.next()).await {
+        Ok(Some(Ok(fb))) => match fb.status {
+            JobFeedbackStatus::Completed { .. } => ApiData::ok(()),
+            JobFeedbackStatus::Failed { error } => {
+                Err(ApiError::new(format!("Reinstall failed: {error}")))
+            }
+            // Any interim status (shouldn't occur on this channel) — treat as
+            // still-running and let the client poll VM state.
+            _ => ApiData::ok(()),
+        },
+        Ok(Some(Err(e))) => Err(ApiError::new(format!("Reinstall reply error: {e}"))),
+        Ok(None) => Err(ApiError::new("Reinstall reply channel closed")),
+        Err(_) => {
+            info!(
+                "Reinstall of VM {} still in progress after 180s; returning to client",
+                vm.id
+            );
+            ApiData::ok(())
+        }
+    }
 }
 
 async fn v1_time_series(
@@ -2159,10 +2166,12 @@ async fn get_user_vm(auth: &Nip98Auth, this: &RouterState, id: u64) -> Result<(u
 
 /// Determine whether a VM is expired based on its subscription expiry.
 ///
-/// A `None` expiry means the VM has never been paid for and is treated as
-/// expired. An expiry at or before `now` is also expired.
+/// Only a concrete expiry at or before `now` counts as expired. A `None` expiry
+/// means the subscription has not been given an expiry yet (e.g. a freshly
+/// provisioned VM whose payment expiry hasn't propagated); it is treated as
+/// *not* expired, matching how the client renders such a VM (new, not expired).
 fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    expires.map(|e| e <= now).unwrap_or(true)
+    expires.map(|e| e <= now).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -2452,8 +2461,11 @@ mod tests {
     fn test_is_vm_expired() {
         let now = Utc::now();
 
-        // Never paid (no subscription expiry) -> expired
-        assert!(is_vm_expired(None, now));
+        // No expiry set yet (e.g. freshly provisioned VM) -> NOT expired.
+        // Matches the client, which treats a null expiry as a new VM, and keeps
+        // reinstall available instead of blocking with a misleading "renew"
+        // error (see api/mod.rs feedback + reinstall handling).
+        assert!(!is_vm_expired(None, now));
 
         // Expired in the past -> expired
         assert!(is_vm_expired(Some(now - chrono::Duration::hours(1)), now));

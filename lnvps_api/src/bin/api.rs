@@ -440,6 +440,10 @@ async fn main() -> Result<(), Error> {
         };
         let listener = bind_address(ip).await?;
         info!("Listening on {}", ip);
+        // Only expose a job-feedback handle to the API when a real (Redis) feedback
+        // service is configured. Without Redis the feedback is a blackhole, so the
+        // reinstall endpoint falls back to running its pipeline inline.
+        let api_feedback = settings.redis.as_ref().map(|_| worker.feedback());
         let mut router = Router::new()
             .merge(docs_router())
             .merge(main_router())
@@ -490,6 +494,7 @@ async fn main() -> Result<(), Error> {
                     settings,
                     rates: exchange,
                     work_sender: worker.commander(),
+                    feedback: api_feedback,
                     geoip: geoip.clone(),
                 }),
             )
