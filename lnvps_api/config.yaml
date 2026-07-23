@@ -35,6 +35,11 @@ provisioner:
       vlan: 100
       kvm: false
       arch: x86_64
+      # Auto-ballooning floor as a percentage of a VM's sold RAM (1..=99).
+      # When set, PVE auto-ballooning may reclaim up to (100 - pct)% of a VM's
+      # RAM under host memory pressure, guarding against host OOM-kills.
+      # Unset / 0 / >= 100 disables dynamic ballooning (default).
+      #balloon-min-pct: 90
 # Captcha is used in various places to prevent spam
 captcha:
   # Turnstile is a Cloudflare captcha product

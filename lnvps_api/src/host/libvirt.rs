@@ -643,6 +643,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
@@ -674,6 +675,7 @@ mod tests {
             cpu: "kvm64".to_string(),
             kvm: true,
             arch: "x86_64".to_string(),
+            balloon_min_pct: None,
             firewall_config: None,
         };
         let host = LibVirtHost::new("test:///default", q_cfg)?;
