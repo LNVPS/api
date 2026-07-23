@@ -11,8 +11,15 @@ max-prepay-days: 365
 # Automated referral commission payouts (opt-in). Omit this section to disable
 # automatic payouts (commission still accrues and can be paid manually by admins).
 referral:
-  # Minimum accrued BTC commission (satoshis) before a payout is attempted.
+  # Minimum accrued BTC commission (satoshis) before a Lightning payout is
+  # attempted.
   min-payout-sats: 1000
+  # Minimum accrued BTC commission (satoshis) before an *on-chain* payout is
+  # attempted. On-chain payouts for all eligible referrers are batched into a
+  # single send-many transaction (one fee for the whole batch). This threshold
+  # is separate from (and typically much higher than) min-payout-sats because
+  # on-chain payouts compete with mempool fees. Omit to disable on-chain payouts.
+  #min-onchain-payout-sats: 100000
 public-url: "https://api.lnvps.net"
 read-only: false
 redis:

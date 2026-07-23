@@ -37,6 +37,7 @@ use payments_rs::lightning::{
 };
 use payments_rs::onchain::{
     ChainPaymentUpdate, NewAddressRequest, NewAddressResponse, OnChainProvider, PaymentCursor,
+    SendCoinsRequest, SendCoinsResponse,
 };
 use ssh2::HashType::Sha256;
 use std::collections::HashMap;
@@ -423,6 +424,8 @@ pub struct MockOnChainProvider {
     pub addresses: Arc<Mutex<Vec<String>>>,
     /// Scripted chain updates returned from `subscribe_payments`.
     pub updates: Arc<Mutex<Vec<ChainPaymentUpdate>>>,
+    /// Every `send_coins` request received, in call order, for assertions.
+    pub sends: Arc<Mutex<Vec<SendCoinsRequest>>>,
 }
 
 #[async_trait]
@@ -443,5 +446,18 @@ impl OnChainProvider for MockOnChainProvider {
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = ChainPaymentUpdate> + Send>>> {
         let updates = self.updates.lock().await.clone();
         Ok(Box::pin(futures::stream::iter(updates)))
+    }
+
+    async fn send_coins(&self, req: SendCoinsRequest) -> anyhow::Result<SendCoinsResponse> {
+        ensure!(!req.outputs.is_empty(), "send_coins requires an output");
+        let total_msat = req.total_msat();
+        let mut sends = self.sends.lock().await;
+        let txid = format!("mocktxid{:08}", sends.len());
+        sends.push(req);
+        Ok(SendCoinsResponse {
+            txid,
+            total_amount: payments_rs::currency::CurrencyAmount::millisats(total_msat),
+            fee: None,
+        })
     }
 }

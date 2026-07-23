@@ -1431,6 +1431,10 @@ pub struct Referral {
     pub code: String,
     /// Lightning address for automatic payouts
     pub lightning_address: Option<String>,
+    /// On-chain Bitcoin address for automatic payouts (used when `mode` is
+    /// `on_chain`).
+    #[sqlx(default)]
+    pub onchain_address: Option<String>,
     /// How the referrer is paid their commission.
     pub mode: ReferralPayoutMode,
     /// When this referral entry was created
@@ -1460,6 +1464,12 @@ pub struct ReferralPayout {
     pub invoice: Option<String>,
     /// Preimage revealed when the invoice was paid (32 bytes, SHA256)
     pub pre_image: Option<Vec<u8>>,
+    /// On-chain transaction id once an on-chain payout has been broadcast. A
+    /// single send-many transaction can back several payout rows (all eligible
+    /// referrers are batched into one transaction), so the same `txid` may
+    /// appear on multiple rows.
+    #[sqlx(default)]
+    pub txid: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug)]
@@ -1498,6 +1508,9 @@ pub enum ReferralPayoutMode {
     Nwc = 1,
     /// Credit the referrer's account balance (not yet implemented).
     AccountCredit = 2,
+    /// Pay to the referrer's on-chain Bitcoin address. Eligible referrers are
+    /// batched into a single send-many transaction.
+    OnChain = 3,
 }
 
 impl Display for ReferralPayoutMode {
@@ -1506,6 +1519,7 @@ impl Display for ReferralPayoutMode {
             ReferralPayoutMode::LightningAddress => "lightning_address",
             ReferralPayoutMode::Nwc => "nwc",
             ReferralPayoutMode::AccountCredit => "account_credit",
+            ReferralPayoutMode::OnChain => "on_chain",
         })
     }
 }
@@ -1520,6 +1534,7 @@ impl FromStr for ReferralPayoutMode {
             }
             "nwc" => Ok(ReferralPayoutMode::Nwc),
             "account_credit" | "credit" => Ok(ReferralPayoutMode::AccountCredit),
+            "on_chain" | "onchain" => Ok(ReferralPayoutMode::OnChain),
             other => anyhow::bail!("Invalid referral payout mode: {}", other),
         }
     }
@@ -2330,6 +2345,7 @@ mod tests {
             ("lightning_address", ReferralPayoutMode::LightningAddress),
             ("nwc", ReferralPayoutMode::Nwc),
             ("account_credit", ReferralPayoutMode::AccountCredit),
+            ("on_chain", ReferralPayoutMode::OnChain),
         ] {
             assert_eq!(ReferralPayoutMode::from_str(s).unwrap(), m);
             assert_eq!(m.to_string(), s);
@@ -2338,6 +2354,10 @@ mod tests {
         assert_eq!(
             ReferralPayoutMode::from_str("NWC").unwrap(),
             ReferralPayoutMode::Nwc
+        );
+        assert_eq!(
+            ReferralPayoutMode::from_str("onchain").unwrap(),
+            ReferralPayoutMode::OnChain
         );
         assert_eq!(
             ReferralPayoutMode::from_str("lightning").unwrap(),

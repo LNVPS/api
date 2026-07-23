@@ -353,10 +353,17 @@ fn default_min_payout_sats() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ReferralConfig {
-    /// Minimum accrued BTC commission (in satoshis) before an automated payout
-    /// is attempted for a referrer. Defaults to 1000 sats.
+    /// Minimum accrued BTC commission (in satoshis) before an automated
+    /// Lightning payout is attempted for a referrer. Defaults to 1000 sats.
     #[serde(default = "default_min_payout_sats")]
     pub min_payout_sats: u64,
+    /// Minimum accrued BTC commission (in satoshis) before an automated
+    /// **on-chain** payout is attempted. On-chain payouts compete with mempool
+    /// fees, so this threshold is deliberately separate (and typically much
+    /// higher) than the Lightning `min_payout_sats`. `None` disables on-chain
+    /// payouts entirely (commission still accrues for manual payout).
+    #[serde(default)]
+    pub min_onchain_payout_sats: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

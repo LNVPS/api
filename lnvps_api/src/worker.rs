@@ -130,8 +130,13 @@ pub struct WorkerSettings {
     pub redis: Option<RedisConfig>,
     pub nostr_hostname: Option<String>,
     /// Minimum accrued BTC referral commission (satoshis) before an automated
-    /// payout is attempted. `None` disables automated referral payouts.
+    /// Lightning payout is attempted. `None` disables automated Lightning
+    /// referral payouts.
     pub referral_min_payout_sats: Option<u64>,
+    /// Minimum accrued BTC referral commission (satoshis) before an automated
+    /// on-chain payout is attempted. `None` disables automated on-chain
+    /// referral payouts.
+    pub referral_min_onchain_payout_sats: Option<u64>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -145,6 +150,10 @@ impl From<&Settings> for WorkerSettings {
             redis: val.redis.clone(),
             nostr_hostname: val.nostr_address_host.clone(),
             referral_min_payout_sats: val.referral.as_ref().map(|r| r.min_payout_sats),
+            referral_min_onchain_payout_sats: val
+                .referral
+                .as_ref()
+                .and_then(|r| r.min_onchain_payout_sats),
         }
     }
 }
@@ -157,6 +166,7 @@ impl Worker {
         work_commander: Arc<dyn WorkCommander>,
         subscription_handler: SubscriptionHandler,
         node: Arc<dyn payments_rs::lightning::LightningNode>,
+        onchain: Option<Arc<dyn payments_rs::onchain::OnChainProvider>>,
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
         nostr: Option<Client>,
@@ -168,6 +178,8 @@ impl Worker {
             node,
             work_commander.clone(),
             settings.referral_min_payout_sats,
+            onchain,
+            settings.referral_min_onchain_payout_sats,
         );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
@@ -3456,6 +3468,7 @@ mod tests {
             work_commander,
             sub_handler,
             node,
+            None,
             &settings,
             cache,
             None,

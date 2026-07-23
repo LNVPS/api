@@ -51,6 +51,7 @@ async fn build_info(this: &RouterState, r: Referral) -> Result<AdminReferralInfo
         user_pubkey: hex::encode(user.pubkey),
         code: r.code,
         lightning_address: r.lightning_address,
+        onchain_address: r.onchain_address,
         mode: r.mode.to_string(),
         referral_rate: r.referral_rate,
         created: r.created,
@@ -201,6 +202,7 @@ async fn admin_create_referral_payout(
         is_paid: false,
         invoice: req.invoice.filter(|s| !s.trim().is_empty()),
         pre_image: None,
+        txid: None,
     };
     let payout_id = this.db.insert_referral_payout(&payout).await?;
 
@@ -255,6 +257,9 @@ async fn admin_update_referral_payout(
             ),
             None => None,
         };
+    }
+    if let Some(txid) = req.txid {
+        payout.txid = txid.filter(|s| !s.trim().is_empty());
     }
 
     this.db.update_referral_payout(&payout).await?;

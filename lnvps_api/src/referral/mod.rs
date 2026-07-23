@@ -14,7 +14,9 @@ use chrono::Utc;
 use lnvps_api_common::{WorkCommander, WorkJob};
 use lnvps_db::{LNVpsDb, Referral, ReferralPayout, ReferralPayoutMode};
 use log::{debug, info, warn};
+use payments_rs::currency::CurrencyAmount;
 use payments_rs::lightning::{LightningNode, PayInvoiceRequest};
+use payments_rs::onchain::{OnChainProvider, SendCoinsRequest, SendOutput};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -33,52 +35,276 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
     if pay_msat == 0 { None } else { Some(pay_msat) }
 }
 
-/// Pays referrers their accrued BTC commission over Lightning.
+/// Pays referrers their accrued BTC commission over Lightning or on-chain.
 #[derive(Clone)]
 pub struct ReferralPayoutHandler {
     db: Arc<dyn LNVpsDb>,
     node: Arc<dyn LightningNode>,
     tx: Arc<dyn WorkCommander>,
-    /// Minimum accrued BTC commission (millisats) before a payout is attempted.
-    /// `None` disables automated payouts.
+    /// Minimum accrued BTC commission (millisats) before a Lightning payout is
+    /// attempted. `None` disables automated Lightning payouts.
     min_payout_msat: Option<u64>,
+    /// On-chain provider used to pay [`ReferralPayoutMode::OnChain`] referrers.
+    /// `None` (or a `None` threshold) disables automated on-chain payouts.
+    onchain: Option<Arc<dyn OnChainProvider>>,
+    /// Minimum accrued BTC commission (millisats) before an on-chain payout is
+    /// attempted. Separate from (and typically higher than) the Lightning
+    /// minimum because on-chain payouts compete with mempool fees.
+    min_onchain_payout_msat: Option<u64>,
 }
 
 impl ReferralPayoutHandler {
-    /// Create a handler. `min_payout_sats` of `None` disables automated payouts;
-    /// commission still accrues and can be paid manually by admins.
+    /// Create a handler. `min_payout_sats` of `None` disables automated
+    /// Lightning payouts; `onchain`/`min_onchain_payout_sats` of `None` disables
+    /// automated on-chain payouts. In all cases commission still accrues and can
+    /// be paid manually by admins.
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
         tx: Arc<dyn WorkCommander>,
         min_payout_sats: Option<u64>,
+        onchain: Option<Arc<dyn OnChainProvider>>,
+        min_onchain_payout_sats: Option<u64>,
     ) -> Self {
         Self {
             db,
             node,
             tx,
             min_payout_msat: min_payout_sats.map(|s| s.saturating_mul(1000)),
+            onchain,
+            min_onchain_payout_msat: min_onchain_payout_sats.map(|s| s.saturating_mul(1000)),
         }
     }
 
     /// Process automated payouts for every enrolled referrer. Per-referrer
     /// failures are logged and do not abort the batch.
+    ///
+    /// Lightning/NWC referrers are paid individually; on-chain referrers are
+    /// **batched into a single send-many transaction** (see
+    /// [`Self::process_onchain_batch`]) so one transaction (and one fee) covers
+    /// every eligible on-chain payout in the run.
     pub async fn process_payouts(&self) -> Result<()> {
-        let Some(min_msat) = self.min_payout_msat else {
-            return Ok(());
-        };
         let referrals = self.db.list_all_referrals().await?;
-        debug!(
-            "Processing referral payouts for {} referrers (min {} msat)",
-            referrals.len(),
-            min_msat
-        );
-        for referral in referrals {
-            if let Err(e) = self.process_one(&referral, min_msat).await {
-                warn!("Referral payout failed for code {}: {}", referral.code, e);
+
+        // Lightning / NWC payouts, one payment each.
+        if let Some(min_msat) = self.min_payout_msat {
+            debug!(
+                "Processing Lightning referral payouts for {} referrers (min {} msat)",
+                referrals.len(),
+                min_msat
+            );
+            for referral in &referrals {
+                // On-chain referrers are handled by the batched pass below.
+                if referral.mode == ReferralPayoutMode::OnChain {
+                    continue;
+                }
+                if let Err(e) = self.process_one(referral, min_msat).await {
+                    warn!("Referral payout failed for code {}: {}", referral.code, e);
+                }
             }
         }
+
+        // On-chain payouts, batched into a single transaction.
+        if let (Some(onchain), Some(min_onchain_msat)) =
+            (self.onchain.as_ref(), self.min_onchain_payout_msat)
+        {
+            if let Err(e) = self
+                .process_onchain_batch(onchain.as_ref(), &referrals, min_onchain_msat)
+                .await
+            {
+                warn!("On-chain referral payout batch failed: {}", e);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Pay every eligible [`ReferralPayoutMode::OnChain`] referrer in a **single
+    /// send-many transaction**.
+    ///
+    /// Each referrer's owed BTC commission is computed exactly as for Lightning
+    /// (earned minus already paid/reserved, cleared against the on-chain
+    /// threshold and rounded to whole sats). Every eligible payout is reserved
+    /// (unpaid) up-front so a crash or concurrent run cannot double-pay, then a
+    /// single transaction pays them all. On success the shared `txid` is
+    /// recorded on every payout row; on failure all reservations are released so
+    /// the balances retry next run.
+    ///
+    /// The network fee is paid by our wallet on top of the outputs (absorbed by
+    /// LNVPS), so each referrer receives their exact owed amount.
+    async fn process_onchain_batch(
+        &self,
+        onchain: &dyn OnChainProvider,
+        referrals: &[Referral],
+        min_onchain_msat: u64,
+    ) -> Result<()> {
+        // 1. Select eligible on-chain referrers and their payable amount.
+        let mut eligible: Vec<(Referral, String, u64)> = Vec::new();
+        for referral in referrals {
+            if referral.mode != ReferralPayoutMode::OnChain {
+                continue;
+            }
+            let Some(address) = referral
+                .onchain_address
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                debug!(
+                    "Skipping on-chain payout for code {}: no on-chain address",
+                    referral.code
+                );
+                continue;
+            };
+            match self.payable_onchain_msat(referral, min_onchain_msat).await {
+                Ok(Some(pay_msat)) => {
+                    eligible.push((referral.clone(), address.to_string(), pay_msat))
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    "Failed to compute on-chain payout for code {}: {}",
+                    referral.code, e
+                ),
+            }
+        }
+        if eligible.is_empty() {
+            return Ok(());
+        }
+        self.send_batch(onchain, eligible).await
+    }
+
+    /// Reserve, broadcast (single send-many) and record a batch of on-chain
+    /// payouts. Split from selection so it can be tested with a hand-built
+    /// `eligible` list. Each entry is `(referrer, address, pay_msat)`.
+    async fn send_batch(
+        &self,
+        onchain: &dyn OnChainProvider,
+        eligible: Vec<(Referral, String, u64)>,
+    ) -> Result<()> {
+        // 1. Reserve every payout (unpaid) before sending, so a crash between
+        //    the broadcast and the DB update cannot double-pay next run.
+        let mut reserved: Vec<(u64, Referral, u64)> = Vec::new();
+        for (referral, _addr, pay_msat) in &eligible {
+            let payout = ReferralPayout {
+                id: 0,
+                referral_id: referral.id,
+                amount: *pay_msat,
+                currency: "BTC".to_string(),
+                created: Utc::now(),
+                is_paid: false,
+                invoice: None,
+                pre_image: None,
+                txid: None,
+            };
+            let payout_id = self.db.insert_referral_payout(&payout).await?;
+            reserved.push((payout_id, referral.clone(), *pay_msat));
+        }
+
+        // 2. Broadcast a single send-many transaction paying every referrer.
+        let req = Self::payout_batch_request(&eligible);
+        let total_msat: u64 = eligible.iter().map(|(_, _, m)| *m).sum();
+        match onchain.send_coins(req).await {
+            Ok(resp) => {
+                info!(
+                    "Broadcast on-chain referral payout batch {} ({} referrers, {} sats)",
+                    resp.txid,
+                    reserved.len(),
+                    total_msat / 1000
+                );
+                // 3. Mark every reserved payout paid with the shared txid.
+                for (payout_id, referral, pay_msat) in reserved {
+                    let payout = ReferralPayout {
+                        id: payout_id,
+                        referral_id: referral.id,
+                        amount: pay_msat,
+                        currency: "BTC".to_string(),
+                        created: Utc::now(),
+                        is_paid: true,
+                        invoice: None,
+                        pre_image: None,
+                        txid: Some(resp.txid.clone()),
+                    };
+                    if let Err(e) = self.db.update_referral_payout(&payout).await {
+                        warn!(
+                            "Broadcast payout {} but failed to mark it paid: {}",
+                            payout_id, e
+                        );
+                    }
+                    let _ = self
+                        .tx
+                        .send(WorkJob::SendNotification {
+                            user_id: referral.user_id,
+                            message: format!(
+                                "You've been paid {} sats in referral commission on-chain (tx {}).",
+                                pay_msat / 1000,
+                                resp.txid
+                            ),
+                            title: Some("Referral payout".to_string()),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Release all reservations so the balances retry next run.
+                for (payout_id, _referral, _pay_msat) in reserved {
+                    if let Err(del) = self.db.delete_referral_payout(payout_id).await {
+                        warn!(
+                            "Failed to release reserved on-chain payout {} after send error: {}",
+                            payout_id, del
+                        );
+                    }
+                }
+                Err(anyhow!("send_coins failed: {}", e))
+            }
+        }
+    }
+
+    /// Build the single send-many request paying every eligible referrer. Each
+    /// entry is `(referrer, address, pay_msat)`; the fee is absorbed by our
+    /// wallet so each referrer receives their exact amount.
+    fn payout_batch_request(eligible: &[(Referral, String, u64)]) -> SendCoinsRequest {
+        SendCoinsRequest {
+            outputs: eligible
+                .iter()
+                .map(|(_r, address, pay_msat)| SendOutput {
+                    address: address.clone(),
+                    amount: CurrencyAmount::millisats(*pay_msat),
+                })
+                .collect(),
+            sat_per_vbyte: None,
+            target_conf: None,
+            label: Some("LNVPS referral payouts".to_string()),
+        }
+    }
+
+    /// Compute a single on-chain referrer's payable BTC commission (millisats),
+    /// or `None` when below the threshold. Mirrors the Lightning accounting:
+    /// earned minus every existing (paid + reserved) BTC payout.
+    async fn payable_onchain_msat(
+        &self,
+        referral: &Referral,
+        min_onchain_msat: u64,
+    ) -> Result<Option<u64>> {
+        let usage = self.db.list_referral_usage(&referral.code).await?;
+        let earned_msat: u64 = usage
+            .iter()
+            .filter(|u| u.currency.eq_ignore_ascii_case("BTC"))
+            .map(|u| u.commission())
+            .sum();
+        let existing: u64 = self
+            .db
+            .list_referral_payouts(referral.id)
+            .await?
+            .iter()
+            .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
+            .map(|p| p.amount)
+            .sum();
+        Ok(payable_referral_msat(
+            earned_msat,
+            existing,
+            min_onchain_msat,
+        ))
     }
 
     /// Accrue and pay a single referrer's owed BTC commission, if it clears the
@@ -118,6 +344,7 @@ impl ReferralPayoutHandler {
             is_paid: false,
             invoice: None,
             pre_image: None,
+            txid: None,
         };
         let payout_id = self.db.insert_referral_payout(&payout).await?;
         payout.id = payout_id;
@@ -187,6 +414,11 @@ impl ReferralPayoutHandler {
             }
             ReferralPayoutMode::AccountCredit => {
                 bail!("account credit payouts are not implemented");
+            }
+            ReferralPayoutMode::OnChain => {
+                // On-chain referrers are paid by the batched send-many pass, not
+                // this per-referrer Lightning path.
+                bail!("on-chain payouts are handled by the batch, not pay_commission");
             }
         };
 
@@ -260,7 +492,159 @@ impl ReferralPayoutHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::payable_referral_msat;
+    use super::*;
+    use crate::mocks::MockOnChainProvider;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb};
+    use lnvps_db::Referral;
+
+    fn referrer(id: u64, code: &str) -> Referral {
+        Referral {
+            id,
+            user_id: id,
+            code: code.to_string(),
+            lightning_address: None,
+            onchain_address: Some(format!("bcrt1qmock{id:08}")),
+            mode: ReferralPayoutMode::OnChain,
+            referral_rate: None,
+            created: Utc::now(),
+        }
+    }
+
+    /// A test handler with the given on-chain provider; thresholds are irrelevant
+    /// for the `send_batch`/`payout_batch_request` tests which bypass selection.
+    fn handler(db: Arc<dyn LNVpsDb>, onchain: Arc<dyn OnChainProvider>) -> ReferralPayoutHandler {
+        ReferralPayoutHandler::new(
+            db,
+            Arc::new(crate::mocks::MockNode::default()),
+            Arc::new(ChannelWorkCommander::new()),
+            None,
+            Some(onchain),
+            Some(1000),
+        )
+    }
+
+    #[test]
+    fn test_payout_batch_request_one_output_per_referrer() {
+        let eligible = vec![
+            (referrer(1, "AAA"), "bcrt1qa".to_string(), 2_000_000),
+            (referrer(2, "BBB"), "bcrt1qb".to_string(), 1_500_000),
+        ];
+        let req = ReferralPayoutHandler::payout_batch_request(&eligible);
+        assert_eq!(req.outputs.len(), 2, "one output per referrer");
+        assert_eq!(
+            req.total_msat(),
+            3_500_000,
+            "outputs sum to the batch total"
+        );
+        assert_eq!(req.outputs[0].address, "bcrt1qa");
+        assert_eq!(req.outputs[0].amount.value(), 2_000_000);
+        assert_eq!(req.outputs[1].address, "bcrt1qb");
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_single_tx_shared_txid_all_paid() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        // Two referrers must be persisted so their payout rows FK-resolve.
+        let ra = db.insert_referral(&referrer(0, "AAA")).await.unwrap();
+        let rb = db.insert_referral(&referrer(0, "BBB")).await.unwrap();
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let h = handler(db.clone(), onchain.clone());
+
+        let eligible = vec![
+            (
+                Referral {
+                    id: ra,
+                    ..referrer(ra, "AAA")
+                },
+                "bcrt1qa".to_string(),
+                2_000_000,
+            ),
+            (
+                Referral {
+                    id: rb,
+                    ..referrer(rb, "BBB")
+                },
+                "bcrt1qb".to_string(),
+                1_500_000,
+            ),
+        ];
+        h.send_batch(onchain.as_ref(), eligible).await.unwrap();
+
+        // Exactly ONE on-chain transaction was broadcast for the whole batch.
+        let sends = onchain.sends.lock().await;
+        assert_eq!(sends.len(), 1, "all referrers batched into a single tx");
+        assert_eq!(sends[0].outputs.len(), 2);
+        drop(sends);
+
+        // Both payout rows are paid and carry the SAME txid.
+        let pa = db.list_referral_payouts(ra).await.unwrap();
+        let pb = db.list_referral_payouts(rb).await.unwrap();
+        assert_eq!(pa.len(), 1);
+        assert_eq!(pb.len(), 1);
+        assert!(pa[0].is_paid && pb[0].is_paid, "both marked paid");
+        assert_eq!(pa[0].amount, 2_000_000);
+        assert_eq!(pb[0].amount, 1_500_000);
+        assert_eq!(
+            pa[0].txid, pb[0].txid,
+            "both rows share the batch transaction id"
+        );
+        assert_eq!(pa[0].txid.as_deref(), Some("mocktxid00000000"));
+    }
+
+    /// A provider whose `send_coins` always fails, to test reservation rollback.
+    #[derive(Default)]
+    struct FailingOnChain;
+
+    #[async_trait::async_trait]
+    impl OnChainProvider for FailingOnChain {
+        async fn new_address(
+            &self,
+            _req: payments_rs::onchain::NewAddressRequest,
+        ) -> anyhow::Result<payments_rs::onchain::NewAddressResponse> {
+            anyhow::bail!("not supported")
+        }
+        async fn subscribe_payments(
+            &self,
+            _from: Option<payments_rs::onchain::PaymentCursor>,
+        ) -> anyhow::Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = payments_rs::onchain::ChainPaymentUpdate> + Send>,
+            >,
+        > {
+            anyhow::bail!("not supported")
+        }
+        async fn send_coins(
+            &self,
+            _req: SendCoinsRequest,
+        ) -> anyhow::Result<payments_rs::onchain::SendCoinsResponse> {
+            anyhow::bail!("node offline")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_releases_reservations_on_failure() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let ra = db.insert_referral(&referrer(0, "AAA")).await.unwrap();
+        let onchain = Arc::new(FailingOnChain);
+        let h = handler(db.clone(), onchain.clone());
+
+        let eligible = vec![(
+            Referral {
+                id: ra,
+                ..referrer(ra, "AAA")
+            },
+            "bcrt1qa".to_string(),
+            2_000_000,
+        )];
+        let res = h.send_batch(onchain.as_ref(), eligible).await;
+        assert!(res.is_err(), "send failure propagates");
+        // The reserved payout was released so the balance retries next run.
+        let payouts = db.list_referral_payouts(ra).await.unwrap();
+        assert!(
+            payouts.is_empty(),
+            "reservation released on send failure, got {payouts:?}"
+        );
+    }
 
     #[test]
     fn test_payable_referral_msat() {

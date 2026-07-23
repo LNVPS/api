@@ -289,11 +289,20 @@ async fn main() -> Result<(), Error> {
     )?;
     sub_handler.vm_provisioner().init().await?;
 
+    // On-chain provider for the worker's automated on-chain referral payouts.
+    // Only available when the `onchain` feature is compiled in.
+    #[cfg(feature = "onchain")]
+    let worker_onchain: Option<Arc<dyn payments_rs::onchain::OnChainProvider>> =
+        Some(onchain.clone());
+    #[cfg(not(feature = "onchain"))]
+    let worker_onchain: Option<Arc<dyn payments_rs::onchain::OnChainProvider>> = None;
+
     let worker = Worker::new(
         db.clone(),
         work_commander.clone(),
         sub_handler.clone(),
         node.clone(),
+        worker_onchain,
         &settings,
         status.clone(),
         nostr_client.clone(),

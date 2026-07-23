@@ -1969,7 +1969,10 @@ pub struct AdminReferralInfo {
     pub user_pubkey: String,
     pub code: String,
     pub lightning_address: Option<String>,
-    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    /// On-chain Bitcoin address for payouts (used when `mode` is `on_chain`).
+    pub onchain_address: Option<String>,
+    /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
+    /// `on_chain`.
     pub mode: String,
     /// Per-referrer commission override (whole %); `null` = use company default.
     pub referral_rate: Option<f32>,
@@ -1993,8 +1996,11 @@ pub struct AdminReferralPayoutInfo {
     pub created: DateTime<Utc>,
     pub is_paid: bool,
     pub invoice: Option<String>,
-    /// Payment preimage (hex), when the payout has been settled.
+    /// Payment preimage (hex), when a Lightning payout has been settled.
     pub pre_image: Option<String>,
+    /// On-chain transaction id, when an on-chain payout has been broadcast.
+    /// Shared across rows batched into the same transaction.
+    pub txid: Option<String>,
 }
 
 impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
@@ -2007,6 +2013,7 @@ impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
             is_paid: p.is_paid,
             invoice: p.invoice,
             pre_image: p.pre_image.map(hex::encode),
+            txid: p.txid,
         }
     }
 }
@@ -2072,6 +2079,13 @@ pub struct AdminUpdateReferralPayoutRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub pre_image: Option<Option<String>>,
+    /// Set or clear the on-chain transaction id (for reconciling an on-chain
+    /// payout).
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub txid: Option<Option<String>>,
 }
 
 // IP Range Management Models

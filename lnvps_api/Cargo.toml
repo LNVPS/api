@@ -77,6 +77,8 @@ futures.workspace = true
 
 chrono = { version = "0.4", features = ["serde"] }
 base64 = { version = "0.22", features = ["alloc"] }
+# On-chain Bitcoin address validation for referral payouts.
+bitcoin = "0.32"
 urlencoding = "2.1"
 rand = "0.9"
 # ES256 signing for the "Sign in with Apple" client-secret JWT (.p8 key).
@@ -124,7 +126,6 @@ quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = tr
 
 [dev-dependencies]
 env_logger = "0.11"
-bitcoin = "0.32"
 wiremock = "0.6"
 
 [build-dependencies]

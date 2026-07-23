@@ -35,7 +35,11 @@ pub struct ApiReferral {
     /// Lightning address for automatic payouts (used when `mode` is
     /// `lightning_address`)
     pub lightning_address: Option<String>,
-    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    /// On-chain Bitcoin address for automatic payouts (used when `mode` is
+    /// `on_chain`)
+    pub onchain_address: Option<String>,
+    /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
+    /// `on_chain`.
     pub mode: String,
     /// Per-referrer commission override, as a whole percentage of a referred
     /// VM's first payment. `null` means the referred VM's company default rate
@@ -56,6 +60,7 @@ impl From<Referral> for ApiReferral {
         Self {
             code: r.code,
             lightning_address: r.lightning_address,
+            onchain_address: r.onchain_address,
             mode: r.mode.to_string(),
             // Fallback until resolved against the default company rate by the
             // handler (see `resolve_effective_rate`).
@@ -104,8 +109,12 @@ pub struct ApiReferralPayout {
     pub created: chrono::DateTime<Utc>,
     pub is_paid: bool,
     pub invoice: Option<String>,
-    /// Payment preimage (hex), present once the payout has settled.
+    /// Payment preimage (hex), present once a Lightning payout has settled.
     pub pre_image: Option<String>,
+    /// On-chain transaction id, present once an on-chain payout has been
+    /// broadcast. A single transaction may back several payouts (on-chain
+    /// payouts are batched), so this `txid` can be shared across rows.
+    pub txid: Option<String>,
 }
 
 impl From<ReferralPayout> for ApiReferralPayout {
@@ -118,6 +127,7 @@ impl From<ReferralPayout> for ApiReferralPayout {
             is_paid: p.is_paid,
             invoice: p.invoice,
             pre_image: p.pre_image.map(hex::encode),
+            txid: p.txid,
         }
     }
 }
@@ -191,7 +201,9 @@ pub struct ApiReferralUsage {
 pub struct ApiReferralSignupRequest {
     /// Lightning address for payouts (required when `mode` is `lightning_address`)
     pub lightning_address: Option<String>,
-    /// Payout method: `lightning_address` (default) or `nwc`.
+    /// On-chain Bitcoin address for payouts (required when `mode` is `on_chain`)
+    pub onchain_address: Option<String>,
+    /// Payout method: `lightning_address` (default), `nwc`, or `on_chain`.
     pub mode: Option<String>,
 }
 
@@ -205,7 +217,15 @@ pub struct ApiReferralPatchRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub lightning_address: Option<Option<String>>,
-    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    /// On-chain Bitcoin address for payouts (None = clear, Some(s) = set)
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub onchain_address: Option<Option<String>>,
+    /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
+    /// `on_chain`.
     pub mode: Option<String>,
 }
 
@@ -217,14 +237,40 @@ fn parse_payout_mode(mode: Option<&str>) -> Result<Option<ReferralPayoutMode>, A
     let Some(s) = mode else {
         return Ok(None);
     };
-    let parsed = ReferralPayoutMode::from_str(s)
-        .map_err(|_| ApiError::new("Invalid payout mode. Use 'lightning_address' or 'nwc'"))?;
+    let parsed = ReferralPayoutMode::from_str(s).map_err(|_| {
+        ApiError::new("Invalid payout mode. Use 'lightning_address', 'nwc', or 'on_chain'")
+    })?;
     if parsed == ReferralPayoutMode::AccountCredit {
         return Err(ApiError::new(
             "Account credit payouts are not yet available",
         ));
     }
     Ok(Some(parsed))
+}
+
+/// Validate an on-chain Bitcoin address.
+///
+/// The address must be a **mainnet** address in release builds. In debug builds
+/// (local/dev/test, e.g. the regtest e2e stack) a **regtest** address is also
+/// accepted so payouts can be exercised end-to-end.
+fn validate_onchain_address(addr: &str) -> Result<(), ApiError> {
+    use bitcoin::{Address, Network};
+    use std::str::FromStr;
+
+    let parsed =
+        Address::from_str(addr.trim()).map_err(|_| ApiError::new("Invalid Bitcoin address"))?;
+    if parsed.is_valid_for_network(Network::Bitcoin) {
+        return Ok(());
+    }
+    if cfg!(debug_assertions) {
+        if parsed.is_valid_for_network(Network::Regtest) {
+            return Ok(());
+        }
+        return Err(ApiError::new(
+            "Bitcoin address must be a mainnet or regtest address",
+        ));
+    }
+    Err(ApiError::new("Bitcoin address must be a mainnet address"))
 }
 
 /// Validate a lightning address by parsing its format and resolving the LNURL pay endpoint
@@ -329,6 +375,12 @@ async fn v1_signup_referral(
                 return ApiData::err("NWC connection is not configured on your account");
             }
         }
+        ReferralPayoutMode::OnChain => match req.onchain_address.as_deref() {
+            Some(addr) if !addr.trim().is_empty() => validate_onchain_address(addr)?,
+            _ => {
+                return ApiData::err("onchain_address is required when mode is 'on_chain'");
+            }
+        },
         ReferralPayoutMode::AccountCredit => unreachable!("rejected by parse_payout_mode"),
     }
 
@@ -338,6 +390,7 @@ async fn v1_signup_referral(
         user_id: uid,
         code,
         lightning_address: req.lightning_address,
+        onchain_address: req.onchain_address,
         mode,
         // Per-referrer commission override is admin-controlled; new enrollments
         // default to the referred VM's company rate (None = use company default).
@@ -374,6 +427,12 @@ async fn v1_update_referral(
             validate_lightning_address(a).await?;
         }
         referral.lightning_address = addr.clone();
+    }
+    if let Some(ref addr) = req.onchain_address {
+        if let Some(a) = addr {
+            validate_onchain_address(a)?;
+        }
+        referral.onchain_address = addr.clone();
     }
     if let Some(mode) = parse_payout_mode(req.mode.as_deref())? {
         if mode == ReferralPayoutMode::Nwc && !user_has_nwc(&this, uid).await {
@@ -518,6 +577,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_effective_rate(&db, &referral).await, 33.0);
+    }
+
+    #[test]
+    fn test_validate_onchain_address() {
+        // Mainnet always accepted.
+        assert!(validate_onchain_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_ok());
+        // Regtest accepted in debug builds (tests run with debug_assertions).
+        let regtest = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        assert_eq!(
+            validate_onchain_address(regtest).is_ok(),
+            cfg!(debug_assertions),
+            "regtest is only valid in debug builds"
+        );
+        // Garbage rejected.
+        assert!(validate_onchain_address("not-an-address").is_err());
+        assert!(validate_onchain_address("").is_err());
+        // Whitespace is trimmed.
+        assert!(validate_onchain_address("  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ").is_ok());
     }
 
     #[test]
