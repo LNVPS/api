@@ -8,7 +8,7 @@ use chrono::{DateTime, Datelike, Utc};
 use futures::StreamExt;
 use futures::future::join_all;
 use isocountry::CountryCode;
-use lnurl::pay::{LnURLPayInvoice, PayResponse};
+use lnurl::pay::PayResponse;
 use lnurl::{LnUrlResponse, Tag};
 use log::{error, info};
 use nostr_sdk::{ToBech32, Url};
@@ -21,9 +21,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use lnvps_api_common::{
-    ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage,
-    ApiVmTemplate, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails,
-    UpgradeConfig, VatClient, WorkJob,
+    ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
+    ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig,
+    VatClient, WorkJob,
 };
 use lnvps_db::{
     LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
@@ -33,12 +33,11 @@ use lnvps_db::{
 use crate::api::model::{
     AccountPatchRequest, AccountPatchResult, AccountTaxInfo, AddNwcPaymentMethodRequest,
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
-    ApiInvoiceItem,
-    ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule,
-    ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey,
-    CreateVmFirewallRule, CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy,
-    PatchVmFirewallRule, PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr,
-    validate_firewall_ports, vm_to_status,
+    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy,
+    ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote,
+    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
+    VMPatchRequest, validate_firewall_cidr, validate_firewall_ports, vm_to_status,
 };
 use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
@@ -973,7 +972,16 @@ async fn v1_create_custom_vm_order(
         .await
         .ok();
 
-    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after, this.settings.max_prepay_days).await?)
+    ApiData::ok(
+        vm_to_status(
+            &this.db,
+            rsp,
+            None,
+            this.settings.delete_after,
+            this.settings.max_prepay_days,
+        )
+        .await?,
+    )
 }
 
 /// List user SSH keys
@@ -1103,7 +1111,16 @@ async fn v1_create_vm_order(
         .await
         .ok();
 
-    ApiData::ok(vm_to_status(&this.db, rsp, None, this.settings.delete_after, this.settings.max_prepay_days).await?)
+    ApiData::ok(
+        vm_to_status(
+            &this.db,
+            rsp,
+            None,
+            this.settings.delete_after,
+            this.settings.max_prepay_days,
+        )
+        .await?,
+    )
 }
 
 /// Renew(Extend) a VM
@@ -1129,12 +1146,32 @@ async fn v1_renew_vm(
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
 }
 
+/// LNURL-pay callback response (LUD-06).
+///
+/// We define this locally instead of using `lnurl::pay::LnURLPayInvoice`
+/// because that type always serializes a non-spec `hodl_invoice` field
+/// (even as `null`), which trips up strict wallets such as LNbits.
+/// See https://github.com/LNVPS/api/issues/197.
+#[derive(Serialize)]
+struct LnUrlPayCallbackResponse {
+    /// Encoded BOLT11 invoice
+    pr: String,
+    /// Routing hints (unused, kept for LUD-06 compatibility)
+    routes: Vec<serde_json::Value>,
+}
+
+impl LnUrlPayCallbackResponse {
+    fn new(pr: String) -> Self {
+        Self { pr, routes: vec![] }
+    }
+}
+
 /// Extend a VM by LNURL payment
 async fn v1_renew_vm_lnurlp(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<AmountQuery>,
-) -> Result<Json<LnURLPayInvoice>, Json<lnurl::Response>> {
+) -> Result<Json<LnUrlPayCallbackResponse>, Json<lnurl::Response>> {
     let vm = this.db.get_vm(id).await.map_err(|_| {
         Json(lnurl::Response::Error {
             reason: "VM not found".to_string(),
@@ -1167,7 +1204,9 @@ async fn v1_renew_vm_lnurlp(
         })?;
 
     // external_data is pr for lightning payment method
-    Ok(Json(LnURLPayInvoice::new(rsp.external_data.into())))
+    Ok(Json(LnUrlPayCallbackResponse::new(
+        rsp.external_data.into(),
+    )))
 }
 
 /// LNURL ad-hoc extend vm
@@ -1780,9 +1819,15 @@ async fn v1_get_payment_invoice(
             &PaymentInfo {
                 year: now.year(),
                 current_date: now,
-                vm: vm_to_status(&this.db, vm, None, this.settings.delete_after, this.settings.max_prepay_days)
-                    .await
-                    .map_err(|_| "Failed to get VM state")?,
+                vm: vm_to_status(
+                    &this.db,
+                    vm,
+                    None,
+                    this.settings.delete_after,
+                    this.settings.max_prepay_days,
+                )
+                .await
+                .map_err(|_| "Failed to get VM state")?,
                 total: payment.amount + payment.tax + payment.processing_fee,
                 total_formatted: CurrencyAmount::from_u64(
                     payment.currency.parse().map_err(|_| "Invalid currency")?,
@@ -2540,5 +2585,17 @@ mod tests {
         // Mixed payment: summary rate/country are null but tax was charged.
         let (label, _rc, _oos, _note) = invoice_vat_display(None, 500, None, None, true);
         assert_eq!(label.as_deref(), Some("VAT"));
+    }
+
+    #[test]
+    fn lnurlp_callback_response_omits_hodl_invoice() {
+        // Regression for #197: the LNURL-pay callback must not emit a
+        // non-spec `hodl_invoice` field (LNbits rejects it).
+        let rsp = LnUrlPayCallbackResponse::new("lnbc123".to_string());
+        let json = serde_json::to_value(&rsp).unwrap();
+        assert_eq!(json["pr"], "lnbc123");
+        assert!(json.get("hodl_invoice").is_none());
+        // LUD-06 routes field present and empty
+        assert_eq!(json["routes"], serde_json::json!([]));
     }
 }
