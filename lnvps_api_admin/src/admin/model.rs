@@ -1326,6 +1326,10 @@ pub struct AdminVmOsImageInfo {
     pub enabled: bool,
     pub release_date: DateTime<Utc>,
     pub url: String,
+    /// CPU architecture this image targets (e.g. `x86_64`, `arm64`);
+    /// `None` means unspecified/any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
     pub default_username: Option<String>,
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this image
     pub sha2: Option<String>,
@@ -1340,6 +1344,8 @@ pub struct CreateVmOsImageRequest {
     pub enabled: bool,
     pub release_date: DateTime<Utc>,
     pub url: String,
+    /// CPU architecture (e.g. `x86_64`, `arm64`). Defaults to `x86_64` when omitted.
+    pub cpu_arch: Option<String>,
     pub default_username: Option<String>,
     pub sha2: Option<String>,
     pub sha2_url: Option<String>,
@@ -1353,6 +1359,12 @@ pub struct UpdateVmOsImageRequest {
     pub enabled: Option<bool>,
     pub release_date: Option<DateTime<Utc>>,
     pub url: Option<String>,
+    /// CPU architecture (e.g. `x86_64`, `arm64`); send `null` to reset to unspecified.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_arch: Option<Option<String>>,
     pub default_username: Option<String>,
     #[serde(
         default,
@@ -1386,6 +1398,11 @@ impl AdminVmOsImageInfo {
             enabled: image.enabled,
             release_date: image.release_date,
             url: image.url,
+            cpu_arch: if matches!(image.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(image.cpu_arch.to_string())
+            },
             default_username: image.default_username,
             sha2: image.sha2,
             sha2_url: image.sha2_url,
@@ -1404,6 +1421,11 @@ impl From<lnvps_db::VmOsImage> for AdminVmOsImageInfo {
             enabled: image.enabled,
             release_date: image.release_date,
             url: image.url,
+            cpu_arch: if matches!(image.cpu_arch, lnvps_db::CpuArch::Unknown) {
+                None
+            } else {
+                Some(image.cpu_arch.to_string())
+            },
             default_username: image.default_username,
             sha2: image.sha2,
             sha2_url: image.sha2_url,
@@ -1445,6 +1467,13 @@ impl CreateVmOsImageRequest {
             enabled: self.enabled,
             release_date: self.release_date,
             url: self.url.clone(),
+            // Default to x86_64 when omitted (matches the migration default and
+            // the fact that all existing images are x86_64).
+            cpu_arch: self
+                .cpu_arch
+                .as_ref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(lnvps_db::CpuArch::X86_64),
             default_username: self.default_username.clone(),
             sha2: self.sha2.clone(),
             sha2_url: self.sha2_url.clone(),
@@ -4074,6 +4103,38 @@ mod tests {
                 .unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
             assert!(req.to_vm_os_image().is_ok());
         }
+    }
+
+    #[test]
+    fn test_create_vm_os_image_request_cpu_arch() {
+        // Explicit arm64
+        let json = r#"{"distribution":"debian","flavour":"server","version":"12","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2","cpu_arch":"arm64"}"#;
+        let req: CreateVmOsImageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.to_vm_os_image().unwrap().cpu_arch,
+            lnvps_db::CpuArch::ARM64
+        );
+
+        // Omitted => defaults to x86_64
+        let json = r#"{"distribution":"debian","flavour":"server","version":"12","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2"}"#;
+        let req: CreateVmOsImageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.to_vm_os_image().unwrap().cpu_arch,
+            lnvps_db::CpuArch::X86_64
+        );
+    }
+
+    #[test]
+    fn test_update_vm_os_image_request_cpu_arch_nullable() {
+        // null => Some(None) (reset to unspecified)
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{"cpu_arch": null}"#).unwrap();
+        assert_eq!(req.cpu_arch, Some(None));
+        // provided => Some(Some(..))
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{"cpu_arch": "arm64"}"#).unwrap();
+        assert_eq!(req.cpu_arch, Some(Some("arm64".to_string())));
+        // absent => None
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req.cpu_arch, None);
     }
 
     #[test]

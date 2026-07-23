@@ -161,6 +161,15 @@ async fn admin_update_vm_os_image(
         image.url = url.clone();
     }
 
+    if let Some(cpu_arch) = &request.cpu_arch {
+        // `Some(None)` (explicit null) resets to Unknown/any; `Some(Some(s))`
+        // parses the arch (invalid strings fall back to Unknown).
+        image.cpu_arch = cpu_arch
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+    }
+
     if let Some(default_username) = &request.default_username {
         image.default_username = Some(default_username.clone());
     }

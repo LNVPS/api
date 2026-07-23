@@ -642,6 +642,10 @@ pub struct ApiVmOsImage {
     pub flavour: String,
     pub version: String,
     pub release_date: DateTime<Utc>,
+    /// CPU architecture this image targets (e.g. `x86_64`, `arm64`).
+    /// `None` means unspecified/any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
     pub default_username: Option<String>,
     /// Popularity of this image expressed as a fraction (0.0â1.0) of all
     /// active VMs currently using it
@@ -656,6 +660,11 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
             flavour: image.flavour,
             version: image.version,
             release_date: image.release_date,
+            cpu_arch: if matches!(image.cpu_arch, CpuArch::Unknown) {
+                None
+            } else {
+                Some(image.cpu_arch.to_string())
+            },
             default_username: image.default_username,
             popularity: 0.0,
         }

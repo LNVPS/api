@@ -499,6 +499,7 @@ async fn create_os_images(db: &LNVpsDbMysql) -> Result<Vec<VmOsImage>> {
             enabled: true,
             release_date,
             url: url.to_string(),
+            cpu_arch: lnvps_db::CpuArch::X86_64,
             default_username: Some("ubuntu".to_string()),
             sha2: None,
             sha2_url: None,

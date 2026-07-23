@@ -363,6 +363,7 @@ interface VmOsImage {
   flavour: string;
   version: string;
   release_date: string; // ISO 8601 datetime
+  cpu_arch?: string; // CPU architecture (e.g. "x86_64", "arm64"; omitted if unspecified)
   default_username?: string;
   popularity: number; // fraction (0.0–1.0) of active VMs using this image
 }

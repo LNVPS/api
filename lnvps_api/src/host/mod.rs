@@ -349,8 +349,8 @@ mod tests {
     use crate::{GB, TB};
     use chrono::Utc;
     use lnvps_db::{
-        DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution, UserSshKey, Vm,
-        VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+        CpuArch, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution,
+        UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
     };
 
     pub fn mock_full_vm() -> FullVmInfo {
@@ -431,6 +431,7 @@ mod tests {
                 enabled: true,
                 release_date: Utc::now(),
                 url: "http://localhost.com/ubuntu_server_24.04.img".to_string(),
+                cpu_arch: CpuArch::X86_64,
                 default_username: None,
                 sha2: None,
                 sha2_url: None,

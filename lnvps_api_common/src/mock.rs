@@ -238,6 +238,7 @@ impl Default for MockDb {
                 enabled: true,
                 release_date: Utc::now(),
                 url: "https://example.com/debian_12.img".to_string(),
+                cpu_arch: CpuArch::X86_64,
                 default_username: None,
                 sha2: None,
                 sha2_url: None,

@@ -3403,6 +3403,7 @@ mod tests {
                 enabled: true,
                 release_date: Utc::now(),
                 url: url.to_string(),
+                cpu_arch: CpuArch::X86_64,
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
