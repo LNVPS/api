@@ -955,6 +955,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_active_vms(&self) -> DbResult<Vec<Vm>> {
+        // Active VMs are non-deleted VMs whose subscription has a concrete
+        // future expiry (never-paid / null-expiry subscriptions are excluded).
+        Ok(sqlx::query_as(
+            "SELECT v.* FROM vm v \
+             INNER JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             INNER JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 0 AND s.expires > NOW()",
+        )
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
         Ok(
             sqlx::query_as("select * from vm where user_id = ? and deleted = 0")

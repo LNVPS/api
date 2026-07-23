@@ -1047,6 +1047,32 @@ impl LNVpsDbBase for MockDb {
         Ok(expired)
     }
 
+    async fn list_active_vms(&self) -> DbResult<Vec<Vm>> {
+        // Active VMs: non-deleted with a concrete future subscription expiry.
+        let vm_list: Vec<Vm> = {
+            let vms = self.vms.lock().await;
+            vms.values().filter(|v| !v.deleted).cloned().collect()
+        };
+        let mut active = Vec::new();
+        for vm in vm_list {
+            let sub_id = {
+                let line_items = self.subscription_line_items.lock().await;
+                line_items
+                    .get(&vm.subscription_line_item_id)
+                    .map(|li| li.subscription_id)
+            };
+            if let Some(sid) = sub_id {
+                let subs = self.subscriptions.lock().await;
+                if let Some(sub) = subs.get(&sid) {
+                    if sub.expires.map(|e| e > Utc::now()).unwrap_or(false) {
+                        active.push(vm);
+                    }
+                }
+            }
+        }
+        Ok(active)
+    }
+
     async fn list_user_vms(&self, id: u64) -> DbResult<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms
@@ -5482,6 +5508,78 @@ mod tests {
         // Delete.
         db.delete_asn_subscription(id).await.unwrap();
         assert!(db.get_asn_subscription(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_active_vms() {
+        use lnvps_db::Vm;
+        let db = MockDb::default();
+
+        // Helper to seed a VM + line item + subscription with the given expiry.
+        async fn seed(db: &MockDb, id: u64, expires: Option<chrono::DateTime<Utc>>, deleted: bool) {
+            db.subscriptions.lock().await.insert(
+                id,
+                Subscription {
+                    id,
+                    user_id: 1,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+            );
+            db.subscription_line_items.lock().await.insert(
+                id,
+                SubscriptionLineItem {
+                    id,
+                    subscription_id: id,
+                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    name: "vm".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                },
+            );
+            db.vms.lock().await.insert(
+                id,
+                Vm {
+                    id,
+                    subscription_line_item_id: id,
+                    deleted,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let now = Utc::now();
+        seed(&db, 1, Some(now + chrono::Duration::days(10)), false).await; // active
+        seed(&db, 2, Some(now - chrono::Duration::days(1)), false).await; // expired
+        seed(&db, 3, None, false).await; // never-paid (null expiry)
+        seed(&db, 4, Some(now + chrono::Duration::days(10)), true).await; // deleted
+
+        let mut active: Vec<u64> = db
+            .list_active_vms()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.id)
+            .collect();
+        active.sort();
+        assert_eq!(
+            active,
+            vec![1],
+            "only the non-deleted future-expiry VM is active"
+        );
     }
 }
 

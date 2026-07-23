@@ -1798,6 +1798,10 @@ pub enum AdminAction {
     View = 1, // Covers both read single item and list multiple items
     Update = 2,
     Delete = 3,
+    /// Bulk mutation across many resources at once (e.g. extend all VMs).
+    /// Held separately from `Update` so a fleet-wide action can be granted
+    /// independently of ordinary single-resource edits.
+    BulkUpdate = 4,
 }
 
 impl Display for AdminResource {
@@ -1946,6 +1950,7 @@ impl Display for AdminAction {
             AdminAction::View => write!(f, "view"),
             AdminAction::Update => write!(f, "update"),
             AdminAction::Delete => write!(f, "delete"),
+            AdminAction::BulkUpdate => write!(f, "bulk_update"),
         }
     }
 }
@@ -1959,6 +1964,7 @@ impl FromStr for AdminAction {
             "view" | "read" | "list" => Ok(AdminAction::View),
             "update" | "edit" => Ok(AdminAction::Update),
             "delete" | "remove" => Ok(AdminAction::Delete),
+            "bulk_update" | "bulk" => Ok(AdminAction::BulkUpdate),
             _ => Err(anyhow!("unknown admin action: {}", s)),
         }
     }
@@ -1973,6 +1979,7 @@ impl TryFrom<u16> for AdminAction {
             1 => Ok(AdminAction::View),
             2 => Ok(AdminAction::Update),
             3 => Ok(AdminAction::Delete),
+            4 => Ok(AdminAction::BulkUpdate),
             _ => Err(anyhow!("unknown admin action value: {}", value)),
         }
     }
@@ -1986,6 +1993,7 @@ impl AdminAction {
             AdminAction::View,
             AdminAction::Update,
             AdminAction::Delete,
+            AdminAction::BulkUpdate,
         ]
     }
 }
@@ -2500,6 +2508,26 @@ mod tests {
         assert_eq!("unknown".parse::<CpuMfg>().unwrap(), CpuMfg::Unknown);
         assert!("invalid".parse::<CpuMfg>().is_err());
         assert!("".parse::<CpuMfg>().is_err());
+    }
+
+    #[test]
+    fn test_admin_action_bulk_update_roundtrip() {
+        // Display / FromStr / TryFrom round-trip for the new bulk_update action
+        assert_eq!(AdminAction::BulkUpdate.to_string(), "bulk_update");
+        assert_eq!(
+            "bulk_update".parse::<AdminAction>().unwrap(),
+            AdminAction::BulkUpdate
+        );
+        assert_eq!(
+            "bulk".parse::<AdminAction>().unwrap(),
+            AdminAction::BulkUpdate
+        );
+        assert_eq!(
+            AdminAction::try_from(4u16).unwrap(),
+            AdminAction::BulkUpdate
+        );
+        assert_eq!(AdminAction::BulkUpdate as u16, 4);
+        assert!(AdminAction::all().contains(&AdminAction::BulkUpdate));
     }
 
     #[test]
