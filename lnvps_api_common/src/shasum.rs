@@ -238,6 +238,9 @@ const CANDIDATE_SUMS_FILES: &[&str] = &[
     "SHA256SUMS.txt",
     // CentOS / Fedora cloud images use a BSD-format "CHECKSUM" file
     "CHECKSUM",
+    // FreeBSD VM images publish BSD-format "CHECKSUM.SHA512"/"CHECKSUM.SHA256"
+    "CHECKSUM.SHA512",
+    "CHECKSUM.SHA256",
 ];
 
 /// Per-file sidecar extensions appended directly to the image filename
@@ -706,6 +709,24 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
             "unexpected sums_url: {sums_url}"
         );
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        Ok(())
+    }
+
+    /// FreeBSD publishes BSD-format `CHECKSUM.SHA512`/`CHECKSUM.SHA256` files
+    /// in the image directory, listing the compressed `.qcow2.xz` artifact.
+    #[tokio::test]
+    async fn test_probe_checksum_freebsd_checksum_sha512() -> anyhow::Result<()> {
+        let image_url = "https://download.freebsd.org/releases/VM-IMAGES/15.0-RELEASE/amd64/Latest/FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz";
+        let filename = "FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz";
+
+        let result = probe_checksum_from_image_url(image_url, filename).await;
+        let (entry, sums_url) = result.expect("should find FreeBSD CHECKSUM file");
+
+        assert!(
+            sums_url.ends_with("/CHECKSUM.SHA512") || sums_url.ends_with("/CHECKSUM.SHA256"),
+            "unexpected sums_url: {sums_url}"
+        );
+        assert_eq!(entry.filename, filename);
         Ok(())
     }
 
