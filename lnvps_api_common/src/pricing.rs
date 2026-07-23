@@ -513,6 +513,93 @@ impl PricingEngine {
         }))
     }
 
+    /// Turn an arbitrary paid amount into time for a **subscription**, priced
+    /// from the subscription's line-item amounts and billing interval.
+    ///
+    /// This is the subscription-level equivalent of [`Self::get_cost_by_amount`]
+    /// (which only prices VM-backed subscriptions). It sums the per-interval
+    /// price of all line items (in the subscription's base currency), converts
+    /// that to the payment method currency, then scales the interval's time by
+    /// `input / interval_cost` — with the same tax determination and
+    /// processing-fee handling as the VM path.
+    ///
+    /// `input` is the **net** amount (tax is added on top), matching
+    /// [`Self::get_cost_by_amount`].
+    pub async fn get_subscription_cost_by_amount(
+        &self,
+        subscription_id: u64,
+        input: CurrencyAmount,
+        method: PaymentMethod,
+    ) -> Result<CostResult> {
+        let subscription = self.db.get_subscription(subscription_id).await?;
+        let line_items = self
+            .db
+            .list_subscription_line_items(subscription_id)
+            .await?;
+        ensure!(!line_items.is_empty(), "Subscription has no line items");
+
+        let subscription_currency = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+
+        // Per-interval list price of all line items, in the subscription's base
+        // currency.
+        let interval_cost: u64 = line_items.iter().map(|li| li.amount).sum();
+        ensure!(interval_cost > 0, "Subscription has zero interval cost");
+
+        // Convert the per-interval list price into the payment method currency,
+        // so it can be compared against `input` and yields the rate to record.
+        let list_price = CurrencyAmount::from_u64(subscription_currency, interval_cost);
+        let converted = self.get_amount_and_rate(list_price, method).await?;
+        ensure!(
+            converted.amount.currency() == input.currency(),
+            "Invalid currency"
+        );
+        ensure!(
+            converted.amount.value() > 0,
+            "Converted interval cost is zero"
+        );
+
+        let interval_seconds = Self::cost_plan_interval_to_seconds(
+            subscription.interval_type,
+            subscription.interval_amount,
+        ) as u64;
+
+        // Scale the interval's time by how much was paid relative to one interval.
+        let scale = input.value() as f64 / converted.amount.value() as f64;
+        let new_time = (interval_seconds as f64 * scale).floor() as u64;
+        ensure!(new_time > 0, "Extend time is less than 1 second");
+
+        // Clamp the base to now for already-expired subscriptions, matching the
+        // VM path — otherwise paid time is added onto a past expiry.
+        let base = subscription
+            .expires
+            .unwrap_or_else(Utc::now)
+            .max(Utc::now());
+        let tax_details = self
+            .determine_tax(subscription.user_id, input.value(), subscription.company_id)
+            .await?;
+        // Processing fee applies to the gross amount (net + tax).
+        let processing_fee = self
+            .calculate_processing_fee(
+                subscription.company_id,
+                method,
+                converted.amount.currency(),
+                input.value() + tax_details.amount,
+            )
+            .await;
+
+        Ok(CostResult::New(NewPaymentInfo {
+            amount: input.value(),
+            currency: converted.amount.currency(),
+            time_value: new_time,
+            new_expiry: base.add(TimeDelta::seconds(new_time as i64)),
+            rate: converted.rate,
+            tax: tax_details.amount,
+            tax_details,
+            processing_fee,
+        }))
+    }
+
     /// Get VM cost (for renewal) for a single interval
     pub async fn get_vm_cost(&self, vm_id: u64, method: PaymentMethod) -> Result<CostResult> {
         self.get_vm_cost_for_intervals(vm_id, method, 1).await
@@ -1736,6 +1823,79 @@ mod tests {
             res.is_err(),
             "an interface with no pricing row must be rejected"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscription_cost_by_amount() -> Result<()> {
+        use lnvps_db::{Subscription, SubscriptionLineItem, SubscriptionType};
+
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+
+        let user_id = db.upsert_user(&[9u8; 32]).await?;
+        let (sub_id, _li) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "ip range".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "ip".to_string(),
+                    description: None,
+                    amount: 1000, // €10.00 / month
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        // Full month price in msats: €10 / 100000 EUR/BTC * 1e11 = 10_000_000 msat
+        let mo_price = (10.0f64 / MOCK_RATE as f64 * 1.0e11) as u64;
+
+        // Pay half a month's price -> ~half the interval's time.
+        let paid = mo_price / 2;
+        let price = pe
+            .get_subscription_cost_by_amount(
+                sub_id,
+                CurrencyAmount::millisats(paid),
+                PaymentMethod::Lightning,
+            )
+            .await?;
+        match price {
+            CostResult::New(p) => {
+                assert_eq!(p.amount, paid);
+                assert_eq!(p.tax, 0);
+                let expect_time = (SECONDS_PER_MONTH * 0.5) as u64;
+                assert!(
+                    p.time_value.abs_diff(expect_time) <= 2,
+                    "time {} ~ {}",
+                    p.time_value,
+                    expect_time
+                );
+            }
+            _ => bail!("unexpected existing cost result"),
+        }
         Ok(())
     }
 
