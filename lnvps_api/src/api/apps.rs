@@ -51,6 +51,9 @@ pub struct ApiApp {
     pub display_name: String,
     pub description: Option<String>,
     pub icon: Option<String>,
+    /// Canonical source repository URL (e.g. the project's GitHub), for a
+    /// "Source" link / README rendering on the app-detail page.
+    pub repo_url: Option<String>,
     /// docker-compose-style YAML defining the app. Clients render the
     /// configuration form (ports/env) from this spec.
     pub compose: String,
@@ -71,6 +74,7 @@ impl From<App> for ApiApp {
             display_name: a.display_name,
             description: a.description,
             icon: a.icon,
+            repo_url: a.repo_url,
             compose: a.compose,
             amount: a.amount,
             currency: a.currency,

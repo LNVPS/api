@@ -5835,6 +5835,7 @@ mod tests {
             display_name: format!("{name} app"),
             description: None,
             icon: None,
+            repo_url: None,
             compose: "services: {}".to_string(),
             amount: 1000,
             currency: "USD".to_string(),

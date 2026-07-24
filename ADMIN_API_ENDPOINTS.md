@@ -3628,6 +3628,7 @@ Required Permission: `app::view`. Returns `AdminAppInfo` object(s):
   "display_name": "Nostr Relay",
   "description": "A personal Nostr relay",
   "icon": null,
+  "repo_url": "https://github.com/hoytech/strfry",
   "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
   "amount": 1000,
   "currency": "USD",
@@ -3657,6 +3658,8 @@ Required Permission: `app::create`. Body:
   // Optional.
   "icon": "https://.../icon.png",
   // Optional.
+  "repo_url": "https://github.com/hoytech/strfry",
+  // Optional. Canonical source repository URL.
   "compose": "services: { ... }",
   // Required. docker-compose-style YAML (image/ports/env/volumes).
   "amount": 1000,
@@ -3679,7 +3682,7 @@ Required Permission: `app::create`. Body:
 PATCH /api/admin/v1/apps/{id}
 ```
 
-Required Permission: `app::update`. All fields optional (omitted = unchanged); `description`/`icon` accept `null` to clear.
+Required Permission: `app::update`. All fields optional (omitted = unchanged); `description`/`icon`/`repo_url` accept `null` to clear.
 
 #### Delete App
 

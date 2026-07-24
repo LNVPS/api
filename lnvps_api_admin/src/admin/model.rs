@@ -4464,6 +4464,8 @@ pub struct AdminAppInfo {
     pub display_name: String,
     pub description: Option<String>,
     pub icon: Option<String>,
+    /// Canonical source repository URL (e.g. the project's GitHub).
+    pub repo_url: Option<String>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).
@@ -4490,6 +4492,7 @@ impl From<lnvps_db::App> for AdminAppInfo {
             display_name: a.display_name,
             description: a.description,
             icon: a.icon,
+            repo_url: a.repo_url,
             compose: a.compose,
             amount: a.amount,
             currency: a.currency,
@@ -4513,6 +4516,8 @@ pub struct AdminCreateAppRequest {
     pub display_name: String,
     pub description: Option<String>,
     pub icon: Option<String>,
+    /// Canonical source repository URL (e.g. the project's GitHub).
+    pub repo_url: Option<String>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     pub amount: u64,
@@ -4541,6 +4546,11 @@ pub struct AdminUpdateAppRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub icon: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub repo_url: Option<Option<String>>,
     pub compose: Option<String>,
     pub amount: Option<u64>,
     pub currency: Option<String>,

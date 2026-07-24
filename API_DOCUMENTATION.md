@@ -1345,6 +1345,7 @@ interface App {
   display_name: string;
   description?: string;
   icon?: string;
+  repo_url?: string;         // canonical source repo (e.g. https://github.com/hoytech/strfry) for a "Source" link / README
   compose: string;           // docker-compose-style YAML; render the config form (ports/env) from this
   amount: number;            // recurring price in smallest currency units (cents / millisats)
   currency: string;

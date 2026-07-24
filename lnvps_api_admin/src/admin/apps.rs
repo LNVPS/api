@@ -120,6 +120,7 @@ async fn admin_create_app(
         display_name: req.display_name,
         description: req.description,
         icon: req.icon,
+        repo_url: req.repo_url.filter(|s| !s.trim().is_empty()),
         compose: req.compose,
         amount: req.amount,
         currency: req.currency.trim().to_uppercase(),
@@ -156,6 +157,9 @@ async fn admin_update_app(
     }
     if let Some(icon) = req.icon {
         app.icon = icon.filter(|s| !s.trim().is_empty());
+    }
+    if let Some(repo_url) = req.repo_url {
+        app.repo_url = repo_url.filter(|s| !s.trim().is_empty());
     }
     if let Some(compose) = req.compose {
         app.compose = compose;

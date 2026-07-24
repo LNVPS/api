@@ -3088,6 +3088,10 @@ pub struct App {
     pub description: Option<String>,
     /// Optional icon/logo URL for the catalog UI.
     pub icon: Option<String>,
+    /// Optional canonical source repository URL (e.g. the project's GitHub),
+    /// so the catalog UI can link to it / render its README.
+    #[sqlx(default)]
+    pub repo_url: Option<String>,
     /// Docker-compose-style YAML defining the app (image, ports, env, volumes).
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).

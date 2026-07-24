@@ -553,6 +553,7 @@ mod tests {
             "name": "e2e-relay",
             "display_name": "E2E Relay",
             "description": "test relay app",
+            "repo_url": "https://github.com/example/relay",
             "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
             "amount": 1000,
             "currency": "usd",
@@ -571,6 +572,11 @@ mod tests {
         assert_eq!(body["data"]["currency"].as_str().unwrap(), "USD");
         // Footprint is computed from the compose (one service, default 250m).
         assert_eq!(body["data"]["cpu_milli"].as_u64(), Some(250));
+        // Source repo URL is stored and echoed back (issue #229).
+        assert_eq!(
+            body["data"]["repo_url"].as_str(),
+            Some("https://github.com/example/relay")
+        );
 
         // Duplicate name is rejected.
         let resp = client
