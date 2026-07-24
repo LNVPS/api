@@ -112,12 +112,23 @@ pub fn build_network_policy(deployment_id: u64) -> NetworkPolicy {
     }
 }
 
-/// A ResourceQuota capping what the whole deployment namespace may consume.
-///
-/// Not applied yet: a `limits.*` quota requires every container to declare
-/// resource limits, which only lands with the capacity increment (per-service
-/// `resources:` → container requests/limits). Wired there.
-#[allow(dead_code)]
+/// Container requests == limits (Guaranteed QoS, 1:1 — no overcommit) from a
+/// compose service's `resources`.
+fn build_resource_requirements(r: &lnvps_compose::Resources) -> ResourceRequirements {
+    let map = BTreeMap::from([
+        ("cpu".to_string(), Quantity(r.cpu.clone())),
+        ("memory".to_string(), Quantity(r.memory.clone())),
+    ]);
+    ResourceRequirements {
+        requests: Some(map.clone()),
+        limits: Some(map),
+        ..Default::default()
+    }
+}
+
+/// A ResourceQuota capping what the whole deployment namespace may consume,
+/// sized from the app's footprint so a misbehaving app can't exceed what was
+/// provisioned (and billed).
 pub fn build_resource_quota(
     deployment_id: u64,
     cpu: &str,
@@ -408,7 +419,7 @@ pub fn build_deployment(
             Some(mounts)
         },
         security_context: Some(container_security_context()),
-        resources: Some(ResourceRequirements::default()),
+        resources: Some(build_resource_requirements(&svc.resources)),
         ..Default::default()
     };
 
@@ -778,7 +789,21 @@ async fn reconcile_one(
         apply(client, &ing).await?;
     }
 
-    // 6. Status write-back: record the hostname and running state.
+    // 6. ResourceQuota sized from the app's footprint (bytes/millicores are
+    // valid k8s quantities), capping the namespace at what was provisioned.
+    let fp = compose.footprint()?;
+    apply(
+        client,
+        &build_resource_quota(
+            id,
+            &format!("{}m", fp.cpu_milli),
+            &fp.memory_bytes.to_string(),
+            &fp.storage_bytes.to_string(),
+        ),
+    )
+    .await?;
+
+    // 7. Status write-back: record the hostname and running state.
     let mut updated = deployment.clone();
     updated.hostname = Some(hostname);
     updated.status = if replicas == 0 {
@@ -935,6 +960,14 @@ config:
         let pod = spec.template.spec.unwrap();
         assert_eq!(pod.security_context.unwrap().run_as_non_root, Some(true));
         let ctr = &pod.containers[0];
+        // Container carries requests == limits from the compose resources
+        // (defaults 250m / 256Mi here).
+        let res = ctr.resources.as_ref().unwrap();
+        assert_eq!(res.requests.as_ref().unwrap().get("cpu").unwrap().0, "250m");
+        assert_eq!(
+            res.limits.as_ref().unwrap().get("memory").unwrap().0,
+            "256Mi"
+        );
         let sc = ctr.security_context.as_ref().unwrap();
         assert_eq!(sc.read_only_root_filesystem, Some(true));
         assert_eq!(sc.allow_privilege_escalation, Some(false));
