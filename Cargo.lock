@@ -3066,6 +3066,7 @@ name = "lnvps_operator"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "config",
  "env_logger",

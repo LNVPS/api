@@ -103,6 +103,9 @@ images (higher isolation risk — design the boundary in now).
 - [x] `reconcile_app_deployments(ctx)`: server-side apply per deployment (filtered by the
       operator's `app_cluster_id`), resolve env+files via `lnvps_compose`, status/hostname
       write-back, and namespace GC for removed/deleted deployments. Wired into the reconcile loop.
+- [x] Retention: an **expired** subscription scales the workload to **0 replicas** (pods stop,
+      PVCs/data retained); only real deletion GCs the namespace. PVCs use the **cluster default
+      StorageClass** (no `storageClassName` set) — decided.
 - [ ] ResourceQuota + container resource requests deferred to the capacity increment (a
       `limits.*` quota needs container limits first). Builder present, `#[allow(dead_code)]`.
 

@@ -720,13 +720,21 @@ async fn reconcile_one(
     let env = compose.resolve_env(&vars)?;
     let files = compose.resolve_files(&vars)?;
 
-    let replicas = if deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running
+    // Retention: an expired (unpaid) subscription scales the workload to 0
+    // replicas — pods stop but the PVCs (customer data) are retained. The
+    // deployment is only fully torn down (namespace GC) on real deletion.
+    let expired = ctx
+        .db
+        .get_subscription_by_line_item_id(deployment.subscription_line_item_id)
+        .await
+        .ok()
+        .and_then(|s| s.expires)
+        .map(|e| e < chrono::Utc::now())
+        .unwrap_or(false);
+    let running = deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running
         && !deployment.deleted
-    {
-        1
-    } else {
-        0
-    };
+        && !expired;
+    let replicas = if running { 1 } else { 0 };
 
     // 4. Per service: PVCs, file ConfigMap/Secret, Service, Deployment.
     for (sname, svc) in &compose.services {
