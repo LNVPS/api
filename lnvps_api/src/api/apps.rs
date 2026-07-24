@@ -23,6 +23,7 @@ pub fn router() -> Router<RouterState> {
     Router::new()
         .route("/api/v1/apps", get(v1_list_apps))
         .route("/api/v1/apps/{id}", get(v1_get_app))
+        .route("/api/v1/apps/{id}/regions", get(v1_list_app_regions))
         .route(
             "/api/v1/app-deployments",
             get(v1_list_app_deployments).post(v1_create_app_deployment),
@@ -78,6 +79,16 @@ impl From<App> for ApiApp {
             setup_amount: a.setup_amount,
         }
     }
+}
+
+/// A region an app can be deployed in.
+#[derive(Serialize)]
+pub struct ApiAppRegion {
+    pub id: u64,
+    pub name: String,
+    /// Whether a cluster in this region currently has enough free capacity for
+    /// this app. `false` regions can be shown-but-disabled in the picker.
+    pub available: bool,
 }
 
 /// A customer's app deployment.
@@ -141,6 +152,39 @@ async fn v1_get_app(
         return Err(ApiError::not_found("App not found"));
     }
     ApiData::ok(app.into())
+}
+
+/// List the regions this app can be deployed in (regions with an enabled
+/// cluster), each flagged with whether it currently has capacity for the app.
+async fn v1_list_app_regions(
+    _auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<ApiAppRegion>> {
+    let app = this.db.get_app(id).await?;
+    if !app.enabled {
+        return Err(ApiError::not_found("App not found"));
+    }
+    let need = AppCapacity {
+        cpu_milli: app.cpu_milli,
+        memory_bytes: app.memory_bytes,
+        storage_bytes: app.storage_bytes,
+    };
+    let capacity = AppClusterCapacityService::new(this.db.clone());
+    let mut out = Vec::new();
+    for (region_id, available) in capacity.regions_availability(need).await? {
+        // Only surface enabled regions; skip any that can't be resolved.
+        if let Ok(region) = this.db.get_host_region(region_id).await
+            && region.enabled
+        {
+            out.push(ApiAppRegion {
+                id: region.id,
+                name: region.name,
+                available,
+            });
+        }
+    }
+    ApiData::ok(out)
 }
 
 /// List the authenticated user's app deployments.
