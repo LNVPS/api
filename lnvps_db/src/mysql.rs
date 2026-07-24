@@ -3456,10 +3456,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral_payout (referral_id, amount, currency, invoice) VALUES (?, ?, ?, ?) returning id",
+            "INSERT INTO referral_payout (referral_id, amount, fee, currency, invoice) VALUES (?, ?, ?, ?, ?) returning id",
         )
         .bind(payout.referral_id)
         .bind(payout.amount)
+        .bind(payout.fee)
         .bind(&payout.currency)
         .bind(&payout.invoice)
         .fetch_one(&self.db)
@@ -3469,12 +3470,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
         sqlx::query(
-            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ?, outpoint = ? WHERE id = ?",
+            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ?, outpoint = ?, fee = ? WHERE id = ?",
         )
         .bind(payout.is_paid)
         .bind(&payout.invoice)
         .bind(&payout.pre_image)
         .bind(&payout.outpoint)
+        .bind(payout.fee)
         .bind(payout.id)
         .execute(&self.db)
         .await?;

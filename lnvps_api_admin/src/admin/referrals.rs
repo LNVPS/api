@@ -198,6 +198,7 @@ async fn admin_create_referral_payout(
         amount: req.amount,
         currency,
         created: chrono::Utc::now(),
+        fee: 0,
         is_paid: false,
         invoice: req.invoice.filter(|s| !s.trim().is_empty()),
         pre_image: None,

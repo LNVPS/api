@@ -1186,7 +1186,7 @@ interface ReferralSignupRequest {
 - **Response**: `Referral`
 - **Error**: Returns error if already enrolled; if `mode` is `lightning_address` (or omitted) without a resolvable `lightning_address`; if `mode` is `nwc` but no NWC connection is configured on the account; or if `mode` is `on_chain` without a valid `onchain_address`. `account_credit` is a defined-but-unimplemented mode and is rejected.
 
-> **On-chain payouts** are paid by an automated worker that **batches every eligible on-chain referrer into a single send-many transaction** (one network fee for the whole batch), gated by a separate, higher minimum threshold (`min-onchain-payout-sats`) because on-chain payouts compete with mempool fees. Balances below the threshold accrue until a later run. The network fee is absorbed by LNVPS — you receive your exact owed amount. Automated on-chain payouts are opt-in and disabled unless the operator configures the threshold; commission always accrues and can be paid manually by admins.
+> **On-chain payouts** are paid by an automated worker that **batches every eligible on-chain referrer into a single send-many transaction**, gated by a minimum threshold (`min-onchain-payout-sats`, default 1000 sats). The **network fee is charged to you**: the transaction fee is split across the batch in proportion to each payout and debited from your balance (along with the amount), so `ReferralPayout.fee` records your share and the running balance may go negative — recovered from future referrals. Before broadcasting, the current next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds the operator's cap** (`max-onchain-fee-per-vbyte`, default 50), so payouts wait for cheaper fees. Balances below the threshold accrue until a later run. Commission always accrues and can also be paid manually by admins.
 
 #### Get Referral State
 - **GET** `/api/v1/referral`
@@ -1240,13 +1240,14 @@ interface ReferralEarning {
 
 interface ReferralPayout {
   id: number;
-  amount: number;
+  amount: number;     // Commission paid out (smallest currency unit)
+  fee: number;        // Network/routing fee charged to you for this payout (smallest currency unit), debited from your balance alongside `amount`. On-chain payout batches split the transaction fee across referrers in proportion to their amount; fees may make the running balance negative, recovered from future referrals.
   currency: string;
   created: string;    // ISO 8601 datetime
   is_paid: boolean;
   invoice?: string;   // BOLT11 lightning invoice (Lightning payouts)
   pre_image?: string; // Payment preimage (hex), present once a Lightning payout has settled
-  txid?: string;      // On-chain transaction id, present once an on-chain payout has been broadcast. Shared across payout rows batched into the same transaction.
+  outpoint?: string;  // On-chain payout outpoint "{txid}:{vout}", present once an on-chain payout has been broadcast. Rows batched into the same transaction share the txid but carry distinct vouts.
 }
 
 interface ReferralUsage {

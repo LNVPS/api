@@ -3298,7 +3298,7 @@ Returns the referral plus per-currency earned commission, payout history and cou
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "payouts": [
-      { "id": 1, "amount": 5000, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "invoice": "lnbc...", "pre_image": "<hex>", "txid": null }
+      { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "invoice": "lnbc...", "pre_image": "<hex>", "outpoint": null }
     ],
     "referrals_success": 3,
     "referrals_failed": 1
@@ -3338,7 +3338,7 @@ GET /api/admin/v1/referrals/{id}/payouts
 
 Required Permission: `referral::view`
 
-Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first. Each record also carries `txid` (the on-chain transaction id once an on-chain payout has been broadcast; shared across rows batched into the same transaction).
+Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first. Each record also carries `fee` (the network/routing fee charged to the referrer, debited from their balance) and `outpoint` (the on-chain payout outpoint `"{txid}:{vout}"` once broadcast; rows batched into one transaction share the txid but carry distinct vouts).
 
 #### Create Referral Payout
 
@@ -3379,12 +3379,12 @@ Required Permission: `referral::update`
   // Optional - set (string) or clear (null) the invoice
   "pre_image": "<hex>",
   // Optional - set (hex, 32 bytes) or clear (null) the payment preimage
-  "txid": "<txid>"
-  // Optional - set (string) or clear (null) the on-chain transaction id
+  "outpoint": "<txid>:<vout>"
+  // Optional - set (string) or clear (null) the on-chain payout outpoint
 }
 ```
 
-> **Automated on-chain payouts** (referrer `mode` = `on_chain`) are sent by a worker that batches **every eligible on-chain referrer into a single send-many transaction**, so one transaction (and one network fee, absorbed by LNVPS) covers the whole batch. Eligibility uses a separate, higher `min-onchain-payout-sats` threshold (mempool-fee aware). All payout rows produced by one batch share the same `txid`.
+> **Automated on-chain payouts** (referrer `mode` = `on_chain`) are sent by a worker that batches **every eligible on-chain referrer into a single send-many transaction**. The **network fee is charged to the referrers**: the transaction fee is split across the batch in proportion to each payout and recorded in `fee`, debited from the referrer's balance (which may go negative, recovered from future referrals). Before broadcasting, the next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds `max-onchain-fee-per-vbyte`** (default 50). Eligibility uses the `min-onchain-payout-sats` threshold (default 1000). Rows from one batch share the txid but carry distinct vouts in their `outpoint`.
 
 ### Reports
 

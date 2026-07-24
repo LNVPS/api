@@ -137,6 +137,11 @@ pub struct WorkerSettings {
     /// on-chain payout is attempted. `None` disables automated on-chain
     /// referral payouts.
     pub referral_min_onchain_payout_sats: Option<u64>,
+    /// Maximum next-block fee rate (sat/vByte) tolerated for on-chain referral
+    /// payouts; batches are deferred above this.
+    pub referral_max_onchain_fee_per_vbyte: u64,
+    /// mempool.space base URL used to fetch the recommended next-block fee rate.
+    pub referral_mempool_url: String,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -154,6 +159,16 @@ impl From<&Settings> for WorkerSettings {
                 .referral
                 .as_ref()
                 .and_then(|r| r.min_onchain_payout_sats),
+            referral_max_onchain_fee_per_vbyte: val
+                .referral
+                .as_ref()
+                .map(|r| r.max_onchain_fee_per_vbyte)
+                .unwrap_or(50),
+            referral_mempool_url: val
+                .referral
+                .as_ref()
+                .map(|r| r.mempool_url.clone())
+                .unwrap_or_else(|| "https://mempool.space".to_string()),
         }
     }
 }
@@ -180,6 +195,8 @@ impl Worker {
             settings.referral_min_payout_sats,
             onchain,
             settings.referral_min_onchain_payout_sats,
+            settings.referral_max_onchain_fee_per_vbyte,
+            settings.referral_mempool_url.clone(),
         );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {

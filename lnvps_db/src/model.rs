@@ -1453,6 +1453,12 @@ pub struct ReferralPayout {
     pub referral_id: u64,
     /// Amount in smallest currency unit
     pub amount: u64,
+    /// Network/routing fee charged to the referrer, in the same smallest
+    /// currency unit as `amount`. The referrer bears the fee: it is debited from
+    /// their balance together with `amount` when computing what remains owed, so
+    /// a fee-induced deficit is recovered from future commission.
+    #[sqlx(default)]
+    pub fee: u64,
     /// Currency of this payout
     pub currency: String,
     /// When this payout record was created

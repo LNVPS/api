@@ -350,6 +350,18 @@ fn default_min_payout_sats() -> u64 {
     1000
 }
 
+fn default_min_onchain_payout_sats() -> Option<u64> {
+    Some(1000)
+}
+
+fn default_max_onchain_fee_per_vbyte() -> u64 {
+    50
+}
+
+fn default_mempool_url() -> String {
+    "https://mempool.space".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ReferralConfig {
@@ -358,12 +370,23 @@ pub struct ReferralConfig {
     #[serde(default = "default_min_payout_sats")]
     pub min_payout_sats: u64,
     /// Minimum accrued BTC commission (in satoshis) before an automated
-    /// **on-chain** payout is attempted. On-chain payouts compete with mempool
-    /// fees, so this threshold is deliberately separate (and typically much
-    /// higher) than the Lightning `min_payout_sats`. `None` disables on-chain
-    /// payouts entirely (commission still accrues for manual payout).
-    #[serde(default)]
+    /// **on-chain** payout is attempted. Defaults to 1000 sats; this minimum
+    /// acts as a small buffer so a payout can absorb the referrer's fee. Set to
+    /// `null` to disable on-chain payouts entirely (commission still accrues for
+    /// manual payout).
+    #[serde(default = "default_min_onchain_payout_sats")]
     pub min_onchain_payout_sats: Option<u64>,
+    /// Maximum acceptable next-block fee rate (sat/vByte) for on-chain payouts.
+    /// Before broadcasting a payout batch, the current next-block fee rate is
+    /// fetched from mempool.space; if it exceeds this cap the batch is skipped
+    /// and retried on a later run, so payouts wait for cheaper fees rather than
+    /// paying "crazy" fees. Defaults to 50 sat/vByte.
+    #[serde(default = "default_max_onchain_fee_per_vbyte")]
+    pub max_onchain_fee_per_vbyte: u64,
+    /// Base URL of the mempool.space (compatible) instance used to fetch the
+    /// recommended next-block fee rate. Defaults to `https://mempool.space`.
+    #[serde(default = "default_mempool_url")]
+    pub mempool_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

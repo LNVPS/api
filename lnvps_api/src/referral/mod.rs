@@ -35,6 +35,47 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
     if pay_msat == 0 { None } else { Some(pay_msat) }
 }
 
+/// mempool.space `/api/v1/fees/recommended` response (only the field we need).
+#[derive(serde::Deserialize)]
+struct RecommendedFees {
+    /// Next-block ("fastest") fee rate, sat/vByte.
+    #[serde(rename = "fastestFee")]
+    fastest_fee: u64,
+}
+
+/// Fetch the current next-block fee rate (sat/vByte) from a mempool.space-
+/// compatible instance.
+async fn fetch_next_block_feerate(mempool_url: &str) -> Result<u64> {
+    let url = format!(
+        "{}/api/v1/fees/recommended",
+        mempool_url.trim_end_matches('/')
+    );
+    let fees: RecommendedFees = reqwest::get(&url).await?.error_for_status()?.json().await?;
+    Ok(fees.fastest_fee)
+}
+
+/// Split `total_fee` across payouts in proportion to their `amounts`, returning
+/// one fee per entry (in order). Any rounding remainder is added to the largest
+/// payout so the shares sum to exactly `total_fee`.
+fn split_fee_proportional(amounts: &[u64], total_fee: u64) -> Vec<u64> {
+    let sum: u128 = amounts.iter().map(|a| *a as u128).sum();
+    if sum == 0 || total_fee == 0 {
+        return vec![0; amounts.len()];
+    }
+    let mut shares: Vec<u64> = amounts
+        .iter()
+        .map(|a| ((*a as u128 * total_fee as u128) / sum) as u64)
+        .collect();
+    let assigned: u64 = shares.iter().sum();
+    let remainder = total_fee.saturating_sub(assigned);
+    if remainder > 0 {
+        if let Some((idx, _)) = amounts.iter().enumerate().max_by_key(|(_, a)| **a) {
+            shares[idx] += remainder;
+        }
+    }
+    shares
+}
+
 /// Decode a hex-encoded raw transaction. Returns `None` if it can't be parsed.
 fn decode_tx(raw_tx_hex: &str) -> Option<bitcoin::Transaction> {
     let bytes = hex::decode(raw_tx_hex.trim()).ok()?;
@@ -74,6 +115,11 @@ pub struct ReferralPayoutHandler {
     /// attempted. Separate from (and typically higher than) the Lightning
     /// minimum because on-chain payouts compete with mempool fees.
     min_onchain_payout_msat: Option<u64>,
+    /// Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts;
+    /// batches are deferred when the current rate exceeds this.
+    max_onchain_fee_per_vbyte: u64,
+    /// mempool.space base URL used to fetch the recommended next-block fee rate.
+    mempool_url: String,
 }
 
 impl ReferralPayoutHandler {
@@ -81,6 +127,7 @@ impl ReferralPayoutHandler {
     /// Lightning payouts; `onchain`/`min_onchain_payout_sats` of `None` disables
     /// automated on-chain payouts. In all cases commission still accrues and can
     /// be paid manually by admins.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<dyn LNVpsDb>,
         node: Arc<dyn LightningNode>,
@@ -88,6 +135,8 @@ impl ReferralPayoutHandler {
         min_payout_sats: Option<u64>,
         onchain: Option<Arc<dyn OnChainProvider>>,
         min_onchain_payout_sats: Option<u64>,
+        max_onchain_fee_per_vbyte: u64,
+        mempool_url: String,
     ) -> Self {
         Self {
             db,
@@ -96,6 +145,8 @@ impl ReferralPayoutHandler {
             min_payout_msat: min_payout_sats.map(|s| s.saturating_mul(1000)),
             onchain,
             min_onchain_payout_msat: min_onchain_payout_sats.map(|s| s.saturating_mul(1000)),
+            max_onchain_fee_per_vbyte,
+            mempool_url,
         }
     }
 
@@ -153,8 +204,13 @@ impl ReferralPayoutHandler {
     /// recorded on every payout row; on failure all reservations are released so
     /// the balances retry next run.
     ///
-    /// The network fee is paid by our wallet on top of the outputs (absorbed by
-    /// LNVPS), so each referrer receives their exact owed amount.
+    /// The network fee is **charged to the referrers**: after the batch
+    /// confirms, the transaction fee is split across the batch in proportion to
+    /// each payout and debited from the referrer's balance (see
+    /// [`Self::payable_onchain_msat`]). Before broadcasting, the current
+    /// next-block fee rate is fetched from mempool.space and the batch is
+    /// deferred if it exceeds the configured cap, so payouts wait for cheaper
+    /// fees.
     async fn process_onchain_batch(
         &self,
         onchain: &dyn OnChainProvider,
@@ -193,16 +249,32 @@ impl ReferralPayoutHandler {
         if eligible.is_empty() {
             return Ok(());
         }
-        self.send_batch(onchain, eligible).await
+
+        // 2. Check the current next-block fee rate; defer the whole batch if
+        //    fees are too high so we wait for cheaper conditions.
+        let feerate = fetch_next_block_feerate(&self.mempool_url)
+            .await
+            .context("fetching next-block fee rate from mempool.space")?;
+        if feerate > self.max_onchain_fee_per_vbyte {
+            info!(
+                "Deferring on-chain referral payouts: next-block fee {} sat/vB exceeds cap {} sat/vB",
+                feerate, self.max_onchain_fee_per_vbyte
+            );
+            return Ok(());
+        }
+
+        self.send_batch(onchain, eligible, feerate).await
     }
 
     /// Reserve, broadcast (single send-many) and record a batch of on-chain
-    /// payouts. Split from selection so it can be tested with a hand-built
-    /// `eligible` list. Each entry is `(referrer, address, pay_msat)`.
+    /// payouts at `sat_per_vbyte`. Split from selection so it can be tested with
+    /// a hand-built `eligible` list. Each entry is `(referrer, address,
+    /// pay_msat)`.
     async fn send_batch(
         &self,
         onchain: &dyn OnChainProvider,
         eligible: Vec<(Referral, String, u64)>,
+        sat_per_vbyte: u64,
     ) -> Result<()> {
         // 1. Reserve every payout (unpaid) before sending, so a crash between
         //    the broadcast and the DB update cannot double-pay next run.
@@ -212,6 +284,7 @@ impl ReferralPayoutHandler {
                 id: 0,
                 referral_id: referral.id,
                 amount: *pay_msat,
+                fee: 0,
                 currency: "BTC".to_string(),
                 created: Utc::now(),
                 is_paid: false,
@@ -223,8 +296,9 @@ impl ReferralPayoutHandler {
             reserved.push((payout_id, referral.clone(), addr.clone(), *pay_msat));
         }
 
-        // 2. Broadcast a single send-many transaction paying every referrer.
-        let req = Self::payout_batch_request(&eligible);
+        // 2. Broadcast a single send-many transaction paying every referrer at
+        //    the chosen fee rate.
+        let req = Self::payout_batch_request(&eligible, sat_per_vbyte);
         let total_msat: u64 = eligible.iter().map(|(_, _, m)| *m).sum();
         match onchain.send_coins(req).await {
             Ok(resp) => {
@@ -235,11 +309,29 @@ impl ReferralPayoutHandler {
                     total_msat / 1000
                 );
                 // Decode the raw transaction once so each payout can record its
-                // exact outpoint (txid:vout) — a batch is one tx with many
-                // outputs, so the vout identifies which output paid a referrer.
+                // exact outpoint (txid:vout) and so we can size the fee from the
+                // real transaction weight.
                 let decoded = resp.raw_tx.as_deref().and_then(decode_tx);
-                // 3. Mark every reserved payout paid with its outpoint.
-                for (payout_id, referral, address, pay_msat) in reserved {
+                // Total on-chain fee = chosen rate × the transaction's vsize
+                // (this is exactly what the wallet pays at `sat_per_vbyte`).
+                // Prefer the backend-reported fee when present.
+                let total_fee_msat = resp
+                    .fee
+                    .map(|f| f.value())
+                    .or_else(|| {
+                        decoded
+                            .as_ref()
+                            .map(|tx| sat_per_vbyte.saturating_mul(tx.vsize() as u64) * 1000)
+                    })
+                    .unwrap_or(0);
+                // Split the fee across referrers in proportion to their payout.
+                let amounts: Vec<u64> = reserved.iter().map(|(_, _, _, m)| *m).collect();
+                let fee_shares = split_fee_proportional(&amounts, total_fee_msat);
+
+                // 3. Mark every reserved payout paid with its outpoint and fee.
+                for ((payout_id, referral, address, pay_msat), fee_msat) in
+                    reserved.into_iter().zip(fee_shares)
+                {
                     let outpoint = match decoded
                         .as_ref()
                         .and_then(|tx| vout_for_address(tx, &address))
@@ -253,6 +345,7 @@ impl ReferralPayoutHandler {
                         id: payout_id,
                         referral_id: referral.id,
                         amount: pay_msat,
+                        fee: fee_msat,
                         currency: "BTC".to_string(),
                         created: Utc::now(),
                         is_paid: true,
@@ -271,9 +364,11 @@ impl ReferralPayoutHandler {
                         .send(WorkJob::SendNotification {
                             user_id: referral.user_id,
                             message: format!(
-                                "You've been paid {} sats in referral commission on-chain ({}).",
+                                "You've been paid {} sats in referral commission on-chain \
+                                 ({}, minus {} sats fee).",
                                 pay_msat / 1000,
-                                outpoint
+                                outpoint,
+                                fee_msat / 1000
                             ),
                             title: Some("Referral payout".to_string()),
                         })
@@ -296,10 +391,12 @@ impl ReferralPayoutHandler {
         }
     }
 
-    /// Build the single send-many request paying every eligible referrer. Each
-    /// entry is `(referrer, address, pay_msat)`; the fee is absorbed by our
-    /// wallet so each referrer receives their exact amount.
-    fn payout_batch_request(eligible: &[(Referral, String, u64)]) -> SendCoinsRequest {
+    /// Build the single send-many request paying every eligible referrer at
+    /// `sat_per_vbyte`. Each entry is `(referrer, address, pay_msat)`.
+    fn payout_batch_request(
+        eligible: &[(Referral, String, u64)],
+        sat_per_vbyte: u64,
+    ) -> SendCoinsRequest {
         SendCoinsRequest {
             outputs: eligible
                 .iter()
@@ -308,7 +405,7 @@ impl ReferralPayoutHandler {
                     amount: CurrencyAmount::millisats(*pay_msat),
                 })
                 .collect(),
-            sat_per_vbyte: None,
+            sat_per_vbyte: Some(sat_per_vbyte),
             target_conf: None,
             label: Some("LNVPS referral payouts".to_string()),
         }
@@ -328,13 +425,14 @@ impl ReferralPayoutHandler {
             .filter(|u| u.currency.eq_ignore_ascii_case("BTC"))
             .map(|u| u.commission())
             .sum();
+        // The referrer bears fees, so debit amount + fee from their balance.
         let existing: u64 = self
             .db
             .list_referral_payouts(referral.id)
             .await?
             .iter()
             .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
-            .map(|p| p.amount)
+            .map(|p| p.amount.saturating_add(p.fee))
             .sum();
         Ok(payable_referral_msat(
             earned_msat,
@@ -356,14 +454,15 @@ impl ReferralPayoutHandler {
             .sum();
 
         // Subtract every existing BTC payout record (paid AND reserved) so an
-        // in-flight reservation is never paid twice.
+        // in-flight reservation is never paid twice. The referrer bears fees, so
+        // debit amount + fee.
         let existing: u64 = self
             .db
             .list_referral_payouts(referral.id)
             .await?
             .iter()
             .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
-            .map(|p| p.amount)
+            .map(|p| p.amount.saturating_add(p.fee))
             .sum();
 
         let Some(pay_msat) = payable_referral_msat(earned_msat, existing, min_msat) else {
@@ -375,6 +474,7 @@ impl ReferralPayoutHandler {
             id: 0,
             referral_id: referral.id,
             amount: pay_msat,
+            fee: 0,
             currency: "BTC".to_string(),
             created: Utc::now(),
             is_paid: false,
@@ -386,22 +486,25 @@ impl ReferralPayoutHandler {
         payout.id = payout_id;
 
         match self.pay_commission(referral, pay_msat).await {
-            Ok((bolt11, pre_image)) => {
+            Ok((bolt11, pre_image, fee_msat)) => {
                 payout.is_paid = true;
                 payout.invoice = Some(bolt11);
                 payout.pre_image = pre_image;
+                // Charge the referrer the routing fee we paid.
+                payout.fee = fee_msat;
                 self.db.update_referral_payout(&payout).await?;
                 info!(
-                    "Paid referral commission {} msat to code {} (payout {})",
-                    pay_msat, referral.code, payout_id
+                    "Paid referral commission {} msat (fee {} msat) to code {} (payout {})",
+                    pay_msat, fee_msat, referral.code, payout_id
                 );
                 let _ = self
                     .tx
                     .send(WorkJob::SendNotification {
                         user_id: referral.user_id,
                         message: format!(
-                            "You've been paid {} sats in referral commission.",
-                            pay_msat / 1000
+                            "You've been paid {} sats in referral commission (minus {} sats fee).",
+                            pay_msat / 1000,
+                            fee_msat / 1000
                         ),
                         title: Some("Referral payout".to_string()),
                     })
@@ -422,12 +525,13 @@ impl ReferralPayoutHandler {
     }
 
     /// Resolve a BOLT11 invoice for `amount_msat` from the referrer's chosen
-    /// payout method and pay it from our node. Returns `(bolt11, preimage)`.
+    /// payout method and pay it from our node. Returns `(bolt11, preimage,
+    /// routing_fee_msat)`.
     async fn pay_commission(
         &self,
         referral: &Referral,
         amount_msat: u64,
-    ) -> Result<(String, Option<Vec<u8>>)> {
+    ) -> Result<(String, Option<Vec<u8>>, u64)> {
         let bolt11 = match referral.mode {
             ReferralPayoutMode::LightningAddress => {
                 let addr = referral
@@ -468,7 +572,7 @@ impl ReferralPayoutHandler {
         let pre_image = resp
             .payment_preimage
             .and_then(|h| hex::decode(h.trim()).ok());
-        Ok((bolt11, pre_image))
+        Ok((bolt11, pre_image, resp.fee_msat))
     }
 
     /// Fetch a BOLT11 invoice for `amount_msat` from a Lightning address via
@@ -562,7 +666,24 @@ mod tests {
             None,
             Some(onchain),
             Some(1000),
+            50,
+            "https://mempool.space".to_string(),
         )
+    }
+
+    #[test]
+    fn test_split_fee_proportional() {
+        // Proportional split; remainder to the largest.
+        let shares = split_fee_proportional(&[2_000_000, 1_000_000], 300);
+        assert_eq!(shares, vec![200, 100], "split in proportion to amount");
+        assert_eq!(shares.iter().sum::<u64>(), 300, "shares sum to the fee");
+        // Rounding remainder is absorbed by the largest payout.
+        let shares = split_fee_proportional(&[2_000_000, 1_000_000], 301);
+        assert_eq!(shares.iter().sum::<u64>(), 301);
+        assert_eq!(shares[0], 201, "largest payout takes the remainder");
+        // Zero fee / zero amounts.
+        assert_eq!(split_fee_proportional(&[1, 2], 0), vec![0, 0]);
+        assert_eq!(split_fee_proportional(&[0, 0], 100), vec![0, 0]);
     }
 
     #[test]
@@ -571,8 +692,9 @@ mod tests {
             (referrer(1, "AAA"), "bcrt1qa".to_string(), 2_000_000),
             (referrer(2, "BBB"), "bcrt1qb".to_string(), 1_500_000),
         ];
-        let req = ReferralPayoutHandler::payout_batch_request(&eligible);
+        let req = ReferralPayoutHandler::payout_batch_request(&eligible, 12);
         assert_eq!(req.outputs.len(), 2, "one output per referrer");
+        assert_eq!(req.sat_per_vbyte, Some(12), "fee rate is passed through");
         assert_eq!(
             req.total_msat(),
             3_500_000,
@@ -612,7 +734,7 @@ mod tests {
                 1_500_000,
             ),
         ];
-        h.send_batch(onchain.as_ref(), eligible).await.unwrap();
+        h.send_batch(onchain.as_ref(), eligible, 10).await.unwrap();
 
         // Exactly ONE on-chain transaction was broadcast for the whole batch.
         let sends = onchain.sends.lock().await;
@@ -637,6 +759,16 @@ mod tests {
         assert_eq!(txa, txb, "both rows share the batch transaction id");
         assert_eq!(va, "0", "referrer A is the first output");
         assert_eq!(vb, "1", "referrer B is the second output");
+
+        // The on-chain fee was charged to the referrers (split by amount) — the
+        // larger payout bears the larger share.
+        assert!(pa[0].fee > 0 && pb[0].fee > 0, "fee charged to both");
+        assert!(
+            pa[0].fee >= pb[0].fee,
+            "larger payout bears >= fee ({} vs {})",
+            pa[0].fee,
+            pb[0].fee
+        );
     }
 
     /// A provider whose `send_coins` always fails, to test reservation rollback.
@@ -684,7 +816,7 @@ mod tests {
             regtest_addr(1),
             2_000_000,
         )];
-        let res = h.send_batch(onchain.as_ref(), eligible).await;
+        let res = h.send_batch(onchain.as_ref(), eligible, 10).await;
         assert!(res.is_err(), "send failure propagates");
         // The reserved payout was released so the balance retries next run.
         let payouts = db.list_referral_payouts(ra).await.unwrap();

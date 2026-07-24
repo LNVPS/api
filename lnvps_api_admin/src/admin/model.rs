@@ -1993,6 +1993,9 @@ pub struct AdminReferralEarning {
 pub struct AdminReferralPayoutInfo {
     pub id: u64,
     pub amount: u64,
+    /// Network/routing fee charged to the referrer (smallest currency unit),
+    /// debited from their balance alongside `amount`.
+    pub fee: u64,
     pub currency: String,
     pub created: DateTime<Utc>,
     pub is_paid: bool,
@@ -2010,6 +2013,7 @@ impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
         Self {
             id: p.id,
             amount: p.amount,
+            fee: p.fee,
             currency: p.currency,
             created: p.created,
             is_paid: p.is_paid,

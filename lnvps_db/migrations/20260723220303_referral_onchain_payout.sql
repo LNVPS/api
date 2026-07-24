@@ -15,3 +15,10 @@ ALTER TABLE referral
 
 ALTER TABLE referral_payout
     ADD COLUMN outpoint VARCHAR(255) NULL DEFAULT NULL;
+
+-- Network/routing fee charged to the referrer for this payout, in the payout's
+-- smallest currency unit (millisats for BTC). The referrer bears the fee: it is
+-- debited from their accrued balance alongside `amount`, so fees are recovered
+-- from current (and, if the balance goes negative, future) commission.
+ALTER TABLE referral_payout
+    ADD COLUMN fee BIGINT UNSIGNED NOT NULL DEFAULT 0;

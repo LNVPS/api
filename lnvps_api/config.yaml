@@ -16,10 +16,17 @@ referral:
   min-payout-sats: 1000
   # Minimum accrued BTC commission (satoshis) before an *on-chain* payout is
   # attempted. On-chain payouts for all eligible referrers are batched into a
-  # single send-many transaction (one fee for the whole batch). This threshold
-  # is separate from (and typically much higher than) min-payout-sats because
-  # on-chain payouts compete with mempool fees. Omit to disable on-chain payouts.
-  #min-onchain-payout-sats: 100000
+  # single send-many transaction. The referrer bears the network fee (it is
+  # debited from their balance), and this minimum acts as a small buffer to
+  # absorb it. Defaults to 1000. Set to null to disable on-chain payouts.
+  min-onchain-payout-sats: 1000
+  # Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts. The
+  # current rate is fetched from mempool.space before each batch; if it exceeds
+  # this cap the batch is deferred until fees drop. Defaults to 50.
+  max-onchain-fee-per-vbyte: 50
+  # mempool.space (compatible) instance used for the recommended fee rate.
+  # Defaults to https://mempool.space.
+  #mempool-url: "https://mempool.space"
 public-url: "https://api.lnvps.net"
 read-only: false
 redis:

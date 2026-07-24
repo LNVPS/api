@@ -3016,6 +3016,7 @@ impl LNVpsDbBase for MockDb {
             p.invoice = payout.invoice.clone();
             p.pre_image = payout.pre_image.clone();
             p.outpoint = payout.outpoint.clone();
+            p.fee = payout.fee;
         }
         Ok(())
     }

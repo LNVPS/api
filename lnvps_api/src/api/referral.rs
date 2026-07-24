@@ -102,6 +102,9 @@ pub struct ApiReferralEarning {
 pub struct ApiReferralPayout {
     pub id: u64,
     pub amount: u64,
+    /// Network/routing fee charged to you for this payout (smallest currency
+    /// unit), debited from your balance alongside `amount`.
+    pub fee: u64,
     pub currency: String,
     pub created: chrono::DateTime<Utc>,
     pub is_paid: bool,
@@ -119,6 +122,7 @@ impl From<ReferralPayout> for ApiReferralPayout {
         Self {
             id: p.id,
             amount: p.amount,
+            fee: p.fee,
             currency: p.currency,
             created: p.created,
             is_paid: p.is_paid,
