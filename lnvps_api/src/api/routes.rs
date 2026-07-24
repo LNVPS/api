@@ -27,7 +27,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHostRegion,
+    VmHost, VmHostRegion,
 };
 
 use crate::api::model::{
@@ -705,13 +705,24 @@ async fn v1_list_vms(
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     let vms = this.db.list_user_vms(uid).await?;
+    // Bulk-load hosts once (there are few) and index by id, instead of a
+    // per-VM host lookup inside vm_to_status.
+    let hosts: HashMap<u64, VmHost> = this
+        .db
+        .list_hosts()
+        .await?
+        .into_iter()
+        .map(|h| (h.id, h))
+        .collect();
     let mut ret = vec![];
     for vm in vms {
         let vm_id = vm.id;
+        let host = hosts.get(&vm.host_id).cloned();
         ret.push(
             vm_to_status(
                 &this.db,
                 vm,
+                host,
                 this.state.get_state(vm_id).await,
                 this.settings.delete_after,
                 this.settings.max_prepay_days,
@@ -730,10 +741,12 @@ async fn v1_get_vm(
     Path(id): Path<u64>,
 ) -> ApiResult<ApiVmStatus> {
     let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let host = this.db.get_host(vm.host_id).await.ok();
     ApiData::ok(
         vm_to_status(
             &this.db,
             vm,
+            host,
             this.state.get_state(id).await,
             this.settings.delete_after,
             this.settings.max_prepay_days,
@@ -1009,10 +1022,12 @@ async fn v1_create_custom_vm_order(
         .await
         .ok();
 
+    let host = this.db.get_host(rsp.host_id).await.ok();
     ApiData::ok(
         vm_to_status(
             &this.db,
             rsp,
+            host,
             None,
             this.settings.delete_after,
             this.settings.max_prepay_days,
@@ -1148,10 +1163,12 @@ async fn v1_create_vm_order(
         .await
         .ok();
 
+    let host = this.db.get_host(rsp.host_id).await.ok();
     ApiData::ok(
         vm_to_status(
             &this.db,
             rsp,
+            host,
             None,
             this.settings.delete_after,
             this.settings.max_prepay_days,
@@ -1858,7 +1875,8 @@ async fn v1_get_payment_invoice(
                 current_date: now,
                 vm: vm_to_status(
                     &this.db,
-                    vm,
+                    vm.clone(),
+                    this.db.get_host(vm.host_id).await.ok(),
                     None,
                     this.settings.delete_after,
                     this.settings.max_prepay_days,

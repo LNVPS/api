@@ -7,7 +7,7 @@ use ipnetwork::IpNetwork;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, Subscription, SubscriptionLineItem,
     SubscriptionType, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHostRegion, VmTemplate,
+    VmHost, VmHostRegion, VmTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -289,9 +289,15 @@ pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_
 }
 
 // Function to build ApiVmStatus from VM data (moved from common)
+///
+/// `host` is the VM's host, passed in by the caller so that listing endpoints
+/// can bulk-load hosts once (there are few) instead of issuing one lookup per
+/// VM. Pass `None` if the host is unknown/unavailable — host-derived fields
+/// (`host_sunset_date`, `cpu_arch`) are then simply omitted.
 pub async fn vm_to_status(
     db: &Arc<dyn LNVpsDb>,
     vm: Vm,
+    host: Option<VmHost>,
     state: Option<VmRunningState>,
     delete_after: u16,
     max_prepay_days_default: u16,
@@ -317,8 +323,6 @@ pub async fn vm_to_status(
         .collect();
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
-    // Load the host once for both its sunset date and CPU architecture.
-    let host = db.get_host(vm.host_id).await.ok();
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
     let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on, max_prepay_days) =
         match db

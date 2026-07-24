@@ -4814,7 +4814,8 @@ mod tests {
 
         let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
         let vm = db.get_vm(1).await.unwrap();
-        let res = vm_to_status(&db, vm, None, 0, 365).await;
+        let host = db.get_host(vm.host_id).await.ok();
+        let res = vm_to_status(&db, vm, host, None, 0, 365).await;
         assert!(res.is_err(), "expected error, not a panic");
     }
 
@@ -4841,13 +4842,17 @@ mod tests {
 
         // Not sunsetting -> field is None.
         let vm = db.get_vm(1).await.unwrap();
-        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm.clone(), host, None, 0, 365)
+            .await
+            .unwrap();
         assert!(status.host_sunset_date.is_none());
 
         // Sunset host 1 -> field surfaces the date.
         let sunset = Utc::now() + chrono::Duration::days(30);
         mdb.hosts.lock().await.get_mut(&1).unwrap().sunset_date = Some(sunset);
-        let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm, host, None, 0, 365).await.unwrap();
         assert_eq!(status.host_sunset_date, Some(sunset));
     }
 
@@ -4872,17 +4877,24 @@ mod tests {
 
         // Mock host 1 is x86_64 -> surfaced as a string.
         let vm = db.get_vm(1).await.unwrap();
-        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm.clone(), host, None, 0, 365)
+            .await
+            .unwrap();
         assert_eq!(status.cpu_arch.as_deref(), Some("x86_64"));
 
         // arm64 host -> surfaced accordingly.
         mdb.hosts.lock().await.get_mut(&1).unwrap().cpu_arch = CpuArch::ARM64;
-        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm.clone(), host, None, 0, 365)
+            .await
+            .unwrap();
         assert_eq!(status.cpu_arch.as_deref(), Some("arm64"));
 
         // Unknown host arch -> omitted (None), not the "unknown" sentinel.
         mdb.hosts.lock().await.get_mut(&1).unwrap().cpu_arch = CpuArch::Unknown;
-        let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm, host, None, 0, 365).await.unwrap();
         assert!(status.cpu_arch.is_none());
     }
 
@@ -4907,7 +4919,10 @@ mod tests {
 
         // Company default is 0 -> inherits the global default passed in.
         let vm = db.get_vm(1).await.unwrap();
-        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm.clone(), host.clone(), None, 0, 365)
+            .await
+            .unwrap();
         assert_eq!(status.max_prepay_days, 365);
 
         // Company override wins over the global default.
@@ -4917,7 +4932,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .max_prepay_days = 90;
-        let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
+        let status = vm_to_status(&db, vm, host, None, 0, 365).await.unwrap();
         assert_eq!(status.max_prepay_days, 90);
     }
 
