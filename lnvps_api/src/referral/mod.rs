@@ -27,6 +27,16 @@ use std::sync::Arc;
 /// Returns `None` when the outstanding balance is below `min_msat` or rounds to
 /// zero whole sats. Lightning settles whole sats, so any sub-sat remainder is
 /// dropped and stays owed for a later payout.
+/// The effective payout threshold (in msat) for a referrer: the larger of the
+/// system minimum and the referrer's own chosen `payout_threshold` (sats), so a
+/// referrer can raise — but never lower — the bar to avoid many tiny payouts.
+fn effective_min_msat(referral: &Referral, system_min_msat: u64) -> u64 {
+    match referral.payout_threshold {
+        Some(sats) => sats.saturating_mul(1000).max(system_min_msat),
+        None => system_min_msat,
+    }
+}
+
 fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) -> Option<u64> {
     let owed = earned_msat.saturating_sub(existing_msat);
     if owed < min_msat {
@@ -423,7 +433,7 @@ impl ReferralPayoutHandler {
         Ok(payable_referral_msat(
             earned_msat,
             existing,
-            min_onchain_msat,
+            effective_min_msat(referral, min_onchain_msat),
         ))
     }
 
@@ -451,7 +461,11 @@ impl ReferralPayoutHandler {
             .map(|p| p.amount.saturating_add(p.fee))
             .sum();
 
-        let Some(pay_msat) = payable_referral_msat(earned_msat, existing, min_msat) else {
+        let Some(pay_msat) = payable_referral_msat(
+            earned_msat,
+            existing,
+            effective_min_msat(referral, min_msat),
+        ) else {
             return Ok(());
         };
 
@@ -639,6 +653,7 @@ mod tests {
             address: Some(regtest_addr(id as u8)),
             mode: ReferralPayoutMode::OnChain,
             referral_rate: None,
+            payout_threshold: None,
             created: Utc::now(),
         }
     }
@@ -868,5 +883,27 @@ mod tests {
         );
         // Owed below a tiny threshold that rounds to zero whole sats -> None
         assert_eq!(payable_referral_msat(999, 0, 1), None);
+    }
+
+    #[test]
+    fn test_effective_min_msat() {
+        let system_min = 1_000 * 1000; // 1000 sats in msat
+
+        // No user threshold -> system minimum is used.
+        let mut r = referrer(1, "AAA");
+        r.payout_threshold = None;
+        assert_eq!(effective_min_msat(&r, system_min), system_min);
+
+        // A higher user threshold raises the bar.
+        r.payout_threshold = Some(50_000);
+        assert_eq!(effective_min_msat(&r, system_min), 50_000 * 1000);
+
+        // A user threshold below the system minimum can never lower it.
+        r.payout_threshold = Some(100);
+        assert_eq!(effective_min_msat(&r, system_min), system_min);
+
+        // Equal to the system minimum -> system minimum.
+        r.payout_threshold = Some(1_000);
+        assert_eq!(effective_min_msat(&r, system_min), system_min);
     }
 }

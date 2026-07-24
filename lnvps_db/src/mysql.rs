@@ -3383,13 +3383,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, address, mode, referral_rate) VALUES (?, ?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, address, mode, referral_rate, payout_threshold) VALUES (?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
         .bind(&referral.address)
         .bind(referral.mode)
         .bind(referral.referral_rate)
+        .bind(referral.payout_threshold)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -3406,12 +3407,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
 
         sqlx::query(
-            "UPDATE referral SET code = ?, address = ?, mode = ?, referral_rate = ? WHERE id = ?",
+            "UPDATE referral SET code = ?, address = ?, mode = ?, referral_rate = ?, payout_threshold = ? WHERE id = ?",
         )
         .bind(&referral.code)
         .bind(&referral.address)
         .bind(referral.mode)
         .bind(referral.referral_rate)
+        .bind(referral.payout_threshold)
         .bind(referral.id)
         .execute(&mut *tx)
         .await?;

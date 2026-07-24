@@ -49,6 +49,11 @@ pub struct ApiReferral {
     /// referral is resolved against the referred VM's own company, so this is
     /// the headline/default rate for display.
     pub effective_referral_rate: f32,
+    /// Your chosen minimum accrued commission (in **satoshis**) before an
+    /// automated payout is made — raise this to avoid many tiny payouts
+    /// (useful for on-chain). `null` uses the system minimum. The effective
+    /// threshold is `max(system minimum, this value)`.
+    pub payout_threshold: Option<u64>,
     /// When the referral was created
     pub created: chrono::DateTime<Utc>,
 }
@@ -63,6 +68,7 @@ impl From<Referral> for ApiReferral {
             // handler (see `resolve_effective_rate`).
             effective_referral_rate: r.referral_rate.unwrap_or(0.0),
             referral_rate: r.referral_rate,
+            payout_threshold: r.payout_threshold,
             created: r.created,
         }
     }
@@ -209,6 +215,10 @@ pub struct ApiReferralSignupRequest {
     pub address: Option<String>,
     /// Payout method: `lightning_address` (default), `nwc`, or `on_chain`.
     pub mode: Option<String>,
+    /// Optional minimum accrued commission (in **satoshis**) before an
+    /// automated payout is made. Must be at least the system minimum. Omit to
+    /// use the system minimum.
+    pub payout_threshold: Option<u64>,
 }
 
 /// Request to update referral payout options
@@ -226,6 +236,14 @@ pub struct ApiReferralPatchRequest {
     /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
     /// `on_chain`.
     pub mode: Option<String>,
+    /// Set (`Some(sats)`) or clear (`null`) your minimum-payout threshold in
+    /// **satoshis**. When set it must be at least the system minimum. Omit the
+    /// field to leave it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub payout_threshold: Option<Option<u64>>,
 }
 
 /// Resolve and validate a requested payout `mode`, defaulting when omitted.
@@ -245,6 +263,40 @@ fn parse_payout_mode(mode: Option<&str>) -> Result<Option<ReferralPayoutMode>, A
         ));
     }
     Ok(Some(parsed))
+}
+
+/// The configured system minimum payout (satoshis) for the given payout `mode`.
+/// On-chain uses its own minimum (falling back to the Lightning minimum if
+/// on-chain is disabled); everything else uses the Lightning minimum. Defaults
+/// to 1000 sats when no referral config is present.
+fn system_min_payout_sats(
+    referral: Option<&crate::settings::ReferralConfig>,
+    mode: ReferralPayoutMode,
+) -> u64 {
+    match referral {
+        Some(r) => match mode {
+            ReferralPayoutMode::OnChain => r.min_onchain_payout_sats.unwrap_or(r.min_payout_sats),
+            _ => r.min_payout_sats,
+        },
+        None => 1000,
+    }
+}
+
+/// Validate a user-chosen payout threshold (satoshis) against the system
+/// minimum for `mode`. A referrer may raise the bar (to avoid many tiny
+/// payouts) but not lower it below the system minimum.
+fn validate_payout_threshold(
+    threshold: u64,
+    referral: Option<&crate::settings::ReferralConfig>,
+    mode: ReferralPayoutMode,
+) -> Result<(), ApiError> {
+    let min = system_min_payout_sats(referral, mode);
+    if threshold < min {
+        return Err(ApiError::new(format!(
+            "payout_threshold must be at least the system minimum of {min} sats"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate an on-chain Bitcoin address.
@@ -385,6 +437,11 @@ async fn v1_signup_referral(
         ReferralPayoutMode::AccountCredit => unreachable!("rejected by parse_payout_mode"),
     }
 
+    // Optional user-chosen payout threshold; must clear the system minimum.
+    if let Some(threshold) = req.payout_threshold {
+        validate_payout_threshold(threshold, this.settings.referral.as_ref(), mode)?;
+    }
+
     let code = generate_referral_code();
     let referral = Referral {
         id: 0,
@@ -395,6 +452,7 @@ async fn v1_signup_referral(
         // Per-referrer commission override is admin-controlled; new enrollments
         // default to the referred VM's company rate (None = use company default).
         referral_rate: None,
+        payout_threshold: req.payout_threshold,
         created: Utc::now(),
     };
 
@@ -443,6 +501,15 @@ async fn v1_update_referral(
             return ApiData::err("NWC connection is not configured on your account");
         }
         referral.mode = mode;
+    }
+
+    // Set or clear the user-chosen payout threshold. When setting, validate it
+    // against the system minimum for the *effective* mode.
+    if let Some(threshold) = req.payout_threshold {
+        if let Some(sats) = threshold {
+            validate_payout_threshold(sats, this.settings.referral.as_ref(), effective_mode)?;
+        }
+        referral.payout_threshold = threshold;
     }
 
     // Note: we intentionally do NOT require the resulting config to be immediately
@@ -617,6 +684,45 @@ mod tests {
         assert!(matches!(parse_payout_mode(Some("account_credit")), Err(_)));
         // unknown -> error
         assert!(matches!(parse_payout_mode(Some("paypal")), Err(_)));
+    }
+
+    #[test]
+    fn test_validate_payout_threshold() {
+        use crate::settings::{FeeEstimatorConfig, ReferralConfig};
+        let cfg = ReferralConfig {
+            min_payout_sats: 1_000,
+            min_onchain_payout_sats: Some(5_000),
+            max_onchain_fee_per_vbyte: 50,
+            fee_estimator: FeeEstimatorConfig::default(),
+        };
+
+        // Lightning uses min_payout_sats (1000).
+        assert!(
+            validate_payout_threshold(1_000, Some(&cfg), ReferralPayoutMode::LightningAddress)
+                .is_ok()
+        );
+        assert!(
+            validate_payout_threshold(50_000, Some(&cfg), ReferralPayoutMode::LightningAddress)
+                .is_ok()
+        );
+        assert!(
+            validate_payout_threshold(999, Some(&cfg), ReferralPayoutMode::LightningAddress)
+                .is_err()
+        );
+
+        // On-chain uses its own higher minimum (5000).
+        assert!(validate_payout_threshold(5_000, Some(&cfg), ReferralPayoutMode::OnChain).is_ok());
+        assert!(validate_payout_threshold(4_999, Some(&cfg), ReferralPayoutMode::OnChain).is_err());
+        // 1000 clears the Lightning min but not the on-chain min.
+        assert!(validate_payout_threshold(1_000, Some(&cfg), ReferralPayoutMode::OnChain).is_err());
+
+        // No config -> default floor of 1000 sats.
+        assert!(
+            validate_payout_threshold(1_000, None, ReferralPayoutMode::LightningAddress).is_ok()
+        );
+        assert!(
+            validate_payout_threshold(999, None, ReferralPayoutMode::LightningAddress).is_err()
+        );
     }
 
     #[test]

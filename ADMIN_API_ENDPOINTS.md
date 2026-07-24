@@ -3259,10 +3259,10 @@ Returns a paginated list of `AdminReferralInfo`:
       "user_id": 34,
       "user_pubkey": "<hex>",
       "code": "ALPHA123",
-      "lightning_address": "user@domain.com",
-      "onchain_address": null,
+      "address": "user@domain.com",
       "mode": "lightning_address",
       "referral_rate": 12.5,
+      "payout_threshold": null,
       "created": "2026-07-18T10:00:00Z"
     }
   ],
@@ -3291,10 +3291,10 @@ Returns the referral plus per-currency earned commission, payout history and cou
     "user_id": 34,
     "user_pubkey": "<hex>",
     "code": "ALPHA123",
-    "lightning_address": "user@domain.com",
-    "onchain_address": null,
+    "address": "user@domain.com",
     "mode": "lightning_address",
     "referral_rate": 12.5,
+    "payout_threshold": null,
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "payouts": [
@@ -3325,8 +3325,10 @@ Body:
   // user's enrollment to a historical `vm.ref_code` that was tracked before
   // the user auto-generated their own code. Must be non-empty and not already
   // in use by another referral.
-  "referral_rate": 12.5
+  "referral_rate": 12.5,
   // Set (number, >= 0), clear to company default (null), or omit to leave unchanged
+  "payout_threshold": 50000
+  // Set (number, satoshis), clear to system minimum (null), or omit to leave unchanged. Admin override is not bounded by the system minimum.
 }
 ```
 

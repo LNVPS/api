@@ -1179,15 +1179,15 @@ The referral program pays a commission = a percentage of each referred VM's **fi
 - **Body**:
 ```typescript
 interface ReferralSignupRequest {
-  lightning_address?: string; // Lightning address for payouts (required when mode is "lightning_address")
-  onchain_address?: string;   // On-chain Bitcoin address for payouts (required when mode is "on_chain"). Must be a mainnet address (regtest also accepted in debug builds).
+  address?: string; // Payout target; its type depends on mode: a Lightning address (required when mode is "lightning_address") or an on-chain Bitcoin address (required when mode is "on_chain", mainnet; regtest also accepted in debug builds). Not needed for "nwc".
   mode?: "lightning_address" | "nwc" | "on_chain"; // Payout method; defaults to "lightning_address"
+  payout_threshold?: number; // Optional minimum accrued commission (in satoshis) before an automated payout is made. Raise it to avoid many tiny payouts (useful for on-chain). Must be at least the system minimum; omit to use the system minimum.
 }
 ```
 - **Response**: `Referral`
-- **Error**: Returns error if already enrolled; if `mode` is `lightning_address` (or omitted) without a resolvable `lightning_address`; if `mode` is `nwc` but no NWC connection is configured on the account; or if `mode` is `on_chain` without a valid `onchain_address`. `account_credit` is a defined-but-unimplemented mode and is rejected.
+- **Error**: Returns error if already enrolled; if `mode` is `lightning_address` (or omitted) without a resolvable Lightning `address`; if `mode` is `nwc` but no NWC connection is configured on the account; if `mode` is `on_chain` without a valid Bitcoin `address`; or if `payout_threshold` is below the system minimum. `account_credit` is a defined-but-unimplemented mode and is rejected.
 
-> **On-chain payouts** are paid by an automated worker that **batches every eligible on-chain referrer into a single send-many transaction**, gated by a minimum threshold (`min-onchain-payout-sats`, default 1000 sats). The **network fee is charged to you**: the transaction fee is split across the batch in proportion to each payout and debited from your balance (along with the amount), so `ReferralPayout.fee` records your share and the running balance may go negative — recovered from future referrals. Before broadcasting, the current next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds the operator's cap** (`max-onchain-fee-per-vbyte`, default 50), so payouts wait for cheaper fees. Balances below the threshold accrue until a later run. Commission always accrues and can also be paid manually by admins.
+> **On-chain payouts** are paid by an automated worker that **batches every eligible on-chain referrer into a single send-many transaction**, gated by a minimum threshold (`min-onchain-payout-sats`, default 1000 sats). The **network fee is charged to you**: the transaction fee is split across the batch in proportion to each payout and debited from your balance (along with the amount), so `ReferralPayout.fee` records your share and the running balance may go negative — recovered from future referrals. Before broadcasting, the current next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds the operator's cap** (`max-onchain-fee-per-vbyte`, default 50), so payouts wait for cheaper fees. Balances below the threshold accrue until a later run. You can also raise your own **`payout_threshold`** (satoshis) to batch up to a larger amount and avoid many tiny payouts — the effective threshold is `max(system minimum, your payout_threshold)`. Commission always accrues and can also be paid manually by admins.
 
 #### Get Referral State
 - **GET** `/api/v1/referral`
@@ -1201,9 +1201,9 @@ interface ReferralSignupRequest {
 - **Body**:
 ```typescript
 interface ReferralPatchRequest {
-  lightning_address?: string | null;  // Set (string) or clear (null) the lightning address; omit to leave unchanged
-  onchain_address?: string | null;    // Set (string) or clear (null) the on-chain Bitcoin address; omit to leave unchanged. Must be a mainnet address (regtest also accepted in debug builds).
+  address?: string | null;  // Set (string) or clear (null) the payout target; validated against the effective mode (Lightning address for "lightning_address", Bitcoin address for "on_chain"). Omit to leave unchanged.
   mode?: "lightning_address" | "nwc" | "on_chain"; // Change payout method; omit to leave unchanged
+  payout_threshold?: number | null; // Set (number, satoshis) or clear (null) your minimum-payout threshold; when set it must be at least the system minimum. Omit to leave unchanged.
 }
 ```
 - **Response**: `Referral`
