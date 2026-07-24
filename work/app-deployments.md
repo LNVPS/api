@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-24
-**Last updated:** 2026-07-25
+**Last updated:** 2026-07-25 (MVP increments 1–5 complete; backups (6) + L4/zap-stream (7) remain)
 
 ## Goal
 
@@ -133,11 +133,13 @@ images (higher isolation risk — design the boundary in now).
       create/update; `capacity_*` on cluster create/update; both exposed on the info responses.
       e2e admin test asserts footprint + capacity echo.
 
-### Increment 5 — Seed launch apps
-- [ ] Seed **strfry**, **haven relay**, **route96 (+ MariaDB)**, **generic Blossom** (compose
-      YAML) via migration or admin seed. All HTTP-ingress; route96 exercises multi-service +
-      generated secrets.
-- [ ] Integration/e2e coverage where feasible.
+### Increment 5 — Launch app examples (DONE, PR pending)
+- [x] **No DB seeding** (prices/enabling are operator decisions). Instead, `docs/managed-app-examples.md`
+      documents ready-to-paste, docs-accurate `compose` definitions for **strfry** (`dockurr/strfry`),
+      **route96 + MariaDB** (`voidic/route96`, YAML config, DB via service `db`), and **Blossom**
+      (`ghcr.io/hzrd149/blossom-server`), plus how to add them via `POST /api/admin/v1/apps`.
+- [x] **HAVEN / zap-stream** documented as not-yet-deployable: HAVEN needs a mounted `templates/`
+      dir of binary assets + JSON lists (no self-contained image); zap-stream needs `expose: tcp/udp`.
 
 ### Increment 6 — Volume backups (post-MVP)
 - [ ] Compose `backup:` grammar (per-service `command:` app-native dump | `volume:` raw tar;
