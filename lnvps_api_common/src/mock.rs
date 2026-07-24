@@ -2963,8 +2963,7 @@ impl LNVpsDbBase for MockDb {
         if let Some(r) = referrals.get_mut(&referral.id) {
             let old_code = r.code.clone();
             r.code = referral.code.clone();
-            r.lightning_address = referral.lightning_address.clone();
-            r.onchain_address = referral.onchain_address.clone();
+            r.address = referral.address.clone();
             r.mode = referral.mode;
             r.referral_rate = referral.referral_rate;
             // Cascade a code rename onto VMs that recorded the old code so
@@ -3016,7 +3015,7 @@ impl LNVpsDbBase for MockDb {
             p.is_paid = payout.is_paid;
             p.invoice = payout.invoice.clone();
             p.pre_image = payout.pre_image.clone();
-            p.txid = payout.txid.clone();
+            p.outpoint = payout.outpoint.clone();
         }
         Ok(())
     }
@@ -4125,8 +4124,7 @@ mod tests {
             id: 0,
             user_id: 1,
             code: code.to_string(),
-            lightning_address: Some("a@b.com".to_string()),
-            onchain_address: None,
+            address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
             created: Utc::now(),
@@ -4152,8 +4150,7 @@ mod tests {
             id: 0,
             user_id: 1,
             code: "OLDCODE".to_string(),
-            lightning_address: Some("a@b.com".to_string()),
-            onchain_address: None,
+            address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
             created: Utc::now(),
@@ -4217,8 +4214,7 @@ mod tests {
             id: 0,
             user_id: 1,
             code: code.to_string(),
-            lightning_address: Some("a@b.com".to_string()),
-            onchain_address: None,
+            address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
             created: Utc::now(),

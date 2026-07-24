@@ -325,10 +325,7 @@ mod tests {
 
         // Referrer updates their payout settings
         let resp = referrer
-            .patch_auth(
-                "/api/v1/referral",
-                &serde_json::json!({"lightning_address": null}),
-            )
+            .patch_auth("/api/v1/referral", &serde_json::json!({"address": null}))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

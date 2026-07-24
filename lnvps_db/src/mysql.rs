@@ -3383,12 +3383,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, lightning_address, onchain_address, mode, referral_rate) VALUES (?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, address, mode, referral_rate) VALUES (?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
-        .bind(&referral.lightning_address)
-        .bind(&referral.onchain_address)
+        .bind(&referral.address)
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .fetch_one(&self.db)
@@ -3407,11 +3406,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
 
         sqlx::query(
-            "UPDATE referral SET code = ?, lightning_address = ?, onchain_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
+            "UPDATE referral SET code = ?, address = ?, mode = ?, referral_rate = ? WHERE id = ?",
         )
         .bind(&referral.code)
-        .bind(&referral.lightning_address)
-        .bind(&referral.onchain_address)
+        .bind(&referral.address)
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .bind(referral.id)
@@ -3471,12 +3469,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
         sqlx::query(
-            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ?, txid = ? WHERE id = ?",
+            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ?, outpoint = ? WHERE id = ?",
         )
         .bind(payout.is_paid)
         .bind(&payout.invoice)
         .bind(&payout.pre_image)
-        .bind(&payout.txid)
+        .bind(&payout.outpoint)
         .bind(payout.id)
         .execute(&self.db)
         .await?;

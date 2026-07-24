@@ -35,6 +35,29 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
     if pay_msat == 0 { None } else { Some(pay_msat) }
 }
 
+/// Decode a hex-encoded raw transaction. Returns `None` if it can't be parsed.
+fn decode_tx(raw_tx_hex: &str) -> Option<bitcoin::Transaction> {
+    let bytes = hex::decode(raw_tx_hex.trim()).ok()?;
+    bitcoin::consensus::encode::deserialize(&bytes).ok()
+}
+
+/// Find the output index (`vout`) in `tx` that pays `address`.
+///
+/// Matches on the output **script**, computed from the address, so it works
+/// regardless of the network the address string is encoded for (a mainnet and a
+/// regtest address for the same witness program share a script_pubkey).
+fn vout_for_address(tx: &bitcoin::Transaction, address: &str) -> Option<u32> {
+    use std::str::FromStr;
+    let script = bitcoin::Address::from_str(address.trim())
+        .ok()?
+        .assume_checked()
+        .script_pubkey();
+    tx.output
+        .iter()
+        .position(|o| o.script_pubkey == script)
+        .map(|i| i as u32)
+}
+
 /// Pays referrers their accrued BTC commission over Lightning or on-chain.
 #[derive(Clone)]
 pub struct ReferralPayoutHandler {
@@ -145,13 +168,13 @@ impl ReferralPayoutHandler {
                 continue;
             }
             let Some(address) = referral
-                .onchain_address
+                .address
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
                 debug!(
-                    "Skipping on-chain payout for code {}: no on-chain address",
+                    "Skipping on-chain payout for code {}: no payout address",
                     referral.code
                 );
                 continue;
@@ -183,8 +206,8 @@ impl ReferralPayoutHandler {
     ) -> Result<()> {
         // 1. Reserve every payout (unpaid) before sending, so a crash between
         //    the broadcast and the DB update cannot double-pay next run.
-        let mut reserved: Vec<(u64, Referral, u64)> = Vec::new();
-        for (referral, _addr, pay_msat) in &eligible {
+        let mut reserved: Vec<(u64, Referral, String, u64)> = Vec::new();
+        for (referral, addr, pay_msat) in &eligible {
             let payout = ReferralPayout {
                 id: 0,
                 referral_id: referral.id,
@@ -194,10 +217,10 @@ impl ReferralPayoutHandler {
                 is_paid: false,
                 invoice: None,
                 pre_image: None,
-                txid: None,
+                outpoint: None,
             };
             let payout_id = self.db.insert_referral_payout(&payout).await?;
-            reserved.push((payout_id, referral.clone(), *pay_msat));
+            reserved.push((payout_id, referral.clone(), addr.clone(), *pay_msat));
         }
 
         // 2. Broadcast a single send-many transaction paying every referrer.
@@ -211,8 +234,21 @@ impl ReferralPayoutHandler {
                     reserved.len(),
                     total_msat / 1000
                 );
-                // 3. Mark every reserved payout paid with the shared txid.
-                for (payout_id, referral, pay_msat) in reserved {
+                // Decode the raw transaction once so each payout can record its
+                // exact outpoint (txid:vout) — a batch is one tx with many
+                // outputs, so the vout identifies which output paid a referrer.
+                let decoded = resp.raw_tx.as_deref().and_then(decode_tx);
+                // 3. Mark every reserved payout paid with its outpoint.
+                for (payout_id, referral, address, pay_msat) in reserved {
+                    let outpoint = match decoded
+                        .as_ref()
+                        .and_then(|tx| vout_for_address(tx, &address))
+                    {
+                        Some(vout) => format!("{}:{}", resp.txid, vout),
+                        // Fall back to the bare txid if the tx couldn't be
+                        // decoded or the output wasn't found.
+                        None => resp.txid.clone(),
+                    };
                     let payout = ReferralPayout {
                         id: payout_id,
                         referral_id: referral.id,
@@ -222,7 +258,7 @@ impl ReferralPayoutHandler {
                         is_paid: true,
                         invoice: None,
                         pre_image: None,
-                        txid: Some(resp.txid.clone()),
+                        outpoint: Some(outpoint.clone()),
                     };
                     if let Err(e) = self.db.update_referral_payout(&payout).await {
                         warn!(
@@ -235,9 +271,9 @@ impl ReferralPayoutHandler {
                         .send(WorkJob::SendNotification {
                             user_id: referral.user_id,
                             message: format!(
-                                "You've been paid {} sats in referral commission on-chain (tx {}).",
+                                "You've been paid {} sats in referral commission on-chain ({}).",
                                 pay_msat / 1000,
-                                resp.txid
+                                outpoint
                             ),
                             title: Some("Referral payout".to_string()),
                         })
@@ -247,7 +283,7 @@ impl ReferralPayoutHandler {
             }
             Err(e) => {
                 // Release all reservations so the balances retry next run.
-                for (payout_id, _referral, _pay_msat) in reserved {
+                for (payout_id, _referral, _address, _pay_msat) in reserved {
                     if let Err(del) = self.db.delete_referral_payout(payout_id).await {
                         warn!(
                             "Failed to release reserved on-chain payout {} after send error: {}",
@@ -344,7 +380,7 @@ impl ReferralPayoutHandler {
             is_paid: false,
             invoice: None,
             pre_image: None,
-            txid: None,
+            outpoint: None,
         };
         let payout_id = self.db.insert_referral_payout(&payout).await?;
         payout.id = payout_id;
@@ -395,7 +431,7 @@ impl ReferralPayoutHandler {
         let bolt11 = match referral.mode {
             ReferralPayoutMode::LightningAddress => {
                 let addr = referral
-                    .lightning_address
+                    .address
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -497,13 +533,19 @@ mod tests {
     use lnvps_api_common::{ChannelWorkCommander, MockDb};
     use lnvps_db::Referral;
 
+    /// A deterministic, checksum-valid regtest P2WPKH address for tests.
+    fn regtest_addr(byte: u8) -> String {
+        let program = bitcoin::WitnessProgram::new(bitcoin::WitnessVersion::V0, &[byte; 20])
+            .expect("valid v0 witness program");
+        bitcoin::Address::from_witness_program(program, bitcoin::KnownHrp::Regtest).to_string()
+    }
+
     fn referrer(id: u64, code: &str) -> Referral {
         Referral {
             id,
             user_id: id,
             code: code.to_string(),
-            lightning_address: None,
-            onchain_address: Some(format!("bcrt1qmock{id:08}")),
+            address: Some(regtest_addr(id as u8)),
             mode: ReferralPayoutMode::OnChain,
             referral_rate: None,
             created: Utc::now(),
@@ -550,13 +592,15 @@ mod tests {
         let onchain = Arc::new(MockOnChainProvider::default());
         let h = handler(db.clone(), onchain.clone());
 
+        let addr_a = regtest_addr(1);
+        let addr_b = regtest_addr(2);
         let eligible = vec![
             (
                 Referral {
                     id: ra,
                     ..referrer(ra, "AAA")
                 },
-                "bcrt1qa".to_string(),
+                addr_a.clone(),
                 2_000_000,
             ),
             (
@@ -564,7 +608,7 @@ mod tests {
                     id: rb,
                     ..referrer(rb, "BBB")
                 },
-                "bcrt1qb".to_string(),
+                addr_b.clone(),
                 1_500_000,
             ),
         ];
@@ -576,7 +620,8 @@ mod tests {
         assert_eq!(sends[0].outputs.len(), 2);
         drop(sends);
 
-        // Both payout rows are paid and carry the SAME txid.
+        // Both payout rows are paid and record an outpoint sharing the batch
+        // txid but with the distinct vout of each referrer's output.
         let pa = db.list_referral_payouts(ra).await.unwrap();
         let pb = db.list_referral_payouts(rb).await.unwrap();
         assert_eq!(pa.len(), 1);
@@ -584,11 +629,14 @@ mod tests {
         assert!(pa[0].is_paid && pb[0].is_paid, "both marked paid");
         assert_eq!(pa[0].amount, 2_000_000);
         assert_eq!(pb[0].amount, 1_500_000);
-        assert_eq!(
-            pa[0].txid, pb[0].txid,
-            "both rows share the batch transaction id"
-        );
-        assert_eq!(pa[0].txid.as_deref(), Some("mocktxid00000000"));
+
+        let oa = pa[0].outpoint.as_deref().expect("outpoint set");
+        let ob = pb[0].outpoint.as_deref().expect("outpoint set");
+        let (txa, va) = oa.rsplit_once(':').expect("txid:vout");
+        let (txb, vb) = ob.rsplit_once(':').expect("txid:vout");
+        assert_eq!(txa, txb, "both rows share the batch transaction id");
+        assert_eq!(va, "0", "referrer A is the first output");
+        assert_eq!(vb, "1", "referrer B is the second output");
     }
 
     /// A provider whose `send_coins` always fails, to test reservation rollback.
@@ -633,7 +681,7 @@ mod tests {
                 id: ra,
                 ..referrer(ra, "AAA")
             },
-            "bcrt1qa".to_string(),
+            regtest_addr(1),
             2_000_000,
         )];
         let res = h.send_batch(onchain.as_ref(), eligible).await;

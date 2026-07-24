@@ -449,15 +449,37 @@ impl OnChainProvider for MockOnChainProvider {
     }
 
     async fn send_coins(&self, req: SendCoinsRequest) -> anyhow::Result<SendCoinsResponse> {
+        use std::str::FromStr;
         ensure!(!req.outputs.is_empty(), "send_coins requires an output");
         let total_msat = req.total_msat();
+        // Build a real (input-less) transaction paying each output so the
+        // returned raw_tx is decodable and the txid is its true id — this lets
+        // callers exercise outpoint (txid:vout) extraction against the mock.
+        let mut tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        for o in &req.outputs {
+            let script = bitcoin::Address::from_str(o.address.trim())
+                .map_err(|_| anyhow!("invalid address {}", o.address))?
+                .assume_checked()
+                .script_pubkey();
+            tx.output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(o.amount.value() / 1000),
+                script_pubkey: script,
+            });
+        }
+        let txid = tx.compute_txid().to_string();
+        let raw_tx = hex::encode(bitcoin::consensus::encode::serialize(&tx));
         let mut sends = self.sends.lock().await;
-        let txid = format!("mocktxid{:08}", sends.len());
         sends.push(req);
         Ok(SendCoinsResponse {
             txid,
             total_amount: payments_rs::currency::CurrencyAmount::millisats(total_msat),
             fee: None,
+            raw_tx: Some(raw_tx),
         })
     }
 }

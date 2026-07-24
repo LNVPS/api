@@ -1429,12 +1429,11 @@ pub struct Referral {
     pub user_id: u64,
     /// The auto-generated referral code (base63, 8 characters)
     pub code: String,
-    /// Lightning address for automatic payouts
-    pub lightning_address: Option<String>,
-    /// On-chain Bitcoin address for automatic payouts (used when `mode` is
-    /// `on_chain`).
-    #[sqlx(default)]
-    pub onchain_address: Option<String>,
+    /// Payout target address. Its type is determined by `mode`: a Lightning
+    /// address for `LightningAddress`, an on-chain Bitcoin address for
+    /// `OnChain`. `None` for modes that need no address (e.g. `Nwc`, which
+    /// pays via the user's saved NWC connection).
+    pub address: Option<String>,
     /// How the referrer is paid their commission.
     pub mode: ReferralPayoutMode,
     /// When this referral entry was created
@@ -1464,12 +1463,12 @@ pub struct ReferralPayout {
     pub invoice: Option<String>,
     /// Preimage revealed when the invoice was paid (32 bytes, SHA256)
     pub pre_image: Option<Vec<u8>>,
-    /// On-chain transaction id once an on-chain payout has been broadcast. A
-    /// single send-many transaction can back several payout rows (all eligible
-    /// referrers are batched into one transaction), so the same `txid` may
-    /// appear on multiple rows.
+    /// On-chain payout outpoint (`"{txid}:{vout}"`) once an on-chain payout has
+    /// been broadcast. All eligible referrers are batched into a single
+    /// send-many transaction, so rows from one batch share the `txid` but each
+    /// carries the distinct `vout` of the output paying that referrer.
     #[sqlx(default)]
-    pub txid: Option<String>,
+    pub outpoint: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug)]
