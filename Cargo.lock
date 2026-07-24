@@ -2923,6 +2923,7 @@ dependencies = [
  "ipnetwork",
  "isocountry",
  "lnvps_api_common",
+ "lnvps_compose",
  "lnvps_db",
  "log 0.4.32",
  "payments-rs",
@@ -2965,6 +2966,15 @@ dependencies = [
  "tokio",
  "try-procedure",
  "wiremock",
+]
+
+[[package]]
+name = "lnvps_compose"
+version = "0.4.7"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]

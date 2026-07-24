@@ -34,9 +34,11 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-/// Validate a catalog app's user-provided fields. `compose` is only checked for
-/// non-emptiness here; the full compose schema (services/ports/env) is validated
-/// by the operator when it reconciles a deployment.
+/// Validate a catalog app's user-provided fields, including a full parse of the
+/// `compose` document using the shared `lnvps_compose` parser — the same code
+/// the operator uses to render Kubernetes objects — so an invalid or unsafe
+/// compose (bad ingress protocol, traversal mount path, unknown `depends_on`,
+/// …) is rejected at catalog-edit time instead of failing later at deploy.
 fn validate_app_fields(
     name: &str,
     display_name: &str,
@@ -61,6 +63,11 @@ fn validate_app_fields(
     }
     if compose.trim().is_empty() {
         return Err(lnvps_api_common::ApiError::new("compose is required"));
+    }
+    if let Err(e) = lnvps_compose::Compose::parse(compose) {
+        return Err(lnvps_api_common::ApiError::new(format!(
+            "invalid compose: {e}"
+        )));
     }
     if currency.trim().is_empty() {
         return Err(lnvps_api_common::ApiError::new("currency is required"));
@@ -292,22 +299,36 @@ async fn admin_delete_app_cluster(
 mod tests {
     use super::*;
 
+    const VALID_COMPOSE: &str = "services:\n  relay:\n    image: example/relay:latest\n";
+
     #[test]
     fn test_validate_app_fields() {
-        // Happy path.
-        assert!(validate_app_fields("nostr-relay", "Relay", "services: {}", "USD").is_ok());
-        assert!(validate_app_fields("relay2", "R", "x", "btc").is_ok());
+        // Happy path (valid compose).
+        assert!(validate_app_fields("nostr-relay", "Relay", VALID_COMPOSE, "USD").is_ok());
+        assert!(validate_app_fields("relay2", "R", VALID_COMPOSE, "btc").is_ok());
 
         // Bad name: empty / uppercase / bad chars / leading-trailing hyphen.
-        assert!(validate_app_fields("", "R", "c", "USD").is_err());
-        assert!(validate_app_fields("Relay", "R", "c", "USD").is_err());
-        assert!(validate_app_fields("re lay", "R", "c", "USD").is_err());
-        assert!(validate_app_fields("-relay", "R", "c", "USD").is_err());
-        assert!(validate_app_fields("relay-", "R", "c", "USD").is_err());
+        assert!(validate_app_fields("", "R", VALID_COMPOSE, "USD").is_err());
+        assert!(validate_app_fields("Relay", "R", VALID_COMPOSE, "USD").is_err());
+        assert!(validate_app_fields("re lay", "R", VALID_COMPOSE, "USD").is_err());
+        assert!(validate_app_fields("-relay", "R", VALID_COMPOSE, "USD").is_err());
+        assert!(validate_app_fields("relay-", "R", VALID_COMPOSE, "USD").is_err());
 
         // Missing other required fields.
-        assert!(validate_app_fields("relay", "  ", "c", "USD").is_err());
+        assert!(validate_app_fields("relay", "  ", VALID_COMPOSE, "USD").is_err());
         assert!(validate_app_fields("relay", "R", "   ", "USD").is_err());
-        assert!(validate_app_fields("relay", "R", "c", "  ").is_err());
+        assert!(validate_app_fields("relay", "R", VALID_COMPOSE, "  ").is_err());
+
+        // Invalid compose is rejected by the shared parser.
+        assert!(validate_app_fields("relay", "R", "services: {}", "USD").is_err());
+        assert!(
+            validate_app_fields(
+                "relay",
+                "R",
+                "services:\n  a:\n    image: x\n    ports:\n      - { name: p, container: 5, protocol: tcp, expose: ingress }\n",
+                "USD"
+            )
+            .is_err()
+        );
     }
 }
