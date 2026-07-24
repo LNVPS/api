@@ -461,6 +461,7 @@ async fn main() -> Result<(), Error> {
             .merge(subscriptions_router())
             .merge(ip_space_router())
             .merge(referral_router())
+            .merge(apps_router())
             .merge(legal_router())
             .merge(oauth_router())
             .merge(webauthn_router());

@@ -1,3 +1,4 @@
+mod apps;
 mod contact;
 mod docs;
 mod ip_space;
@@ -14,6 +15,7 @@ mod webhook;
 
 use crate::settings::Settings;
 use crate::subscription::SubscriptionHandler;
+pub use apps::router as apps_router;
 pub use contact::router as contacts_router;
 pub use docs::router as docs_router;
 pub use ip_space::router as ip_space_router;

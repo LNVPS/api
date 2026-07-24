@@ -894,4 +894,71 @@ mod tests {
             resp.status()
         );
     }
+
+    #[tokio::test]
+    async fn test_app_catalog_and_deployments() {
+        // Dedicated user so the seeded deployment is isolated from other tests.
+        let keys = nostr::Keys::generate();
+        let client = user_client_with_keys(keys.clone());
+        let pool = crate::db::connect().await.unwrap();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+
+        // Seed a full deployment (app + cluster + subscription + deployment).
+        let (app_id, _cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "my-relay")
+            .await
+            .unwrap();
+
+        // Catalog listing includes the seeded (enabled) app.
+        let resp = client.get_auth("/api/v1/apps").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let apps = body["data"].as_array().unwrap();
+        assert!(apps.iter().any(|a| a["id"].as_u64() == Some(app_id)));
+        // Compose is exposed so the UI can render the deploy form.
+        let seeded = apps
+            .iter()
+            .find(|a| a["id"].as_u64() == Some(app_id))
+            .unwrap();
+        assert!(seeded["compose"].as_str().is_some());
+        assert_eq!(seeded["currency"].as_str().unwrap(), "USD");
+
+        // Get single app.
+        let resp = client
+            .get_auth(&format!("/api/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Deployment listing includes the seeded deployment.
+        let resp = client.get_auth("/api/v1/app-deployments").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let dep = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("seeded deployment present");
+        assert_eq!(dep["name"].as_str().unwrap(), "my-relay");
+        assert_eq!(dep["status"].as_str().unwrap(), "pending");
+        assert_eq!(dep["desired_state"].as_str().unwrap(), "running");
+        // subscription_id resolves from the line item.
+        assert!(dep["subscription_id"].as_u64().is_some());
+
+        // Get single deployment (ownership OK).
+        let resp = client
+            .get_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A non-existent deployment id is 404 for this user.
+        let resp = client
+            .get_auth("/api/v1/app-deployments/99999999")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        pool.close().await;
+    }
 }
