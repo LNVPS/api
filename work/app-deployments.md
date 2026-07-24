@@ -54,9 +54,12 @@ images (higher isolation risk — design the boundary in now).
 - [x] mysql impl + MockDb impl.
 - [x] Unit tests (mock CRUD round-trips: catalog, cluster, deployment).
 
-### Increment 2 — Admin catalog API
-- [ ] `lnvps_api_admin` CRUD for `app` (compose YAML validation), `AdminResource::App` + RBAC migration.
-- [ ] Admin model + tests + ADMIN_API_ENDPOINTS.md.
+### Increment 2 — Admin catalog API (DONE, PR pending)
+- [x] `lnvps_api_admin` CRUD for `app` + `app_cluster`; `AdminResource::App = 26` + RBAC migration.
+- [x] Admin model (AdminAppInfo/AdminAppClusterInfo + create/update requests); slug/field
+      validation (compose non-empty; full compose schema deferred to the operator).
+- [x] Unit test (validate_app_fields) + e2e admin CRUD test (apps + clusters, auth enforcement).
+- [x] ADMIN_API_ENDPOINTS.md + API_CHANGELOG.md.
 
 ### Increment 3 — Customer API
 - [ ] `GET /api/v1/apps` (catalog), create deployment (→ subscription + line item + invoice,
