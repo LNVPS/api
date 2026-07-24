@@ -49,9 +49,35 @@ pub struct Service {
     /// Advisory startup ordering hints (k8s has no hard ordering; apps retry).
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Config files injected read-only into the container (ConfigMap/Secret),
+    /// separate from `volumes` (which are read-write PVCs for app data).
+    #[serde(default)]
+    pub files: Vec<File>,
     /// Optional backup method for this service's data.
     #[serde(default)]
     pub backup: Option<Backup>,
+}
+
+/// A config file injected into a container (rendered into a ConfigMap, or a
+/// Secret when `sensitive`) and mounted **read-only** at `path` via `subPath`
+/// so it drops in as a single file without shadowing the directory.
+///
+/// Exactly one content source is used: an inline templated `content` (with
+/// `${…}` filled from `config`/`secrets`), or `content_from` a `config` field
+/// (e.g. `type: file`) whose value the customer supplies verbatim.
+#[derive(Debug, Clone, Deserialize)]
+pub struct File {
+    /// Absolute in-container mount path.
+    pub path: String,
+    /// Inline templated file content.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Name of a `config` field whose value is used as the file content.
+    #[serde(default)]
+    pub content_from: Option<String>,
+    /// Render into a Secret instead of a ConfigMap (holds secret material).
+    #[serde(default)]
+    pub sensitive: bool,
 }
 
 /// How a port is exposed.
@@ -153,6 +179,9 @@ pub enum FieldType {
     String,
     Int,
     Bool,
+    /// Multiline free-form content, typically referenced by a file's
+    /// `content_from` to let the customer supply a whole config file.
+    File,
 }
 
 /// A service's backup method.
@@ -206,6 +235,52 @@ impl Compose {
                     bail!("service '{sname}': depends_on unknown service '{dep}'");
                 }
             }
+            // Config files: valid path, single content source, size-bounded,
+            // and not overlapping a data volume.
+            for f in &svc.files {
+                check_abs_no_traversal(sname, "file", &f.path)?;
+                match (&f.content, &f.content_from) {
+                    (Some(_), Some(_)) => {
+                        bail!(
+                            "service '{sname}': file '{}' has both content and content_from",
+                            f.path
+                        )
+                    }
+                    (None, None) => {
+                        bail!(
+                            "service '{sname}': file '{}' needs content or content_from",
+                            f.path
+                        )
+                    }
+                    (Some(c), None) => {
+                        if c.len() > MAX_FILE_BYTES {
+                            bail!(
+                                "service '{sname}': file '{}' content exceeds {MAX_FILE_BYTES} bytes",
+                                f.path
+                            );
+                        }
+                    }
+                    (None, Some(field)) => {
+                        if !self.config.iter().any(|cf| &cf.name == field) {
+                            bail!(
+                                "service '{sname}': file '{}' content_from references unknown config field '{field}'",
+                                f.path
+                            );
+                        }
+                    }
+                }
+                // A config file must not land inside a read-write data volume.
+                for v in &svc.volumes {
+                    if f.path == v.path || path_is_within(&f.path, &v.path) {
+                        bail!(
+                            "service '{sname}': file '{}' overlaps data volume mount '{}'",
+                            f.path,
+                            v.path
+                        );
+                    }
+                }
+            }
+
             // A backup entry is exactly one of command | volume.
             if let Some(b) = &svc.backup {
                 match (&b.command, &b.volume) {
@@ -227,15 +302,24 @@ impl Compose {
         Ok(())
     }
 
-    /// Every distinct env var name referenced as `${…}` across all services.
+    /// Every distinct env var name referenced as `${…}` across all services —
+    /// in env values and in inline file `content` templates.
     pub fn referenced_vars(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        let push = |val: &str, out: &mut Vec<String>| {
+            for name in extract_refs(val) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        };
         for svc in self.services.values() {
             for val in svc.env.values() {
-                for name in extract_refs(val) {
-                    if !out.contains(&name) {
-                        out.push(name);
-                    }
+                push(val, &mut out);
+            }
+            for f in &svc.files {
+                if let Some(content) = &f.content {
+                    push(content, &mut out);
                 }
             }
         }
@@ -262,9 +346,72 @@ impl Compose {
         }
         Ok(out)
     }
+
+    /// Resolve every service's config files to their final (path, content,
+    /// sensitive) form: inline `content` has `${…}` substituted; `content_from`
+    /// takes the customer-supplied value from `vars`. Errors on unknown refs.
+    pub fn resolve_files(
+        &self,
+        vars: &HashMap<String, String>,
+    ) -> Result<HashMap<String, Vec<ResolvedFile>>> {
+        let mut out = HashMap::new();
+        for (sname, svc) in &self.services {
+            let mut files = Vec::new();
+            for f in &svc.files {
+                let content = match (&f.content, &f.content_from) {
+                    (Some(c), _) => substitute(c, vars)?,
+                    (_, Some(field)) => vars
+                        .get(field)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("file '{}': unresolved config '{field}'", f.path))?,
+                    (None, None) => bail!("file '{}': no content source", f.path),
+                };
+                files.push(ResolvedFile {
+                    path: f.path.clone(),
+                    content,
+                    sensitive: f.sensitive,
+                });
+            }
+            out.insert(sname.clone(), files);
+        }
+        Ok(out)
+    }
 }
 
-/// Validate a volume mount path: absolute, no `..` traversal, not root.
+/// A config file with its final rendered content, ready to become a ConfigMap
+/// (or Secret when `sensitive`) mounted read-only at `path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFile {
+    pub path: String,
+    pub content: String,
+    pub sensitive: bool,
+}
+
+/// Maximum inline file / ConfigMap content size we accept (well under the k8s
+/// ~1 MiB ConfigMap limit).
+const MAX_FILE_BYTES: usize = 256 * 1024;
+
+/// Whether `path` sits inside directory `dir` (both absolute).
+fn path_is_within(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    path.starts_with(&format!("{dir}/"))
+}
+
+/// Validate an in-container path: absolute, not root, no `..` traversal.
+fn check_abs_no_traversal(service: &str, label: &str, path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("service '{service}': {label} path '{path}' must be absolute");
+    }
+    if path == "/" {
+        bail!("service '{service}': {label} path cannot be '/'");
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        bail!("service '{service}': {label} path '{path}' must not contain '..'");
+    }
+    Ok(())
+}
+
+/// Validate a volume mount: name is a slug, path is absolute/non-traversal.
 fn validate_mount_path(service: &str, name: &str, path: &str) -> Result<()> {
     if name.is_empty()
         || !name
@@ -273,15 +420,7 @@ fn validate_mount_path(service: &str, name: &str, path: &str) -> Result<()> {
     {
         bail!("service '{service}': volume name '{name}' must be a lowercase slug");
     }
-    if !path.starts_with('/') {
-        bail!("service '{service}': volume '{name}' path must be absolute");
-    }
-    if path == "/" {
-        bail!("service '{service}': volume '{name}' cannot mount at '/'");
-    }
-    if path.split('/').any(|seg| seg == "..") {
-        bail!("service '{service}': volume '{name}' path must not contain '..'");
-    }
+    check_abs_no_traversal(service, "volume", path)?;
     Ok(())
 }
 
@@ -484,5 +623,103 @@ config:
     fn substitute_unterminated_errors() {
         let vars = HashMap::new();
         assert!(substitute("${oops", &vars).is_err());
+    }
+
+    const STRFRY: &str = r#"
+services:
+  strfry:
+    image: ghcr.io/hoytech/strfry:latest
+    ports:
+      - { name: ws, container: 7777, protocol: http, expose: ingress }
+    files:
+      - path: /etc/strfry.conf
+        content: |
+          relay { info { name = "${relay_name}"; } }
+      - path: /etc/custom.conf
+        content_from: custom_conf
+      - path: /etc/secret.key
+        content: "${API_KEY}"
+        sensitive: true
+    volumes:
+      - { name: db, path: /app/db, size: 5Gi }
+
+secrets:
+  - { name: API_KEY, generate: token }
+
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My Relay" }
+  - { name: custom_conf, label: "Custom config", type: file }
+"#;
+
+    #[test]
+    fn parses_and_resolves_files() {
+        let c = Compose::parse(STRFRY).unwrap();
+        let files = &c.services["strfry"].files;
+        assert_eq!(files.len(), 3);
+        assert!(files[2].sensitive);
+
+        // referenced_vars picks up ${…} in file content too.
+        let mut refs = c.referenced_vars();
+        refs.sort();
+        assert_eq!(refs, vec!["API_KEY", "relay_name"]);
+
+        let mut vars = HashMap::new();
+        vars.insert("relay_name".to_string(), "Zap Relay".to_string());
+        vars.insert("API_KEY".to_string(), "deadbeef".to_string());
+        vars.insert("custom_conf".to_string(), "my custom file body".to_string());
+
+        let resolved = c.resolve_files(&vars).unwrap();
+        let sf = &resolved["strfry"];
+        assert!(sf.iter().any(|f| f.path == "/etc/strfry.conf"
+            && f.content.contains("name = \"Zap Relay\"")));
+        // content_from injects the customer-supplied value verbatim.
+        assert!(
+            sf.iter()
+                .any(|f| f.path == "/etc/custom.conf" && f.content == "my custom file body")
+        );
+        // sensitive file flagged for a Secret.
+        assert!(
+            sf.iter()
+                .any(|f| f.path == "/etc/secret.key" && f.sensitive)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_files() {
+        // both content and content_from
+        assert!(
+            Compose::parse(
+                "services:\n  a:\n    image: x\n    files:\n      - { path: /e.conf, content: 'x', content_from: y }\n"
+            )
+            .is_err()
+        );
+        // neither content nor content_from
+        assert!(
+            Compose::parse(
+                "services:\n  a:\n    image: x\n    files:\n      - { path: /e.conf }\n"
+            )
+            .is_err()
+        );
+        // content_from unknown config field
+        assert!(
+            Compose::parse(
+                "services:\n  a:\n    image: x\n    files:\n      - { path: /e.conf, content_from: nope }\n"
+            )
+            .is_err()
+        );
+        // traversal path
+        assert!(
+            Compose::parse(
+                "services:\n  a:\n    image: x\n    files:\n      - { path: /etc/../x, content: 'y' }\n"
+            )
+            .is_err()
+        );
+        // file overlaps a data volume
+        assert!(
+            Compose::parse(
+                "services:\n  a:\n    image: x\n    files:\n      - { path: /app/db/f.conf, content: 'y' }\n    volumes:\n      - { name: db, path: /app/db, size: 1Gi }\n"
+            )
+            .is_err()
+        );
     }
 }

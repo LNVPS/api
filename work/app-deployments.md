@@ -77,7 +77,7 @@ images (higher isolation risk — design the boundary in now).
 - [ ] Create deployment (validate config vs compose env schema → subscription + line item
       (type App) + payment invoice, mirroring VM order); delete/stop/start; renew via subscription.
 
-### Increment 4a — Shared compose parser (DONE, PR pending)
+### Increment 4a — Shared compose parser (DONE, PR #218 merged)
 - [x] New `lnvps_compose` crate (serde + serde_yaml, no heavy deps): typed model (`Compose`
       /`Service`/`Port`/`Volume`/`SecretDecl`/`ConfigField`/`Backup`), `parse` + `validate`
       (ingress=http only, mount-path traversal guard, depends_on refs, backup command|volume),
@@ -85,6 +85,15 @@ images (higher isolation risk — design the boundary in now).
 - [x] Shared with the API: `lnvps_api_admin` validates `compose` via `lnvps_compose::Compose::parse`
       on catalog create/update (same parser the operator will use).
 - [x] Unit tests (9) in the crate + admin validator test updated.
+
+### Increment 4a+ — Config files (`files:`) (DONE, PR pending)
+- [x] `files:` per service: read-only injected config, `content` (templated) or `content_from`
+      (a `config` field, incl. new `type: file`), optional `sensitive` (→ Secret vs ConfigMap).
+      Operator mounts via `subPath` at `path`.
+- [x] Validation: absolute/non-traversal path, single content source, ≤256 KiB inline,
+      `content_from` must be a declared config field, file must not overlap a data volume.
+- [x] `resolve_files(vars) -> {service: [ResolvedFile{path,content,sensitive}]}`;
+      `referenced_vars` also scans file content. Distinct from `volumes:` (PVC, read-write).
 
 ### Increment 4b — Operator reconcile — TODO
 - [ ] `lnvps_operator/src/app_deployments.rs`: use `lnvps_compose` to map compose + deployment
