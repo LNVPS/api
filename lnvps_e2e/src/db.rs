@@ -492,11 +492,7 @@ pub async fn seed_referrer_with_commission(
     .bind(template_id)
     .bind(li_id)
     .bind(disk_id)
-    .bind(format!(
-        "00:00:00:00:{:02x}:{:02x}",
-        referral_id & 0xff,
-        vm_mac_suffix(code)
-    ))
+    .bind(random_mac())
     .bind(code)
     .fetch_one(pool)
     .await?;
@@ -521,8 +517,12 @@ pub async fn seed_referrer_with_commission(
     Ok((referral_id, vm_id))
 }
 
-fn vm_mac_suffix(code: &str) -> u8 {
-    code.bytes().fold(0u8, |a, b| a.wrapping_add(b))
+fn random_mac() -> String {
+    let b = rand_bytes32();
+    format!(
+        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[0], b[1], b[2], b[3], b[4]
+    )
 }
 
 fn rand_bytes32() -> [u8; 32] {

@@ -1007,22 +1007,42 @@ mod tests {
         // ----------------------------------------------------------------
         {
             let pool = crate::db::connect().await.unwrap();
-            let referrer_user_id = crate::db::ensure_user(&pool, &referrer_keys).await.unwrap();
-
-            // Turn the existing referrer (which already earned BTC commission
-            // from the referred VM) into an on-chain payout target.
-            let oc_addr_1 = crate::onchain::new_regtest_address().await.unwrap();
-            crate::db::set_referral_mode_address(&pool, referral_id, 3, Some(&oc_addr_1))
+            // Distinct users: `uk_referral_user` is unique per user, so each
+            // referrer needs its own. One extra user owns the referred VMs.
+            let oc1_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let oc2_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let ln_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let referred_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
                 .await
                 .unwrap();
 
-            // A second on-chain referrer with its own seeded BTC commission, so
-            // the batch pays more than one output.
+            // Two on-chain referrers (so the batch pays >1 output) each with
+            // their own seeded BTC commission (100% per-referral override).
+            let oc_addr_1 = crate::onchain::new_regtest_address().await.unwrap();
+            let (oc1_ref_id, oc1_vm_id) = crate::db::seed_referrer_with_commission(
+                &pool,
+                oc1_user,
+                referred_user,
+                &format!("{ref_code}OC1"),
+                3,
+                Some(&oc_addr_1),
+                5000,
+                vm_id,
+            )
+            .await
+            .unwrap();
+
             let oc_addr_2 = crate::onchain::new_regtest_address().await.unwrap();
             let (oc2_ref_id, oc2_vm_id) = crate::db::seed_referrer_with_commission(
                 &pool,
-                referrer_user_id,
-                referrer_user_id,
+                oc2_user,
+                referred_user,
                 &format!("{ref_code}OC2"),
                 3,
                 Some(&oc_addr_2),
@@ -1037,8 +1057,8 @@ mod tests {
             // the on-chain batch.
             let (ln_ref_id, ln_vm_id) = crate::db::seed_referrer_with_commission(
                 &pool,
-                referrer_user_id,
-                referrer_user_id,
+                ln_user,
+                referred_user,
                 &format!("{ref_code}LN"),
                 0,
                 Some("nobody@e2e.invalid"),
@@ -1056,7 +1076,7 @@ mod tests {
             let both_paid = poll_until(30, 500, || {
                 let pool = pool.clone();
                 async move {
-                    let p1 = crate::db::list_referral_payouts(&pool, referral_id)
+                    let p1 = crate::db::list_referral_payouts(&pool, oc1_ref_id)
                         .await
                         .unwrap_or_default();
                     let p2 = crate::db::list_referral_payouts(&pool, oc2_ref_id)
@@ -1068,7 +1088,7 @@ mod tests {
             .await;
 
             if both_paid {
-                let p1 = crate::db::list_referral_payouts(&pool, referral_id)
+                let p1 = crate::db::list_referral_payouts(&pool, oc1_ref_id)
                     .await
                     .unwrap();
                 let p2 = crate::db::list_referral_payouts(&pool, oc2_ref_id)
@@ -1106,7 +1126,7 @@ mod tests {
                     .unwrap();
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 assert_eq!(
-                    crate::db::list_referral_payouts(&pool, referral_id)
+                    crate::db::list_referral_payouts(&pool, oc1_ref_id)
                         .await
                         .unwrap()
                         .len(),
@@ -1128,17 +1148,13 @@ mod tests {
                 );
             }
 
-            // Clean up seeded rows; restore the referrer to lightning mode so
-            // later assertions/cleanup are unaffected.
-            crate::db::hard_delete_vm(&pool, oc2_vm_id).await.ok();
-            crate::db::hard_delete_vm(&pool, ln_vm_id).await.ok();
-            crate::db::hard_delete_referral(&pool, oc2_ref_id)
-                .await
-                .ok();
-            crate::db::hard_delete_referral(&pool, ln_ref_id).await.ok();
-            crate::db::set_referral_mode_address(&pool, referral_id, 0, Some("test@e2e.local"))
-                .await
-                .ok();
+            // Clean up seeded rows.
+            for vm in [oc1_vm_id, oc2_vm_id, ln_vm_id] {
+                crate::db::hard_delete_vm(&pool, vm).await.ok();
+            }
+            for r in [oc1_ref_id, oc2_ref_id, ln_ref_id] {
+                crate::db::hard_delete_referral(&pool, r).await.ok();
+            }
             pool.close().await;
         }
 
