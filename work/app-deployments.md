@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-07-24
-**Last updated:** 2026-07-25
+**Last updated:** 2026-07-25 (MVP increments 1–5 complete; backups (6) + L4/zap-stream (7) remain)
 
 ## Goal
 
@@ -133,11 +133,12 @@ images (higher isolation risk — design the boundary in now).
       create/update; `capacity_*` on cluster create/update; both exposed on the info responses.
       e2e admin test asserts footprint + capacity echo.
 
-### Increment 5 — Seed launch apps
-- [ ] Seed **strfry**, **haven relay**, **route96 (+ MariaDB)**, **generic Blossom** (compose
-      YAML) via migration or admin seed. All HTTP-ingress; route96 exercises multi-service +
-      generated secrets.
-- [ ] Integration/e2e coverage where feasible.
+### Increment 5 — Seed launch apps (DONE, PR pending)
+- [x] `lnvps_api_admin::app_seeds`: validated compose definitions for **strfry**, **HAVEN**,
+      **route96 (+ MariaDB)**, **generic Blossom**; `seed_launch_apps(db)` inserts missing ones
+      **disabled** (operator reviews/prices before enabling) with footprint computed from compose.
+      Wired into `generate_demo_data`. Unit tests: all composes parse + have footprint; seed is
+      idempotent (MockDb).
 
 ### Increment 6 — Volume backups (post-MVP)
 - [ ] Compose `backup:` grammar (per-service `command:` app-native dump | `volume:` raw tar;

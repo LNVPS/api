@@ -88,6 +88,11 @@ async fn generate_demo_data(db: &LNVpsDbMysql) -> Result<()> {
     info!("Creating host disks...");
     let disks = create_host_disks(db, &hosts).await?;
 
+    // Seed the managed-app catalog (disabled; operator reviews/prices before enabling).
+    info!("Seeding launch apps...");
+    let seeded = lnvps_api_admin::app_seeds::seed_launch_apps(db).await?;
+    info!("Seeded {} launch apps", seeded);
+
     // 6. Create OS images
     info!("Creating OS images...");
     let os_images = create_os_images(db).await?;
