@@ -7,11 +7,11 @@ use lnvps_db::{
     CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType,
     IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
     NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
-    ReferralCostUsage, ReferralPayout, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
+    RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate,
+    VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
     WebauthnCredential,
 };
 
@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct MockDb {
-    pub regions: Arc<Mutex<HashMap<u64, VmHostRegion>>>,
+    pub regions: Arc<Mutex<HashMap<u64, Region>>>,
     pub hosts: Arc<Mutex<HashMap<u64, VmHost>>>,
     pub host_disks: Arc<Mutex<HashMap<u64, VmHostDisk>>>,
     pub users: Arc<Mutex<HashMap<u64, User>>>,
@@ -136,7 +136,7 @@ impl Default for MockDb {
         let mut regions = HashMap::new();
         regions.insert(
             1,
-            VmHostRegion {
+            Region {
                 id: 1,
                 name: "Mock".to_string(),
                 enabled: true,
@@ -757,17 +757,17 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
-    async fn list_host_region(&self) -> DbResult<Vec<VmHostRegion>> {
+    async fn list_host_region(&self) -> DbResult<Vec<Region>> {
         let regions = self.regions.lock().await;
         Ok(regions.values().filter(|r| r.enabled).cloned().collect())
     }
 
-    async fn get_host_region(&self, id: u64) -> DbResult<VmHostRegion> {
+    async fn get_host_region(&self, id: u64) -> DbResult<Region> {
         let regions = self.regions.lock().await;
         Ok(regions.get(&id).ok_or(anyhow!("no region"))?.clone())
     }
 
-    async fn get_host_region_by_name(&self, name: &str) -> DbResult<VmHostRegion> {
+    async fn get_host_region_by_name(&self, name: &str) -> DbResult<Region> {
         let regions = self.regions.lock().await;
         Ok(regions
             .iter()
@@ -798,7 +798,7 @@ impl LNVpsDbBase for MockDb {
         &self,
         limit: u64,
         offset: u64,
-    ) -> DbResult<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    ) -> DbResult<(Vec<(VmHost, Region)>, u64)> {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
@@ -3297,14 +3297,10 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(None)
     }
 
-    async fn admin_list_regions(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> DbResult<(Vec<VmHostRegion>, u64)> {
+    async fn admin_list_regions(&self, limit: u64, offset: u64) -> DbResult<(Vec<Region>, u64)> {
         let regions = self.regions.lock().await;
         let total = regions.len() as u64;
-        let paginated_regions: Vec<VmHostRegion> = regions
+        let paginated_regions: Vec<Region> = regions
             .values()
             .skip(offset as usize)
             .take(limit as usize)
@@ -3322,7 +3318,7 @@ impl lnvps_db::AdminDb for MockDb {
     ) -> DbResult<u64> {
         Ok(1)
     }
-    async fn admin_update_region(&self, _region: &VmHostRegion) -> DbResult<()> {
+    async fn admin_update_region(&self, _region: &Region) -> DbResult<()> {
         Ok(())
     }
     async fn admin_delete_region(&self, _region_id: u64) -> DbResult<()> {

@@ -247,7 +247,7 @@ pub async fn hard_delete_host(pool: &MySqlPool, host_id: u64) -> anyhow::Result<
 
 /// Hard-delete a region (admin DELETE only soft-deletes via `enabled = false`).
 pub async fn hard_delete_region(pool: &MySqlPool, region_id: u64) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM vm_host_region WHERE id = ?")
+    sqlx::query("DELETE FROM region WHERE id = ?")
         .bind(region_id)
         .execute(pool)
         .await?;

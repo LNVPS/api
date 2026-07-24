@@ -1026,7 +1026,7 @@ pub struct UpdateRegionRequest {
 }
 
 impl AdminHostInfo {
-    pub fn from_host_and_region(host: lnvps_db::VmHost, region: lnvps_db::VmHostRegion) -> Self {
+    pub fn from_host_and_region(host: lnvps_db::VmHost, region: lnvps_db::Region) -> Self {
         let ssh_key_configured = host.ssh_key.is_some();
         Self {
             id: host.id,
@@ -1075,7 +1075,7 @@ impl AdminHostInfo {
 
     pub fn from_host_region_and_disks(
         host: lnvps_db::VmHost,
-        region: lnvps_db::VmHostRegion,
+        region: lnvps_db::Region,
         disks: Vec<lnvps_db::VmHostDisk>,
     ) -> Self {
         let admin_disks = disks.into_iter().map(|disk| disk.into()).collect();
@@ -1128,7 +1128,7 @@ impl AdminHostInfo {
 
     pub fn from_host_capacity(
         capacity: &lnvps_api_common::HostCapacity,
-        region: lnvps_db::VmHostRegion,
+        region: lnvps_db::Region,
         disks: Vec<lnvps_db::VmHostDisk>,
         active_vms: u64,
     ) -> Self {

@@ -551,7 +551,7 @@ impl FromStr for CpuFeature {
 }
 
 #[derive(FromRow, Clone, Debug)]
-pub struct VmHostRegion {
+pub struct Region {
     pub id: u64,
     pub name: String,
     pub enabled: bool,

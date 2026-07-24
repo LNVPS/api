@@ -7,9 +7,9 @@ use lnvps_api_admin::settings::Settings;
 use lnvps_db::{
     AdminDb, Company, DiskInterface, DiskType, EncryptedString, EncryptionContext, IntervalType,
     IpRange, IpRangeAllocationMode, LNVpsDbBase, LNVpsDbMysql, OsDistribution, PaymentMethod,
-    SubscriptionPayment, SubscriptionPaymentType, User, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmHostRegion,
-    VmIpAssignment, VmOsImage, VmTemplate,
+    Region, SubscriptionPayment, SubscriptionPaymentType, User, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomTemplate, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage,
+    VmTemplate,
 };
 use log::info;
 use std::path::PathBuf;
@@ -209,7 +209,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
     Ok(created_companies)
 }
 
-async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<VmHostRegion>> {
+async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<Region>> {
     let regions_data = vec![
         ("US-East-1 (Virginia)", companies[0].id),
         ("US-West-1 (California)", companies[0].id),
@@ -223,7 +223,7 @@ async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<
 
     let mut regions = Vec::new();
     for (name, company_id) in regions_data {
-        let region = VmHostRegion {
+        let region = Region {
             id: 0, // Will be auto-generated
             name: name.to_string(),
             enabled: true,
@@ -242,7 +242,7 @@ async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<
     Ok(regions)
 }
 
-async fn create_ip_ranges(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result<Vec<IpRange>> {
+async fn create_ip_ranges(db: &LNVpsDbMysql, regions: &[Region]) -> Result<Vec<IpRange>> {
     let ranges_data = vec![
         ("10.1.0.0/24", "10.1.0.1", regions[0].id),
         ("10.2.0.0/24", "10.2.0.1", regions[1].id),
@@ -281,7 +281,7 @@ async fn create_ip_ranges(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result
     Ok(ip_ranges)
 }
 
-async fn create_hosts(db: &LNVpsDbMysql, regions: &[VmHostRegion]) -> Result<Vec<VmHost>> {
+async fn create_hosts(db: &LNVpsDbMysql, regions: &[Region]) -> Result<Vec<VmHost>> {
     let hosts_data = vec![
         (
             VmHostKind::Proxmox,
@@ -643,7 +643,7 @@ async fn create_cost_plans(db: &LNVpsDbMysql) -> Result<Vec<VmCostPlan>> {
 async fn create_vm_templates(
     db: &LNVpsDbMysql,
     cost_plans: &[VmCostPlan],
-    regions: &[VmHostRegion],
+    regions: &[Region],
 ) -> Result<Vec<VmTemplate>> {
     let mut templates = Vec::new();
 
@@ -825,7 +825,7 @@ async fn create_vm_templates(
 
 async fn create_custom_pricing(
     db: &LNVpsDbMysql,
-    regions: &[VmHostRegion],
+    regions: &[Region],
 ) -> Result<Vec<VmCustomPricing>> {
     // Costs are in smallest currency units per resource unit:
     // - cpu_cost: per CPU core per month

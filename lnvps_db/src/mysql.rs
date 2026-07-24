@@ -2,11 +2,11 @@ use crate::{
     AccessPolicy, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError,
     DbResult, DnsServer, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
     PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
-    VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -523,32 +523,28 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
-    async fn list_host_region(&self) -> DbResult<Vec<VmHostRegion>> {
-        Ok(
-            sqlx::query_as("select * from vm_host_region where enabled=1")
-                .fetch_all(&self.db)
-                .await?,
-        )
+    async fn list_host_region(&self) -> DbResult<Vec<Region>> {
+        Ok(sqlx::query_as("select * from region where enabled=1")
+            .fetch_all(&self.db)
+            .await?)
     }
 
-    async fn get_host_region(&self, id: u64) -> DbResult<VmHostRegion> {
-        Ok(sqlx::query_as("select * from vm_host_region where id=?")
+    async fn get_host_region(&self, id: u64) -> DbResult<Region> {
+        Ok(sqlx::query_as("select * from region where id=?")
             .bind(id)
             .fetch_one(&self.db)
             .await?)
     }
 
-    async fn get_host_region_by_name(&self, name: &str) -> DbResult<VmHostRegion> {
-        Ok(
-            sqlx::query_as("select * from vm_host_region where name like ?")
-                .bind(name)
-                .fetch_one(&self.db)
-                .await?,
-        )
+    async fn get_host_region_by_name(&self, name: &str) -> DbResult<Region> {
+        Ok(sqlx::query_as("select * from region where name like ?")
+            .bind(name)
+            .fetch_one(&self.db)
+            .await?)
     }
 
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>> {
-        Ok(sqlx::query_as("select h.* from vm_host h,vm_host_region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
+        Ok(sqlx::query_as("select h.* from vm_host h,region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
             .fetch_all(&self.db)
             .await?)
     }
@@ -556,14 +552,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
+            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
         .await?;
 
         // Get paginated results
         let hosts = sqlx::query_as(
-            "SELECT h.* FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
+            "SELECT h.* FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
         )
         .bind(limit)
         .bind(offset)
@@ -577,10 +573,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         limit: u64,
         offset: u64,
-    ) -> DbResult<(Vec<(VmHost, VmHostRegion)>, u64)> {
+    ) -> DbResult<(Vec<(VmHost, Region)>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, vm_host_region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
+            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
         .await?;
@@ -588,7 +584,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // Get paginated results with region info
         let rows = sqlx::query(
             "SELECT h.*, hr.id as region_id, hr.name as region_name, hr.enabled as region_enabled, hr.company_id as region_company_id 
-             FROM vm_host h, vm_host_region hr 
+             FROM vm_host h, region hr 
              WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 
              ORDER BY h.name LIMIT ? OFFSET ?"
         )
@@ -622,7 +618,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 sunset_date: row.get("sunset_date"),
             };
 
-            let region = VmHostRegion {
+            let region = Region {
                 id: row.get("region_id"),
                 name: row.get("region_name"),
                 enabled: row.get("region_enabled"),
@@ -1839,7 +1835,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "SELECT COALESCE(c.base_currency, 'EUR') as base_currency 
              FROM vm v
              JOIN vm_host vh ON v.host_id = vh.id  
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN region vhr ON vh.region_id = vhr.id
              LEFT JOIN company c ON vhr.company_id = c.id
              WHERE v.id = ?",
         )
@@ -1854,7 +1850,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "SELECT vhr.company_id 
              FROM vm v
              JOIN vm_host vh ON v.host_id = vh.id  
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN region vhr ON vh.region_id = vhr.id
              WHERE v.id = ?",
         )
         .bind(vm_id)
@@ -2544,7 +2540,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  AND sli.subscription_type = 3
              LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
              LEFT JOIN vm_host vh ON v.host_id = vh.id
-             LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             LEFT JOIN region vhr ON vh.region_id = vhr.id
              JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
                                      THEN vhr.company_id
                                      ELSE s.company_id END) = c.id
@@ -3516,7 +3512,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  WHERE sp2.is_paid = 1
              ) sp ON v.id = sp.vm_id AND sp.rn = 1
              JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
              LEFT JOIN referral r ON r.code = v.ref_code
              WHERE v.ref_code = ?
@@ -3553,7 +3549,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  WHERE sp2.is_paid = 1
              ) sp ON v.id = sp.vm_id AND sp.rn = 1
              JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
              LEFT JOIN referral r ON r.code = v.ref_code
              WHERE v.ref_code = ?
@@ -3580,7 +3576,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  WHERE sp2.is_paid = 1
              ) sp ON v.id = sp.vm_id AND sp.rn = 1
              JOIN vm_host vh ON v.host_id = vh.id
-             JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             JOIN region vhr ON vh.region_id = vhr.id
              JOIN company c ON vhr.company_id = c.id
              WHERE v.ref_code = ?",
         )
@@ -4304,24 +4300,19 @@ impl AdminDb for LNVpsDbMysql {
         Ok(user)
     }
 
-    async fn admin_list_regions(
-        &self,
-        limit: u64,
-        offset: u64,
-    ) -> DbResult<(Vec<VmHostRegion>, u64)> {
+    async fn admin_list_regions(&self, limit: u64, offset: u64) -> DbResult<(Vec<Region>, u64)> {
         // Get total count
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host_region")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM region")
             .fetch_one(&self.db)
             .await?;
 
         // Get paginated results
-        let regions = sqlx::query_as::<_, VmHostRegion>(
-            "SELECT * FROM vm_host_region ORDER BY name LIMIT ? OFFSET ?",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db)
-        .await?;
+        let regions =
+            sqlx::query_as::<_, Region>("SELECT * FROM region ORDER BY name LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.db)
+                .await?;
 
         Ok((regions, total as u64))
     }
@@ -4333,7 +4324,7 @@ impl AdminDb for LNVpsDbMysql {
         company_id: u64,
     ) -> DbResult<u64> {
         let id = sqlx::query_scalar::<_, u64>(
-            "INSERT INTO vm_host_region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
+            "INSERT INTO region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(enabled)
@@ -4344,8 +4335,8 @@ impl AdminDb for LNVpsDbMysql {
         Ok(id)
     }
 
-    async fn admin_update_region(&self, region: &VmHostRegion) -> DbResult<()> {
-        sqlx::query("UPDATE vm_host_region SET name = ?, enabled = ?, company_id = ? WHERE id = ?")
+    async fn admin_update_region(&self, region: &Region) -> DbResult<()> {
+        sqlx::query("UPDATE region SET name = ?, enabled = ?, company_id = ? WHERE id = ?")
             .bind(&region.name)
             .bind(region.enabled)
             .bind(region.company_id)
@@ -4372,7 +4363,7 @@ impl AdminDb for LNVpsDbMysql {
         }
 
         // Disable the region instead of deleting to preserve referential integrity
-        sqlx::query("UPDATE vm_host_region SET enabled = ? WHERE id = ?")
+        sqlx::query("UPDATE region SET enabled = ? WHERE id = ?")
             .bind(false)
             .bind(region_id)
             .execute(&self.db)
@@ -4642,7 +4633,7 @@ impl AdminDb for LNVpsDbMysql {
     ) -> DbResult<(Vec<AdminVmHost>, u64)> {
         // Get total count (including disabled hosts)
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h JOIN vm_host_region hr ON h.region_id = hr.id",
+            "SELECT COUNT(*) FROM vm_host h JOIN region hr ON h.region_id = hr.id",
         )
         .fetch_one(&self.db)
         .await?;
@@ -4656,7 +4647,7 @@ impl AdminDb for LNVpsDbMysql {
                     hr.company_id as region_company_id,
                     COALESCE(vm_counts.active_vm_count, 0) as active_vm_count
              FROM vm_host h 
-             JOIN vm_host_region hr ON h.region_id = hr.id 
+             JOIN region hr ON h.region_id = hr.id 
              LEFT JOIN (
                  SELECT host_id, COUNT(*) as active_vm_count 
                  FROM vm 
@@ -5028,12 +5019,11 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_count_company_regions(&self, company_id: u64) -> DbResult<u64> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vm_host_region WHERE company_id = ?",
-        )
-        .bind(company_id)
-        .fetch_one(&self.db)
-        .await?;
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM region WHERE company_id = ?")
+                .bind(company_id)
+                .fetch_one(&self.db)
+                .await?;
 
         Ok(count as u64)
     }
@@ -5057,7 +5047,7 @@ impl AdminDb for LNVpsDbMysql {
                  AND sli.subscription_type = 3
              LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
              LEFT JOIN vm_host vh ON v.host_id = vh.id
-             LEFT JOIN vm_host_region vhr ON vh.region_id = vhr.id
+             LEFT JOIN region vhr ON vh.region_id = vhr.id
              JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
                                      THEN vhr.company_id
                                      ELSE s.company_id END) = c.id
@@ -5108,7 +5098,7 @@ impl AdminDb for LNVpsDbMysql {
                              WHERE sp2.is_paid = 1
                          ) sp ON v.id = sp.vm_id AND sp.rn = 1
                          JOIN vm_host vh ON v.host_id = vh.id
-                         JOIN vm_host_region vhr ON vh.region_id = vhr.id
+                         JOIN region vhr ON vh.region_id = vhr.id
                          JOIN company c ON vhr.company_id = c.id
                          LEFT JOIN referral r ON r.code = v.ref_code
                          WHERE v.ref_code IS NOT NULL
