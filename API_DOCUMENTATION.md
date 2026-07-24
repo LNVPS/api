@@ -244,6 +244,7 @@ interface VmStatus {
   subscription_id?: number; // The subscription this VM is billed under; renew via /api/v1/subscriptions/{id}/renew. null/omitted if never paid
   host_sunset_date?: string; // ISO 8601 datetime — set when the VM's host is being decommissioned; migrate before this date. Renewals are blocked once expires reaches it. Omitted when the host is not being sunset
   max_prepay_days: number; // Max days this VM may be prepaid/renewed in advance. A renewal is rejected once it would push `expires` beyond now + max_prepay_days; cap the renewal interval selector accordingly
+  cpu_arch?: string; // CPU architecture of the host this VM runs on ("x86_64" | "arm64"), from the host record. Unlike template.cpu_arch (an optional constraint) this is present whenever the host arch is known; use it to always pass ?arch= when listing OS images for a reinstall. Omitted when unknown
 }
 
 interface VmRunningState {

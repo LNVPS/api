@@ -4851,6 +4851,41 @@ mod tests {
         assert_eq!(status.host_sunset_date, Some(sunset));
     }
 
+    /// vm_to_status surfaces the host's CPU architecture (from the host record,
+    /// not the template constraint), and omits the "unknown" sentinel.
+    #[tokio::test]
+    async fn test_vm_to_status_surfaces_host_cpu_arch() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{CpuArch, LNVpsDb, UserSshKey};
+
+        let mdb = MockDb::default();
+        mdb.vms.lock().await.insert(1, MockDb::mock_vm());
+        mdb.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(mdb.clone());
+
+        // Mock host 1 is x86_64 -> surfaced as a string.
+        let vm = db.get_vm(1).await.unwrap();
+        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        assert_eq!(status.cpu_arch.as_deref(), Some("x86_64"));
+
+        // arm64 host -> surfaced accordingly.
+        mdb.hosts.lock().await.get_mut(&1).unwrap().cpu_arch = CpuArch::ARM64;
+        let status = vm_to_status(&db, vm.clone(), None, 0, 365).await.unwrap();
+        assert_eq!(status.cpu_arch.as_deref(), Some("arm64"));
+
+        // Unknown host arch -> omitted (None), not the "unknown" sentinel.
+        mdb.hosts.lock().await.get_mut(&1).unwrap().cpu_arch = CpuArch::Unknown;
+        let status = vm_to_status(&db, vm, None, 0, 365).await.unwrap();
+        assert!(status.cpu_arch.is_none());
+    }
+
     /// vm_to_status surfaces the effective prepay window: the global default
     /// when the company has none, and the company override when set.
     #[tokio::test]
