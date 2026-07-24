@@ -1314,6 +1314,16 @@ The catalog + read endpoints below are unauthenticated-safe views of what you ca
 - **Response**: `App`
 - **Error**: `404` if the app doesn't exist or isn't currently offered
 
+#### List Deployable Regions for an App
+- **GET** `/api/v1/apps/{id}/regions`
+- **Auth**: Required
+- **Response**: `{ id: number, name: string, available: boolean }[]` — every region
+  with an enabled app cluster. `available` is `true` when a cluster there
+  currently has enough free capacity for this app; `false` regions can be
+  shown-but-disabled in a deploy-form region picker. Use one of these `id`s as
+  `region_id` when ordering.
+- **Error**: `404` if the app doesn't exist or isn't currently offered
+
 #### List Your Deployments
 - **GET** `/api/v1/app-deployments`
 - **Auth**: Required

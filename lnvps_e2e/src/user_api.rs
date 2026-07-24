@@ -970,6 +970,23 @@ mod tests {
         let (app_id, _cluster_id, region_id) =
             crate::db::seed_app_and_cluster(&pool).await.unwrap();
 
+        // Deployable regions for this app: the seeded region is present with
+        // capacity available (drives the deploy-form region picker, issue #225).
+        let resp = client
+            .get_auth(&format!("/api/v1/apps/{app_id}/regions"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let region = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_u64() == Some(region_id))
+            .expect("seeded region is deployable");
+        assert!(!region["name"].as_str().unwrap().is_empty());
+        assert_eq!(region["available"].as_bool(), Some(true));
+
         // Order a deployment.
         let resp = client
             .post_auth(

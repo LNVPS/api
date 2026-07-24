@@ -620,6 +620,33 @@ impl AppClusterCapacityService {
         }
         Ok(None)
     }
+
+    /// Regions that can host an app: every distinct region with at least one
+    /// enabled cluster, paired with whether some cluster there currently has
+    /// room for `need`. Powers the customer deploy-form region picker so full
+    /// regions can be shown-but-disabled instead of failing at order time.
+    /// Region order follows the enabled-cluster listing.
+    pub async fn regions_availability(&self, need: AppCapacity) -> Result<Vec<(u64, bool)>> {
+        let clusters = self.db.list_app_clusters(true).await?;
+        let mut region_ids: Vec<u64> = Vec::new();
+        for c in &clusters {
+            if !region_ids.contains(&c.region_id) {
+                region_ids.push(c.region_id);
+            }
+        }
+        let mut out = Vec::with_capacity(region_ids.len());
+        for rid in region_ids {
+            let mut available = false;
+            for c in clusters.iter().filter(|c| c.region_id == rid) {
+                if self.fits(c.id, need).await? {
+                    available = true;
+                    break;
+                }
+            }
+            out.push((rid, available));
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
