@@ -133,17 +133,13 @@ images (higher isolation risk — design the boundary in now).
       create/update; `capacity_*` on cluster create/update; both exposed on the info responses.
       e2e admin test asserts footprint + capacity echo.
 
-### Increment 5 — Seed launch apps (DONE, PR pending)
-- [x] `lnvps_api_admin::app_seeds`: validated compose definitions matching each project's real
-      deploy docs — **strfry** (`dockurr/strfry`, /etc/strfry.conf, bind 0.0.0.0), **route96 +
-      MariaDB** (`voidic/route96`, /app/config.yaml, DB via service `db`), **Blossom**
-      (`ghcr.io/hzrd149/blossom-server`, /app/config.yml, bare `publicDomain`). `seed_launch_apps(db)`
-      inserts missing ones **disabled** with footprint computed from compose. Wired into
-      `generate_demo_data`. Unit tests: all composes parse + have footprint; seed idempotent.
-- [x] **HAVEN dropped** from the seed: no official image, and the community `haven-docker` image
-      requires a mounted `templates/` directory of binary web assets + 4 JSON files, which the
-      ConfigMap-file model can't provide cleanly. Revisit if a self-contained HAVEN image exists
-      (or build one bundling templates).
+### Increment 5 — Launch app examples (DONE, PR pending)
+- [x] **No DB seeding** (prices/enabling are operator decisions). Instead, `docs/managed-app-examples.md`
+      documents ready-to-paste, docs-accurate `compose` definitions for **strfry** (`dockurr/strfry`),
+      **route96 + MariaDB** (`voidic/route96`, YAML config, DB via service `db`), and **Blossom**
+      (`ghcr.io/hzrd149/blossom-server`), plus how to add them via `POST /api/admin/v1/apps`.
+- [x] **HAVEN / zap-stream** documented as not-yet-deployable: HAVEN needs a mounted `templates/`
+      dir of binary assets + JSON lists (no self-contained image); zap-stream needs `expose: tcp/udp`.
 
 ### Increment 6 — Volume backups (post-MVP)
 - [ ] Compose `backup:` grammar (per-service `command:` app-native dump | `volume:` raw tar;
