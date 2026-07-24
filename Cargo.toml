@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "lnvps_db",
+    "lnvps_compose",
     "lnvps_api",
     "lnvps_api_admin",
     "lnvps_api_common",
