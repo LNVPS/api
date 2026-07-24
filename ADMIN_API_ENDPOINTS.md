@@ -3671,7 +3671,7 @@ Required Permission: `app::create`. Body:
 }
 ```
 
-`name` must be a DNS-safe slug and unique; `display_name`, `compose` and `currency` are required. `currency` is normalised to upper-case. The full `compose` schema is validated by the operator at deploy time.
+`name` must be a DNS-safe slug and unique; `display_name`, `compose` and `currency` are required. `currency` is normalised to upper-case. The `compose` is fully parsed and validated on create/update, and the app's **resource footprint** (`cpu_milli` / `memory_bytes` / `storage_bytes` — Σ service `resources` + volume sizes) is computed from it and returned on `AdminAppInfo` (used for cluster capacity accounting).
 
 #### Update App
 
@@ -3710,6 +3710,11 @@ Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete
   "ingress_domain": "apps.lnvps.tld",
   // Required. Wildcard base for deployment hostnames ("{name}.{ingress_domain}").
   "enabled": true,
+  "capacity_cpu_milli": 8000,
+  "capacity_memory_bytes": 8589934592,
+  "capacity_storage_bytes": 107374182400,
+  // Static total capacity available for deployments (millicores / bytes / bytes).
+  // A cluster with 0 capacity accepts no deployments (1:1, no overcommit).
   "created": "2026-07-24T10:00:00Z"
 }
 ```

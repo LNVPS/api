@@ -5,8 +5,8 @@ use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
 use lnvps_db::{
-    CpuArch, CpuMfg, DbResult, DiskInterface, DiskType, IpRange, LNVpsDb, VmCustomTemplate, VmHost,
-    VmHostDisk, VmIpAssignment, VmTemplate,
+    App, AppCluster, CpuArch, CpuMfg, DbResult, DiskInterface, DiskType, IpRange, LNVpsDb,
+    VmCustomTemplate, VmHost, VmHostDisk, VmIpAssignment, VmTemplate,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -531,6 +531,94 @@ impl IPRangeCapacity {
             .parse::<IpNetwork>()
             .map(|n| n.is_ipv4())
             .unwrap_or(false)
+    }
+}
+
+/// Remaining or allocated app capacity on a cluster (millicores / bytes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppCapacity {
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+    pub storage_bytes: u64,
+}
+
+/// Order-time capacity accounting for managed app deployments — the admission
+/// counterpart to the operator's per-namespace ResourceQuota. Mirrors
+/// [`HostCapacityService`]: a cluster's remaining capacity is its static
+/// configured capacity minus the summed footprint of its live deployments
+/// (1:1, no overcommit).
+#[derive(Clone)]
+pub struct AppClusterCapacityService {
+    db: Arc<dyn LNVpsDb>,
+}
+
+impl AppClusterCapacityService {
+    pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
+        Self { db }
+    }
+
+    /// Footprint currently allocated on a cluster: the summed footprint of every
+    /// non-deleted deployment on it (expired deployments still hold their PVCs
+    /// and can be revived, so they count).
+    pub async fn used(&self, cluster_id: u64) -> Result<AppCapacity> {
+        // Index app footprints by id to avoid a lookup per deployment.
+        let apps: HashMap<u64, App> = self
+            .db
+            .list_apps(false)
+            .await?
+            .into_iter()
+            .map(|a| (a.id, a))
+            .collect();
+        let mut used = AppCapacity::default();
+        for d in self.db.list_all_app_deployments().await? {
+            if d.cluster_id != cluster_id {
+                continue;
+            }
+            if let Some(a) = apps.get(&d.app_id) {
+                used.cpu_milli += a.cpu_milli;
+                used.memory_bytes += a.memory_bytes;
+                used.storage_bytes += a.storage_bytes;
+            }
+        }
+        Ok(used)
+    }
+
+    /// Remaining capacity on a cluster = configured capacity − used (saturating).
+    pub async fn available(&self, cluster_id: u64) -> Result<AppCapacity> {
+        let cluster = self.db.get_app_cluster(cluster_id).await?;
+        let used = self.used(cluster_id).await?;
+        Ok(AppCapacity {
+            cpu_milli: cluster.capacity_cpu_milli.saturating_sub(used.cpu_milli),
+            memory_bytes: cluster
+                .capacity_memory_bytes
+                .saturating_sub(used.memory_bytes),
+            storage_bytes: cluster
+                .capacity_storage_bytes
+                .saturating_sub(used.storage_bytes),
+        })
+    }
+
+    /// Whether an additional `need` fits in the cluster's remaining capacity.
+    pub async fn fits(&self, cluster_id: u64, need: AppCapacity) -> Result<bool> {
+        let avail = self.available(cluster_id).await?;
+        Ok(need.cpu_milli <= avail.cpu_milli
+            && need.memory_bytes <= avail.memory_bytes
+            && need.storage_bytes <= avail.storage_bytes)
+    }
+
+    /// The first enabled cluster in `region_id` that can fit `need`, for
+    /// order-time placement. `None` when the region is full / has no cluster.
+    pub async fn select_in_region(
+        &self,
+        region_id: u64,
+        need: AppCapacity,
+    ) -> Result<Option<AppCluster>> {
+        for cluster in self.db.list_app_clusters(true).await? {
+            if cluster.region_id == region_id && self.fits(cluster.id, need).await? {
+                return Ok(Some(cluster));
+            }
+        }
+        Ok(None)
     }
 }
 

@@ -5842,6 +5842,9 @@ mod tests {
             interval_type: IntervalType::Month,
             setup_amount: 0,
             enabled: true,
+            cpu_milli: 500,
+            memory_bytes: 512 * 1024 * 1024,
+            storage_bytes: 1024 * 1024 * 1024,
             created: Utc::now(),
         }
     }
@@ -5892,6 +5895,9 @@ mod tests {
                 region_id: 1,
                 ingress_domain: "apps.example.com".to_string(),
                 enabled: true,
+                capacity_cpu_milli: 100_000,
+                capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
+                capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
                 created: Utc::now(),
             })
             .await
@@ -5921,6 +5927,9 @@ mod tests {
                 region_id: 1,
                 ingress_domain: "apps.example.com".to_string(),
                 enabled: true,
+                capacity_cpu_milli: 100_000,
+                capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
+                capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
                 created: Utc::now(),
             })
             .await
@@ -5973,6 +5982,85 @@ mod tests {
         assert_eq!(db.list_user_app_deployments(1).await.unwrap().len(), 1);
         assert_eq!(db.list_all_app_deployments().await.unwrap().len(), 2);
         assert!(db.get_app_deployment(d1).await.unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn test_app_cluster_capacity() {
+        use crate::{AppCapacity, AppClusterCapacityService};
+
+        let db = MockDb::default();
+        // Cluster with capacity for exactly 3 of mk_app's footprint
+        // (mk_app = 500m / 512Mi / 1Gi).
+        let cluster_id = db
+            .insert_app_cluster(&AppCluster {
+                id: 0,
+                name: "cap".to_string(),
+                region_id: 7,
+                ingress_domain: "apps.example.com".to_string(),
+                enabled: true,
+                capacity_cpu_milli: 1500,
+                capacity_memory_bytes: 3 * 512 * 1024 * 1024,
+                capacity_storage_bytes: 3 * 1024 * 1024 * 1024,
+                created: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
+
+        let mk_dep = |name: &str| AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id,
+            cluster_id,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("app-{name}"),
+            hostname: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+        db.insert_app_deployment(&mk_dep("a")).await.unwrap();
+        db.insert_app_deployment(&mk_dep("b")).await.unwrap();
+
+        let dba: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(db.clone());
+        let svc = AppClusterCapacityService::new(dba);
+
+        // Two deployments used -> 1000m / 1Gi / 2Gi.
+        let used = svc.used(cluster_id).await.unwrap();
+        assert_eq!(used.cpu_milli, 1000);
+        assert_eq!(used.storage_bytes, 2 * 1024 * 1024 * 1024);
+
+        // Remaining capacity = room for exactly one more.
+        let avail = svc.available(cluster_id).await.unwrap();
+        assert_eq!(avail.cpu_milli, 500);
+
+        let one_more = AppCapacity {
+            cpu_milli: 500,
+            memory_bytes: 512 * 1024 * 1024,
+            storage_bytes: 1024 * 1024 * 1024,
+        };
+        assert!(svc.fits(cluster_id, one_more).await.unwrap());
+        let two_more = AppCapacity {
+            cpu_milli: 1000,
+            ..one_more
+        };
+        assert!(!svc.fits(cluster_id, two_more).await.unwrap());
+
+        // Region selection finds this cluster for a fitting need, none when full.
+        assert_eq!(
+            svc.select_in_region(7, one_more)
+                .await
+                .unwrap()
+                .map(|c| c.id),
+            Some(cluster_id)
+        );
+        assert!(svc.select_in_region(7, two_more).await.unwrap().is_none());
+        // Wrong region -> nothing.
+        assert!(svc.select_in_region(99, one_more).await.unwrap().is_none());
     }
 }
 

@@ -4473,6 +4473,12 @@ pub struct AdminAppInfo {
     pub interval_type: ApiIntervalType,
     pub setup_amount: u64,
     pub enabled: bool,
+    /// Resource footprint computed from the compose (CPU millicores).
+    pub cpu_milli: u64,
+    /// Memory footprint in bytes.
+    pub memory_bytes: u64,
+    /// Persistent storage footprint in bytes.
+    pub storage_bytes: u64,
     pub created: DateTime<Utc>,
 }
 
@@ -4491,6 +4497,9 @@ impl From<lnvps_db::App> for AdminAppInfo {
             interval_type: a.interval_type.into(),
             setup_amount: a.setup_amount,
             enabled: a.enabled,
+            cpu_milli: a.cpu_milli,
+            memory_bytes: a.memory_bytes,
+            storage_bytes: a.storage_bytes,
             created: a.created,
         }
     }
@@ -4549,6 +4558,10 @@ pub struct AdminAppClusterInfo {
     pub region_id: u64,
     pub ingress_domain: String,
     pub enabled: bool,
+    /// Static total capacity available for app deployments.
+    pub capacity_cpu_milli: u64,
+    pub capacity_memory_bytes: u64,
+    pub capacity_storage_bytes: u64,
     pub created: DateTime<Utc>,
 }
 
@@ -4560,6 +4573,9 @@ impl From<lnvps_db::AppCluster> for AdminAppClusterInfo {
             region_id: c.region_id,
             ingress_domain: c.ingress_domain,
             enabled: c.enabled,
+            capacity_cpu_milli: c.capacity_cpu_milli,
+            capacity_memory_bytes: c.capacity_memory_bytes,
+            capacity_storage_bytes: c.capacity_storage_bytes,
             created: c.created,
         }
     }
@@ -4573,6 +4589,14 @@ pub struct AdminCreateAppClusterRequest {
     pub ingress_domain: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Static total capacity (millicores / bytes / bytes). A cluster with 0
+    /// capacity accepts no deployments.
+    #[serde(default)]
+    pub capacity_cpu_milli: u64,
+    #[serde(default)]
+    pub capacity_memory_bytes: u64,
+    #[serde(default)]
+    pub capacity_storage_bytes: u64,
 }
 
 /// Update an app cluster (all fields optional; omitted = unchanged).
@@ -4582,6 +4606,9 @@ pub struct AdminUpdateAppClusterRequest {
     pub region_id: Option<u64>,
     pub ingress_domain: Option<String>,
     pub enabled: Option<bool>,
+    pub capacity_cpu_milli: Option<u64>,
+    pub capacity_memory_bytes: Option<u64>,
+    pub capacity_storage_bytes: Option<u64>,
 }
 
 fn default_true() -> bool {
