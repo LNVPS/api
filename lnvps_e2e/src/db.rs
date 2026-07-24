@@ -387,14 +387,15 @@ pub async fn set_referral_mode_address(
     Ok(())
 }
 
-/// Read a referral's payouts as `(amount, fee, is_paid, outpoint)` rows,
-/// most-recent first.
+/// Read a referral's payouts as `(amount, fee, is_paid, output)` rows,
+/// most-recent first. `output` is a BOLT11 invoice for Lightning payouts or the
+/// on-chain outpoint (`"{txid}:{vout}"`) for on-chain payouts.
 pub async fn list_referral_payouts(
     pool: &MySqlPool,
     referral_id: u64,
 ) -> anyhow::Result<Vec<(u64, u64, bool, Option<String>)>> {
     let rows = sqlx::query(
-        "SELECT amount, fee, is_paid, outpoint FROM referral_payout \
+        "SELECT amount, fee, is_paid, output FROM referral_payout \
          WHERE referral_id = ? ORDER BY created DESC, id DESC",
     )
     .bind(referral_id)

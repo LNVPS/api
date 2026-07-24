@@ -1465,16 +1465,20 @@ pub struct ReferralPayout {
     pub created: DateTime<Utc>,
     /// Whether this payout has been completed
     pub is_paid: bool,
-    /// Lightning invoice for this payout
-    pub invoice: Option<String>,
-    /// Preimage revealed when the invoice was paid (32 bytes, SHA256)
-    pub pre_image: Option<Vec<u8>>,
-    /// On-chain payout outpoint (`"{txid}:{vout}"`) once an on-chain payout has
-    /// been broadcast. All eligible referrers are batched into a single
-    /// send-many transaction, so rows from one batch share the `txid` but each
-    /// carries the distinct `vout` of the output paying that referrer.
+    /// How the payout was made, recorded for reference so `output` can be
+    /// interpreted without joining to the referral.
     #[sqlx(default)]
-    pub outpoint: Option<String>,
+    pub mode: ReferralPayoutMode,
+    /// The payout's output reference: a BOLT11 invoice for a Lightning payout,
+    /// or the on-chain outpoint (`"{txid}:{vout}"`) for an on-chain payout.
+    ///
+    /// On-chain payouts batch every eligible referrer into a single send-many
+    /// transaction, so their outpoints share the `txid` but each carries the
+    /// distinct `vout` of the output paying that referrer.
+    #[sqlx(default)]
+    pub output: Option<String>,
+    /// Preimage revealed when a Lightning invoice was paid (32 bytes, SHA256).
+    pub pre_image: Option<Vec<u8>>,
 }
 
 #[derive(FromRow, Clone, Debug)]

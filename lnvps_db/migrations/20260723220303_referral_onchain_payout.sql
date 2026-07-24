@@ -13,8 +13,15 @@
 ALTER TABLE referral
     CHANGE COLUMN lightning_address address VARCHAR(200) NULL DEFAULT NULL;
 
+-- A single `output` reference replaces the mode-specific `invoice` column: it
+-- holds the BOLT11 invoice for a Lightning payout, or the on-chain outpoint
+-- ("{txid}:{vout}") for an on-chain payout. `mode` records how the payout was
+-- made so `output` can be interpreted without joining to the referral.
 ALTER TABLE referral_payout
-    ADD COLUMN outpoint VARCHAR(255) NULL DEFAULT NULL;
+    CHANGE COLUMN invoice output VARCHAR(2048) NULL DEFAULT NULL;
+
+ALTER TABLE referral_payout
+    ADD COLUMN mode SMALLINT UNSIGNED NOT NULL DEFAULT 0;
 
 -- Network/routing fee charged to the referrer for this payout, in the payout's
 -- smallest currency unit (millisats for BTC). The referrer bears the fee: it is

@@ -3013,9 +3013,9 @@ impl LNVpsDbBase for MockDb {
         let mut payouts = self.referral_payouts.lock().await;
         if let Some(p) = payouts.iter_mut().find(|p| p.id == payout.id) {
             p.is_paid = payout.is_paid;
-            p.invoice = payout.invoice.clone();
+            p.mode = payout.mode;
+            p.output = payout.output.clone();
             p.pre_image = payout.pre_image.clone();
-            p.outpoint = payout.outpoint.clone();
             p.fee = payout.fee;
         }
         Ok(())

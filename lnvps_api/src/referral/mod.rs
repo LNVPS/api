@@ -274,9 +274,9 @@ impl ReferralPayoutHandler {
                 currency: "BTC".to_string(),
                 created: Utc::now(),
                 is_paid: false,
-                invoice: None,
+                mode: ReferralPayoutMode::OnChain,
+                output: None,
                 pre_image: None,
-                outpoint: None,
             };
             let payout_id = self.db.insert_referral_payout(&payout).await?;
             reserved.push((payout_id, referral.clone(), addr.clone(), *pay_msat));
@@ -335,9 +335,9 @@ impl ReferralPayoutHandler {
                         currency: "BTC".to_string(),
                         created: Utc::now(),
                         is_paid: true,
-                        invoice: None,
+                        mode: ReferralPayoutMode::OnChain,
+                        output: Some(outpoint.clone()),
                         pre_image: None,
-                        outpoint: Some(outpoint.clone()),
                     };
                     if let Err(e) = self.db.update_referral_payout(&payout).await {
                         warn!(
@@ -464,9 +464,9 @@ impl ReferralPayoutHandler {
             currency: "BTC".to_string(),
             created: Utc::now(),
             is_paid: false,
-            invoice: None,
+            mode: referral.mode,
+            output: None,
             pre_image: None,
-            outpoint: None,
         };
         let payout_id = self.db.insert_referral_payout(&payout).await?;
         payout.id = payout_id;
@@ -474,7 +474,8 @@ impl ReferralPayoutHandler {
         match self.pay_commission(referral, pay_msat).await {
             Ok((bolt11, pre_image, fee_msat)) => {
                 payout.is_paid = true;
-                payout.invoice = Some(bolt11);
+                // `output` is the paid BOLT11 invoice for Lightning payouts.
+                payout.output = Some(bolt11);
                 payout.pre_image = pre_image;
                 // Charge the referrer the routing fee we paid.
                 payout.fee = fee_msat;
@@ -747,8 +748,10 @@ mod tests {
         assert_eq!(pa[0].amount, 2_000_000);
         assert_eq!(pb[0].amount, 1_500_000);
 
-        let oa = pa[0].outpoint.as_deref().expect("outpoint set");
-        let ob = pb[0].outpoint.as_deref().expect("outpoint set");
+        let oa = pa[0].output.as_deref().expect("output set");
+        let ob = pb[0].output.as_deref().expect("output set");
+        assert_eq!(pa[0].mode, ReferralPayoutMode::OnChain);
+        assert_eq!(pb[0].mode, ReferralPayoutMode::OnChain);
         let (txa, va) = oa.rsplit_once(':').expect("txid:vout");
         let (txb, vb) = ob.rsplit_once(':').expect("txid:vout");
         assert_eq!(txa, txb, "both rows share the batch transaction id");

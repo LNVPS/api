@@ -108,13 +108,16 @@ pub struct ApiReferralPayout {
     pub currency: String,
     pub created: chrono::DateTime<Utc>,
     pub is_paid: bool,
-    pub invoice: Option<String>,
+    /// How this payout was made: `lightning_address`, `nwc`, or `on_chain`.
+    /// Tells you how to interpret `output`.
+    pub mode: String,
+    /// The payout output reference: a BOLT11 invoice for a Lightning payout, or
+    /// the on-chain outpoint (`"{txid}:{vout}"`) for an on-chain payout.
+    /// On-chain payouts are batched into one transaction, so rows share the txid
+    /// but carry distinct vouts.
+    pub output: Option<String>,
     /// Payment preimage (hex), present once a Lightning payout has settled.
     pub pre_image: Option<String>,
-    /// On-chain payout outpoint (`"{txid}:{vout}"`), present once an on-chain
-    /// payout has been broadcast. On-chain payouts are batched into one
-    /// transaction, so rows share the txid but carry distinct vouts.
-    pub outpoint: Option<String>,
 }
 
 impl From<ReferralPayout> for ApiReferralPayout {
@@ -126,9 +129,9 @@ impl From<ReferralPayout> for ApiReferralPayout {
             currency: p.currency,
             created: p.created,
             is_paid: p.is_paid,
-            invoice: p.invoice,
+            mode: p.mode.to_string(),
+            output: p.output,
             pre_image: p.pre_image.map(hex::encode),
-            outpoint: p.outpoint,
         }
     }
 }

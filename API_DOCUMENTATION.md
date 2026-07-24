@@ -1245,9 +1245,9 @@ interface ReferralPayout {
   currency: string;
   created: string;    // ISO 8601 datetime
   is_paid: boolean;
-  invoice?: string;   // BOLT11 lightning invoice (Lightning payouts)
+  mode: "lightning_address" | "nwc" | "on_chain"; // How this payout was made; tells you how to interpret `output`
+  output?: string;    // Payout output reference: a BOLT11 invoice for a Lightning payout, or the on-chain outpoint "{txid}:{vout}" for an on-chain payout. On-chain payouts are batched into one transaction, so rows share the txid but carry distinct vouts.
   pre_image?: string; // Payment preimage (hex), present once a Lightning payout has settled
-  outpoint?: string;  // On-chain payout outpoint "{txid}:{vout}", present once an on-chain payout has been broadcast. Rows batched into the same transaction share the txid but carry distinct vouts.
 }
 
 interface ReferralUsage {

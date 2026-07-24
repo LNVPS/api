@@ -3298,7 +3298,7 @@ Returns the referral plus per-currency earned commission, payout history and cou
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "payouts": [
-      { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "invoice": "lnbc...", "pre_image": "<hex>", "outpoint": null }
+      { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
     ],
     "referrals_success": 3,
     "referrals_failed": 1
@@ -3338,7 +3338,7 @@ GET /api/admin/v1/referrals/{id}/payouts
 
 Required Permission: `referral::view`
 
-Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first. Each record also carries `fee` (the network/routing fee charged to the referrer, debited from their balance) and `outpoint` (the on-chain payout outpoint `"{txid}:{vout}"` once broadcast; rows batched into one transaction share the txid but carry distinct vouts).
+Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first. Each record carries `fee` (the network/routing fee charged to the referrer, debited from their balance), `mode` (`lightning_address`/`nwc`/`on_chain`), and `output` (a BOLT11 invoice for Lightning payouts, or the on-chain outpoint `"{txid}:{vout}"` for on-chain payouts; batched rows share the txid but carry distinct vouts).
 
 #### Create Referral Payout
 
@@ -3356,8 +3356,10 @@ Creates a manual payout record (e.g. reconciling an out-of-band payment).
   // Required - smallest currency unit, > 0
   "currency": "BTC",
   // Required
-  "invoice": "lnbc...",
-  // Optional - associated Lightning invoice
+  "output": "lnbc...",
+  // Optional - payout output reference (BOLT11 invoice or on-chain outpoint)
+  "mode": "lightning_address",
+  // Optional - payout mode (lightning_address|nwc|on_chain), default lightning_address
   "is_paid": false
   // Optional - mark already paid (default false)
 }
@@ -3375,12 +3377,12 @@ Required Permission: `referral::update`
 {
   "is_paid": true,
   // Optional - mark paid/unpaid
-  "invoice": "lnbc...",
-  // Optional - set (string) or clear (null) the invoice
-  "pre_image": "<hex>",
+  "output": "lnbc... | <txid>:<vout>",
+  // Optional - set (string) or clear (null) the payout output reference
+  "mode": "on_chain",
+  // Optional - change the payout mode (lightning_address|nwc|on_chain)
+  "pre_image": "<hex>"
   // Optional - set (hex, 32 bytes) or clear (null) the payment preimage
-  "outpoint": "<txid>:<vout>"
-  // Optional - set (string) or clear (null) the on-chain payout outpoint
 }
 ```
 

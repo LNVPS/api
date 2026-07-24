@@ -13,6 +13,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{AdminAction, AdminResource, Referral, ReferralPayout};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -200,9 +201,13 @@ async fn admin_create_referral_payout(
         created: chrono::Utc::now(),
         fee: 0,
         is_paid: false,
-        invoice: req.invoice.filter(|s| !s.trim().is_empty()),
+        mode: match req.mode.as_deref() {
+            Some(m) => lnvps_db::ReferralPayoutMode::from_str(m)
+                .map_err(|_| ApiError::new("Invalid payout mode"))?,
+            None => lnvps_db::ReferralPayoutMode::default(),
+        },
+        output: req.output.filter(|s| !s.trim().is_empty()),
         pre_image: None,
-        outpoint: None,
     };
     let payout_id = this.db.insert_referral_payout(&payout).await?;
 
@@ -246,8 +251,12 @@ async fn admin_update_referral_payout(
     if let Some(is_paid) = req.is_paid {
         payout.is_paid = is_paid;
     }
-    if let Some(invoice) = req.invoice {
-        payout.invoice = invoice.filter(|s| !s.trim().is_empty());
+    if let Some(output) = req.output {
+        payout.output = output.filter(|s| !s.trim().is_empty());
+    }
+    if let Some(mode) = req.mode.as_deref() {
+        payout.mode = lnvps_db::ReferralPayoutMode::from_str(mode)
+            .map_err(|_| ApiError::new("Invalid payout mode"))?;
     }
     if let Some(pre_image) = req.pre_image {
         payout.pre_image = match pre_image.filter(|s| !s.trim().is_empty()) {
@@ -257,9 +266,6 @@ async fn admin_update_referral_payout(
             ),
             None => None,
         };
-    }
-    if let Some(outpoint) = req.outpoint {
-        payout.outpoint = outpoint.filter(|s| !s.trim().is_empty());
     }
 
     this.db.update_referral_payout(&payout).await?;
