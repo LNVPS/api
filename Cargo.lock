@@ -3066,13 +3066,16 @@ name = "lnvps_operator"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "config",
  "env_logger",
  "k8s-openapi",
  "kube",
+ "lnvps_compose",
  "lnvps_db",
  "log 0.4.32",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tokio",

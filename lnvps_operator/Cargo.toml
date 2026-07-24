@@ -9,6 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db", features = ["nostr-domain"] }
+lnvps_compose = { path = "../lnvps_compose" }
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
 
 # Workspace dependencies
 tokio = { workspace = true, features = ["time", "signal"] }

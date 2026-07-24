@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
+mod app_deployments;
 mod nostr_domains;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -21,6 +22,11 @@ pub struct Settings {
 
     /// Kubernetes namespace to watch (defaults to "default" if not specified)
     pub namespace: Option<String>,
+
+    /// The app cluster this operator serves. When set, the operator reconciles
+    /// `app_deployment` rows whose `cluster_id` matches this into Kubernetes.
+    /// When unset, app-deployment reconciliation is disabled.
+    pub app_cluster_id: Option<u64>,
 
     /// Reconciliation interval in seconds (defaults to 60)
     pub reconcile_interval: Option<u64>,
@@ -91,6 +97,9 @@ async fn main() -> Result<()> {
     if let Err(e) = nostr_domains::reconcile_nostr_domains(&context).await {
         error!("Failed to reconcile nostr domains: {}", e);
     }
+    if let Err(e) = app_deployments::reconcile_app_deployments(&context).await {
+        error!("Failed to reconcile app deployments: {}", e);
+    }
 
     // Set up periodic reconciliation
     let context_clone = context.clone();
@@ -100,9 +109,12 @@ async fn main() -> Result<()> {
     let reconciliation_task = async move {
         loop {
             interval.tick().await;
-            info!("Running periodic nostr domain reconciliation...");
+            info!("Running periodic reconciliation...");
             if let Err(e) = nostr_domains::reconcile_nostr_domains(&context_clone).await {
                 error!("Failed to reconcile nostr domains: {}", e);
+            }
+            if let Err(e) = app_deployments::reconcile_app_deployments(&context_clone).await {
+                error!("Failed to reconcile app deployments: {}", e);
             }
         }
     };
