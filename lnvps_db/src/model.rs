@@ -1820,6 +1820,7 @@ pub enum AdminResource {
     UserPaymentMethod = 23,
     ResourceCost = 24,
     Referral = 25,
+    App = 26,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1865,6 +1866,7 @@ impl Display for AdminResource {
             AdminResource::UserPaymentMethod => write!(f, "user_payment_method"),
             AdminResource::ResourceCost => write!(f, "resource_cost"),
             AdminResource::Referral => write!(f, "referral"),
+            AdminResource::App => write!(f, "app"),
         }
     }
 }
@@ -1900,6 +1902,7 @@ impl FromStr for AdminResource {
             "user_payment_method" => Ok(AdminResource::UserPaymentMethod),
             "resource_cost" => Ok(AdminResource::ResourceCost),
             "referral" => Ok(AdminResource::Referral),
+            "app" => Ok(AdminResource::App),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1936,6 +1939,7 @@ impl TryFrom<u16> for AdminResource {
             23 => Ok(AdminResource::UserPaymentMethod),
             24 => Ok(AdminResource::ResourceCost),
             25 => Ok(AdminResource::Referral),
+            26 => Ok(AdminResource::App),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1971,6 +1975,7 @@ impl AdminResource {
             AdminResource::UserPaymentMethod,
             AdminResource::ResourceCost,
             AdminResource::Referral,
+            AdminResource::App,
         ]
     }
 }

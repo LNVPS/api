@@ -3605,6 +3605,117 @@ Response:
 - Payments whose currency cannot be converted to the company base currency are
   skipped.
 
+### App Deployments — Catalog & Clusters
+
+Manage the **managed app** catalog (predefined apps deployed on shared Kubernetes
+infra) and the clusters they run on. All endpoints require the `app` resource
+permissions. An app is defined by a docker-compose-style `compose` YAML; a cluster
+references a `region` (which provides the billing company) and an ingress domain.
+
+#### List / Get Apps
+
+```
+GET /api/admin/v1/apps
+GET /api/admin/v1/apps/{id}
+```
+
+Required Permission: `app::view`. Returns `AdminAppInfo` object(s):
+
+```json
+{
+  "id": 1,
+  "name": "nostr-relay",
+  "display_name": "Nostr Relay",
+  "description": "A personal Nostr relay",
+  "icon": null,
+  "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
+  "amount": 1000,
+  "currency": "USD",
+  "interval_amount": 1,
+  "interval_type": "month",
+  "setup_amount": 0,
+  "enabled": true,
+  "created": "2026-07-24T10:00:00Z"
+}
+```
+
+#### Create App
+
+```
+POST /api/admin/v1/apps
+```
+
+Required Permission: `app::create`. Body:
+
+```json
+{
+  "name": "nostr-relay",
+  // Required. DNS-safe slug (lowercase letters, digits, hyphens), unique.
+  "display_name": "Nostr Relay",
+  // Required.
+  "description": "A personal Nostr relay",
+  // Optional.
+  "icon": "https://.../icon.png",
+  // Optional.
+  "compose": "services: { ... }",
+  // Required. docker-compose-style YAML (image/ports/env/volumes).
+  "amount": 1000,
+  "currency": "USD",
+  "interval_amount": 1,
+  "interval_type": "month",
+  // Required pricing (amount in smallest units; interval_type: day|month|year).
+  "setup_amount": 0,
+  // Optional one-off setup fee (default 0).
+  "enabled": true
+  // Optional (default true).
+}
+```
+
+`name` must be a DNS-safe slug and unique; `display_name`, `compose` and `currency` are required. `currency` is normalised to upper-case. The full `compose` schema is validated by the operator at deploy time.
+
+#### Update App
+
+```
+PATCH /api/admin/v1/apps/{id}
+```
+
+Required Permission: `app::update`. All fields optional (omitted = unchanged); `description`/`icon` accept `null` to clear.
+
+#### Delete App
+
+```
+DELETE /api/admin/v1/apps/{id}
+```
+
+Required Permission: `app::delete`. Rejected while the app still has deployments (disable it instead).
+
+#### App Clusters
+
+```
+GET    /api/admin/v1/app_clusters
+GET    /api/admin/v1/app_clusters/{id}
+POST   /api/admin/v1/app_clusters
+PATCH  /api/admin/v1/app_clusters/{id}
+DELETE /api/admin/v1/app_clusters/{id}
+```
+
+Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete`. `AdminAppClusterInfo` / create body:
+
+```json
+{
+  "id": 1,
+  "name": "eu-central",
+  "region_id": 1,
+  // Required on create; must reference an existing region (drives billing company).
+  "ingress_domain": "apps.lnvps.tld",
+  // Required. Wildcard base for deployment hostnames ("{name}.{ingress_domain}").
+  "enabled": true,
+  "created": "2026-07-24T10:00:00Z"
+}
+```
+
+Delete is rejected while the cluster still has deployments.
+
 ## Error Responses
 
 All error responses follow the format:
@@ -3681,6 +3792,8 @@ The RBAC system uses the following permission format: `resource::action`
 - `subscription_line_items` - Subscription line item management
 - `subscription_payments` - Subscription payment management
 - `payment_method_config` - Payment method configuration management
+- `referral` - Referral program management
+- `app` - Managed app catalog + cluster management
 
 ### Actions:
 

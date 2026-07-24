@@ -97,6 +97,8 @@ mod tests {
             "/api/admin/v1/subscriptions",
             "/api/admin/v1/payment_methods",
             "/api/admin/v1/ip_space",
+            "/api/admin/v1/apps",
+            "/api/admin/v1/app_clusters",
         ];
 
         for endpoint in endpoints {
@@ -533,6 +535,171 @@ mod tests {
         // Delete
         let resp = client
             .delete_auth(&format!("/api/admin/v1/regions/{region_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ========================================================================
+    // App catalog + cluster CRUD Lifecycle
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_admin_app_and_cluster_crud() {
+        let client = setup().await;
+
+        // --- App catalog ---
+        let create_app = serde_json::json!({
+            "name": "e2e-relay",
+            "display_name": "E2E Relay",
+            "description": "test relay app",
+            "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
+            "amount": 1000,
+            "currency": "usd",
+            "interval_amount": 1,
+            "interval_type": "month",
+            "setup_amount": 0
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &create_app)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "app creation should succeed");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = body["data"]["id"].as_u64().expect("app id");
+        // currency is normalised to upper-case.
+        assert_eq!(body["data"]["currency"].as_str().unwrap(), "USD");
+
+        // Duplicate name is rejected.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &create_app)
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "duplicate app name rejected");
+
+        // Invalid slug rejected.
+        let bad = serde_json::json!({
+            "name": "Bad Name",
+            "display_name": "x",
+            "compose": "services: {}",
+            "amount": 1,
+            "currency": "usd",
+            "interval_amount": 1,
+            "interval_type": "month"
+        });
+        let resp = client.post_auth("/api/admin/v1/apps", &bad).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "bad slug rejected");
+
+        // Read.
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["display_name"].as_str().unwrap(), "E2E Relay");
+
+        // List includes it.
+        let resp = client.get_auth("/api/admin/v1/apps").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"].as_u64() == Some(app_id))
+        );
+
+        // Update (disable + rename).
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({"display_name": "Renamed", "enabled": false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["display_name"].as_str().unwrap(), "Renamed");
+        assert_eq!(body["data"]["enabled"].as_bool().unwrap(), false);
+
+        // --- App cluster (needs a region) ---
+        let resp = client.get_auth("/api/admin/v1/companies").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let company_id = body["data"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|c| c["id"].as_u64())
+            .unwrap_or(1);
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/regions",
+                &serde_json::json!({"name": "e2e-app-region", "enabled": true, "company_id": company_id}),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let region_id = body["data"]["id"].as_u64().expect("region id");
+
+        // Cluster with a non-existent region is rejected.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app_clusters",
+                &serde_json::json!({"name": "bad", "region_id": 99999999u64, "ingress_domain": "x.example.com"}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "unknown region rejected");
+
+        // Create cluster.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app_clusters",
+                &serde_json::json!({"name": "e2e-cluster", "region_id": region_id, "ingress_domain": "apps.e2e.example.com"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "cluster creation should succeed"
+        );
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let cluster_id = body["data"]["id"].as_u64().expect("cluster id");
+
+        // Read / list / update.
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client.get_auth("/api/admin/v1/app_clusters").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/app_clusters/{cluster_id}"),
+                &serde_json::json!({"ingress_domain": "apps2.e2e.example.com", "enabled": false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["ingress_domain"].as_str().unwrap(),
+            "apps2.e2e.example.com"
+        );
+
+        // Cleanup: delete cluster, region, app.
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/regions/{region_id}"))
+            .await;
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

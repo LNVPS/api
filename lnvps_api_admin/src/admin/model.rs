@@ -4453,3 +4453,137 @@ mod tests {
         assert!(!req.enabled);
     }
 }
+
+// ----- App catalog (managed app deployments) -----
+
+/// Admin view of a catalog app.
+#[derive(Serialize)]
+pub struct AdminAppInfo {
+    pub id: u64,
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    /// docker-compose-style YAML defining the app.
+    pub compose: String,
+    /// Recurring price in the smallest currency unit (cents / millisats).
+    pub amount: u64,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
+    pub setup_amount: u64,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+impl From<lnvps_db::App> for AdminAppInfo {
+    fn from(a: lnvps_db::App) -> Self {
+        Self {
+            id: a.id,
+            name: a.name,
+            display_name: a.display_name,
+            description: a.description,
+            icon: a.icon,
+            compose: a.compose,
+            amount: a.amount,
+            currency: a.currency,
+            interval_amount: a.interval_amount,
+            interval_type: a.interval_type.into(),
+            setup_amount: a.setup_amount,
+            enabled: a.enabled,
+            created: a.created,
+        }
+    }
+}
+
+/// Create a catalog app.
+#[derive(Deserialize)]
+pub struct AdminCreateAppRequest {
+    /// URL/DNS-safe slug, unique (e.g. `nostr-relay`).
+    pub name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    /// docker-compose-style YAML defining the app.
+    pub compose: String,
+    pub amount: u64,
+    pub currency: String,
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
+    #[serde(default)]
+    pub setup_amount: u64,
+    /// Whether the app is offered in the catalog (default true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Update a catalog app (all fields optional; omitted = unchanged).
+#[derive(Deserialize)]
+pub struct AdminUpdateAppRequest {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub description: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub icon: Option<Option<String>>,
+    pub compose: Option<String>,
+    pub amount: Option<u64>,
+    pub currency: Option<String>,
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
+    pub setup_amount: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+/// Admin view of an app cluster.
+#[derive(Serialize)]
+pub struct AdminAppClusterInfo {
+    pub id: u64,
+    pub name: String,
+    pub region_id: u64,
+    pub ingress_domain: String,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+impl From<lnvps_db::AppCluster> for AdminAppClusterInfo {
+    fn from(c: lnvps_db::AppCluster) -> Self {
+        Self {
+            id: c.id,
+            name: c.name,
+            region_id: c.region_id,
+            ingress_domain: c.ingress_domain,
+            enabled: c.enabled,
+            created: c.created,
+        }
+    }
+}
+
+/// Create an app cluster.
+#[derive(Deserialize)]
+pub struct AdminCreateAppClusterRequest {
+    pub name: String,
+    pub region_id: u64,
+    pub ingress_domain: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Update an app cluster (all fields optional; omitted = unchanged).
+#[derive(Deserialize)]
+pub struct AdminUpdateAppClusterRequest {
+    pub name: Option<String>,
+    pub region_id: Option<u64>,
+    pub ingress_domain: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+fn default_true() -> bool {
+    true
+}
