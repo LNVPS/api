@@ -2878,6 +2878,7 @@ dependencies = [
  "lightning-invoice",
  "lnurl-rs",
  "lnvps_api_common",
+ "lnvps_compose",
  "lnvps_db",
  "log 0.4.32",
  "mustache",

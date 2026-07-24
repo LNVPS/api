@@ -57,6 +57,7 @@ stripe = ["payments-rs/method-stripe"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
+lnvps_compose = { path = "../lnvps_compose" }
 lnvps_api_common = { path = "../lnvps_api_common" }
 try-procedure = { path = "../try-procedure" }
 

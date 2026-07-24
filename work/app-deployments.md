@@ -73,9 +73,16 @@ images (higher isolation risk — design the boundary in now).
       subscription_id resolved from the line item).
 - [x] e2e customer test (seed_app_deployment helper) + API_DOCUMENTATION.md + API_CHANGELOG.md.
 
-### Increment 3b — Customer ordering / lifecycle (billing) — TODO
-- [ ] Create deployment (validate config vs compose env schema → subscription + line item
-      (type App) + payment invoice, mirroring VM order); delete/stop/start; renew via subscription.
+### Increment 3b — Customer ordering / lifecycle (billing) (DONE, PR pending)
+- [x] `POST /api/v1/app-deployments`: validate name + config (vs compose `config`), capacity
+      admission (`select_in_region`), create Subscription + `App` line item + deployment (pending).
+      Pay via the standard subscription flow; the renew engine already bills flat `App` line items.
+- [x] `DELETE` (deactivate subscription + soft-delete → operator GC), `PATCH .../stop|start`
+      (desired_state). Ownership-checked.
+- [x] Operator gate: only run **paid** (`is_setup`) + unexpired deployments (unpaid orders stay at
+      0 replicas).
+- [x] Unit tests (name + config validation) + e2e ordering test (order, name/config/capacity
+      rejection, stop/start, delete). Docs + changelog.
 
 ### Increment 4a — Shared compose parser (DONE, PR #218 merged)
 - [x] New `lnvps_compose` crate (serde + serde_yaml, no heavy deps): typed model (`Compose`
