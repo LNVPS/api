@@ -378,15 +378,40 @@ pub struct ReferralConfig {
     pub min_onchain_payout_sats: Option<u64>,
     /// Maximum acceptable next-block fee rate (sat/vByte) for on-chain payouts.
     /// Before broadcasting a payout batch, the current next-block fee rate is
-    /// fetched from mempool.space; if it exceeds this cap the batch is skipped
+    /// obtained from `fee_estimator`; if it exceeds this cap the batch is skipped
     /// and retried on a later run, so payouts wait for cheaper fees rather than
     /// paying "crazy" fees. Defaults to 50 sat/vByte.
     #[serde(default = "default_max_onchain_fee_per_vbyte")]
     pub max_onchain_fee_per_vbyte: u64,
-    /// Base URL of the mempool.space (compatible) instance used to fetch the
-    /// recommended next-block fee rate. Defaults to `https://mempool.space`.
-    #[serde(default = "default_mempool_url")]
-    pub mempool_url: String,
+    /// Source of the on-chain fee-rate estimate used for the cap above. Defaults
+    /// to mempool.space; a fixed rate can be configured for regtest/testing.
+    #[serde(default)]
+    pub fee_estimator: FeeEstimatorConfig,
+}
+
+/// Source of on-chain fee-rate estimates for referral payouts.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeeEstimatorConfig {
+    /// Fetch the recommended next-block fee rate from a mempool.space-compatible
+    /// instance at `url`.
+    #[serde(rename_all = "kebab-case")]
+    Mempool {
+        #[serde(default = "default_mempool_url")]
+        url: String,
+    },
+    /// Use a fixed fee rate (sat/vByte). Mainly for regtest/tests where no
+    /// mempool.space is reachable.
+    #[serde(rename_all = "kebab-case")]
+    Fixed { sat_per_vbyte: u64 },
+}
+
+impl Default for FeeEstimatorConfig {
+    fn default() -> Self {
+        FeeEstimatorConfig::Mempool {
+            url: default_mempool_url(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

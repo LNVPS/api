@@ -21,12 +21,17 @@ referral:
   # absorb it. Defaults to 1000. Set to null to disable on-chain payouts.
   min-onchain-payout-sats: 1000
   # Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts. The
-  # current rate is fetched from mempool.space before each batch; if it exceeds
+  # current rate is obtained from fee-estimator before each batch; if it exceeds
   # this cap the batch is deferred until fees drop. Defaults to 50.
   max-onchain-fee-per-vbyte: 50
-  # mempool.space (compatible) instance used for the recommended fee rate.
-  # Defaults to https://mempool.space.
-  #mempool-url: "https://mempool.space"
+  # Source of the on-chain fee-rate estimate. Defaults to mempool.space; use a
+  # fixed rate for regtest/testing where mempool.space is unreachable.
+  fee-estimator:
+    mempool:
+      url: "https://mempool.space"
+  #fee-estimator:
+  #  fixed:
+  #    sat-per-vbyte: 2
 public-url: "https://api.lnvps.net"
 read-only: false
 redis:

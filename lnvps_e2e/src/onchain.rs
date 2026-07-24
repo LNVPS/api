@@ -50,6 +50,21 @@ async fn exec_in_service(service: &str, args: &[&str]) -> anyhow::Result<std::pr
     Ok(out)
 }
 
+/// Derive a fresh regtest address from the `lnd-payer` wallet — a valid
+/// destination for on-chain referral payout tests.
+pub async fn new_regtest_address() -> anyhow::Result<String> {
+    let out = exec_in_service(
+        PAYER_SERVICE,
+        &["lncli", "--network=regtest", "newaddress", "p2wkh"],
+    )
+    .await?;
+    let v: Value = serde_json::from_slice(&out.stdout).context("parsing newaddress output")?;
+    v["address"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("no address in newaddress output: {v}"))
+}
+
 /// Send `amount_sats` on-chain to `address` from the `lnd-payer` wallet.
 ///
 /// Returns the txid. The transaction is only broadcast — call

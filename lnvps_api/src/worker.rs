@@ -140,8 +140,8 @@ pub struct WorkerSettings {
     /// Maximum next-block fee rate (sat/vByte) tolerated for on-chain referral
     /// payouts; batches are deferred above this.
     pub referral_max_onchain_fee_per_vbyte: u64,
-    /// mempool.space base URL used to fetch the recommended next-block fee rate.
-    pub referral_mempool_url: String,
+    /// Source of the on-chain fee-rate estimate for the cap above.
+    pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -164,11 +164,11 @@ impl From<&Settings> for WorkerSettings {
                 .as_ref()
                 .map(|r| r.max_onchain_fee_per_vbyte)
                 .unwrap_or(50),
-            referral_mempool_url: val
+            referral_fee_estimator: val
                 .referral
                 .as_ref()
-                .map(|r| r.mempool_url.clone())
-                .unwrap_or_else(|| "https://mempool.space".to_string()),
+                .map(|r| r.fee_estimator.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -188,6 +188,8 @@ impl Worker {
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         let settings = settings.into();
+        let fee_estimator =
+            crate::fee_estimate::build_fee_estimator(&settings.referral_fee_estimator);
         let referral_payouts = crate::referral::ReferralPayoutHandler::new(
             db.clone(),
             node,
@@ -196,7 +198,7 @@ impl Worker {
             onchain,
             settings.referral_min_onchain_payout_sats,
             settings.referral_max_onchain_fee_per_vbyte,
-            settings.referral_mempool_url.clone(),
+            fee_estimator,
         );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {

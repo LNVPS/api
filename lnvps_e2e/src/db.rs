@@ -370,6 +370,168 @@ pub async fn insert_referral(
     Ok(res.0)
 }
 
+/// Update a referral's payout `mode` (0=lightning_address, 1=nwc, 3=on_chain)
+/// and `address` directly (bypasses API validation).
+pub async fn set_referral_mode_address(
+    pool: &MySqlPool,
+    referral_id: u64,
+    mode: u16,
+    address: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE referral SET mode = ?, address = ? WHERE id = ?")
+        .bind(mode)
+        .bind(address)
+        .bind(referral_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Read a referral's payouts as `(amount, fee, is_paid, outpoint)` rows,
+/// most-recent first.
+pub async fn list_referral_payouts(
+    pool: &MySqlPool,
+    referral_id: u64,
+) -> anyhow::Result<Vec<(u64, u64, bool, Option<String>)>> {
+    let rows = sqlx::query(
+        "SELECT amount, fee, is_paid, outpoint FROM referral_payout \
+         WHERE referral_id = ? ORDER BY created DESC, id DESC",
+    )
+    .bind(referral_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get::<u64, _>(0).unwrap_or(0),
+                r.try_get::<u64, _>(1).unwrap_or(0),
+                r.try_get::<i8, _>(2).map(|v| v != 0).unwrap_or(false),
+                r.try_get::<Option<String>, _>(3).unwrap_or(None),
+            )
+        })
+        .collect())
+}
+
+/// The FK ids `(host_id, image_id, template_id, disk_id)` of an existing VM, so
+/// seeded referred VMs can reuse valid references.
+pub async fn vm_fk_ids(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<(u64, u64, u64, u64)> {
+    let row = sqlx::query("SELECT host_id, image_id, template_id, disk_id FROM vm WHERE id = ?")
+        .bind(vm_id)
+        .fetch_one(pool)
+        .await?;
+    Ok((
+        row.try_get::<u64, _>(0)?,
+        row.try_get::<u64, _>(1)?,
+        row.try_get::<u64, _>(2)?,
+        row.try_get::<u64, _>(3)?,
+    ))
+}
+
+/// Seed a referrer enrolled in `mode` with `address`, plus a referred VM whose
+/// first paid BTC payment earns them exactly `commission_sats` of commission
+/// (via a 100% per-referrer rate on a `commission_sats`-sized payment). FK ids
+/// are reused from `fk_from_vm`. Returns `(referral_id, referred_vm_id)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_referrer_with_commission(
+    pool: &MySqlPool,
+    referrer_user_id: u64,
+    referred_user_id: u64,
+    code: &str,
+    mode: u16,
+    address: Option<&str>,
+    commission_sats: u64,
+    fk_from_vm: u64,
+) -> anyhow::Result<(u64, u64)> {
+    let (host_id, image_id, template_id, disk_id) = vm_fk_ids(pool, fk_from_vm).await?;
+
+    // Referrer enrollment with a 100% override so commission == payment amount.
+    let (referral_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO referral (user_id, code, mode, address, referral_rate) \
+         VALUES (?, ?, ?, ?, 100) RETURNING id",
+    )
+    .bind(referrer_user_id)
+    .bind(code)
+    .bind(mode)
+    .bind(address)
+    .fetch_one(pool)
+    .await?;
+
+    // A BTC subscription + VPS line item + one paid payment == the referred VM's
+    // first payment that earns commission.
+    let (sub_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO subscription (user_id, company_id, name, description, created, expires, \
+             is_active, is_setup, currency, interval_amount, interval_type, setup_fee, \
+             auto_renewal_enabled, external_id) \
+         VALUES (?, (SELECT MIN(id) FROM company), 'e2e-referred', NULL, NOW(), NULL, 1, 1, \
+             'BTC', 1, 0, 0, 0, NULL) RETURNING id",
+    )
+    .bind(referred_user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let amount_msat = commission_sats * 1000;
+    let (li_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, \
+             description, amount, setup_amount, configuration) \
+         VALUES (?, 3, 'vm', NULL, ?, 0, NULL) RETURNING id",
+    )
+    .bind(sub_id)
+    .bind(amount_msat)
+    .fetch_one(pool)
+    .await?;
+
+    let (vm_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm(host_id,user_id,image_id,template_id,custom_template_id,\
+             subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code) \
+         VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?) RETURNING id",
+    )
+    .bind(host_id)
+    .bind(referred_user_id)
+    .bind(image_id)
+    .bind(template_id)
+    .bind(li_id)
+    .bind(disk_id)
+    .bind(format!(
+        "00:00:00:00:{:02x}:{:02x}",
+        referral_id & 0xff,
+        vm_mac_suffix(code)
+    ))
+    .bind(code)
+    .fetch_one(pool)
+    .await?;
+
+    // Random 32-byte payment id; is_paid=1 BTC payment.
+    let payment_id: [u8; 32] = rand_bytes32();
+    sqlx::query(
+        "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, \
+             currency, payment_method, payment_type, external_data, external_id, is_paid, rate, \
+             tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, \
+             tax_treatment, tax_evidence, tax_breakdown) \
+         VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), ?, 'BTC', 0, 0, '', NULL, 1, \
+             1.0, 0, 0, 2592000, NULL, NOW(), NULL, NULL, NULL, NULL, NULL)",
+    )
+    .bind(payment_id.as_slice())
+    .bind(sub_id)
+    .bind(referred_user_id)
+    .bind(amount_msat)
+    .execute(pool)
+    .await?;
+
+    Ok((referral_id, vm_id))
+}
+
+fn vm_mac_suffix(code: &str) -> u8 {
+    code.bytes().fold(0u8, |a, b| a.wrapping_add(b))
+}
+
+fn rand_bytes32() -> [u8; 32] {
+    use rand_core::RngCore;
+    let mut b = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut b);
+    b
+}
+
 /// Hard-delete a referral and its payouts.
 pub async fn hard_delete_referral(pool: &MySqlPool, referral_id: u64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM referral_payout WHERE referral_id = ?")

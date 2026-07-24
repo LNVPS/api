@@ -25,6 +25,17 @@ webauthn:
 session:
   secret: "e2e-session-secret-not-for-production-0123456789abcdef"
   ttl: 3600
+# Automated referral commission payouts. Enabled with low thresholds so the
+# e2e payout tests exercise Lightning + on-chain payouts. The fee estimator is
+# fixed (regtest has no mempool.space); 2 sat/vByte is below the 50 cap so
+# batches broadcast.
+referral:
+  min-payout-sats: 1
+  min-onchain-payout-sats: 1
+  max-onchain-fee-per-vbyte: 50
+  fee-estimator:
+    fixed:
+      sat-per-vbyte: 2
 provisioner:
   proxmox:
     qemu:

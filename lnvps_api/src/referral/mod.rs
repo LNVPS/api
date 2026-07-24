@@ -9,6 +9,7 @@
 //! sats — and is left to accrue for manual admin payout. Automated payouts are
 //! opt-in: when no minimum threshold is configured they are disabled entirely.
 
+use crate::fee_estimate::FeeEstimator;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use lnvps_api_common::{WorkCommander, WorkJob};
@@ -33,25 +34,6 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
     }
     let pay_msat = (owed / 1000) * 1000;
     if pay_msat == 0 { None } else { Some(pay_msat) }
-}
-
-/// mempool.space `/api/v1/fees/recommended` response (only the field we need).
-#[derive(serde::Deserialize)]
-struct RecommendedFees {
-    /// Next-block ("fastest") fee rate, sat/vByte.
-    #[serde(rename = "fastestFee")]
-    fastest_fee: u64,
-}
-
-/// Fetch the current next-block fee rate (sat/vByte) from a mempool.space-
-/// compatible instance.
-async fn fetch_next_block_feerate(mempool_url: &str) -> Result<u64> {
-    let url = format!(
-        "{}/api/v1/fees/recommended",
-        mempool_url.trim_end_matches('/')
-    );
-    let fees: RecommendedFees = reqwest::get(&url).await?.error_for_status()?.json().await?;
-    Ok(fees.fastest_fee)
 }
 
 /// Split `total_fee` across payouts in proportion to their `amounts`, returning
@@ -118,8 +100,8 @@ pub struct ReferralPayoutHandler {
     /// Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts;
     /// batches are deferred when the current rate exceeds this.
     max_onchain_fee_per_vbyte: u64,
-    /// mempool.space base URL used to fetch the recommended next-block fee rate.
-    mempool_url: String,
+    /// Source of the current on-chain fee-rate estimate (mockable).
+    fee_estimator: Arc<dyn FeeEstimator>,
 }
 
 impl ReferralPayoutHandler {
@@ -136,7 +118,7 @@ impl ReferralPayoutHandler {
         onchain: Option<Arc<dyn OnChainProvider>>,
         min_onchain_payout_sats: Option<u64>,
         max_onchain_fee_per_vbyte: u64,
-        mempool_url: String,
+        fee_estimator: Arc<dyn FeeEstimator>,
     ) -> Self {
         Self {
             db,
@@ -146,7 +128,7 @@ impl ReferralPayoutHandler {
             onchain,
             min_onchain_payout_msat: min_onchain_payout_sats.map(|s| s.saturating_mul(1000)),
             max_onchain_fee_per_vbyte,
-            mempool_url,
+            fee_estimator,
         }
     }
 
@@ -249,33 +231,37 @@ impl ReferralPayoutHandler {
         if eligible.is_empty() {
             return Ok(());
         }
-
-        // 2. Check the current next-block fee rate; defer the whole batch if
-        //    fees are too high so we wait for cheaper conditions.
-        let feerate = fetch_next_block_feerate(&self.mempool_url)
-            .await
-            .context("fetching next-block fee rate from mempool.space")?;
-        if feerate > self.max_onchain_fee_per_vbyte {
-            info!(
-                "Deferring on-chain referral payouts: next-block fee {} sat/vB exceeds cap {} sat/vB",
-                feerate, self.max_onchain_fee_per_vbyte
-            );
-            return Ok(());
-        }
-
-        self.send_batch(onchain, eligible, feerate).await
+        self.send_batch(onchain, eligible).await
     }
 
     /// Reserve, broadcast (single send-many) and record a batch of on-chain
-    /// payouts at `sat_per_vbyte`. Split from selection so it can be tested with
-    /// a hand-built `eligible` list. Each entry is `(referrer, address,
-    /// pay_msat)`.
+    /// payouts. Split from selection so it can be tested with a hand-built
+    /// `eligible` list. Each entry is `(referrer, address, pay_msat)`.
+    ///
+    /// The current next-block fee rate is obtained from the fee estimator; if it
+    /// exceeds the configured cap the whole batch is **deferred** (returns `Ok`
+    /// without reserving or sending) so payouts wait for cheaper fees. Otherwise
+    /// the batch is broadcast at that rate.
     async fn send_batch(
         &self,
         onchain: &dyn OnChainProvider,
         eligible: Vec<(Referral, String, u64)>,
-        sat_per_vbyte: u64,
     ) -> Result<()> {
+        // Check the current next-block fee rate; defer the whole batch if fees
+        // are too high so we wait for cheaper conditions.
+        let sat_per_vbyte = self
+            .fee_estimator
+            .next_block_fee_rate()
+            .await
+            .context("estimating next-block on-chain fee rate")?;
+        if sat_per_vbyte > self.max_onchain_fee_per_vbyte {
+            info!(
+                "Deferring on-chain referral payouts: next-block fee {} sat/vB exceeds cap {} sat/vB",
+                sat_per_vbyte, self.max_onchain_fee_per_vbyte
+            );
+            return Ok(());
+        }
+
         // 1. Reserve every payout (unpaid) before sending, so a crash between
         //    the broadcast and the DB update cannot double-pay next run.
         let mut reserved: Vec<(u64, Referral, String, u64)> = Vec::new();
@@ -656,9 +642,14 @@ mod tests {
         }
     }
 
-    /// A test handler with the given on-chain provider; thresholds are irrelevant
-    /// for the `send_batch`/`payout_batch_request` tests which bypass selection.
-    fn handler(db: Arc<dyn LNVpsDb>, onchain: Arc<dyn OnChainProvider>) -> ReferralPayoutHandler {
+    /// A test handler with the given on-chain provider and a fixed fee
+    /// estimate (sat/vByte). The fee cap is 50, so `feerate <= 50` broadcasts
+    /// and `> 50` defers.
+    fn handler_with_feerate(
+        db: Arc<dyn LNVpsDb>,
+        onchain: Arc<dyn OnChainProvider>,
+        feerate: u64,
+    ) -> ReferralPayoutHandler {
         ReferralPayoutHandler::new(
             db,
             Arc::new(crate::mocks::MockNode::default()),
@@ -667,8 +658,12 @@ mod tests {
             Some(onchain),
             Some(1000),
             50,
-            "https://mempool.space".to_string(),
+            Arc::new(crate::fee_estimate::FixedFeeEstimator(feerate)),
         )
+    }
+
+    fn handler(db: Arc<dyn LNVpsDb>, onchain: Arc<dyn OnChainProvider>) -> ReferralPayoutHandler {
+        handler_with_feerate(db, onchain, 10)
     }
 
     #[test]
@@ -734,7 +729,7 @@ mod tests {
                 1_500_000,
             ),
         ];
-        h.send_batch(onchain.as_ref(), eligible, 10).await.unwrap();
+        h.send_batch(onchain.as_ref(), eligible).await.unwrap();
 
         // Exactly ONE on-chain transaction was broadcast for the whole batch.
         let sends = onchain.sends.lock().await;
@@ -768,6 +763,32 @@ mod tests {
             "larger payout bears >= fee ({} vs {})",
             pa[0].fee,
             pb[0].fee
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_defers_when_fee_rate_too_high() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let ra = db.insert_referral(&referrer(0, "AAA")).await.unwrap();
+        let onchain = Arc::new(MockOnChainProvider::default());
+        // Fee estimate 100 sat/vB exceeds the handler's 50 cap.
+        let h = handler_with_feerate(db.clone(), onchain.clone(), 100);
+
+        let eligible = vec![(
+            Referral {
+                id: ra,
+                ..referrer(ra, "AAA")
+            },
+            regtest_addr(1),
+            2_000_000,
+        )];
+        h.send_batch(onchain.as_ref(), eligible).await.unwrap();
+
+        // Nothing was broadcast and no payout was reserved/recorded.
+        assert!(onchain.sends.lock().await.is_empty(), "no tx broadcast");
+        assert!(
+            db.list_referral_payouts(ra).await.unwrap().is_empty(),
+            "no payout reserved when deferred"
         );
     }
 
@@ -816,7 +837,7 @@ mod tests {
             regtest_addr(1),
             2_000_000,
         )];
-        let res = h.send_batch(onchain.as_ref(), eligible, 10).await;
+        let res = h.send_batch(onchain.as_ref(), eligible).await;
         assert!(res.is_err(), "send failure propagates");
         // The reserved payout was released so the balance retries next run.
         let payouts = db.list_referral_payouts(ra).await.unwrap();
