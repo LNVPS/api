@@ -26,9 +26,9 @@ use lnvps_api_common::{ExchangeRateService, VmRunningState, VmRunningStates, op_
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, Company, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, LNVpsDb,
-    NostrDomain, NostrDomainHandle, OsDistribution, User, UserSshKey, Vm, VmCostPlan,
+    NostrDomain, NostrDomainHandle, OsDistribution, Region, User, UserSshKey, Vm, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmHistory, VmHost, VmHostDisk,
-    VmHostKind, VmHostRegion, VmIpAssignment, VmOsImage, VmTemplate,
+    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
 };
 use nostr_sdk::Timestamp;
 use payments_rs::lightning::{

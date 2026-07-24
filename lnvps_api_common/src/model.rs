@@ -5,9 +5,9 @@ use chrono::{DateTime, Days, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, Subscription, SubscriptionLineItem,
-    SubscriptionType, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHost, VmHostRegion, VmTemplate,
+    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, Region, Subscription,
+    SubscriptionLineItem, SubscriptionType, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmHost, VmTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -165,7 +165,7 @@ impl ApiVmTemplate {
     pub fn from_standard_data(
         template: &VmTemplate,
         cost_plan: &VmCostPlan,
-        region: &VmHostRegion,
+        region: &Region,
     ) -> Result<Self> {
         Ok(Self {
             id: template.id,
@@ -759,7 +759,7 @@ impl ApiCustomTemplateParams {
     pub fn from(
         pricing: &VmCustomPricing,
         disks: &Vec<VmCustomPricingDisk>,
-        region: &VmHostRegion,
+        region: &Region,
     ) -> Self {
         ApiCustomTemplateParams {
             id: pricing.id,

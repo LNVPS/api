@@ -26,8 +26,8 @@ use lnvps_api_common::{
     VatClient, WorkJob,
 };
 use lnvps_db::{
-    CpuArch, LNVpsDb, PaymentMethod, Vm, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHost, VmHostRegion,
+    CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmHost,
 };
 
 use crate::api::model::{
@@ -887,7 +887,7 @@ async fn v1_list_vm_templates(State(this): State<RouterState>) -> ApiResult<ApiT
     let templates = hc.list_available_vm_templates().await?;
 
     let cost_plans: HashSet<u64> = templates.iter().map(|t| t.cost_plan_id).collect();
-    let regions: HashMap<u64, VmHostRegion> = this
+    let regions: HashMap<u64, Region> = this
         .db
         .list_host_region()
         .await?

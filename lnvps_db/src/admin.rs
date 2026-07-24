@@ -107,7 +107,7 @@ pub trait AdminDb: Send + Sync {
         &self,
         limit: u64,
         offset: u64,
-    ) -> DbResult<(Vec<crate::VmHostRegion>, u64)>;
+    ) -> DbResult<(Vec<crate::Region>, u64)>;
 
     /// Create a new region
     async fn admin_create_region(
@@ -118,7 +118,7 @@ pub trait AdminDb: Send + Sync {
     ) -> DbResult<u64>;
 
     /// Update region information
-    async fn admin_update_region(&self, region: &crate::VmHostRegion) -> DbResult<()>;
+    async fn admin_update_region(&self, region: &crate::Region) -> DbResult<()>;
 
     /// Delete/disable region (only if no hosts assigned)
     async fn admin_delete_region(&self, region_id: u64) -> DbResult<()>;

@@ -255,13 +255,13 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn list_user_ssh_key(&self, user_id: u64) -> DbResult<Vec<UserSshKey>>;
 
     /// Get VM host regions
-    async fn list_host_region(&self) -> DbResult<Vec<VmHostRegion>>;
+    async fn list_host_region(&self) -> DbResult<Vec<Region>>;
 
     /// Get VM host region by id
-    async fn get_host_region(&self, id: u64) -> DbResult<VmHostRegion>;
+    async fn get_host_region(&self, id: u64) -> DbResult<Region>;
 
     /// Get VM host region by name
-    async fn get_host_region_by_name(&self, name: &str) -> DbResult<VmHostRegion>;
+    async fn get_host_region_by_name(&self, name: &str) -> DbResult<Region>;
 
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>>;
@@ -274,7 +274,7 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         limit: u64,
         offset: u64,
-    ) -> DbResult<(Vec<(VmHost, VmHostRegion)>, u64)>;
+    ) -> DbResult<(Vec<(VmHost, Region)>, u64)>;
 
     /// List VM's owned by a specific user
     async fn get_host(&self, id: u64) -> DbResult<VmHost>;
