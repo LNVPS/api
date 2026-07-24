@@ -3100,6 +3100,16 @@ pub struct App {
     pub setup_amount: u64,
     /// Whether the app is offered in the catalog.
     pub enabled: bool,
+    /// Resource footprint computed from the compose (Σ service CPU requests, in
+    /// millicores). Denormalized for cheap cluster-capacity accounting.
+    #[sqlx(default)]
+    pub cpu_milli: u64,
+    /// Memory footprint in bytes.
+    #[sqlx(default)]
+    pub memory_bytes: u64,
+    /// Persistent storage footprint in bytes.
+    #[sqlx(default)]
+    pub storage_bytes: u64,
     pub created: DateTime<Utc>,
 }
 
@@ -3119,6 +3129,15 @@ pub struct AppCluster {
     /// deployment's host is `"{deployment.name}.{ingress_domain}"`.
     pub ingress_domain: String,
     pub enabled: bool,
+    /// Static total CPU capacity (millicores) available for app deployments.
+    #[sqlx(default)]
+    pub capacity_cpu_milli: u64,
+    /// Static total memory capacity (bytes).
+    #[sqlx(default)]
+    pub capacity_memory_bytes: u64,
+    /// Static total persistent-storage capacity (bytes).
+    #[sqlx(default)]
+    pub capacity_storage_bytes: u64,
     pub created: DateTime<Utc>,
 }
 

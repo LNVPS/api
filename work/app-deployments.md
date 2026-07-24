@@ -116,11 +116,15 @@ images (higher isolation risk — design the boundary in now).
 - [x] Operator: container requests==limits from `resources:` (Guaranteed QoS, 1:1); ResourceQuota
       sized from `compose.footprint()` now applied (caps the namespace at what was provisioned).
 
-### Increment 4c-ii — Capacity admission (NEXT)
-- [ ] DB: `app` footprint columns + `app_cluster` static `capacity_*` columns (admin-set), 1:1.
-- [ ] `AppClusterCapacityService` (mirrors `HostCapacityService`): available = capacity − Σ active
-      footprints; used at order time (3b) for admission + cluster selection in a region.
-- [ ] Admin: compute+store footprint on app save; capacity fields on cluster create/update.
+### Increment 4c-ii — Capacity admission (DONE, PR pending)
+- [x] DB: `app` footprint columns (`cpu_milli`/`memory_bytes`/`storage_bytes`) + `app_cluster`
+      static `capacity_*` columns (admin-set), 1:1.
+- [x] `AppClusterCapacityService` (lnvps_api_common, mirrors `HostCapacityService`): `used` /
+      `available` / `fits` / `select_in_region` (available = capacity − Σ non-deleted deployment
+      footprints). Unit-tested via MockDb.
+- [x] Admin: footprint computed from compose (`lnvps_compose::footprint`) + stored on app
+      create/update; `capacity_*` on cluster create/update; both exposed on the info responses.
+      e2e admin test asserts footprint + capacity echo.
 
 ### Increment 5 — Seed launch apps
 - [ ] Seed **strfry**, **haven relay**, **route96 (+ MariaDB)**, **generic Blossom** (compose

@@ -3634,8 +3634,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_app(&self, app: &App) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app (name, display_name, description, icon, compose, amount, currency, \
-             interval_amount, interval_type, setup_amount, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             interval_amount, interval_type, setup_amount, enabled, cpu_milli, memory_bytes, \
+             storage_bytes) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&app.name)
         .bind(&app.display_name)
@@ -3648,6 +3649,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(app.interval_type)
         .bind(app.setup_amount)
         .bind(app.enabled)
+        .bind(app.cpu_milli)
+        .bind(app.memory_bytes)
+        .bind(app.storage_bytes)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -3657,7 +3661,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         sqlx::query(
             "UPDATE app SET name = ?, display_name = ?, description = ?, icon = ?, compose = ?, \
              amount = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_amount = ?, \
-             enabled = ? WHERE id = ?",
+             enabled = ?, cpu_milli = ?, memory_bytes = ?, storage_bytes = ? WHERE id = ?",
         )
         .bind(&app.name)
         .bind(&app.display_name)
@@ -3670,6 +3674,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(app.interval_type)
         .bind(app.setup_amount)
         .bind(app.enabled)
+        .bind(app.cpu_milli)
+        .bind(app.memory_bytes)
+        .bind(app.storage_bytes)
         .bind(app.id)
         .execute(&self.db)
         .await?;
@@ -3704,13 +3711,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled) \
-             VALUES (?, ?, ?, ?) returning id",
+            "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled, \
+             capacity_cpu_milli, capacity_memory_bytes, capacity_storage_bytes) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&cluster.name)
         .bind(cluster.region_id)
         .bind(&cluster.ingress_domain)
         .bind(cluster.enabled)
+        .bind(cluster.capacity_cpu_milli)
+        .bind(cluster.capacity_memory_bytes)
+        .bind(cluster.capacity_storage_bytes)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -3718,13 +3729,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()> {
         sqlx::query(
-            "UPDATE app_cluster SET name = ?, region_id = ?, ingress_domain = ?, enabled = ? \
+            "UPDATE app_cluster SET name = ?, region_id = ?, ingress_domain = ?, enabled = ?, \
+             capacity_cpu_milli = ?, capacity_memory_bytes = ?, capacity_storage_bytes = ? \
              WHERE id = ?",
         )
         .bind(&cluster.name)
         .bind(cluster.region_id)
         .bind(&cluster.ingress_domain)
         .bind(cluster.enabled)
+        .bind(cluster.capacity_cpu_milli)
+        .bind(cluster.capacity_memory_bytes)
+        .bind(cluster.capacity_storage_bytes)
         .bind(cluster.id)
         .execute(&self.db)
         .await?;

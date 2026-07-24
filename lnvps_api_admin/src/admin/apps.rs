@@ -75,6 +75,17 @@ fn validate_app_fields(
     Ok(())
 }
 
+/// Parse the compose and compute the app's resource footprint (already
+/// validated by `validate_app_fields`).
+fn compose_footprint(
+    compose: &str,
+) -> Result<lnvps_compose::Footprint, lnvps_api_common::ApiError> {
+    let c = lnvps_compose::Compose::parse(compose)
+        .map_err(|e| lnvps_api_common::ApiError::new(format!("invalid compose: {e}")))?;
+    c.footprint()
+        .map_err(|e| lnvps_api_common::ApiError::new(format!("invalid compose resources: {e}")))
+}
+
 async fn admin_list_apps(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -101,6 +112,7 @@ async fn admin_create_app(
 ) -> ApiResult<AdminAppInfo> {
     auth.require_permission(AdminResource::App, AdminAction::Create)?;
     validate_app_fields(&req.name, &req.display_name, &req.compose, &req.currency)?;
+    let footprint = compose_footprint(&req.compose)?;
 
     let app = App {
         id: 0,
@@ -115,6 +127,9 @@ async fn admin_create_app(
         interval_type: req.interval_type.into(),
         setup_amount: req.setup_amount,
         enabled: req.enabled,
+        cpu_milli: footprint.cpu_milli,
+        memory_bytes: footprint.memory_bytes,
+        storage_bytes: footprint.storage_bytes,
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app(&app).await?;
@@ -165,6 +180,11 @@ async fn admin_update_app(
     }
 
     validate_app_fields(&app.name, &app.display_name, &app.compose, &app.currency)?;
+    // Recompute the footprint from the (possibly updated) compose.
+    let footprint = compose_footprint(&app.compose)?;
+    app.cpu_milli = footprint.cpu_milli;
+    app.memory_bytes = footprint.memory_bytes;
+    app.storage_bytes = footprint.storage_bytes;
     this.db.update_app(&app).await?;
     ApiData::ok(this.db.get_app(id).await?.into())
 }
@@ -238,6 +258,9 @@ async fn admin_create_app_cluster(
         region_id: req.region_id,
         ingress_domain: req.ingress_domain.trim().to_string(),
         enabled: req.enabled,
+        capacity_cpu_milli: req.capacity_cpu_milli,
+        capacity_memory_bytes: req.capacity_memory_bytes,
+        capacity_storage_bytes: req.capacity_storage_bytes,
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app_cluster(&cluster).await?;
@@ -265,6 +288,15 @@ async fn admin_update_app_cluster(
     }
     if let Some(enabled) = req.enabled {
         cluster.enabled = enabled;
+    }
+    if let Some(v) = req.capacity_cpu_milli {
+        cluster.capacity_cpu_milli = v;
+    }
+    if let Some(v) = req.capacity_memory_bytes {
+        cluster.capacity_memory_bytes = v;
+    }
+    if let Some(v) = req.capacity_storage_bytes {
+        cluster.capacity_storage_bytes = v;
     }
 
     this.db.update_app_cluster(&cluster).await?;

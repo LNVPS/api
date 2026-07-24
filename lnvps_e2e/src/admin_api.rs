@@ -569,6 +569,8 @@ mod tests {
         let app_id = body["data"]["id"].as_u64().expect("app id");
         // currency is normalised to upper-case.
         assert_eq!(body["data"]["currency"].as_str().unwrap(), "USD");
+        // Footprint is computed from the compose (one service, default 250m).
+        assert_eq!(body["data"]["cpu_milli"].as_u64(), Some(250));
 
         // Duplicate name is rejected.
         let resp = client
@@ -655,7 +657,7 @@ mod tests {
         let resp = client
             .post_auth(
                 "/api/admin/v1/app_clusters",
-                &serde_json::json!({"name": "e2e-cluster", "region_id": region_id, "ingress_domain": "apps.e2e.example.com"}),
+                &serde_json::json!({"name": "e2e-cluster", "region_id": region_id, "ingress_domain": "apps.e2e.example.com", "capacity_cpu_milli": 8000, "capacity_memory_bytes": 8589934592u64, "capacity_storage_bytes": 107374182400u64}),
             )
             .await
             .unwrap();
@@ -666,6 +668,7 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         let cluster_id = body["data"]["id"].as_u64().expect("cluster id");
+        assert_eq!(body["data"]["capacity_cpu_milli"].as_u64(), Some(8000));
 
         // Read / list / update.
         let resp = client
