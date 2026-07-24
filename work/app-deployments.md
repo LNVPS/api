@@ -109,15 +109,18 @@ images (higher isolation risk — design the boundary in now).
 - [ ] ResourceQuota + container resource requests deferred to the capacity increment (a
       `limits.*` quota needs container limits first). Builder present, `#[allow(dead_code)]`.
 
-### Increment 4c — Capacity management (NEXT, decided)
-- [ ] Compose: per-service `resources: { cpu, memory }`; compute app footprint (Σ services + Σ
-      volume sizes) → store `cpu_milli`/`memory_bytes`/`storage_bytes` on `app` at catalog save.
-- [ ] DB: `app` footprint columns + `app_cluster` static `capacity_*` columns (admin-set). 1:1, no
-      overcommit for MVP.
+### Increment 4c-i — Resources + footprint + operator enforcement (DONE, PR pending)
+- [x] Compose: per-service `resources: { cpu, memory }` (defaults 250m/256Mi); `Compose::footprint()`
+      = Σ service cpu/mem + Σ volume sizes → `Footprint { cpu_milli, memory_bytes, storage_bytes }`;
+      `parse_cpu_milli` / `parse_bytes` (k8s quantities). Unit-tested (15 total).
+- [x] Operator: container requests==limits from `resources:` (Guaranteed QoS, 1:1); ResourceQuota
+      sized from `compose.footprint()` now applied (caps the namespace at what was provisioned).
+
+### Increment 4c-ii — Capacity admission (NEXT)
+- [ ] DB: `app` footprint columns + `app_cluster` static `capacity_*` columns (admin-set), 1:1.
 - [ ] `AppClusterCapacityService` (mirrors `HostCapacityService`): available = capacity − Σ active
       footprints; used at order time (3b) for admission + cluster selection in a region.
-- [ ] Operator: set container requests/limits from `resources:` and apply the ResourceQuota.
-- [ ] Admin: compute+expose footprint; capacity fields on cluster create/update.
+- [ ] Admin: compute+store footprint on app save; capacity fields on cluster create/update.
 
 ### Increment 5 — Seed launch apps
 - [ ] Seed **strfry**, **haven relay**, **route96 (+ MariaDB)**, **generic Blossom** (compose

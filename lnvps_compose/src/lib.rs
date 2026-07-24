@@ -53,9 +53,53 @@ pub struct Service {
     /// separate from `volumes` (which are read-write PVCs for app data).
     #[serde(default)]
     pub files: Vec<File>,
+    /// Requested CPU/memory for this service (drives k8s requests/limits and the
+    /// app's capacity footprint). Defaults apply when omitted.
+    #[serde(default)]
+    pub resources: Resources,
     /// Optional backup method for this service's data.
     #[serde(default)]
     pub backup: Option<Backup>,
+}
+
+/// A service's requested CPU and memory. Kubernetes-style quantities: CPU as
+/// cores or millicores (`"1"`, `"500m"`), memory with binary/SI suffixes
+/// (`"512Mi"`, `"2Gi"`, `"1G"`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Resources {
+    #[serde(default = "default_cpu")]
+    pub cpu: String,
+    #[serde(default = "default_memory")]
+    pub memory: String,
+}
+
+fn default_cpu() -> String {
+    "250m".to_string()
+}
+
+fn default_memory() -> String {
+    "256Mi".to_string()
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        Self {
+            cpu: default_cpu(),
+            memory: default_memory(),
+        }
+    }
+}
+
+/// An app's total resource footprint, summed across its services and volumes,
+/// used for cluster capacity accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Footprint {
+    /// CPU in millicores (e.g. `1500` = 1.5 cores).
+    pub cpu_milli: u64,
+    /// Memory in bytes.
+    pub memory_bytes: u64,
+    /// Persistent storage in bytes (sum of `volumes[].size`).
+    pub storage_bytes: u64,
 }
 
 /// A config file injected into a container (rendered into a ConfigMap, or a
@@ -376,6 +420,72 @@ impl Compose {
         }
         Ok(out)
     }
+
+    /// Compute the app's total resource footprint: CPU/memory summed across all
+    /// services' `resources`, plus storage summed across all `volumes[].size`.
+    /// Errors if any quantity string is malformed.
+    pub fn footprint(&self) -> Result<Footprint> {
+        let mut f = Footprint::default();
+        for (sname, svc) in &self.services {
+            f.cpu_milli += parse_cpu_milli(&svc.resources.cpu)
+                .map_err(|e| anyhow!("service '{sname}': cpu: {e}"))?;
+            f.memory_bytes += parse_bytes(&svc.resources.memory)
+                .map_err(|e| anyhow!("service '{sname}': memory: {e}"))?;
+            for v in &svc.volumes {
+                f.storage_bytes += parse_bytes(&v.size)
+                    .map_err(|e| anyhow!("service '{sname}': volume '{}': {e}", v.name))?;
+            }
+        }
+        Ok(f)
+    }
+}
+
+/// Parse a Kubernetes CPU quantity to millicores: `"500m"` → 500, `"2"` → 2000,
+/// `"1.5"` → 1500.
+pub fn parse_cpu_milli(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if let Some(m) = s.strip_suffix('m') {
+        return m
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| anyhow!("invalid cpu '{s}'"));
+    }
+    let cores: f64 = s.parse().map_err(|_| anyhow!("invalid cpu '{s}'"))?;
+    if cores < 0.0 {
+        bail!("negative cpu '{s}'");
+    }
+    Ok((cores * 1000.0).round() as u64)
+}
+
+/// Parse a Kubernetes memory/storage quantity to bytes. Supports binary
+/// suffixes (`Ki`,`Mi`,`Gi`,`Ti`), decimal suffixes (`k`,`M`,`G`,`T`), and bare
+/// byte counts.
+pub fn parse_bytes(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, mult): (&str, u128) = if let Some(n) = s.strip_suffix("Ki") {
+        (n, 1 << 10)
+    } else if let Some(n) = s.strip_suffix("Mi") {
+        (n, 1 << 20)
+    } else if let Some(n) = s.strip_suffix("Gi") {
+        (n, 1 << 30)
+    } else if let Some(n) = s.strip_suffix("Ti") {
+        (n, 1u128 << 40)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1_000)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1_000_000)
+    } else if let Some(n) = s.strip_suffix('G') {
+        (n, 1_000_000_000)
+    } else if let Some(n) = s.strip_suffix('T') {
+        (n, 1_000_000_000_000)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("invalid size '{s}'"))?;
+    u64::try_from(n as u128 * mult).map_err(|_| anyhow!("size '{s}' overflows"))
 }
 
 /// A config file with its final rendered content, ready to become a ConfigMap
@@ -623,6 +733,49 @@ config:
     fn substitute_unterminated_errors() {
         let vars = HashMap::new();
         assert!(substitute("${oops", &vars).is_err());
+    }
+
+    #[test]
+    fn parses_cpu_quantities() {
+        assert_eq!(parse_cpu_milli("500m").unwrap(), 500);
+        assert_eq!(parse_cpu_milli("2").unwrap(), 2000);
+        assert_eq!(parse_cpu_milli("1.5").unwrap(), 1500);
+        assert!(parse_cpu_milli("abc").is_err());
+        assert!(parse_cpu_milli("-1").is_err());
+    }
+
+    #[test]
+    fn parses_byte_quantities() {
+        assert_eq!(parse_bytes("512Mi").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_bytes("2Gi").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_bytes("1000").unwrap(), 1000);
+        assert!(parse_bytes("big").is_err());
+    }
+
+    #[test]
+    fn resources_default_and_footprint() {
+        // mariadb: default resources + 5Gi vol; route96: default + 20Gi vol.
+        let c = Compose::parse(ROUTE96).unwrap();
+        // route96 has no explicit resources -> defaults (250m / 256Mi).
+        assert_eq!(c.services["route96"].resources.cpu, "250m");
+        let f = c.footprint().unwrap();
+        // two services @ 250m = 500m, @ 256Mi = 512Mi, storage 25Gi.
+        assert_eq!(f.cpu_milli, 500);
+        assert_eq!(f.memory_bytes, 512 * 1024 * 1024);
+        assert_eq!(f.storage_bytes, 25u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn footprint_uses_explicit_resources() {
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n    resources: { cpu: \"2\", memory: 1Gi }\n    volumes:\n      - { name: d, path: /data, size: 10Gi }\n",
+        )
+        .unwrap();
+        let f = c.footprint().unwrap();
+        assert_eq!(f.cpu_milli, 2000);
+        assert_eq!(f.memory_bytes, 1024 * 1024 * 1024);
+        assert_eq!(f.storage_bytes, 10u64 * 1024 * 1024 * 1024);
     }
 
     const STRFRY: &str = r#"
