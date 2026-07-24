@@ -89,6 +89,9 @@ pub struct ApiAppRegion {
     /// Whether a cluster in this region currently has enough free capacity for
     /// this app. `false` regions can be shown-but-disabled in the picker.
     pub available: bool,
+    /// Ingress base domain of a cluster in this region. The deploy form can
+    /// preview the final hostname as `{name}.{ingress_domain}`.
+    pub ingress_domain: String,
 }
 
 /// A customer's app deployment.
@@ -171,15 +174,16 @@ async fn v1_list_app_regions(
     };
     let capacity = AppClusterCapacityService::new(this.db.clone());
     let mut out = Vec::new();
-    for (region_id, available) in capacity.regions_availability(need).await? {
+    for r in capacity.regions_availability(need).await? {
         // Only surface enabled regions; skip any that can't be resolved.
-        if let Ok(region) = this.db.get_host_region(region_id).await
+        if let Ok(region) = this.db.get_host_region(r.region_id).await
             && region.enabled
         {
             out.push(ApiAppRegion {
                 id: region.id,
                 name: region.name,
-                available,
+                available: r.available,
+                ingress_domain: r.ingress_domain,
             });
         }
     }

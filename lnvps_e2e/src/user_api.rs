@@ -997,6 +997,11 @@ mod tests {
             .expect("seeded region is deployable");
         assert!(!region["name"].as_str().unwrap().is_empty());
         assert_eq!(region["available"].as_bool(), Some(true));
+        // Ingress base domain is exposed for hostname preview (issue #228).
+        assert!(
+            !region["ingress_domain"].as_str().unwrap_or("").is_empty(),
+            "region exposes ingress_domain"
+        );
 
         // Order a deployment.
         let resp = client

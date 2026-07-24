@@ -623,10 +623,15 @@ impl AppClusterCapacityService {
 
     /// Regions that can host an app: every distinct region with at least one
     /// enabled cluster, paired with whether some cluster there currently has
-    /// room for `need`. Powers the customer deploy-form region picker so full
-    /// regions can be shown-but-disabled instead of failing at order time.
-    /// Region order follows the enabled-cluster listing.
-    pub async fn regions_availability(&self, need: AppCapacity) -> Result<Vec<(u64, bool)>> {
+    /// room for `need` and the ingress base domain to preview the hostname.
+    /// Powers the customer deploy-form region picker so full regions can be
+    /// shown-but-disabled instead of failing at order time. Region order
+    /// follows the enabled-cluster listing; the ingress domain is taken from a
+    /// cluster that can serve the deployment (the first one otherwise).
+    pub async fn regions_availability(
+        &self,
+        need: AppCapacity,
+    ) -> Result<Vec<AppRegionAvailability>> {
         let clusters = self.db.list_app_clusters(true).await?;
         let mut region_ids: Vec<u64> = Vec::new();
         for c in &clusters {
@@ -636,17 +641,38 @@ impl AppClusterCapacityService {
         }
         let mut out = Vec::with_capacity(region_ids.len());
         for rid in region_ids {
+            let region_clusters: Vec<&AppCluster> =
+                clusters.iter().filter(|c| c.region_id == rid).collect();
+            // Default to the first cluster; prefer one that actually fits.
             let mut available = false;
-            for c in clusters.iter().filter(|c| c.region_id == rid) {
+            let mut chosen = region_clusters.first().copied();
+            for c in &region_clusters {
                 if self.fits(c.id, need).await? {
                     available = true;
+                    chosen = Some(c);
                     break;
                 }
             }
-            out.push((rid, available));
+            if let Some(c) = chosen {
+                out.push(AppRegionAvailability {
+                    region_id: rid,
+                    available,
+                    ingress_domain: c.ingress_domain.clone(),
+                });
+            }
         }
         Ok(out)
     }
+}
+
+/// A region an app can be deployed in: whether it currently has capacity plus
+/// the cluster ingress base domain, so the client can preview the hostname
+/// (`{deployment-name}.{ingress_domain}`) before ordering.
+#[derive(Debug, Clone)]
+pub struct AppRegionAvailability {
+    pub region_id: u64,
+    pub available: bool,
+    pub ingress_domain: String,
 }
 
 #[cfg(test)]
