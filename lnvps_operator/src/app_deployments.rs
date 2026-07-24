@@ -731,19 +731,24 @@ async fn reconcile_one(
     let env = compose.resolve_env(&vars)?;
     let files = compose.resolve_files(&vars)?;
 
-    // Retention: an expired (unpaid) subscription scales the workload to 0
-    // replicas — pods stop but the PVCs (customer data) are retained. The
-    // deployment is only fully torn down (namespace GC) on real deletion.
-    let expired = ctx
+    // Billing gate + retention. The workload only runs when the subscription is
+    // set up (paid at least once) and not expired. A freshly-ordered, unpaid
+    // deployment (not set up) stays at 0 replicas; an expired one scales to 0
+    // but keeps its PVCs (customer data) — only real deletion tears it down.
+    let sub = ctx
         .db
         .get_subscription_by_line_item_id(deployment.subscription_line_item_id)
         .await
-        .ok()
+        .ok();
+    let paid = sub.as_ref().map(|s| s.is_setup).unwrap_or(false);
+    let expired = sub
+        .as_ref()
         .and_then(|s| s.expires)
         .map(|e| e < chrono::Utc::now())
         .unwrap_or(false);
     let running = deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running
         && !deployment.deleted
+        && paid
         && !expired;
     let replicas = if running { 1 } else { 0 };
 

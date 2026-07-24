@@ -585,6 +585,41 @@ pub async fn seed_app_deployment(
     Ok((app_id, cluster_id, dep_id))
 }
 
+/// Seed an enabled catalog app (small footprint) + a cluster with capacity in an
+/// existing region. Returns `(app_id, cluster_id, region_id)`. Used to exercise
+/// the customer ordering flow.
+pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64, u64)> {
+    let suffix = hex::encode(&rand_bytes32()[..4]);
+    let (region_id,): (u64,) = sqlx::query_as("SELECT MIN(id) FROM region")
+        .fetch_one(pool)
+        .await?;
+
+    // App with a real (small) footprint and a valid single-service compose.
+    let (app_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app (name, display_name, description, icon, compose, amount, currency, \
+             interval_amount, interval_type, setup_amount, enabled, cpu_milli, memory_bytes, \
+             storage_bytes) \
+         VALUES (?, 'E2E Orderable', NULL, NULL, \
+             'services:\\n  web:\\n    image: example/web:latest\\n    ports:\\n      - { name: http, container: 80, protocol: http, expose: ingress }\\nconfig:\\n  - { name: title, type: string, default: \"hi\" }\\n', \
+             1000, 'USD', 1, 1, 0, 1, 250, 268435456, 0) RETURNING id",
+    )
+    .bind(format!("orderable-{suffix}"))
+    .fetch_one(pool)
+    .await?;
+
+    let (cluster_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled, capacity_cpu_milli, \
+             capacity_memory_bytes, capacity_storage_bytes) \
+         VALUES (?, ?, 'apps.e2e.example.com', 1, 8000, 8589934592, 107374182400) RETURNING id",
+    )
+    .bind(format!("ordercluster-{suffix}"))
+    .bind(region_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((app_id, cluster_id, region_id))
+}
+
 fn random_mac() -> String {
     let b = rand_bytes32();
     format!(

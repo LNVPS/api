@@ -961,4 +961,102 @@ mod tests {
 
         pool.close().await;
     }
+
+    #[tokio::test]
+    async fn test_app_deployment_ordering() {
+        let keys = nostr::Keys::generate();
+        let client = user_client_with_keys(keys.clone());
+        let pool = crate::db::connect().await.unwrap();
+        let (app_id, _cluster_id, region_id) =
+            crate::db::seed_app_and_cluster(&pool).await.unwrap();
+
+        // Order a deployment.
+        let resp = client
+            .post_auth(
+                "/api/v1/app-deployments",
+                &serde_json::json!({
+                    "app_id": app_id,
+                    "name": "my-app",
+                    "region_id": region_id,
+                    "config": { "title": "Hello" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "ordering should succeed");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let dep_id = body["data"]["id"].as_u64().expect("deployment id");
+        assert_eq!(body["data"]["name"].as_str().unwrap(), "my-app");
+        // New order is pending (unpaid) and has a billing subscription.
+        assert_eq!(body["data"]["status"].as_str().unwrap(), "pending");
+        assert!(body["data"]["subscription_id"].as_u64().is_some());
+
+        // Invalid name is rejected.
+        let resp = client
+            .post_auth(
+                "/api/v1/app-deployments",
+                &serde_json::json!({"app_id": app_id, "name": "Bad Name", "region_id": region_id, "config": {}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "bad name rejected");
+
+        // Unknown config field is rejected.
+        let resp = client
+            .post_auth(
+                "/api/v1/app-deployments",
+                &serde_json::json!({"app_id": app_id, "name": "ok", "region_id": region_id, "config": {"nope": "x"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown config rejected"
+        );
+
+        // No capacity in a bogus region.
+        let resp = client
+            .post_auth(
+                "/api/v1/app-deployments",
+                &serde_json::json!({"app_id": app_id, "name": "ok", "region_id": 99999999u64, "config": {}}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "no capacity -> rejected");
+
+        // Stop / start toggles desired_state.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep_id}/stop"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["desired_state"].as_str().unwrap(), "stopped");
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep_id}/start"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Delete removes it from the user's listing.
+        let resp = client
+            .delete_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .get_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "deleted -> 404");
+
+        pool.close().await;
+    }
 }

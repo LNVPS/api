@@ -1271,7 +1271,37 @@ interface ReferralState extends Referral {
 
 ### Managed Apps
 
-Browse the catalog of predefined apps (e.g. Nostr relay, Blossom) and view your own deployments. These endpoints are **read-only**; deployment ordering and lifecycle control are added in a later release.
+Browse the catalog of predefined apps (e.g. Nostr relay, Blossom), order your own deployments, and manage their lifecycle.
+
+#### Order a Deployment
+- **POST** `/api/v1/app-deployments`
+- **Auth**: Required
+- **Body**:
+```typescript
+interface CreateAppDeploymentRequest {
+  app_id: number;                        // catalog app to deploy
+  name: string;                          // DNS-safe label (lowercase letters/digits/hyphens, ≤40), becomes the subdomain
+  region_id: number;                     // region to deploy in; a cluster there with capacity is chosen
+  config?: { [field: string]: string };  // values for the app's `config` fields
+}
+```
+- **Response**: `AppDeployment` — created in `pending` state with a billing subscription; **pay the subscription** (`GET /api/v1/subscriptions/{subscription_id}/renew`) to activate it. The operator starts the workload once paid.
+- **Errors**: `400` for an invalid `name`, missing required / unknown `config` fields, or when no cluster in the region has enough capacity; `404` if the app doesn't exist or isn't offered.
+
+#### Stop / Start a Deployment
+- **PATCH** `/api/v1/app-deployments/{id}/stop` — scale to 0 (data retained)
+- **PATCH** `/api/v1/app-deployments/{id}/start` — resume
+- **Auth**: Required
+- **Response**: `AppDeployment`
+- **Error**: `404` if not found or not owned by you
+
+#### Delete a Deployment
+- **DELETE** `/api/v1/app-deployments/{id}`
+- **Auth**: Required
+- **Response**: `true` — stops billing (deactivates the subscription) and tears the deployment down (namespace + volumes removed).
+- **Error**: `404` if not found or not owned by you
+
+The catalog + read endpoints below are unauthenticated-safe views of what you can deploy and what you're running.
 
 #### List Catalog Apps
 - **GET** `/api/v1/apps`
