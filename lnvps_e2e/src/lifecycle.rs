@@ -1073,7 +1073,7 @@ mod tests {
             crate::worker::publish_job("\"ProcessReferralPayouts\"")
                 .await
                 .unwrap();
-            let both_paid = poll_until(30, 500, || {
+            let both_paid = poll_until(60, 500, || {
                 let pool = pool.clone();
                 async move {
                     let p1 = crate::db::list_referral_payouts(&pool, oc1_ref_id)
@@ -1143,8 +1143,9 @@ mod tests {
                 );
                 eprintln!("Referral payout idempotency verified (no double-pay)");
             } else {
-                eprintln!(
-                    "Skipping referral payout assertions: on-chain batch not settled (LND on-chain unavailable?)"
+                panic!(
+                    "on-chain referral payout batch was not recorded within the timeout \
+                     (referrers {oc1_ref_id}/{oc2_ref_id})"
                 );
             }
 
