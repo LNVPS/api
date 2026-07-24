@@ -1269,6 +1269,61 @@ interface ReferralState extends Referral {
 }
 ```
 
+### Managed Apps
+
+Browse the catalog of predefined apps (e.g. Nostr relay, Blossom) and view your own deployments. These endpoints are **read-only**; deployment ordering and lifecycle control are added in a later release.
+
+#### List Catalog Apps
+- **GET** `/api/v1/apps`
+- **Auth**: Required
+- **Response**: `App[]` — all currently offered apps
+
+#### Get Catalog App
+- **GET** `/api/v1/apps/{id}`
+- **Auth**: Required
+- **Response**: `App`
+- **Error**: `404` if the app doesn't exist or isn't currently offered
+
+#### List Your Deployments
+- **GET** `/api/v1/app-deployments`
+- **Auth**: Required
+- **Response**: `AppDeployment[]` — your deployments (most recent first)
+
+#### Get Your Deployment
+- **GET** `/api/v1/app-deployments/{id}`
+- **Auth**: Required
+- **Response**: `AppDeployment`
+- **Error**: `404` if not found or not owned by you
+
+**Response Types:**
+```typescript
+interface App {
+  id: number;
+  name: string;              // URL/DNS-safe slug
+  display_name: string;
+  description?: string;
+  icon?: string;
+  compose: string;           // docker-compose-style YAML; render the config form (ports/env) from this
+  amount: number;            // recurring price in smallest currency units (cents / millisats)
+  currency: string;
+  interval_amount: number;
+  interval_type: "day" | "month" | "year";
+  setup_amount: number;      // one-off setup fee in smallest currency units (0 = none)
+}
+
+interface AppDeployment {
+  id: number;
+  app_id: number;            // catalog app being run
+  name: string;              // your instance name
+  hostname?: string;         // public endpoint host once assigned (null until reconciled, or for apps with no ingress port)
+  desired_state: "running" | "stopped";
+  status: "pending" | "running" | "stopped" | "error" | "deleting";
+  status_message?: string;   // operator status/error detail when present
+  subscription_id?: number;  // subscription this deployment is billed under (renew via the subscription endpoints)
+  created: string;           // ISO 8601 datetime
+}
+```
+
 ### Monitoring and History
 
 #### Get VM Time Series Data

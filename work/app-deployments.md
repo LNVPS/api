@@ -61,11 +61,16 @@ images (higher isolation risk — design the boundary in now).
 - [x] Unit test (validate_app_fields) + e2e admin CRUD test (apps + clusters, auth enforcement).
 - [x] ADMIN_API_ENDPOINTS.md + API_CHANGELOG.md.
 
-### Increment 3 — Customer API
-- [ ] `GET /api/v1/apps` (catalog), create deployment (→ subscription + line item + invoice,
-      mirroring VM order), list/get/delete deployments, status + endpoint.
-- [ ] Validate submitted env/config against the app's compose env schema.
-- [ ] Tests + API_DOCUMENTATION.md + API_CHANGELOG.md.
+### Increment 3a — Customer API (read-only) (DONE, PR pending)
+- [x] `GET /api/v1/apps`, `GET /api/v1/apps/{id}` (catalog); `GET /api/v1/app-deployments`,
+      `GET /api/v1/app-deployments/{id}` (own deployments, ownership-checked).
+- [x] ApiApp / ApiAppDeployment response models (compose exposed for the deploy form;
+      subscription_id resolved from the line item).
+- [x] e2e customer test (seed_app_deployment helper) + API_DOCUMENTATION.md + API_CHANGELOG.md.
+
+### Increment 3b — Customer ordering / lifecycle (billing) — TODO
+- [ ] Create deployment (validate config vs compose env schema → subscription + line item
+      (type App) + payment invoice, mirroring VM order); delete/stop/start; renew via subscription.
 
 ### Increment 4 — Operator reconcile
 - [ ] `lnvps_operator/src/app_deployments.rs`: parse compose YAML + deployment config →

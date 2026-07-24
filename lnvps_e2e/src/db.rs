@@ -518,6 +518,73 @@ pub async fn seed_referrer_with_commission(
     Ok((referral_id, vm_id))
 }
 
+/// Seed a full app deployment (catalog app + cluster + subscription/line-item +
+/// deployment) owned by `user_id`. Returns `(app_id, cluster_id, deployment_id)`.
+/// Used to exercise the read-only customer app endpoints before the ordering
+/// flow exists.
+pub async fn seed_app_deployment(
+    pool: &MySqlPool,
+    user_id: u64,
+    name: &str,
+) -> anyhow::Result<(u64, u64, u64)> {
+    let suffix = hex::encode(&rand_bytes32()[..4]);
+    let slug = format!("{name}-{suffix}");
+
+    let (app_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app (name, display_name, description, icon, compose, amount, currency, \
+             interval_amount, interval_type, setup_amount, enabled) \
+         VALUES (?, 'E2E App', NULL, NULL, 'services: {}', 1000, 'USD', 1, 1, 0, 1) RETURNING id",
+    )
+    .bind(&slug)
+    .fetch_one(pool)
+    .await?;
+
+    let (cluster_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled) \
+         VALUES (?, (SELECT MIN(id) FROM region), 'apps.e2e.example.com', 1) RETURNING id",
+    )
+    .bind(&slug)
+    .fetch_one(pool)
+    .await?;
+
+    let (sub_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO subscription (user_id, company_id, name, description, created, expires, \
+             is_active, is_setup, currency, interval_amount, interval_type, setup_fee, \
+             auto_renewal_enabled, external_id) \
+         VALUES (?, (SELECT MIN(id) FROM company), 'e2e-app-sub', NULL, NOW(), NULL, 1, 1, \
+             'USD', 1, 1, 0, 0, NULL) RETURNING id",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    // subscription_type = 4 (App)
+    let (li_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, \
+             description, amount, setup_amount, configuration) \
+         VALUES (?, 4, 'app', NULL, 1000, 0, NULL) RETURNING id",
+    )
+    .bind(sub_id)
+    .fetch_one(pool)
+    .await?;
+
+    let (dep_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app_deployment (user_id, app_id, cluster_id, subscription_line_item_id, \
+             name, namespace, hostname, config, desired_state, status, status_message) \
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, NULL) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(app_id)
+    .bind(cluster_id)
+    .bind(li_id)
+    .bind(name)
+    .bind(&slug)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((app_id, cluster_id, dep_id))
+}
+
 fn random_mac() -> String {
     let b = rand_bytes32();
     format!(
