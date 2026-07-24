@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **App catalog is now public** (issue #227) — `GET /api/v1/apps`, `GET /api/v1/apps/{id}` and `GET /api/v1/apps/{id}/regions` no longer require `Nip98Auth`, mirroring `GET /api/v1/vm/templates`. The catalog is a shopping/marketing surface, so anonymous visitors and SSR homepages can browse offered apps (and per-region availability) without logging in. All user-owned deployment endpoints (`/api/v1/app-deployments...`) remain authenticated.
+
 ### Added
 
 - **Managed app deployments — deployable regions per app** (issue #225) — new customer endpoint `GET /api/v1/apps/{id}/regions` lists every region with an enabled app cluster, each flagged `available: true/false` for whether a cluster there currently has enough free capacity for that app. This gives the deploy-form region picker a valid source (show full regions disabled instead of failing at order time) and returns the `region_id` values accepted by `POST /api/v1/app-deployments`. Read-only, additive.

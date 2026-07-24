@@ -908,6 +908,17 @@ mod tests {
             .await
             .unwrap();
 
+        // Catalog is public (no auth) — issue #227.
+        let resp = client.get("/api/v1/apps").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "catalog list is public");
+        let resp = client.get(&format!("/api/v1/apps/{app_id}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "catalog get is public");
+        let resp = client
+            .get(&format!("/api/v1/apps/{app_id}/regions"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "catalog regions is public");
+
         // Catalog listing includes the seeded (enabled) app.
         let resp = client.get_auth("/api/v1/apps").await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

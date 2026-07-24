@@ -136,17 +136,16 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
 }
 
 /// List all enabled catalog apps.
-async fn v1_list_apps(_auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<Vec<ApiApp>> {
+///
+/// Public (no auth) — the catalog is a shopping/marketing surface, mirroring
+/// `GET /api/v1/vm/templates`.
+async fn v1_list_apps(State(this): State<RouterState>) -> ApiResult<Vec<ApiApp>> {
     let apps = this.db.list_apps(true).await?;
     ApiData::ok(apps.into_iter().map(Into::into).collect())
 }
 
-/// Get a single enabled catalog app.
-async fn v1_get_app(
-    _auth: Nip98Auth,
-    State(this): State<RouterState>,
-    Path(id): Path<u64>,
-) -> ApiResult<ApiApp> {
+/// Get a single enabled catalog app. Public (no auth), like the list.
+async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> ApiResult<ApiApp> {
     let app = this.db.get_app(id).await?;
     if !app.enabled {
         return Err(ApiError::not_found("App not found"));
@@ -156,8 +155,8 @@ async fn v1_get_app(
 
 /// List the regions this app can be deployed in (regions with an enabled
 /// cluster), each flagged with whether it currently has capacity for the app.
+/// Public (no auth) so the deploy form can show availability pre-login.
 async fn v1_list_app_regions(
-    _auth: Nip98Auth,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<Vec<ApiAppRegion>> {

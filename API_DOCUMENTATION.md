@@ -1305,18 +1305,18 @@ The catalog + read endpoints below are unauthenticated-safe views of what you ca
 
 #### List Catalog Apps
 - **GET** `/api/v1/apps`
-- **Auth**: Required
+- **Auth**: None (public, like `GET /api/v1/vm/templates`)
 - **Response**: `App[]` — all currently offered apps
 
 #### Get Catalog App
 - **GET** `/api/v1/apps/{id}`
-- **Auth**: Required
+- **Auth**: None (public)
 - **Response**: `App`
 - **Error**: `404` if the app doesn't exist or isn't currently offered
 
 #### List Deployable Regions for an App
 - **GET** `/api/v1/apps/{id}/regions`
-- **Auth**: Required
+- **Auth**: None (public)
 - **Response**: `{ id: number, name: string, available: boolean }[]` — every region
   with an enabled app cluster. `available` is `true` when a cluster there
   currently has enough free capacity for this app; `false` regions can be
