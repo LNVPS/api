@@ -95,11 +95,26 @@ images (higher isolation risk — design the boundary in now).
 - [x] `resolve_files(vars) -> {service: [ResolvedFile{path,content,sensitive}]}`;
       `referenced_vars` also scans file content. Distinct from `volumes:` (PVC, read-write).
 
-### Increment 4b — Operator reconcile — TODO
-- [ ] `lnvps_operator/src/app_deployments.rs`: use `lnvps_compose` to map compose + deployment
-      config → Namespace + Deployment/StatefulSet + Service + Ingress + PVC + Secret (generated) +
-      NetworkPolicy + ResourceQuota, locked-down securityContext; status write-back; teardown on
-      delete. Filter by the operator's configured `cluster_id`. Wire into the reconcile loop.
+### Increment 4b — Operator reconcile (DONE, PR pending)
+- [x] `lnvps_operator/src/app_deployments.rs`: pure k8s object builders (Namespace w/ restricted
+      PSS, default-deny NetworkPolicy, PVC, ConfigMap/Secret for files, Deployment w/ locked-down
+      securityContext + PVC/file subPath mounts, ClusterIP Service, cert-manager Ingress) — all
+      unit-tested (13). Generated-secret stability via a namespace `generated` Secret.
+- [x] `reconcile_app_deployments(ctx)`: server-side apply per deployment (filtered by the
+      operator's `app_cluster_id`), resolve env+files via `lnvps_compose`, status/hostname
+      write-back, and namespace GC for removed/deleted deployments. Wired into the reconcile loop.
+- [ ] ResourceQuota + container resource requests deferred to the capacity increment (a
+      `limits.*` quota needs container limits first). Builder present, `#[allow(dead_code)]`.
+
+### Increment 4c — Capacity management (NEXT, decided)
+- [ ] Compose: per-service `resources: { cpu, memory }`; compute app footprint (Σ services + Σ
+      volume sizes) → store `cpu_milli`/`memory_bytes`/`storage_bytes` on `app` at catalog save.
+- [ ] DB: `app` footprint columns + `app_cluster` static `capacity_*` columns (admin-set). 1:1, no
+      overcommit for MVP.
+- [ ] `AppClusterCapacityService` (mirrors `HostCapacityService`): available = capacity − Σ active
+      footprints; used at order time (3b) for admission + cluster selection in a region.
+- [ ] Operator: set container requests/limits from `resources:` and apply the ResourceQuota.
+- [ ] Admin: compute+expose footprint; capacity fields on cluster create/update.
 
 ### Increment 5 — Seed launch apps
 - [ ] Seed **strfry**, **haven relay**, **route96 (+ MariaDB)**, **generic Blossom** (compose
