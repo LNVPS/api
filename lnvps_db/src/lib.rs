@@ -984,6 +984,42 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Count VMs that used this referral code but have never made a paid subscription payment.
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
+
+    // ----- App catalog -----
+
+    /// List catalog apps. When `enabled_only` is set, only apps offered in the
+    /// catalog are returned (for the customer-facing listing).
+    async fn list_apps(&self, enabled_only: bool) -> DbResult<Vec<App>>;
+    async fn get_app(&self, id: u64) -> DbResult<App>;
+    async fn get_app_by_name(&self, name: &str) -> DbResult<App>;
+    async fn insert_app(&self, app: &App) -> DbResult<u64>;
+    async fn update_app(&self, app: &App) -> DbResult<()>;
+    async fn delete_app(&self, id: u64) -> DbResult<()>;
+
+    // ----- App clusters -----
+
+    /// List app clusters. When `enabled_only` is set, only clusters that accept
+    /// new deployments are returned.
+    async fn list_app_clusters(&self, enabled_only: bool) -> DbResult<Vec<AppCluster>>;
+    async fn get_app_cluster(&self, id: u64) -> DbResult<AppCluster>;
+    async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64>;
+    async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()>;
+    async fn delete_app_cluster(&self, id: u64) -> DbResult<()>;
+
+    // ----- App deployments -----
+
+    /// List a user's app deployments (excludes soft-deleted rows).
+    async fn list_user_app_deployments(&self, user_id: u64) -> DbResult<Vec<AppDeployment>>;
+    /// List every non-deleted app deployment (used by the operator to reconcile).
+    async fn list_all_app_deployments(&self) -> DbResult<Vec<AppDeployment>>;
+    async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment>;
+    /// Resolve the deployment billed by a given subscription line item.
+    async fn get_app_deployment_by_line_item(&self, line_item_id: u64) -> DbResult<AppDeployment>;
+    async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64>;
+    async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()>;
+    /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down
+    /// the Kubernetes resources on its next reconcile.
+    async fn delete_app_deployment(&self, id: u64) -> DbResult<()>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

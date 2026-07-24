@@ -828,6 +828,9 @@ pub enum ApiSubscriptionLineItemResource {
     /// A sponsored AS number.
     #[serde(rename = "asn")]
     Asn { asn_subscription_id: u64 },
+    /// A managed app deployment.
+    #[serde(rename = "app")]
+    App { app_deployment_id: u64 },
 }
 
 impl ApiSubscriptionLineItemResource {
@@ -860,6 +863,13 @@ impl ApiSubscriptionLineItemResource {
                 .and_then(|subs| subs.into_iter().next())
                 .map(|sub| Self::Asn {
                     asn_subscription_id: sub.id,
+                }),
+            SubscriptionType::App => db
+                .get_app_deployment_by_line_item(line_item.id)
+                .await
+                .ok()
+                .map(|d| Self::App {
+                    app_deployment_id: d.id,
                 }),
             SubscriptionType::DnsHosting => None,
         }
