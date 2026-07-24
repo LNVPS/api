@@ -16,9 +16,12 @@ pub struct LaunchApp {
     pub amount_cents: u64,
 }
 
+// strfry has no official image; dockurr/strfry is the widely-used community
+// build. It reads /etc/strfry.conf and listens on 7777 (bind must be 0.0.0.0
+// inside a container). Data lives under /app/strfry-db.
 const STRFRY: &str = r#"services:
   strfry:
-    image: ghcr.io/hoytech/strfry:latest
+    image: dockurr/strfry:latest
     resources: { cpu: 500m, memory: 512Mi }
     ports:
       - { name: ws, container: 7777, protocol: http, expose: ingress }
@@ -27,12 +30,12 @@ const STRFRY: &str = r#"services:
         content: |
           db = "/app/strfry-db/"
           relay {
-            bind = "0.0.0.0"
-            port = 7777
-            info {
-              name = "${relay_name}"
-              description = "${relay_description}"
-            }
+              bind = "0.0.0.0"
+              port = 7777
+              info {
+                  name = "${relay_name}"
+                  description = "${relay_description}"
+              }
           }
     volumes:
       - { name: db, path: /app/strfry-db, size: 5Gi }
@@ -41,54 +44,45 @@ config:
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
 "#;
 
-const HAVEN: &str = r#"services:
-  haven:
-    image: ghcr.io/bitvora/haven:latest
-    resources: { cpu: 500m, memory: 512Mi }
-    ports:
-      - { name: http, container: 3355, protocol: http, expose: ingress }
-    env:
-      OWNER_NPUB: "${owner_npub}"
-      RELAY_URL: "https://${HOSTNAME}"
-    volumes:
-      - { name: db, path: /app/db, size: 10Gi }
-      - { name: blossom, path: /app/blossom, size: 20Gi }
-config:
-  - { name: owner_npub, label: "Owner npub", type: string, required: true }
-"#;
-
+// route96 (voidic/route96) is a YAML-config Blossom/NIP-96 server backed by
+// MySQL. Config is a file at /app/config.yaml; it reaches MariaDB via the
+// in-namespace service name `db`. See route96 config.prod.yaml / docker-compose.
 const ROUTE96: &str = r#"services:
-  mariadb:
+  db:
     image: mariadb:11
     resources: { cpu: 500m, memory: 512Mi }
     env:
-      MARIADB_DATABASE: route96
-      MARIADB_USER: route96
-      MARIADB_PASSWORD: ${DB_PASSWORD}
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: route96
     volumes:
       - { name: data, path: /var/lib/mysql, size: 5Gi }
     backup:
-      command: ["sh", "-c", "mariadb-dump --all-databases -uroute96 -p$DB_PASSWORD"]
+      command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
       artifact: route96.sql
   route96:
-    image: ghcr.io/v0l/route96:latest
+    image: voidic/route96:latest
     resources: { cpu: 500m, memory: 512Mi }
-    depends_on: [mariadb]
+    depends_on: [db]
     ports:
       - { name: http, container: 8000, protocol: http, expose: ingress }
-    env:
-      DATABASE: "mysql://route96:${DB_PASSWORD}@mariadb:3306/route96"
-      PUBLIC_URL: "https://${HOSTNAME}"
+    files:
+      - path: /app/config.yaml
+        content: |
+          listen: "0.0.0.0:8000"
+          database: "mysql://root:${DB_ROOT_PASSWORD}@db:3306/route96"
+          storage_dir: "/app/data"
+          max_upload_bytes: 104857600
+          public_url: "https://${HOSTNAME}"
     volumes:
       - { name: blobs, path: /app/data, size: 20Gi }
     backup:
       volume: blobs
 secrets:
-  - { name: DB_PASSWORD, generate: password }
   - { name: DB_ROOT_PASSWORD, generate: password }
 "#;
 
+// hzrd149/blossom-server (Deno). YAML config at /app/config.yml; listens on
+// 3000; SQLite + blobs under /app/data. `publicDomain` is a BARE hostname.
 const BLOSSOM: &str = r#"services:
   blossom:
     image: ghcr.io/hzrd149/blossom-server:master
@@ -98,12 +92,20 @@ const BLOSSOM: &str = r#"services:
     files:
       - path: /app/config.yml
         content: |
-          publicDomain: "https://${HOSTNAME}"
-          databasePath: /app/data/sqlite.db
+          port: 3000
+          host: 0.0.0.0
+          publicDomain: "${HOSTNAME}"
+          database:
+            path: /app/data/sqlite.db
           storage:
             backend: local
             local:
               dir: /app/data/blobs
+            rules:
+              - { type: "*", expiration: "1 month" }
+          upload:
+            enabled: true
+            requireAuth: true
     volumes:
       - { name: data, path: /app/data, size: 20Gi }
 "#;
@@ -114,28 +116,21 @@ pub fn launch_apps() -> Vec<LaunchApp> {
         LaunchApp {
             name: "strfry",
             display_name: "strfry Relay",
-            description: "A high-performance personal Nostr relay (C++/LMDB).",
+            description: "A high-performance personal Nostr relay (C++/LMDB). Uses the community dockurr/strfry image.",
             compose: STRFRY,
             amount_cents: 500,
         },
         LaunchApp {
-            name: "haven",
-            display_name: "HAVEN Relay",
-            description: "Four relays in one plus a Blossom media server - a sovereign personal Nostr setup.",
-            compose: HAVEN,
-            amount_cents: 800,
-        },
-        LaunchApp {
             name: "route96",
             display_name: "route96 (Blossom + NIP-96)",
-            description: "A Blossom / NIP-96 media server backed by MariaDB.",
+            description: "A Blossom / NIP-96 media server (voidic/route96) backed by MariaDB.",
             compose: ROUTE96,
             amount_cents: 1000,
         },
         LaunchApp {
             name: "blossom",
             display_name: "Blossom Server",
-            description: "A simple Blossom blob/media server with local storage.",
+            description: "A simple Blossom blob/media server (hzrd149/blossom-server) with local storage.",
             compose: BLOSSOM,
             amount_cents: 500,
         },

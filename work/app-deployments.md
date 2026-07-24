@@ -134,11 +134,16 @@ images (higher isolation risk — design the boundary in now).
       e2e admin test asserts footprint + capacity echo.
 
 ### Increment 5 — Seed launch apps (DONE, PR pending)
-- [x] `lnvps_api_admin::app_seeds`: validated compose definitions for **strfry**, **HAVEN**,
-      **route96 (+ MariaDB)**, **generic Blossom**; `seed_launch_apps(db)` inserts missing ones
-      **disabled** (operator reviews/prices before enabling) with footprint computed from compose.
-      Wired into `generate_demo_data`. Unit tests: all composes parse + have footprint; seed is
-      idempotent (MockDb).
+- [x] `lnvps_api_admin::app_seeds`: validated compose definitions matching each project's real
+      deploy docs — **strfry** (`dockurr/strfry`, /etc/strfry.conf, bind 0.0.0.0), **route96 +
+      MariaDB** (`voidic/route96`, /app/config.yaml, DB via service `db`), **Blossom**
+      (`ghcr.io/hzrd149/blossom-server`, /app/config.yml, bare `publicDomain`). `seed_launch_apps(db)`
+      inserts missing ones **disabled** with footprint computed from compose. Wired into
+      `generate_demo_data`. Unit tests: all composes parse + have footprint; seed idempotent.
+- [x] **HAVEN dropped** from the seed: no official image, and the community `haven-docker` image
+      requires a mounted `templates/` directory of binary web assets + 4 JSON files, which the
+      ConfigMap-file model can't provide cleanly. Revisit if a self-contained HAVEN image exists
+      (or build one bundling templates).
 
 ### Increment 6 — Volume backups (post-MVP)
 - [ ] Compose `backup:` grammar (per-service `command:` app-native dump | `volume:` raw tar;
