@@ -3260,6 +3260,7 @@ Returns a paginated list of `AdminReferralInfo`:
       "user_pubkey": "<hex>",
       "code": "ALPHA123",
       "lightning_address": "user@domain.com",
+      "onchain_address": null,
       "mode": "lightning_address",
       "referral_rate": 12.5,
       "created": "2026-07-18T10:00:00Z"
@@ -3291,12 +3292,13 @@ Returns the referral plus per-currency earned commission, payout history and cou
     "user_pubkey": "<hex>",
     "code": "ALPHA123",
     "lightning_address": "user@domain.com",
+    "onchain_address": null,
     "mode": "lightning_address",
     "referral_rate": 12.5,
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "payouts": [
-      { "id": 1, "amount": 5000, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "invoice": "lnbc...", "pre_image": "<hex>" }
+      { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
     ],
     "referrals_success": 3,
     "referrals_failed": 1
@@ -3336,7 +3338,7 @@ GET /api/admin/v1/referrals/{id}/payouts
 
 Required Permission: `referral::view`
 
-Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first.
+Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first. Each record carries `fee` (the network/routing fee charged to the referrer, debited from their balance), `mode` (`lightning_address`/`nwc`/`on_chain`), and `output` (a BOLT11 invoice for Lightning payouts, or the on-chain outpoint `"{txid}:{vout}"` for on-chain payouts; batched rows share the txid but carry distinct vouts).
 
 #### Create Referral Payout
 
@@ -3354,8 +3356,10 @@ Creates a manual payout record (e.g. reconciling an out-of-band payment).
   // Required - smallest currency unit, > 0
   "currency": "BTC",
   // Required
-  "invoice": "lnbc...",
-  // Optional - associated Lightning invoice
+  "output": "lnbc...",
+  // Optional - payout output reference (BOLT11 invoice or on-chain outpoint)
+  "mode": "lightning_address",
+  // Optional - payout mode (lightning_address|nwc|on_chain), default lightning_address
   "is_paid": false
   // Optional - mark already paid (default false)
 }
@@ -3373,12 +3377,16 @@ Required Permission: `referral::update`
 {
   "is_paid": true,
   // Optional - mark paid/unpaid
-  "invoice": "lnbc...",
-  // Optional - set (string) or clear (null) the invoice
+  "output": "lnbc... | <txid>:<vout>",
+  // Optional - set (string) or clear (null) the payout output reference
+  "mode": "on_chain",
+  // Optional - change the payout mode (lightning_address|nwc|on_chain)
   "pre_image": "<hex>"
   // Optional - set (hex, 32 bytes) or clear (null) the payment preimage
 }
 ```
+
+> **Automated on-chain payouts** (referrer `mode` = `on_chain`) are sent by a worker that batches **every eligible on-chain referrer into a single send-many transaction**. The **network fee is charged to the referrers**: the transaction fee is split across the batch in proportion to each payout and recorded in `fee`, debited from the referrer's balance (which may go negative, recovered from future referrals). Before broadcasting, the next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds `max-onchain-fee-per-vbyte`** (default 50). Eligibility uses the `min-onchain-payout-sats` threshold (default 1000). Rows from one batch share the txid but carry distinct vouts in their `outpoint`.
 
 ### Reports
 

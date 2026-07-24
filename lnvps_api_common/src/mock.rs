@@ -2963,7 +2963,7 @@ impl LNVpsDbBase for MockDb {
         if let Some(r) = referrals.get_mut(&referral.id) {
             let old_code = r.code.clone();
             r.code = referral.code.clone();
-            r.lightning_address = referral.lightning_address.clone();
+            r.address = referral.address.clone();
             r.mode = referral.mode;
             r.referral_rate = referral.referral_rate;
             // Cascade a code rename onto VMs that recorded the old code so
@@ -3013,8 +3013,10 @@ impl LNVpsDbBase for MockDb {
         let mut payouts = self.referral_payouts.lock().await;
         if let Some(p) = payouts.iter_mut().find(|p| p.id == payout.id) {
             p.is_paid = payout.is_paid;
-            p.invoice = payout.invoice.clone();
+            p.mode = payout.mode;
+            p.output = payout.output.clone();
             p.pre_image = payout.pre_image.clone();
+            p.fee = payout.fee;
         }
         Ok(())
     }
@@ -4123,7 +4125,7 @@ mod tests {
             id: 0,
             user_id: 1,
             code: code.to_string(),
-            lightning_address: Some("a@b.com".to_string()),
+            address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
             created: Utc::now(),
@@ -4149,7 +4151,7 @@ mod tests {
             id: 0,
             user_id: 1,
             code: "OLDCODE".to_string(),
-            lightning_address: Some("a@b.com".to_string()),
+            address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
             created: Utc::now(),
@@ -4213,7 +4215,7 @@ mod tests {
             id: 0,
             user_id: 1,
             code: code.to_string(),
-            lightning_address: Some("a@b.com".to_string()),
+            address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
             created: Utc::now(),

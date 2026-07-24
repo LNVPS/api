@@ -32,10 +32,12 @@ pub fn router() -> Router<RouterState> {
 pub struct ApiReferral {
     /// The referral code to share with others
     pub code: String,
-    /// Lightning address for automatic payouts (used when `mode` is
-    /// `lightning_address`)
-    pub lightning_address: Option<String>,
-    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    /// Payout target address; its type is determined by `mode`: a Lightning
+    /// address for `lightning_address`, an on-chain Bitcoin address for
+    /// `on_chain`, absent for `nwc`.
+    pub address: Option<String>,
+    /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
+    /// `on_chain`.
     pub mode: String,
     /// Per-referrer commission override, as a whole percentage of a referred
     /// VM's first payment. `null` means the referred VM's company default rate
@@ -55,7 +57,7 @@ impl From<Referral> for ApiReferral {
     fn from(r: Referral) -> Self {
         Self {
             code: r.code,
-            lightning_address: r.lightning_address,
+            address: r.address,
             mode: r.mode.to_string(),
             // Fallback until resolved against the default company rate by the
             // handler (see `resolve_effective_rate`).
@@ -100,11 +102,21 @@ pub struct ApiReferralEarning {
 pub struct ApiReferralPayout {
     pub id: u64,
     pub amount: u64,
+    /// Network/routing fee charged to you for this payout (smallest currency
+    /// unit), debited from your balance alongside `amount`.
+    pub fee: u64,
     pub currency: String,
     pub created: chrono::DateTime<Utc>,
     pub is_paid: bool,
-    pub invoice: Option<String>,
-    /// Payment preimage (hex), present once the payout has settled.
+    /// How this payout was made: `lightning_address`, `nwc`, or `on_chain`.
+    /// Tells you how to interpret `output`.
+    pub mode: String,
+    /// The payout output reference: a BOLT11 invoice for a Lightning payout, or
+    /// the on-chain outpoint (`"{txid}:{vout}"`) for an on-chain payout.
+    /// On-chain payouts are batched into one transaction, so rows share the txid
+    /// but carry distinct vouts.
+    pub output: Option<String>,
+    /// Payment preimage (hex), present once a Lightning payout has settled.
     pub pre_image: Option<String>,
 }
 
@@ -113,10 +125,12 @@ impl From<ReferralPayout> for ApiReferralPayout {
         Self {
             id: p.id,
             amount: p.amount,
+            fee: p.fee,
             currency: p.currency,
             created: p.created,
             is_paid: p.is_paid,
-            invoice: p.invoice,
+            mode: p.mode.to_string(),
+            output: p.output,
             pre_image: p.pre_image.map(hex::encode),
         }
     }
@@ -189,23 +203,28 @@ pub struct ApiReferralUsage {
 /// Request to sign up for the referral program
 #[derive(Deserialize)]
 pub struct ApiReferralSignupRequest {
-    /// Lightning address for payouts (required when `mode` is `lightning_address`)
-    pub lightning_address: Option<String>,
-    /// Payout method: `lightning_address` (default) or `nwc`.
+    /// Payout target address. Required and validated according to `mode`: a
+    /// Lightning address for `lightning_address`, an on-chain Bitcoin address
+    /// for `on_chain`. Not needed for `nwc`.
+    pub address: Option<String>,
+    /// Payout method: `lightning_address` (default), `nwc`, or `on_chain`.
     pub mode: Option<String>,
 }
 
 /// Request to update referral payout options
 #[derive(Deserialize)]
 pub struct ApiReferralPatchRequest {
-    /// Lightning address for payouts (None = clear, Some(s) = set)
+    /// Payout target address (None = clear, Some(s) = set). Validated according
+    /// to the effective `mode`: a Lightning address for `lightning_address`, an
+    /// on-chain Bitcoin address for `on_chain`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
-    pub lightning_address: Option<Option<String>>,
-    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    pub address: Option<Option<String>>,
+    /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
+    /// `on_chain`.
     pub mode: Option<String>,
 }
 
@@ -217,14 +236,40 @@ fn parse_payout_mode(mode: Option<&str>) -> Result<Option<ReferralPayoutMode>, A
     let Some(s) = mode else {
         return Ok(None);
     };
-    let parsed = ReferralPayoutMode::from_str(s)
-        .map_err(|_| ApiError::new("Invalid payout mode. Use 'lightning_address' or 'nwc'"))?;
+    let parsed = ReferralPayoutMode::from_str(s).map_err(|_| {
+        ApiError::new("Invalid payout mode. Use 'lightning_address', 'nwc', or 'on_chain'")
+    })?;
     if parsed == ReferralPayoutMode::AccountCredit {
         return Err(ApiError::new(
             "Account credit payouts are not yet available",
         ));
     }
     Ok(Some(parsed))
+}
+
+/// Validate an on-chain Bitcoin address.
+///
+/// The address must be a **mainnet** address in release builds. In debug builds
+/// (local/dev/test, e.g. the regtest e2e stack) a **regtest** address is also
+/// accepted so payouts can be exercised end-to-end.
+fn validate_onchain_address(addr: &str) -> Result<(), ApiError> {
+    use bitcoin::{Address, Network};
+    use std::str::FromStr;
+
+    let parsed =
+        Address::from_str(addr.trim()).map_err(|_| ApiError::new("Invalid Bitcoin address"))?;
+    if parsed.is_valid_for_network(Network::Bitcoin) {
+        return Ok(());
+    }
+    if cfg!(debug_assertions) {
+        if parsed.is_valid_for_network(Network::Regtest) {
+            return Ok(());
+        }
+        return Err(ApiError::new(
+            "Bitcoin address must be a mainnet or regtest address",
+        ));
+    }
+    Err(ApiError::new("Bitcoin address must be a mainnet address"))
 }
 
 /// Validate a lightning address by parsing its format and resolving the LNURL pay endpoint
@@ -314,13 +359,13 @@ async fn v1_signup_referral(
     let mode =
         parse_payout_mode(req.mode.as_deref())?.unwrap_or(ReferralPayoutMode::LightningAddress);
 
-    // Validate the payout details required by the chosen mode.
+    // Validate the payout address required by the chosen mode.
     match mode {
-        ReferralPayoutMode::LightningAddress => match req.lightning_address.as_deref() {
+        ReferralPayoutMode::LightningAddress => match req.address.as_deref() {
             Some(addr) if !addr.trim().is_empty() => validate_lightning_address(addr).await?,
             _ => {
                 return ApiData::err(
-                    "lightning_address is required when mode is 'lightning_address'",
+                    "address (a lightning address) is required when mode is 'lightning_address'",
                 );
             }
         },
@@ -329,6 +374,14 @@ async fn v1_signup_referral(
                 return ApiData::err("NWC connection is not configured on your account");
             }
         }
+        ReferralPayoutMode::OnChain => match req.address.as_deref() {
+            Some(addr) if !addr.trim().is_empty() => validate_onchain_address(addr)?,
+            _ => {
+                return ApiData::err(
+                    "address (a Bitcoin address) is required when mode is 'on_chain'",
+                );
+            }
+        },
         ReferralPayoutMode::AccountCredit => unreachable!("rejected by parse_payout_mode"),
     }
 
@@ -337,7 +390,7 @@ async fn v1_signup_referral(
         id: 0,
         user_id: uid,
         code,
-        lightning_address: req.lightning_address,
+        address: req.address,
         mode,
         // Per-referrer commission override is admin-controlled; new enrollments
         // default to the referred VM's company rate (None = use company default).
@@ -369,13 +422,23 @@ async fn v1_update_referral(
         .await
         .map_err(|_| ApiError::not_found("Not enrolled in referral program"))?;
 
-    if let Some(ref addr) = req.lightning_address {
+    // Validate a supplied address against the *effective* mode (the new mode if
+    // being changed in this request, otherwise the existing one) so the address
+    // type matches the payout method.
+    let new_mode = parse_payout_mode(req.mode.as_deref())?;
+    let effective_mode = new_mode.unwrap_or(referral.mode);
+    if let Some(ref addr) = req.address {
         if let Some(a) = addr {
-            validate_lightning_address(a).await?;
+            match effective_mode {
+                ReferralPayoutMode::LightningAddress => validate_lightning_address(a).await?,
+                ReferralPayoutMode::OnChain => validate_onchain_address(a)?,
+                // Other modes (nwc, account_credit) don't use an address.
+                _ => {}
+            }
         }
-        referral.lightning_address = addr.clone();
+        referral.address = addr.clone();
     }
-    if let Some(mode) = parse_payout_mode(req.mode.as_deref())? {
+    if let Some(mode) = new_mode {
         if mode == ReferralPayoutMode::Nwc && !user_has_nwc(&this, uid).await {
             return ApiData::err("NWC connection is not configured on your account");
         }
@@ -518,6 +581,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_effective_rate(&db, &referral).await, 33.0);
+    }
+
+    #[test]
+    fn test_validate_onchain_address() {
+        // Mainnet always accepted.
+        assert!(validate_onchain_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_ok());
+        // Regtest accepted in debug builds (tests run with debug_assertions).
+        let regtest = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        assert_eq!(
+            validate_onchain_address(regtest).is_ok(),
+            cfg!(debug_assertions),
+            "regtest is only valid in debug builds"
+        );
+        // Garbage rejected.
+        assert!(validate_onchain_address("not-an-address").is_err());
+        assert!(validate_onchain_address("").is_err());
+        // Whitespace is trimmed.
+        assert!(validate_onchain_address("  bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4  ").is_ok());
     }
 
     #[test]

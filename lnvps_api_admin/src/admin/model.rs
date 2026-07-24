@@ -1968,8 +1968,12 @@ pub struct AdminReferralInfo {
     /// Owner's Nostr pubkey (hex), for cross-referencing with users.
     pub user_pubkey: String,
     pub code: String,
-    pub lightning_address: Option<String>,
-    /// Payout method: `lightning_address`, `nwc`, or `account_credit`.
+    /// Payout target address; its type is determined by `mode` (Lightning
+    /// address for `lightning_address`, Bitcoin address for `on_chain`, absent
+    /// for `nwc`).
+    pub address: Option<String>,
+    /// Payout method: `lightning_address`, `nwc`, `account_credit`, or
+    /// `on_chain`.
     pub mode: String,
     /// Per-referrer commission override (whole %); `null` = use company default.
     pub referral_rate: Option<f32>,
@@ -1989,11 +1993,19 @@ pub struct AdminReferralEarning {
 pub struct AdminReferralPayoutInfo {
     pub id: u64,
     pub amount: u64,
+    /// Network/routing fee charged to the referrer (smallest currency unit),
+    /// debited from their balance alongside `amount`.
+    pub fee: u64,
     pub currency: String,
     pub created: DateTime<Utc>,
     pub is_paid: bool,
-    pub invoice: Option<String>,
-    /// Payment preimage (hex), when the payout has been settled.
+    /// How this payout was made: `lightning_address`, `nwc`, or `on_chain`.
+    pub mode: String,
+    /// The payout output reference: a BOLT11 invoice for a Lightning payout, or
+    /// the on-chain outpoint (`"{txid}:{vout}"`) for an on-chain payout. Rows
+    /// batched into one transaction share the txid but carry distinct vouts.
+    pub output: Option<String>,
+    /// Payment preimage (hex), when a Lightning payout has been settled.
     pub pre_image: Option<String>,
 }
 
@@ -2002,10 +2014,12 @@ impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
         Self {
             id: p.id,
             amount: p.amount,
+            fee: p.fee,
             currency: p.currency,
             created: p.created,
             is_paid: p.is_paid,
-            invoice: p.invoice,
+            mode: p.mode.to_string(),
+            output: p.output,
             pre_image: p.pre_image.map(hex::encode),
         }
     }
@@ -2048,8 +2062,11 @@ pub struct AdminCreateReferralPayoutRequest {
     pub amount: u64,
     /// Currency code (e.g. `BTC`, `EUR`).
     pub currency: String,
-    /// Optional Lightning invoice associated with the payout.
-    pub invoice: Option<String>,
+    /// Optional payout output reference (BOLT11 invoice or on-chain outpoint).
+    pub output: Option<String>,
+    /// Optional payout mode (`lightning_address`, `nwc`, `on_chain`); defaults
+    /// to `lightning_address` when omitted.
+    pub mode: Option<String>,
     /// Mark the payout as already paid (e.g. reconciling an out-of-band payment).
     #[serde(default)]
     pub is_paid: bool,
@@ -2060,12 +2077,15 @@ pub struct AdminCreateReferralPayoutRequest {
 pub struct AdminUpdateReferralPayoutRequest {
     /// Mark paid / unpaid.
     pub is_paid: Option<bool>,
-    /// Set or clear the associated Lightning invoice.
+    /// Set or clear the payout output reference (BOLT11 invoice or on-chain
+    /// outpoint `"{txid}:{vout}"`).
     #[serde(
         default,
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
-    pub invoice: Option<Option<String>>,
+    pub output: Option<Option<String>>,
+    /// Change the payout mode (`lightning_address`, `nwc`, `on_chain`).
+    pub mode: Option<String>,
     /// Set or clear the payment preimage (hex-encoded, 32 bytes).
     #[serde(
         default,

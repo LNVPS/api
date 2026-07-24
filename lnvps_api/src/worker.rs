@@ -130,8 +130,18 @@ pub struct WorkerSettings {
     pub redis: Option<RedisConfig>,
     pub nostr_hostname: Option<String>,
     /// Minimum accrued BTC referral commission (satoshis) before an automated
-    /// payout is attempted. `None` disables automated referral payouts.
+    /// Lightning payout is attempted. `None` disables automated Lightning
+    /// referral payouts.
     pub referral_min_payout_sats: Option<u64>,
+    /// Minimum accrued BTC referral commission (satoshis) before an automated
+    /// on-chain payout is attempted. `None` disables automated on-chain
+    /// referral payouts.
+    pub referral_min_onchain_payout_sats: Option<u64>,
+    /// Maximum next-block fee rate (sat/vByte) tolerated for on-chain referral
+    /// payouts; batches are deferred above this.
+    pub referral_max_onchain_fee_per_vbyte: u64,
+    /// Source of the on-chain fee-rate estimate for the cap above.
+    pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -145,6 +155,20 @@ impl From<&Settings> for WorkerSettings {
             redis: val.redis.clone(),
             nostr_hostname: val.nostr_address_host.clone(),
             referral_min_payout_sats: val.referral.as_ref().map(|r| r.min_payout_sats),
+            referral_min_onchain_payout_sats: val
+                .referral
+                .as_ref()
+                .and_then(|r| r.min_onchain_payout_sats),
+            referral_max_onchain_fee_per_vbyte: val
+                .referral
+                .as_ref()
+                .map(|r| r.max_onchain_fee_per_vbyte)
+                .unwrap_or(50),
+            referral_fee_estimator: val
+                .referral
+                .as_ref()
+                .map(|r| r.fee_estimator.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -157,17 +181,24 @@ impl Worker {
         work_commander: Arc<dyn WorkCommander>,
         subscription_handler: SubscriptionHandler,
         node: Arc<dyn payments_rs::lightning::LightningNode>,
+        onchain: Option<Arc<dyn payments_rs::onchain::OnChainProvider>>,
         settings: impl Into<WorkerSettings>,
         vm_state_cache: VmStateCache,
         nostr: Option<Client>,
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
         let settings = settings.into();
+        let fee_estimator =
+            crate::fee_estimate::build_fee_estimator(&settings.referral_fee_estimator);
         let referral_payouts = crate::referral::ReferralPayoutHandler::new(
             db.clone(),
             node,
             work_commander.clone(),
             settings.referral_min_payout_sats,
+            onchain,
+            settings.referral_min_onchain_payout_sats,
+            settings.referral_max_onchain_fee_per_vbyte,
+            fee_estimator,
         );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
@@ -3456,6 +3487,7 @@ mod tests {
             work_commander,
             sub_handler,
             node,
+            None,
             &settings,
             cache,
             None,

@@ -325,10 +325,7 @@ mod tests {
 
         // Referrer updates their payout settings
         let resp = referrer
-            .patch_auth(
-                "/api/v1/referral",
-                &serde_json::json!({"lightning_address": null}),
-            )
+            .patch_auth("/api/v1/referral", &serde_json::json!({"address": null}))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1003,6 +1000,164 @@ mod tests {
         assert_eq!(empty_page["total"].as_u64().unwrap(), 1);
         assert!(empty_page["data"].as_array().unwrap().is_empty());
         eprintln!("Referral usage pagination verified");
+
+        // ----------------------------------------------------------------
+        // 14b. Referral payouts: on-chain batch (fee + outpoint), a mixed
+        //      Lightning referrer, and idempotency (no double-pay).
+        // ----------------------------------------------------------------
+        {
+            let pool = crate::db::connect().await.unwrap();
+            // Distinct users: `uk_referral_user` is unique per user, so each
+            // referrer needs its own. One extra user owns the referred VMs.
+            let oc1_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let oc2_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let ln_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let referred_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+
+            // Two on-chain referrers (so the batch pays >1 output) each with
+            // their own seeded BTC commission (100% per-referral override).
+            let oc_addr_1 = crate::onchain::new_regtest_address().await.unwrap();
+            let (oc1_ref_id, oc1_vm_id) = crate::db::seed_referrer_with_commission(
+                &pool,
+                oc1_user,
+                referred_user,
+                &format!("{ref_code}OC1"),
+                3,
+                Some(&oc_addr_1),
+                5000,
+                vm_id,
+            )
+            .await
+            .unwrap();
+
+            let oc_addr_2 = crate::onchain::new_regtest_address().await.unwrap();
+            let (oc2_ref_id, oc2_vm_id) = crate::db::seed_referrer_with_commission(
+                &pool,
+                oc2_user,
+                referred_user,
+                &format!("{ref_code}OC2"),
+                3,
+                Some(&oc_addr_2),
+                4000,
+                vm_id,
+            )
+            .await
+            .unwrap();
+
+            // A Lightning referrer with an unresolvable address (mixed batch):
+            // its payout is attempted but cannot complete, and must not block
+            // the on-chain batch.
+            let (ln_ref_id, ln_vm_id) = crate::db::seed_referrer_with_commission(
+                &pool,
+                ln_user,
+                referred_user,
+                &format!("{ref_code}LN"),
+                0,
+                Some("nobody@e2e.invalid"),
+                3000,
+                vm_id,
+            )
+            .await
+            .unwrap();
+
+            // Trigger the payout job and wait for both on-chain referrers to be
+            // paid.
+            crate::worker::publish_job("\"ProcessReferralPayouts\"")
+                .await
+                .unwrap();
+            let both_paid = poll_until(60, 500, || {
+                let pool = pool.clone();
+                async move {
+                    let p1 = crate::db::list_referral_payouts(&pool, oc1_ref_id)
+                        .await
+                        .unwrap_or_default();
+                    let p2 = crate::db::list_referral_payouts(&pool, oc2_ref_id)
+                        .await
+                        .unwrap_or_default();
+                    p1.iter().any(|p| p.2) && p2.iter().any(|p| p.2)
+                }
+            })
+            .await;
+
+            if both_paid {
+                let p1 = crate::db::list_referral_payouts(&pool, oc1_ref_id)
+                    .await
+                    .unwrap();
+                let p2 = crate::db::list_referral_payouts(&pool, oc2_ref_id)
+                    .await
+                    .unwrap();
+                assert_eq!(p1.len(), 1, "one payout for referrer 1");
+                assert_eq!(p2.len(), 1, "one payout for referrer 2");
+                let (_a1, fee1, paid1, op1) = &p1[0];
+                let (_a2, fee2, paid2, op2) = &p2[0];
+                assert!(*paid1 && *paid2, "both marked paid");
+                assert!(*fee1 > 0 && *fee2 > 0, "referrer bears the on-chain fee");
+                // Both outpoints share the batch txid but differ in vout.
+                let op1 = op1.as_ref().expect("outpoint set");
+                let op2 = op2.as_ref().expect("outpoint set");
+                let (tx1, v1) = op1.rsplit_once(':').expect("txid:vout");
+                let (tx2, v2) = op2.rsplit_once(':').expect("txid:vout");
+                assert_eq!(tx1, tx2, "both paid by one batched transaction");
+                assert_ne!(v1, v2, "distinct outputs within the batch");
+                eprintln!("On-chain referral batch paid: {op1} / {op2} (fees {fee1}/{fee2})");
+
+                // Mixed: the Lightning referrer's payout could not resolve its
+                // address, so no payout row persists — and it didn't block the
+                // on-chain batch above.
+                let ln_payouts = crate::db::list_referral_payouts(&pool, ln_ref_id)
+                    .await
+                    .unwrap();
+                assert!(
+                    ln_payouts.is_empty(),
+                    "unresolvable Lightning payout leaves no row"
+                );
+
+                // Idempotency: re-running the job pays nothing new.
+                crate::worker::publish_job("\"ProcessReferralPayouts\"")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                assert_eq!(
+                    crate::db::list_referral_payouts(&pool, oc1_ref_id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "no new payout for referrer 1 on re-run"
+                );
+                assert_eq!(
+                    crate::db::list_referral_payouts(&pool, oc2_ref_id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "no new payout for referrer 2 on re-run"
+                );
+                eprintln!("Referral payout idempotency verified (no double-pay)");
+            } else {
+                panic!(
+                    "on-chain referral payout batch was not recorded within the timeout \
+                     (referrers {oc1_ref_id}/{oc2_ref_id})"
+                );
+            }
+
+            // Clean up seeded rows.
+            for vm in [oc1_vm_id, oc2_vm_id, ln_vm_id] {
+                crate::db::hard_delete_vm(&pool, vm).await.ok();
+            }
+            for r in [oc1_ref_id, oc2_ref_id, ln_ref_id] {
+                crate::db::hard_delete_referral(&pool, r).await.ok();
+            }
+            pool.close().await;
+        }
 
         // Admin referral report should include this VM
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();

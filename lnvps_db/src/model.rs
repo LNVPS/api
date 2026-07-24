@@ -1429,8 +1429,11 @@ pub struct Referral {
     pub user_id: u64,
     /// The auto-generated referral code (base63, 8 characters)
     pub code: String,
-    /// Lightning address for automatic payouts
-    pub lightning_address: Option<String>,
+    /// Payout target address. Its type is determined by `mode`: a Lightning
+    /// address for `LightningAddress`, an on-chain Bitcoin address for
+    /// `OnChain`. `None` for modes that need no address (e.g. `Nwc`, which
+    /// pays via the user's saved NWC connection).
+    pub address: Option<String>,
     /// How the referrer is paid their commission.
     pub mode: ReferralPayoutMode,
     /// When this referral entry was created
@@ -1450,15 +1453,31 @@ pub struct ReferralPayout {
     pub referral_id: u64,
     /// Amount in smallest currency unit
     pub amount: u64,
+    /// Network/routing fee charged to the referrer, in the same smallest
+    /// currency unit as `amount`. The referrer bears the fee: it is debited from
+    /// their balance together with `amount` when computing what remains owed, so
+    /// a fee-induced deficit is recovered from future commission.
+    #[sqlx(default)]
+    pub fee: u64,
     /// Currency of this payout
     pub currency: String,
     /// When this payout record was created
     pub created: DateTime<Utc>,
     /// Whether this payout has been completed
     pub is_paid: bool,
-    /// Lightning invoice for this payout
-    pub invoice: Option<String>,
-    /// Preimage revealed when the invoice was paid (32 bytes, SHA256)
+    /// How the payout was made, recorded for reference so `output` can be
+    /// interpreted without joining to the referral.
+    #[sqlx(default)]
+    pub mode: ReferralPayoutMode,
+    /// The payout's output reference: a BOLT11 invoice for a Lightning payout,
+    /// or the on-chain outpoint (`"{txid}:{vout}"`) for an on-chain payout.
+    ///
+    /// On-chain payouts batch every eligible referrer into a single send-many
+    /// transaction, so their outpoints share the `txid` but each carries the
+    /// distinct `vout` of the output paying that referrer.
+    #[sqlx(default)]
+    pub output: Option<String>,
+    /// Preimage revealed when a Lightning invoice was paid (32 bytes, SHA256).
     pub pre_image: Option<Vec<u8>>,
 }
 
@@ -1498,6 +1517,9 @@ pub enum ReferralPayoutMode {
     Nwc = 1,
     /// Credit the referrer's account balance (not yet implemented).
     AccountCredit = 2,
+    /// Pay to the referrer's on-chain Bitcoin address. Eligible referrers are
+    /// batched into a single send-many transaction.
+    OnChain = 3,
 }
 
 impl Display for ReferralPayoutMode {
@@ -1506,6 +1528,7 @@ impl Display for ReferralPayoutMode {
             ReferralPayoutMode::LightningAddress => "lightning_address",
             ReferralPayoutMode::Nwc => "nwc",
             ReferralPayoutMode::AccountCredit => "account_credit",
+            ReferralPayoutMode::OnChain => "on_chain",
         })
     }
 }
@@ -1520,6 +1543,7 @@ impl FromStr for ReferralPayoutMode {
             }
             "nwc" => Ok(ReferralPayoutMode::Nwc),
             "account_credit" | "credit" => Ok(ReferralPayoutMode::AccountCredit),
+            "on_chain" | "onchain" => Ok(ReferralPayoutMode::OnChain),
             other => anyhow::bail!("Invalid referral payout mode: {}", other),
         }
     }
@@ -2330,6 +2354,7 @@ mod tests {
             ("lightning_address", ReferralPayoutMode::LightningAddress),
             ("nwc", ReferralPayoutMode::Nwc),
             ("account_credit", ReferralPayoutMode::AccountCredit),
+            ("on_chain", ReferralPayoutMode::OnChain),
         ] {
             assert_eq!(ReferralPayoutMode::from_str(s).unwrap(), m);
             assert_eq!(m.to_string(), s);
@@ -2338,6 +2363,10 @@ mod tests {
         assert_eq!(
             ReferralPayoutMode::from_str("NWC").unwrap(),
             ReferralPayoutMode::Nwc
+        );
+        assert_eq!(
+            ReferralPayoutMode::from_str("onchain").unwrap(),
+            ReferralPayoutMode::OnChain
         );
         assert_eq!(
             ReferralPayoutMode::from_str("lightning").unwrap(),

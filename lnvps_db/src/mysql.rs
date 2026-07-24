@@ -3383,11 +3383,11 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, lightning_address, mode, referral_rate) VALUES (?, ?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, address, mode, referral_rate) VALUES (?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
-        .bind(&referral.lightning_address)
+        .bind(&referral.address)
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .fetch_one(&self.db)
@@ -3406,10 +3406,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?;
 
         sqlx::query(
-            "UPDATE referral SET code = ?, lightning_address = ?, mode = ?, referral_rate = ? WHERE id = ?",
+            "UPDATE referral SET code = ?, address = ?, mode = ?, referral_rate = ? WHERE id = ?",
         )
         .bind(&referral.code)
-        .bind(&referral.lightning_address)
+        .bind(&referral.address)
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .bind(referral.id)
@@ -3456,12 +3456,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral_payout (referral_id, amount, currency, invoice) VALUES (?, ?, ?, ?) returning id",
+            "INSERT INTO referral_payout (referral_id, amount, fee, currency, mode, output) VALUES (?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(payout.referral_id)
         .bind(payout.amount)
+        .bind(payout.fee)
         .bind(&payout.currency)
-        .bind(&payout.invoice)
+        .bind(payout.mode)
+        .bind(&payout.output)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -3469,11 +3471,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
         sqlx::query(
-            "UPDATE referral_payout SET is_paid = ?, invoice = ?, pre_image = ? WHERE id = ?",
+            "UPDATE referral_payout SET is_paid = ?, mode = ?, output = ?, pre_image = ?, fee = ? WHERE id = ?",
         )
         .bind(payout.is_paid)
-        .bind(&payout.invoice)
+        .bind(payout.mode)
+        .bind(&payout.output)
         .bind(&payout.pre_image)
+        .bind(payout.fee)
         .bind(payout.id)
         .execute(&self.db)
         .await?;

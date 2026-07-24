@@ -37,6 +37,7 @@ use payments_rs::lightning::{
 };
 use payments_rs::onchain::{
     ChainPaymentUpdate, NewAddressRequest, NewAddressResponse, OnChainProvider, PaymentCursor,
+    SendCoinsRequest, SendCoinsResponse,
 };
 use ssh2::HashType::Sha256;
 use std::collections::HashMap;
@@ -423,6 +424,8 @@ pub struct MockOnChainProvider {
     pub addresses: Arc<Mutex<Vec<String>>>,
     /// Scripted chain updates returned from `subscribe_payments`.
     pub updates: Arc<Mutex<Vec<ChainPaymentUpdate>>>,
+    /// Every `send_coins` request received, in call order, for assertions.
+    pub sends: Arc<Mutex<Vec<SendCoinsRequest>>>,
 }
 
 #[async_trait]
@@ -443,5 +446,40 @@ impl OnChainProvider for MockOnChainProvider {
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = ChainPaymentUpdate> + Send>>> {
         let updates = self.updates.lock().await.clone();
         Ok(Box::pin(futures::stream::iter(updates)))
+    }
+
+    async fn send_coins(&self, req: SendCoinsRequest) -> anyhow::Result<SendCoinsResponse> {
+        use std::str::FromStr;
+        ensure!(!req.outputs.is_empty(), "send_coins requires an output");
+        let total_msat = req.total_msat();
+        // Build a real (input-less) transaction paying each output so the
+        // returned raw_tx is decodable and the txid is its true id — this lets
+        // callers exercise outpoint (txid:vout) extraction against the mock.
+        let mut tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        for o in &req.outputs {
+            let script = bitcoin::Address::from_str(o.address.trim())
+                .map_err(|_| anyhow!("invalid address {}", o.address))?
+                .assume_checked()
+                .script_pubkey();
+            tx.output.push(bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(o.amount.value() / 1000),
+                script_pubkey: script,
+            });
+        }
+        let txid = tx.compute_txid().to_string();
+        let raw_tx = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+        let mut sends = self.sends.lock().await;
+        sends.push(req);
+        Ok(SendCoinsResponse {
+            txid,
+            total_amount: payments_rs::currency::CurrencyAmount::millisats(total_msat),
+            fee: None,
+            raw_tx: Some(raw_tx),
+        })
     }
 }

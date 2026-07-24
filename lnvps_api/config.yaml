@@ -11,8 +11,27 @@ max-prepay-days: 365
 # Automated referral commission payouts (opt-in). Omit this section to disable
 # automatic payouts (commission still accrues and can be paid manually by admins).
 referral:
-  # Minimum accrued BTC commission (satoshis) before a payout is attempted.
+  # Minimum accrued BTC commission (satoshis) before a Lightning payout is
+  # attempted.
   min-payout-sats: 1000
+  # Minimum accrued BTC commission (satoshis) before an *on-chain* payout is
+  # attempted. On-chain payouts for all eligible referrers are batched into a
+  # single send-many transaction. The referrer bears the network fee (it is
+  # debited from their balance), and this minimum acts as a small buffer to
+  # absorb it. Defaults to 1000. Set to null to disable on-chain payouts.
+  min-onchain-payout-sats: 1000
+  # Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts. The
+  # current rate is obtained from fee-estimator before each batch; if it exceeds
+  # this cap the batch is deferred until fees drop. Defaults to 50.
+  max-onchain-fee-per-vbyte: 50
+  # Source of the on-chain fee-rate estimate. Defaults to mempool.space; use a
+  # fixed rate for regtest/testing where mempool.space is unreachable.
+  fee-estimator:
+    mempool:
+      url: "https://mempool.space"
+  #fee-estimator:
+  #  fixed:
+  #    sat-per-vbyte: 2
 public-url: "https://api.lnvps.net"
 read-only: false
 redis:

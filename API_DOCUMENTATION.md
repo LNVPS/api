@@ -1179,11 +1179,14 @@ The referral program pays a commission = a percentage of each referred VM's **fi
 ```typescript
 interface ReferralSignupRequest {
   lightning_address?: string; // Lightning address for payouts (required when mode is "lightning_address")
-  mode?: "lightning_address" | "nwc"; // Payout method; defaults to "lightning_address"
+  onchain_address?: string;   // On-chain Bitcoin address for payouts (required when mode is "on_chain"). Must be a mainnet address (regtest also accepted in debug builds).
+  mode?: "lightning_address" | "nwc" | "on_chain"; // Payout method; defaults to "lightning_address"
 }
 ```
 - **Response**: `Referral`
-- **Error**: Returns error if already enrolled; if `mode` is `lightning_address` (or omitted) without a resolvable `lightning_address`; or if `mode` is `nwc` but no NWC connection is configured on the account. `account_credit` is a defined-but-unimplemented mode and is rejected.
+- **Error**: Returns error if already enrolled; if `mode` is `lightning_address` (or omitted) without a resolvable `lightning_address`; if `mode` is `nwc` but no NWC connection is configured on the account; or if `mode` is `on_chain` without a valid `onchain_address`. `account_credit` is a defined-but-unimplemented mode and is rejected.
+
+> **On-chain payouts** are paid by an automated worker that **batches every eligible on-chain referrer into a single send-many transaction**, gated by a minimum threshold (`min-onchain-payout-sats`, default 1000 sats). The **network fee is charged to you**: the transaction fee is split across the batch in proportion to each payout and debited from your balance (along with the amount), so `ReferralPayout.fee` records your share and the running balance may go negative — recovered from future referrals. Before broadcasting, the current next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds the operator's cap** (`max-onchain-fee-per-vbyte`, default 50), so payouts wait for cheaper fees. Balances below the threshold accrue until a later run. Commission always accrues and can also be paid manually by admins.
 
 #### Get Referral State
 - **GET** `/api/v1/referral`
@@ -1198,7 +1201,8 @@ interface ReferralSignupRequest {
 ```typescript
 interface ReferralPatchRequest {
   lightning_address?: string | null;  // Set (string) or clear (null) the lightning address; omit to leave unchanged
-  mode?: "lightning_address" | "nwc"; // Change payout method; omit to leave unchanged
+  onchain_address?: string | null;    // Set (string) or clear (null) the on-chain Bitcoin address; omit to leave unchanged. Must be a mainnet address (regtest also accepted in debug builds).
+  mode?: "lightning_address" | "nwc" | "on_chain"; // Change payout method; omit to leave unchanged
 }
 ```
 - **Response**: `Referral`
@@ -1222,7 +1226,8 @@ interface ReferralPatchRequest {
 interface Referral {
   code: string;                    // 8-character base63 referral code to share
   lightning_address?: string;      // Lightning address for payouts (used when mode is "lightning_address")
-  mode: "lightning_address" | "nwc" | "account_credit"; // Payout method
+  onchain_address?: string;        // On-chain Bitcoin address for payouts (used when mode is "on_chain")
+  mode: "lightning_address" | "nwc" | "account_credit" | "on_chain"; // Payout method
   referral_rate: number | null;    // Per-referrer commission override (whole %), admin-controlled; null = no override, use company default. NOT the rate you earn by itself.
   effective_referral_rate: number; // The commission rate that currently applies to you (whole %): the override if set, else the default company's rate. Use this for display.
   created: string;                 // ISO 8601 datetime
@@ -1235,12 +1240,14 @@ interface ReferralEarning {
 
 interface ReferralPayout {
   id: number;
-  amount: number;
+  amount: number;     // Commission paid out (smallest currency unit)
+  fee: number;        // Network/routing fee charged to you for this payout (smallest currency unit), debited from your balance alongside `amount`. On-chain payout batches split the transaction fee across referrers in proportion to their amount; fees may make the running balance negative, recovered from future referrals.
   currency: string;
   created: string;    // ISO 8601 datetime
   is_paid: boolean;
-  invoice?: string;   // BOLT11 lightning invoice
-  pre_image?: string; // Payment preimage (hex), present once the payout has settled
+  mode: "lightning_address" | "nwc" | "on_chain"; // How this payout was made; tells you how to interpret `output`
+  output?: string;    // Payout output reference: a BOLT11 invoice for a Lightning payout, or the on-chain outpoint "{txid}:{vout}" for an on-chain payout. On-chain payouts are batched into one transaction, so rows share the txid but carry distinct vouts.
+  pre_image?: string; // Payment preimage (hex), present once a Lightning payout has settled
 }
 
 interface ReferralUsage {

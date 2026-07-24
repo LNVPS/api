@@ -350,13 +350,68 @@ fn default_min_payout_sats() -> u64 {
     1000
 }
 
+fn default_min_onchain_payout_sats() -> Option<u64> {
+    Some(1000)
+}
+
+fn default_max_onchain_fee_per_vbyte() -> u64 {
+    50
+}
+
+fn default_mempool_url() -> String {
+    "https://mempool.space".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ReferralConfig {
-    /// Minimum accrued BTC commission (in satoshis) before an automated payout
-    /// is attempted for a referrer. Defaults to 1000 sats.
+    /// Minimum accrued BTC commission (in satoshis) before an automated
+    /// Lightning payout is attempted for a referrer. Defaults to 1000 sats.
     #[serde(default = "default_min_payout_sats")]
     pub min_payout_sats: u64,
+    /// Minimum accrued BTC commission (in satoshis) before an automated
+    /// **on-chain** payout is attempted. Defaults to 1000 sats; this minimum
+    /// acts as a small buffer so a payout can absorb the referrer's fee. Set to
+    /// `null` to disable on-chain payouts entirely (commission still accrues for
+    /// manual payout).
+    #[serde(default = "default_min_onchain_payout_sats")]
+    pub min_onchain_payout_sats: Option<u64>,
+    /// Maximum acceptable next-block fee rate (sat/vByte) for on-chain payouts.
+    /// Before broadcasting a payout batch, the current next-block fee rate is
+    /// obtained from `fee_estimator`; if it exceeds this cap the batch is skipped
+    /// and retried on a later run, so payouts wait for cheaper fees rather than
+    /// paying "crazy" fees. Defaults to 50 sat/vByte.
+    #[serde(default = "default_max_onchain_fee_per_vbyte")]
+    pub max_onchain_fee_per_vbyte: u64,
+    /// Source of the on-chain fee-rate estimate used for the cap above. Defaults
+    /// to mempool.space; a fixed rate can be configured for regtest/testing.
+    #[serde(default)]
+    pub fee_estimator: FeeEstimatorConfig,
+}
+
+/// Source of on-chain fee-rate estimates for referral payouts.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeeEstimatorConfig {
+    /// Fetch the recommended next-block fee rate from a mempool.space-compatible
+    /// instance at `url`.
+    #[serde(rename_all = "kebab-case")]
+    Mempool {
+        #[serde(default = "default_mempool_url")]
+        url: String,
+    },
+    /// Use a fixed fee rate (sat/vByte). Mainly for regtest/tests where no
+    /// mempool.space is reachable.
+    #[serde(rename_all = "kebab-case")]
+    Fixed { sat_per_vbyte: u64 },
+}
+
+impl Default for FeeEstimatorConfig {
+    fn default() -> Self {
+        FeeEstimatorConfig::Mempool {
+            url: default_mempool_url(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
