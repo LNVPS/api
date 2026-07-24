@@ -7,7 +7,7 @@ use ipnetwork::IpNetwork;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, Subscription, SubscriptionLineItem,
     SubscriptionType, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmHostRegion, VmTemplate,
+    VmHost, VmHostRegion, VmTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -253,6 +253,13 @@ pub struct ApiVmStatus {
     /// max_prepay_days`. Clients should cap the renewal interval selector
     /// accordingly (given `expires` and the subscription's interval length).
     pub max_prepay_days: u16,
+    /// CPU architecture of the host this VM runs on (e.g. `"x86_64"`, `"arm64"`).
+    /// Sourced from the host record, so — unlike the optional
+    /// `template.cpu_arch` constraint — it is present whenever the host arch is
+    /// known. Clients can use it to always pass `?arch=` when listing OS images
+    /// for a reinstall. `None`/omitted when the host arch is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -282,9 +289,15 @@ pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_
 }
 
 // Function to build ApiVmStatus from VM data (moved from common)
+///
+/// `host` is the VM's host, passed in by the caller so that listing endpoints
+/// can bulk-load hosts once (there are few) instead of issuing one lookup per
+/// VM. Pass `None` if the host is unknown/unavailable — host-derived fields
+/// (`host_sunset_date`, `cpu_arch`) are then simply omitted.
 pub async fn vm_to_status(
     db: &Arc<dyn LNVpsDb>,
     vm: Vm,
+    host: Option<VmHost>,
     state: Option<VmRunningState>,
     delete_after: u16,
     max_prepay_days_default: u16,
@@ -366,11 +379,12 @@ pub async fn vm_to_status(
         subscription_id: sub_id,
         // Surface the host's sunset date so clients can warn users on VMs that
         // must be migrated before the host is decommissioned.
-        host_sunset_date: db
-            .get_host(vm.host_id)
-            .await
-            .ok()
-            .and_then(|h| h.sunset_date),
+        host_sunset_date: host.as_ref().and_then(|h| h.sunset_date),
+        // Surface the host's CPU architecture (skip the "unknown" sentinel).
+        cpu_arch: host.as_ref().and_then(|h| match h.cpu_arch {
+            lnvps_db::CpuArch::Unknown => None,
+            arch => Some(arch.to_string()),
+        }),
         max_prepay_days,
     })
 }
