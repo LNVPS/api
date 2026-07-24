@@ -2090,6 +2090,7 @@ pub enum SubscriptionType {
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
     Vps = 3,           // VM (links to vm table via vm.subscription_line_item_id)
+    App = 4, // Managed app deployment (links via app_deployment.subscription_line_item_id)
 }
 
 impl Display for SubscriptionType {
@@ -2099,6 +2100,7 @@ impl Display for SubscriptionType {
             SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
             SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
             SubscriptionType::Vps => write!(f, "VPS"),
+            SubscriptionType::App => write!(f, "App"),
         }
     }
 }
@@ -3061,4 +3063,145 @@ impl PaymentMethodConfig {
             modified: Utc::now(),
         }
     }
+}
+
+/// A predefined managed application in the catalog.
+///
+/// Each app is defined by a **docker-compose-style YAML** blob (`compose`) that
+/// describes the container image(s), ports, environment and volumes. The
+/// customer UI renders forms from that spec, and `lnvps_operator` translates it
+/// (merged with a deployment's chosen config) into Kubernetes objects. Apps are
+/// billed through the subscription engine using the inline pricing fields
+/// (`amount`/`currency`/`interval_*`, matching [`VmCostPlan`]).
+#[derive(FromRow, Clone, Debug)]
+pub struct App {
+    pub id: u64,
+    /// URL/DNS-safe slug (e.g. `nostr-relay`); unique.
+    pub name: String,
+    /// Human-friendly catalog name.
+    pub display_name: String,
+    pub description: Option<String>,
+    /// Optional icon/logo URL for the catalog UI.
+    pub icon: Option<String>,
+    /// Docker-compose-style YAML defining the app (image, ports, env, volumes).
+    pub compose: String,
+    /// Recurring price in the smallest currency unit (cents / millisats).
+    pub amount: u64,
+    pub currency: String,
+    /// Billing interval, e.g. `1` `Month`.
+    pub interval_amount: u64,
+    pub interval_type: IntervalType,
+    /// One-off setup fee in the smallest currency unit (0 = none).
+    pub setup_amount: u64,
+    /// Whether the app is offered in the catalog.
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+/// A Kubernetes cluster where apps can be deployed.
+///
+/// Linked to a [`Region`] so location, company, tax and currency resolve
+/// exactly like VMs (`region.company_id`). The `lnvps_operator` instance that
+/// runs inside a cluster is configured with its own cluster id and reconciles
+/// only that cluster's deployments — no kube credentials are stored in the DB.
+#[derive(FromRow, Clone, Debug)]
+pub struct AppCluster {
+    pub id: u64,
+    pub name: String,
+    /// Region this cluster belongs to (drives company / tax / currency).
+    pub region_id: u64,
+    /// Wildcard base domain for ingress hostnames on this cluster; a
+    /// deployment's host is `"{deployment.name}.{ingress_domain}"`.
+    pub ingress_domain: String,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+/// Desired run state of a deployment, set by the customer and honoured by the
+/// operator (scale to 0 replicas when `Stopped`).
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDeploymentDesiredState {
+    #[default]
+    Running = 0,
+    Stopped = 1,
+}
+
+impl Display for AppDeploymentDesiredState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppDeploymentDesiredState::Running => write!(f, "running"),
+            AppDeploymentDesiredState::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+/// Observed status of a deployment, written back by the operator as it
+/// reconciles the Kubernetes resources.
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDeploymentStatus {
+    /// Created in the DB but not yet reconciled / not yet ready.
+    #[default]
+    Pending = 0,
+    /// Reconciled and the workload is running.
+    Running = 1,
+    /// Scaled to zero at the customer's request.
+    Stopped = 2,
+    /// Reconciliation failed; see `status_message`.
+    Error = 3,
+    /// Being torn down.
+    Deleting = 4,
+}
+
+impl Display for AppDeploymentStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppDeploymentStatus::Pending => write!(f, "pending"),
+            AppDeploymentStatus::Running => write!(f, "running"),
+            AppDeploymentStatus::Stopped => write!(f, "stopped"),
+            AppDeploymentStatus::Error => write!(f, "error"),
+            AppDeploymentStatus::Deleting => write!(f, "deleting"),
+        }
+    }
+}
+
+/// A customer's running instance of an [`App`].
+///
+/// Billed via the subscription engine: `subscription_line_item_id` links to a
+/// [`SubscriptionLineItem`] of type [`SubscriptionType::App`], mirroring how
+/// `vm.subscription_line_item_id` works. Reconciled into its own Kubernetes
+/// namespace (`namespace`) by `lnvps_operator`.
+#[derive(FromRow, Clone, Debug)]
+pub struct AppDeployment {
+    pub id: u64,
+    pub user_id: u64,
+    /// Catalog app being deployed.
+    pub app_id: u64,
+    /// Cluster this deployment runs on (drives placement + billing region).
+    pub cluster_id: u64,
+    /// Billing back-reference (subscription line item of type `App`).
+    pub subscription_line_item_id: u64,
+    /// User-chosen, DNS-safe instance name (used for the subdomain/host).
+    pub name: String,
+    /// Dedicated Kubernetes namespace for this deployment (isolation boundary).
+    pub namespace: String,
+    /// Public ingress hostname once assigned (e.g. `name.apps.lnvps.tld`).
+    pub hostname: Option<String>,
+    /// Resolved per-deployment configuration (env values etc.), stored as an
+    /// encrypted JSON blob so secret values are protected at rest. `None` until
+    /// the customer supplies configuration.
+    pub config: Option<EncryptedString>,
+    /// Desired run state (customer-controlled).
+    pub desired_state: AppDeploymentDesiredState,
+    /// Observed status (operator-controlled).
+    pub status: AppDeploymentStatus,
+    /// Optional human-readable status/error detail from the operator.
+    pub status_message: Option<String>,
+    pub created: DateTime<Utc>,
+    /// Soft-delete flag; a deleted deployment is torn down by the operator and
+    /// retained only for accounting.
+    pub deleted: bool,
 }

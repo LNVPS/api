@@ -3,9 +3,10 @@ use anyhow::{Context, anyhow};
 use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch,
-    CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType,
-    IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
+    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus,
+    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
+    DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType, IpRange,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
     NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
     ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
     RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
@@ -60,6 +61,9 @@ pub struct MockDb {
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
     pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
+    pub apps: Arc<Mutex<HashMap<u64, App>>>,
+    pub app_clusters: Arc<Mutex<HashMap<u64, AppCluster>>>,
+    pub app_deployments: Arc<Mutex<HashMap<u64, AppDeployment>>>,
 }
 
 impl MockDb {
@@ -343,6 +347,9 @@ impl Default for MockDb {
             router_bgp_routes: Arc::new(Default::default()),
             firewall_rules: Arc::new(Default::default()),
             webauthn_credentials: Arc::new(Default::default()),
+            apps: Arc::new(Default::default()),
+            app_clusters: Arc::new(Default::default()),
+            app_deployments: Arc::new(Default::default()),
         }
     }
 }
@@ -3118,6 +3125,183 @@ impl LNVpsDbBase for MockDb {
             })
             .count() as u64)
     }
+
+    // ----- App catalog -----
+
+    async fn list_apps(&self, enabled_only: bool) -> DbResult<Vec<App>> {
+        let apps = self.apps.lock().await;
+        let mut out: Vec<App> = apps
+            .values()
+            .filter(|a| !enabled_only || a.enabled)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        Ok(out)
+    }
+
+    async fn get_app(&self, id: u64) -> DbResult<App> {
+        self.apps
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("app not found").into())
+    }
+
+    async fn get_app_by_name(&self, name: &str) -> DbResult<App> {
+        self.apps
+            .lock()
+            .await
+            .values()
+            .find(|a| a.name == name)
+            .cloned()
+            .ok_or_else(|| anyhow!("app not found").into())
+    }
+
+    async fn insert_app(&self, app: &App) -> DbResult<u64> {
+        let mut apps = self.apps.lock().await;
+        if apps.values().any(|a| a.name == app.name) {
+            return Err(DbError::Other(anyhow!("app name already exists")));
+        }
+        let new_id = apps.keys().max().copied().unwrap_or(0) + 1;
+        apps.insert(
+            new_id,
+            App {
+                id: new_id,
+                ..app.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_app(&self, app: &App) -> DbResult<()> {
+        let mut apps = self.apps.lock().await;
+        if let Some(a) = apps.get_mut(&app.id) {
+            *a = app.clone();
+        }
+        Ok(())
+    }
+
+    async fn delete_app(&self, id: u64) -> DbResult<()> {
+        self.apps.lock().await.remove(&id);
+        Ok(())
+    }
+
+    // ----- App clusters -----
+
+    async fn list_app_clusters(&self, enabled_only: bool) -> DbResult<Vec<AppCluster>> {
+        let clusters = self.app_clusters.lock().await;
+        let mut out: Vec<AppCluster> = clusters
+            .values()
+            .filter(|c| !enabled_only || c.enabled)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn get_app_cluster(&self, id: u64) -> DbResult<AppCluster> {
+        self.app_clusters
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("app cluster not found").into())
+    }
+
+    async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64> {
+        let mut clusters = self.app_clusters.lock().await;
+        let new_id = clusters.keys().max().copied().unwrap_or(0) + 1;
+        clusters.insert(
+            new_id,
+            AppCluster {
+                id: new_id,
+                ..cluster.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()> {
+        let mut clusters = self.app_clusters.lock().await;
+        if let Some(c) = clusters.get_mut(&cluster.id) {
+            *c = cluster.clone();
+        }
+        Ok(())
+    }
+
+    async fn delete_app_cluster(&self, id: u64) -> DbResult<()> {
+        self.app_clusters.lock().await.remove(&id);
+        Ok(())
+    }
+
+    // ----- App deployments -----
+
+    async fn list_user_app_deployments(&self, user_id: u64) -> DbResult<Vec<AppDeployment>> {
+        let d = self.app_deployments.lock().await;
+        let mut out: Vec<AppDeployment> = d
+            .values()
+            .filter(|x| x.user_id == user_id && !x.deleted)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created.cmp(&a.created));
+        Ok(out)
+    }
+
+    async fn list_all_app_deployments(&self) -> DbResult<Vec<AppDeployment>> {
+        let d = self.app_deployments.lock().await;
+        let mut out: Vec<AppDeployment> = d.values().filter(|x| !x.deleted).cloned().collect();
+        out.sort_by_key(|x| x.id);
+        Ok(out)
+    }
+
+    async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment> {
+        self.app_deployments
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("app deployment not found").into())
+    }
+
+    async fn get_app_deployment_by_line_item(&self, line_item_id: u64) -> DbResult<AppDeployment> {
+        self.app_deployments
+            .lock()
+            .await
+            .values()
+            .find(|x| x.subscription_line_item_id == line_item_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("app deployment not found").into())
+    }
+
+    async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
+        let mut d = self.app_deployments.lock().await;
+        let new_id = d.keys().max().copied().unwrap_or(0) + 1;
+        d.insert(
+            new_id,
+            AppDeployment {
+                id: new_id,
+                ..deployment.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()> {
+        let mut d = self.app_deployments.lock().await;
+        if let Some(x) = d.get_mut(&deployment.id) {
+            *x = deployment.clone();
+        }
+        Ok(())
+    }
+
+    async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
+        let mut d = self.app_deployments.lock().await;
+        if let Some(x) = d.get_mut(&id) {
+            x.deleted = true;
+        }
+        Ok(())
+    }
 }
 
 pub struct MockExchangeRate {
@@ -5642,6 +5826,153 @@ mod tests {
             vec![1, 2],
             "active = non-deleted, set-up VMs (incl. expired)"
         );
+    }
+
+    fn mk_app(name: &str) -> App {
+        App {
+            id: 0,
+            name: name.to_string(),
+            display_name: format!("{name} app"),
+            description: None,
+            icon: None,
+            compose: "services: {}".to_string(),
+            amount: 1000,
+            currency: "USD".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_amount: 0,
+            enabled: true,
+            created: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_app_catalog_crud() {
+        let db = MockDb::default();
+
+        // Insert two apps; the second disabled.
+        let id1 = db.insert_app(&mk_app("nostr-relay")).await.unwrap();
+        let mut a2 = mk_app("blossom");
+        a2.enabled = false;
+        let id2 = db.insert_app(&a2).await.unwrap();
+
+        // Duplicate name is rejected.
+        assert!(db.insert_app(&mk_app("nostr-relay")).await.is_err());
+
+        // get / get_by_name.
+        assert_eq!(db.get_app(id1).await.unwrap().name, "nostr-relay");
+        assert_eq!(db.get_app_by_name("blossom").await.unwrap().id, id2);
+        assert!(db.get_app(9999).await.is_err());
+
+        // list all vs enabled-only.
+        assert_eq!(db.list_apps(false).await.unwrap().len(), 2);
+        let enabled = db.list_apps(true).await.unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].id, id1);
+
+        // update.
+        let mut a1 = db.get_app(id1).await.unwrap();
+        a1.display_name = "Relay!".to_string();
+        db.update_app(&a1).await.unwrap();
+        assert_eq!(db.get_app(id1).await.unwrap().display_name, "Relay!");
+
+        // delete.
+        db.delete_app(id2).await.unwrap();
+        assert!(db.get_app(id2).await.is_err());
+        assert_eq!(db.list_apps(false).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_app_cluster_crud() {
+        let db = MockDb::default();
+        let id = db
+            .insert_app_cluster(&AppCluster {
+                id: 0,
+                name: "eu-1".to_string(),
+                region_id: 1,
+                ingress_domain: "apps.example.com".to_string(),
+                enabled: true,
+                created: Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(db.get_app_cluster(id).await.unwrap().name, "eu-1");
+        assert_eq!(db.list_app_clusters(true).await.unwrap().len(), 1);
+
+        // Disable -> excluded from enabled-only listing.
+        let mut c = db.get_app_cluster(id).await.unwrap();
+        c.enabled = false;
+        db.update_app_cluster(&c).await.unwrap();
+        assert_eq!(db.list_app_clusters(true).await.unwrap().len(), 0);
+        assert_eq!(db.list_app_clusters(false).await.unwrap().len(), 1);
+
+        db.delete_app_cluster(id).await.unwrap();
+        assert!(db.get_app_cluster(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_app_deployment_crud() {
+        let db = MockDb::default();
+        let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
+        let cluster_id = db
+            .insert_app_cluster(&AppCluster {
+                id: 0,
+                name: "c1".to_string(),
+                region_id: 1,
+                ingress_domain: "apps.example.com".to_string(),
+                enabled: true,
+                created: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let mk_dep = |user: u64, li: u64, name: &str| AppDeployment {
+            id: 0,
+            user_id: user,
+            app_id,
+            cluster_id,
+            subscription_line_item_id: li,
+            name: name.to_string(),
+            namespace: format!("app-{name}"),
+            hostname: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+
+        let d1 = db.insert_app_deployment(&mk_dep(1, 10, "a")).await.unwrap();
+        let _d2 = db.insert_app_deployment(&mk_dep(1, 11, "b")).await.unwrap();
+        let _d3 = db.insert_app_deployment(&mk_dep(2, 12, "c")).await.unwrap();
+
+        // Per-user listing.
+        assert_eq!(db.list_user_app_deployments(1).await.unwrap().len(), 2);
+        assert_eq!(db.list_user_app_deployments(2).await.unwrap().len(), 1);
+        // Operator listing sees all non-deleted.
+        assert_eq!(db.list_all_app_deployments().await.unwrap().len(), 3);
+
+        // Resolve by line item.
+        assert_eq!(
+            db.get_app_deployment_by_line_item(11).await.unwrap().name,
+            "b"
+        );
+
+        // Status write-back.
+        let mut dep = db.get_app_deployment(d1).await.unwrap();
+        dep.status = AppDeploymentStatus::Running;
+        dep.hostname = Some("a.apps.example.com".to_string());
+        db.update_app_deployment(&dep).await.unwrap();
+        let reloaded = db.get_app_deployment(d1).await.unwrap();
+        assert_eq!(reloaded.status, AppDeploymentStatus::Running);
+        assert_eq!(reloaded.hostname.as_deref(), Some("a.apps.example.com"));
+
+        // Soft delete removes it from both listings but the row still exists.
+        db.delete_app_deployment(d1).await.unwrap();
+        assert_eq!(db.list_user_app_deployments(1).await.unwrap().len(), 1);
+        assert_eq!(db.list_all_app_deployments().await.unwrap().len(), 2);
+        assert!(db.get_app_deployment(d1).await.unwrap().deleted);
     }
 }
 

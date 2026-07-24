@@ -1,12 +1,13 @@
 use crate::{
-    AccessPolicy, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError,
-    DbResult, DnsServer, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
-    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    AccessPolicy, App, AppCluster, AppDeployment, AsnSubscription, AsnSubscriptionStatus,
+    AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
+    PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router,
+    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
+    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -3603,6 +3604,223 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await?;
         Ok(count as u64)
+    }
+
+    // ----- App catalog -----
+
+    async fn list_apps(&self, enabled_only: bool) -> DbResult<Vec<App>> {
+        let sql = if enabled_only {
+            "SELECT * FROM app WHERE enabled = 1 ORDER BY display_name"
+        } else {
+            "SELECT * FROM app ORDER BY display_name"
+        };
+        Ok(sqlx::query_as(sql).fetch_all(&self.db).await?)
+    }
+
+    async fn get_app(&self, id: u64) -> DbResult<App> {
+        Ok(sqlx::query_as("SELECT * FROM app WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_app_by_name(&self, name: &str) -> DbResult<App> {
+        Ok(sqlx::query_as("SELECT * FROM app WHERE name = ?")
+            .bind(name)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn insert_app(&self, app: &App) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO app (name, display_name, description, icon, compose, amount, currency, \
+             interval_amount, interval_type, setup_amount, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(&app.name)
+        .bind(&app.display_name)
+        .bind(&app.description)
+        .bind(&app.icon)
+        .bind(&app.compose)
+        .bind(app.amount)
+        .bind(&app.currency)
+        .bind(app.interval_amount)
+        .bind(app.interval_type)
+        .bind(app.setup_amount)
+        .bind(app.enabled)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_app(&self, app: &App) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE app SET name = ?, display_name = ?, description = ?, icon = ?, compose = ?, \
+             amount = ?, currency = ?, interval_amount = ?, interval_type = ?, setup_amount = ?, \
+             enabled = ? WHERE id = ?",
+        )
+        .bind(&app.name)
+        .bind(&app.display_name)
+        .bind(&app.description)
+        .bind(&app.icon)
+        .bind(&app.compose)
+        .bind(app.amount)
+        .bind(&app.currency)
+        .bind(app.interval_amount)
+        .bind(app.interval_type)
+        .bind(app.setup_amount)
+        .bind(app.enabled)
+        .bind(app.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_app(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM app WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ----- App clusters -----
+
+    async fn list_app_clusters(&self, enabled_only: bool) -> DbResult<Vec<AppCluster>> {
+        let sql = if enabled_only {
+            "SELECT * FROM app_cluster WHERE enabled = 1 ORDER BY name"
+        } else {
+            "SELECT * FROM app_cluster ORDER BY name"
+        };
+        Ok(sqlx::query_as(sql).fetch_all(&self.db).await?)
+    }
+
+    async fn get_app_cluster(&self, id: u64) -> DbResult<AppCluster> {
+        Ok(sqlx::query_as("SELECT * FROM app_cluster WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled) \
+             VALUES (?, ?, ?, ?) returning id",
+        )
+        .bind(&cluster.name)
+        .bind(cluster.region_id)
+        .bind(&cluster.ingress_domain)
+        .bind(cluster.enabled)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE app_cluster SET name = ?, region_id = ?, ingress_domain = ?, enabled = ? \
+             WHERE id = ?",
+        )
+        .bind(&cluster.name)
+        .bind(cluster.region_id)
+        .bind(&cluster.ingress_domain)
+        .bind(cluster.enabled)
+        .bind(cluster.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_app_cluster(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM app_cluster WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ----- App deployments -----
+
+    async fn list_user_app_deployments(&self, user_id: u64) -> DbResult<Vec<AppDeployment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM app_deployment WHERE user_id = ? AND deleted = 0 ORDER BY created DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_all_app_deployments(&self) -> DbResult<Vec<AppDeployment>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM app_deployment WHERE deleted = 0 ORDER BY id")
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment> {
+        Ok(sqlx::query_as("SELECT * FROM app_deployment WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_app_deployment_by_line_item(&self, line_item_id: u64) -> DbResult<AppDeployment> {
+        Ok(
+            sqlx::query_as("SELECT * FROM app_deployment WHERE subscription_line_item_id = ?")
+                .bind(line_item_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO app_deployment (user_id, app_id, cluster_id, subscription_line_item_id, \
+             name, namespace, hostname, config, desired_state, status, status_message) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(deployment.user_id)
+        .bind(deployment.app_id)
+        .bind(deployment.cluster_id)
+        .bind(deployment.subscription_line_item_id)
+        .bind(&deployment.name)
+        .bind(&deployment.namespace)
+        .bind(&deployment.hostname)
+        .bind(&deployment.config)
+        .bind(deployment.desired_state)
+        .bind(deployment.status)
+        .bind(&deployment.status_message)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE app_deployment SET name = ?, namespace = ?, hostname = ?, config = ?, \
+             desired_state = ?, status = ?, status_message = ?, deleted = ? WHERE id = ?",
+        )
+        .bind(&deployment.name)
+        .bind(&deployment.namespace)
+        .bind(&deployment.hostname)
+        .bind(&deployment.config)
+        .bind(deployment.desired_state)
+        .bind(deployment.status)
+        .bind(&deployment.status_message)
+        .bind(deployment.deleted)
+        .bind(deployment.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
+        sqlx::query("UPDATE app_deployment SET deleted = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 }
 
