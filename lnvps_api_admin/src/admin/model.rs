@@ -1977,6 +1977,10 @@ pub struct AdminReferralInfo {
     pub mode: String,
     /// Per-referrer commission override (whole %); `null` = use company default.
     pub referral_rate: Option<f32>,
+    /// User-chosen minimum accrued commission (satoshis) before an automated
+    /// payout; `null` = use the system minimum. Effective threshold is
+    /// `max(system minimum, this value)`.
+    pub payout_threshold: Option<u64>,
     pub created: DateTime<Utc>,
 }
 
@@ -2053,6 +2057,14 @@ pub struct AdminUpdateReferralRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub referral_rate: Option<Option<f32>>,
+    /// Set (`Some(Some(sats))`) or clear (`Some(None)`) the referrer's
+    /// minimum-payout threshold in satoshis; omitted leaves it unchanged. Not
+    /// bounded by the system minimum here (admin override).
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub payout_threshold: Option<Option<u64>>,
 }
 
 /// Create a manual payout record for a referral.

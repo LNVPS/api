@@ -54,6 +54,7 @@ async fn build_info(this: &RouterState, r: Referral) -> Result<AdminReferralInfo
         address: r.address,
         mode: r.mode.to_string(),
         referral_rate: r.referral_rate,
+        payout_threshold: r.payout_threshold,
         created: r.created,
     })
 }
@@ -153,6 +154,10 @@ async fn admin_update_referral(
             }
         }
         referral.referral_rate = rate;
+    }
+
+    if let Some(threshold) = req.payout_threshold {
+        referral.payout_threshold = threshold;
     }
 
     this.db.update_referral(&referral).await?;

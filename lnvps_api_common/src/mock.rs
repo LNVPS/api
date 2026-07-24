@@ -2966,6 +2966,7 @@ impl LNVpsDbBase for MockDb {
             r.address = referral.address.clone();
             r.mode = referral.mode;
             r.referral_rate = referral.referral_rate;
+            r.payout_threshold = referral.payout_threshold;
             // Cascade a code rename onto VMs that recorded the old code so
             // historical referral attribution is preserved.
             if old_code != referral.code {
@@ -4128,6 +4129,7 @@ mod tests {
             address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
+            payout_threshold: None,
             created: Utc::now(),
         };
         let id_a = db.insert_referral(&mk("AAA")).await.unwrap();
@@ -4154,6 +4156,7 @@ mod tests {
             address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
+            payout_threshold: None,
             created: Utc::now(),
         };
         let ref_id = db.insert_referral(&referral).await.unwrap();
@@ -4218,6 +4221,7 @@ mod tests {
             address: Some("a@b.com".to_string()),
             mode: ReferralPayoutMode::LightningAddress,
             referral_rate: None,
+            payout_threshold: None,
             created: Utc::now(),
         };
         let id_a = db.insert_referral(&mk("ALPHA123")).await.unwrap();
