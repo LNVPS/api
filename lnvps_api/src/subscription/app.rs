@@ -160,6 +160,7 @@ mod tests {
             name: "inst".to_string(),
             namespace: "app-1".to_string(),
             hostname: None,
+            custom_domain: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,

@@ -3218,6 +3218,10 @@ pub struct AppDeployment {
     pub namespace: String,
     /// Public ingress hostname once assigned (e.g. `name.apps.lnvps.tld`).
     pub hostname: Option<String>,
+    /// Optional customer-owned domain (CNAME'd to `hostname` by the customer).
+    /// When set, the operator adds it to the Ingress and cert-manager issues a
+    /// TLS cert for it; the default `hostname` keeps working alongside it.
+    pub custom_domain: Option<String>,
     /// Resolved per-deployment configuration (env values etc.), stored as an
     /// encrypted JSON blob so secret values are protected at rest. `None` until
     /// the customer supplies configuration.

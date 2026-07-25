@@ -577,13 +577,20 @@ pub fn build_deployment(
     }
 }
 
-/// An Ingress routing `hostname` to the first `expose: ingress` port found
-/// across the app's services, with cert-manager TLS. Returns `None` when no
-/// service exposes an ingress port. `issuer`/`class` come from operator config.
+/// An Ingress routing `hostname` (and an optional customer `custom_domain`) to
+/// the first `expose: ingress` port found across the app's services, with
+/// cert-manager TLS. Returns `None` when no service exposes an ingress port.
+/// `issuer`/`class` come from operator config.
+///
+/// Both hosts serve the same backend. Each gets its own TLS secret
+/// (`app-tls` for the default host, `app-tls-custom` for the custom domain) so
+/// cert-manager issues a separate certificate per host via HTTP-01 — the custom
+/// domain's cert is only solvable once the customer's CNAME points at us.
 pub fn build_ingress(
     deployment_id: u64,
     compose: &Compose,
     hostname: &str,
+    custom_domain: Option<&str>,
     issuer: &str,
     class: &str,
 ) -> Option<Ingress> {
@@ -604,15 +611,15 @@ pub fn build_ingress(
         issuer.to_string(),
     )]);
 
-    let rule = IngressRule {
-        host: Some(hostname.to_string()),
+    let rule_for = |host: &str| IngressRule {
+        host: Some(host.to_string()),
         http: Some(HTTPIngressRuleValue {
             paths: vec![HTTPIngressPath {
                 path: Some(port.path.clone().unwrap_or_else(|| "/".to_string())),
                 path_type: "Prefix".to_string(),
                 backend: IngressBackend {
                     service: Some(IngressServiceBackend {
-                        name: service_name,
+                        name: service_name.clone(),
                         port: Some(ServiceBackendPort {
                             number: Some(port.container as i32),
                             ..Default::default()
@@ -624,6 +631,22 @@ pub fn build_ingress(
         }),
     };
 
+    let mut rules = vec![rule_for(hostname)];
+    let mut tls = vec![IngressTLS {
+        hosts: Some(vec![hostname.to_string()]),
+        secret_name: Some("app-tls".to_string()),
+    }];
+    // Custom domain (dedup against the default host in case they're identical).
+    if let Some(cd) = custom_domain
+        && !cd.eq_ignore_ascii_case(hostname)
+    {
+        rules.push(rule_for(cd));
+        tls.push(IngressTLS {
+            hosts: Some(vec![cd.to_string()]),
+            secret_name: Some("app-tls-custom".to_string()),
+        });
+    }
+
     Some(Ingress {
         metadata: ObjectMeta {
             name: Some("app".to_string()),
@@ -634,11 +657,8 @@ pub fn build_ingress(
         },
         spec: Some(IngressSpec {
             ingress_class_name: Some(class.to_string()),
-            tls: Some(vec![IngressTLS {
-                hosts: Some(vec![hostname.to_string()]),
-                secret_name: Some("app-tls".to_string()),
-            }]),
-            rules: Some(vec![rule]),
+            tls: Some(tls),
+            rules: Some(rules),
             ..Default::default()
         }),
         status: None,
@@ -997,11 +1017,13 @@ async fn reconcile_one(
         .await?;
     }
 
-    // 5. Ingress for the exposed port (if any).
+    // 5. Ingress for the exposed port (if any), serving both the default
+    // hostname and any customer custom domain.
     if let Some(ing) = build_ingress(
         id,
         &compose,
         &hostname,
+        deployment.custom_domain.as_deref(),
         ctx.settings
             .cluster_issuer
             .as_deref()
@@ -1354,8 +1376,15 @@ config:
     #[test]
     fn ingress_targets_exposed_port_with_tls() {
         let c = compose();
-        let ing =
-            build_ingress(7, &c, "relay.apps.example.com", "letsencrypt-prod", "nginx").unwrap();
+        let ing = build_ingress(
+            7,
+            &c,
+            "relay.apps.example.com",
+            None,
+            "letsencrypt-prod",
+            "nginx",
+        )
+        .unwrap();
         // cert-manager issuer via annotation; ingress class via the modern
         // spec.ingressClassName (not the deprecated annotation).
         let ann = ing.metadata.annotations.as_ref().unwrap();
@@ -1388,7 +1417,66 @@ config:
             "services:\n  a:\n    image: x\n    ports:\n      - { name: p, container: 5, protocol: tcp }\n",
         )
         .unwrap();
-        assert!(build_ingress(7, &c, "h", "i", "nginx").is_none());
+        assert!(build_ingress(7, &c, "h", None, "i", "nginx").is_none());
+    }
+
+    /// A custom domain adds a second rule + a separate TLS secret
+    /// (`app-tls-custom`), while the default host keeps its own (`app-tls`).
+    #[test]
+    fn ingress_adds_custom_domain_rule_and_tls() {
+        let c = compose();
+        let ing = build_ingress(
+            7,
+            &c,
+            "relay.apps.example.com",
+            Some("blog.example.com"),
+            "letsencrypt-prod",
+            "nginx",
+        )
+        .unwrap();
+        let spec = ing.spec.unwrap();
+
+        // Two rules: default host + custom domain, same backend.
+        let rules = spec.rules.unwrap();
+        let hosts: Vec<&str> = rules
+            .iter()
+            .filter_map(|r| r.host.as_deref())
+            .collect();
+        assert_eq!(hosts, vec!["relay.apps.example.com", "blog.example.com"]);
+        let backend = rules[1].http.as_ref().unwrap().paths[0]
+            .backend
+            .service
+            .as_ref()
+            .unwrap();
+        assert_eq!(backend.name, "web");
+
+        // Two TLS blocks with distinct secrets/hosts.
+        let tls = spec.tls.unwrap();
+        assert_eq!(tls.len(), 2);
+        assert_eq!(tls[0].secret_name.as_deref(), Some("app-tls"));
+        assert_eq!(
+            tls[0].hosts.as_ref().unwrap(),
+            &vec!["relay.apps.example.com".to_string()]
+        );
+        assert_eq!(tls[1].secret_name.as_deref(), Some("app-tls-custom"));
+        assert_eq!(
+            tls[1].hosts.as_ref().unwrap(),
+            &vec!["blog.example.com".to_string()]
+        );
+
+        // Custom domain identical to the default host is deduped (no dup rule).
+        let ing = build_ingress(
+            7,
+            &c,
+            "relay.apps.example.com",
+            Some("relay.apps.example.com"),
+            "letsencrypt-prod",
+            "nginx",
+        )
+        .unwrap();
+        let spec = ing.spec.unwrap();
+        assert_eq!(spec.rules.unwrap().len(), 1);
+        assert_eq!(spec.tls.unwrap().len(), 1);
     }
 
     #[test]
@@ -1514,7 +1602,7 @@ config:
         // Service + Ingress target web's exposed port 8000.
         let svc = build_service(id, "web", &c.services["web"]).unwrap();
         assert_eq!(svc.spec.unwrap().ports.unwrap()[0].port, 8000);
-        let ing = build_ingress(id, &c, &host, "letsencrypt-prod", "nginx").unwrap();
+        let ing = build_ingress(id, &c, &host, None, "letsencrypt-prod", "nginx").unwrap();
         let backend = ing.spec.unwrap().rules.unwrap()[0]
             .http
             .as_ref()
@@ -1668,7 +1756,7 @@ config:
 
             // Each documented app exposes an ingress endpoint.
             assert!(
-                build_ingress(id, &c, &host, "letsencrypt-prod", "nginx").is_some(),
+                build_ingress(id, &c, &host, None, "letsencrypt-prod", "nginx").is_some(),
                 "{name}: expected an ingress endpoint"
             );
             // Shared namespace objects render from the footprint.

@@ -146,6 +146,10 @@ pub struct ApiAppDeployment {
     /// Public endpoint hostname once assigned (`None` until reconciled or for
     /// apps with no ingress port).
     pub hostname: Option<String>,
+    /// Customer-owned domain (CNAME'd to `hostname`). When set, the operator
+    /// serves it too and cert-manager issues a TLS cert for it (HTTP-01 once
+    /// DNS resolves). `None` when unset.
+    pub custom_domain: Option<String>,
     /// Desired run state: `running` or `stopped`.
     pub desired_state: String,
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
@@ -182,6 +186,7 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         app_id: d.app_id,
         name: d.name,
         hostname: d.hostname,
+        custom_domain: d.custom_domain,
         desired_state: d.desired_state.to_string(),
         status: d.status.to_string(),
         status_message: d.status_message,
@@ -433,6 +438,7 @@ async fn v1_create_app_deployment(
         // Temporary unique namespace; finalized to `app-{id}` below.
         namespace: format!("app-pending-{line_item_id}"),
         hostname: None,
+        custom_domain: None,
         config: Some(EncryptedString::new(config_json)),
         desired_state: AppDeploymentDesiredState::Running,
         status: AppDeploymentStatus::Pending,
@@ -499,6 +505,38 @@ pub struct PatchAppDeploymentRequest {
     /// send the full desired config; it replaces the stored config wholesale.
     #[serde(default)]
     pub config: Option<BTreeMap<String, String>>,
+    /// Set or clear the customer-owned domain. `Some("blog.example.com")` sets
+    /// it (validated DNS-safe); `Some("")` or `Some(null)` clears it. When set,
+    /// the operator serves the domain and cert-manager issues a TLS cert once
+    /// the customer points a CNAME at the deployment's `hostname`. Absent =
+    /// leave unchanged.
+    #[serde(default)]
+    pub custom_domain: Option<Option<String>>,
+}
+
+/// Validate a customer-supplied custom domain: lowercase DNS hostname, one or
+/// more labels, no scheme/port/path. Returns the normalized (trimmed, lowercase)
+/// domain.
+fn validate_custom_domain(d: &str) -> Result<String, ApiError> {
+    let d = d.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() || d.len() > 253 {
+        return Err(ApiError::new("custom domain must be 1–253 characters"));
+    }
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && l.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    // Require at least one dot (a registrable host, not a bare TLD/label).
+    if !d.contains('.') || !d.split('.').all(label_ok) {
+        return Err(ApiError::new(
+            "custom domain must be a valid DNS hostname (e.g. blog.example.com)",
+        ));
+    }
+    Ok(d)
 }
 
 /// Update a deployment's name and/or config. The operator re-applies the change
@@ -542,6 +580,16 @@ async fn v1_patch_app_deployment(
         let config = resolve_config(&compose, submitted)?;
         let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
         deployment.config = Some(EncryptedString::new(config_json));
+    }
+
+    // Custom domain: set (validated) or clear. The operator reconciles the
+    // Ingress + cert on its next loop; TLS is issued once the customer's CNAME
+    // resolves to the deployment hostname.
+    if let Some(cd) = &req.custom_domain {
+        deployment.custom_domain = match cd {
+            Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(d)?),
+            _ => None,
+        };
     }
 
     this.db.update_app_deployment(&deployment).await?;
@@ -595,6 +643,36 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_custom_domain() {
+        // Valid hostnames normalize (trim, lowercase, strip trailing dot).
+        assert_eq!(
+            validate_custom_domain("blog.example.com").ok().as_deref(),
+            Some("blog.example.com")
+        );
+        assert_eq!(
+            validate_custom_domain(" Blog.Example.COM. ").ok().as_deref(),
+            Some("blog.example.com")
+        );
+        assert_eq!(
+            validate_custom_domain("a-b.co.uk").ok().as_deref(),
+            Some("a-b.co.uk")
+        );
+
+        // Invalid: no dot (bare label/TLD), bad chars, scheme/port/path, empties.
+        assert!(validate_custom_domain("").is_err());
+        assert!(validate_custom_domain("localhost").is_err());
+        assert!(validate_custom_domain("example").is_err());
+        assert!(validate_custom_domain("https://blog.example.com").is_err());
+        assert!(validate_custom_domain("blog.example.com:8443").is_err());
+        assert!(validate_custom_domain("blog.example.com/path").is_err());
+        assert!(validate_custom_domain("-bad.example.com").is_err());
+        assert!(validate_custom_domain("bad-.example.com").is_err());
+        assert!(validate_custom_domain("bl og.example.com").is_err());
+        assert!(validate_custom_domain("a..com").is_err());
+        assert!(validate_custom_domain(&format!("{}.com", "a".repeat(64))).is_err());
+    }
+
+    #[test]
     fn test_resolve_config() {
         let compose = lnvps_compose::Compose::parse(
             "services:\n  a:\n    image: x\nconfig:\n  - { name: relay_name, type: string, required: true }\n  - { name: max_mb, type: int, default: \"100\" }\n",
@@ -640,6 +718,7 @@ mod tests {
             name: name.to_string(),
             namespace: format!("ns-{name}"),
             hostname: None,
+            custom_domain: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,

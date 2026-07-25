@@ -1198,6 +1198,44 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::OK, "unknown config key rejected");
+
+        // PATCH custom_domain (validated) succeeds and is returned; clearing works.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep2_id}"),
+                &serde_json::json!({"custom_domain": "Blog.Example.com"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "custom_domain set should succeed");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["custom_domain"].as_str().unwrap(),
+            "blog.example.com",
+            "custom_domain normalized to lowercase"
+        );
+        // An invalid domain (no dot / scheme / bad label) is rejected.
+        for bad in ["localhost", "https://blog.example.com", "-bad.example.com"] {
+            let resp = client
+                .patch_auth(
+                    &format!("/api/v1/app-deployments/{dep2_id}"),
+                    &serde_json::json!({"custom_domain": bad}),
+                )
+                .await
+                .unwrap();
+            assert_ne!(resp.status(), StatusCode::OK, "invalid domain {bad} rejected");
+        }
+        // Clearing with empty string removes it.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep2_id}"),
+                &serde_json::json!({"custom_domain": ""}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "custom_domain clear should succeed");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(body["data"]["custom_domain"].is_null(), "cleared -> null");
         let _ = client
             .delete_auth(&format!("/api/v1/app-deployments/{dep2_id}"))
             .await;

@@ -4603,6 +4603,8 @@ pub struct AdminAppDeploymentInfo {
     pub name: String,
     pub namespace: String,
     pub hostname: Option<String>,
+    /// Customer-owned domain (CNAME'd to `hostname`), served alongside it.
+    pub custom_domain: Option<String>,
     /// Desired run state: `running` or `stopped`.
     pub desired_state: String,
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
@@ -4622,6 +4624,7 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             name: d.name,
             namespace: d.namespace,
             hostname: d.hostname,
+            custom_domain: d.custom_domain,
             desired_state: d.desired_state.to_string(),
             status: d.status.to_string(),
             status_message: d.status_message,
