@@ -36,9 +36,19 @@ Top-level keys: `services`, `secrets` (operator-generated, injected as
 `${NAME}`), `config` (customer form fields, injected as `${name}`). Per service:
 `image`, `resources: { cpu, memory }`, `ports` (`expose: none|ingress`, ingress
 is HTTP only), `env`, `volumes` (PVCs, read-write), `files` (ConfigMap/Secret,
-read-only, mounted via subPath), `depends_on`, `backup`. `${HOSTNAME}` resolves
-to `{deployment-name}.{cluster-ingress-domain}`; a service name resolves to its
-in-namespace DNS (e.g. `db:3306`).
+read-only, mounted via subPath), `depends_on`, `backup`, `user`. `${HOSTNAME}`
+resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
+resolves to its in-namespace DNS (e.g. `db:3306`).
+
+**`user`** — by default every service runs under the restricted Pod Security
+Standard with `runAsNonRoot: true`. Set `user: root` (or `"0"`) on a service
+whose image entrypoint must *start* as root and drop privileges itself —
+`mariadb`, `postgres`, `redis`, etc. That container gets `runAsNonRoot: false`
+and the deployment's namespace drops to the baseline Pod Security Standard
+(still blocking privileged pods, host namespaces/ports/PID/IPC and hostPath);
+all other hardening (no privilege escalation, drop ALL capabilities, read-only
+root filesystem) stays in force. Only set it where the image genuinely needs
+it.
 
 ## Validating a compose document
 
@@ -107,6 +117,7 @@ config:
 services:
   db:
     image: mariadb:11
+    user: root    # mariadb's entrypoint starts as root, then drops to `mysql`
     resources: { cpu: 500m, memory: 512Mi }
     env:
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
