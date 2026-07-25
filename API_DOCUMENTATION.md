@@ -978,6 +978,21 @@ the full firewall ruleset on the host.
 - **Body**: `CustomVmRequest`
 - **Response**: `CustomVmPrice` (base `{ currency, amount }` plus `other_price[]` with the same quote converted to the other supported currencies)
 
+#### Exchange Rates
+- **GET** `/api/v1/exchange-rate`
+- **Auth**: None (public, cacheable — rates change slowly)
+- **Query Params**:
+  - `base`: Optional base currency (`BTC`, `EUR`, `USD`, `GBP`, `CAD`, `CHF`, `AUD`, `JPY`). Defaults to `BTC`. An unrecognised value returns an error.
+- **Response**:
+```typescript
+interface ExchangeRates {
+  updated: string;                       // ISO 8601, server read time (rates refresh on a ~5 min cache)
+  base: string;                          // e.g. "BTC"
+  rates: { [currency: string]: number }; // 1 unit of `base` = rates[X] units of X (standard units); excludes `base`
+}
+```
+  Convert between any two currencies A and B as `rates[B] / rates[A]`. Uses the same conversion (direct FX + BTC cross-hop) as the `other_price[]` fields, so client-side gating (e.g. `min_amount`) agrees with server-side acceptance.
+
 ### Payment Management
 
 #### Get Available Payment Methods

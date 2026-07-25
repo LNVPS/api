@@ -173,6 +173,34 @@ mod tests {
         }
     }
 
+    /// Exchange-rate feed (#230) is public and re-baseable.
+    #[tokio::test]
+    async fn test_exchange_rate_public() {
+        #[derive(serde::Deserialize)]
+        struct ExchangeRatesResp {
+            updated: String,
+            base: String,
+            rates: std::collections::HashMap<String, f64>,
+        }
+
+        let client = user_client_no_auth();
+
+        // Default base is BTC; no auth required.
+        let resp = client.get("/api/v1/exchange-rate").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let data: ApiData<ExchangeRatesResp> = parse_data(resp).await.unwrap();
+        assert_eq!(data.data.base, "BTC");
+        assert!(!data.data.updated.is_empty());
+        assert!(!data.data.rates.contains_key("BTC"), "base is excluded");
+
+        // Re-base to a fiat currency.
+        let resp = client.get("/api/v1/exchange-rate?base=EUR").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let data: ApiData<ExchangeRatesResp> = parse_data(resp).await.unwrap();
+        assert_eq!(data.data.base, "EUR");
+        assert!(!data.data.rates.contains_key("EUR"));
+    }
+
     #[tokio::test]
     async fn test_list_vm_images() {
         let client = user_client_no_auth();

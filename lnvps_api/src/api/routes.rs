@@ -12,7 +12,7 @@ use lnurl::pay::PayResponse;
 use lnurl::{LnUrlResponse, Tag};
 use log::{error, info};
 use nostr_sdk::{ToBech32, Url};
-use payments_rs::currency::CurrencyAmount;
+use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::Serialize;
 use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
@@ -33,9 +33,9 @@ use lnvps_db::{
 use crate::api::model::{
     AccountPatchRequest, AccountPatchResult, AccountTaxInfo, AddNwcPaymentMethodRequest,
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
-    ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse, ApiVmFirewallPolicy,
-    ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus, ApiVmUpgradeQuote,
-    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse,
+    ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus,
+    ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
     PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
     VMPatchRequest, validate_firewall_cidr, validate_firewall_ports, vm_to_status,
 };
@@ -78,6 +78,7 @@ pub fn routes() -> Router<RouterState> {
         .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
         .route("/api/v1/image", get(v1_list_vm_images))
         .route("/api/v1/vm/templates", get(v1_list_vm_templates))
+        .route("/api/v1/exchange-rate", get(v1_exchange_rate))
         .route(
             "/api/v1/vm/custom-template/price",
             post(v1_custom_template_calc),
@@ -879,6 +880,32 @@ async fn v1_list_vm_images(
         })
         .collect();
     ApiData::ok(ret)
+}
+
+#[derive(serde::Deserialize)]
+struct ExchangeRateQuery {
+    /// Base currency to quote rates from (e.g. `EUR`). Defaults to `BTC`.
+    base: Option<String>,
+}
+
+/// Public exchange-rate feed for cross-currency reconciliation (issue #230).
+///
+/// Returns the rates the pricing engine maintains, quoted from `base` (default
+/// `BTC`): `1` unit of `base` = `rates[X]` units of `X`. Public and cacheable
+/// (rates change slowly). Clients derive any pair as `rates[B] / rates[A]`.
+async fn v1_exchange_rate(
+    State(this): State<RouterState>,
+    Query(q): Query<ExchangeRateQuery>,
+) -> ApiResult<ApiExchangeRates> {
+    let base = match q.base.as_deref() {
+        Some(b) => match b.parse::<Currency>() {
+            Ok(c) => c,
+            Err(_) => return ApiData::err("Invalid base currency"),
+        },
+        None => Currency::BTC,
+    };
+    let rates = ApiExchangeRates::build(base, &this.rates).await?;
+    ApiData::ok(rates)
 }
 
 /// List available VM templates (Offers)

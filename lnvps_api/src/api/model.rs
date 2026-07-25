@@ -83,6 +83,59 @@ impl ApiCustomVmPrice {
     }
 }
 
+/// Server exchange rates for cross-currency reconciliation (issue #230).
+///
+/// Exposes the rates the pricing engine already maintains (BTC spot + fiat FX)
+/// so clients can convert any amount between supported currencies — e.g. gate a
+/// payment method's `min_amount` (quoted in its own currency) against an order
+/// priced in a different currency, or render conversions where `other_price`
+/// isn't provided.
+#[derive(Serialize)]
+pub struct ApiExchangeRates {
+    /// Server time the rates were read (ISO 8601). Rates refresh on the cache
+    /// TTL (~5 min); use this to show/refresh staleness client-side.
+    pub updated: DateTime<Utc>,
+    /// The base currency the `rates` map is quoted from.
+    pub base: ApiCurrency,
+    /// `1` unit of `base` equals `rates[X]` units of currency `X`, in standard
+    /// units (decimal EUR/USD/… or BTC). Excludes `base` itself. Conversion
+    /// between any two currencies A and B is `rates[B] / rates[A]`.
+    pub rates: HashMap<String, f64>,
+}
+
+impl ApiExchangeRates {
+    /// Smallest units per standard unit, matching the pricing engine /
+    /// payments-rs (BTC = 1e11 milli-sats, all fiat = 100 cents).
+    fn scale(c: Currency) -> f64 {
+        match c {
+            Currency::BTC => 1.0e11,
+            _ => 100.0,
+        }
+    }
+
+    /// Build the rate table for `base` from the exchange service, reusing the
+    /// same `alt_prices` routing (direct + BTC cross-hop) that powers
+    /// `other_price`, so client-side gating agrees with server-side acceptance.
+    pub async fn build(base: Currency, rates: &Arc<dyn ExchangeRateService>) -> Result<Self> {
+        let rate_list = rates.list_rates().await?;
+        // Convert a large base amount (1,000,000 standard units) rather than a
+        // single unit, so the derived per-unit rate isn't degraded by
+        // smallest-unit rounding of a tiny value.
+        const UNITS: f64 = 1_000_000.0;
+        let src = CurrencyAmount::from_u64(base, (UNITS * Self::scale(base)) as u64);
+        let mut map = HashMap::new();
+        for alt in alt_prices(&rate_list, src) {
+            let standard = alt.value() as f64 / Self::scale(alt.currency());
+            map.insert(alt.currency().to_string(), standard / UNITS);
+        }
+        Ok(Self {
+            updated: Utc::now(),
+            base: base.into(),
+            rates: map,
+        })
+    }
+}
+
 // Models that are only used in lnvps_api (moved from common)
 
 #[derive(Serialize, Deserialize)]
@@ -1414,6 +1467,32 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exchange-rate feed (#230): a BTC base quotes fiat directly, a fiat base
+    /// reconciles cross pairs via BTC, and the base currency is excluded.
+    #[tokio::test]
+    async fn exchange_rates_build() {
+        use lnvps_api_common::{ExchangeRateService, MockExchangeRate, Ticker};
+
+        let svc = MockExchangeRate::default();
+        svc.set_rate(Ticker::btc_rate("EUR").unwrap(), 100_000.0)
+            .await;
+        svc.set_rate(Ticker::btc_rate("USD").unwrap(), 110_000.0)
+            .await;
+        let svc: Arc<dyn ExchangeRateService> = Arc::new(svc);
+
+        // Base BTC: 1 BTC = 100000 EUR / 110000 USD.
+        let btc = ApiExchangeRates::build(Currency::BTC, &svc).await.unwrap();
+        assert!((btc.rates["EUR"] - 100_000.0).abs() < 1.0);
+        assert!((btc.rates["USD"] - 110_000.0).abs() < 1.0);
+        assert!(!btc.rates.contains_key("BTC"), "base is excluded");
+
+        // Base EUR: 1 EUR = 1/100000 BTC, and 1.1 USD via the BTC cross-hop.
+        let eur = ApiExchangeRates::build(Currency::EUR, &svc).await.unwrap();
+        assert!((eur.rates["BTC"] - (1.0 / 100_000.0)).abs() < 1e-9);
+        assert!((eur.rates["USD"] - 1.1).abs() < 1e-3);
+        assert!(!eur.rates.contains_key("EUR"));
+    }
 
     /// On-chain payment data exposes the deposit outpoint (`{txid}:{vout}`) once
     /// a deposit is seen (external_id set), before confirmation, and omits it
