@@ -102,6 +102,19 @@ pub struct Footprint {
     pub storage_bytes: u64,
 }
 
+/// One service's resource contribution to the [`Footprint`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServiceFootprint {
+    /// Compose service name.
+    pub name: String,
+    /// CPU in millicores.
+    pub cpu_milli: u64,
+    /// Memory in bytes.
+    pub memory_bytes: u64,
+    /// Persistent storage in bytes (sum of this service's `volumes[].size`).
+    pub storage_bytes: u64,
+}
+
 /// A config file injected into a container (rendered into a ConfigMap, or a
 /// Secret when `sensitive`) and mounted **read-only** at `path` via `subPath`
 /// so it drops in as a single file without shadowing the directory.
@@ -426,17 +439,39 @@ impl Compose {
     /// Errors if any quantity string is malformed.
     pub fn footprint(&self) -> Result<Footprint> {
         let mut f = Footprint::default();
-        for (sname, svc) in &self.services {
-            f.cpu_milli += parse_cpu_milli(&svc.resources.cpu)
-                .map_err(|e| anyhow!("service '{sname}': cpu: {e}"))?;
-            f.memory_bytes += parse_bytes(&svc.resources.memory)
-                .map_err(|e| anyhow!("service '{sname}': memory: {e}"))?;
-            for v in &svc.volumes {
-                f.storage_bytes += parse_bytes(&v.size)
-                    .map_err(|e| anyhow!("service '{sname}': volume '{}': {e}", v.name))?;
-            }
+        for s in self.service_footprints()? {
+            f.cpu_milli += s.cpu_milli;
+            f.memory_bytes += s.memory_bytes;
+            f.storage_bytes += s.storage_bytes;
         }
         Ok(f)
+    }
+
+    /// Per-service resource breakdown (CPU / memory / storage), sorted by
+    /// service name for a stable order. Sums to [`Compose::footprint`]. Each
+    /// service contributes its `resources` (defaulted when omitted) plus the
+    /// sizes of its `volumes`.
+    pub fn service_footprints(&self) -> Result<Vec<ServiceFootprint>> {
+        let mut out = Vec::with_capacity(self.services.len());
+        for (sname, svc) in &self.services {
+            let cpu_milli = parse_cpu_milli(&svc.resources.cpu)
+                .map_err(|e| anyhow!("service '{sname}': cpu: {e}"))?;
+            let memory_bytes = parse_bytes(&svc.resources.memory)
+                .map_err(|e| anyhow!("service '{sname}': memory: {e}"))?;
+            let mut storage_bytes = 0u64;
+            for v in &svc.volumes {
+                storage_bytes += parse_bytes(&v.size)
+                    .map_err(|e| anyhow!("service '{sname}': volume '{}': {e}", v.name))?;
+            }
+            out.push(ServiceFootprint {
+                name: sname.clone(),
+                cpu_milli,
+                memory_bytes,
+                storage_bytes,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
     }
 }
 
@@ -764,6 +799,34 @@ config:
         assert_eq!(f.cpu_milli, 500);
         assert_eq!(f.memory_bytes, 512 * 1024 * 1024);
         assert_eq!(f.storage_bytes, 25u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn service_footprints_breaks_down_by_service() {
+        let c = Compose::parse(ROUTE96).unwrap();
+        let sf = c.service_footprints().unwrap();
+        assert_eq!(sf.len(), 2);
+        // Sorted by name: mariadb before route96.
+        assert_eq!(sf[0].name, "mariadb");
+        assert_eq!(sf[1].name, "route96");
+        // Each defaults to 250m / 256Mi; volumes differ per service.
+        for s in &sf {
+            assert_eq!(s.cpu_milli, 250);
+            assert_eq!(s.memory_bytes, 256 * 1024 * 1024);
+        }
+        assert_eq!(sf[0].storage_bytes, 5u64 * 1024 * 1024 * 1024);
+        assert_eq!(sf[1].storage_bytes, 20u64 * 1024 * 1024 * 1024);
+        // The breakdown sums to the flat footprint.
+        let f = c.footprint().unwrap();
+        assert_eq!(f.cpu_milli, sf.iter().map(|s| s.cpu_milli).sum::<u64>());
+        assert_eq!(
+            f.memory_bytes,
+            sf.iter().map(|s| s.memory_bytes).sum::<u64>()
+        );
+        assert_eq!(
+            f.storage_bytes,
+            sf.iter().map(|s| s.storage_bytes).sum::<u64>()
+        );
     }
 
     #[test]

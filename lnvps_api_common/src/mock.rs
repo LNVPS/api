@@ -3274,6 +3274,20 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("app deployment not found").into())
     }
 
+    async fn find_app_deployment_by_cluster_name(
+        &self,
+        cluster_id: u64,
+        name: &str,
+    ) -> DbResult<Option<AppDeployment>> {
+        Ok(self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .find(|x| x.cluster_id == cluster_id && x.name == name && !x.deleted)
+            .cloned())
+    }
+
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let mut d = self.app_deployments.lock().await;
         let new_id = d.keys().max().copied().unwrap_or(0) + 1;

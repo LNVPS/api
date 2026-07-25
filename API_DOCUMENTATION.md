@@ -1306,7 +1306,21 @@ interface CreateAppDeploymentRequest {
 }
 ```
 - **Response**: `AppDeployment` — created in `pending` state with a billing subscription; **pay the subscription** (`GET /api/v1/subscriptions/{subscription_id}/renew`) to activate it. The operator starts the workload once paid.
-- **Errors**: `400` for an invalid `name`, missing required / unknown `config` fields, or when no cluster in the region has enough capacity; `404` if the app doesn't exist or isn't offered.
+- **Errors**: `400` for an invalid `name`, a name already in use by another deployment on the chosen cluster, missing required / unknown `config` fields, or when no cluster in the region has enough capacity; `404` if the app doesn't exist or isn't offered.
+
+#### Update a Deployment (rename / reconfigure)
+- **PATCH** `/api/v1/app-deployments/{id}`
+- **Auth**: Required
+- **Body** (all fields optional — only those present are changed):
+```typescript
+interface PatchAppDeploymentRequest {
+  name?: string;                         // new DNS-safe instance name; changes the public hostname
+  config?: { [field: string]: string };  // full desired config for the app's `config` fields; replaces the stored config wholesale
+}
+```
+- **Response**: `AppDeployment` — the operator re-applies the change (hostname/ingress, secrets/env/configmap) and rolls the workload on its next reconcile.
+- **Notes**: only the app's declared `config:` fields can be set (the compose — image, resources, volumes, ports — is fixed by the catalog). Prefill from the deployment's current `config` (returned on `AppDeployment`) so untouched fields are preserved.
+- **Errors**: `400` for an invalid `name`, a name already in use on the cluster, or missing-required / unknown `config` fields; `404` if not found or not owned by you.
 
 #### Stop / Start a Deployment
 - **PATCH** `/api/v1/app-deployments/{id}/stop` — scale to 0 (data retained)
@@ -1372,6 +1386,16 @@ interface App {
   interval_amount: number;
   interval_type: "day" | "month" | "year";
   setup_amount: number;      // one-off setup fee in smallest currency units (0 = none)
+  // Resource footprint computed from the compose (issue #231):
+  cpu_milli: number;         // total requested CPU in millicores
+  memory_bytes: number;      // total requested memory
+  storage_bytes: number;     // total persistent volume size
+  services: {                // per-service breakdown (sorted by name), sums to the totals above
+    name: string;
+    cpu_milli: number;
+    memory_bytes: number;
+    storage_bytes: number;
+  }[];
 }
 
 interface AppDeployment {
@@ -1383,6 +1407,7 @@ interface AppDeployment {
   status: "pending" | "running" | "stopped" | "error" | "deleting";
   status_message?: string;   // operator status/error detail when present
   subscription_id?: number;  // subscription this deployment is billed under (renew via the subscription endpoints)
+  config?: { [field: string]: string }; // current customer-supplied config values, for prefilling the edit form (issue #232); omitted if none
   created: string;           // ISO 8601 datetime
 }
 ```

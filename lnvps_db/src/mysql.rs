@@ -3792,6 +3792,20 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn find_app_deployment_by_cluster_name(
+        &self,
+        cluster_id: u64,
+        name: &str,
+    ) -> DbResult<Option<AppDeployment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM app_deployment WHERE cluster_id = ? AND name = ? AND deleted = 0 LIMIT 1",
+        )
+        .bind(cluster_id)
+        .bind(name)
+        .fetch_optional(&self.db)
+        .await?)
+    }
+
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app_deployment (user_id, app_id, cluster_id, subscription_line_item_id, \

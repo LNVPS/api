@@ -4591,6 +4591,45 @@ impl From<lnvps_db::AppCluster> for AdminAppClusterInfo {
     }
 }
 
+/// An app deployment as seen by an admin (oversight / support). Excludes the
+/// encrypted per-deployment config blob.
+#[derive(Serialize)]
+pub struct AdminAppDeploymentInfo {
+    pub id: u64,
+    pub user_id: u64,
+    pub app_id: u64,
+    pub cluster_id: u64,
+    pub subscription_line_item_id: u64,
+    pub name: String,
+    pub namespace: String,
+    pub hostname: Option<String>,
+    /// Desired run state: `running` or `stopped`.
+    pub desired_state: String,
+    /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
+    pub status: String,
+    pub status_message: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
+    fn from(d: lnvps_db::AppDeployment) -> Self {
+        Self {
+            id: d.id,
+            user_id: d.user_id,
+            app_id: d.app_id,
+            cluster_id: d.cluster_id,
+            subscription_line_item_id: d.subscription_line_item_id,
+            name: d.name,
+            namespace: d.namespace,
+            hostname: d.hostname,
+            desired_state: d.desired_state.to_string(),
+            status: d.status.to_string(),
+            status_message: d.status_message,
+            created: d.created,
+        }
+    }
+}
+
 /// Create an app cluster.
 #[derive(Deserialize)]
 pub struct AdminCreateAppClusterRequest {

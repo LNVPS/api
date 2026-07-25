@@ -1015,6 +1015,14 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment>;
     /// Resolve the deployment billed by a given subscription line item.
     async fn get_app_deployment_by_line_item(&self, line_item_id: u64) -> DbResult<AppDeployment>;
+    /// Find a non-deleted deployment by its `name` on a given cluster, if any.
+    /// Used to enforce unique deployment names per cluster (the name becomes the
+    /// ingress hostname subdomain, so duplicates would collide).
+    async fn find_app_deployment_by_cluster_name(
+        &self,
+        cluster_id: u64,
+        name: &str,
+    ) -> DbResult<Option<AppDeployment>>;
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64>;
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()>;
     /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down

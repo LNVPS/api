@@ -1058,6 +1058,24 @@ mod tests {
         // New order is pending (unpaid) and has a billing subscription.
         assert_eq!(body["data"]["status"].as_str().unwrap(), "pending");
         assert!(body["data"]["subscription_id"].as_u64().is_some());
+        // Config is returned for edit-form prefill (#232).
+        assert_eq!(body["data"]["config"]["title"].as_str(), Some("Hello"));
+
+        // App footprint is exposed on the customer App (#231).
+        let resp = client
+            .get_auth(&format!("/api/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let app_body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(app_body["data"]["cpu_milli"].as_u64(), Some(250));
+        assert!(app_body["data"]["memory_bytes"].as_u64().is_some());
+        assert!(app_body["data"]["storage_bytes"].as_u64().is_some());
+        // Per-service breakdown is present (single service "web" here).
+        let services = app_body["data"]["services"].as_array().unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0]["name"].as_str(), Some("web"));
+        assert_eq!(services[0]["cpu_milli"].as_u64(), Some(250));
 
         // Invalid name is rejected.
         let resp = client
@@ -1112,6 +1130,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Duplicate name on the same cluster is rejected ("my-app" still exists).
+        let resp = client
+            .post_auth(
+                "/api/v1/app-deployments",
+                &serde_json::json!({"app_id": app_id, "name": "my-app", "region_id": region_id, "config": {}}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "duplicate name rejected");
+
+        // Order a second deployment to exercise rename + config PATCH.
+        let resp = client
+            .post_auth(
+                "/api/v1/app-deployments",
+                &serde_json::json!({"app_id": app_id, "name": "second-app", "region_id": region_id, "config": {}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let dep2_id = body["data"]["id"].as_u64().unwrap();
+
+        // PATCH rename succeeds and updates the name.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep2_id}"),
+                &serde_json::json!({"name": "renamed-app"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "rename should succeed");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["name"].as_str().unwrap(), "renamed-app");
+
+        // Renaming to a name already taken on the cluster is rejected.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep2_id}"),
+                &serde_json::json!({"name": "my-app"}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "rename to duplicate rejected"
+        );
+
+        // PATCH config (schema-validated) succeeds.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep2_id}"),
+                &serde_json::json!({"config": {"title": "Updated"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "config patch should succeed");
+
+        // PATCH config with an unknown field is rejected.
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep2_id}"),
+                &serde_json::json!({"config": {"nope": "x"}}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "unknown config key rejected");
+        let _ = client
+            .delete_auth(&format!("/api/v1/app-deployments/{dep2_id}"))
+            .await;
 
         // Delete removes it from the user's listing.
         let resp = client

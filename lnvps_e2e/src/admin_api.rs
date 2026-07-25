@@ -98,6 +98,7 @@ mod tests {
             "/api/admin/v1/payment_methods",
             "/api/admin/v1/ip_space",
             "/api/admin/v1/apps",
+            "/api/admin/v1/app-deployments",
             "/api/admin/v1/app_clusters",
         ];
 
@@ -712,6 +713,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Top-level admin listing of all app deployments (oversight/support).
+    #[tokio::test]
+    async fn test_admin_list_app_deployments() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (_app_id, _cluster_id, dep_id) =
+            crate::db::seed_app_deployment(&pool, uid, "admin-list")
+                .await
+                .unwrap();
+
+        let resp = client
+            .get_auth("/api/admin/v1/app-deployments")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let found = body["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("seeded deployment is listed");
+        assert_eq!(found["user_id"].as_u64(), Some(uid));
+        assert!(!found["namespace"].as_str().unwrap().is_empty());
+        assert!(!found["status"].as_str().unwrap().is_empty());
+
+        pool.close().await;
     }
 
     // ========================================================================

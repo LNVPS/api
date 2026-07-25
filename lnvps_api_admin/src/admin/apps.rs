@@ -1,8 +1,8 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminAppClusterInfo, AdminAppInfo, AdminCreateAppClusterRequest, AdminCreateAppRequest,
-    AdminUpdateAppClusterRequest, AdminUpdateAppRequest,
+    AdminAppClusterInfo, AdminAppDeploymentInfo, AdminAppInfo, AdminCreateAppClusterRequest,
+    AdminCreateAppRequest, AdminUpdateAppClusterRequest, AdminUpdateAppRequest,
 };
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -21,6 +21,10 @@ pub fn router() -> Router<RouterState> {
             get(admin_get_app)
                 .patch(admin_update_app)
                 .delete(admin_delete_app),
+        )
+        .route(
+            "/api/admin/v1/app-deployments",
+            get(admin_list_app_deployments),
         )
         .route(
             "/api/admin/v1/app_clusters",
@@ -217,6 +221,19 @@ async fn admin_delete_app(
 
     this.db.delete_app(id).await?;
     ApiData::ok(true)
+}
+
+// ----- App deployments -----
+
+/// List every (non-deleted) app deployment across all users and clusters, for
+/// admin oversight and support. Excludes the encrypted per-deployment config.
+async fn admin_list_app_deployments(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+) -> ApiResult<Vec<AdminAppDeploymentInfo>> {
+    auth.require_permission(AdminResource::App, AdminAction::View)?;
+    let deployments = this.db.list_all_app_deployments().await?;
+    ApiData::ok(deployments.into_iter().map(Into::into).collect())
 }
 
 // ----- App clusters -----

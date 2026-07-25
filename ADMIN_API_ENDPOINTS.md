@@ -3692,6 +3692,31 @@ DELETE /api/admin/v1/apps/{id}
 
 Required Permission: `app::delete`. Rejected while the app still has deployments (disable it instead).
 
+#### App Deployments
+
+```
+GET /api/admin/v1/app-deployments
+```
+
+Required Permission: `app::view`. Lists every non-deleted app deployment across all users and clusters, for oversight/support. Excludes the encrypted per-deployment config blob. `AdminAppDeploymentInfo`:
+
+```json
+{
+  "id": 1,
+  "user_id": 42,
+  "app_id": 3,
+  "cluster_id": 1,
+  "subscription_line_item_id": 7,
+  "name": "my-relay",
+  "namespace": "app-1",
+  "hostname": "my-relay.apps.lnvps.tld",
+  "desired_state": "running",
+  "status": "running",
+  "status_message": null,
+  "created": "2026-07-25T10:00:00Z"
+}
+```
+
 #### App Clusters
 
 ```

@@ -5,7 +5,7 @@
 
 use crate::api::RouterState;
 use axum::extract::{Path, State};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use lnvps_api_common::{
@@ -13,7 +13,7 @@ use lnvps_api_common::{
     Nip98Auth,
 };
 use lnvps_db::{
-    App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, EncryptedString, LNVpsDb,
+    App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, EncryptedString,
     Subscription, SubscriptionLineItem, SubscriptionType,
 };
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,9 @@ pub fn router() -> Router<RouterState> {
         )
         .route(
             "/api/v1/app-deployments/{id}",
-            get(v1_get_app_deployment).delete(v1_delete_app_deployment),
+            get(v1_get_app_deployment)
+                .patch(v1_patch_app_deployment)
+                .delete(v1_delete_app_deployment),
         )
         .route(
             "/api/v1/app-deployments/{id}/start",
@@ -64,10 +66,41 @@ pub struct ApiApp {
     pub interval_type: ApiIntervalType,
     /// One-off setup fee in the smallest currency unit (0 = none).
     pub setup_amount: u64,
+    /// Total requested CPU in millicores, computed from the compose (issue #231).
+    pub cpu_milli: u64,
+    /// Total requested memory in bytes, computed from the compose.
+    pub memory_bytes: u64,
+    /// Total persistent volume size in bytes, computed from the compose.
+    pub storage_bytes: u64,
+    /// Per-service resource breakdown (sorted by name), summing to the totals
+    /// above. Lets the UI show what each container in a multi-service app uses.
+    pub services: Vec<ApiAppServiceResources>,
+}
+
+/// One service's share of an app's resource footprint.
+#[derive(Serialize)]
+pub struct ApiAppServiceResources {
+    pub name: String,
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+    pub storage_bytes: u64,
 }
 
 impl From<App> for ApiApp {
     fn from(a: App) -> Self {
+        // Per-service breakdown from the (already-validated) compose; best-effort.
+        let services = lnvps_compose::Compose::parse(&a.compose)
+            .ok()
+            .and_then(|c| c.service_footprints().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| ApiAppServiceResources {
+                name: s.name,
+                cpu_milli: s.cpu_milli,
+                memory_bytes: s.memory_bytes,
+                storage_bytes: s.storage_bytes,
+            })
+            .collect();
         Self {
             id: a.id,
             name: a.name,
@@ -81,6 +114,10 @@ impl From<App> for ApiApp {
             interval_amount: a.interval_amount,
             interval_type: a.interval_type.into(),
             setup_amount: a.setup_amount,
+            cpu_milli: a.cpu_milli,
+            memory_bytes: a.memory_bytes,
+            storage_bytes: a.storage_bytes,
+            services,
         }
     }
 }
@@ -118,6 +155,12 @@ pub struct ApiAppDeployment {
     /// Subscription this deployment is billed under (renew via the subscription
     /// endpoints). `None` if the subscription can't be resolved.
     pub subscription_id: Option<u64>,
+    /// Current customer-supplied `config` field values (issue #232), for
+    /// prefilling the edit form so a config `PATCH` preserves untouched fields.
+    /// Only the `config:` map — generated `secrets:` are never exposed. `None`
+    /// if no config was stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<BTreeMap<String, String>>,
     pub created: DateTime<Utc>,
 }
 
@@ -129,6 +172,11 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         .await
         .ok()
         .map(|s| s.id);
+    // Decrypt and parse the stored config (customer-supplied field values only).
+    let config = d
+        .config
+        .as_ref()
+        .and_then(|c| serde_json::from_str::<BTreeMap<String, String>>(c.as_str()).ok());
     ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
@@ -138,6 +186,7 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         status: d.status.to_string(),
         status_message: d.status_message,
         subscription_id,
+        config,
         created: d.created,
     }
 }
@@ -320,6 +369,22 @@ async fn v1_create_app_deployment(
     };
     let region = this.db.get_host_region(cluster.region_id).await?;
 
+    // Enforce unique deployment name per cluster: the name becomes the ingress
+    // hostname subdomain (`{name}.{ingress_domain}`), so a duplicate on the same
+    // cluster would collide on routing and TLS. Checked against non-deleted
+    // deployments so a name freed by deletion can be reused.
+    let name = req.name.trim();
+    if this
+        .db
+        .find_app_deployment_by_cluster_name(cluster.id, name)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::new(
+            "A deployment with this name already exists in this region",
+        ));
+    }
+
     // Create the subscription + App line item (billed via the standard
     // subscription payment flow — pay the returned subscription to activate).
     let subscription = Subscription {
@@ -364,7 +429,7 @@ async fn v1_create_app_deployment(
         app_id: app.id,
         cluster_id: cluster.id,
         subscription_line_item_id: line_item_id,
-        name: req.name.trim().to_string(),
+        name: name.to_string(),
         // Temporary unique namespace; finalized to `app-{id}` below.
         namespace: format!("app-pending-{line_item_id}"),
         hostname: None,
@@ -419,6 +484,68 @@ async fn v1_delete_app_deployment(
     }
     this.db.delete_app_deployment(id).await?;
     ApiData::ok(true)
+}
+
+/// Update an app deployment. All fields are optional — only those present are
+/// changed (partial update).
+#[derive(Deserialize)]
+pub struct PatchAppDeploymentRequest {
+    /// New instance name (becomes the ingress subdomain). Validated DNS-safe and
+    /// checked unique on the cluster. Changing it changes the public hostname.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New values for the app's `config` fields. When present, validated against
+    /// the app's compose schema and defaults are filled, exactly like ordering —
+    /// send the full desired config; it replaces the stored config wholesale.
+    #[serde(default)]
+    pub config: Option<BTreeMap<String, String>>,
+}
+
+/// Update a deployment's name and/or config. The operator re-applies the change
+/// (hostname/ingress, secrets/env/configmap) and rolls the workload on its next
+/// reconcile.
+async fn v1_patch_app_deployment(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<PatchAppDeploymentRequest>,
+) -> ApiResult<ApiAppDeployment> {
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let mut deployment = owned_deployment(&this, uid, id).await?;
+
+    // Rename: validate DNS-safe and enforce unique name per cluster (the name is
+    // the ingress hostname subdomain). Skip the check when the name is unchanged.
+    if let Some(new_name) = &req.name {
+        let new_name = new_name.trim();
+        validate_deployment_name(new_name)?;
+        if new_name != deployment.name {
+            if let Some(existing) = this
+                .db
+                .find_app_deployment_by_cluster_name(deployment.cluster_id, new_name)
+                .await?
+                && existing.id != deployment.id
+            {
+                return Err(ApiError::new(
+                    "A deployment with this name already exists in this region",
+                ));
+            }
+            deployment.name = new_name.to_string();
+        }
+    }
+
+    // Config update: validate against the app's compose schema and store the
+    // resolved map (encrypted — it may hold secret values).
+    if let Some(submitted) = &req.config {
+        let app = this.db.get_app(deployment.app_id).await?;
+        let compose = lnvps_compose::Compose::parse(&app.compose)
+            .map_err(|e| ApiError::new(format!("app compose is invalid: {e}")))?;
+        let config = resolve_config(&compose, submitted)?;
+        let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+        deployment.config = Some(EncryptedString::new(config_json));
+    }
+
+    this.db.update_app_deployment(&deployment).await?;
+    ApiData::ok(deployment_to_api(&this, deployment).await)
 }
 
 async fn set_desired_state(
@@ -494,5 +621,63 @@ mod tests {
         over.insert("max_mb".to_string(), "500".to_string());
         let resolved = resolve_config(&compose, &over).ok().unwrap();
         assert_eq!(resolved.get("max_mb").unwrap(), "500");
+    }
+
+    /// The unique-name lookup is scoped to (cluster, name) and ignores
+    /// soft-deleted rows, so a freed name is reusable but a live one isn't.
+    #[tokio::test]
+    async fn find_app_deployment_by_cluster_name_scopes_correctly() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{AppDeployment, LNVpsDbBase};
+
+        let db = MockDb::default();
+        let mk = |cluster_id: u64, name: &str| AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("ns-{name}"),
+            hostname: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+        db.insert_app_deployment(&mk(1, "live")).await.unwrap();
+        let gone = db.insert_app_deployment(&mk(1, "gone")).await.unwrap();
+        db.delete_app_deployment(gone).await.unwrap();
+
+        // Live name on the cluster is found.
+        assert!(
+            db.find_app_deployment_by_cluster_name(1, "live")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Same name on a different cluster is not.
+        assert!(
+            db.find_app_deployment_by_cluster_name(2, "live")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A soft-deleted name is treated as free.
+        assert!(
+            db.find_app_deployment_by_cluster_name(1, "gone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Unknown name.
+        assert!(
+            db.find_app_deployment_by_cluster_name(1, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
