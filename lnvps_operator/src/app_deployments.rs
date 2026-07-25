@@ -227,20 +227,30 @@ fn build_resource_requirements(r: &lnvps_compose::Resources) -> ResourceRequirem
     }
 }
 
-/// A ResourceQuota capping what the whole deployment namespace may consume,
-/// sized from the app's footprint so a misbehaving app can't exceed what was
-/// provisioned (and billed).
-pub fn build_resource_quota(
-    deployment_id: u64,
-    cpu: &str,
-    memory: &str,
-    pvc: &str,
-) -> ResourceQuota {
-    let hard = BTreeMap::from([
-        ("limits.cpu".to_string(), Quantity(cpu.to_string())),
-        ("limits.memory".to_string(), Quantity(memory.to_string())),
-        ("requests.storage".to_string(), Quantity(pvc.to_string())),
-    ]);
+/// A ResourceQuota capping the storage a deployment namespace may consume.
+///
+/// **Storage only, deliberately.** A `limits.cpu` / `limits.memory` quota was
+/// removed because it enforced nothing that isn't already enforced, while
+/// breaking cluster infrastructure that has to run in the tenant namespace:
+///
+/// - Every container is created with `requests == limits` from the compose
+///   (see [`build_resource_requirements`], Guaranteed QoS) and `replicas` is
+///   fixed at 0 or 1, so the workload cannot exceed its billed footprint
+///   regardless of any namespace quota. Customers have no Kubernetes API
+///   access; this operator is the only writer in the namespace.
+/// - The quota was sized to *exactly* the footprint, leaving zero room for
+///   cert-manager's ephemeral ACME HTTP-01 solver pod (which carries its own
+///   ~100m/64Mi limits). Every TLS issuance was rejected with
+///   `exceeded quota: quota, requested: limits.cpu=100m,limits.memory=64Mi`,
+///   so certificates could never be issued. A deployment with a custom domain
+///   needs two certificates (`app-tls` + `app-tls-custom`) and can therefore
+///   want two solver pods at once, so fixed "headroom" would only have moved
+///   the failure rather than removing it.
+///
+/// Storage stays capped: it is the expensive persistent resource, and no
+/// infrastructure pod requests a PVC, so the cap can never block one.
+pub fn build_resource_quota(deployment_id: u64, pvc: &str) -> ResourceQuota {
+    let hard = BTreeMap::from([("requests.storage".to_string(), Quantity(pvc.to_string()))]);
     ResourceQuota {
         metadata: ObjectMeta {
             name: Some("quota".to_string()),
@@ -1033,17 +1043,14 @@ async fn reconcile_one(
         apply(client, &ing).await?;
     }
 
-    // 6. ResourceQuota sized from the app's footprint (bytes/millicores are
-    // valid k8s quantities), capping the namespace at what was provisioned.
+    // 6. ResourceQuota capping namespace storage at what was provisioned. CPU
+    // and memory are intentionally not quota'd here - they are already pinned
+    // per-container at requests == limits, and a namespace-wide cap starves
+    // cert-manager's ACME solver pods. See build_resource_quota.
     let fp = compose.footprint()?;
     apply(
         client,
-        &build_resource_quota(
-            id,
-            &format!("{}m", fp.cpu_milli),
-            &fp.memory_bytes.to_string(),
-            &fp.storage_bytes.to_string(),
-        ),
+        &build_resource_quota(id, &fp.storage_bytes.to_string()),
     )
     .await?;
 
@@ -1243,11 +1250,24 @@ config:
     }
 
     #[test]
-    fn quota_sets_hard_limits() {
-        let q = build_resource_quota(7, "2", "2Gi", "30Gi");
+    fn quota_caps_storage_only() {
+        // Regression: a limits.cpu/limits.memory quota sized to exactly the app
+        // footprint left no room for cert-manager's ACME HTTP-01 solver pod, so
+        // TLS issuance failed with "exceeded quota: quota, requested:
+        // limits.cpu=100m,limits.memory=64Mi". CPU/memory are already pinned
+        // per-container (requests == limits) with replicas fixed at 1, so the
+        // namespace-wide cap added no enforcement - only a failure mode.
+        let q = build_resource_quota(7, "30Gi");
         let hard = q.spec.unwrap().hard.unwrap();
-        assert_eq!(hard.get("limits.cpu").unwrap().0, "2");
         assert_eq!(hard.get("requests.storage").unwrap().0, "30Gi");
+        assert!(
+            !hard.contains_key("limits.cpu"),
+            "namespace cpu quota starves the ACME solver pod"
+        );
+        assert!(
+            !hard.contains_key("limits.memory"),
+            "namespace memory quota starves the ACME solver pod"
+        );
     }
 
     #[test]
@@ -1761,12 +1781,7 @@ config:
             );
             // Shared namespace objects render from the footprint.
             let _ = build_network_policy(id, "ingress-nginx");
-            let _ = build_resource_quota(
-                id,
-                &format!("{}m", fp.cpu_milli),
-                &fp.memory_bytes.to_string(),
-                &fp.storage_bytes.to_string(),
-            );
+            let _ = build_resource_quota(id, &fp.storage_bytes.to_string());
         }
     }
 
