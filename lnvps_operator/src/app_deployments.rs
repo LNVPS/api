@@ -21,7 +21,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::NamespaceResourceScope;
-use lnvps_db::{AppDeployment, AppDeploymentStatus, EncryptedString};
+use lnvps_db::{
+    AppDeployment, AppDeploymentStatus, EncryptedString, Subscription,
+};
 
 use crate::Context;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
@@ -764,6 +766,75 @@ fn parse_config(cfg: &Option<EncryptedString>) -> BTreeMap<String, String> {
     }
 }
 
+/// Why a deployment's workload is not running (drives the reconcile billing
+/// gate). Each variant maps to a customer-visible reason so a deployment that
+/// *should* be running never silently sits at 0 replicas with no explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateReason {
+    /// Running: subscription set up (paid), not expired, desired running.
+    Running,
+    /// Customer (or admin) set the deployment's desired state to stopped.
+    StoppedByUser,
+    /// The subscription could not be read (DB error, or decryption of an
+    /// encrypted column failed because the operator's encryption key is
+    /// missing/mismatched). Distinct from [`GateReason::Unpaid`]: this is an
+    /// operational fault, not a billing state, and must be loud.
+    SubscriptionLookupFailed(String),
+    /// The subscription's initial purchase payment has not been confirmed
+    /// (`is_setup = 0`) — a freshly-ordered, unpaid deployment.
+    Unpaid,
+    /// The subscription was paid but has since expired (and is within the
+    /// grace period, so data is retained at 0 replicas).
+    Expired,
+}
+
+impl std::fmt::Display for GateReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateReason::Running => write!(f, "running"),
+            GateReason::StoppedByUser => write!(f, "deployment stopped by user"),
+            GateReason::SubscriptionLookupFailed(e) => {
+                write!(f, "subscription lookup failed: {e}")
+            }
+            GateReason::Unpaid => write!(f, "subscription not yet paid"),
+            GateReason::Expired => write!(f, "subscription expired (data retained)"),
+        }
+    }
+}
+
+/// The pure billing/lifecycle gate: given the deployment's desired state and
+/// its subscription (or the lookup error), decide whether the workload runs.
+///
+/// Returns [`GateReason::Running`] (1 replica) or the reason it stays at 0.
+/// Extracted as a pure function so the gate logic is unit-testable without a
+/// cluster or DB.
+pub fn gate_running(
+    desired_running: bool,
+    deleted: bool,
+    sub: Option<&Subscription>,
+    sub_lookup_err: Option<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> GateReason {
+    if deleted || !desired_running {
+        return GateReason::StoppedByUser;
+    }
+    if let Some(e) = sub_lookup_err {
+        return GateReason::SubscriptionLookupFailed(e);
+    }
+    let Some(sub) = sub else {
+        // Lookup succeeded but found nothing — treat as unpaid (no billing
+        // record yet) rather than an operational fault.
+        return GateReason::Unpaid;
+    };
+    if !sub.is_setup {
+        return GateReason::Unpaid;
+    }
+    if sub.expires.map(|e| e < now).unwrap_or(false) {
+        return GateReason::Expired;
+    }
+    GateReason::Running
+}
+
 /// Reconcile every app deployment assigned to this operator's cluster into
 /// Kubernetes. No-op when the operator isn't configured with an `app_cluster_id`.
 pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
@@ -833,22 +904,29 @@ async fn reconcile_one(
     // set up (paid at least once) and not expired. A freshly-ordered, unpaid
     // deployment (not set up) stays at 0 replicas; an expired one scales to 0
     // but keeps its PVCs (customer data) — only real deletion tears it down.
-    let sub = ctx
+    //
+    // The lookup error is NOT swallowed: a DB/decryption fault here must be
+    // surfaced (and the gate fails closed) rather than silently reading as
+    // "unpaid", which is how a paid deployment previously sat at 0 replicas
+    // with an empty status message.
+    let (sub, sub_err) = match ctx
         .db
         .get_subscription_by_line_item_id(deployment.subscription_line_item_id)
         .await
-        .ok();
-    let paid = sub.as_ref().map(|s| s.is_setup).unwrap_or(false);
-    let expired = sub
-        .as_ref()
-        .and_then(|s| s.expires)
-        .map(|e| e < chrono::Utc::now())
-        .unwrap_or(false);
-    let running = deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running
-        && !deployment.deleted
-        && paid
-        && !expired;
-    let replicas = if running { 1 } else { 0 };
+    {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    let desired_running =
+        deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running;
+    let gate = gate_running(
+        desired_running,
+        deployment.deleted,
+        sub.as_ref(),
+        sub_err,
+        chrono::Utc::now(),
+    );
+    let replicas = if gate == GateReason::Running { 1 } else { 0 };
 
     // 4. Per service: PVCs, file ConfigMap/Secret, Service, Deployment.
     for (sname, svc) in &compose.services {
@@ -906,15 +984,29 @@ async fn reconcile_one(
     )
     .await?;
 
-    // 7. Status write-back: record the hostname and running state.
+    // 7. Status write-back: record the hostname and running state. When the
+    // workload isn't running, surface *why* so a paid-intended deployment never
+    // sits at 0 replicas with no explanation (previously a silent `stopped`).
     let mut updated = deployment.clone();
     updated.hostname = Some(hostname);
-    updated.status = if replicas == 0 {
-        AppDeploymentStatus::Stopped
-    } else {
-        AppDeploymentStatus::Running
-    };
-    updated.status_message = None;
+    match &gate {
+        GateReason::Running => {
+            updated.status = AppDeploymentStatus::Running;
+            updated.status_message = None;
+        }
+        // A lookup fault is an operational error, not a lifecycle state — mark
+        // it Error so it's visibly wrong and alerted on, not a calm `stopped`.
+        GateReason::SubscriptionLookupFailed(e) => {
+            updated.status = AppDeploymentStatus::Error;
+            updated.status_message = Some(format!("subscription lookup failed: {e}"));
+            error!("app deployment {id} not running: subscription lookup failed: {e}");
+        }
+        reason => {
+            updated.status = AppDeploymentStatus::Stopped;
+            updated.status_message = Some(reason.to_string());
+            info!("app deployment {id} not running: {reason}");
+        }
+    }
     ctx.db.update_app_deployment(&updated).await?;
     info!("reconciled app deployment {id}");
     Ok(())
@@ -1491,5 +1583,122 @@ config:
                 &fp.storage_bytes.to_string(),
             );
         }
+    }
+
+    // ── billing gate (reconcile_one) ────────────────────────────────────────
+
+    use lnvps_db::{IntervalType, Subscription};
+
+    fn sub(is_setup: bool, expires: Option<chrono::DateTime<chrono::Utc>>) -> Subscription {
+        Subscription {
+            id: 1,
+            user_id: 1,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: chrono::Utc::now(),
+            expires,
+            is_active: true,
+            is_setup,
+            currency: "USD".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: true,
+            external_id: None,
+        }
+    }
+
+    /// A paid, unexpired, desired-running deployment runs.
+    #[test]
+    fn gate_paid_and_running() {
+        let s = sub(true, Some(chrono::Utc::now() + chrono::Duration::days(30)));
+        assert_eq!(
+            gate_running(true, false, Some(&s), None, chrono::Utc::now()),
+            GateReason::Running
+        );
+    }
+
+    /// Regression: a *lookup fault* (DB error / decryption failure) must NOT be
+    /// silently treated as "unpaid". It surfaces as a distinct, loud reason so
+    /// a paid deployment doesn't sit at 0 replicas with an empty status message.
+    #[test]
+    fn gate_lookup_error_is_not_unpaid() {
+        let now = chrono::Utc::now();
+        let err = Some("Encryption context not initialized".to_string());
+        assert_eq!(
+            gate_running(true, false, None, err, now),
+            GateReason::SubscriptionLookupFailed(
+                "Encryption context not initialized".to_string()
+            )
+        );
+        // ...and it is NOT the calm Unpaid reason.
+        assert_ne!(
+            gate_running(true, false, None, Some("x".to_string()), now),
+            GateReason::Unpaid
+        );
+    }
+
+    /// A freshly-ordered deployment whose subscription isn't set up yet stays
+    /// at 0 replicas with the Unpaid reason.
+    #[test]
+    fn gate_unpaid_when_not_setup() {
+        let s = sub(false, None);
+        assert_eq!(
+            gate_running(true, false, Some(&s), None, chrono::Utc::now()),
+            GateReason::Unpaid
+        );
+        // No subscription row at all (lookup succeeded, nothing found) → Unpaid.
+        assert_eq!(
+            gate_running(true, false, None, None, chrono::Utc::now()),
+            GateReason::Unpaid
+        );
+    }
+
+    /// A paid but expired subscription scales to 0 (data retained).
+    #[test]
+    fn gate_expired_when_past_expiry() {
+        let s = sub(true, Some(chrono::Utc::now() - chrono::Duration::hours(1)));
+        assert_eq!(
+            gate_running(true, false, Some(&s), None, chrono::Utc::now()),
+            GateReason::Expired
+        );
+    }
+
+    /// Desired-stopped (or deleted) always wins, regardless of billing.
+    #[test]
+    fn gate_stopped_by_user() {
+        let s = sub(true, Some(chrono::Utc::now() + chrono::Duration::days(30)));
+        assert_eq!(
+            gate_running(false, false, Some(&s), None, chrono::Utc::now()),
+            GateReason::StoppedByUser
+        );
+        assert_eq!(
+            gate_running(true, true, Some(&s), None, chrono::Utc::now()),
+            GateReason::StoppedByUser
+        );
+    }
+
+    /// The customer-facing messages for each gate reason (also exercises the
+    /// Display impl that status write-back relies on).
+    #[test]
+    fn gate_reason_messages() {
+        assert_eq!(GateReason::Running.to_string(), "running");
+        assert_eq!(
+            GateReason::StoppedByUser.to_string(),
+            "deployment stopped by user"
+        );
+        assert_eq!(
+            GateReason::Unpaid.to_string(),
+            "subscription not yet paid"
+        );
+        assert_eq!(
+            GateReason::Expired.to_string(),
+            "subscription expired (data retained)"
+        );
+        assert_eq!(
+            GateReason::SubscriptionLookupFailed("boom".to_string()).to_string(),
+            "subscription lookup failed: boom"
+        );
     }
 }
