@@ -916,6 +916,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let payments = body["data"].as_array().unwrap().clone();
+
+        // Item form of the payments list: the replacement for the deprecated
+        // VM-only GET /api/v1/payment/{id}, usable for polling a payment on any
+        // subscription type.
+        if let Some(payment_id) = payments.first().and_then(|p| p["id"].as_str()) {
+            let resp = client
+                .get_auth(&format!(
+                    "/api/v1/subscriptions/{sub_id}/payments/{payment_id}"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(body["data"]["id"].as_str(), Some(payment_id));
+            assert_eq!(body["data"]["subscription_id"].as_u64(), Some(sub_id));
+
+            // Another user must not read it.
+            let other = user_client_with_keys(nostr::Keys::generate());
+            let resp = other
+                .get_auth(&format!(
+                    "/api/v1/subscriptions/{sub_id}/payments/{payment_id}"
+                ))
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "another user must not read this payment"
+            );
+        }
+
+        // A malformed (non-hex) payment id is rejected, not 500.
+        let resp = client
+            .get_auth(&format!("/api/v1/subscriptions/{sub_id}/payments/nothex"))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
 
         let resp = client
             .get_auth(&format!("/api/v1/subscriptions/{sub_id}/renew"))

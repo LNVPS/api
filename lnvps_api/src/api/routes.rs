@@ -18,6 +18,7 @@ use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use lnvps_api_common::{
@@ -1205,6 +1206,15 @@ async fn v1_create_vm_order(
 }
 
 /// Renew(Extend) a VM
+///
+/// **Deprecated** — VM billing is a subscription like any other. Use
+/// `GET /api/v1/subscriptions/{id}/renew` with the VM's subscription id
+/// (`ApiVmStatus.subscription_id`, `None` only for a VM that was never paid)
+/// instead; it takes the same `method` / `intervals` query and resolves saved
+/// payment methods identically. This
+/// route is a thin wrapper that looks up the VM's subscription and calls the
+/// same handler, so it stays for backward compatibility and will be removed in
+/// a future release.
 async fn v1_renew_vm(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -1672,6 +1682,14 @@ fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
 }
 
 /// Get payment status (for polling)
+///
+/// **Deprecated** — only resolves payments belonging to a VM subscription (it
+/// looks the payer up via the VPS line item), so it cannot poll a payment for
+/// any other subscription type. Use
+/// `GET /api/v1/subscriptions/{id}/payments/{payment_id}`, which returns
+/// `ApiSubscriptionPayment` for every subscription type (the subscription id is
+/// on the payment object as `subscription_id`). Kept for backward
+/// compatibility; will be removed in a future release.
 async fn v1_get_payment(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -1745,6 +1763,96 @@ fn invoice_vat_display(
     }
 }
 
+/// A single rendered line on an invoice, one per subscription line item.
+#[derive(Serialize)]
+struct InvoiceLine {
+    /// What is being billed, e.g. `"VM Renewal #12 - vps-1 - debian 12"` for a
+    /// VPS line or the line item name for anything else.
+    description: String,
+    /// Billing period covered, omitted for lines that do not extend time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<String>,
+}
+
+/// Human label for a subscription billing interval, e.g. `"1 month"`,
+/// `"3 months"`. Used as the invoice period for line items that do not carry
+/// their own `time_value` (everything that is not a VPS).
+fn interval_label(amount: u64, interval: lnvps_db::IntervalType) -> String {
+    let unit = match interval {
+        lnvps_db::IntervalType::Day => "day",
+        lnvps_db::IntervalType::Month => "month",
+        lnvps_db::IntervalType::Year => "year",
+    };
+    if amount == 1 {
+        format!("1 {}", unit)
+    } else {
+        format!("{} {}s", amount, unit)
+    }
+}
+
+/// Build the invoice line for one subscription line item.
+///
+/// VPS lines resolve the VM (plus template and OS image) for a descriptive
+/// label matching the historic invoice output. Every other line item type
+/// (IP range, ASN sponsoring, DNS hosting, managed app) uses the line item's
+/// own name and description, so an invoice renders regardless of what the
+/// lines are for. Resolution failures degrade to the line item name rather
+/// than failing the whole invoice.
+async fn invoice_line_for_item(
+    db: &Arc<dyn LNVpsDb>,
+    item: &lnvps_db::SubscriptionLineItem,
+    is_upgrade: bool,
+    duration: Option<&str>,
+) -> InvoiceLine {
+    let duration = duration.map(|d| d.to_string());
+    match item.subscription_type {
+        lnvps_db::SubscriptionType::Vps => {
+            let Ok(vm) = db.get_vm_by_line_item(item.id).await else {
+                return InvoiceLine {
+                    description: item.name.clone(),
+                    duration,
+                };
+            };
+            let verb = if is_upgrade { "Upgrade" } else { "Renewal" };
+            let mut description = format!("VM {} #{}", verb, vm.id);
+            if let Some(template_id) = vm.template_id
+                && let Ok(template) = db.get_vm_template(template_id).await
+            {
+                description.push_str(&format!(" - {}", template.name));
+            }
+            if let Ok(image) = db.get_os_image(vm.image_id).await {
+                description.push_str(&format!(" - {} {}", image.distribution, image.version));
+            }
+            InvoiceLine {
+                description,
+                duration,
+            }
+        }
+        _ => InvoiceLine {
+            description: match item.description.as_deref() {
+                Some(d) if !d.is_empty() => format!("{} - {}", item.name, d),
+                _ => item.name.clone(),
+            },
+            duration,
+        },
+    }
+}
+
+/// VM id of the first VPS line item in the subscription, if any.
+async fn first_vps_vm_id(
+    db: &Arc<dyn LNVpsDb>,
+    line_items: &[lnvps_db::SubscriptionLineItem],
+) -> Option<u64> {
+    for item in line_items {
+        if item.subscription_type == lnvps_db::SubscriptionType::Vps
+            && let Ok(vm) = db.get_vm_by_line_item(item.id).await
+        {
+            return Some(vm.id);
+        }
+    }
+    None
+}
+
 async fn v1_get_payment_invoice(
     State(this): State<RouterState>,
     Path(id): Path<String>,
@@ -1774,15 +1882,20 @@ async fn v1_get_payment_invoice(
         .get_subscription_payment(&id)
         .await
         .map_err(|_| "Payment not found")?;
-    let vm = this
+    // Invoices are scoped to the subscription, not to a VM: a subscription may
+    // bill for a VPS, an IP range, a managed app, etc. Ownership, the selling
+    // company and the invoice lines are all resolved from the subscription so
+    // every line item type renders (previously this looked up
+    // `get_vm_by_subscription`, which only matches `SubscriptionType::Vps` and
+    // so failed with "VM not found" for every other subscription).
+    let subscription = this
         .db
-        .get_vm_by_subscription(payment.subscription_id)
+        .get_subscription(payment.subscription_id)
         .await
-        .map_err(|_| "VM not found")?;
-    if vm.user_id != uid {
-        return Err("VM does not belong to you");
+        .map_err(|_| "Subscription not found")?;
+    if subscription.user_id != uid {
+        return Err("Payment does not belong to you");
     }
-    let vm_id_for_payment = vm.id;
 
     if !payment.is_paid {
         return Err("Payment is not paid, can't generate invoice");
@@ -1792,7 +1905,8 @@ async fn v1_get_payment_invoice(
     struct PaymentInfo {
         year: i32,
         current_date: DateTime<Utc>,
-        vm: ApiVmStatus,
+        /// One entry per subscription line item, in line item order.
+        lines: Vec<InvoiceLine>,
         payment: ApiVmPayment,
         invoice_item: ApiInvoiceItem,
         user: AccountPatchRequest,
@@ -1834,17 +1948,9 @@ async fn v1_get_payment_invoice(
         disk_upgrade: Option<u64>,
     }
 
-    let host = this
-        .db
-        .get_host(vm.host_id)
-        .await
-        .map_err(|_| "Host not found")?;
-    let region = this
-        .db
-        .get_host_region(host.region_id)
-        .await
-        .map_err(|_| "Region not found")?;
-    let company = this.db.get_company(region.company_id).await.ok();
+    // The selling company comes from the subscription, which is also what the
+    // tax determination was frozen against when the payment was created.
+    let company = this.db.get_company(subscription.company_id).await.ok();
     let user = this.db.get_user(uid).await.map_err(|_| "User not found")?;
     #[cfg(debug_assertions)]
     let template =
@@ -1871,6 +1977,43 @@ async fn v1_get_payment_invoice(
     let now = Utc::now();
     let invoice_item = ApiInvoiceItem::from_subscription_payment(&payment)
         .map_err(|_| "Failed to create formatted invoice item")?;
+
+    let line_items = this
+        .db
+        .list_subscription_line_items(subscription.id)
+        .await
+        .map_err(|_| "Failed to load subscription line items")?;
+    let is_upgrade = payment.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade;
+    // An upgrade buys capacity, not time, so it carries no period. Otherwise use
+    // the period the payment actually bought (`time_value`, set for VPS lines);
+    // subscriptions whose lines don't extend expiry (apps, IP ranges) fall back
+    // to the subscription's own billing interval.
+    let duration = if is_upgrade {
+        None
+    } else if payment.time_value.unwrap_or(0) > 0 {
+        Some(invoice_item.formatted_duration.clone())
+    } else {
+        Some(interval_label(
+            subscription.interval_amount,
+            subscription.interval_type,
+        ))
+    };
+    let mut lines = Vec::with_capacity(line_items.len());
+    for item in &line_items {
+        lines.push(invoice_line_for_item(&this.db, item, is_upgrade, duration.as_deref()).await);
+    }
+    // A subscription with no line items still renders a valid invoice; fall back
+    // to the subscription name so the Description cell is never blank.
+    if lines.is_empty() {
+        lines.push(InvoiceLine {
+            description: subscription.name.clone(),
+            duration,
+        });
+    }
+
+    // `ApiVmPayment` carries a `vm_id`; use the first VPS line item's VM when the
+    // subscription has one, else 0 (the invoice template does not render it).
+    let vm_id_for_payment = first_vps_vm_id(&this.db, &line_items).await.unwrap_or(0);
 
     // Present the tax fields stored on the payment. EU-specific notes are only
     // shown for a seller established in the EU VAT area.
@@ -1900,16 +2043,7 @@ async fn v1_get_payment_invoice(
             &PaymentInfo {
                 year: now.year(),
                 current_date: now,
-                vm: vm_to_status(
-                    &this.db,
-                    vm.clone(),
-                    this.db.get_host(vm.host_id).await.ok(),
-                    None,
-                    this.settings.delete_after,
-                    this.settings.max_prepay_days,
-                )
-                .await
-                .map_err(|_| "Failed to get VM state")?,
+                lines,
                 total: payment.amount + payment.tax + payment.processing_fee,
                 total_formatted: CurrencyAmount::from_u64(
                     payment.currency.parse().map_err(|_| "Invalid currency")?,
@@ -1932,6 +2066,12 @@ async fn v1_get_payment_invoice(
 }
 
 /// List payment history of a VM
+///
+/// **Deprecated** — use `GET /api/v1/subscriptions/{id}/payments` with the VM's
+/// subscription id (`ApiVmStatus.subscription_id`, `None` only for a VM that
+/// was never paid), which is paginated the same way and covers every
+/// subscription type. Kept for backward compatibility; will be removed in a
+/// future release.
 async fn v1_payment_history(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -2682,6 +2822,170 @@ mod tests {
         assert!(!image_matches_arch(CpuArch::ARM64, Some(CpuArch::X86_64)));
         assert!(image_matches_arch(CpuArch::ARM64, Some(CpuArch::ARM64)));
         assert!(!image_matches_arch(CpuArch::X86_64, Some(CpuArch::ARM64)));
+    }
+
+    /// Insert a line item of the given type into the mock DB and return it.
+    async fn insert_line_item(
+        mock: &lnvps_api_common::MockDb,
+        id: u64,
+        subscription_type: lnvps_db::SubscriptionType,
+        name: &str,
+        description: Option<&str>,
+    ) -> lnvps_db::SubscriptionLineItem {
+        let item = lnvps_db::SubscriptionLineItem {
+            id,
+            subscription_id: 1,
+            subscription_type,
+            name: name.to_string(),
+            description: description.map(String::from),
+            amount: 1000,
+            setup_amount: 0,
+            configuration: None,
+        };
+        mock.subscription_line_items
+            .lock()
+            .await
+            .insert(id, item.clone());
+        item
+    }
+
+    #[tokio::test]
+    async fn test_invoice_line_for_app_line_item_renders_without_vm() {
+        // Regression: invoice generation resolved the payment's VM via
+        // get_vm_by_subscription, which only matches SubscriptionType::Vps, so
+        // every non-VPS subscription (managed app, IP range, ...) failed with
+        // "VM not found". A non-VPS line must render from the line item itself.
+        let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let item = insert_line_item(
+            &mock,
+            77,
+            lnvps_db::SubscriptionType::App,
+            "Managed App",
+            Some("nostr relay"),
+        )
+        .await;
+        let db: Arc<dyn LNVpsDb> = mock;
+
+        let line = invoice_line_for_item(&db, &item, false, Some("1 month")).await;
+        assert_eq!(line.description, "Managed App - nostr relay");
+        assert_eq!(line.duration.as_deref(), Some("1 month"));
+    }
+
+    #[tokio::test]
+    async fn test_invoice_line_for_non_vps_without_description() {
+        // No line item description => bare name, no trailing separator.
+        let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let item = insert_line_item(
+            &mock,
+            78,
+            lnvps_db::SubscriptionType::IpRange,
+            "IP Range",
+            None,
+        )
+        .await;
+        let db: Arc<dyn LNVpsDb> = mock;
+
+        let line = invoice_line_for_item(&db, &item, false, None).await;
+        assert_eq!(line.description, "IP Range");
+        assert!(line.duration.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invoice_line_for_vps_line_item_describes_vm() {
+        // VPS lines keep the historic descriptive label.
+        let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let uid = {
+            use lnvps_db::LNVpsDbBase;
+            mock.upsert_user(&[9; 32]).await.unwrap()
+        };
+        let item = insert_line_item(
+            &mock,
+            1,
+            lnvps_db::SubscriptionType::Vps,
+            "mock vm renewal",
+            None,
+        )
+        .await;
+        {
+            let mut vms = mock.vms.lock().await;
+            vms.insert(
+                42,
+                Vm {
+                    id: 42,
+                    host_id: 1,
+                    user_id: uid,
+                    image_id: 1,
+                    template_id: Some(1),
+                    custom_template_id: None,
+                    subscription_line_item_id: item.id,
+                    ssh_key_id: Some(1),
+                    disk_id: 1,
+                    mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+                    deleted: false,
+                    ref_code: None,
+                    disabled: false,
+                    fw_policy_in: None,
+                    fw_policy_out: None,
+                    admin_notes: None,
+                },
+            );
+        }
+        let db: Arc<dyn LNVpsDb> = mock;
+
+        let renewal = invoice_line_for_item(&db, &item, false, Some("1month")).await;
+        assert!(
+            renewal.description.starts_with("VM Renewal #42"),
+            "unexpected description: {}",
+            renewal.description
+        );
+        assert!(renewal.description.contains("Debian 12"));
+        assert_eq!(renewal.duration.as_deref(), Some("1month"));
+
+        let upgrade = invoice_line_for_item(&db, &item, true, None).await;
+        assert!(upgrade.description.starts_with("VM Upgrade #42"));
+
+        assert_eq!(first_vps_vm_id(&db, &[item]).await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_invoice_line_for_vps_falls_back_when_vm_missing() {
+        // A VPS line whose VM row is gone must still render (degrades to the
+        // line item name) instead of failing the whole invoice.
+        let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let item = insert_line_item(
+            &mock,
+            91,
+            lnvps_db::SubscriptionType::Vps,
+            "orphaned vps",
+            None,
+        )
+        .await;
+        let db: Arc<dyn LNVpsDb> = mock;
+
+        let line = invoice_line_for_item(&db, &item, false, Some("1 month")).await;
+        assert_eq!(line.description, "orphaned vps");
+        assert_eq!(line.duration.as_deref(), Some("1 month"));
+        // And no VM id is resolvable for the payment.
+        assert_eq!(first_vps_vm_id(&db, &[item]).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_first_vps_vm_id_none_for_non_vps_lines() {
+        let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let item = insert_line_item(&mock, 92, lnvps_db::SubscriptionType::App, "App", None).await;
+        let db: Arc<dyn LNVpsDb> = mock;
+        assert_eq!(first_vps_vm_id(&db, &[item]).await, None);
+    }
+
+    #[test]
+    fn test_interval_label_singular_and_plural() {
+        use lnvps_db::IntervalType;
+        assert_eq!(interval_label(1, IntervalType::Month), "1 month");
+        assert_eq!(interval_label(3, IntervalType::Month), "3 months");
+        assert_eq!(interval_label(1, IntervalType::Day), "1 day");
+        assert_eq!(interval_label(14, IntervalType::Day), "14 days");
+        assert_eq!(interval_label(1, IntervalType::Year), "1 year");
+        assert_eq!(interval_label(2, IntervalType::Year), "2 years");
     }
 
     #[test]

@@ -31,6 +31,10 @@ pub fn router() -> Router<RouterState> {
             "/api/v1/subscriptions/{id}/renew",
             get(v1_renew_subscription),
         )
+        .route(
+            "/api/v1/subscriptions/{id}/payments/{payment_id}",
+            get(v1_get_subscription_payment),
+        )
 }
 
 // ============================================================================
@@ -110,6 +114,39 @@ pub async fn v1_list_subscription_payments(
         page.into_iter().map(ApiSubscriptionPayment::from).collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
+}
+
+/// Get a single subscription payment
+///
+/// The item form of `GET /api/v1/subscriptions/{id}/payments`, for polling one
+/// payment (e.g. a checkout waiting on settlement) without fetching the whole
+/// history. Replaces the VM-only `GET /api/v1/payment/{id}` and works for every
+/// subscription type. Ownership is enforced on the subscription.
+async fn v1_get_subscription_payment(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, payment_id)): Path<(u64, String)>,
+) -> ApiResult<ApiSubscriptionPayment> {
+    let pubkey = auth.pubkey();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let subscription = this.db.get_subscription(id).await?;
+    if subscription.user_id != uid {
+        return Err(ApiError::forbidden("Access denied: not your subscription"));
+    }
+
+    let payment_id =
+        hex::decode(&payment_id).map_err(|_| ApiError::new("Invalid payment id".to_string()))?;
+    let payment = this.db.get_subscription_payment(&payment_id).await?;
+
+    // Payment ids are globally unique, so the path pair can disagree; treat a
+    // payment belonging to another subscription as absent rather than leaking
+    // its existence to a caller who owns the subscription in the path.
+    if payment.subscription_id != id {
+        return Err(ApiError::not_found("Payment not found"));
+    }
+
+    ApiData::ok(ApiSubscriptionPayment::from(payment))
 }
 
 /// Update a subscription (user-facing)

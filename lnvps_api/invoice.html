@@ -319,22 +319,16 @@
         <tbody>
         <tr>
             <td>
-                {{#payment.is_upgrade}}
-                VM Upgrade #{{vm.id}}
-                - {{vm.template.name}}
-                - {{vm.image.distribution}} {{vm.image.version}}
+                {{#lines}}
+                <div>
+                    {{description}}{{#duration}} - {{duration}}{{/duration}}
+                </div>
+                {{/lines}}
                 {{#upgrade_details}}
                 {{#cpu_upgrade}}<br/>• CPU: {{cpu_upgrade}} cores{{/cpu_upgrade}}
                 {{#memory_upgrade}}<br/>• Memory: {{memory_upgrade}}GB{{/memory_upgrade}}
                 {{#disk_upgrade}}<br/>• Disk: {{disk_upgrade}}GB{{/disk_upgrade}}
                 {{/upgrade_details}}
-                {{/payment.is_upgrade}}
-                {{^payment.is_upgrade}}
-                VM Renewal #{{vm.id}}
-                - {{vm.template.name}}
-                - {{vm.image.distribution}} {{vm.image.version}}
-                - {{invoice_item.formatted_duration}}
-                {{/payment.is_upgrade}}
             </td>
             <td>{{invoice_item.currency}}</td>
             <td class="num">{{invoice_item.formatted_amount}}</td>
