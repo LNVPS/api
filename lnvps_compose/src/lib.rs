@@ -60,11 +60,22 @@ pub struct Service {
     /// Optional backup method for this service's data.
     #[serde(default)]
     pub backup: Option<Backup>,
-    /// Run the container as this user. Set to `"root"` (or `"0"`) for images
-    /// whose entrypoint must *start* as root and drop privileges itself (e.g.
-    /// `mariadb`, `postgres`, `redis`) — the operator then omits `runAsNonRoot`
-    /// for this container only. Omit for normal images so the default
-    /// non-root hardening still applies. Only curated catalog apps can set
+    /// Run the container as this user. Accepts either:
+    ///
+    /// - `"root"` / `"0"` — for images whose entrypoint must *start* as root
+    ///   and drop privileges itself (e.g. `mariadb`, `postgres`, `redis`); the
+    ///   operator then omits `runAsNonRoot` for this container only.
+    /// - a numeric UID (e.g. `"1000"`) — required for images whose Dockerfile
+    ///   `USER` is a *name* rather than a number (e.g. `USER nonroot`). The
+    ///   kubelet enforces `runAsNonRoot` by reading the image config's user
+    ///   field and cannot resolve a name to a UID, so such an image fails to
+    ///   start with "container has runAsNonRoot and image has non-numeric user
+    ///   ... cannot verify user is non-root" unless an explicit `runAsUser` is
+    ///   supplied. The value is also used as the pod's `fsGroup` so mounted
+    ///   volumes are writable by that user.
+    ///
+    /// Omit for images whose `USER` is already numeric — the default non-root
+    /// hardening then applies unchanged. Only curated catalog apps can set
     /// this; it is not customer-controlled at order time.
     #[serde(default)]
     pub user: Option<String>,
@@ -74,6 +85,23 @@ impl Service {
     /// Whether this service must start as root (compose `user: root` / `0`).
     pub fn runs_as_root(&self) -> bool {
         matches!(self.user.as_deref(), Some("root") | Some("0"))
+    }
+
+    /// The explicit numeric UID this service runs as, if the compose specifies
+    /// one. `None` for `user: root` (handled by [`Self::runs_as_root`]) and
+    /// when no user is set.
+    ///
+    /// Doubles as the pod's `fsGroup`: a container user's primary group
+    /// conventionally matches its UID, and without it a fresh PVC mounts
+    /// root-owned `0755` and the non-root process cannot write to it.
+    pub fn run_as_user(&self) -> Option<i64> {
+        match self.user.as_deref() {
+            Some(u) => match u.parse::<i64>() {
+                Ok(uid) if uid > 0 => Some(uid),
+                _ => None,
+            },
+            None => None,
+        }
     }
 }
 
@@ -297,6 +325,21 @@ impl Compose {
                         p.name
                     );
                 }
+            }
+            // `user:` must be root or a numeric UID. A name (e.g. `nonroot`)
+            // is rejected here rather than at runtime: the kubelet cannot
+            // resolve a name against the image, so under `runAsNonRoot` the
+            // pod would fail to start with "image has non-numeric user" and
+            // retry for minutes with no signal to whoever added the app.
+            if let Some(u) = svc.user.as_deref()
+                && !svc.runs_as_root()
+                && svc.run_as_user().is_none()
+            {
+                bail!(
+                    "service '{sname}': user '{u}' must be \"root\", \"0\", or a positive numeric UID \
+                     (a user *name* cannot be verified by the kubelet under runAsNonRoot — use the \
+                     numeric UID from the image's /etc/passwd)"
+                );
             }
             for v in &svc.volumes {
                 validate_mount_path(sname, &v.name, &v.path)?;
@@ -782,6 +825,41 @@ config:
         // `0` is equivalent to `root`.
         let c = Compose::parse("services:\n  db:\n    image: x\n    user: \"0\"\n").unwrap();
         assert!(c.services["db"].runs_as_root());
+    }
+
+    /// A numeric `user:` yields an explicit UID, which the operator turns into
+    /// `runAsUser` + `fsGroup`. Required for images whose `USER` is a name
+    /// (e.g. `USER nonroot`), which the kubelet cannot verify.
+    #[test]
+    fn numeric_user_is_parsed_as_uid() {
+        let c = Compose::parse("services:\n  a:\n    image: x\n    user: \"1000\"\n").unwrap();
+        assert_eq!(c.services["a"].run_as_user(), Some(1000));
+        assert!(!c.services["a"].runs_as_root());
+
+        // root / 0 / unset carry no explicit uid.
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n  b:\n    image: x\n    user: root\n  c:\n    image: x\n    user: \"0\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.services["a"].run_as_user(), None);
+        assert_eq!(c.services["b"].run_as_user(), None);
+        assert_eq!(c.services["c"].run_as_user(), None);
+    }
+
+    /// Regression: a *named* user was silently accepted and then ignored, so
+    /// the pod was refused by the kubelet at runtime ("image has non-numeric
+    /// user (nonroot), cannot verify user is non-root") and retried for
+    /// minutes. It must fail when the catalog app is validated instead.
+    #[test]
+    fn named_user_is_rejected_at_validation() {
+        for bad in ["nonroot", "app", "-1", "1.5", ""] {
+            let yaml = format!("services:\n  a:\n    image: x\n    user: \"{bad}\"\n");
+            let err = Compose::parse(&yaml).expect_err("named user must be rejected");
+            assert!(
+                err.to_string().contains("numeric UID"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
     }
 
     #[test]

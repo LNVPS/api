@@ -261,9 +261,15 @@ async fn delete_resource_quota(client: &Client, deployment_id: u64) -> Result<()
 }
 
 /// A locked-down pod security context (non-root, seccomp RuntimeDefault).
-fn pod_security_context() -> PodSecurityContext {
+///
+/// `fs_group` is set when the service declares a numeric `user:`, so the
+/// kubelet chowns mounted volumes to that group. Without it a freshly
+/// provisioned PVC is root-owned `0755` and a non-root process cannot write to
+/// it — the app starts and then fails on its first write.
+fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
     PodSecurityContext {
         run_as_non_root: Some(true),
+        fs_group,
         seccomp_profile: Some(SeccompProfile {
             type_: "RuntimeDefault".to_string(),
             ..Default::default()
@@ -279,12 +285,22 @@ fn pod_security_context() -> PodSecurityContext {
 /// only when the catalog compose service opts in via `user: root` — for images
 /// whose entrypoint must *start* as root and drop privileges itself (mariadb,
 /// postgres, redis). The other restrictions stay in force either way.
-fn container_security_context_for(run_as_non_root: bool) -> SecurityContext {
+///
+/// `run_as_user` is set from a numeric compose `user:`. It is required for
+/// images whose Dockerfile `USER` is a name (e.g. `USER nonroot`): the kubelet
+/// verifies `runAsNonRoot` against the image config and cannot resolve a name,
+/// so without an explicit UID the container is refused with "image has
+/// non-numeric user ... cannot verify user is non-root".
+fn container_security_context_for(
+    run_as_non_root: bool,
+    run_as_user: Option<i64>,
+) -> SecurityContext {
     use k8s_openapi::api::core::v1::Capabilities;
     SecurityContext {
         allow_privilege_escalation: Some(false),
         read_only_root_filesystem: Some(true),
         run_as_non_root: Some(run_as_non_root),
+        run_as_user,
         capabilities: Some(Capabilities {
             drop: Some(vec!["ALL".to_string()]),
             ..Default::default()
@@ -528,7 +544,10 @@ pub fn build_deployment(
         } else {
             Some(mounts)
         },
-        security_context: Some(container_security_context_for(!svc.runs_as_root())),
+        security_context: Some(container_security_context_for(
+            !svc.runs_as_root(),
+            svc.run_as_user(),
+        )),
         resources: Some(build_resource_requirements(&svc.resources)),
         ..Default::default()
     };
@@ -562,7 +581,7 @@ pub fn build_deployment(
                     } else {
                         Some(volumes)
                     },
-                    security_context: Some(pod_security_context()),
+                    security_context: Some(pod_security_context_for(svc.run_as_user())),
                     // Don't mount the ServiceAccount token: a managed app never
                     // talks to the Kubernetes API, and withholding the token
                     // blocks API access even on CNIs that don't enforce the
@@ -1193,6 +1212,50 @@ config:
             ctr.security_context.as_ref().unwrap().run_as_non_root,
             Some(true)
         );
+    }
+
+    /// Regression: an image whose Dockerfile `USER` is a *name* (e.g. haven's
+    /// `USER nonroot`) is refused by the kubelet under `runAsNonRoot` with
+    /// "image has non-numeric user (nonroot), cannot verify user is non-root",
+    /// because the kubelet reads the image config and cannot resolve a name.
+    /// A numeric compose `user:` supplies `runAsUser` so the check passes, and
+    /// the same value becomes `fsGroup` so mounted PVCs are writable (a fresh
+    /// PVC is root-owned `0755`).
+    #[test]
+    fn numeric_user_sets_run_as_user_and_fs_group() {
+        let c = Compose::parse(
+            "services:\n  haven:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: db, path: /app/db, size: 10Gi }\n",
+        )
+        .unwrap();
+        let d = build_deployment(7, "haven", &c.services["haven"], &BTreeMap::new(), &[], 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+
+        let ctr = &pod.containers[0];
+        let sc = ctr.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_user, Some(1000));
+        assert_eq!(sc.run_as_non_root, Some(true), "still non-root hardened");
+
+        let psc = pod.security_context.as_ref().unwrap();
+        assert_eq!(
+            psc.fs_group,
+            Some(1000),
+            "volumes must be chowned to the run-as user"
+        );
+
+        // Services without a numeric user keep the previous behaviour: no
+        // runAsUser, no fsGroup (their image's USER is already numeric).
+        let plain = Compose::parse("services:\n  app:\n    image: x\n").unwrap();
+        let d = build_deployment(7, "app", &plain.services["app"], &BTreeMap::new(), &[], 1);
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.containers[0]
+                .security_context
+                .as_ref()
+                .unwrap()
+                .run_as_user,
+            None
+        );
+        assert_eq!(pod.security_context.as_ref().unwrap().fs_group, None);
     }
 
     #[test]

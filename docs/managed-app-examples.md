@@ -50,6 +50,25 @@ all other hardening (no privilege escalation, drop ALL capabilities, read-only
 root filesystem) stays in force. Only set it where the image genuinely needs
 it.
 
+`user` also accepts a **numeric UID** (e.g. `user: "1000"`), which is required
+when the image's Dockerfile sets `USER` to a *name* rather than a number (e.g.
+`USER nonroot`). The kubelet enforces `runAsNonRoot` by reading the image
+config's user field and cannot resolve a name to a UID, so such an image is
+refused at startup with:
+
+```
+container has runAsNonRoot and image has non-numeric user (nonroot),
+cannot verify user is non-root
+```
+
+Setting the numeric UID supplies `runAsUser` explicitly, which satisfies the
+check. The same value is used as the pod's `fsGroup`, so mounted volumes are
+chowned to that group and the non-root process can write to them (a fresh PVC
+is otherwise root-owned `0755`). Find the UID in the image's `/etc/passwd` —
+for an Alpine `adduser -D nonroot` that is `1000`; for distroless `nonroot`
+it is `65532`. A `user:` that is neither `root`/`0` nor a positive integer is
+rejected when the compose is validated.
+
 ## Validating a compose document
 
 Before pasting a `compose` into the admin API, validate it locally with the
@@ -287,6 +306,11 @@ services:
 services:
   haven:
     image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    # The image sets `USER nonroot` (a name), which the kubelet cannot verify
+    # under runAsNonRoot. `nonroot` is uid 1000 in this image (Alpine
+    # `adduser -D nonroot`), and 1000 also becomes the fsGroup so the db and
+    # blossom volumes are writable.
+    user: "1000"
     resources: { cpu: 500m, memory: 512Mi }
     ports:
       - { name: ws, container: 3355, protocol: http, expose: ingress }
