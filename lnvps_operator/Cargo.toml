@@ -24,3 +24,6 @@ config.workspace = true
 clap = { version = "4.5.21", features = ["derive"] }
 kube = { version = "1.1.0", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.25.0", features = ["latest"] }
+# kube/sqlx use rustls but the dependency tree doesn't auto-select a default
+# crypto provider, so we install the ring provider explicitly in main().
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

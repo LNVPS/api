@@ -3077,6 +3077,7 @@ dependencies = [
  "lnvps_db",
  "log 0.4.32",
  "rand 0.8.6",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

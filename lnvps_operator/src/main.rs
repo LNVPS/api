@@ -97,6 +97,12 @@ pub struct Context {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // kube (via hyper-rustls) and sqlx's TLS both use rustls, but the dependency
+    // tree exposes a crypto provider without auto-selecting a process default,
+    // so rustls panics on first TLS use. Install the ring provider explicitly
+    // before any TLS connection (DB or Kubernetes API).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     env_logger::init();
     info!("Starting LNVPS Kubernetes Operator");
     let args = Args::parse();
