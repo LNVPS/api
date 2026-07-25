@@ -60,6 +60,21 @@ pub struct Service {
     /// Optional backup method for this service's data.
     #[serde(default)]
     pub backup: Option<Backup>,
+    /// Run the container as this user. Set to `"root"` (or `"0"`) for images
+    /// whose entrypoint must *start* as root and drop privileges itself (e.g.
+    /// `mariadb`, `postgres`, `redis`) — the operator then omits `runAsNonRoot`
+    /// for this container only. Omit for normal images so the default
+    /// non-root hardening still applies. Only curated catalog apps can set
+    /// this; it is not customer-controlled at order time.
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+impl Service {
+    /// Whether this service must start as root (compose `user: root` / `0`).
+    pub fn runs_as_root(&self) -> bool {
+        matches!(self.user.as_deref(), Some("root") | Some("0"))
+    }
 }
 
 /// A service's requested CPU and memory. Kubernetes-style quantities: CPU as
@@ -677,6 +692,24 @@ config:
         let p = &c.services["a"].ports[0];
         assert_eq!(p.expose, Expose::None);
         assert_eq!(p.protocol, Protocol::Tcp);
+        // No `user:` -> default non-root hardening applies.
+        assert!(!c.services["a"].runs_as_root());
+    }
+
+    /// A service may opt into starting as root (e.g. mariadb/postgres/redis
+    /// whose entrypoint drops privileges itself) via `user: root` / `0`.
+    #[test]
+    fn user_root_opts_out_of_non_root() {
+        let c = Compose::parse(
+            "services:\n  db:\n    image: mariadb:11\n    user: root\n  app:\n    image: x\n",
+        )
+        .unwrap();
+        assert!(c.services["db"].runs_as_root());
+        assert!(!c.services["app"].runs_as_root());
+
+        // `0` is equivalent to `root`.
+        let c = Compose::parse("services:\n  db:\n    image: x\n    user: \"0\"\n").unwrap();
+        assert!(c.services["db"].runs_as_root());
     }
 
     #[test]

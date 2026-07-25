@@ -71,13 +71,14 @@ fn service_labels(deployment_id: u64, service: &str) -> BTreeMap<String, String>
     l
 }
 
-/// A namespace for a deployment, labelled for the **restricted** Pod Security
-/// Standard so the admission controller rejects privileged pods.
-pub fn build_namespace(deployment_id: u64) -> Namespace {
+/// A namespace for a deployment, labelled for a Pod Security Standard
+/// enforcement `level` (`restricted` or `baseline`) so the admission
+/// controller rejects pods that violate it.
+pub fn build_namespace_with_level(deployment_id: u64, level: &str) -> Namespace {
     let mut l = labels(deployment_id);
     l.insert(
         "pod-security.kubernetes.io/enforce".to_string(),
-        "restricted".to_string(),
+        level.to_string(),
     );
     l.insert(
         "pod-security.kubernetes.io/enforce-version".to_string(),
@@ -91,6 +92,22 @@ pub fn build_namespace(deployment_id: u64) -> Namespace {
         },
         ..Default::default()
     }
+}
+
+/// A namespace for a deployment, labelled for the **restricted** Pod Security
+/// Standard so the admission controller rejects privileged pods.
+pub fn build_namespace(deployment_id: u64) -> Namespace {
+    build_namespace_with_level(deployment_id, "restricted")
+}
+
+/// A namespace for a deployment containing a root-entrypoint service (mariadb,
+/// postgres, redis, …). The **baseline** standard still blocks genuinely
+/// dangerous pods (privileged, host namespaces/ports/PID/IPC, hostPath) but
+/// does not force `runAsNonRoot`, so a curated image that starts as root and
+/// drops privileges itself can be admitted. The per-container SecurityContext
+/// (no privilege escalation, drop ALL caps, read-only root fs) still applies.
+pub fn build_namespace_baseline(deployment_id: u64) -> Namespace {
+    build_namespace_with_level(deployment_id, "baseline")
 }
 
 /// The isolation NetworkPolicy for a deployment namespace.
@@ -253,12 +270,17 @@ fn pod_security_context() -> PodSecurityContext {
 
 /// A locked-down container security context: no privilege escalation, all
 /// capabilities dropped, read-only root filesystem.
-fn container_security_context() -> SecurityContext {
+///
+/// `run_as_non_root` is normally `true` (default-deny). It is set to `false`
+/// only when the catalog compose service opts in via `user: root` — for images
+/// whose entrypoint must *start* as root and drop privileges itself (mariadb,
+/// postgres, redis). The other restrictions stay in force either way.
+fn container_security_context_for(run_as_non_root: bool) -> SecurityContext {
     use k8s_openapi::api::core::v1::Capabilities;
     SecurityContext {
         allow_privilege_escalation: Some(false),
         read_only_root_filesystem: Some(true),
-        run_as_non_root: Some(true),
+        run_as_non_root: Some(run_as_non_root),
         capabilities: Some(Capabilities {
             drop: Some(vec!["ALL".to_string()]),
             ..Default::default()
@@ -502,7 +524,7 @@ pub fn build_deployment(
         } else {
             Some(mounts)
         },
-        security_context: Some(container_security_context()),
+        security_context: Some(container_security_context_for(!svc.runs_as_root())),
         resources: Some(build_resource_requirements(&svc.resources)),
         ..Default::default()
     };
@@ -880,8 +902,17 @@ async fn reconcile_one(
     let compose = lnvps_compose::Compose::parse(&app.compose)?;
     let hostname = deployment_hostname(&deployment.name, ingress_domain);
 
-    // 1. Namespace (restricted PSS) + isolation NetworkPolicy.
-    apply_namespace(client, &build_namespace(id)).await?;
+    // 1. Namespace (Pod Security Standard) + isolation NetworkPolicy.
+    // Default to the restricted PSS; drop to baseline only when a catalog
+    // service opts into running as root (e.g. mariadb), whose entrypoint
+    // starts as root and drops privileges itself. Baseline still blocks
+    // privileged pods / host namespaces, ports, PID/IPC and hostPath.
+    let namespace = if compose.services.values().any(|s| s.runs_as_root()) {
+        build_namespace_baseline(id)
+    } else {
+        build_namespace(id)
+    };
+    apply_namespace(client, &namespace).await?;
     let ingress_ns = ctx
         .settings
         .ingress_namespace
@@ -926,6 +957,16 @@ async fn reconcile_one(
         sub_err,
         chrono::Utc::now(),
     );
+    // Log the gate's actual inputs so a surprising conclusion (e.g. "not yet
+    // paid" on a subscription that looks paid in the DB) can be diagnosed
+    // against the exact is_setup/expires the operator decoded.
+    if gate != GateReason::Running {
+        info!(
+            "app deployment {id} gate={gate}: desired_running={desired_running} deleted={} sub={:?}",
+            deployment.deleted,
+            sub.as_ref().map(|s| (s.id, s.is_setup, s.expires))
+        );
+    }
     let replicas = if gate == GateReason::Running { 1 } else { 0 };
 
     // 4. Per service: PVCs, file ConfigMap/Secret, Service, Deployment.
@@ -1079,6 +1120,62 @@ config:
             Some("restricted")
         );
         assert_eq!(l.get("managed-by").map(String::as_str), Some(MANAGED_BY));
+    }
+
+    /// A deployment with a root-entrypoint service gets the baseline PSS (which
+    /// permits starting as root) instead of restricted; restricted stays the
+    /// default otherwise.
+    #[test]
+    fn namespace_baseline_for_root_services() {
+        let base = build_namespace_baseline(7);
+        let l = base.metadata.labels.unwrap();
+        assert_eq!(
+            l.get("pod-security.kubernetes.io/enforce")
+                .map(String::as_str),
+            Some("baseline")
+        );
+        assert_eq!(
+            l.get("pod-security.kubernetes.io/enforce-version")
+                .map(String::as_str),
+            Some("latest")
+        );
+
+        // The parameterized builder produces identical output for both levels.
+        let r = build_namespace_with_level(7, "restricted");
+        assert_eq!(
+            r.metadata.labels.as_ref().unwrap()
+                .get("pod-security.kubernetes.io/enforce")
+                .map(String::as_str),
+            Some("restricted")
+        );
+    }
+
+    /// A `user: root` service omits runAsNonRoot on its container; a normal
+    /// service keeps it (default-deny hardening).
+    #[test]
+    fn root_service_omits_run_as_non_root() {
+        let root = Compose::parse("services:\n  db:\n    image: mariadb:11\n    user: root\n")
+            .unwrap();
+        let d = build_deployment(7, "db", &root.services["db"], &BTreeMap::new(), &[], 1);
+        let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
+        let sc = ctr.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        // The rest of the lockdown still applies.
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop,
+            Some(vec!["ALL".to_string()])
+        );
+
+        // Default (no user:) stays runAsNonRoot.
+        let plain = Compose::parse("services:\n  app:\n    image: x\n").unwrap();
+        let d = build_deployment(7, "app", &plain.services["app"], &BTreeMap::new(), &[], 1);
+        let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
+        assert_eq!(
+            ctr.security_context.as_ref().unwrap().run_as_non_root,
+            Some(true)
+        );
     }
 
     #[test]
