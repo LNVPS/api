@@ -59,8 +59,10 @@ Exits non-zero if any document fails to parse or validate.
 
 ## strfry — Nostr relay
 
-- **Image:** `dockurr/strfry` (community; strfry has no official image).
-- **Docs:** <https://github.com/hoytech/strfry> — config file, `bind` defaults
+- **Image:** `dockurr/strfry` — <https://hub.docker.com/r/dockurr/strfry>
+  (community; strfry has no official image; image source
+  <https://github.com/dockur/strfry>).
+- **Repo:** <https://github.com/hoytech/strfry> — config file, `bind` defaults
   to `127.0.0.1` (must be `0.0.0.0` in a container), port `7777`, data in
   `./strfry-db/`. The `dockurr/strfry` image reads `/etc/strfry.conf`.
 
@@ -94,8 +96,9 @@ config:
 
 ## route96 — Blossom / NIP-96 media server (+ MariaDB)
 
-- **Image:** `voidic/route96` (Docker Hub) + `mariadb:11`.
-- **Docs:** <https://github.com/v0l/route96> — YAML config file at
+- **Image:** `voidic/route96` — <https://hub.docker.com/r/voidic/route96> +
+  `mariadb:11` — <https://hub.docker.com/_/mariadb>.
+- **Repo:** <https://github.com/v0l/route96> — YAML config file at
   `/app/config.yaml`; MySQL/MariaDB backend; blobs under `storage_dir`; port
   `8000`. Mirrors route96's `config.prod.yaml` + `docker-compose.prod.yml`
   (app reaches the DB via the service name `db`).
@@ -139,8 +142,9 @@ secrets:
 
 ## Blossom Server (hzrd149)
 
-- **Image:** `ghcr.io/hzrd149/blossom-server`.
-- **Docs:** <https://github.com/hzrd149/blossom-server> — YAML config at
+- **Image:** `ghcr.io/hzrd149/blossom-server` —
+  <https://github.com/hzrd149/blossom-server/pkgs/container/blossom-server>.
+- **Repo:** <https://github.com/hzrd149/blossom-server> — YAML config at
   `/app/config.yml`; listens on `3000`; SQLite + blobs under `/app/data`.
   `publicDomain` is a **bare** hostname (no scheme).
 
@@ -176,8 +180,9 @@ services:
 
 ## nostr-rs-relay
 
-- **Image:** `scsibug/nostr-rs-relay` (Docker Hub, official pre-built).
-- **Docs:** <https://github.com/scsibug/nostr-rs-relay> — optional TOML config
+- **Image:** `scsibug/nostr-rs-relay` (official pre-built) —
+  <https://hub.docker.com/r/scsibug/nostr-rs-relay>.
+- **Repo:** <https://github.com/scsibug/nostr-rs-relay> — optional TOML config
   at `/usr/src/app/config.toml`; listens on `8080`; SQLite DB under
   `/usr/src/app/db`. Set `network.address = "0.0.0.0"` so it's reachable in the
   pod.
@@ -212,8 +217,9 @@ config:
 
 ## Pyramid — community relay (fiatjaf)
 
-- **Image:** `ghcr.io/fiatjaf/pyramid` (official, published from the repo).
-- **Docs:** <https://github.com/fiatjaf/pyramid> — a feature-rich hierarchical
+- **Image:** `ghcr.io/fiatjaf/pyramid` (official, published from the repo) —
+  <https://github.com/fiatjaf/pyramid/pkgs/container/pyramid>.
+- **Repo:** <https://github.com/fiatjaf/pyramid> — a feature-rich hierarchical
   community relay (invite tree, sub-relays, NIP-29 groups, Blossom, search).
   Env-configured with sensible defaults baked into the image (`HOST`, `PORT`
   `3334`, `DATA_PATH` `./data`, `NO_AUTO_UPDATES`); a single LMDB store + the
@@ -248,9 +254,11 @@ services:
 
 ## HAVEN — sovereign personal relay (+ Blossom)
 
-- **Image:** `holgerhatgarkeinenode/haven-docker` (community; barrydeen ships
-  binaries, not an image). Workdir `/app`.
-- **Docs:** <https://github.com/barrydeen/haven> — configured entirely by env
+- **Image:** `holgerhatgarkeinenode/haven-docker` —
+  <https://hub.docker.com/r/holgerhatgarkeinenode/haven-docker> (community;
+  barrydeen ships binaries, not an image; image source
+  <https://github.com/HolgerHatGarKeineNode/haven-docker>). Workdir `/app`.
+- **Repo:** <https://github.com/barrydeen/haven> — configured entirely by env
   vars; listens on `RELAY_PORT` (default `3355`), `RELAY_BIND_ADDRESS` must be
   `0.0.0.0`. Databases (badger) live under `/app/db`, Blossom media under
   `/app/blossom`. It **fatally requires** the two relay-list files
