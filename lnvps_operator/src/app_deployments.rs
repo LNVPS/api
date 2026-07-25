@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 
 use anyhow::{Result, anyhow};
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
 use log::{error, info, warn};
 use serde::Serialize;
@@ -30,8 +30,8 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy}
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
     PersistentVolumeClaimSpec, PodSecurityContext, PodSpec, PodTemplateSpec, ResourceQuota,
-    ResourceQuotaSpec, ResourceRequirements, SeccompProfile, SecurityContext, Service, ServicePort,
-    ServiceSpec, Volume as K8sVolume, VolumeMount, VolumeResourceRequirements,
+    ResourceRequirements, SeccompProfile, SecurityContext, Service, ServicePort, ServiceSpec,
+    Volume as K8sVolume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -227,42 +227,36 @@ fn build_resource_requirements(r: &lnvps_compose::Resources) -> ResourceRequirem
     }
 }
 
-/// A ResourceQuota capping the storage a deployment namespace may consume.
+/// Remove the per-namespace `ResourceQuota` if one is still present.
 ///
-/// **Storage only, deliberately.** A `limits.cpu` / `limits.memory` quota was
-/// removed because it enforced nothing that isn't already enforced, while
-/// breaking cluster infrastructure that has to run in the tenant namespace:
+/// Deployment namespaces no longer carry a quota at all, because it enforced
+/// nothing that isn't already enforced while breaking legitimate operations:
 ///
 /// - Every container is created with `requests == limits` from the compose
 ///   (see [`build_resource_requirements`], Guaranteed QoS) and `replicas` is
-///   fixed at 0 or 1, so the workload cannot exceed its billed footprint
-///   regardless of any namespace quota. Customers have no Kubernetes API
-///   access; this operator is the only writer in the namespace.
-/// - The quota was sized to *exactly* the footprint, leaving zero room for
-///   cert-manager's ephemeral ACME HTTP-01 solver pod (which carries its own
-///   ~100m/64Mi limits). Every TLS issuance was rejected with
-///   `exceeded quota: quota, requested: limits.cpu=100m,limits.memory=64Mi`,
-///   so certificates could never be issued. A deployment with a custom domain
-///   needs two certificates (`app-tls` + `app-tls-custom`) and can therefore
-///   want two solver pods at once, so fixed "headroom" would only have moved
-///   the failure rather than removing it.
+///   fixed at 0 or 1; PVC sizes come from the compose too. Customers have no
+///   Kubernetes API access — this operator is the only writer in the namespace
+///   — so the workload cannot exceed its provisioned footprint with or without
+///   a quota. Cluster-level capacity is enforced at order/upgrade time by
+///   `AppClusterCapacityService`, not here.
+/// - Sized to *exactly* the footprint, it left zero headroom, so anything
+///   needing transient extra capacity was rejected: cert-manager's ephemeral
+///   ACME HTTP-01 solver pod (`limits.cpu=100m,limits.memory=64Mi`), which
+///   blocked all TLS issuance, and later PVC growth/replacement
+///   (`requests.storage=5Gi, used: 5Gi, limited: 5Gi`), which blocked volume
+///   expansion because the outgoing PVC still counts toward usage while the
+///   incoming one is admitted.
 ///
-/// Storage stays capped: it is the expensive persistent resource, and no
-/// infrastructure pod requests a PVC, so the cap can never block one.
-pub fn build_resource_quota(deployment_id: u64, pvc: &str) -> ResourceQuota {
-    let hard = BTreeMap::from([("requests.storage".to_string(), Quantity(pvc.to_string()))]);
-    ResourceQuota {
-        metadata: ObjectMeta {
-            name: Some("quota".to_string()),
-            namespace: Some(namespace_name(deployment_id)),
-            labels: Some(labels(deployment_id)),
-            ..Default::default()
-        },
-        spec: Some(ResourceQuotaSpec {
-            hard: Some(hard),
-            ..Default::default()
-        }),
-        ..Default::default()
+/// Deleting is idempotent — a `404` means it is already gone. This runs on
+/// every reconcile so namespaces created before the quota was retired heal
+/// themselves; server-side apply cannot prune an object we simply stop
+/// applying.
+async fn delete_resource_quota(client: &Client, deployment_id: u64) -> Result<()> {
+    let api: Api<ResourceQuota> = Api::namespaced(client.clone(), &namespace_name(deployment_id));
+    match api.delete("quota", &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1043,16 +1037,10 @@ async fn reconcile_one(
         apply(client, &ing).await?;
     }
 
-    // 6. ResourceQuota capping namespace storage at what was provisioned. CPU
-    // and memory are intentionally not quota'd here - they are already pinned
-    // per-container at requests == limits, and a namespace-wide cap starves
-    // cert-manager's ACME solver pods. See build_resource_quota.
-    let fp = compose.footprint()?;
-    apply(
-        client,
-        &build_resource_quota(id, &fp.storage_bytes.to_string()),
-    )
-    .await?;
+    // 6. Remove any leftover ResourceQuota. Namespaces are deliberately not
+    // quota'd - see delete_resource_quota for why - but ones provisioned
+    // before that change still have the object, which blocks PVC growth.
+    delete_resource_quota(client, id).await?;
 
     // 7. Status write-back: record the hostname and running state. When the
     // workload isn't running, surface *why* so a paid-intended deployment never
@@ -1247,27 +1235,6 @@ config:
         assert!(except.contains(&"10.0.0.0/8".to_string()));
         // cloud metadata endpoint is inside the excluded link-local range
         assert!(except.contains(&"169.254.0.0/16".to_string()));
-    }
-
-    #[test]
-    fn quota_caps_storage_only() {
-        // Regression: a limits.cpu/limits.memory quota sized to exactly the app
-        // footprint left no room for cert-manager's ACME HTTP-01 solver pod, so
-        // TLS issuance failed with "exceeded quota: quota, requested:
-        // limits.cpu=100m,limits.memory=64Mi". CPU/memory are already pinned
-        // per-container (requests == limits) with replicas fixed at 1, so the
-        // namespace-wide cap added no enforcement - only a failure mode.
-        let q = build_resource_quota(7, "30Gi");
-        let hard = q.spec.unwrap().hard.unwrap();
-        assert_eq!(hard.get("requests.storage").unwrap().0, "30Gi");
-        assert!(
-            !hard.contains_key("limits.cpu"),
-            "namespace cpu quota starves the ACME solver pod"
-        );
-        assert!(
-            !hard.contains_key("limits.memory"),
-            "namespace memory quota starves the ACME solver pod"
-        );
     }
 
     #[test]
@@ -1781,7 +1748,6 @@ config:
             );
             // Shared namespace objects render from the footprint.
             let _ = build_network_policy(id, "ingress-nginx");
-            let _ = build_resource_quota(id, &fp.storage_bytes.to_string());
         }
     }
 
