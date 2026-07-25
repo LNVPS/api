@@ -34,11 +34,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod app;
 mod ip_range;
 mod vm;
 
 use crate::provisioner::{IpRangeProvisioner, VmProvisioner};
 use crate::settings::Settings;
+pub use app::AppLineItemHandler;
 pub use ip_range::IpRangeLineItemHandler;
 use lnvps_api_common::VmStateCache;
 pub use vm::VmLineItemHandler;
@@ -230,8 +232,17 @@ impl SubscriptionHandler {
                 self.ip_range_provisioner.clone(),
                 li.id,
             ))),
-            other => {
-                bail!("No line item handler implemented for subscription type {other:?}")
+            SubscriptionType::App => {
+                Ok(Box::new(AppLineItemHandler::new(self.db.clone(), li.id)))
+            }
+            // Exhaustive on purpose (no catch-all): adding a new SubscriptionType
+            // must fail to compile until a handler is wired here, rather than
+            // silently falling through. These variants have no ordering flow yet,
+            // so reaching this is a wiring bug — fail loud instead of a swallowed
+            // Err (the callers only `warn!` on Err, which is how a missing App
+            // handler previously went unnoticed).
+            t @ (SubscriptionType::AsnSponsoring | SubscriptionType::DnsHosting) => {
+                panic!("no subscription line item handler implemented for {t:?}")
             }
         }
     }
