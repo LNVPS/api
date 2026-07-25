@@ -567,6 +567,10 @@ pub struct ApiVmCostPlan {
     pub currency: ApiCurrency,
     /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
     pub amount: u64,
+    /// **Deprecated (#230)** — the same price converted to the other supported
+    /// currencies. Use `GET /api/v1/exchange-rate` for a single, consistent
+    /// conversion source instead. Still populated for backward compatibility;
+    /// will be removed in a future release.
     pub other_price: Vec<ApiPrice>,
     pub interval_amount: u64,
     pub interval_type: ApiIntervalType,

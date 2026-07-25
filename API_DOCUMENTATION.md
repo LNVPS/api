@@ -292,6 +292,7 @@ interface VmCostPlan {
   name: string;
   currency: 'BTC' | 'EUR' | 'USD';
   amount: number; // Price amount in smallest currency units (cents for fiat, millisats for BTC)
+  /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // Alternative currency prices
   interval_amount: number;
   interval_type: 'day' | 'month' | 'year';
@@ -305,6 +306,7 @@ interface Price {
 interface CustomVmPrice {
   currency: 'BTC' | 'EUR' | 'USD';
   amount: number; // Base price in smallest currency units
+  /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // The same price converted to other supported currencies
 }
 
@@ -976,7 +978,7 @@ the full firewall ruleset on the host.
 - **POST** `/api/v1/vm/custom-template/price`
 - **Auth**: None
 - **Body**: `CustomVmRequest`
-- **Response**: `CustomVmPrice` (base `{ currency, amount }` plus `other_price[]` with the same quote converted to the other supported currencies)
+- **Response**: `CustomVmPrice` (base `{ currency, amount }` plus the deprecated `other_price[]`; prefer `GET /api/v1/exchange-rate` for conversions)
 
 #### Exchange Rates
 - **GET** `/api/v1/exchange-rate`
@@ -1168,7 +1170,9 @@ interface IpSpacePricing {
   prefix_size: number;
   price: Price;                     // Recurring price in the base currency
   setup_fee: Price;                 // One-time setup fee in the base currency
+  /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[];             // Same recurring price in alternative currencies
+  /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_setup_fee: Price[];         // Same setup fee in alternative currencies
 }
 ```
@@ -1719,7 +1723,9 @@ interface IpSpacePricing {
   prefix_size: number; // e.g., 24 for /24
   price: Price; // Base price in original currency
   setup_fee: Price; // Setup fee in original currency
+  /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // Prices converted to alternative currencies
+  /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_setup_fee: Price[]; // Setup fees converted to alternative currencies
 }
 

@@ -50,13 +50,14 @@ impl ApiTemplatesResponse {
     }
 }
 
-/// Price for a custom VM order. Mirrors the template listing by including the
-/// same price converted to the other supported currencies in `other_price`.
+/// Price for a custom VM order.
 #[derive(Serialize)]
 pub struct ApiCustomVmPrice {
     pub currency: ApiCurrency,
     pub amount: u64,
-    /// The same price converted to other supported currencies.
+    /// **Deprecated (#230)** — the same price converted to the other supported
+    /// currencies. Use `GET /api/v1/exchange-rate` instead. Still populated for
+    /// backward compatibility; will be removed in a future release.
     pub other_price: Vec<ApiPrice>,
 }
 
@@ -1354,7 +1355,13 @@ pub struct ApiIpSpacePricing {
     pub prefix_size: u16,
     pub price: ApiPrice,
     pub setup_fee: ApiPrice,
+    /// **Deprecated (#230)** — `price` converted to the other supported
+    /// currencies. Use `GET /api/v1/exchange-rate` instead. Still populated for
+    /// backward compatibility; will be removed in a future release.
     pub other_price: Vec<ApiPrice>,
+    /// **Deprecated (#230)** — `setup_fee` converted to the other supported
+    /// currencies. Use `GET /api/v1/exchange-rate` instead. Still populated for
+    /// backward compatibility; will be removed in a future release.
     pub other_setup_fee: Vec<ApiPrice>,
 }
 

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Deprecated
+
+- **Per-response currency conversion arrays** (follows #230) — `other_price[]` on VM cost plans (`VmCostPlan`) and custom VM prices (`CustomVmPrice`), and `other_price[]` / `other_setup_fee[]` on `IpSpacePricing`, are now deprecated in favour of the single `GET /api/v1/exchange-rate` feed. They are still populated for backward compatibility but will be removed in a future release. Clients should compute conversions from the exchange-rate endpoint (`rates[B] / rates[A]`), which uses the same conversion source and precision.
+
 ### Fixed
 
 - **Lightning/on-chain invoices for app-only subscriptions** — generating a payment for a subscription with only non-VM line items (e.g. a managed app) priced in fiat failed with `Lightning payment must be in BTC` (and the on-chain equivalent). The non-VM cost was already converted to the payment method's currency, but the payment currency was only inferred from VM items, so an app-only subscription wrongly kept its fiat currency. The converted currency is now used, so fiat-priced apps can be paid via Lightning/on-chain. Also wires the `SubscriptionType::App` lifecycle handler (missing handler previously skipped expiry/grace-period cleanup of the deployment's namespace and volumes).
