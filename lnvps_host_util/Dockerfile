@@ -3,7 +3,10 @@ ARG IMAGE=rust:trixie
 FROM $IMAGE AS chef
 RUN apt update && apt -y install libva-dev libclang-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked
+# Prebuilt cargo-chef binary via cargo-binstall: avoids a multi-minute
+# from-source compile of cargo-chef on every cold cache.
+RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+    && cargo binstall -y --locked cargo-chef
 WORKDIR /app/src
 
 FROM chef AS planner
