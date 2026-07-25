@@ -4610,6 +4610,11 @@ pub struct AdminAppDeploymentInfo {
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
     pub status: String,
     pub status_message: Option<String>,
+    /// Decrypted customer-supplied `config` map (may hold secret values —
+    /// admin-only). `None` when no config was stored. Populated only on the
+    /// single-deployment GET; the list endpoint leaves it `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<std::collections::BTreeMap<String, String>>,
     pub created: DateTime<Utc>,
 }
 
@@ -4628,9 +4633,27 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             desired_state: d.desired_state.to_string(),
             status: d.status.to_string(),
             status_message: d.status_message,
+            config: None, // filled in by the single-GET handler (decrypted)
             created: d.created,
         }
     }
+}
+
+/// Admin update of an app deployment. All fields optional — only those present
+/// change (partial update). Mirrors the customer PATCH but admin-scoped.
+#[derive(Deserialize)]
+pub struct AdminUpdateAppDeploymentRequest {
+    /// New DNS-safe instance name (becomes the ingress subdomain).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// New values for the app's `config` fields (validated against the compose
+    /// schema; replaces the stored config wholesale).
+    #[serde(default)]
+    pub config: Option<std::collections::BTreeMap<String, String>>,
+    /// Set (`Some("blog.example.com")`) or clear (`Some("")` / `Some(null)`)
+    /// the custom domain. Absent = leave unchanged.
+    #[serde(default)]
+    pub custom_domain: Option<Option<String>>,
 }
 
 /// Create an app cluster.

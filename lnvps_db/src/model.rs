@@ -1821,6 +1821,9 @@ pub enum AdminResource {
     ResourceCost = 24,
     Referral = 25,
     App = 26,
+    /// Customer app deployments (read/write name, custom domain, config) —
+    /// distinct from the catalog `App` resource.
+    AppDeployment = 27,
 }
 
 /// Actions that can be performed on administrative resources
@@ -1867,6 +1870,7 @@ impl Display for AdminResource {
             AdminResource::ResourceCost => write!(f, "resource_cost"),
             AdminResource::Referral => write!(f, "referral"),
             AdminResource::App => write!(f, "app"),
+            AdminResource::AppDeployment => write!(f, "app_deployment"),
         }
     }
 }
@@ -1903,6 +1907,7 @@ impl FromStr for AdminResource {
             "resource_cost" => Ok(AdminResource::ResourceCost),
             "referral" => Ok(AdminResource::Referral),
             "app" => Ok(AdminResource::App),
+            "app_deployment" | "app_deployments" => Ok(AdminResource::AppDeployment),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -1940,6 +1945,7 @@ impl TryFrom<u16> for AdminResource {
             24 => Ok(AdminResource::ResourceCost),
             25 => Ok(AdminResource::Referral),
             26 => Ok(AdminResource::App),
+            27 => Ok(AdminResource::AppDeployment),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -1976,6 +1982,7 @@ impl AdminResource {
             AdminResource::ResourceCost,
             AdminResource::Referral,
             AdminResource::App,
+            AdminResource::AppDeployment,
         ]
     }
 }

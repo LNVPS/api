@@ -538,6 +538,78 @@ pub fn parse_bytes(s: &str) -> Result<u64> {
     u64::try_from(n as u128 * mult).map_err(|_| anyhow!("size '{s}' overflows"))
 }
 
+/// Validate a deployment's instance `name` as a DNS-safe label usable as an
+/// ingress subdomain. Shared by the customer and admin APIs.
+pub fn validate_deployment_name(name: &str) -> Result<()> {
+    let n = name.trim();
+    if n.is_empty() || n.len() > 40 {
+        bail!("name must be 1–40 characters");
+    }
+    if !n
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || n.starts_with('-')
+        || n.ends_with('-')
+    {
+        bail!("name must be a DNS-safe label (lowercase letters, digits, hyphens)");
+    }
+    Ok(())
+}
+
+/// Validate and normalize a customer-supplied custom domain: lowercase DNS
+/// hostname with at least one dot, no scheme/port/path. Returns the normalized
+/// (trimmed, lowercased, trailing-dot-stripped) domain. Shared by the customer
+/// and admin APIs.
+pub fn validate_custom_domain(d: &str) -> Result<String> {
+    let d = d.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() || d.len() > 253 {
+        bail!("custom domain must be 1–253 characters");
+    }
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && l.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    // Require at least one dot (a registrable host, not a bare TLD/label).
+    if !d.contains('.') || !d.split('.').all(label_ok) {
+        bail!("custom domain must be a valid DNS hostname (e.g. blog.example.com)");
+    }
+    Ok(d)
+}
+
+/// Resolve a submitted `config` map against the app's `config` schema: required
+/// fields must be present, unknown keys rejected; returns the resolved map
+/// (submitted values ∪ declared defaults). Shared by the customer and admin
+/// APIs. `submitted` keys/values are the customer-supplied field values.
+pub fn resolve_config(
+    compose: &Compose,
+    submitted: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let declared: std::collections::HashSet<&str> =
+        compose.config.iter().map(|c| c.name.as_str()).collect();
+    for key in submitted.keys() {
+        if !declared.contains(key.as_str()) {
+            bail!("unknown config field '{key}'");
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for field in &compose.config {
+        match submitted.get(&field.name).or(field.default.as_ref()) {
+            Some(v) => {
+                out.insert(field.name.clone(), v.clone());
+            }
+            None if field.required => {
+                bail!("config field '{}' is required", field.name);
+            }
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
 /// A config file with its final rendered content, ready to become a ConfigMap
 /// (or Secret when `sensitive`) mounted read-only at `path`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -292,21 +292,7 @@ pub struct CreateAppDeploymentRequest {
 
 /// Validate `name` is a DNS-safe label usable as a subdomain.
 fn validate_deployment_name(name: &str) -> Result<(), ApiError> {
-    let n = name.trim();
-    if n.is_empty() || n.len() > 40 {
-        return Err(ApiError::new("name must be 1–40 characters"));
-    }
-    if !n
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        || n.starts_with('-')
-        || n.ends_with('-')
-    {
-        return Err(ApiError::new(
-            "name must be a DNS-safe label (lowercase letters, digits, hyphens)",
-        ));
-    }
-    Ok(())
+    lnvps_compose::validate_deployment_name(name).map_err(|e| ApiError::new(e.to_string()))
 }
 
 /// Validate the submitted `config` against the app's compose `config` schema:
@@ -316,29 +302,7 @@ fn resolve_config(
     compose: &lnvps_compose::Compose,
     submitted: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, ApiError> {
-    let declared: std::collections::HashSet<&str> =
-        compose.config.iter().map(|c| c.name.as_str()).collect();
-    for key in submitted.keys() {
-        if !declared.contains(key.as_str()) {
-            return Err(ApiError::new(format!("unknown config field '{key}'")));
-        }
-    }
-    let mut out = BTreeMap::new();
-    for field in &compose.config {
-        match submitted.get(&field.name).or(field.default.as_ref()) {
-            Some(v) => {
-                out.insert(field.name.clone(), v.clone());
-            }
-            None if field.required => {
-                return Err(ApiError::new(format!(
-                    "config field '{}' is required",
-                    field.name
-                )));
-            }
-            None => {}
-        }
-    }
-    Ok(out)
+    lnvps_compose::resolve_config(compose, submitted).map_err(|e| ApiError::new(e.to_string()))
 }
 
 async fn v1_create_app_deployment(
@@ -518,25 +482,7 @@ pub struct PatchAppDeploymentRequest {
 /// more labels, no scheme/port/path. Returns the normalized (trimmed, lowercase)
 /// domain.
 fn validate_custom_domain(d: &str) -> Result<String, ApiError> {
-    let d = d.trim().trim_end_matches('.').to_ascii_lowercase();
-    if d.is_empty() || d.len() > 253 {
-        return Err(ApiError::new("custom domain must be 1–253 characters"));
-    }
-    let label_ok = |l: &str| {
-        !l.is_empty()
-            && l.len() <= 63
-            && l.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            && !l.starts_with('-')
-            && !l.ends_with('-')
-    };
-    // Require at least one dot (a registrable host, not a bare TLD/label).
-    if !d.contains('.') || !d.split('.').all(label_ok) {
-        return Err(ApiError::new(
-            "custom domain must be a valid DNS hostname (e.g. blog.example.com)",
-        ));
-    }
-    Ok(d)
+    lnvps_compose::validate_custom_domain(d).map_err(|e| ApiError::new(e.to_string()))
 }
 
 /// Update a deployment's name and/or config. The operator re-applies the change

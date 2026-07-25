@@ -2,7 +2,8 @@ use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminAppClusterInfo, AdminAppDeploymentInfo, AdminAppInfo, AdminCreateAppClusterRequest,
-    AdminCreateAppRequest, AdminUpdateAppClusterRequest, AdminUpdateAppRequest,
+    AdminCreateAppRequest, AdminUpdateAppClusterRequest, AdminUpdateAppDeploymentRequest,
+    AdminUpdateAppRequest,
 };
 use axum::extract::{Path, State};
 use axum::routing::get;
@@ -25,6 +26,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/app-deployments",
             get(admin_list_app_deployments),
+        )
+        .route(
+            "/api/admin/v1/app-deployments/{id}",
+            get(admin_get_app_deployment).patch(admin_update_app_deployment),
         )
         .route(
             "/api/admin/v1/app_clusters",
@@ -231,9 +236,94 @@ async fn admin_list_app_deployments(
     auth: AdminAuth,
     State(this): State<RouterState>,
 ) -> ApiResult<Vec<AdminAppDeploymentInfo>> {
-    auth.require_permission(AdminResource::App, AdminAction::View)?;
+    auth.require_permission(AdminResource::AppDeployment, AdminAction::View)?;
     let deployments = this.db.list_all_app_deployments().await?;
     ApiData::ok(deployments.into_iter().map(Into::into).collect())
+}
+
+/// Decrypt and parse a deployment's stored config JSON into a flat map.
+fn deployment_config_map(
+    d: &lnvps_db::AppDeployment,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    d.config
+        .as_ref()
+        .and_then(|c| serde_json::from_str::<std::collections::BTreeMap<String, String>>(c.as_str()).ok())
+}
+
+/// Get a single app deployment, including its decrypted config (may hold
+/// secret values — admin-only, `app_deployment::view`).
+async fn admin_get_app_deployment(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<AdminAppDeploymentInfo> {
+    auth.require_permission(AdminResource::AppDeployment, AdminAction::View)?;
+    let d = this.db.get_app_deployment(id).await?;
+    let mut info = AdminAppDeploymentInfo::from(d.clone());
+    info.config = deployment_config_map(&d);
+    ApiData::ok(info)
+}
+
+/// Admin update of a deployment's name, custom_domain and/or config (partial;
+/// `app_deployment::update`). Validation matches the customer PATCH endpoint —
+/// the operator reconciles the change on its next loop.
+async fn admin_update_app_deployment(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminUpdateAppDeploymentRequest>,
+) -> ApiResult<AdminAppDeploymentInfo> {
+    auth.require_permission(AdminResource::AppDeployment, AdminAction::Update)?;
+    let mut d = this.db.get_app_deployment(id).await?;
+
+    // Rename: validate DNS-safe and enforce unique name per cluster.
+    if let Some(new_name) = &req.name {
+        let new_name = new_name.trim();
+        lnvps_compose::validate_deployment_name(new_name)
+            .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?;
+        if new_name != d.name {
+            if let Some(existing) = this
+                .db
+                .find_app_deployment_by_cluster_name(d.cluster_id, new_name)
+                .await?
+                && existing.id != d.id
+            {
+                return Err(lnvps_api_common::ApiError::new(
+                    "A deployment with this name already exists in this region",
+                ));
+            }
+            d.name = new_name.to_string();
+        }
+    }
+
+    // Config update: validate against the app's compose schema and store the
+    // resolved map (encrypted — it may hold secret values).
+    if let Some(submitted) = &req.config {
+        let app = this.db.get_app(d.app_id).await?;
+        let compose = lnvps_compose::Compose::parse(&app.compose).map_err(|e| {
+            lnvps_api_common::ApiError::new(format!("app compose is invalid: {e}"))
+        })?;
+        let config = lnvps_compose::resolve_config(&compose, submitted)
+            .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?;
+        let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+        d.config = Some(lnvps_db::EncryptedString::new(config_json));
+    }
+
+    // Custom domain: set (validated) or clear.
+    if let Some(cd) = &req.custom_domain {
+        d.custom_domain = match cd {
+            Some(v) if !v.trim().is_empty() => Some(
+                lnvps_compose::validate_custom_domain(v)
+                    .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?,
+            ),
+            _ => None,
+        };
+    }
+
+    this.db.update_app_deployment(&d).await?;
+    let mut info = AdminAppDeploymentInfo::from(d.clone());
+    info.config = deployment_config_map(&d);
+    ApiData::ok(info)
 }
 
 // ----- App clusters -----
