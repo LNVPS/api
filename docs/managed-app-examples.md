@@ -210,6 +210,42 @@ config:
 
 ---
 
+## Pyramid — community relay (fiatjaf)
+
+- **Image:** `ghcr.io/fiatjaf/pyramid` (official, published from the repo).
+- **Docs:** <https://github.com/fiatjaf/pyramid> — a feature-rich hierarchical
+  community relay (invite tree, sub-relays, NIP-29 groups, Blossom, search).
+  Env-configured with sensible defaults baked into the image (`HOST`, `PORT`
+  `3334`, `DATA_PATH` `./data`, `NO_AUTO_UPDATES`); a single LMDB store + the
+  settings JSON live under `/app/data`. The **relay domain and root member are
+  set through a one-time web setup flow** the first time you open the
+  deployment's hostname and sign in with a Nostr signer — nothing to configure
+  here.
+- **Notes:** keep `NO_AUTO_UPDATES=true` (the operator manages the image; the
+  in-app self-update writes to a read-only rootfs and would fail anyway). TLS is
+  terminated at the ingress, so run plain HTTP on `3334` (don't enable the
+  built-in autocert/`443`). Optional extras that need raw TCP — the SFTP blob
+  manager (`2222`) and audio/video via embedded LiveKit — aren't reachable
+  until the `expose: tcp/udp` path exists.
+
+```yaml
+services:
+  pyramid:
+    image: ghcr.io/fiatjaf/pyramid:latest
+    resources: { cpu: 500m, memory: 512Mi }
+    ports:
+      - { name: http, container: 3334, protocol: http, expose: ingress }
+    env:
+      HOST: "0.0.0.0"
+      PORT: "3334"
+      DATA_PATH: "/app/data"
+      NO_AUTO_UPDATES: "true"
+    volumes:
+      - { name: data, path: /app/data, size: 20Gi }
+```
+
+---
+
 ## HAVEN — sovereign personal relay (+ Blossom)
 
 - **Image:** `holgerhatgarkeinenode/haven-docker` (community; barrydeen ships
