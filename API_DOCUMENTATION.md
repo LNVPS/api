@@ -446,6 +446,7 @@ interface Subscription {
   expires?: string; // ISO 8601 datetime
   is_active: boolean;
   auto_renewal_enabled: boolean;
+  company_id: number; // seller company billing this subscription; match against account.tax[].company_id for the VAT rate
   line_items: SubscriptionLineItem[]; // Services included in this subscription
 }
 

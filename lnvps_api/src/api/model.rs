@@ -1016,6 +1016,10 @@ pub struct ApiSubscription {
     pub expires: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub auto_renewal_enabled: bool,
+    /// Seller company that bills this subscription. Match against
+    /// `account.tax[].company_id` to gross-up its line-item prices with the
+    /// correct VAT rate (applies to every line item — they share this company).
+    pub company_id: u64,
     pub line_items: Vec<ApiSubscriptionLineItem>,
 }
 
@@ -1040,6 +1044,7 @@ impl ApiSubscription {
             expires: subscription.expires,
             is_active: subscription.is_active,
             auto_renewal_enabled: subscription.auto_renewal_enabled,
+            company_id: subscription.company_id,
             line_items,
         })
     }

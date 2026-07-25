@@ -869,12 +869,19 @@ mod tests {
         }
 
         let sub_id = subs[0]["id"].as_u64().unwrap();
+        // Seller company is exposed for per-company VAT resolution (issue #216).
+        assert!(
+            subs[0]["company_id"].as_u64().is_some(),
+            "subscription exposes company_id"
+        );
 
         let resp = client
             .get_auth(&format!("/api/v1/subscriptions/{sub_id}"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(body["data"]["company_id"].as_u64().is_some());
 
         let resp = client
             .get_auth(&format!("/api/v1/subscriptions/{sub_id}/payments"))
