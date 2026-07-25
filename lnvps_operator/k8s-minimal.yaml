@@ -18,8 +18,22 @@ kind: ClusterRole
 metadata:
   name: lnvps-operator
 rules:
+# Namespaces: one dedicated namespace per app deployment (isolation boundary),
+# plus cluster-scoped listing for namespace garbage collection.
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Core resources created inside each deployment namespace.
+- apiGroups: [""]
+  resources: ["services", "secrets", "configmaps", "persistentvolumeclaims", "resourcequotas"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Workloads.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Ingress (nostr domains + app deployments) and per-deployment isolation policy.
 - apiGroups: ["networking.k8s.io"]
-  resources: ["ingresses"]
+  resources: ["ingresses", "networkpolicies"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["events"]
@@ -52,6 +66,13 @@ data:
     port-name: "http"
     cluster-issuer: "letsencrypt-prod"
     verbose: true
+    # --- Managed app deployments (omit to run nostr-domains only) ---
+    # The app cluster this operator instance serves; enables app reconciliation.
+    app-cluster-id: 1
+    # Namespace the ingress controller runs in (isolation NetworkPolicy allows it).
+    ingress-namespace: "ingress-nginx"
+    # Encryption key: supplied via the LNVPS_ENCRYPTION_KEY env var below (must
+    # match the API's key) so the operator can decrypt app_deployment.config.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -76,6 +97,14 @@ spec:
         env:
         - name: RUST_LOG
           value: "info"
+        # Database field-encryption key (hex). MUST match the API's key so the
+        # operator can decrypt app_deployment.config. Required for app
+        # deployments; omit if running nostr-domains only.
+        - name: LNVPS_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: lnvps-operator-encryption
+              key: key
         volumeMounts:
         - name: config
           mountPath: /etc/config
