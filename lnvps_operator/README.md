@@ -23,7 +23,7 @@ A Kubernetes operator that automatically manages Ingress resources for LNVPS nos
 
 ```bash
 # From the project root
-docker build -f lnvps_operator/Dockerfile -t lnvps-operator:latest .
+docker buildx bake lnvps-operator   # shared root Dockerfile, target lnvps-operator
 ```
 
 ### 2. Update Configuration
