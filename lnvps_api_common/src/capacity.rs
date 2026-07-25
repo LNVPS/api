@@ -575,9 +575,13 @@ impl AppClusterCapacityService {
                 continue;
             }
             if let Some(a) = apps.get(&d.app_id) {
-                used.cpu_milli += a.cpu_milli;
-                used.memory_bytes += a.memory_bytes;
-                used.storage_bytes += a.storage_bytes;
+                // A deployment occupies its app's footprint times its resource
+                // multiplier (1 = base size). Counting the base footprint here
+                // would let upgraded deployments oversubscribe the cluster.
+                let m = d.resource_multiplier.max(1) as u64;
+                used.cpu_milli += a.cpu_milli * m;
+                used.memory_bytes += a.memory_bytes * m;
+                used.storage_bytes += a.storage_bytes * m;
             }
         }
         Ok(used)
@@ -1287,6 +1291,93 @@ mod tests {
             "only the SSD option should remain"
         );
         assert!(result[0].max_cpu > 0, "SSD host still has schedulable CPU");
+        Ok(())
+    }
+
+    /// A deployment occupies its app's footprint times its resource multiplier.
+    /// Counting only the base footprint would let upgraded deployments
+    /// oversubscribe the cluster.
+    #[tokio::test]
+    async fn app_capacity_counts_resource_multiplier() -> Result<()> {
+        use lnvps_db::{AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus};
+
+        let db = MockDb::default();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                lnvps_db::App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    compose: String::new(),
+                    amount: 1000,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_amount: 0,
+                    enabled: true,
+                    cpu_milli: 500,
+                    memory_bytes: 1024,
+                    storage_bytes: 4096,
+                    created: Utc::now(),
+                },
+            );
+            let mut clusters = db.app_clusters.lock().await;
+            clusters.insert(
+                1,
+                AppCluster {
+                    id: 1,
+                    name: "c1".to_string(),
+                    region_id: 1,
+                    ingress_domain: "apps.example.com".to_string(),
+                    enabled: true,
+                    capacity_cpu_milli: 10_000,
+                    capacity_memory_bytes: 100_000,
+                    capacity_storage_bytes: 100_000,
+                    created: Utc::now(),
+                },
+            );
+            let mut deps = db.app_deployments.lock().await;
+            let mk = |id: u64, multiplier: u32| AppDeployment {
+                id,
+                user_id: 1,
+                app_id: 1,
+                cluster_id: 1,
+                resource_multiplier: multiplier,
+                subscription_line_item_id: id,
+                name: format!("d{id}"),
+                namespace: format!("app-{id}"),
+                hostname: None,
+                custom_domain: None,
+                config: None,
+                desired_state: AppDeploymentDesiredState::Running,
+                status: AppDeploymentStatus::Running,
+                status_message: None,
+                created: Utc::now(),
+                deleted: false,
+            };
+            // One base-size deployment, one upgraded to 3x, and one legacy row
+            // whose column predates the migration (decodes as 0 = base size).
+            deps.insert(1, mk(1, 1));
+            deps.insert(2, mk(2, 3));
+            deps.insert(3, mk(3, 0));
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let svc = AppClusterCapacityService::new(db);
+        let used = svc.used(1).await?;
+
+        // 1x + 3x + (0 -> 1x) = 5x the app footprint.
+        assert_eq!(used.cpu_milli, 500 * 5);
+        assert_eq!(used.memory_bytes, 1024 * 5);
+        assert_eq!(used.storage_bytes, 4096 * 5);
+
+        let avail = svc.available(1).await?;
+        assert_eq!(avail.cpu_milli, 10_000 - 2500);
         Ok(())
     }
 }

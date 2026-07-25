@@ -3,9 +3,10 @@
 //! Browse the app catalog and view your own deployments. Ordering, lifecycle
 //! control and the operator reconcile land in later increments.
 
-use crate::api::RouterState;
-use axum::extract::{Path, State};
-use axum::routing::{get, patch};
+use crate::api::model::{ApiPrice, ApiSubscriptionPayment};
+use crate::api::{PaymentMethodQuery, RouterState};
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use lnvps_api_common::{
@@ -14,10 +15,12 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, EncryptedString,
-    Subscription, SubscriptionLineItem, SubscriptionType,
+    PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType,
 };
+use payments_rs::currency::CurrencyAmount;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -41,6 +44,14 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/v1/app-deployments/{id}/stop",
             patch(v1_stop_app_deployment),
+        )
+        .route(
+            "/api/v1/app-deployments/{id}/upgrade-quote",
+            post(v1_app_deployment_upgrade_quote),
+        )
+        .route(
+            "/api/v1/app-deployments/{id}/upgrade",
+            post(v1_app_deployment_upgrade),
         )
 }
 
@@ -159,6 +170,15 @@ pub struct ApiAppDeployment {
     /// Subscription this deployment is billed under (renew via the subscription
     /// endpoints). `None` if the subscription can't be resolved.
     pub subscription_id: Option<u64>,
+    /// Size of this deployment as a multiple of the catalog app's base
+    /// footprint and price. `1` = the base app. Increase it via
+    /// `POST /api/v1/app-deployments/{id}/upgrade`.
+    pub resource_multiplier: u32,
+    /// Effective resources after applying `resource_multiplier`, so the UI does
+    /// not have to multiply the catalog app's figures itself.
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+    pub storage_bytes: u64,
     /// Current customer-supplied `config` field values (issue #232), for
     /// prefilling the edit form so a config `PATCH` preserves untouched fields.
     /// Only the `config:` map — generated `secrets:` are never exposed. `None`
@@ -181,6 +201,10 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         .config
         .as_ref()
         .and_then(|c| serde_json::from_str::<BTreeMap<String, String>>(c.as_str()).ok());
+    // Effective footprint = the catalog app's footprint x the multiplier.
+    let multiplier = d.resource_multiplier.max(1);
+    let app = this.db.get_app(d.app_id).await.ok();
+    let m = multiplier as u64;
     ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
@@ -191,6 +215,10 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         status: d.status.to_string(),
         status_message: d.status_message,
         subscription_id,
+        resource_multiplier: multiplier,
+        cpu_milli: app.as_ref().map(|a| a.cpu_milli * m).unwrap_or(0),
+        memory_bytes: app.as_ref().map(|a| a.memory_bytes * m).unwrap_or(0),
+        storage_bytes: app.as_ref().map(|a| a.storage_bytes * m).unwrap_or(0),
         config,
         created: d.created,
     }
@@ -397,6 +425,7 @@ async fn v1_create_app_deployment(
         user_id: uid,
         app_id: app.id,
         cluster_id: cluster.id,
+        resource_multiplier: 1,
         subscription_line_item_id: line_item_id,
         name: name.to_string(),
         // Temporary unique namespace; finalized to `app-{id}` below.
@@ -563,6 +592,132 @@ async fn v1_start_app_deployment(
     set_desired_state(&this, uid, id, AppDeploymentDesiredState::Running).await
 }
 
+/// Request to resize a deployment to a larger multiple of the app's base size.
+#[derive(Deserialize)]
+pub struct ApiAppUpgradeRequest {
+    /// Desired size as a multiple of the catalog app's base footprint. Must be
+    /// greater than the deployment's current `resource_multiplier`.
+    pub resource_multiplier: u32,
+}
+
+/// Quoted cost of an app resize.
+#[derive(Serialize)]
+pub struct ApiAppUpgradeQuote {
+    /// Prorated amount payable now (net, before tax) to run at the new size for
+    /// the remainder of the current period.
+    pub cost_difference: ApiPrice,
+    /// What a full period will cost at the new size from the next renewal.
+    pub new_renewal_cost: ApiPrice,
+    /// Credit for the time already paid for at the current size.
+    pub discount: ApiPrice,
+    pub tax: ApiPrice,
+    pub processing_fee: ApiPrice,
+}
+
+/// Largest size a deployment may be upgraded to, as a multiple of the base app.
+///
+/// A guard rail against a typo (`resource_multiplier: 1000`) quoting an
+/// enormous invoice or exhausting a cluster; raise it if real demand appears.
+const MAX_RESOURCE_MULTIPLIER: u32 = 16;
+
+/// Validate an upgrade request and return the capacity delta it needs.
+///
+/// Shared by the quote and the payment endpoints so both enforce the same
+/// rules: increase-only (PVCs cannot shrink), bounded, and the *additional*
+/// footprint must fit on the cluster the deployment already runs on — it cannot
+/// be moved, because its volumes live there.
+async fn validate_app_upgrade(
+    this: &RouterState,
+    deployment: &AppDeployment,
+    new_multiplier: u32,
+) -> Result<(), ApiError> {
+    let current = deployment.resource_multiplier.max(1);
+    if new_multiplier <= current {
+        return Err(ApiError::new(format!(
+            "Resource multiplier can only be increased (current {current}, requested {new_multiplier})"
+        )));
+    }
+    if new_multiplier > MAX_RESOURCE_MULTIPLIER {
+        return Err(ApiError::new(format!(
+            "Resource multiplier may not exceed {MAX_RESOURCE_MULTIPLIER}"
+        )));
+    }
+
+    let app = this.db.get_app(deployment.app_id).await?;
+    let delta = (new_multiplier - current) as u64;
+    let need = AppCapacity {
+        cpu_milli: app.cpu_milli * delta,
+        memory_bytes: app.memory_bytes * delta,
+        storage_bytes: app.storage_bytes * delta,
+    };
+    let capacity = AppClusterCapacityService::new(this.db.clone());
+    if !capacity.fits(deployment.cluster_id, need).await? {
+        return Err(ApiError::new(
+            "The cluster this deployment runs on does not have enough free capacity for this upgrade",
+        ));
+    }
+    Ok(())
+}
+
+/// Quote the prorated cost of resizing a deployment. Does not charge anything.
+async fn v1_app_deployment_upgrade_quote(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(q): Query<PaymentMethodQuery>,
+    Json(req): Json<ApiAppUpgradeRequest>,
+) -> ApiResult<ApiAppUpgradeQuote> {
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let deployment = owned_deployment(&this, uid, id).await?;
+    validate_app_upgrade(&this, &deployment, req.resource_multiplier).await?;
+
+    let method = q
+        .method
+        .as_deref()
+        .and_then(|m| PaymentMethod::from_str(m).ok())
+        .unwrap_or(PaymentMethod::Lightning);
+    let quote = this
+        .sub_handler
+        .pricing_engine()
+        .calculate_app_upgrade_cost(id, req.resource_multiplier, method)
+        .await?;
+
+    let currency = quote.upgrade.amount.currency();
+    ApiData::ok(ApiAppUpgradeQuote {
+        cost_difference: quote.upgrade.amount.into(),
+        new_renewal_cost: quote.renewal.amount.into(),
+        discount: quote.discount.amount.into(),
+        tax: CurrencyAmount::from_u64(currency, quote.tax.amount).into(),
+        processing_fee: CurrencyAmount::from_u64(currency, quote.processing_fee).into(),
+    })
+}
+
+/// Start an app resize by creating the upgrade payment.
+///
+/// The deployment is resized only once this payment settles, so an abandoned
+/// upgrade leaves it untouched.
+async fn v1_app_deployment_upgrade(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(q): Query<PaymentMethodQuery>,
+    Json(req): Json<ApiAppUpgradeRequest>,
+) -> ApiResult<ApiSubscriptionPayment> {
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let deployment = owned_deployment(&this, uid, id).await?;
+    validate_app_upgrade(&this, &deployment, req.resource_multiplier).await?;
+
+    // Same payment resolution as renewals: interactive, saved NWC wallet, or
+    // saved Revolut card.
+    let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
+    let payment = this
+        .sub_handler
+        .create_app_upgrade_payment(id, req.resource_multiplier, method, mode)
+        .await?;
+
+    ApiData::ok(ApiSubscriptionPayment::from(payment))
+}
+
 async fn v1_stop_app_deployment(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -596,7 +751,9 @@ mod tests {
             Some("blog.example.com")
         );
         assert_eq!(
-            validate_custom_domain(" Blog.Example.COM. ").ok().as_deref(),
+            validate_custom_domain(" Blog.Example.COM. ")
+                .ok()
+                .as_deref(),
             Some("blog.example.com")
         );
         assert_eq!(
@@ -660,6 +817,7 @@ mod tests {
             user_id: 1,
             app_id: 1,
             cluster_id,
+            resource_multiplier: 1,
             subscription_line_item_id: 0,
             name: name.to_string(),
             namespace: format!("ns-{name}"),

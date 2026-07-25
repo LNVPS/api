@@ -4599,6 +4599,9 @@ pub struct AdminAppDeploymentInfo {
     pub user_id: u64,
     pub app_id: u64,
     pub cluster_id: u64,
+    /// Size as a multiple of the catalog app's base footprint and price
+    /// (`1` = base). Customers raise this via the app upgrade endpoint.
+    pub resource_multiplier: u32,
     pub subscription_line_item_id: u64,
     pub name: String,
     pub namespace: String,
@@ -4625,6 +4628,7 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             user_id: d.user_id,
             app_id: d.app_id,
             cluster_id: d.cluster_id,
+            resource_multiplier: d.resource_multiplier.max(1),
             subscription_line_item_id: d.subscription_line_item_id,
             name: d.name,
             namespace: d.namespace,

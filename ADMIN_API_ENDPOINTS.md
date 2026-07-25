@@ -3708,6 +3708,7 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "user_id": 42,
   "app_id": 3,
   "cluster_id": 1,
+  "resource_multiplier": 1,
   "subscription_line_item_id": 7,
   "name": "my-relay",
   "namespace": "app-1",
@@ -3720,6 +3721,8 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "created": "2026-07-25T10:00:00Z"
 }
 ```
+
+`resource_multiplier` is the deployment's size as a multiple of the catalog app's base footprint and price (`1` = base). The customer raises it via `POST /api/v1/app-deployments/{id}/upgrade`, which is applied only once the prorated upgrade payment settles. It is read-only here — the admin `PATCH` does not accept it, because changing it without a payment would desynchronise the billed price from the provisioned size.
 
 **List** — `GET /api/admin/v1/app-deployments`. Required Permission: `app_deployment::view`. Lists every non-deleted app deployment across all users and clusters, for oversight/support. Excludes the per-deployment `config` (omitted).
 

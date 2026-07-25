@@ -3217,6 +3217,17 @@ pub struct AppDeployment {
     pub app_id: u64,
     /// Cluster this deployment runs on (drives placement + billing region).
     pub cluster_id: u64,
+    /// Size of this deployment as a multiple of the catalog app's base
+    /// footprint and price. `1` = the base app.
+    ///
+    /// The operator multiplies every container's CPU/memory limits and every
+    /// PVC's size by this value, capacity accounting counts the multiplied
+    /// footprint, and the subscription line item is priced at
+    /// `app.amount * resource_multiplier`.
+    ///
+    /// Increase-only: PVCs cannot shrink, so a downgrade would strand storage.
+    #[sqlx(default)]
+    pub resource_multiplier: u32,
     /// Billing back-reference (subscription line item of type `App`).
     pub subscription_line_item_id: u64,
     /// User-chosen, DNS-safe instance name (used for the subdomain/host).
