@@ -232,9 +232,7 @@ impl SubscriptionHandler {
                 self.ip_range_provisioner.clone(),
                 li.id,
             ))),
-            SubscriptionType::App => {
-                Ok(Box::new(AppLineItemHandler::new(self.db.clone(), li.id)))
-            }
+            SubscriptionType::App => Ok(Box::new(AppLineItemHandler::new(self.db.clone(), li.id))),
             // Exhaustive on purpose (no catch-all): adding a new SubscriptionType
             // must fail to compile until a handler is wired here, rather than
             // silently falling through. These variants have no ordering flow yet,
@@ -540,7 +538,15 @@ impl SubscriptionHandler {
             non_vm_tax,
             non_vm_processing_fee,
             non_vm_tax_line,
-        ): (u64, f32, u64, u64, Option<lnvps_api_common::TaxLine>) = if non_vm_base > 0 {
+            non_vm_currency,
+        ): (
+            u64,
+            f32,
+            u64,
+            u64,
+            Option<lnvps_api_common::TaxLine>,
+            Option<Currency>,
+        ) = if non_vm_base > 0 {
             let base = non_vm_base;
             let list_price = CurrencyAmount::from_u64(subscription_currency, base);
             let converted = self.pe.get_amount_and_rate(list_price, method).await?;
@@ -565,9 +571,10 @@ impl SubscriptionHandler {
                 det.amount,
                 processing_fee,
                 Some(line),
+                Some(converted.amount.currency()),
             )
         } else {
-            (0u64, 0f32, 0u64, 0u64, None)
+            (0u64, 0f32, 0u64, 0u64, None, None)
         };
 
         // Aggregate all line item amounts.  All VM infos are already in the
@@ -638,10 +645,15 @@ impl SubscriptionHandler {
                 .evidence_json(),
         );
 
-        // Payment method currency: BTC for Lightning, otherwise subscription currency
+        // Payment method currency. VM items are already converted to the method
+        // currency; for subscriptions with no VM items (e.g. managed apps) the
+        // non-VM block converted the amount to the method currency too, so use
+        // that. Only fall back to the raw subscription currency when nothing was
+        // converted (defensive; shouldn't happen for a billable subscription).
         let payment_currency = vm_payment_infos
             .first()
             .map(|p| p.currency)
+            .or(non_vm_currency)
             .unwrap_or(subscription_currency);
 
         // Wrap the aggregated values so the invoice/order creation below can use them
@@ -1726,6 +1738,82 @@ mod revolut_offline_tests {
         assert!(breakdown.is_array());
         let ev = payment.tax_evidence.expect("evidence present");
         assert_eq!(ev["declared_country"], "DEU");
+    }
+
+    /// A subscription with only non-VM line items (e.g. a managed app) priced in
+    /// fiat must still produce a Lightning invoice: the non-VM cost is converted
+    /// to BTC, so the payment currency is BTC. Regression for "Lightning payment
+    /// must be in BTC" when ordering/renewing an app (no VM item to carry the
+    /// converted currency).
+    #[tokio::test]
+    async fn renew_app_only_subscription_via_lightning_converts_to_btc() {
+        let db = Arc::new(MockDb::default());
+        let node = Arc::new(MockNode::default());
+        let user_id = db.upsert_user(&[42u8; 32]).await.unwrap();
+
+        // 1 EUR/mo managed app, no VM items.
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "relay".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::App,
+                    name: "relay".to_string(),
+                    description: None,
+                    amount: 100, // 1.00 EUR
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            node,
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+
+        let payment = sub
+            .renew_subscription(sub_id, PaymentMethod::Lightning, 1)
+            .await
+            .expect("app-only lightning invoice should generate");
+
+        assert_eq!(payment.payment_method, PaymentMethod::Lightning);
+        // Amount is now in sats (msat), converted from EUR — not left as EUR cents.
+        assert!(payment.amount > 0, "invoice amount should be set");
     }
 
     /// An on-chain renewal derives a fresh receive address from the provider and

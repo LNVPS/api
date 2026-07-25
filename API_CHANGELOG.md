@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lightning/on-chain invoices for app-only subscriptions** — generating a payment for a subscription with only non-VM line items (e.g. a managed app) priced in fiat failed with `Lightning payment must be in BTC` (and the on-chain equivalent). The non-VM cost was already converted to the payment method's currency, but the payment currency was only inferred from VM items, so an app-only subscription wrongly kept its fiat currency. The converted currency is now used, so fiat-priced apps can be paid via Lightning/on-chain. Also wires the `SubscriptionType::App` lifecycle handler (missing handler previously skipped expiry/grace-period cleanup of the deployment's namespace and volumes).
+
 ### Changed
 
 - **App catalog is now public** (issue #227) — `GET /api/v1/apps`, `GET /api/v1/apps/{id}` and `GET /api/v1/apps/{id}/regions` no longer require `Nip98Auth`, mirroring `GET /api/v1/vm/templates`. The catalog is a shopping/marketing surface, so anonymous visitors and SSR homepages can browse offered apps (and per-region availability) without logging in. All user-owned deployment endpoints (`/api/v1/app-deployments...`) remain authenticated.
