@@ -188,7 +188,10 @@ pub struct ApiAppDeployment {
     pub created: DateTime<Utc>,
 }
 
-async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeployment {
+async fn deployment_to_api(
+    this: &RouterState,
+    d: AppDeployment,
+) -> Result<ApiAppDeployment, ApiError> {
     // Resolve the owning subscription from the line item (best-effort).
     let subscription_id = this
         .db
@@ -202,10 +205,13 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         .as_ref()
         .and_then(|c| serde_json::from_str::<BTreeMap<String, String>>(c.as_str()).ok());
     // Effective footprint = the catalog app's footprint x the multiplier.
+    // `app_id` is a required foreign key, so a missing app is a broken
+    // deployment row; propagate rather than reporting a zero footprint, which
+    // the client would render as "0 CPU".
     let multiplier = d.resource_multiplier.max(1);
-    let app = this.db.get_app(d.app_id).await.ok();
+    let app = this.db.get_app(d.app_id).await?;
     let m = multiplier as u64;
-    ApiAppDeployment {
+    Ok(ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
         name: d.name,
@@ -216,12 +222,12 @@ async fn deployment_to_api(this: &RouterState, d: AppDeployment) -> ApiAppDeploy
         status_message: d.status_message,
         subscription_id,
         resource_multiplier: multiplier,
-        cpu_milli: app.as_ref().map(|a| a.cpu_milli * m).unwrap_or(0),
-        memory_bytes: app.as_ref().map(|a| a.memory_bytes * m).unwrap_or(0),
-        storage_bytes: app.as_ref().map(|a| a.storage_bytes * m).unwrap_or(0),
+        cpu_milli: app.cpu_milli * m,
+        memory_bytes: app.memory_bytes * m,
+        storage_bytes: app.storage_bytes * m,
         config,
         created: d.created,
-    }
+    })
 }
 
 /// List all enabled catalog apps.
@@ -285,7 +291,7 @@ async fn v1_list_app_deployments(
     let deployments = this.db.list_user_app_deployments(uid).await?;
     let mut out = Vec::with_capacity(deployments.len());
     for d in deployments {
-        out.push(deployment_to_api(&this, d).await);
+        out.push(deployment_to_api(&this, d).await?);
     }
     ApiData::ok(out)
 }
@@ -301,7 +307,7 @@ async fn v1_get_app_deployment(
     if deployment.user_id != uid || deployment.deleted {
         return Err(ApiError::not_found("Deployment not found"));
     }
-    ApiData::ok(deployment_to_api(&this, deployment).await)
+    ApiData::ok(deployment_to_api(&this, deployment).await?)
 }
 
 /// Order a new app deployment.
@@ -445,7 +451,7 @@ async fn v1_create_app_deployment(
     deployment.namespace = format!("app-{id}");
     this.db.update_app_deployment(&deployment).await?;
 
-    ApiData::ok(deployment_to_api(&this, deployment).await)
+    ApiData::ok(deployment_to_api(&this, deployment).await?)
 }
 
 /// Resolve and ownership-check a deployment for the authenticated user.
@@ -568,7 +574,7 @@ async fn v1_patch_app_deployment(
     }
 
     this.db.update_app_deployment(&deployment).await?;
-    ApiData::ok(deployment_to_api(&this, deployment).await)
+    ApiData::ok(deployment_to_api(&this, deployment).await?)
 }
 
 async fn set_desired_state(
@@ -580,7 +586,7 @@ async fn set_desired_state(
     let mut deployment = owned_deployment(this, uid, id).await?;
     deployment.desired_state = state;
     this.db.update_app_deployment(&deployment).await?;
-    ApiData::ok(deployment_to_api(this, deployment).await)
+    ApiData::ok(deployment_to_api(this, deployment).await?)
 }
 
 async fn v1_start_app_deployment(

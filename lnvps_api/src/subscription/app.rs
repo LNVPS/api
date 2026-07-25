@@ -12,7 +12,7 @@
 //! after its grace period.
 
 use crate::subscription::{AppUpgradeConfig, SubscriptionLineItemHandler};
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use lnvps_db::{
     LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
@@ -41,17 +41,28 @@ impl SubscriptionLineItemHandler for AppLineItemHandler {
         // and future renewals bill at the new size. Doing this only on payment
         // means an abandoned upgrade never changes anything.
         if payment.payment_type == SubscriptionPaymentType::Upgrade {
-            let Some(cfg) = payment
-                .metadata
-                .clone()
-                .and_then(|m| serde_json::from_value::<AppUpgradeConfig>(m).ok())
-            else {
-                info!(
-                    "App line item {} upgrade payment has no usable metadata; nothing to apply",
+            // Every app upgrade payment is created by
+            // `create_app_upgrade_payment`, which always serializes an
+            // `AppUpgradeConfig` into the metadata. Missing or malformed
+            // metadata therefore means the payment record is corrupt — and the
+            // customer has already been charged. Fail loudly: swallowing it
+            // would leave them paid up at the old size with nothing but an
+            // info-level log to show for it.
+            let metadata = payment.metadata.clone().ok_or_else(|| {
+                anyhow!(
+                    "app upgrade payment {} (line item {}) has no metadata; cannot tell what size was paid for",
+                    hex::encode(&payment.id),
                     self.line_item_id
-                );
-                return Ok(());
-            };
+                )
+            })?;
+            let cfg: AppUpgradeConfig =
+                serde_json::from_value(metadata.clone()).with_context(|| {
+                    format!(
+                        "app upgrade payment {} (line item {}) has unreadable metadata: {metadata}",
+                        hex::encode(&payment.id),
+                        self.line_item_id
+                    )
+                })?;
 
             let mut dep = self
                 .db
@@ -337,19 +348,35 @@ mod tests {
         );
     }
 
-    /// An upgrade payment with unusable metadata is tolerated (logged, ignored)
-    /// rather than failing the whole payment pipeline.
+    /// An upgrade payment always carries an `AppUpgradeConfig` (written by
+    /// `create_app_upgrade_payment`), so missing or malformed metadata means the
+    /// record is corrupt *and the customer has already paid*. That must surface
+    /// as an error rather than silently leaving them at the old size.
     #[tokio::test]
-    async fn upgrade_payment_without_metadata_is_ignored() {
+    async fn upgrade_payment_with_unusable_metadata_errors() {
         let db = std::sync::Arc::new(MockDb::default());
         let id = seed_deployment(&db, 13).await;
         let h = AppLineItemHandler::new(db.clone(), 13);
 
+        // No metadata at all.
         let mut p = payment();
         p.payment_type = SubscriptionPaymentType::Upgrade;
         p.metadata = None;
-        h.on_payment(&p).await.unwrap();
+        let err = h
+            .on_payment(&p)
+            .await
+            .expect_err("missing metadata must error");
+        assert!(err.to_string().contains("no metadata"), "{err}");
 
+        // Present, but not an AppUpgradeConfig (e.g. a VM UpgradeConfig).
+        p.metadata = Some(serde_json::json!({ "new_cpu": 4 }));
+        let err = h
+            .on_payment(&p)
+            .await
+            .expect_err("unreadable metadata must error");
+        assert!(err.to_string().contains("unreadable metadata"), "{err}");
+
+        // Either way the deployment is untouched.
         assert_eq!(
             db.get_app_deployment(id).await.unwrap().resource_multiplier,
             1
