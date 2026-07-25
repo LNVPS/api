@@ -40,6 +40,21 @@ read-only, mounted via subPath), `depends_on`, `backup`. `${HOSTNAME}` resolves
 to `{deployment-name}.{cluster-ingress-domain}`; a service name resolves to its
 in-namespace DNS (e.g. `db:3306`).
 
+## Validating a compose document
+
+Before pasting a `compose` into the admin API, validate it locally with the
+`compose-validate` CLI (runs the exact parser + checks the API and operator
+use, and prints the resource footprint):
+
+```sh
+cargo run -p lnvps_compose --bin compose-validate -- app.yaml
+# or pipe one doc via stdin:
+cat app.yaml | cargo run -q -p lnvps_compose --bin compose-validate
+# → OK   app.yaml: 2 service(s), cpu=1000m memory=1.00 GiB storage=25.00 GiB; vars: DB_ROOT_PASSWORD
+```
+
+Exits non-zero if any document fails to parse or validate.
+
 ---
 
 ## strfry — Nostr relay
@@ -159,14 +174,97 @@ services:
 
 ---
 
+## nostr-rs-relay
+
+- **Image:** `scsibug/nostr-rs-relay` (Docker Hub, official pre-built).
+- **Docs:** <https://github.com/scsibug/nostr-rs-relay> — optional TOML config
+  at `/usr/src/app/config.toml`; listens on `8080`; SQLite DB under
+  `/usr/src/app/db`. Set `network.address = "0.0.0.0"` so it's reachable in the
+  pod.
+
+```yaml
+services:
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    resources: { cpu: 250m, memory: 256Mi }
+    ports:
+      - { name: ws, container: 8080, protocol: http, expose: ingress }
+    files:
+      - path: /usr/src/app/config.toml
+        content: |
+          [info]
+          relay_url = "wss://${HOSTNAME}/"
+          name = "${relay_name}"
+          description = "${relay_description}"
+          [database]
+          data_directory = "/usr/src/app/db"
+          [network]
+          address = "0.0.0.0"
+          port = 8080
+    volumes:
+      - { name: db, path: /usr/src/app/db, size: 10Gi }
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay" }
+  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
+```
+
+---
+
+## HAVEN — sovereign personal relay (+ Blossom)
+
+- **Image:** `holgerhatgarkeinenode/haven-docker` (community; barrydeen ships
+  binaries, not an image). Workdir `/app`.
+- **Docs:** <https://github.com/barrydeen/haven> — configured entirely by env
+  vars; listens on `RELAY_PORT` (default `3355`), `RELAY_BIND_ADDRESS` must be
+  `0.0.0.0`. Databases (badger) live under `/app/db`, Blossom media under
+  `/app/blossom`. It **fatally requires** the two relay-list files
+  `relays_import.json` and `relays_blastr.json` at startup (provided below via
+  `files:`); the whitelist/blacklist files are optional and disabled by setting
+  their env vars to `""` (owner-only).
+- **Caveat:** the community image does **not** bundle HAVEN's `templates/`
+  directory, so the web landing page at `/` won't render — but the relay itself
+  works fully over WebSocket (which is what the ingress serves as `wss://`).
+
+```yaml
+services:
+  haven:
+    image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    resources: { cpu: 500m, memory: 512Mi }
+    ports:
+      - { name: ws, container: 3355, protocol: http, expose: ingress }
+    env:
+      OWNER_NPUB: "${owner_npub}"
+      RELAY_URL: "${HOSTNAME}"
+      RELAY_PORT: "3355"
+      RELAY_BIND_ADDRESS: "0.0.0.0"
+      DB_ENGINE: "badger"
+      BLOSSOM_PATH: "blossom/"
+      PRIVATE_RELAY_NPUB: "${owner_npub}"
+      CHAT_RELAY_NPUB: "${owner_npub}"
+      OUTBOX_RELAY_NPUB: "${owner_npub}"
+      INBOX_RELAY_NPUB: "${owner_npub}"
+      IMPORT_SEED_RELAYS_FILE: "relays_import.json"
+      BLASTR_RELAYS_FILE: "relays_blastr.json"
+      WHITELISTED_NPUBS_FILE: ""
+      BLACKLISTED_NPUBS_FILE: ""
+      BACKUP_PROVIDER: "none"
+    files:
+      - path: /app/relays_import.json
+        content: |
+          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+      - path: /app/relays_blastr.json
+        content: |
+          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+    volumes:
+      - { name: db, path: /app/db, size: 10Gi }
+      - { name: blossom, path: /app/blossom, size: 20Gi }
+config:
+  - { name: owner_npub, label: "Owner npub", type: string, required: true }
+```
+
+---
+
 ## Notes on other apps
 
-- **HAVEN** (<https://github.com/barrydeen/haven>) — no official image; the
-  community `holgerhatgarkeinenode/haven-docker` image requires a mounted
-  `templates/` directory of binary web assets plus several JSON list files
-  (`relays_import.json`, `relays_blastr.json`, whitelist/blacklist). The
-  `files:` mechanism only injects individual text files, so HAVEN isn't cleanly
-  deployable here yet — it would need a self-contained image that bundles the
-  templates.
 - **zap-stream-core** — needs raw TCP/UDP ingest (RTMP `1935/tcp`, SRT), i.e.
   the not-yet-implemented `expose: tcp|udp` path.
