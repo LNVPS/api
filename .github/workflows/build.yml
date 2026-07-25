@@ -22,6 +22,13 @@ on:
           - lnvps-nostr
           - lnvps-host-info
 
+# Back-to-back pushes to the same ref supersede each other: cancel the older
+# in-flight build. Release tags each have a unique ref, so tag builds are
+# never cancelled by master pushes or by other tags.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: registry.v0l.io
   HOST_INFO_IMAGE: registry.v0l.io/lnvps-host-info
