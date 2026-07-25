@@ -221,9 +221,12 @@ config:
   `relays_import.json` and `relays_blastr.json` at startup (provided below via
   `files:`); the whitelist/blacklist files are optional and disabled by setting
   their env vars to `""` (owner-only).
-- **Caveat:** the community image does **not** bundle HAVEN's `templates/`
-  directory, so the web landing page at `/` won't render — but the relay itself
-  works fully over WebSocket (which is what the ingress serves as `wss://`).
+- **Caveat:** current published community images do **not** bundle HAVEN's
+  `templates/` directory, so the web landing page at `/` won't render — but the
+  relay itself works fully over WebSocket (which is what the ingress serves as
+  `wss://`). A fix to bake the templates into the image is proposed upstream
+  (<https://github.com/HolgerHatGarKeineNode/haven-docker/pull/8>); once merged
+  and released the dashboard works out of the box.
 
 ```yaml
 services:
