@@ -3695,10 +3695,12 @@ Required Permission: `app::delete`. Rejected while the app still has deployments
 #### App Deployments
 
 ```
-GET /api/admin/v1/app-deployments
+GET   /api/admin/v1/app-deployments
+GET   /api/admin/v1/app-deployments/{id}
+PATCH /api/admin/v1/app-deployments/{id}
 ```
 
-Required Permission: `app::view`. Lists every non-deleted app deployment across all users and clusters, for oversight/support. Excludes the encrypted per-deployment config blob. `AdminAppDeploymentInfo`:
+These use the dedicated **`app_deployment`** RBAC resource (distinct from the catalog `app` resource). `AdminAppDeploymentInfo`:
 
 ```json
 {
@@ -3710,12 +3712,30 @@ Required Permission: `app::view`. Lists every non-deleted app deployment across 
   "name": "my-relay",
   "namespace": "app-1",
   "hostname": "my-relay.apps.lnvps.tld",
+  "custom_domain": "blog.example.com",
   "desired_state": "running",
   "status": "running",
   "status_message": null,
+  "config": { "relay_name": "My relay" },
   "created": "2026-07-25T10:00:00Z"
 }
 ```
+
+**List** — `GET /api/admin/v1/app-deployments`. Required Permission: `app_deployment::view`. Lists every non-deleted app deployment across all users and clusters, for oversight/support. Excludes the per-deployment `config` (omitted).
+
+**Get** — `GET /api/admin/v1/app-deployments/{id}`. Required Permission: `app_deployment::view`. Returns a single deployment **including its decrypted `config`** map (which may hold secret values — admin-only). `404` if not found.
+
+**Update** — `PATCH /api/admin/v1/app-deployments/{id}`. Required Permission: `app_deployment::update`. Partial update of `name`, `custom_domain` and/or `config`, mirroring the customer `PATCH /api/v1/app-deployments/{id}` for support/ops fixes. The operator reconciles the change (hostname/ingress, secrets/env/configmap) on its next loop. Request body (all optional — only those present change):
+
+```json
+{
+  "name": "new-name",               // DNS-safe; unique per cluster
+  "custom_domain": "blog.example.com", // set; "" or null clears
+  "config": { "relay_name": "New" }  // validated against the app compose schema; replaces the stored config wholesale
+}
+```
+
+Returns the updated `AdminAppDeploymentInfo` (including decrypted `config`). `400` for an invalid `name`, a name already in use on the cluster, an invalid `custom_domain`, or missing-required/unknown `config` fields; `404` if not found.
 
 #### App Clusters
 

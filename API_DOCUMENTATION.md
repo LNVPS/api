@@ -1308,7 +1308,7 @@ interface CreateAppDeploymentRequest {
 - **Response**: `AppDeployment` — created in `pending` state with a billing subscription; **pay the subscription** (`GET /api/v1/subscriptions/{subscription_id}/renew`) to activate it. The operator starts the workload once paid.
 - **Errors**: `400` for an invalid `name`, a name already in use by another deployment on the chosen cluster, missing required / unknown `config` fields, or when no cluster in the region has enough capacity; `404` if the app doesn't exist or isn't offered.
 
-#### Update a Deployment (rename / reconfigure)
+#### Update a Deployment (rename / reconfigure / custom domain)
 - **PATCH** `/api/v1/app-deployments/{id}`
 - **Auth**: Required
 - **Body** (all fields optional — only those present are changed):
@@ -1316,11 +1316,13 @@ interface CreateAppDeploymentRequest {
 interface PatchAppDeploymentRequest {
   name?: string;                         // new DNS-safe instance name; changes the public hostname
   config?: { [field: string]: string };  // full desired config for the app's `config` fields; replaces the stored config wholesale
+  custom_domain?: string | null;         // set a customer-owned domain (e.g. "blog.example.com"); "" or null clears it. Omit to leave unchanged
 }
 ```
 - **Response**: `AppDeployment` — the operator re-applies the change (hostname/ingress, secrets/env/configmap) and rolls the workload on its next reconcile.
 - **Notes**: only the app's declared `config:` fields can be set (the compose — image, resources, volumes, ports — is fixed by the catalog). Prefill from the deployment's current `config` (returned on `AppDeployment`) so untouched fields are preserved.
-- **Errors**: `400` for an invalid `name`, a name already in use on the cluster, or missing-required / unknown `config` fields; `404` if not found or not owned by you.
+- **Custom domains**: set `custom_domain` to your own hostname, then point a **CNAME** at the deployment's `hostname` (`{name}.{ingress_domain}`). Once DNS resolves, the operator serves the domain alongside the default hostname and cert-manager issues a TLS certificate for it (HTTP-01, stored in the `app-tls-custom` secret). There is no pre-verification — the certificate is only issued once your CNAME actually points at the cluster, so set DNS *before* expecting HTTPS to work.
+- **Errors**: `400` for an invalid `name`, a name already in use on the cluster, an invalid `custom_domain`, or missing-required / unknown `config` fields; `404` if not found or not owned by you.
 
 #### Stop / Start a Deployment
 - **PATCH** `/api/v1/app-deployments/{id}/stop` — scale to 0 (data retained)
@@ -1403,6 +1405,7 @@ interface AppDeployment {
   app_id: number;            // catalog app being run
   name: string;              // your instance name
   hostname?: string;         // public endpoint host once assigned (null until reconciled, or for apps with no ingress port)
+  custom_domain?: string;    // your own domain (CNAME'd to `hostname`), served alongside it with its own TLS cert; null if unset
   desired_state: "running" | "stopped";
   status: "pending" | "running" | "stopped" | "error" | "deleting";
   status_message?: string;   // operator status/error detail when present
