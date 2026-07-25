@@ -1,6 +1,9 @@
 # LNVPS Kubernetes Operator Configuration
+#
+# Full reference — every setting the operator understands, with its default.
+# Optional keys can be omitted; the shown value is the default unless noted.
 
-# Database connection string
+# Database connection string (required)
 db: "mysql://root:root@localhost:3376/lnvps"
 
 # Kubernetes namespace to watch (optional, defaults to "default")
@@ -15,6 +18,33 @@ error-retry-interval: 30
 # Enable verbose logging (optional, defaults to false)
 verbose: true
 
+# --- Database field encryption (required to read encrypted columns) ---------
+# The operator decrypts columns the API encrypted — notably
+# `app_deployment.config`. The key MUST be identical to the API's, otherwise
+# decryption fails. Precedence: the LNVPS_ENCRYPTION_KEY environment variable
+# (64 hex chars = 32 bytes) overrides the key file below.
+encryption:
+  # Path to the 32-byte key file (same file/key the API uses).
+  key-file: "/etc/lnvps/encryption.key"
+  # Generate the key if the file doesn't exist (optional, defaults to false).
+  # Leave false in production and share the API's existing key.
+  auto-generate: false
+
+# --- Managed app deployments ------------------------------------------------
+# The app cluster this operator instance serves (optional). When set, the
+# operator reconciles `app_deployment` rows whose cluster_id matches this into
+# Kubernetes. When unset, app-deployment reconciliation is disabled (the
+# operator only manages nostr domains). Requires `encryption` (above).
+app-cluster-id: 1
+
+# Namespace the ingress controller runs in (optional, defaults to
+# "ingress-nginx"). The per-deployment isolation NetworkPolicy allows inbound
+# traffic from this namespace; it must match that namespace's
+# `kubernetes.io/metadata.name` label. For a hostNetwork ingress controller the
+# source is the node IP, not this namespace — see docs.
+ingress-namespace: "ingress-nginx"
+
+# --- Nostr domains ----------------------------------------------------------
 # Service name for nostr domain ingress (optional, defaults to "lnvps-nostr")
 # All nostr domains will point to this single service
 service-name: "lnvps-nostr"
@@ -23,13 +53,15 @@ service-name: "lnvps-nostr"
 port-name: "http"
 
 # Cert-manager cluster issuer name (optional, defaults to "letsencrypt-prod")
-# Used to automatically generate TLS certificates for all nostr domains
+# Used to automatically generate TLS certificates for nostr domains AND managed
+# app-deployment ingresses.
 cluster-issuer: "letsencrypt-prod"
 
-# Ingress class name (optional, defaults to "nginx")
+# Ingress class name (optional, defaults to "nginx"). Applied via the modern
+# `spec.ingressClassName` on generated Ingress objects.
 ingress-class: "nginx"
 
-# Additional custom annotations for the ingress (optional)
+# Additional custom annotations for the nostr-domain ingress (optional)
 # These will be merged with the default annotations
 # Custom annotations take precedence over defaults
 annotations:

@@ -2,7 +2,7 @@
 //!
 //! Each `app_deployment` row (for this operator's cluster) is rendered from its
 //! app's `lnvps_compose` document into a set of namespaced Kubernetes objects:
-//! a locked-down Namespace (one per deployment) with a default-deny
+//! a locked-down Namespace (one per deployment) with an isolation
 //! NetworkPolicy and a ResourceQuota, a Deployment + Service per compose
 //! service, an Ingress for each `expose: ingress` port, PVCs for `volumes:`, and
 //! ConfigMap/Secret-backed `files:` mounted read-only via `subPath`.
@@ -91,23 +91,105 @@ pub fn build_namespace(deployment_id: u64) -> Namespace {
     }
 }
 
-/// A default-deny NetworkPolicy (blocks all ingress/egress) leaving only DNS —
-/// so services can resolve each other but the deployment can't reach the rest of
-/// the cluster. Egress to the internet is added by the ingress/service path.
-pub fn build_network_policy(deployment_id: u64) -> NetworkPolicy {
+/// The isolation NetworkPolicy for a deployment namespace.
+///
+/// Tenant isolation without cutting the deployment off from the outside world:
+///
+/// * **Ingress** — accept traffic only from the ingress-controller namespace
+///   (the inbound HTTP path) and from pods in the deployment's own namespace
+///   (multi-service apps). Other tenants' namespaces are denied.
+/// * **Egress** — allow DNS (so services resolve each other and the internet),
+///   same-namespace traffic (e.g. `app` → its `db`), and the **public
+///   internet** — minus RFC1918 / CGNAT / link-local ranges. Excluding those
+///   private ranges keeps a deployment from reaching other tenants' pods,
+///   in-cluster services, the Kubernetes API, or the cloud metadata endpoint
+///   (`169.254.169.254`), while still permitting normal outbound internet
+///   access (relay sync, blastr, webhooks, API calls, …).
+pub fn build_network_policy(deployment_id: u64, ingress_namespace: &str) -> NetworkPolicy {
+    use k8s_openapi::api::networking::v1::{
+        IPBlock, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+        NetworkPolicyPort,
+    };
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+    // All pods in this deployment's own namespace.
+    let same_ns = NetworkPolicyPeer {
+        pod_selector: Some(LabelSelector::default()),
+        ..Default::default()
+    };
+    // The public internet, minus internal ranges a tenant must not reach
+    // directly (other pods/services, kube API, cloud metadata, CGNAT).
+    let internet = NetworkPolicyPeer {
+        ip_block: Some(IPBlock {
+            cidr: "0.0.0.0/0".to_string(),
+            except: Some(vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+                // link-local incl. the cloud metadata endpoint 169.254.169.254
+                "169.254.0.0/16".to_string(),
+                "100.64.0.0/10".to_string(), // CGNAT
+            ]),
+        }),
+        ..Default::default()
+    };
+    // `..Default::default()` covers the optional `end_port` field, which only
+    // exists under some k8s_openapi feature sets; harmless where it doesn't.
+    #[allow(clippy::needless_update)]
+    let dns_ports = vec![
+        NetworkPolicyPort {
+            protocol: Some("UDP".to_string()),
+            port: Some(IntOrString::Int(53)),
+            ..Default::default()
+        },
+        NetworkPolicyPort {
+            protocol: Some("TCP".to_string()),
+            port: Some(IntOrString::Int(53)),
+            ..Default::default()
+        },
+    ];
+    let ingress_controller = NetworkPolicyPeer {
+        namespace_selector: Some(LabelSelector {
+            match_labels: Some(BTreeMap::from([(
+                "kubernetes.io/metadata.name".to_string(),
+                ingress_namespace.to_string(),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
     NetworkPolicy {
         metadata: ObjectMeta {
-            name: Some("default-deny".to_string()),
+            name: Some("default-isolation".to_string()),
             namespace: Some(namespace_name(deployment_id)),
             labels: Some(labels(deployment_id)),
             ..Default::default()
         },
         spec: Some(NetworkPolicySpec {
-            // Empty selector = all pods; no ingress/egress rules = deny all
-            // (except intra-namespace is still governed by CNI defaults).
             pod_selector: LabelSelector::default(),
             policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
-            ..Default::default()
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![same_ns.clone(), ingress_controller]),
+                ports: None,
+            }]),
+            egress: Some(vec![
+                // DNS to the cluster resolver (any destination, port 53 only).
+                NetworkPolicyEgressRule {
+                    to: None,
+                    ports: Some(dns_ports),
+                },
+                // Same-namespace service-to-service (e.g. app -> its DB).
+                NetworkPolicyEgressRule {
+                    to: Some(vec![same_ns]),
+                    ports: None,
+                },
+                // The public internet (private/cluster/metadata ranges excluded).
+                NetworkPolicyEgressRule {
+                    to: Some(vec![internet]),
+                    ports: None,
+                },
+            ]),
         }),
     }
 }
@@ -453,6 +535,15 @@ pub fn build_deployment(
                         Some(volumes)
                     },
                     security_context: Some(pod_security_context()),
+                    // Don't mount the ServiceAccount token: a managed app never
+                    // talks to the Kubernetes API, and withholding the token
+                    // blocks API access even on CNIs that don't enforce the
+                    // isolation NetworkPolicy (e.g. Flannel). Enforced by the
+                    // kubelet, independent of the CNI.
+                    automount_service_account_token: Some(false),
+                    // Don't inject `*_SERVICE_HOST/PORT` env vars for every
+                    // service in the namespace (avoids leaking topology).
+                    enable_service_links: Some(false),
                     ..Default::default()
                 }),
             },
@@ -480,13 +571,14 @@ pub fn build_ingress(
             .map(|p| (name.clone(), p.clone()))
     })?;
 
-    let annotations = BTreeMap::from([
-        (
-            "cert-manager.io/cluster-issuer".to_string(),
-            issuer.to_string(),
-        ),
-        ("kubernetes.io/ingress.class".to_string(), class.to_string()),
-    ]);
+    // cert-manager cluster-issuer drives TLS issuance. The ingress class is set
+    // via the modern `spec.ingressClassName` (below) rather than the deprecated
+    // `kubernetes.io/ingress.class` annotation, which recent ingress-nginx
+    // ignores (and warns about if both are present).
+    let annotations = BTreeMap::from([(
+        "cert-manager.io/cluster-issuer".to_string(),
+        issuer.to_string(),
+    )]);
 
     let rule = IngressRule {
         host: Some(hostname.to_string()),
@@ -517,6 +609,7 @@ pub fn build_ingress(
             ..Default::default()
         },
         spec: Some(IngressSpec {
+            ingress_class_name: Some(class.to_string()),
             tls: Some(vec![IngressTLS {
                 hosts: Some(vec![hostname.to_string()]),
                 secret_name: Some("app-tls".to_string()),
@@ -716,9 +809,14 @@ async fn reconcile_one(
     let compose = lnvps_compose::Compose::parse(&app.compose)?;
     let hostname = deployment_hostname(&deployment.name, ingress_domain);
 
-    // 1. Namespace (restricted PSS) + default-deny NetworkPolicy.
+    // 1. Namespace (restricted PSS) + isolation NetworkPolicy.
     apply_namespace(client, &build_namespace(id)).await?;
-    apply(client, &build_network_policy(id)).await?;
+    let ingress_ns = ctx
+        .settings
+        .ingress_namespace
+        .as_deref()
+        .unwrap_or("ingress-nginx");
+    apply(client, &build_network_policy(id, ingress_ns)).await?;
 
     // 2. Generated secrets: preserve existing values, generate any new ones.
     let existing = read_generated(client, id).await;
@@ -892,16 +990,45 @@ config:
     }
 
     #[test]
-    fn netpol_denies_all() {
-        let np = build_network_policy(7);
+    fn netpol_isolates_but_allows_internet_egress() {
+        let np = build_network_policy(7, "ingress-nginx");
         let spec = np.spec.unwrap();
         assert_eq!(
             spec.policy_types,
             Some(vec!["Ingress".to_string(), "Egress".to_string()])
         );
-        // no ingress/egress allow rules => deny
-        assert!(spec.ingress.is_none());
-        assert!(spec.egress.is_none());
+
+        // Ingress: only same-namespace + the ingress controller namespace.
+        let ingress = spec.ingress.expect("ingress rules");
+        let from = ingress[0].from.as_ref().unwrap();
+        assert!(from.iter().any(|p| p.pod_selector.is_some()));
+        assert!(from.iter().any(|p| {
+            p.namespace_selector
+                .as_ref()
+                .and_then(|s| s.match_labels.as_ref())
+                .and_then(|l| l.get("kubernetes.io/metadata.name"))
+                .map(|v| v == "ingress-nginx")
+                .unwrap_or(false)
+        }));
+
+        // Egress: DNS (port 53), same-namespace, and internet with private
+        // ranges excluded.
+        let egress = spec.egress.expect("egress rules");
+        assert!(egress.iter().any(|r| {
+            r.ports
+                .as_ref()
+                .map(|ps| ps.iter().any(|p| p.protocol.as_deref() == Some("UDP")))
+                .unwrap_or(false)
+        }));
+        let internet = egress
+            .iter()
+            .find_map(|r| r.to.as_ref()?.iter().find_map(|p| p.ip_block.as_ref()))
+            .expect("internet ipBlock");
+        assert_eq!(internet.cidr, "0.0.0.0/0");
+        let except = internet.except.as_ref().unwrap();
+        assert!(except.contains(&"10.0.0.0/8".to_string()));
+        // cloud metadata endpoint is inside the excluded link-local range
+        assert!(except.contains(&"169.254.0.0/16".to_string()));
     }
 
     #[test]
@@ -962,8 +1089,15 @@ config:
         assert_eq!(spec.replicas, Some(1));
         assert_eq!(spec.strategy.unwrap().type_.as_deref(), Some("Recreate"));
 
-        let pod = spec.template.spec.unwrap();
-        assert_eq!(pod.security_context.unwrap().run_as_non_root, Some(true));
+        let pod = spec.template.spec.clone().unwrap();
+        assert_eq!(
+            pod.security_context.as_ref().unwrap().run_as_non_root,
+            Some(true)
+        );
+        // ServiceAccount token withheld (blocks kube-API even without a
+        // policy-enforcing CNI) and service-link env injection disabled.
+        assert_eq!(pod.automount_service_account_token, Some(false));
+        assert_eq!(pod.enable_service_links, Some(false));
         let ctr = &pod.containers[0];
         // Container carries requests == limits from the compose resources
         // (defaults 250m / 256Mi here).
@@ -1033,7 +1167,17 @@ config:
         let c = compose();
         let ing =
             build_ingress(7, &c, "relay.apps.example.com", "letsencrypt-prod", "nginx").unwrap();
+        // cert-manager issuer via annotation; ingress class via the modern
+        // spec.ingressClassName (not the deprecated annotation).
+        let ann = ing.metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            ann.get("cert-manager.io/cluster-issuer")
+                .map(|s| s.as_str()),
+            Some("letsencrypt-prod")
+        );
+        assert!(!ann.contains_key("kubernetes.io/ingress.class"));
         let spec = ing.spec.unwrap();
+        assert_eq!(spec.ingress_class_name.as_deref(), Some("nginx"));
         assert_eq!(
             spec.tls.unwrap()[0].hosts.as_ref().unwrap()[0],
             "relay.apps.example.com"
@@ -1100,5 +1244,252 @@ config:
         assert_eq!(a.len(), 48);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// Full compose → Kubernetes mapping, mirroring `reconcile_one`: generate
+    /// secrets, resolve env/files against them, then assert the resolved values
+    /// actually land in the rendered Deployment / ConfigMap / Secret / Service /
+    /// Ingress / PVC objects for every service.
+    #[test]
+    fn compose_maps_to_k8s_end_to_end() {
+        let c = compose();
+        let id = 42u64;
+        let host = deployment_hostname("my-relay", "apps.example.com");
+
+        // 1. Generate secrets and resolve env/files exactly like the reconciler.
+        let generated = ensure_secrets(&c, &BTreeMap::new()).unwrap();
+        let pw = generated["DB_PASSWORD"].clone();
+        let vars = build_vars(&generated, &BTreeMap::new(), &host);
+        let env = c.resolve_env(&vars).unwrap();
+        let files = c.resolve_files(&vars).unwrap();
+        let to_bt = |m: &std::collections::HashMap<String, String>| -> BTreeMap<String, String> {
+            m.clone().into_iter().collect()
+        };
+
+        // ── web service (ingress, files: ConfigMap + Secret, env with vars) ──
+        let web_env = to_bt(&env["web"]);
+        let web_files = files["web"].clone();
+        let web = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 1);
+        let pod = web.spec.unwrap().template.spec.unwrap();
+        let ctr = &pod.containers[0];
+        assert_eq!(ctr.image.as_deref(), Some("example/web:latest"));
+
+        // Env is inlined with fully-resolved values (no `${…}` left).
+        let cenv: BTreeMap<String, String> = ctr
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            cenv["DATABASE_URL"],
+            format!("mysql://web:{pw}@mariadb:3306/web")
+        );
+        assert_eq!(cenv["PUBLIC_URL"], "https://my-relay.apps.example.com");
+        assert!(cenv.values().all(|v| !v.contains("${")));
+
+        // File mounts: non-sensitive via ConfigMap volume, sensitive via Secret
+        // volume — both read-only + subPath so they don't shadow the dir.
+        let mounts = ctr.volume_mounts.as_ref().unwrap();
+        let conf = mounts
+            .iter()
+            .find(|m| m.mount_path == "/etc/web.conf")
+            .unwrap();
+        assert_eq!(conf.name, "files-cm");
+        assert_eq!(conf.read_only, Some(true));
+        assert!(conf.sub_path.is_some());
+        let key = mounts
+            .iter()
+            .find(|m| m.mount_path == "/etc/api.key")
+            .unwrap();
+        assert_eq!(key.name, "files-secret");
+        assert_eq!(key.read_only, Some(true));
+
+        // ConfigMap carries only the non-sensitive file, rendered with ${HOSTNAME}.
+        let cm = build_files_configmap(id, "web", &web_files).unwrap();
+        let cm_data = cm.data.unwrap();
+        assert_eq!(cm_data.len(), 1);
+        assert!(
+            cm_data
+                .values()
+                .any(|v| v == "name=my-relay.apps.example.com")
+        );
+
+        // Secret carries only the sensitive file, rendered to the generated pw.
+        let sec = build_secret(id, "web", &BTreeMap::new(), &web_files).unwrap();
+        let sec_data = sec.data.unwrap();
+        assert_eq!(sec_data.len(), 1);
+        assert!(sec_data.values().any(|b| b.0 == pw.clone().into_bytes()));
+
+        // Service + Ingress target web's exposed port 8000.
+        let svc = build_service(id, "web", &c.services["web"]).unwrap();
+        assert_eq!(svc.spec.unwrap().ports.unwrap()[0].port, 8000);
+        let ing = build_ingress(id, &c, &host, "letsencrypt-prod", "nginx").unwrap();
+        let backend = ing.spec.unwrap().rules.unwrap()[0]
+            .http
+            .as_ref()
+            .unwrap()
+            .paths[0]
+            .backend
+            .service
+            .clone()
+            .unwrap();
+        assert_eq!(backend.name, "web");
+        assert_eq!(backend.port.unwrap().number, Some(8000));
+
+        // ── mariadb service (no ports, PVC, secret injected into env) ──
+        let db_env = to_bt(&env["mariadb"]);
+        assert_eq!(db_env["MARIADB_PASSWORD"], pw);
+        let db = build_deployment(id, "mariadb", &c.services["mariadb"], &db_env, &[], 1);
+        let db_pod = db.spec.unwrap().template.spec.unwrap();
+        let vm = db_pod.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.mount_path == "/var/lib/mysql")
+            .unwrap();
+        assert_eq!(vm.name, "mariadb-db");
+        // No declared ports ⇒ no Service.
+        assert!(build_service(id, "mariadb", &c.services["mariadb"]).is_none());
+        // PVC uses the declared size.
+        let vol = &c.services["mariadb"].volumes[0];
+        let pvc = build_pvc(id, "mariadb", &vol.name, &vol.size);
+        assert_eq!(
+            pvc.spec.unwrap().resources.unwrap().requests.unwrap()["storage"].0,
+            "5Gi"
+        );
+
+        // ── lifecycle: stopped ⇒ 0 replicas (data-preserving) ──
+        let stopped = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 0);
+        assert_eq!(stopped.spec.unwrap().replicas, Some(0));
+    }
+
+    /// Extract every ```yaml fenced block from a markdown doc, tagged with the
+    /// nearest preceding `## ` heading (used to name the fixture in failures).
+    fn extract_yaml_blocks(md: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut heading = String::new();
+        let mut lines = md.lines();
+        while let Some(line) = lines.next() {
+            if let Some(h) = line.strip_prefix("## ") {
+                heading = h.trim().to_string();
+            } else if line.trim_start() == "```yaml" {
+                let mut body = String::new();
+                for l in lines.by_ref() {
+                    if l.trim_start() == "```" {
+                        break;
+                    }
+                    body.push_str(l);
+                    body.push('\n');
+                }
+                out.push((heading.clone(), body));
+            }
+        }
+        out
+    }
+
+    /// Every app compose published in `docs/managed-app-examples.md` must run
+    /// through the full compose → Kubernetes pipeline: parse, validate, compute
+    /// a footprint, resolve secrets/config/files, and render each service's
+    /// Deployment / Service / PVC / ConfigMap / Secret plus the shared Ingress /
+    /// NetworkPolicy / ResourceQuota — without panicking and with the key
+    /// invariants intact. This keeps the documented fixtures from drifting out
+    /// of the grammar the operator actually implements.
+    #[test]
+    fn documented_examples_map_to_k8s() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/managed-app-examples.md"
+        ))
+        .expect("read docs/managed-app-examples.md");
+
+        let examples = extract_yaml_blocks(&doc);
+        assert!(
+            examples.len() >= 6,
+            "expected at least the 6 documented app composes, found {}",
+            examples.len()
+        );
+
+        for (name, yaml) in examples {
+            let c = Compose::parse(&yaml).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            c.validate()
+                .unwrap_or_else(|e| panic!("{name}: validate: {e}"));
+            let fp = c
+                .footprint()
+                .unwrap_or_else(|e| panic!("{name}: footprint: {e}"));
+            assert!(
+                fp.cpu_milli > 0 && fp.memory_bytes > 0,
+                "{name}: empty footprint"
+            );
+
+            // Resolve every referenced var: generated secrets + config (its
+            // default, or a placeholder for required fields) + HOSTNAME.
+            let id = 1u64;
+            let generated = ensure_secrets(&c, &BTreeMap::new()).unwrap();
+            let config: BTreeMap<String, String> = c
+                .config
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        f.default.clone().unwrap_or_else(|| "test".to_string()),
+                    )
+                })
+                .collect();
+            let host = deployment_hostname("inst", "apps.example.com");
+            let vars = build_vars(&generated, &config, &host);
+            let env = c
+                .resolve_env(&vars)
+                .unwrap_or_else(|e| panic!("{name}: resolve_env: {e}"));
+            let files = c
+                .resolve_files(&vars)
+                .unwrap_or_else(|e| panic!("{name}: resolve_files: {e}"));
+
+            // Every service renders a Deployment with its image; ported services
+            // render a Service; declared volumes render PVCs; resolved files stay
+            // free of unresolved `${…}`.
+            for (sname, svc) in &c.services {
+                let senv: BTreeMap<String, String> = env[sname].clone().into_iter().collect();
+                let sfiles = files[sname].clone();
+                for f in &sfiles {
+                    assert!(
+                        !f.content.contains("${"),
+                        "{name}/{sname}: unresolved var in {}",
+                        f.path
+                    );
+                }
+                let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1);
+                let image = dep.spec.unwrap().template.spec.unwrap().containers[0]
+                    .image
+                    .clone();
+                assert_eq!(image.as_deref(), Some(svc.image.as_str()));
+                assert_eq!(
+                    build_service(id, sname, svc).is_some(),
+                    !svc.ports.is_empty(),
+                    "{name}/{sname}: service presence tracks declared ports"
+                );
+                for v in &svc.volumes {
+                    assert!(build_pvc(id, sname, &v.name, &v.size).spec.is_some());
+                }
+                let _ = build_files_configmap(id, sname, &sfiles);
+                let _ = build_secret(id, sname, &BTreeMap::new(), &sfiles);
+            }
+
+            // Each documented app exposes an ingress endpoint.
+            assert!(
+                build_ingress(id, &c, &host, "letsencrypt-prod", "nginx").is_some(),
+                "{name}: expected an ingress endpoint"
+            );
+            // Shared namespace objects render from the footprint.
+            let _ = build_network_policy(id, "ingress-nginx");
+            let _ = build_resource_quota(
+                id,
+                &format!("{}m", fp.cpu_milli),
+                &fp.memory_bytes.to_string(),
+                &fp.storage_bytes.to_string(),
+            );
+        }
     }
 }

@@ -26,10 +26,21 @@ images (higher isolation risk — design the boundary in now).
 - **Target catalog (Nostr services):** strfry, haven relay, route96 (+ its MariaDB), a generic
   Blossom server for the first cut (all pure HTTP ingress). **zap-stream-core** is the driver
   for the L4 (`expose: tcp/udp`) work (RTMP `1935/tcp` + SRT `udp` ingest) — later.
-- **Isolation:** **namespace per deployment** (`app-{id}`) with default-deny NetworkPolicy,
+- **Isolation:** **namespace per deployment** (`app-{id}`) with an isolation NetworkPolicy,
   ResourceQuota/LimitRange, restricted PodSecurity, and a locked-down pod securityContext.
   Predefined apps are low-risk; keep the boundary so user-defined images later is a tightening
   (runtimeClass/egress), not a redesign.
+- **NetworkPolicy** (`build_network_policy`): ingress from the ingress-controller namespace
+  (`ingress_namespace` setting, default `ingress-nginx`) + same namespace; egress = DNS +
+  same namespace + **public internet** with RFC1918/CGNAT/link-local (incl. `169.254.169.254`
+  metadata) excluded — so internet access works but a tenant can't reach other pods / the kube
+  API / cloud metadata. **Requires a policy-enforcing CNI (Calico/Cilium/Canal).** On **Flannel
+  (+MetalLB), NetworkPolicy is a no-op** — nothing breaks, but there is no network isolation;
+  use Canal (Flannel networking + Calico policy) to enforce it. `hostNetwork` ingress controllers
+  need the node CIDR allowed inbound (namespaceSelector won't match a node-sourced packet).
+- **CNI-independent hardening** (enforced by the kubelet regardless of CNI): pods set
+  `automountServiceAccountToken: false` (no kube-API access even on Flannel) and
+  `enableServiceLinks: false`. This is the real API-access boundary on a non-policy CNI.
 - Scope now: **predefined apps only**.
 
 ## Findings

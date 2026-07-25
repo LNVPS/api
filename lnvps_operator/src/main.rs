@@ -14,6 +14,23 @@ use tokio::signal;
 mod app_deployments;
 mod nostr_domains;
 
+/// Environment variable holding the hex-encoded database encryption key. Must
+/// match the API's key (`lnvps_api::settings::ENCRYPTION_KEY_ENV`) so the
+/// operator can decrypt columns the API encrypted (e.g. `app_deployment.config`).
+const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
+
+/// Database field-encryption configuration (mirrors the API's `EncryptionConfig`
+/// so both sides use the same key).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EncryptionConfig {
+    /// Path to the encryption key file.
+    pub key_file: PathBuf,
+    /// Automatically generate the key if the file doesn't exist.
+    #[serde(default)]
+    pub auto_generate: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Settings {
@@ -49,8 +66,19 @@ pub struct Settings {
     /// Ingress class name (optional, defaults to "nginx")
     pub ingress_class: Option<String>,
 
+    /// Namespace the ingress controller runs in — the app-deployment isolation
+    /// NetworkPolicy allows inbound traffic from it (optional, defaults to
+    /// "ingress-nginx"). Must match the `kubernetes.io/metadata.name` label of
+    /// that namespace.
+    pub ingress_namespace: Option<String>,
+
     /// Additional ingress annotations (optional)
     pub annotations: Option<HashMap<String, String>>,
+
+    /// Database field-encryption key (optional). Required to read encrypted
+    /// columns such as `app_deployment.config`; must match the API's key. The
+    /// `LNVPS_ENCRYPTION_KEY` env var (hex) takes precedence over this file.
+    pub encryption: Option<EncryptionConfig>,
 }
 
 #[derive(Parser)]
@@ -80,6 +108,22 @@ async fn main() -> Result<()> {
         ))
         .build()?
         .try_deserialize()?;
+
+    // Initialize database field encryption before reading any EncryptedString
+    // columns (e.g. app_deployment.config). Prefer the env var, else the key
+    // file from settings — the key MUST match the API's or decryption fails.
+    if let Ok(hex_key) = std::env::var(ENCRYPTION_KEY_ENV) {
+        lnvps_db::EncryptionContext::init_from_hex(&hex_key)?;
+        info!("Database encryption initialized from environment");
+    } else if let Some(ref enc) = settings.encryption {
+        lnvps_db::EncryptionContext::init_from_file(&enc.key_file, enc.auto_generate)?;
+        info!("Database encryption initialized from key file");
+    } else if settings.app_cluster_id.is_some() {
+        // App reconciliation needs to decrypt app_deployment.config.
+        warn!(
+            "app-cluster-id is set but no encryption key is configured (LNVPS_ENCRYPTION_KEY or `encryption.key-file`); app deployment config cannot be decrypted"
+        );
+    }
 
     let db = LNVpsDbMysql::new(&settings.db).await?;
     let client = Client::try_default().await?;
@@ -132,4 +176,40 @@ async fn main() -> Result<()> {
 
     info!("LNVPS Operator shutting down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(name: &str) -> Settings {
+        let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), name);
+        ConfigBuilder::builder()
+            .add_source(File::from(PathBuf::from(path)))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap_or_else(|e| panic!("{name} must deserialize into Settings: {e}"))
+    }
+
+    /// The shipped example configs must stay in sync with the `Settings` struct
+    /// (kebab-case keys, valid types) so the documented reference never drifts.
+    #[test]
+    fn example_configs_deserialize() {
+        // Full reference exercises every field, including the app-deployment
+        // and encryption settings.
+        let full = load("config.yaml");
+        assert!(full.app_cluster_id.is_some());
+        assert!(full.encryption.is_some());
+        assert_eq!(full.ingress_namespace.as_deref(), Some("ingress-nginx"));
+        assert_eq!(
+            full.encryption.unwrap().key_file,
+            PathBuf::from("/etc/lnvps/encryption.key")
+        );
+
+        // Minimal config (app-deployment keys commented out) still loads.
+        let minimal = load("config.minimal.yaml");
+        assert!(minimal.app_cluster_id.is_none());
+        assert!(minimal.encryption.is_none());
+    }
 }

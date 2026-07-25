@@ -13,8 +13,18 @@ port-name: "http"
 # TLS certificate configuration
 cluster-issuer: "letsencrypt-prod"
 
+# Managed app deployments (omit both to run nostr-domains only).
+# app-cluster-id enables app reconciliation for this cluster; encryption is
+# required to decrypt app_deployment.config and MUST match the API's key
+# (or set the LNVPS_ENCRYPTION_KEY env var instead of the key file).
+# app-cluster-id: 1
+# encryption:
+#   key-file: "/etc/lnvps/encryption.key"
+#   auto-generate: false
+
 # Ingress configuration (optional - defaults shown)
 # ingress-class: "nginx"
+# ingress-namespace: "ingress-nginx"
 # reconcile-interval: 60
 # error-retry-interval: 30
 # verbose: false
