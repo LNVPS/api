@@ -540,8 +540,9 @@ pub async fn seed_app_deployment(
     .await?;
 
     let (cluster_id,): (u64,) = sqlx::query_as(
+        // Enabled region only — see seed_app_and_cluster.
         "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled) \
-         VALUES (?, (SELECT MIN(id) FROM region), 'apps.e2e.example.com', 1) RETURNING id",
+         VALUES (?, (SELECT MIN(id) FROM region WHERE enabled = 1), 'apps.e2e.example.com', 1) RETURNING id",
     )
     .bind(&slug)
     .fetch_one(pool)
@@ -590,7 +591,11 @@ pub async fn seed_app_deployment(
 /// the customer ordering flow.
 pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64, u64)> {
     let suffix = hex::encode(&rand_bytes32()[..4]);
-    let (region_id,): (u64,) = sqlx::query_as("SELECT MIN(id) FROM region")
+    // Must be an *enabled* region: `GET /api/v1/apps/{id}/regions` only surfaces
+    // enabled ones, and admin region DELETE soft-deletes (`enabled = false`), so
+    // a plain MIN(id) can land on a region left disabled by an earlier test and
+    // the seeded cluster would never appear as deployable.
+    let (region_id,): (u64,) = sqlx::query_as("SELECT MIN(id) FROM region WHERE enabled = 1")
         .fetch_one(pool)
         .await?;
 

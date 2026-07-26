@@ -649,6 +649,29 @@ async fn validate_app_upgrade(
         )));
     }
 
+    // An upgrade is prorated against the time left on the current period, so a
+    // deployment that was never paid for (no expiry) or has already expired
+    // cannot be quoted. Checked here so these return 400 with an actionable
+    // message; reaching the pricing engine would surface them as a 500.
+    let line_item = this
+        .db
+        .get_subscription_line_item(deployment.subscription_line_item_id)
+        .await?;
+    let subscription = this.db.get_subscription(line_item.subscription_id).await?;
+    match subscription.expires {
+        None => {
+            return Err(ApiError::new(
+                "This deployment has not been paid for yet, so there is no period to upgrade. Pay for it first, then upgrade.",
+            ));
+        }
+        Some(expires) if expires <= Utc::now() => {
+            return Err(ApiError::new(
+                "This deployment has expired. Renew it before upgrading.",
+            ));
+        }
+        Some(_) => {}
+    }
+
     let app = this.db.get_app(deployment.app_id).await?;
     let delta = (new_multiplier - current) as u64;
     let need = AppCapacity {
