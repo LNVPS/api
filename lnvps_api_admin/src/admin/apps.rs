@@ -73,10 +73,22 @@ fn validate_app_fields(
     if compose.trim().is_empty() {
         return Err(lnvps_api_common::ApiError::new("compose is required"));
     }
-    if let Err(e) = lnvps_compose::Compose::parse(compose) {
-        return Err(lnvps_api_common::ApiError::new(format!(
-            "invalid compose: {e}"
-        )));
+    match lnvps_compose::Compose::parse(compose) {
+        Err(e) => {
+            return Err(lnvps_api_common::ApiError::new(format!(
+                "invalid compose: {e}"
+            )));
+        }
+        // Authoring-time only: every `${...}` must be declared. Checked here
+        // rather than in `parse` so the operator can still render an app that
+        // was stored before this rule existed (see validate_declarations).
+        Ok(c) => {
+            if let Err(e) = c.validate_declarations() {
+                return Err(lnvps_api_common::ApiError::new(format!(
+                    "invalid compose: {e}"
+                )));
+            }
+        }
     }
     if currency.trim().is_empty() {
         return Err(lnvps_api_common::ApiError::new("currency is required"));
@@ -245,9 +257,9 @@ async fn admin_list_app_deployments(
 fn deployment_config_map(
     d: &lnvps_db::AppDeployment,
 ) -> Option<std::collections::BTreeMap<String, String>> {
-    d.config
-        .as_ref()
-        .and_then(|c| serde_json::from_str::<std::collections::BTreeMap<String, String>>(c.as_str()).ok())
+    d.config.as_ref().and_then(|c| {
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(c.as_str()).ok()
+    })
 }
 
 /// Get a single app deployment, including its decrypted config (may hold
@@ -300,9 +312,8 @@ async fn admin_update_app_deployment(
     // resolved map (encrypted — it may hold secret values).
     if let Some(submitted) = &req.config {
         let app = this.db.get_app(d.app_id).await?;
-        let compose = lnvps_compose::Compose::parse(&app.compose).map_err(|e| {
-            lnvps_api_common::ApiError::new(format!("app compose is invalid: {e}"))
-        })?;
+        let compose = lnvps_compose::Compose::parse(&app.compose)
+            .map_err(|e| lnvps_api_common::ApiError::new(format!("app compose is invalid: {e}")))?;
         let config = lnvps_compose::resolve_config(&compose, submitted)
             .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?;
         let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());

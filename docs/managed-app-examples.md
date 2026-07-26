@@ -69,6 +69,22 @@ for an Alpine `adduser -D nonroot` that is `1000`; for distroless `nonroot`
 it is `65532`. A `user:` that is neither `root`/`0` nor a positive integer is
 rejected when the compose is validated.
 
+**Variable references** — every `${NAME}` in `env`, `files[].content` or a
+`content_from` must be declared, either as a `config:` field, a `secrets:` entry,
+or the built-in `HOSTNAME`. This is enforced when an app is created or updated
+(and by `compose-validate`), so adding a reference without declaring it is
+rejected up front.
+
+It is deliberately *not* enforced when the operator renders a deployment. A
+deployment stores the config values the customer supplied at order time, so if
+the catalog compose later gains a new `config:` field, existing deployments have
+no value for it. Rather than failing the reconcile — which would take a running
+workload offline over a value the customer never had the chance to supply — the
+operator resolves such a reference to the field's **default**, or to an empty
+string if it has none, and logs a warning. So a compose change is safe to roll
+out to already-deployed instances; give any new field a sensible `default` if a
+blank would break the app.
+
 ## Validating a compose document
 
 Before pasting a `compose` into the admin API, validate it locally with the

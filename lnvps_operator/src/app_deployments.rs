@@ -704,11 +704,18 @@ pub fn deployment_hostname(name: &str, ingress_domain: &str) -> String {
 /// Build the merged `${…}` substitution map from generated secrets + config
 /// values + operator context (currently `HOSTNAME`).
 pub fn build_vars(
+    compose: &Compose,
     generated: &BTreeMap<String, String>,
     config: &BTreeMap<String, String>,
     hostname: &str,
 ) -> std::collections::HashMap<String, String> {
     let mut vars = std::collections::HashMap::new();
+    // Declared defaults first, so a config field added to the catalog app after
+    // this deployment was created resolves to its default instead of an empty
+    // string. The deployment's stored config then overrides them.
+    for (k, v) in compose.config_defaults() {
+        vars.insert(k, v);
+    }
     for (k, v) in generated {
         vars.insert(k.clone(), v.clone());
     }
@@ -716,6 +723,21 @@ pub fn build_vars(
         vars.insert(k.clone(), v.clone());
     }
     vars.insert("HOSTNAME".to_string(), hostname.to_string());
+
+    // Anything still unset substitutes empty (see lnvps_compose::substitute).
+    // That keeps a running deployment running, but is worth surfacing: it means
+    // a required field has no value and no default.
+    let missing: Vec<String> = compose
+        .referenced_vars()
+        .into_iter()
+        .filter(|n| !vars.contains_key(n))
+        .collect();
+    if !missing.is_empty() {
+        warn!(
+            "compose references {} with no value or default; substituting empty",
+            missing.join(", ")
+        );
+    }
     vars
 }
 
@@ -970,7 +992,7 @@ async fn reconcile_one(
 
     // 3. Resolve env + files against generated secrets + customer config.
     let config = parse_config(&deployment.config);
-    let vars = build_vars(&generated, &config, &hostname);
+    let vars = build_vars(&compose, &generated, &config, &hostname);
     let env = compose.resolve_env(&vars)?;
     let files = compose.resolve_files(&vars)?;
 
@@ -1546,7 +1568,7 @@ config:
         let generated = ensure_secrets(&c, &BTreeMap::new()).unwrap();
         let config = BTreeMap::new();
         let host = deployment_hostname("my-relay", "apps.example.com");
-        let vars = build_vars(&generated, &config, &host);
+        let vars = build_vars(&c, &generated, &config, &host);
 
         // env + files resolve end-to-end against the generated secret.
         let env = c.resolve_env(&vars).unwrap();
@@ -1586,7 +1608,7 @@ config:
         // 1. Generate secrets and resolve env/files exactly like the reconciler.
         let generated = ensure_secrets(&c, &BTreeMap::new()).unwrap();
         let pw = generated["DB_PASSWORD"].clone();
-        let vars = build_vars(&generated, &BTreeMap::new(), &host);
+        let vars = build_vars(&c, &generated, &BTreeMap::new(), &host);
         let env = c.resolve_env(&vars).unwrap();
         let files = c.resolve_files(&vars).unwrap();
         let to_bt = |m: &std::collections::HashMap<String, String>| -> BTreeMap<String, String> {
@@ -1766,7 +1788,7 @@ config:
                 })
                 .collect();
             let host = deployment_hostname("inst", "apps.example.com");
-            let vars = build_vars(&generated, &config, &host);
+            let vars = build_vars(&c, &generated, &config, &host);
             let env = c
                 .resolve_env(&vars)
                 .unwrap_or_else(|e| panic!("{name}: resolve_env: {e}"));

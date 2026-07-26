@@ -307,12 +307,56 @@ impl Compose {
         Ok(c)
     }
 
+    /// Values the operator supplies itself, so they need no `config:` entry.
+    pub const BUILTIN_VARS: &'static [&'static str] = &["HOSTNAME"];
+
+    /// Declared config defaults, for seeding a substitution map so a field the
+    /// deployment never supplied renders as its default rather than blank.
+    pub fn config_defaults(&self) -> std::collections::BTreeMap<String, String> {
+        self.config
+            .iter()
+            .filter_map(|f| f.default.clone().map(|d| (f.name.clone(), d)))
+            .collect()
+    }
+
+    /// Every `${...}` must be declared in `config:`/`secrets:` or be a builtin.
+    ///
+    /// **An authoring rule, checked at admission only** — deliberately *not*
+    /// part of [`Self::validate`], because the operator parses the stored
+    /// compose on every reconcile: enforcing it there would take an already
+    /// deployed app offline over a reference it cannot fix, which is exactly the
+    /// failure this is meant to prevent. Substitution at reconcile time stays
+    /// tolerant (missing -> declared default -> empty).
+    ///
+    /// Call this wherever a compose is *authored* (admin create/update, the
+    /// `compose-validate` CLI) so a typo or a newly added reference is caught
+    /// while a human can still fix it.
+    pub fn validate_declarations(&self) -> Result<()> {
+        for name in self.referenced_vars() {
+            let declared = self.config.iter().any(|c| c.name == name)
+                || self.secrets.iter().any(|s| s.name == name)
+                || Self::BUILTIN_VARS.contains(&name.as_str());
+            if !declared {
+                bail!(
+                    "'${{{name}}}' is referenced but not declared — add it to the `config:` list \
+                     (or `secrets:`), or remove the reference. Built-ins: {}",
+                    Self::BUILTIN_VARS.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Validate structural + policy rules. Enforced at parse time so the
     /// operator never tries to render an unsafe or malformed app.
+    ///
+    /// Note this does **not** check that `${...}` references are declared — see
+    /// [`Self::validate_declarations`].
     pub fn validate(&self) -> Result<()> {
         if self.services.is_empty() {
             bail!("compose must define at least one service");
         }
+
         for (sname, svc) in &self.services {
             if svc.image.trim().is_empty() {
                 bail!("service '{sname}': image is required");
@@ -445,8 +489,10 @@ impl Compose {
     ///
     /// `vars` is the merged map of generated secret values, resolved config
     /// values, and operator-provided context (e.g. `HOSTNAME`). A reference with
-    /// no matching entry is an error, so a misconfigured app fails loudly rather
-    /// than silently shipping an empty value.
+    /// no matching entry resolves to the empty string rather than failing — see
+    /// [`substitute`] for why, and [`Compose::config_defaults`] for seeding
+    /// declared defaults so a newly added field takes its default instead of a
+    /// blank.
     pub fn resolve_env(
         &self,
         vars: &HashMap<String, String>,
@@ -475,10 +521,10 @@ impl Compose {
             for f in &svc.files {
                 let content = match (&f.content, &f.content_from) {
                     (Some(c), _) => substitute(c, vars)?,
-                    (_, Some(field)) => vars
-                        .get(field)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("file '{}': unresolved config '{field}'", f.path))?,
+                    // Same tolerance as `substitute`: a value the deployment
+                    // never supplied yields empty content rather than breaking
+                    // the reconcile.
+                    (_, Some(field)) => vars.get(field).cloned().unwrap_or_default(),
                     (None, None) => bail!("file '{}': no content source", f.path),
                 };
                 files.push(ResolvedFile {
@@ -722,20 +768,32 @@ fn extract_refs(s: &str) -> Vec<String> {
 }
 
 /// Substitute every `${NAME}` in `s` from `vars`, erroring on an unknown name.
+/// Substitute `${NAME}` references from `vars`.
+///
+/// A reference with no value substitutes the **empty string** rather than
+/// failing. This is deliberate: substitution runs in the operator's reconcile
+/// loop against a deployment's *stored* config, which can legitimately predate
+/// a catalog compose that has since gained a new field. Failing there would
+/// break a running customer workload over a value it never had the chance to
+/// supply. Authoring mistakes are caught instead by [`Compose::validate`],
+/// which rejects a reference that is not declared in `config:`/`secrets:` (or a
+/// builtin) at the point a human can still fix it.
+///
+/// Callers that want defaults rather than blanks should seed `vars` from
+/// [`Compose::config_defaults`] first.
 fn substitute(s: &str, vars: &HashMap<String, String>) -> Result<String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
+        // A malformed `${` is still an error: it is a syntax mistake in the
+        // compose, not a missing value, and validate() rejects it too.
         let end = after
             .find('}')
             .ok_or_else(|| anyhow!("unterminated '${{' in '{s}'"))?;
         let name = &after[..end];
-        let val = vars
-            .get(name)
-            .ok_or_else(|| anyhow!("unresolved reference '${{{name}}}'"))?;
-        out.push_str(val);
+        out.push_str(vars.get(name).map(String::as_str).unwrap_or(""));
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -894,13 +952,69 @@ config:
         assert_eq!(env["route96"]["MAX_UPLOAD_MB"], "100");
     }
 
+    /// A reference that is not declared in `config:`/`secrets:` (and is not a
+    /// builtin) is rejected at validation, so an authoring mistake is caught
+    /// while a human can still fix it.
     #[test]
-    fn unresolved_reference_errors() {
+    fn undeclared_reference_rejected_at_admission() {
+        let yaml = "services:\n  a:\n    image: x\n    env:\n      TOKEN: ${not_declared}\n";
+        // Structurally valid, so it still parses...
+        let c = Compose::parse(yaml).expect("parse must stay lenient for the operator");
+        // ...but authoring it is rejected.
+        let err = c
+            .validate_declarations()
+            .expect_err("undeclared reference must be rejected");
+        assert!(err.to_string().contains("not declared"), "{err}");
+
+        // Declaring it as a config field fixes it...
+        let ok = "services:\n  a:\n    image: x\n    env:\n      TOKEN: ${tok}\nconfig:\n  - { name: tok, type: string }\n";
+        assert!(Compose::parse(ok).unwrap().validate_declarations().is_ok());
+        // ...as does a secret, or a builtin.
+        let sec = "services:\n  a:\n    image: x\n    env:\n      TOKEN: ${TOK}\nsecrets:\n  - { name: TOK, generate: password }\n";
+        assert!(Compose::parse(sec).unwrap().validate_declarations().is_ok());
+        let builtin = "services:\n  a:\n    image: x\n    env:\n      URL: https://${HOSTNAME}\n";
+        assert!(
+            Compose::parse(builtin)
+                .unwrap()
+                .validate_declarations()
+                .is_ok()
+        );
+    }
+
+    /// The operator must keep rendering an already-stored app whose compose has
+    /// an undeclared reference: `parse` (used on every reconcile) must not
+    /// enforce the authoring rule, or the deployment goes offline over something
+    /// it cannot fix.
+    #[test]
+    fn parse_stays_lenient_so_reconcile_never_breaks() {
+        let yaml = "services:\n  a:\n    image: x\n    env:\n      TOKEN: ${gone}\n";
+        let c = Compose::parse(yaml).expect("must parse");
+        let env = c.resolve_env(&HashMap::new()).expect("must resolve");
+        assert_eq!(env["a"]["TOKEN"], "");
+    }
+
+    /// Substitution at reconcile time is deliberately tolerant: a declared field
+    /// the deployment never supplied must not break a running workload. It
+    /// resolves to the empty string, and the operator seeds declared defaults
+    /// first so a newly added field renders as its default.
+    #[test]
+    fn missing_value_substitutes_empty_not_error() {
         let c = Compose::parse(ROUTE96).unwrap();
-        // Missing max_upload_mb / HOSTNAME.
+        // Only DB_PASSWORD supplied: max_upload_mb and HOSTNAME are missing.
         let mut vars = HashMap::new();
         vars.insert("DB_PASSWORD".to_string(), "x".to_string());
-        assert!(c.resolve_env(&vars).is_err());
+        let env = c.resolve_env(&vars).expect("must not error");
+        assert_eq!(env["route96"]["MAX_UPLOAD_MB"], "");
+        assert_eq!(env["route96"]["PUBLIC_URL"], "https://");
+        assert_eq!(env["mariadb"]["MARIADB_PASSWORD"], "x");
+
+        // Seeding declared defaults gives the default instead of a blank.
+        let mut vars = HashMap::new();
+        for (k, v) in c.config_defaults() {
+            vars.insert(k, v);
+        }
+        let env = c.resolve_env(&vars).unwrap();
+        assert_eq!(env["route96"]["MAX_UPLOAD_MB"], "100");
     }
 
     #[test]

@@ -38,6 +38,11 @@ fn check(source: &str) -> Result<String, String> {
     compose
         .validate()
         .map_err(|e| format!("validation error: {e}"))?;
+    // This CLI is an authoring tool, so it applies the admission-only rule that
+    // every `${...}` is declared — the same check the admin API performs.
+    compose
+        .validate_declarations()
+        .map_err(|e| format!("validation error: {e}"))?;
     let f = compose
         .footprint()
         .map_err(|e| format!("footprint error: {e}"))?;
