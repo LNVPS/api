@@ -540,11 +540,12 @@ pub async fn seed_app_deployment(
     .await?;
 
     let (cluster_id,): (u64,) = sqlx::query_as(
-        // Enabled region only — see seed_app_and_cluster.
         "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled) \
-         VALUES (?, (SELECT MIN(id) FROM region WHERE enabled = 1), 'apps.e2e.example.com', 1) RETURNING id",
+         VALUES (?, ?, 'apps.e2e.example.com', 1) RETURNING id",
     )
     .bind(&slug)
+    // Own enabled region — see seed_enabled_region.
+    .bind(seed_enabled_region(pool, &format!("e2e-app-{slug}")).await?)
     .fetch_one(pool)
     .await?;
 
@@ -589,15 +590,31 @@ pub async fn seed_app_deployment(
 /// Seed an enabled catalog app (small footprint) + a cluster with capacity in an
 /// existing region. Returns `(app_id, cluster_id, region_id)`. Used to exercise
 /// the customer ordering flow.
-pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64, u64)> {
-    let suffix = hex::encode(&rand_bytes32()[..4]);
-    // Must be an *enabled* region: `GET /api/v1/apps/{id}/regions` only surfaces
-    // enabled ones, and admin region DELETE soft-deletes (`enabled = false`), so
-    // a plain MIN(id) can land on a region left disabled by an earlier test and
-    // the seeded cluster would never appear as deployable.
-    let (region_id,): (u64,) = sqlx::query_as("SELECT MIN(id) FROM region WHERE enabled = 1")
+/// Create an enabled region (under the lowest-id company) and return its id.
+///
+/// App tests seed their own region instead of reusing whatever is already in the
+/// database. Regions are created and soft-deleted (`enabled = false`) by other
+/// tests and the base dataset has no enabled region of its own, so picking one
+/// by `MIN(id)` either lands on a disabled leftover — and
+/// `GET /api/v1/apps/{id}/regions` only surfaces enabled regions, so the seeded
+/// cluster never shows as deployable — or finds nothing at all and inserts NULL.
+async fn seed_enabled_region(pool: &MySqlPool, name: &str) -> anyhow::Result<u64> {
+    let (company_id,): (u64,) = sqlx::query_as("SELECT MIN(id) FROM company")
         .fetch_one(pool)
         .await?;
+    let (region_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO region (name, enabled, company_id) VALUES (?, 1, ?) RETURNING id",
+    )
+    .bind(name)
+    .bind(company_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(region_id)
+}
+
+pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64, u64)> {
+    let suffix = hex::encode(&rand_bytes32()[..4]);
+    let region_id = seed_enabled_region(pool, &format!("e2e-apps-{suffix}")).await?;
 
     // App with a real (small) footprint and a valid single-service compose.
     let (app_id,): (u64,) = sqlx::query_as(
