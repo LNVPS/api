@@ -297,4 +297,64 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(body.contains("Insufficient permissions"));
     }
+
+    /// `app_deployment::delete` is enough to delete a deployment but not to
+    /// purge one — that stays super_admin-only. Like the VM purge, the check
+    /// runs before the lookup, so a non-existent id still yields 403.
+    #[tokio::test]
+    async fn test_app_deleter_cannot_purge_app_deployment() {
+        setup_rbac().await;
+
+        // A role that can delete deployments but is not super_admin.
+        let admin = admin_client_with_keys(super_admin_keys().clone());
+        let role_name = "e2e-app-deleter";
+        let create = serde_json::json!({
+            "name": role_name,
+            "description": "E2E: delete but not purge deployments",
+            "permissions": ["app_deployment::view", "app_deployment::delete"]
+        });
+        let resp = admin
+            .post_auth("/api/admin/v1/roles", &create)
+            .await
+            .unwrap();
+        // The role survives between runs against the same database.
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
+            "unexpected role create status: {}",
+            resp.status()
+        );
+
+        let keys = Keys::generate();
+        let pool = db::connect().await.unwrap();
+        db::ensure_user_with_role(&pool, &keys, role_name)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let client = admin_client_with_keys(keys);
+        let resp = client
+            .delete_auth_body(
+                "/api/admin/v1/app-deployments/999999999",
+                &serde_json::json!({ "purge": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("Only super admins can permanently purge")
+        );
+
+        // The same role reaches the lookup on a plain delete (404, not 403).
+        let resp = client
+            .delete_auth_body(
+                "/api/admin/v1/app-deployments/999999999",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }

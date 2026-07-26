@@ -1,7 +1,7 @@
 use crate::{
-    AccessPolicy, App, AppCluster, AppDeployment, AsnSubscription, AsnSubscriptionStatus,
-    AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
+    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentFilter, AsnSubscription,
+    AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType,
+    IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
     PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router,
     RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
     SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
@@ -37,6 +37,111 @@ impl LNVpsDbMysql {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.db
+    }
+}
+
+/// A paired `COUNT(*)` / `SELECT *` query over the same table, so a filtered
+/// listing builds its row page and its total from one set of conditions.
+///
+/// [`Self::next`] emits `WHERE` for the first condition and `AND` for every
+/// one after it, then hands back both builders so the caller pushes the same
+/// fragment (and its binds) into each.
+struct FilteredQuery<'a> {
+    count: QueryBuilder<'a, sqlx::MySql>,
+    data: QueryBuilder<'a, sqlx::MySql>,
+    has_conditions: bool,
+}
+
+impl<'a> FilteredQuery<'a> {
+    fn new(table: &str) -> Self {
+        let mut count = QueryBuilder::new("SELECT COUNT(*) FROM ");
+        count.push(table);
+        let mut data = QueryBuilder::new("SELECT * FROM ");
+        data.push(table);
+        Self {
+            count,
+            data,
+            has_conditions: false,
+        }
+    }
+
+    fn next(
+        &mut self,
+    ) -> (
+        &mut QueryBuilder<'a, sqlx::MySql>,
+        &mut QueryBuilder<'a, sqlx::MySql>,
+    ) {
+        let keyword = if self.has_conditions {
+            " AND "
+        } else {
+            " WHERE "
+        };
+        self.has_conditions = true;
+        self.count.push(keyword);
+        self.data.push(keyword);
+        (&mut self.count, &mut self.data)
+    }
+
+    /// Add an `x = ?` equality condition to both queries.
+    fn eq<T>(&mut self, column: &str, value: T)
+    where
+        T: 'a + Clone + Send + sqlx::Type<sqlx::MySql> + sqlx::Encode<'a, sqlx::MySql>,
+    {
+        let (count, data) = self.next();
+        count.push(column).push(" = ").push_bind(value.clone());
+        data.push(column).push(" = ").push_bind(value);
+    }
+
+    /// Add a case-insensitive `LIKE %term%` condition across `columns`, OR'd
+    /// together. LIKE wildcards in `term` are escaped so it matches literally.
+    /// `NULL` columns are treated as empty strings rather than dropping the row.
+    fn search(&mut self, columns: &[&str], term: &str) {
+        let escaped = term
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{}%", escaped.to_lowercase());
+
+        let (count, data) = self.next();
+        for query in [count, data] {
+            query.push("(");
+            for (i, column) in columns.iter().enumerate() {
+                if i > 0 {
+                    query.push(" OR ");
+                }
+                query
+                    .push("LOWER(COALESCE(")
+                    .push(column)
+                    .push(", '')) LIKE ")
+                    .push_bind(pattern.clone());
+            }
+            query.push(")");
+        }
+    }
+
+    /// Run the count, then the ordered page, and return `(rows, total)`.
+    async fn fetch<T>(
+        mut self,
+        pool: &sqlx::MySqlPool,
+        order_by: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<T>, u64)>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Send + Unpin,
+    {
+        let total: i64 = self.count.build_query_scalar().fetch_one(pool).await?;
+
+        self.data
+            .push(" ORDER BY ")
+            .push(order_by)
+            .push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        let rows: Vec<T> = self.data.build_query_as().fetch_all(pool).await?;
+
+        Ok((rows, total as u64))
     }
 }
 
@@ -2347,6 +2452,46 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn hard_delete_subscription(&self, id: u64) -> DbResult<()> {
+        // Guard: a VM or app deployment still pointing at one of the line items
+        // would be orphaned (and the FK would reject the delete anyway), so
+        // refuse with a message that says which resource is in the way.
+        for (table, label) in [("vm", "VM"), ("app_deployment", "app deployment")] {
+            let referencing: i64 = sqlx::query_scalar(&format!(
+                "select count(*) from {table} r \
+                 join subscription_line_item li on li.id = r.subscription_line_item_id \
+                 where li.subscription_id = ?"
+            ))
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?;
+            if referencing > 0 {
+                return Err(DbError::Source(
+                    anyhow!(
+                        "Cannot purge subscription with {referencing} attached {label}(s); delete them first"
+                    )
+                    .into_boxed_dyn_error(),
+                ));
+            }
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        // subscription_payment has no ON DELETE CASCADE so it must be cleared
+        // first; subscription_line_item does cascade from subscription.
+        sqlx::query("delete from subscription_payment where subscription_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from subscription where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String> {
         let result: (String,) = sqlx::query_as(
             "SELECT c.base_currency 
@@ -3617,6 +3762,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as(sql).fetch_all(&self.db).await?)
     }
 
+    async fn admin_list_apps_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        enabled: Option<bool>,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<App>, u64)> {
+        let mut query = FilteredQuery::new("app");
+        if let Some(enabled) = enabled {
+            query.eq("enabled", enabled);
+        }
+        if let Some(term) = search.map(str::trim).filter(|s| !s.is_empty()) {
+            query.search(&["name", "display_name", "description"], term);
+        }
+        query.fetch(&self.db, "id DESC", limit, offset).await
+    }
+
     async fn get_app(&self, id: u64) -> DbResult<App> {
         Ok(sqlx::query_as("SELECT * FROM app WHERE id = ?")
             .bind(id)
@@ -3705,6 +3867,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(sqlx::query_as(sql).fetch_all(&self.db).await?)
     }
 
+    async fn admin_list_app_clusters_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        enabled: Option<bool>,
+        region_id: Option<u64>,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<AppCluster>, u64)> {
+        let mut query = FilteredQuery::new("app_cluster");
+        if let Some(enabled) = enabled {
+            query.eq("enabled", enabled);
+        }
+        if let Some(region_id) = region_id {
+            query.eq("region_id", region_id);
+        }
+        if let Some(term) = search.map(str::trim).filter(|s| !s.is_empty()) {
+            query.search(&["name", "ingress_domain"], term);
+        }
+        query.fetch(&self.db, "id DESC", limit, offset).await
+    }
+
     async fn get_app_cluster(&self, id: u64) -> DbResult<AppCluster> {
         Ok(sqlx::query_as("SELECT * FROM app_cluster WHERE id = ?")
             .bind(id)
@@ -3774,6 +3957,52 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn admin_list_app_deployments_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        filter: &AppDeploymentFilter,
+    ) -> DbResult<(Vec<AppDeployment>, u64)> {
+        let mut query = FilteredQuery::new("app_deployment");
+        if !filter.include_deleted {
+            query.eq("deleted", false);
+        }
+        if let Some(user_id) = filter.user_id {
+            query.eq("user_id", user_id);
+        }
+        if let Some(app_id) = filter.app_id {
+            query.eq("app_id", app_id);
+        }
+        if let Some(cluster_id) = filter.cluster_id {
+            query.eq("cluster_id", cluster_id);
+        }
+        if let Some(region_id) = filter.region_id {
+            // A deployment's region comes from its cluster, so match against
+            // every cluster in the region rather than joining.
+            let (count, data) = query.next();
+            for q in [count, data] {
+                q.push("cluster_id IN (SELECT id FROM app_cluster WHERE region_id = ")
+                    .push_bind(region_id)
+                    .push(")");
+            }
+        }
+        if let Some(status) = filter.status {
+            query.eq("status", status);
+        }
+        if let Some(desired_state) = filter.desired_state {
+            query.eq("desired_state", desired_state);
+        }
+        if let Some(term) = filter
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.search(&["name", "hostname", "custom_domain"], term);
+        }
+        query.fetch(&self.db, "id DESC", limit, offset).await
     }
 
     async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment> {
@@ -3856,6 +4085,63 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(id)
             .execute(&self.db)
             .await?;
+        Ok(())
+    }
+
+    async fn hard_delete_app_deployment(&self, id: u64) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+
+        // Resolve the deployment's subscription (via its line item) before the
+        // row goes, so the billing records can be cleaned up too.
+        let subscription_id: Option<u64> = sqlx::query_scalar(
+            "select li.subscription_id from app_deployment d \
+             join subscription_line_item li on li.id = d.subscription_line_item_id \
+             where d.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // Delete the deployment first — it holds the FK to subscription_line_item.
+        sqlx::query("delete from app_deployment where id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        if let Some(subscription_id) = subscription_id {
+            // A deployment normally owns its subscription outright. If the
+            // subscription also bills something else (a VM or another
+            // deployment), leave the billing rows alone rather than destroying
+            // another resource's billing — and its FK — with it.
+            let still_billed: i64 = sqlx::query_scalar(
+                "select (select count(*) from vm v \
+                         join subscription_line_item li on li.id = v.subscription_line_item_id \
+                         where li.subscription_id = ?) \
+                      + (select count(*) from app_deployment d \
+                         join subscription_line_item li on li.id = d.subscription_line_item_id \
+                         where li.subscription_id = ?)",
+            )
+            .bind(subscription_id)
+            .bind(subscription_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            // subscription_payment has no ON DELETE CASCADE so it must be
+            // cleared first; subscription_line_item does cascade from
+            // subscription.
+            if still_billed == 0 {
+                sqlx::query("delete from subscription_payment where subscription_id = ?")
+                    .bind(subscription_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("delete from subscription where id = ?")
+                    .bind(subscription_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 }

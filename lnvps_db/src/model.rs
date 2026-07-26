@@ -3255,3 +3255,23 @@ pub struct AppDeployment {
     /// retained only for accounting.
     pub deleted: bool,
 }
+
+/// Optional filters for the admin app-deployment listing. Every field is
+/// combined with `AND`; `None` means "don't filter on this". Passed as a struct
+/// rather than positional arguments because the set is open-ended.
+#[derive(Clone, Debug, Default)]
+pub struct AppDeploymentFilter {
+    pub user_id: Option<u64>,
+    pub app_id: Option<u64>,
+    pub cluster_id: Option<u64>,
+    /// Matches deployments on any cluster in this region.
+    pub region_id: Option<u64>,
+    pub status: Option<AppDeploymentStatus>,
+    pub desired_state: Option<AppDeploymentDesiredState>,
+    /// Case-insensitive substring match against `name`, `hostname` and
+    /// `custom_domain`.
+    pub search: Option<String>,
+    /// Include soft-deleted deployments. Deletion is a soft delete, so an
+    /// admin needs this to inspect or confirm a teardown.
+    pub include_deleted: bool,
+}

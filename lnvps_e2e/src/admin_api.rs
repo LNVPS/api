@@ -742,7 +742,489 @@ mod tests {
         assert_eq!(found["user_id"].as_u64(), Some(uid));
         assert!(!found["namespace"].as_str().unwrap().is_empty());
         assert!(!found["status"].as_str().unwrap().is_empty());
+        // Standard paginated envelope.
+        assert!(body["total"].as_u64().unwrap() >= 1);
+        assert_eq!(body["limit"].as_u64(), Some(50));
+        assert_eq!(body["offset"].as_u64(), Some(0));
 
+        pool.close().await;
+    }
+
+    /// Filters and pagination on the admin deployment listing (#235).
+    #[tokio::test]
+    async fn test_admin_list_app_deployments_filters() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (app_id, cluster_id, dep_id) =
+            crate::db::seed_app_deployment(&pool, uid, "filter-target")
+                .await
+                .unwrap();
+        // A second deployment for the same user, on its own app + cluster.
+        let (other_app, other_cluster, other_dep) =
+            crate::db::seed_app_deployment(&pool, uid, "filter-other")
+                .await
+                .unwrap();
+
+        let ids = |body: &Value| -> Vec<u64> {
+            body["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .filter_map(|d| d["id"].as_u64())
+                .collect()
+        };
+
+        // user_id: both, and nothing belonging to anyone else.
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/app-deployments?user_id={uid}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(2));
+        let mut found = ids(&body);
+        found.sort_unstable();
+        let mut expected = vec![dep_id, other_dep];
+        expected.sort_unstable();
+        assert_eq!(found, expected);
+
+        // app_id / cluster_id narrow to the one deployment.
+        for query in [
+            format!("app_id={app_id}"),
+            format!("cluster_id={cluster_id}"),
+        ] {
+            let resp = client
+                .get_auth(&format!("/api/admin/v1/app-deployments?{query}"))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(ids(&body), vec![dep_id], "filter {query}");
+        }
+
+        // search matches the deployment name.
+        let resp = client
+            .get_auth("/api/admin/v1/app-deployments?search=filter-target")
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(ids(&body), vec![dep_id]);
+
+        // status: seeded deployments are pending; `running` excludes them.
+        let resp = client
+            .get_auth(&format!(
+                "/api/admin/v1/app-deployments?user_id={uid}&status=pending"
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(2));
+        let resp = client
+            .get_auth(&format!(
+                "/api/admin/v1/app-deployments?user_id={uid}&status=running"
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(0));
+
+        // limit/offset page through the filtered set; total stays the full count.
+        let resp = client
+            .get_auth(&format!(
+                "/api/admin/v1/app-deployments?user_id={uid}&limit=1&offset=1"
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(2));
+        assert_eq!(body["limit"].as_u64(), Some(1));
+        assert_eq!(body["offset"].as_u64(), Some(1));
+        assert_eq!(
+            ids(&body),
+            vec![dep_id],
+            "id DESC, so offset 1 is the older"
+        );
+
+        // include_deleted is the only way to see a torn-down deployment.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/app-deployments?user_id={uid}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(ids(&body), vec![other_dep], "deleted row is hidden");
+        let resp = client
+            .get_auth(&format!(
+                "/api/admin/v1/app-deployments?user_id={uid}&include_deleted=true"
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(2));
+        let deleted = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("deleted deployment is listed");
+        assert_eq!(deleted["deleted"].as_bool(), Some(true));
+
+        // Cleanup: purge both, then the catalog rows they pinned.
+        for id in [dep_id, other_dep] {
+            let resp = client
+                .delete_auth_body(
+                    &format!("/api/admin/v1/app-deployments/{id}"),
+                    &serde_json::json!({ "purge": true }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        for id in [cluster_id, other_cluster] {
+            let _ = client
+                .delete_auth(&format!("/api/admin/v1/app_clusters/{id}"))
+                .await;
+        }
+        for id in [app_id, other_app] {
+            let _ = client
+                .delete_auth(&format!("/api/admin/v1/apps/{id}"))
+                .await;
+        }
+
+        pool.close().await;
+    }
+
+    /// Paginated envelope + filters on the catalog app listing (#235).
+    #[tokio::test]
+    async fn test_admin_list_apps_paginated() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (app_id, cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "apps-page")
+            .await
+            .unwrap();
+        let app_name: String = sqlx::query_scalar("SELECT name FROM app WHERE id = ?")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let resp = client.get_auth("/api/admin/v1/apps?limit=1").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert!(body["total"].as_u64().unwrap() >= 1);
+        assert_eq!(body["limit"].as_u64(), Some(1));
+
+        // search finds the seeded app; enabled=false excludes it (seeded enabled).
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/apps?search={app_name}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"][0]["id"].as_u64(), Some(app_id));
+        let resp = client
+            .get_auth(&format!(
+                "/api/admin/v1/apps?search={app_name}&enabled=false"
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(0));
+
+        // Clusters list carries the same envelope and a region filter.
+        let region_id: u64 = sqlx::query_scalar("SELECT region_id FROM app_cluster WHERE id = ?")
+            .bind(cluster_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/app_clusters?region_id={region_id}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(1));
+        assert_eq!(body["data"][0]["id"].as_u64(), Some(cluster_id));
+
+        // Cleanup.
+        let _ = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({ "purge": true }),
+            )
+            .await;
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await;
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await;
+
+        pool.close().await;
+    }
+
+    /// Admin delete of an ever-paid deployment soft-deletes and stops billing;
+    /// a repeat delete conflicts; `purge` removes the row and its billing (#234).
+    #[tokio::test]
+    async fn test_admin_delete_and_purge_app_deployment() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (app_id, cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "purge-me")
+            .await
+            .unwrap();
+        // seed_app_deployment marks the subscription set up (ever paid).
+        let sub_id: u64 = sqlx::query_scalar(
+            "SELECT li.subscription_id FROM app_deployment d \
+             JOIN subscription_line_item li ON li.id = d.subscription_line_item_id \
+             WHERE d.id = ?",
+        )
+        .bind(dep_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Plain delete: soft-delete + billing deactivated, row retained.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (deleted, is_active, auto_renew): (bool, bool, bool) = sqlx::query_as(
+            "SELECT d.deleted, s.is_active, s.auto_renewal_enabled FROM app_deployment d \
+             JOIN subscription s ON s.id = ? WHERE d.id = ?",
+        )
+        .bind(sub_id)
+        .bind(dep_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(deleted, "soft-deleted");
+        assert!(!is_active, "billing deactivated");
+        assert!(!auto_renew, "auto-renewal off");
+
+        // Deleting again without purge conflicts.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Purge: an already soft-deleted deployment can still be purged, and it
+        // takes its subscription and line items with it.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({ "purge": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_deployment WHERE id = ?")
+            .bind(dep_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "row purged");
+        let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription WHERE id = ?")
+            .bind(sub_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(subs, 0, "subscription purged");
+        let items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscription_line_item WHERE subscription_id = ?",
+        )
+        .bind(sub_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(items, 0, "line items cascaded");
+
+        // A purged deployment is gone even with include_deleted.
+        let resp = client
+            .get_auth(&format!(
+                "/api/admin/v1/app-deployments?user_id={uid}&include_deleted=true"
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["total"].as_u64(), Some(0));
+
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await;
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await;
+        pool.close().await;
+    }
+
+    /// A deployment whose first payment was never confirmed is removed entirely
+    /// by a plain delete — the same never-paid rule VMs use (#234).
+    #[tokio::test]
+    async fn test_admin_delete_never_paid_app_deployment_purges() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (app_id, cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "never-paid")
+            .await
+            .unwrap();
+        let sub_id: u64 = sqlx::query_scalar(
+            "SELECT li.subscription_id FROM app_deployment d \
+             JOIN subscription_line_item li ON li.id = d.subscription_line_item_id \
+             WHERE d.id = ?",
+        )
+        .bind(dep_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Never paid: the first payment was never confirmed.
+        sqlx::query("UPDATE subscription SET is_setup = 0 WHERE id = ?")
+            .bind(sub_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_deployment WHERE id = ?")
+            .bind(dep_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "never-paid deployment is purged, not soft-deleted");
+        let subs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription WHERE id = ?")
+            .bind(sub_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(subs, 0);
+
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await;
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await;
+        pool.close().await;
+    }
+
+    /// `purge` bypasses the paid-payments guard on subscription delete (#234).
+    #[tokio::test]
+    async fn test_admin_purge_subscription_with_paid_payments() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (app_id, cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "sub-purge")
+            .await
+            .unwrap();
+        let sub_id: u64 = sqlx::query_scalar(
+            "SELECT li.subscription_id FROM app_deployment d \
+             JOIN subscription_line_item li ON li.id = d.subscription_line_item_id \
+             WHERE d.id = ?",
+        )
+        .bind(dep_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, \
+                 amount, currency, payment_method, payment_type, external_data, is_paid, rate, \
+                 tax, processing_fee) \
+             VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 HOUR), 1000, 'EUR', 0, 0, '', 1, 1.0, 0, 0)",
+        )
+        .bind(vec![9u8; 16])
+        .bind(sub_id)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The deployment still references a line item, so a purge is refused.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/subscriptions/{sub_id}"),
+                &serde_json::json!({ "purge": true }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("app deployment"));
+
+        // Soft-delete the deployment row out of the way (the purge guard looks
+        // at the FK, so the row itself must go).
+        sqlx::query("DELETE FROM app_deployment WHERE id = ?")
+            .bind(dep_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Without purge the paid payment still blocks the delete.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/subscriptions/{sub_id}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("paid payments exist"));
+
+        // With purge it goes, taking payments and line items with it.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/subscriptions/{sub_id}"),
+                &serde_json::json!({ "purge": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        for (table, column) in [
+            ("subscription", "id"),
+            ("subscription_line_item", "subscription_id"),
+            ("subscription_payment", "subscription_id"),
+        ] {
+            let rows: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"))
+                    .bind(sub_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rows, 0, "{table} purged");
+        }
+
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await;
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await;
         pool.close().await;
     }
 

@@ -4619,6 +4619,10 @@ pub struct AdminAppDeploymentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<std::collections::BTreeMap<String, String>>,
     pub created: DateTime<Utc>,
+    /// Soft-deleted: the operator has torn the workload down and the row is
+    /// retained only for accounting. Only ever `true` in listings requested
+    /// with `include_deleted=true`.
+    pub deleted: bool,
 }
 
 impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
@@ -4639,6 +4643,7 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             status_message: d.status_message,
             config: None, // filled in by the single-GET handler (decrypted)
             created: d.created,
+            deleted: d.deleted,
         }
     }
 }

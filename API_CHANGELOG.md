@@ -22,9 +22,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Admin app listings are paginated and filterable** (issue #235) — **breaking response-shape change for admin clients.** `GET /api/admin/v1/apps`, `GET /api/admin/v1/app_clusters` and `GET /api/admin/v1/app-deployments` previously returned every row as a bare `{ "data": [...] }` with no query parameters at all. They now accept `limit`/`offset` (default 50, max 100) and return the standard `ApiPaginatedData` envelope (`{ data, total, limit, offset }`) used by every other admin list endpoint, so the admin dashboard's shared paginated table can drive them and report a total. Results are ordered `id DESC`.
+
+  Filters are pushed down into SQL rather than applied in the handler. Deployments accept `user_id`, `app_id`, `cluster_id`, `region_id` (matches any cluster in the region), `status`, `desired_state`, `search` (substring on `name`/`hostname`/`custom_domain`) and `include_deleted`; apps accept `enabled` and `search` (`name`/`display_name`/`description`); clusters accept `enabled`, `region_id` and `search` (`name`/`ingress_domain`). All combine with AND.
+
+  Because deployment deletion is a soft delete, a deleted deployment was previously invisible to admins entirely — `include_deleted=true` (default `false`) is now the way to inspect a customer's torn-down deployment or confirm a teardown happened, and `AdminAppDeploymentInfo` gains a `deleted` boolean. `app` and `app_cluster` have no soft-delete, so `include_deleted` does not apply to those two — `enabled` is their only visibility filter.
+
 - **App catalog is now public** (issue #227) — `GET /api/v1/apps`, `GET /api/v1/apps/{id}` and `GET /api/v1/apps/{id}/regions` no longer require `Nip98Auth`, mirroring `GET /api/v1/vm/templates`. The catalog is a shopping/marketing surface, so anonymous visitors and SSR homepages can browse offered apps (and per-region availability) without logging in. All user-owned deployment endpoints (`/api/v1/app-deployments...`) remain authenticated.
 
 ### Added
+
+- **Admin delete & purge for app deployments and subscriptions** (issue #234) — there was previously no way for an admin to remove an app deployment at all, and no way to remove a subscription that had ever been paid, so test/demo data and orphaned billing rows accumulated permanently.
+
+  New `DELETE /api/admin/v1/app-deployments/{id}` (`app_deployment::delete`) is the admin equivalent of the customer delete: it deactivates billing and soft-deletes the deployment, and the operator tears down the namespace and its volumes on the next reconcile. Following the VM rule, a deployment whose **first payment was never confirmed** carries no billing history and is removed entirely instead. An optional `{ "purge": true }` body hard-deletes the `app_deployment` row together with its `subscription`, `subscription_line_item` and payment rows in one transaction; it requires the `super_admin` role (`403` for everyone else, checked before the lookup, exactly like the VM purge). An already soft-deleted deployment can still be purged; a plain delete of one returns `409`. Purging does not orphan Kubernetes resources — the operator garbage-collects any `app-{id}` namespace whose deployment is absent from its active set, and a purged row is absent exactly like a soft-deleted one.
+
+  `DELETE /api/admin/v1/subscriptions/{id}` gains the same optional `{ "purge": true }` body, again `super_admin`-only: it bypasses the "N paid payments exist" guard and cascades line items and payments. It is refused while a VM or app deployment still references one of the subscription's line items — those resources must be deleted first. Regular deletes keep today's guard and behaviour unchanged.
+
+  No migration is needed: the `app_deployment` permission set (including `delete`) was already seeded for `super_admin`.
 
 - **Managed app deployments — resource upgrades** — a deployment now carries a `resource_multiplier`: its size as a multiple of the catalog app's base footprint *and* price (`1` = the base app, which is what every existing deployment is). The operator multiplies every container's CPU/memory limits and every PVC's size by it, cluster capacity accounting counts the multiplied footprint, and the subscription line item is priced at `app.amount x resource_multiplier`.
 

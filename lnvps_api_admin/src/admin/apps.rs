@@ -5,11 +5,15 @@ use crate::admin::model::{
     AdminCreateAppRequest, AdminUpdateAppClusterRequest, AdminUpdateAppDeploymentRequest,
     AdminUpdateAppRequest,
 };
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiResult};
-use lnvps_db::{AdminAction, AdminResource, App, AppCluster};
+use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_db::{
+    AdminAction, AdminResource, App, AppCluster, AppDeploymentDesiredState, AppDeploymentFilter,
+    AppDeploymentStatus,
+};
+use serde::Deserialize;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -29,7 +33,9 @@ pub fn router() -> Router<RouterState> {
         )
         .route(
             "/api/admin/v1/app-deployments/{id}",
-            get(admin_get_app_deployment).patch(admin_update_app_deployment),
+            get(admin_get_app_deployment)
+                .patch(admin_update_app_deployment)
+                .delete(admin_delete_app_deployment),
         )
         .route(
             "/api/admin/v1/app_clusters",
@@ -107,13 +113,39 @@ fn compose_footprint(
         .map_err(|e| lnvps_api_common::ApiError::new(format!("invalid compose resources: {e}")))
 }
 
+/// Query parameters for the catalog app listing. `app` has no soft-delete, so
+/// there is no `include_deleted` here — `enabled` is the only visibility filter.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AppQuery {
+    #[serde(flatten)]
+    page: PageQuery,
+    /// Filter by catalog-enabled flag; omit for all.
+    enabled: Option<bool>,
+    /// Case-insensitive substring match against name, display_name, description.
+    search: Option<String>,
+}
+
 async fn admin_list_apps(
     auth: AdminAuth,
     State(this): State<RouterState>,
-) -> ApiResult<Vec<AdminAppInfo>> {
+    Query(params): Query<AppQuery>,
+) -> ApiPaginatedResult<AdminAppInfo> {
     auth.require_permission(AdminResource::App, AdminAction::View)?;
-    let apps = this.db.list_apps(false).await?;
-    ApiData::ok(apps.into_iter().map(Into::into).collect())
+
+    let limit = params.page.limit.unwrap_or(50).min(100);
+    let offset = params.page.offset.unwrap_or(0);
+
+    let (apps, total) = this
+        .db
+        .admin_list_apps_filtered(limit, offset, params.enabled, params.search.as_deref())
+        .await?;
+    ApiPaginatedData::ok(
+        apps.into_iter().map(Into::into).collect(),
+        total,
+        limit,
+        offset,
+    )
 }
 
 async fn admin_get_app(
@@ -242,15 +274,65 @@ async fn admin_delete_app(
 
 // ----- App deployments -----
 
-/// List every (non-deleted) app deployment across all users and clusters, for
-/// admin oversight and support. Excludes the encrypted per-deployment config.
+/// Query parameters for the deployment listing. All filters are optional and
+/// combine with AND.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AppDeploymentQuery {
+    #[serde(flatten)]
+    page: PageQuery,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
+    user_id: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
+    app_id: Option<u64>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
+    cluster_id: Option<u64>,
+    /// Matches deployments on any cluster in this region.
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
+    region_id: Option<u64>,
+    /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
+    status: Option<AppDeploymentStatus>,
+    /// Desired run state: `running` or `stopped`.
+    desired_state: Option<AppDeploymentDesiredState>,
+    /// Case-insensitive substring match against name, hostname, custom_domain.
+    search: Option<String>,
+    /// Include soft-deleted deployments (default `false`). Deletion is a soft
+    /// delete, so this is the only way to inspect a torn-down deployment.
+    include_deleted: bool,
+}
+
+/// List app deployments across all users and clusters, for admin oversight and
+/// support. Excludes the encrypted per-deployment config.
 async fn admin_list_app_deployments(
     auth: AdminAuth,
     State(this): State<RouterState>,
-) -> ApiResult<Vec<AdminAppDeploymentInfo>> {
+    Query(params): Query<AppDeploymentQuery>,
+) -> ApiPaginatedResult<AdminAppDeploymentInfo> {
     auth.require_permission(AdminResource::AppDeployment, AdminAction::View)?;
-    let deployments = this.db.list_all_app_deployments().await?;
-    ApiData::ok(deployments.into_iter().map(Into::into).collect())
+
+    let limit = params.page.limit.unwrap_or(50).min(100);
+    let offset = params.page.offset.unwrap_or(0);
+
+    let filter = AppDeploymentFilter {
+        user_id: params.user_id,
+        app_id: params.app_id,
+        cluster_id: params.cluster_id,
+        region_id: params.region_id,
+        status: params.status,
+        desired_state: params.desired_state,
+        search: params.search,
+        include_deleted: params.include_deleted,
+    };
+    let (deployments, total) = this
+        .db
+        .admin_list_app_deployments_filtered(limit, offset, &filter)
+        .await?;
+    ApiPaginatedData::ok(
+        deployments.into_iter().map(Into::into).collect(),
+        total,
+        limit,
+        offset,
+    )
 }
 
 /// Decrypt and parse a deployment's stored config JSON into a flat map.
@@ -337,15 +419,116 @@ async fn admin_update_app_deployment(
     ApiData::ok(info)
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AdminDeleteAppDeploymentRequest {
+    /// Permanently purge the deployment and all of its billing records
+    /// (subscription, line items and payments) from the database, even if it
+    /// has payment history. Requires the `super_admin` role. Never-paid
+    /// deployments are purged regardless of this flag.
+    purge: Option<bool>,
+}
+
+/// Delete an app deployment (`app_deployment::delete`).
+///
+/// The admin equivalent of the customer delete: billing is deactivated and the
+/// row soft-deleted, and the operator tears the namespace and its volumes down
+/// on its next reconcile. Teardown is driven by the deployment's absence from
+/// the operator's active set, so a purged row is collected exactly like a
+/// soft-deleted one — a purge does not orphan Kubernetes resources.
+async fn admin_delete_app_deployment(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    body: Option<Json<AdminDeleteAppDeploymentRequest>>,
+) -> ApiResult<bool> {
+    auth.require_permission(AdminResource::AppDeployment, AdminAction::Delete)?;
+
+    // Purging a deployment with payment history is destructive and
+    // irreversible, so it is restricted to super-admins. Authorize before
+    // looking the deployment up, matching the VM purge.
+    let purge = body.and_then(|b| b.purge).unwrap_or(false);
+    if purge && !auth.is_super_admin(&this.db).await? {
+        return Err(lnvps_api_common::ApiError::forbidden(
+            "Only super admins can permanently purge an app deployment",
+        ));
+    }
+
+    let deployment = this.db.get_app_deployment(id).await?;
+
+    // An already-deleted deployment can still be purged (that is the point of a
+    // purge). Only reject a plain delete of an already-deleted deployment.
+    if deployment.deleted && !purge {
+        return Err(lnvps_api_common::ApiError::conflict(
+            "Deployment is already deleted",
+        ));
+    }
+
+    // A deployment whose first payment was never confirmed carries no billing
+    // history, so it is removed entirely — the same rule VMs use.
+    let subscription = this
+        .db
+        .get_subscription_by_line_item_id(deployment.subscription_line_item_id)
+        .await;
+    let ever_paid = subscription.as_ref().map(|s| s.is_setup).unwrap_or(false);
+
+    if purge || !ever_paid {
+        this.db.hard_delete_app_deployment(id).await?;
+    } else {
+        // Stop billing, then soft-delete.
+        if let Ok(mut sub) = subscription {
+            sub.is_active = false;
+            sub.auto_renewal_enabled = false;
+            this.db.update_subscription(&sub).await?;
+        }
+        this.db.delete_app_deployment(id).await?;
+    }
+    ApiData::ok(true)
+}
+
 // ----- App clusters -----
+
+/// Query parameters for the cluster listing. `app_cluster` has no soft-delete,
+/// so `enabled` is the only visibility filter.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AppClusterQuery {
+    #[serde(flatten)]
+    page: PageQuery,
+    /// Filter by accepting-new-deployments flag; omit for all.
+    enabled: Option<bool>,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str_optional")]
+    region_id: Option<u64>,
+    /// Case-insensitive substring match against name and ingress_domain.
+    search: Option<String>,
+}
 
 async fn admin_list_app_clusters(
     auth: AdminAuth,
     State(this): State<RouterState>,
-) -> ApiResult<Vec<AdminAppClusterInfo>> {
+    Query(params): Query<AppClusterQuery>,
+) -> ApiPaginatedResult<AdminAppClusterInfo> {
     auth.require_permission(AdminResource::App, AdminAction::View)?;
-    let clusters = this.db.list_app_clusters(false).await?;
-    ApiData::ok(clusters.into_iter().map(Into::into).collect())
+
+    let limit = params.page.limit.unwrap_or(50).min(100);
+    let offset = params.page.offset.unwrap_or(0);
+
+    let (clusters, total) = this
+        .db
+        .admin_list_app_clusters_filtered(
+            limit,
+            offset,
+            params.enabled,
+            params.region_id,
+            params.search.as_deref(),
+        )
+        .await?;
+    ApiPaginatedData::ok(
+        clusters.into_iter().map(Into::into).collect(),
+        total,
+        limit,
+        offset,
+    )
 }
 
 async fn admin_get_app_cluster(
