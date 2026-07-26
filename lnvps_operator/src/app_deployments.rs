@@ -1765,6 +1765,12 @@ config:
             let c = Compose::parse(&yaml).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
             c.validate()
                 .unwrap_or_else(|e| panic!("{name}: validate: {e}"));
+            // The documented composes are what an admin pastes into the API, so
+            // they must satisfy the admission-only rule too: every `${...}`
+            // declared in config:/secrets: or a builtin. Otherwise we would
+            // publish examples the API now rejects.
+            c.validate_declarations()
+                .unwrap_or_else(|e| panic!("{name}: validate_declarations: {e}"));
             let fp = c
                 .footprint()
                 .unwrap_or_else(|e| panic!("{name}: footprint: {e}"));
