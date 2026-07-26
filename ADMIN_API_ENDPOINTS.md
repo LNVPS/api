@@ -781,7 +781,18 @@ DELETE /api/admin/v1/subscriptions/{id}
 
 Required Permission: `subscriptions::delete`
 
-**Note:** Cannot delete subscriptions with paid payments. Returns error if paid payments exist.
+Request body (optional):
+
+```json
+{
+  "purge": false
+  // Optional (default false). Permanently remove the subscription along with
+  // its line items and payment history, bypassing the paid-payments guard.
+  // super_admin only.
+}
+```
+
+**Note:** Without `purge`, a subscription with paid payments cannot be deleted — the request returns an error naming the paid-payment count. `purge: true` requires the `super_admin` role (`403` otherwise, checked before the lookup) and cascades line items and payments. It is refused while a VM or app deployment still references one of the subscription's line items — delete those resources first.
 
 Response:
 
@@ -3619,7 +3630,18 @@ GET /api/admin/v1/apps
 GET /api/admin/v1/apps/{id}
 ```
 
-Required Permission: `app::view`. Returns `AdminAppInfo` object(s):
+Required Permission: `app::view`. The list returns the standard paginated envelope (`{ data, total, limit, offset }`); the single `GET` returns `{ data }`. Query parameters on the list (all optional, combined with AND):
+
+| Parameter | Type | Description |
+|---|---|---|
+| `limit` | int | Page size (default `50`, max `100`) |
+| `offset` | int | Rows to skip (default `0`) |
+| `enabled` | bool | Only catalog-enabled (`true`) or disabled (`false`) apps; omit for all |
+| `search` | string | Case-insensitive substring match on `name`, `display_name`, `description` |
+
+Ordered `id DESC`. `app` has no soft-delete, so there is no `include_deleted` here — `enabled` is the only visibility filter.
+
+`AdminAppInfo` object(s):
 
 ```json
 {
@@ -3695,9 +3717,10 @@ Required Permission: `app::delete`. Rejected while the app still has deployments
 #### App Deployments
 
 ```
-GET   /api/admin/v1/app-deployments
-GET   /api/admin/v1/app-deployments/{id}
-PATCH /api/admin/v1/app-deployments/{id}
+GET    /api/admin/v1/app-deployments
+GET    /api/admin/v1/app-deployments/{id}
+PATCH  /api/admin/v1/app-deployments/{id}
+DELETE /api/admin/v1/app-deployments/{id}
 ```
 
 These use the dedicated **`app_deployment`** RBAC resource (distinct from the catalog `app` resource). `AdminAppDeploymentInfo`:
@@ -3718,13 +3741,29 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "status": "running",
   "status_message": null,
   "config": { "relay_name": "My relay" },
-  "created": "2026-07-25T10:00:00Z"
+  "created": "2026-07-25T10:00:00Z",
+  "deleted": false
 }
 ```
 
 `resource_multiplier` is the deployment's size as a multiple of the catalog app's base footprint and price (`1` = base). The customer raises it via `POST /api/v1/app-deployments/{id}/upgrade`, which is applied only once the prorated upgrade payment settles. It is read-only here — the admin `PATCH` does not accept it, because changing it without a payment would desynchronise the billed price from the provisioned size.
 
-**List** — `GET /api/admin/v1/app-deployments`. Required Permission: `app_deployment::view`. Lists every non-deleted app deployment across all users and clusters, for oversight/support. Excludes the per-deployment `config` (omitted).
+**List** — `GET /api/admin/v1/app-deployments`. Required Permission: `app_deployment::view`. Lists app deployments across all users and clusters, for oversight/support. Excludes the per-deployment `config` (omitted). Returns the standard paginated envelope (`{ data, total, limit, offset }`), ordered `id DESC`. Query parameters (all optional, combined with AND):
+
+| Parameter | Type | Description |
+|---|---|---|
+| `limit` | int | Page size (default `50`, max `100`) |
+| `offset` | int | Rows to skip (default `0`) |
+| `user_id` | int | Only this customer's deployments |
+| `app_id` | int | Only deployments of this catalog app |
+| `cluster_id` | int | Only deployments on this cluster |
+| `region_id` | int | Only deployments on any cluster in this region |
+| `status` | string | Observed status: `pending`, `running`, `stopped`, `error`, `deleting` |
+| `desired_state` | string | Desired run state: `running`, `stopped` |
+| `search` | string | Case-insensitive substring match on `name`, `hostname`, `custom_domain` |
+| `include_deleted` | bool | Include soft-deleted deployments (default `false`) |
+
+Deletion is a soft delete, so `include_deleted=true` is the only way to inspect a torn-down deployment or confirm the teardown happened. Rows returned that way carry `"deleted": true`.
 
 **Get** — `GET /api/admin/v1/app-deployments/{id}`. Required Permission: `app_deployment::view`. Returns a single deployment **including its decrypted `config`** map (which may hold secret values — admin-only). `404` if not found.
 
@@ -3740,6 +3779,24 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
 
 Returns the updated `AdminAppDeploymentInfo` (including decrypted `config`). `400` for an invalid `name`, a name already in use on the cluster, an invalid `custom_domain`, or missing-required/unknown `config` fields; `404` if not found.
 
+**Delete** — `DELETE /api/admin/v1/app-deployments/{id}`. Required Permission: `app_deployment::delete`. The admin equivalent of the customer delete: the subscription is deactivated (billing and auto-renewal off) and the deployment soft-deleted, and the operator tears down the namespace and its volumes on its next reconcile. Request body (optional):
+
+```json
+{
+  "purge": false
+  // Optional (default false). Permanently remove the deployment row along with
+  // its subscription, line items and payment history. super_admin only.
+}
+```
+
+- A deployment whose **first payment was never confirmed** carries no billing history and is removed entirely by a plain delete — the same rule VMs use. `purge` is only needed for a deployment that has been paid.
+- `purge: true` requires the `super_admin` role and is rejected `403` for everyone else. The check runs **before** the lookup, so an unknown id still returns `403`.
+- An already soft-deleted deployment can still be purged; a plain delete of one returns `409`.
+- A deployment normally owns its subscription outright. In the rare case that the subscription also bills another resource, the billing rows are kept and only the deployment row is removed.
+- Purging does not orphan Kubernetes resources: the operator garbage-collects any `app-{id}` namespace whose deployment is absent from its active set, and a purged row is absent exactly like a soft-deleted one.
+
+Returns `{ "data": true }`. `404` if not found.
+
 #### App Clusters
 
 ```
@@ -3750,7 +3807,19 @@ PATCH  /api/admin/v1/app_clusters/{id}
 DELETE /api/admin/v1/app_clusters/{id}
 ```
 
-Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete`. `AdminAppClusterInfo` / create body:
+Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete`. The list returns the standard paginated envelope (`{ data, total, limit, offset }`), ordered `id DESC`. Query parameters on the list (all optional, combined with AND):
+
+| Parameter | Type | Description |
+|---|---|---|
+| `limit` | int | Page size (default `50`, max `100`) |
+| `offset` | int | Rows to skip (default `0`) |
+| `enabled` | bool | Only clusters accepting new deployments (`true`) or not (`false`) |
+| `region_id` | int | Only clusters in this region |
+| `search` | string | Case-insensitive substring match on `name`, `ingress_domain` |
+
+`app_cluster` has no soft-delete, so there is no `include_deleted` here.
+
+`AdminAppClusterInfo` / create body:
 
 ```json
 {

@@ -720,6 +720,14 @@ pub trait LNVpsDbBase: Send + Sync {
     ) -> DbResult<(u64, Vec<u64>)>;
     async fn update_subscription(&self, subscription: &Subscription) -> DbResult<()>;
     async fn delete_subscription(&self, id: u64) -> DbResult<()>;
+    /// Permanently remove a subscription along with its line items and payment
+    /// history, in one transaction. Unlike [`Self::delete_subscription`] this
+    /// clears `subscription_payment` rows (which have no ON DELETE CASCADE), so
+    /// a subscription that has been paid can be removed.
+    ///
+    /// Refuses while a VM or app deployment still references one of the
+    /// subscription's line items — those resources must be deleted first.
+    async fn hard_delete_subscription(&self, id: u64) -> DbResult<()>;
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String>;
 
     // Subscription Line Items
@@ -990,6 +998,19 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List catalog apps. When `enabled_only` is set, only apps offered in the
     /// catalog are returned (for the customer-facing listing).
     async fn list_apps(&self, enabled_only: bool) -> DbResult<Vec<App>>;
+    /// Admin listing of catalog apps with database-level pagination. Filters are
+    /// optional and combine with AND: `enabled` filters on the catalog flag,
+    /// `search` is a case-insensitive substring match against name, display name
+    /// and description. Returns `(rows, total_count)` where the count reflects
+    /// the filtered set. `app` has no soft-delete, so there is nothing to
+    /// include or exclude beyond `enabled`.
+    async fn admin_list_apps_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        enabled: Option<bool>,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<App>, u64)>;
     async fn get_app(&self, id: u64) -> DbResult<App>;
     async fn get_app_by_name(&self, name: &str) -> DbResult<App>;
     async fn insert_app(&self, app: &App) -> DbResult<u64>;
@@ -1001,6 +1022,19 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List app clusters. When `enabled_only` is set, only clusters that accept
     /// new deployments are returned.
     async fn list_app_clusters(&self, enabled_only: bool) -> DbResult<Vec<AppCluster>>;
+    /// Admin listing of app clusters with database-level pagination. Filters are
+    /// optional and combine with AND: `enabled` filters on the accepting-new-
+    /// deployments flag, `region_id` restricts to one region, `search` is a
+    /// case-insensitive substring match against name and ingress domain. Returns
+    /// `(rows, total_count)`. `app_cluster` has no soft-delete.
+    async fn admin_list_app_clusters_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        enabled: Option<bool>,
+        region_id: Option<u64>,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<AppCluster>, u64)>;
     async fn get_app_cluster(&self, id: u64) -> DbResult<AppCluster>;
     async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64>;
     async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()>;
@@ -1012,6 +1046,15 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn list_user_app_deployments(&self, user_id: u64) -> DbResult<Vec<AppDeployment>>;
     /// List every non-deleted app deployment (used by the operator to reconcile).
     async fn list_all_app_deployments(&self) -> DbResult<Vec<AppDeployment>>;
+    /// Admin listing of app deployments with database-level pagination and
+    /// filtering (see [`AppDeploymentFilter`]). Returns `(rows, total_count)`
+    /// where the count reflects the filtered set.
+    async fn admin_list_app_deployments_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        filter: &AppDeploymentFilter,
+    ) -> DbResult<(Vec<AppDeployment>, u64)>;
     async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment>;
     /// Resolve the deployment billed by a given subscription line item.
     async fn get_app_deployment_by_line_item(&self, line_item_id: u64) -> DbResult<AppDeployment>;
@@ -1028,6 +1071,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down
     /// the Kubernetes resources on its next reconcile.
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()>;
+    /// Permanently remove a deployment and its billing records (subscription,
+    /// line items and payment history) in one transaction. The billing rows are
+    /// kept if the subscription still bills another resource.
+    ///
+    /// Kubernetes teardown is unaffected: the operator garbage-collects any
+    /// `app-{id}` namespace whose deployment is no longer in its active set, and
+    /// a purged row is absent from that set exactly like a soft-deleted one.
+    async fn hard_delete_app_deployment(&self, id: u64) -> DbResult<()>;
 }
 
 /// Super trait that combines all database functionality based on enabled features

@@ -3,11 +3,11 @@ use anyhow::{Context, anyhow};
 use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
-    DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType, IpRange,
-    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
+    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
+    AppDeploymentStatus, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company,
+    CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
+    IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
+    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
     ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
     RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
@@ -23,6 +23,19 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Take one page out of an already-filtered and sorted set, returning
+/// `(page, total)` the way the paginated DB queries do. In-memory skip/take is
+/// fine here — the real implementations push `LIMIT`/`OFFSET` into SQL.
+fn paginate<T>(all: Vec<T>, limit: u64, offset: u64) -> (Vec<T>, u64) {
+    let total = all.len() as u64;
+    let page = all
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    (page, total)
+}
 
 #[derive(Debug, Clone)]
 pub struct MockDb {
@@ -2155,6 +2168,54 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn hard_delete_subscription(&self, id: u64) -> DbResult<()> {
+        let line_item_ids: Vec<u64> = self
+            .subscription_line_items
+            .lock()
+            .await
+            .values()
+            .filter(|li| li.subscription_id == id)
+            .map(|li| li.id)
+            .collect();
+
+        // Guard: refuse while a VM or app deployment still references a line item.
+        let attached_vms = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter(|v| line_item_ids.contains(&v.subscription_line_item_id))
+            .count();
+        if attached_vms > 0 {
+            return Err(DbError::Other(anyhow!(
+                "Cannot purge subscription with {attached_vms} attached VM(s); delete them first"
+            )));
+        }
+        let attached_deployments = self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .filter(|d| line_item_ids.contains(&d.subscription_line_item_id))
+            .count();
+        if attached_deployments > 0 {
+            return Err(DbError::Other(anyhow!(
+                "Cannot purge subscription with {attached_deployments} attached app deployment(s); delete them first"
+            )));
+        }
+
+        self.subscription_payments
+            .lock()
+            .await
+            .retain(|p| p.subscription_id != id);
+        self.subscription_line_items
+            .lock()
+            .await
+            .retain(|_, li| li.subscription_id != id);
+        self.subscriptions.lock().await.remove(&id);
+        Ok(())
+    }
+
     async fn get_subscription_base_currency(&self, subscription_id: u64) -> DbResult<String> {
         // Get currency from the subscription itself
         let subscriptions = self.subscriptions.lock().await;
@@ -3139,6 +3200,36 @@ impl LNVpsDbBase for MockDb {
         Ok(out)
     }
 
+    async fn admin_list_apps_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        enabled: Option<bool>,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<App>, u64)> {
+        let search = search
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let apps = self.apps.lock().await;
+        let mut all: Vec<App> = apps
+            .values()
+            .filter(|a| enabled.is_none_or(|e| a.enabled == e))
+            .filter(|a| {
+                search.as_ref().is_none_or(|q| {
+                    a.name.to_lowercase().contains(q)
+                        || a.display_name.to_lowercase().contains(q)
+                        || a.description
+                            .as_ref()
+                            .is_some_and(|d| d.to_lowercase().contains(q))
+                })
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(paginate(all, limit, offset))
+    }
+
     async fn get_app(&self, id: u64) -> DbResult<App> {
         self.apps
             .lock()
@@ -3200,6 +3291,34 @@ impl LNVpsDbBase for MockDb {
         Ok(out)
     }
 
+    async fn admin_list_app_clusters_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        enabled: Option<bool>,
+        region_id: Option<u64>,
+        search: Option<&str>,
+    ) -> DbResult<(Vec<AppCluster>, u64)> {
+        let search = search
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let clusters = self.app_clusters.lock().await;
+        let mut all: Vec<AppCluster> = clusters
+            .values()
+            .filter(|c| enabled.is_none_or(|e| c.enabled == e))
+            .filter(|c| region_id.is_none_or(|r| c.region_id == r))
+            .filter(|c| {
+                search.as_ref().is_none_or(|q| {
+                    c.name.to_lowercase().contains(q) || c.ingress_domain.to_lowercase().contains(q)
+                })
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(paginate(all, limit, offset))
+    }
+
     async fn get_app_cluster(&self, id: u64) -> DbResult<AppCluster> {
         self.app_clusters
             .lock()
@@ -3253,6 +3372,64 @@ impl LNVpsDbBase for MockDb {
         let mut out: Vec<AppDeployment> = d.values().filter(|x| !x.deleted).cloned().collect();
         out.sort_by_key(|x| x.id);
         Ok(out)
+    }
+
+    async fn admin_list_app_deployments_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        filter: &AppDeploymentFilter,
+    ) -> DbResult<(Vec<AppDeployment>, u64)> {
+        // Resolve the region filter to cluster ids first, so the clusters lock
+        // is released before the deployments lock is taken.
+        let region_clusters: Option<Vec<u64>> = match filter.region_id {
+            Some(region_id) => Some(
+                self.app_clusters
+                    .lock()
+                    .await
+                    .values()
+                    .filter(|c| c.region_id == region_id)
+                    .map(|c| c.id)
+                    .collect(),
+            ),
+            None => None,
+        };
+        let search = filter
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+
+        let deployments = self.app_deployments.lock().await;
+        let mut all: Vec<AppDeployment> = deployments
+            .values()
+            .filter(|d| filter.include_deleted || !d.deleted)
+            .filter(|d| filter.user_id.is_none_or(|u| d.user_id == u))
+            .filter(|d| filter.app_id.is_none_or(|a| d.app_id == a))
+            .filter(|d| filter.cluster_id.is_none_or(|c| d.cluster_id == c))
+            .filter(|d| {
+                region_clusters
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&d.cluster_id))
+            })
+            .filter(|d| filter.status.is_none_or(|s| d.status == s))
+            .filter(|d| filter.desired_state.is_none_or(|s| d.desired_state == s))
+            .filter(|d| {
+                search.as_ref().is_none_or(|q| {
+                    d.name.to_lowercase().contains(q)
+                        || d.hostname
+                            .as_ref()
+                            .is_some_and(|h| h.to_lowercase().contains(q))
+                        || d.custom_domain
+                            .as_ref()
+                            .is_some_and(|c| c.to_lowercase().contains(q))
+                })
+            })
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(paginate(all, limit, offset))
     }
 
     async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment> {
@@ -3313,6 +3490,57 @@ impl LNVpsDbBase for MockDb {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
             x.deleted = true;
+        }
+        Ok(())
+    }
+
+    async fn hard_delete_app_deployment(&self, id: u64) -> DbResult<()> {
+        let Some(deployment) = self.app_deployments.lock().await.remove(&id) else {
+            return Ok(());
+        };
+
+        // Remove the billing records the deployment was attached to.
+        let subscription_id = self
+            .subscription_line_items
+            .lock()
+            .await
+            .get(&deployment.subscription_line_item_id)
+            .map(|li| li.subscription_id);
+        if let Some(subscription_id) = subscription_id {
+            // Keep the billing rows if the subscription still bills something
+            // else (a VM or another deployment).
+            let line_item_ids: Vec<u64> = self
+                .subscription_line_items
+                .lock()
+                .await
+                .values()
+                .filter(|li| li.subscription_id == subscription_id)
+                .map(|li| li.id)
+                .collect();
+            let still_billed = self
+                .vms
+                .lock()
+                .await
+                .values()
+                .any(|v| line_item_ids.contains(&v.subscription_line_item_id))
+                || self
+                    .app_deployments
+                    .lock()
+                    .await
+                    .values()
+                    .any(|d| line_item_ids.contains(&d.subscription_line_item_id));
+
+            if !still_billed {
+                self.subscription_payments
+                    .lock()
+                    .await
+                    .retain(|p| p.subscription_id != subscription_id);
+                self.subscription_line_items
+                    .lock()
+                    .await
+                    .retain(|_, li| li.subscription_id != subscription_id);
+                self.subscriptions.lock().await.remove(&subscription_id);
+            }
         }
         Ok(())
     }
@@ -5999,6 +6227,505 @@ mod tests {
         assert_eq!(db.list_user_app_deployments(1).await.unwrap().len(), 1);
         assert_eq!(db.list_all_app_deployments().await.unwrap().len(), 2);
         assert!(db.get_app_deployment(d1).await.unwrap().deleted);
+    }
+
+    fn mk_cluster(name: &str, region_id: u64) -> AppCluster {
+        AppCluster {
+            id: 0,
+            name: name.to_string(),
+            region_id,
+            ingress_domain: format!("{name}.apps.example.com"),
+            enabled: true,
+            capacity_cpu_milli: 100_000,
+            capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
+            capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+            created: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_list_apps_filtered() {
+        let db = MockDb::default();
+        let relay = db.insert_app(&mk_app("nostr-relay")).await.unwrap();
+        let mut blossom = mk_app("blossom");
+        blossom.enabled = false;
+        blossom.description = Some("media server".to_string());
+        let blossom = db.insert_app(&blossom).await.unwrap();
+        let mailer = db.insert_app(&mk_app("mailer")).await.unwrap();
+
+        // No filters: everything, newest first, with the unfiltered total.
+        let (page, total) = db
+            .admin_list_apps_filtered(50, 0, None, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            page.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![mailer, blossom, relay]
+        );
+
+        // enabled filter.
+        let (page, total) = db
+            .admin_list_apps_filtered(50, 0, Some(false), None)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 1));
+        assert_eq!(page[0].id, blossom);
+
+        // search matches name, display_name and description, case-insensitively.
+        let (page, _) = db
+            .admin_list_apps_filtered(50, 0, None, Some("RELAY"))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1, "matched by name");
+        let (page, _) = db
+            .admin_list_apps_filtered(50, 0, None, Some("media"))
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, blossom, "matched by description");
+        let (page, _) = db
+            .admin_list_apps_filtered(50, 0, None, Some("nothing-matches"))
+            .await
+            .unwrap();
+        assert!(page.is_empty());
+
+        // A blank search is ignored rather than matching nothing.
+        let (_, total) = db
+            .admin_list_apps_filtered(50, 0, None, Some("   "))
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+
+        // Pagination: total stays the filtered total, not the page size.
+        let (page, total) = db.admin_list_apps_filtered(2, 2, None, None).await.unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+        assert_eq!(page[0].id, relay);
+    }
+
+    #[tokio::test]
+    async fn test_admin_list_app_clusters_filtered() {
+        let db = MockDb::default();
+        let eu = db.insert_app_cluster(&mk_cluster("eu-1", 1)).await.unwrap();
+        let us = db.insert_app_cluster(&mk_cluster("us-1", 2)).await.unwrap();
+        let mut disabled = mk_cluster("eu-2", 1);
+        disabled.enabled = false;
+        let eu2 = db.insert_app_cluster(&disabled).await.unwrap();
+
+        let (page, total) = db
+            .admin_list_app_clusters_filtered(50, 0, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page[0].id, eu2, "newest first");
+
+        // enabled + region filters combine with AND.
+        let (page, total) = db
+            .admin_list_app_clusters_filtered(50, 0, Some(true), Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 1));
+        assert_eq!(page[0].id, eu);
+
+        let (page, _) = db
+            .admin_list_app_clusters_filtered(50, 0, None, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, us);
+
+        // search matches name and ingress domain.
+        let (page, _) = db
+            .admin_list_app_clusters_filtered(50, 0, None, None, Some("US-1"))
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, us);
+        let (page, _) = db
+            .admin_list_app_clusters_filtered(50, 0, None, None, Some("apps.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 3, "every cluster shares the ingress suffix");
+
+        // Pagination.
+        let (page, total) = db
+            .admin_list_app_clusters_filtered(1, 0, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+    }
+
+    #[tokio::test]
+    async fn test_admin_list_app_deployments_filtered() {
+        let db = MockDb::default();
+        let relay = db.insert_app(&mk_app("relay")).await.unwrap();
+        let blossom = db.insert_app(&mk_app("blossom")).await.unwrap();
+        let eu = db.insert_app_cluster(&mk_cluster("eu-1", 1)).await.unwrap();
+        let us = db.insert_app_cluster(&mk_cluster("us-1", 2)).await.unwrap();
+
+        let mk_dep = |user: u64, app_id: u64, cluster_id: u64, name: &str| AppDeployment {
+            id: 0,
+            user_id: user,
+            app_id,
+            cluster_id,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("app-{name}"),
+            hostname: Some(format!("{name}.apps.example.com")),
+            custom_domain: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+
+        let d1 = db
+            .insert_app_deployment(&mk_dep(1, relay, eu, "alpha"))
+            .await
+            .unwrap();
+        let d2 = db
+            .insert_app_deployment(&mk_dep(2, blossom, us, "beta"))
+            .await
+            .unwrap();
+        let mut third = mk_dep(1, relay, us, "gamma");
+        third.status = AppDeploymentStatus::Error;
+        third.desired_state = AppDeploymentDesiredState::Stopped;
+        third.custom_domain = Some("blog.example.org".to_string());
+        let d3 = db.insert_app_deployment(&third).await.unwrap();
+
+        let all = AppDeploymentFilter::default;
+
+        // Default: all live deployments, newest first.
+        let (page, total) = db
+            .admin_list_app_deployments_filtered(50, 0, &all())
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            page.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![d3, d2, d1]
+        );
+
+        // Each filter on its own.
+        let by_user = AppDeploymentFilter {
+            user_id: Some(1),
+            ..all()
+        };
+        let (page, total) = db
+            .admin_list_app_deployments_filtered(50, 0, &by_user)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (2, 2));
+
+        let by_app = AppDeploymentFilter {
+            app_id: Some(blossom),
+            ..all()
+        };
+        let (page, _) = db
+            .admin_list_app_deployments_filtered(50, 0, &by_app)
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, d2);
+
+        let by_cluster = AppDeploymentFilter {
+            cluster_id: Some(eu),
+            ..all()
+        };
+        let (page, _) = db
+            .admin_list_app_deployments_filtered(50, 0, &by_cluster)
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, d1);
+
+        // region resolves through the cluster.
+        let by_region = AppDeploymentFilter {
+            region_id: Some(2),
+            ..all()
+        };
+        let (page, total) = db
+            .admin_list_app_deployments_filtered(50, 0, &by_region)
+            .await
+            .unwrap();
+        assert_eq!(total, 2, "both us-1 deployments");
+        assert!(page.iter().all(|d| d.cluster_id == us));
+
+        let by_status = AppDeploymentFilter {
+            status: Some(AppDeploymentStatus::Error),
+            ..all()
+        };
+        let (page, _) = db
+            .admin_list_app_deployments_filtered(50, 0, &by_status)
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, d3);
+
+        let by_desired = AppDeploymentFilter {
+            desired_state: Some(AppDeploymentDesiredState::Stopped),
+            ..all()
+        };
+        let (page, _) = db
+            .admin_list_app_deployments_filtered(50, 0, &by_desired)
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, d3);
+
+        // search covers name, hostname and custom_domain.
+        for term in ["ALPHA", "alpha.apps.example.com"] {
+            let f = AppDeploymentFilter {
+                search: Some(term.to_string()),
+                ..all()
+            };
+            let (page, _) = db
+                .admin_list_app_deployments_filtered(50, 0, &f)
+                .await
+                .unwrap();
+            assert_eq!(page[0].id, d1, "search term {term}");
+        }
+        let f = AppDeploymentFilter {
+            search: Some("blog.example.org".to_string()),
+            ..all()
+        };
+        let (page, _) = db
+            .admin_list_app_deployments_filtered(50, 0, &f)
+            .await
+            .unwrap();
+        assert_eq!(page[0].id, d3, "matched by custom_domain");
+
+        // Filters combine with AND.
+        let combined = AppDeploymentFilter {
+            user_id: Some(1),
+            cluster_id: Some(us),
+            ..all()
+        };
+        let (page, total) = db
+            .admin_list_app_deployments_filtered(50, 0, &combined)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 1));
+        assert_eq!(page[0].id, d3);
+
+        // Soft-deleted rows are hidden by default and only surface with
+        // include_deleted — the whole point of the flag.
+        db.delete_app_deployment(d1).await.unwrap();
+        let (_, total) = db
+            .admin_list_app_deployments_filtered(50, 0, &all())
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        let with_deleted = AppDeploymentFilter {
+            include_deleted: true,
+            ..all()
+        };
+        let (page, total) = db
+            .admin_list_app_deployments_filtered(50, 0, &with_deleted)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert!(page.iter().any(|d| d.id == d1 && d.deleted));
+
+        // Pagination.
+        let (page, total) = db
+            .admin_list_app_deployments_filtered(1, 1, &with_deleted)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+        assert_eq!(page[0].id, d2);
+    }
+
+    /// Seed `subscription` + `subscription_line_item` + one paid payment for an
+    /// app deployment, returning `(subscription_id, line_item_id)`.
+    async fn seed_app_subscription(db: &MockDb, user_id: u64) -> (u64, u64) {
+        let sub_id = db
+            .insert_subscription(&Subscription {
+                id: 0,
+                user_id,
+                company_id: 1,
+                name: "app sub".to_string(),
+                description: None,
+                created: Utc::now(),
+                expires: None,
+                is_active: true,
+                is_setup: true,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: IntervalType::Month,
+                setup_fee: 0,
+                auto_renewal_enabled: true,
+                external_id: None,
+            })
+            .await
+            .unwrap();
+        let li_id = db
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: sub_id,
+                subscription_type: lnvps_db::SubscriptionType::App,
+                name: "app".to_string(),
+                description: None,
+                amount: 1000,
+                setup_amount: 0,
+                configuration: None,
+            })
+            .await
+            .unwrap();
+        let mut payment = make_payment(sub_id, None);
+        payment.user_id = user_id;
+        payment.is_paid = true;
+        db.insert_subscription_payment(&payment).await.unwrap();
+        (sub_id, li_id)
+    }
+
+    #[tokio::test]
+    async fn test_hard_delete_app_deployment() {
+        let db = MockDb::default();
+        // subscription_payment inserts validate the owning user exists.
+        let uid = db.upsert_user(&[7u8; 32]).await.unwrap();
+        let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
+        let cluster_id = db.insert_app_cluster(&mk_cluster("eu-1", 1)).await.unwrap();
+        let (sub_id, li_id) = seed_app_subscription(&db, uid).await;
+
+        let dep_id = db
+            .insert_app_deployment(&AppDeployment {
+                id: 0,
+                user_id: uid,
+                app_id,
+                cluster_id,
+                resource_multiplier: 1,
+                subscription_line_item_id: li_id,
+                name: "alpha".to_string(),
+                namespace: "app-alpha".to_string(),
+                hostname: None,
+                custom_domain: None,
+                config: None,
+                desired_state: AppDeploymentDesiredState::Running,
+                status: AppDeploymentStatus::Running,
+                status_message: None,
+                created: Utc::now(),
+                deleted: false,
+            })
+            .await
+            .unwrap();
+
+        db.hard_delete_app_deployment(dep_id).await.unwrap();
+
+        // The row is gone, not soft-deleted, and takes its billing with it.
+        assert!(db.get_app_deployment(dep_id).await.is_err());
+        assert!(db.get_subscription(sub_id).await.is_err());
+        assert!(db.get_subscription_line_item(li_id).await.is_err());
+        assert!(
+            db.list_subscription_payments(sub_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Purging an unknown id is a no-op rather than an error, so a repeated
+        // purge does not 500.
+        db.hard_delete_app_deployment(dep_id).await.unwrap();
+
+        // A subscription that still bills something else keeps its billing
+        // rows. The default MockDb has subscription 1 with Vps line item 1,
+        // which mock_vm points at; hang a deployment off the same line item.
+        db.insert_vm(&Vm {
+            ssh_key_id: None,
+            ..MockDb::mock_vm()
+        })
+        .await
+        .unwrap();
+        let shared_sub = db.get_subscription_by_line_item_id(1).await.unwrap().id;
+        let shared_dep = db
+            .insert_app_deployment(&AppDeployment {
+                id: 0,
+                user_id: uid,
+                app_id,
+                cluster_id,
+                resource_multiplier: 1,
+                subscription_line_item_id: 1,
+                name: "shared".to_string(),
+                namespace: "app-shared".to_string(),
+                hostname: None,
+                custom_domain: None,
+                config: None,
+                desired_state: AppDeploymentDesiredState::Running,
+                status: AppDeploymentStatus::Running,
+                status_message: None,
+                created: Utc::now(),
+                deleted: false,
+            })
+            .await
+            .unwrap();
+
+        db.hard_delete_app_deployment(shared_dep).await.unwrap();
+        assert!(db.get_app_deployment(shared_dep).await.is_err());
+        assert!(
+            db.get_subscription(shared_sub).await.is_ok(),
+            "the VM's billing survives the deployment purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_delete_subscription() {
+        let db = MockDb::default();
+        let uid = db.upsert_user(&[7u8; 32]).await.unwrap();
+
+        // Refuses while a VM still references a line item. The default MockDb
+        // has subscription 1 with Vps line item 1, which mock_vm points at.
+        db.insert_vm(&Vm {
+            ssh_key_id: None,
+            ..MockDb::mock_vm()
+        })
+        .await
+        .unwrap();
+        let vm_sub_id = db.get_subscription_by_line_item_id(1).await.unwrap().id;
+        let err = db.hard_delete_subscription(vm_sub_id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("VM"),
+            "error names the blocking resource: {err}"
+        );
+
+        // Same for an app deployment.
+        let (sub_id, li_id) = seed_app_subscription(&db, uid).await;
+        let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
+        let cluster_id = db.insert_app_cluster(&mk_cluster("eu-1", 1)).await.unwrap();
+        let dep_id = db
+            .insert_app_deployment(&AppDeployment {
+                id: 0,
+                user_id: uid,
+                app_id,
+                cluster_id,
+                resource_multiplier: 1,
+                subscription_line_item_id: li_id,
+                name: "alpha".to_string(),
+                namespace: "app-alpha".to_string(),
+                hostname: None,
+                custom_domain: None,
+                config: None,
+                desired_state: AppDeploymentDesiredState::Running,
+                status: AppDeploymentStatus::Running,
+                status_message: None,
+                created: Utc::now(),
+                deleted: false,
+            })
+            .await
+            .unwrap();
+        let err = db.hard_delete_subscription(sub_id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("app deployment"),
+            "error names the blocking resource: {err}"
+        );
+
+        // With nothing attached the purge succeeds, cascading the line items and
+        // paid payments that `delete_subscription` would have left behind.
+        db.app_deployments.lock().await.remove(&dep_id);
+        db.hard_delete_subscription(sub_id).await.unwrap();
+        assert!(db.get_subscription(sub_id).await.is_err());
+        assert!(db.get_subscription_line_item(li_id).await.is_err());
+        assert!(
+            db.list_subscription_payments(sub_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

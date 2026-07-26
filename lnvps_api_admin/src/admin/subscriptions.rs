@@ -275,16 +275,47 @@ async fn admin_update_subscription(
     ApiData::ok(info)
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AdminDeleteSubscriptionRequest {
+    /// Permanently purge the subscription along with its line items and payment
+    /// history, bypassing the paid-payments guard. Requires the `super_admin`
+    /// role. Without it a subscription that was ever paid can never be removed
+    /// (regtest/e2e and demo data included).
+    purge: Option<bool>,
+}
+
 /// Delete subscription
 async fn admin_delete_subscription(
     auth: AdminAuth,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
+    body: Option<Json<AdminDeleteSubscriptionRequest>>,
 ) -> ApiResult<serde_json::Value> {
     auth.require_permission(AdminResource::Subscriptions, AdminAction::Delete)?;
 
+    // Purging payment history is destructive and irreversible, so it is
+    // restricted to super-admins. Authorize before the lookup, matching the VM
+    // and app-deployment purges.
+    let purge = body.and_then(|b| b.purge).unwrap_or(false);
+    if purge && !auth.is_super_admin(&this.db).await? {
+        return Err(ApiError::forbidden(
+            "Only super admins can permanently purge a subscription",
+        ));
+    }
+
     // Check if subscription exists
     let _subscription = this.db.get_subscription(id).await?;
+
+    if purge {
+        // Cascades line items and payments; refuses while a VM or app
+        // deployment still references one of the line items.
+        this.db.hard_delete_subscription(id).await?;
+        return ApiData::ok(serde_json::json!({
+            "success": true,
+            "message": "Subscription purged successfully"
+        }));
+    }
 
     // Check if subscription has payments
     let payments = this.db.list_subscription_payments(id).await?;
@@ -292,7 +323,7 @@ async fn admin_delete_subscription(
 
     if paid_payment_count > 0 {
         return Err(anyhow::anyhow!(
-            "Cannot delete subscription: {} paid payments exist. Consider deactivating instead.",
+            "Cannot delete subscription: {} paid payments exist. Consider deactivating instead, or purge as a super admin.",
             paid_payment_count
         )
         .into());
