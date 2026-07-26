@@ -933,15 +933,14 @@ impl SubscriptionHandler {
         metadata: Option<serde_json::Value>,
         mode: RenewMode,
     ) -> Result<SubscriptionPayment> {
-        match price {
-            CostResult::Existing(p) => Ok(p),
+        let (subscription_id, user_id, desc) = match &price {
+            CostResult::Existing(_) => (0, 0, String::new()),
             CostResult::New(p) => {
                 let vm = self.db.get_vm(vm_id).await?;
                 let line_item = self
                     .db
                     .get_subscription_line_item(vm.subscription_line_item_id)
                     .await?;
-                let subscription_id = line_item.subscription_id;
                 let desc = match payment_type {
                     SubscriptionPaymentType::Renewal => {
                         format!("VM renewal {vm_id} to {}", p.new_expiry)
@@ -949,6 +948,43 @@ impl SubscriptionHandler {
                     SubscriptionPaymentType::Upgrade => format!("VM upgrade {vm_id}"),
                     SubscriptionPaymentType::Purchase => format!("VM purchase {vm_id}"),
                 };
+                (line_item.subscription_id, vm.user_id, desc)
+            }
+        };
+        self.price_to_payment_for_subscription(
+            subscription_id,
+            user_id,
+            desc,
+            method,
+            price,
+            payment_type,
+            metadata,
+            mode,
+        )
+        .await
+    }
+
+    /// Turn a priced [`CostResult`] into a [`SubscriptionPayment`] against an
+    /// arbitrary subscription.
+    ///
+    /// The product-agnostic core of [`Self::price_to_payment_with_type`]: it
+    /// needs only the subscription, the paying user and a description, so it
+    /// serves VMs, managed apps and anything else billed as a subscription.
+    #[allow(clippy::too_many_arguments)]
+    async fn price_to_payment_for_subscription(
+        &self,
+        subscription_id: u64,
+        user_id: u64,
+        desc: String,
+        method: PaymentMethod,
+        price: CostResult,
+        payment_type: SubscriptionPaymentType,
+        metadata: Option<serde_json::Value>,
+        mode: RenewMode,
+    ) -> Result<SubscriptionPayment> {
+        match price {
+            CostResult::Existing(p) => Ok(p),
+            CostResult::New(p) => {
                 // Record the tax values on the payment. Single line item, so the
                 // breakdown has exactly one entry.
                 let tax_lines = vec![p.tax_details.to_line(p.amount)];
@@ -964,7 +1000,7 @@ impl SubscriptionHandler {
                         const INVOICE_EXPIRE: u64 = 600;
                         let total_amount = round_msat_to_sat(p.amount + p.tax);
                         info!(
-                            "Creating invoice for vm {vm_id} for {} sats",
+                            "Creating invoice for subscription {subscription_id} for {} sats",
                             total_amount / 1000
                         );
                         let invoice = self
@@ -978,7 +1014,7 @@ impl SubscriptionHandler {
                         SubscriptionPayment {
                             id: hex::decode(invoice.payment_hash())?,
                             subscription_id,
-                            user_id: vm.user_id,
+                            user_id: user_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
                             amount: p.amount,
@@ -1012,7 +1048,7 @@ impl SubscriptionHandler {
                             "Cannot create revolut orders for BTC currency"
                         );
                         let subscription = self.db.get_subscription(subscription_id).await?;
-                        let user = self.db.get_user(vm.user_id).await?;
+                        let user = self.db.get_user(user_id).await?;
                         let order_amount = CurrencyAmount::from_u64(
                             p.currency,
                             p.amount + p.tax + p.processing_fee,
@@ -1059,7 +1095,7 @@ impl SubscriptionHandler {
                         SubscriptionPayment {
                             id: new_id.to_vec(),
                             subscription_id,
-                            user_id: vm.user_id,
+                            user_id: user_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(3600)),
                             amount: p.amount,
@@ -1090,7 +1126,7 @@ impl SubscriptionHandler {
                         const ONCHAIN_EXPIRE: u64 = 3600;
                         let total_amount = round_msat_to_sat(p.amount + p.tax);
                         info!(
-                            "Creating on-chain address for vm {vm_id} for {} sats",
+                            "Creating on-chain address for subscription {subscription_id} for {} sats",
                             total_amount / 1000
                         );
                         let new_id: [u8; 32] = rand::random();
@@ -1100,7 +1136,7 @@ impl SubscriptionHandler {
                         SubscriptionPayment {
                             id: new_id.to_vec(),
                             subscription_id,
-                            user_id: vm.user_id,
+                            user_id: user_id,
                             created: Utc::now(),
                             expires: Utc::now().add(Duration::from_secs(ONCHAIN_EXPIRE)),
                             amount: p.amount,
@@ -1345,6 +1381,68 @@ impl SubscriptionHandler {
         )
         .await
     }
+
+    /// Create a payment for resizing a managed app deployment to
+    /// `new_multiplier` times the catalog app's base size.
+    ///
+    /// The prorated cost is quoted by
+    /// [`PricingEngine::calculate_app_upgrade_cost`]. The requested multiplier
+    /// is recorded in the payment metadata as [`AppUpgradeConfig`]; the resize
+    /// is applied by [`AppLineItemHandler::on_payment`] once the payment
+    /// settles, so an unpaid upgrade never changes the deployment.
+    pub async fn create_app_upgrade_payment(
+        &self,
+        deployment_id: u64,
+        new_multiplier: u32,
+        method: PaymentMethod,
+        mode: RenewMode,
+    ) -> Result<SubscriptionPayment> {
+        let quote = self
+            .pe
+            .calculate_app_upgrade_cost(deployment_id, new_multiplier, method)
+            .await?;
+
+        let dep = self.db.get_app_deployment(deployment_id).await?;
+        let line_item = self
+            .db
+            .get_subscription_line_item(dep.subscription_line_item_id)
+            .await?;
+
+        let payment = NewPaymentInfo {
+            amount: quote.upgrade.amount.value(),
+            currency: quote.upgrade.amount.currency(),
+            rate: quote.upgrade.rate,
+            time_value: 0, // upgrades buy capacity, not time
+            new_expiry: Default::default(),
+            tax: quote.tax.amount,
+            tax_details: quote.tax,
+            processing_fee: quote.processing_fee,
+        };
+        let metadata = serde_json::to_value(AppUpgradeConfig { new_multiplier })?;
+
+        self.price_to_payment_for_subscription(
+            line_item.subscription_id,
+            dep.user_id,
+            format!("App upgrade {deployment_id} to {new_multiplier}x"),
+            method,
+            CostResult::New(payment),
+            SubscriptionPaymentType::Upgrade,
+            Some(metadata),
+            mode,
+        )
+        .await
+    }
+}
+
+/// Upgrade bookkeeping recorded on a managed-app upgrade payment.
+///
+/// Serialized into `subscription_payment.metadata`, and read back by
+/// [`AppLineItemHandler::on_payment`] to apply the resize once the payment is
+/// confirmed. The app equivalent of [`UpgradeConfig`] for VMs.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct AppUpgradeConfig {
+    /// Requested size, as a multiple of the catalog app's base footprint.
+    pub new_multiplier: u32,
 }
 
 #[cfg(all(test, feature = "revolut"))]

@@ -1401,6 +1401,96 @@ impl PricingEngine {
             .await
     }
 
+    /// Calculate the prorated cost of resizing a managed app deployment to
+    /// `new_multiplier` times the catalog app's base size.
+    ///
+    /// Mirrors [`Self::calculate_vm_upgrade_cost`]: the customer pays the new
+    /// rate for the time remaining on the current period, minus a discount for
+    /// the time already bought at the old rate. Upgrades buy capacity, not
+    /// time, so the subscription expiry is unchanged.
+    ///
+    /// Increase-only: a multiplier at or below the current one is rejected,
+    /// because PersistentVolumeClaims cannot shrink.
+    pub async fn calculate_app_upgrade_cost(
+        &self,
+        deployment_id: u64,
+        new_multiplier: u32,
+        method: PaymentMethod,
+    ) -> Result<UpgradeCostQuote> {
+        let dep = self.db.get_app_deployment(deployment_id).await?;
+        ensure!(!dep.deleted, "Can't upgrade a deleted deployment");
+
+        let current = dep.resource_multiplier.max(1);
+        ensure!(
+            new_multiplier > current,
+            "Resource multiplier can only be increased (current {current}, requested {new_multiplier})"
+        );
+
+        let line_item = self
+            .db
+            .get_subscription_line_item(dep.subscription_line_item_id)
+            .await?;
+        let subscription = self.db.get_subscription(line_item.subscription_id).await?;
+        let expires = subscription
+            .expires
+            .ok_or_else(|| anyhow!("Deployment subscription has no expiry date"))?;
+        let now = Utc::now();
+        ensure!(expires > now, "Can't upgrade an expired deployment");
+
+        let app = self.db.get_app(dep.app_id).await?;
+        let currency =
+            Currency::from_str(&app.currency).map_err(|_| anyhow!("Invalid app currency"))?;
+
+        // Full-period price at the old and new sizes. The catalog app's price is
+        // per base unit, so a size of N costs N x amount.
+        let old_price = CurrencyAmount::from_u64(currency, app.amount * current as u64);
+        let new_price = CurrencyAmount::from_u64(currency, app.amount * new_multiplier as u64);
+
+        // Prorate both over the time left on the current period.
+        let period_seconds =
+            Self::cost_plan_interval_to_seconds(app.interval_type, app.interval_amount);
+        ensure!(period_seconds > 0, "App has a zero-length billing interval");
+        let seconds_remaining = (expires - now).num_seconds().max(0);
+        let prorate = |full: &CurrencyAmount| {
+            CurrencyAmount::from_u64(
+                full.currency(),
+                (full.value() as f64 / period_seconds as f64 * seconds_remaining as f64) as u64,
+            )
+        };
+
+        let new_cost_until_expire = self
+            .get_amount_and_rate(prorate(&new_price), method)
+            .await?;
+        let discount = self
+            .get_amount_and_rate(prorate(&old_price), method)
+            .await?;
+        let new_renewal = self.get_amount_and_rate(new_price, method).await?;
+        let upgrade = new_cost_until_expire.sub(discount)?;
+
+        // Taxed like any other charge: VAT on the net upgrade amount, and the
+        // processing fee grossed up on net + tax.
+        let company_id = subscription.company_id;
+        let tax = self
+            .determine_tax(dep.user_id, upgrade.amount.value(), company_id)
+            .await?;
+        let processing_fee = self
+            .calculate_processing_fee(
+                company_id,
+                method,
+                upgrade.amount.currency(),
+                upgrade.amount.value() + tax.amount,
+            )
+            .await;
+
+        Ok(UpgradeCostQuote {
+            upgrade,
+            renewal: new_renewal,
+            discount,
+            tax,
+            processing_fee,
+        })
+    }
+
     /// Calculate both the upgrade cost and new renewal cost for a VM
     pub async fn calculate_vm_upgrade_cost(
         &self,
@@ -4058,6 +4148,156 @@ mod tests {
             )
             .await
             .is_ok()
+        );
+        Ok(())
+    }
+
+    /// Seed an app + deployment + subscription for app-upgrade pricing tests.
+    /// The subscription expires exactly `seconds_remaining` from now.
+    async fn setup_app_upgrade_data(db: &MockDb, multiplier: u32, seconds_remaining: i64) {
+        use lnvps_db::{AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus};
+        // The tax determination reads the paying user, so it must exist.
+        db.upsert_user(&[1; 32]).await.expect("seed user");
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                lnvps_db::App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    compose: String::new(),
+                    // EUR 10.00/month at the base size.
+                    amount: 1000,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_amount: 0,
+                    enabled: true,
+                    cpu_milli: 500,
+                    memory_bytes: 1024,
+                    storage_bytes: 4096,
+                    created: Utc::now(),
+                },
+            );
+        }
+        {
+            let mut items = db.subscription_line_items.lock().await;
+            items.insert(
+                1,
+                lnvps_db::SubscriptionLineItem {
+                    id: 1,
+                    subscription_id: 1,
+                    subscription_type: lnvps_db::SubscriptionType::App,
+                    name: "relay".to_string(),
+                    description: None,
+                    amount: 1000 * multiplier as u64,
+                    setup_amount: 0,
+                    configuration: None,
+                },
+            );
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::seconds(seconds_remaining));
+                s.is_setup = true;
+                s.currency = "EUR".to_string();
+            }
+        }
+        {
+            let mut deps = db.app_deployments.lock().await;
+            deps.insert(
+                1,
+                AppDeployment {
+                    id: 1,
+                    user_id: 1,
+                    app_id: 1,
+                    cluster_id: 1,
+                    resource_multiplier: multiplier,
+                    subscription_line_item_id: 1,
+                    name: "d1".to_string(),
+                    namespace: "app-1".to_string(),
+                    hostname: None,
+                    custom_domain: None,
+                    config: None,
+                    desired_state: AppDeploymentDesiredState::Running,
+                    status: AppDeploymentStatus::Running,
+                    status_message: None,
+                    created: Utc::now(),
+                    deleted: false,
+                },
+            );
+        }
+    }
+
+    /// Upgrading charges the new rate for the time remaining, minus a credit
+    /// for that same time already bought at the old rate. With half a 30-day
+    /// month left, going 1x -> 3x costs (3-1) x EUR 10 x 0.5 = EUR 10.
+    #[tokio::test]
+    async fn test_app_upgrade_cost_is_prorated_delta() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        // Half of the 30-day month the pricing engine uses for a Month interval.
+        setup_app_upgrade_data(&db, 1, 15 * 24 * 60 * 60).await;
+
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db_arc, rates, VatClient::new());
+        let quote = pe
+            .calculate_app_upgrade_cost(1, 3, PaymentMethod::Revolut)
+            .await?;
+
+        // Net upgrade = EUR 10.00 (1000 minor units), within rounding.
+        let diff = quote.upgrade.amount.value() as i64 - 1000;
+        assert!(
+            diff.abs() <= 2,
+            "expected ~1000 minor units, got {}",
+            quote.upgrade.amount.value()
+        );
+        // A full period at the new size is 3 x the base price.
+        assert_eq!(quote.renewal.amount.value(), 3000);
+        Ok(())
+    }
+
+    /// Downgrades and no-ops are rejected: PVCs cannot shrink.
+    #[tokio::test]
+    async fn test_app_upgrade_rejects_non_increase() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_app_upgrade_data(&db, 4, 15 * 24 * 60 * 60).await;
+
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db_arc, rates, VatClient::new());
+
+        for requested in [1u32, 3, 4] {
+            assert!(
+                pe.calculate_app_upgrade_cost(1, requested, PaymentMethod::Revolut)
+                    .await
+                    .is_err(),
+                "{requested}x must be rejected from 4x"
+            );
+        }
+        Ok(())
+    }
+
+    /// An expired subscription cannot be upgraded — there is no remaining time
+    /// to prorate, and the deployment is already scaled to zero.
+    #[tokio::test]
+    async fn test_app_upgrade_rejects_expired_subscription() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_app_upgrade_data(&db, 1, -60).await;
+
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db_arc, rates, VatClient::new());
+        assert!(
+            pe.calculate_app_upgrade_cost(1, 2, PaymentMethod::Revolut)
+                .await
+                .is_err()
         );
         Ok(())
     }

@@ -11,10 +11,12 @@
 //! namespace and volumes on the next reconcile — mirroring how a VM is deleted
 //! after its grace period.
 
-use crate::subscription::SubscriptionLineItemHandler;
-use anyhow::Result;
+use crate::subscription::{AppUpgradeConfig, SubscriptionLineItemHandler};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use lnvps_db::{LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment};
+use lnvps_db::{
+    LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
+};
 use log::info;
 use std::sync::Arc;
 
@@ -32,7 +34,65 @@ impl AppLineItemHandler {
 
 #[async_trait]
 impl SubscriptionLineItemHandler for AppLineItemHandler {
-    async fn on_payment(&self, _payment: &SubscriptionPayment) -> Result<()> {
+    async fn on_payment(&self, payment: &SubscriptionPayment) -> Result<()> {
+        // A settled upgrade payment is the point at which a resize becomes
+        // real: apply the paid-for multiplier to the deployment and reprice the
+        // line item, so the operator scales the workload on its next reconcile
+        // and future renewals bill at the new size. Doing this only on payment
+        // means an abandoned upgrade never changes anything.
+        if payment.payment_type == SubscriptionPaymentType::Upgrade {
+            // Every app upgrade payment is created by
+            // `create_app_upgrade_payment`, which always serializes an
+            // `AppUpgradeConfig` into the metadata. Missing or malformed
+            // metadata therefore means the payment record is corrupt — and the
+            // customer has already been charged. Fail loudly: swallowing it
+            // would leave them paid up at the old size with nothing but an
+            // info-level log to show for it.
+            let metadata = payment.metadata.clone().ok_or_else(|| {
+                anyhow!(
+                    "app upgrade payment {} (line item {}) has no metadata; cannot tell what size was paid for",
+                    hex::encode(&payment.id),
+                    self.line_item_id
+                )
+            })?;
+            let cfg: AppUpgradeConfig =
+                serde_json::from_value(metadata.clone()).with_context(|| {
+                    format!(
+                        "app upgrade payment {} (line item {}) has unreadable metadata: {metadata}",
+                        hex::encode(&payment.id),
+                        self.line_item_id
+                    )
+                })?;
+
+            let mut dep = self
+                .db
+                .get_app_deployment_by_line_item(self.line_item_id)
+                .await?;
+            // Increase-only, re-checked here: a replayed or out-of-order
+            // payment must never shrink a deployment (PVCs cannot shrink).
+            if cfg.new_multiplier > dep.resource_multiplier.max(1) {
+                let app = self.db.get_app(dep.app_id).await?;
+                info!(
+                    "App deployment {} upgraded {}x -> {}x (line item {})",
+                    dep.id,
+                    dep.resource_multiplier.max(1),
+                    cfg.new_multiplier,
+                    self.line_item_id
+                );
+                dep.resource_multiplier = cfg.new_multiplier;
+                self.db.update_app_deployment(&dep).await?;
+
+                // Reprice the line item so renewals charge the new size.
+                let mut li = self
+                    .db
+                    .get_subscription_line_item(self.line_item_id)
+                    .await?;
+                li.amount = app.amount * cfg.new_multiplier as u64;
+                self.db.update_subscription_line_item(&li).await?;
+            }
+            return Ok(());
+        }
+
         // The subscription is marked set up by `subscription_payment_paid`; the
         // operator provisions the deployment on its next reconcile. Nothing to
         // do synchronously here.
@@ -117,6 +177,28 @@ mod tests {
         }
     }
 
+    fn mock_app(amount: u64) -> lnvps_db::App {
+        lnvps_db::App {
+            id: 1,
+            name: "relay".to_string(),
+            display_name: "Relay".to_string(),
+            description: None,
+            icon: None,
+            repo_url: None,
+            compose: String::new(),
+            amount,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: lnvps_db::IntervalType::Month,
+            setup_amount: 0,
+            enabled: true,
+            cpu_milli: 500,
+            memory_bytes: 1024,
+            storage_bytes: 4096,
+            created: Utc::now(),
+        }
+    }
+
     fn line_item(id: u64) -> SubscriptionLineItem {
         SubscriptionLineItem {
             id,
@@ -156,6 +238,7 @@ mod tests {
             user_id: 1,
             app_id: 1,
             cluster_id: 1,
+            resource_multiplier: 1,
             subscription_line_item_id: line_item_id,
             name: "inst".to_string(),
             namespace: "app-1".to_string(),
@@ -198,6 +281,106 @@ mod tests {
             .unwrap();
 
         assert!(db.get_app_deployment(id).await.unwrap().deleted);
+    }
+
+    /// A settled upgrade payment applies the paid-for multiplier and reprices
+    /// the line item so renewals bill at the new size.
+    #[tokio::test]
+    async fn upgrade_payment_applies_multiplier_and_reprices() {
+        let db = std::sync::Arc::new(MockDb::default());
+        let id = seed_deployment(&db, 11).await;
+        {
+            // Catalog app priced at 1000/base-unit.
+            let mut apps = db.apps.lock().await;
+            apps.insert(1, mock_app(1000));
+            let mut items = db.subscription_line_items.lock().await;
+            items.insert(11, line_item(11));
+        }
+        let h = AppLineItemHandler::new(db.clone(), 11);
+
+        let mut p = payment();
+        p.payment_type = SubscriptionPaymentType::Upgrade;
+        p.metadata = Some(serde_json::json!({ "new_multiplier": 4 }));
+        h.on_payment(&p).await.unwrap();
+
+        assert_eq!(
+            db.get_app_deployment(id).await.unwrap().resource_multiplier,
+            4
+        );
+        assert_eq!(
+            db.get_subscription_line_item(11).await.unwrap().amount,
+            4000,
+            "line item repriced to app.amount x multiplier"
+        );
+    }
+
+    /// An upgrade payment must never shrink a deployment: PVCs cannot shrink,
+    /// so a replayed or out-of-order payment carrying a smaller multiplier is
+    /// ignored rather than applied.
+    #[tokio::test]
+    async fn upgrade_payment_never_shrinks_deployment() {
+        let db = std::sync::Arc::new(MockDb::default());
+        let id = seed_deployment(&db, 12).await;
+        {
+            let mut deps = db.app_deployments.lock().await;
+            deps.get_mut(&id).unwrap().resource_multiplier = 8;
+            let mut apps = db.apps.lock().await;
+            apps.insert(1, mock_app(1000));
+            let mut items = db.subscription_line_items.lock().await;
+            items.insert(12, line_item(12));
+        }
+        let h = AppLineItemHandler::new(db.clone(), 12);
+
+        let mut p = payment();
+        p.payment_type = SubscriptionPaymentType::Upgrade;
+        p.metadata = Some(serde_json::json!({ "new_multiplier": 2 }));
+        h.on_payment(&p).await.unwrap();
+
+        assert_eq!(
+            db.get_app_deployment(id).await.unwrap().resource_multiplier,
+            8,
+            "a smaller multiplier must be ignored"
+        );
+        assert_eq!(
+            db.get_subscription_line_item(12).await.unwrap().amount,
+            1000,
+            "price must not change either"
+        );
+    }
+
+    /// An upgrade payment always carries an `AppUpgradeConfig` (written by
+    /// `create_app_upgrade_payment`), so missing or malformed metadata means the
+    /// record is corrupt *and the customer has already paid*. That must surface
+    /// as an error rather than silently leaving them at the old size.
+    #[tokio::test]
+    async fn upgrade_payment_with_unusable_metadata_errors() {
+        let db = std::sync::Arc::new(MockDb::default());
+        let id = seed_deployment(&db, 13).await;
+        let h = AppLineItemHandler::new(db.clone(), 13);
+
+        // No metadata at all.
+        let mut p = payment();
+        p.payment_type = SubscriptionPaymentType::Upgrade;
+        p.metadata = None;
+        let err = h
+            .on_payment(&p)
+            .await
+            .expect_err("missing metadata must error");
+        assert!(err.to_string().contains("no metadata"), "{err}");
+
+        // Present, but not an AppUpgradeConfig (e.g. a VM UpgradeConfig).
+        p.metadata = Some(serde_json::json!({ "new_cpu": 4 }));
+        let err = h
+            .on_payment(&p)
+            .await
+            .expect_err("unreadable metadata must error");
+        assert!(err.to_string().contains("unreadable metadata"), "{err}");
+
+        // Either way the deployment is untouched.
+        assert_eq!(
+            db.get_app_deployment(id).await.unwrap().resource_multiplier,
+            1
+        );
     }
 
     /// A missing deployment (already gone) is tolerated, not an error.

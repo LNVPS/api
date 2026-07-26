@@ -213,12 +213,50 @@ pub fn build_network_policy(deployment_id: u64, ingress_namespace: &str) -> Netw
     }
 }
 
+/// Scale a Kubernetes CPU quantity by a deployment's resource multiplier,
+/// e.g. `("500m", 2) -> "1000m"`.
+///
+/// A multiplier of 1 returns the value untouched so base-size deployments keep
+/// rendering byte-identical specs. An unparseable value is also returned as-is:
+/// compose resources are validated when the catalog app is admitted, so this is
+/// unreachable in practice, and silently keeping the base size is safer than
+/// failing a reconcile.
+fn scale_cpu(cpu: &str, multiplier: u32) -> String {
+    if multiplier <= 1 {
+        return cpu.to_string();
+    }
+    match lnvps_compose::parse_cpu_milli(cpu) {
+        Ok(m) => format!("{}m", m * multiplier as u64),
+        Err(_) => cpu.to_string(),
+    }
+}
+
+/// Scale a Kubernetes byte quantity (memory or storage) by a deployment's
+/// resource multiplier, e.g. `("1Gi", 2) -> "2147483648"`. Same passthrough
+/// rules as [`scale_cpu`].
+fn scale_bytes(value: &str, multiplier: u32) -> String {
+    if multiplier <= 1 {
+        return value.to_string();
+    }
+    match lnvps_compose::parse_bytes(value) {
+        Ok(b) => (b * multiplier as u64).to_string(),
+        Err(_) => value.to_string(),
+    }
+}
+
 /// Container requests == limits (Guaranteed QoS, 1:1 — no overcommit) from a
-/// compose service's `resources`.
-fn build_resource_requirements(r: &lnvps_compose::Resources) -> ResourceRequirements {
+/// compose service's `resources`, scaled by the deployment's resource
+/// multiplier (1 = the catalog app's base size).
+fn build_resource_requirements(
+    r: &lnvps_compose::Resources,
+    multiplier: u32,
+) -> ResourceRequirements {
     let map = BTreeMap::from([
-        ("cpu".to_string(), Quantity(r.cpu.clone())),
-        ("memory".to_string(), Quantity(r.memory.clone())),
+        ("cpu".to_string(), Quantity(scale_cpu(&r.cpu, multiplier))),
+        (
+            "memory".to_string(),
+            Quantity(scale_bytes(&r.memory, multiplier)),
+        ),
     ]);
     ResourceRequirements {
         requests: Some(map.clone()),
@@ -315,8 +353,12 @@ pub fn build_pvc(
     service: &str,
     name: &str,
     size: &str,
+    multiplier: u32,
 ) -> PersistentVolumeClaim {
-    let requests = BTreeMap::from([("storage".to_string(), Quantity(size.to_string()))]);
+    let requests = BTreeMap::from([(
+        "storage".to_string(),
+        Quantity(scale_bytes(size, multiplier)),
+    )]);
     PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(format!("{service}-{name}")),
@@ -446,6 +488,8 @@ pub fn build_service(
 /// stopped. Mounts PVCs (read-write) and file ConfigMap/Secret (read-only via
 /// `subPath`). Uses the `Recreate` strategy so a single RWO PVC is released
 /// before a new pod starts.
+///
+/// `multiplier` scales the container's CPU/memory limits (1 = base app size).
 pub fn build_deployment(
     deployment_id: u64,
     service_name: &str,
@@ -453,6 +497,7 @@ pub fn build_deployment(
     env: &BTreeMap<String, String>,
     files: &[ResolvedFile],
     replicas: i32,
+    multiplier: u32,
 ) -> Deployment {
     let sel = service_labels(deployment_id, service_name);
 
@@ -548,7 +593,7 @@ pub fn build_deployment(
             !svc.runs_as_root(),
             svc.run_as_user(),
         )),
-        resources: Some(build_resource_requirements(&svc.resources)),
+        resources: Some(build_resource_requirements(&svc.resources, multiplier)),
         ..Default::default()
     };
 
@@ -1033,11 +1078,14 @@ async fn reconcile_one(
         );
     }
     let replicas = if gate == GateReason::Running { 1 } else { 0 };
+    // Size of this deployment as a multiple of the catalog app's footprint.
+    // Legacy rows (pre-multiplier) decode as 0, so clamp to the base size.
+    let multiplier = deployment.resource_multiplier.max(1);
 
     // 4. Per service: PVCs, file ConfigMap/Secret, Service, Deployment.
     for (sname, svc) in &compose.services {
         for v in &svc.volumes {
-            apply(client, &build_pvc(id, sname, &v.name, &v.size)).await?;
+            apply(client, &build_pvc(id, sname, &v.name, &v.size, multiplier)).await?;
         }
         let sfiles = files.get(sname).cloned().unwrap_or_default();
         if let Some(cm) = build_files_configmap(id, sname, &sfiles) {
@@ -1057,7 +1105,7 @@ async fn reconcile_one(
             .collect();
         apply(
             client,
-            &build_deployment(id, sname, svc, &svc_env, &sfiles, replicas),
+            &build_deployment(id, sname, svc, &svc_env, &sfiles, replicas, multiplier),
         )
         .await?;
     }
@@ -1081,6 +1129,9 @@ async fn reconcile_one(
     // 6. Remove any leftover ResourceQuota. Namespaces are deliberately not
     // quota'd - see delete_resource_quota for why - but ones provisioned
     // before that change still have the object, which blocks PVC growth.
+    // Nothing here scales with `multiplier`: the deployment's size is enforced
+    // by the per-container limits and PVC sizes written above, not by a
+    // namespace cap.
     delete_resource_quota(client, id).await?;
 
     // 7. Status write-back: record the hostname and running state. When the
@@ -1214,7 +1265,7 @@ config:
     fn root_service_omits_run_as_non_root() {
         let root = Compose::parse("services:\n  db:\n    image: mariadb:11\n    user: root\n")
             .unwrap();
-        let d = build_deployment(7, "db", &root.services["db"], &BTreeMap::new(), &[], 1);
+        let d = build_deployment(7, "db", &root.services["db"], &BTreeMap::new(), &[], 1, 1);
         let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let sc = ctr.security_context.as_ref().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
@@ -1228,7 +1279,15 @@ config:
 
         // Default (no user:) stays runAsNonRoot.
         let plain = Compose::parse("services:\n  app:\n    image: x\n").unwrap();
-        let d = build_deployment(7, "app", &plain.services["app"], &BTreeMap::new(), &[], 1);
+        let d = build_deployment(
+            7,
+            "app",
+            &plain.services["app"],
+            &BTreeMap::new(),
+            &[],
+            1,
+            1,
+        );
         let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
         assert_eq!(
             ctr.security_context.as_ref().unwrap().run_as_non_root,
@@ -1249,7 +1308,7 @@ config:
             "services:\n  haven:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: db, path: /app/db, size: 10Gi }\n",
         )
         .unwrap();
-        let d = build_deployment(7, "haven", &c.services["haven"], &BTreeMap::new(), &[], 1);
+        let d = build_deployment(7, "haven", &c.services["haven"], &BTreeMap::new(), &[], 1, 1);
         let pod = d.spec.unwrap().template.spec.unwrap();
 
         let ctr = &pod.containers[0];
@@ -1267,7 +1326,7 @@ config:
         // Services without a numeric user keep the previous behaviour: no
         // runAsUser, no fsGroup (their image's USER is already numeric).
         let plain = Compose::parse("services:\n  app:\n    image: x\n").unwrap();
-        let d = build_deployment(7, "app", &plain.services["app"], &BTreeMap::new(), &[], 1);
+        let d = build_deployment(7, "app", &plain.services["app"], &BTreeMap::new(), &[], 1, 1);
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(
             pod.containers[0]
@@ -1323,8 +1382,55 @@ config:
     }
 
     #[test]
+    fn multiplier_scales_cpu_memory_and_storage() {
+        // A resource multiplier of N runs the app at N times its base size:
+        // every container's CPU/memory limits and every PVC scale together.
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n    resources: { cpu: \"500m\", memory: 1Gi }\n",
+        )
+        .unwrap();
+        let d = build_deployment(7, "a", &c.services["a"], &BTreeMap::new(), &[], 1, 3);
+        let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
+        let limits = ctr.resources.as_ref().unwrap().limits.as_ref().unwrap();
+        assert_eq!(limits.get("cpu").unwrap().0, "1500m");
+        assert_eq!(
+            limits.get("memory").unwrap().0,
+            (3u64 * 1024 * 1024 * 1024).to_string()
+        );
+
+        let pvc = build_pvc(7, "a", "data", "10Gi", 3);
+        assert_eq!(
+            pvc.spec
+                .unwrap()
+                .resources
+                .unwrap()
+                .requests
+                .unwrap()
+                .get("storage")
+                .unwrap()
+                .0,
+            (30u64 * 1024 * 1024 * 1024).to_string()
+        );
+    }
+
+    #[test]
+    fn multiplier_of_one_leaves_quantities_untouched() {
+        // Base-size deployments must render byte-identical specs, so upgrading
+        // the operator does not churn every existing deployment.
+        assert_eq!(scale_cpu("500m", 1), "500m");
+        assert_eq!(scale_bytes("1Gi", 1), "1Gi");
+        // 0 is what a pre-migration row decodes to; treat it as the base size.
+        assert_eq!(scale_cpu("500m", 0), "500m");
+        assert_eq!(scale_bytes("1Gi", 0), "1Gi");
+        // An unparseable quantity is passed through rather than failing the
+        // reconcile (compose values are validated at catalog admission).
+        assert_eq!(scale_cpu("not-a-cpu", 4), "not-a-cpu");
+        assert_eq!(scale_bytes("not-bytes", 4), "not-bytes");
+    }
+
+    #[test]
     fn pvc_is_rwo_with_size() {
-        let pvc = build_pvc(7, "mariadb", "db", "5Gi");
+        let pvc = build_pvc(7, "mariadb", "db", "5Gi", 1);
         assert_eq!(pvc.metadata.name.as_deref(), Some("mariadb-db"));
         let spec = pvc.spec.unwrap();
         assert_eq!(spec.access_modes, Some(vec!["ReadWriteOnce".to_string()]));
@@ -1367,7 +1473,7 @@ config:
             },
         ];
         let env = BTreeMap::from([("PUBLIC_URL".to_string(), "https://h".to_string())]);
-        let d = build_deployment(7, "web", &c.services["web"], &env, &files, 1);
+        let d = build_deployment(7, "web", &c.services["web"], &env, &files, 1, 1);
         let spec = d.spec.unwrap();
         assert_eq!(spec.replicas, Some(1));
         assert_eq!(spec.strategy.unwrap().type_.as_deref(), Some("Recreate"));
@@ -1411,7 +1517,7 @@ config:
     #[test]
     fn stopped_deployment_has_zero_replicas() {
         let c = compose();
-        let d = build_deployment(7, "web", &c.services["web"], &BTreeMap::new(), &[], 0);
+        let d = build_deployment(7, "web", &c.services["web"], &BTreeMap::new(), &[], 0, 1);
         assert_eq!(d.spec.unwrap().replicas, Some(0));
     }
 
@@ -1618,7 +1724,7 @@ config:
         // ── web service (ingress, files: ConfigMap + Secret, env with vars) ──
         let web_env = to_bt(&env["web"]);
         let web_files = files["web"].clone();
-        let web = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 1);
+        let web = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 1, 1);
         let pod = web.spec.unwrap().template.spec.unwrap();
         let ctr = &pod.containers[0];
         assert_eq!(ctr.image.as_deref(), Some("example/web:latest"));
@@ -1690,7 +1796,7 @@ config:
         // ── mariadb service (no ports, PVC, secret injected into env) ──
         let db_env = to_bt(&env["mariadb"]);
         assert_eq!(db_env["MARIADB_PASSWORD"], pw);
-        let db = build_deployment(id, "mariadb", &c.services["mariadb"], &db_env, &[], 1);
+        let db = build_deployment(id, "mariadb", &c.services["mariadb"], &db_env, &[], 1, 1);
         let db_pod = db.spec.unwrap().template.spec.unwrap();
         let vm = db_pod.containers[0]
             .volume_mounts
@@ -1704,14 +1810,14 @@ config:
         assert!(build_service(id, "mariadb", &c.services["mariadb"]).is_none());
         // PVC uses the declared size.
         let vol = &c.services["mariadb"].volumes[0];
-        let pvc = build_pvc(id, "mariadb", &vol.name, &vol.size);
+        let pvc = build_pvc(id, "mariadb", &vol.name, &vol.size, 1);
         assert_eq!(
             pvc.spec.unwrap().resources.unwrap().requests.unwrap()["storage"].0,
             "5Gi"
         );
 
         // ── lifecycle: stopped ⇒ 0 replicas (data-preserving) ──
-        let stopped = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 0);
+        let stopped = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 0, 1);
         assert_eq!(stopped.spec.unwrap().replicas, Some(0));
     }
 
@@ -1815,7 +1921,7 @@ config:
                         f.path
                     );
                 }
-                let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1);
+                let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1, 1);
                 let image = dep.spec.unwrap().template.spec.unwrap().containers[0]
                     .image
                     .clone();
@@ -1826,7 +1932,7 @@ config:
                     "{name}/{sname}: service presence tracks declared ports"
                 );
                 for v in &svc.volumes {
-                    assert!(build_pvc(id, sname, &v.name, &v.size).spec.is_some());
+                    assert!(build_pvc(id, sname, &v.name, &v.size, 1).spec.is_some());
                 }
                 let _ = build_files_configmap(id, sname, &sfiles);
                 let _ = build_secret(id, sname, &BTreeMap::new(), &sfiles);

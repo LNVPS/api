@@ -3808,13 +3808,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO app_deployment (user_id, app_id, cluster_id, subscription_line_item_id, \
+            "INSERT INTO app_deployment (user_id, app_id, cluster_id, resource_multiplier, subscription_line_item_id, \
              name, namespace, hostname, custom_domain, config, desired_state, status, status_message) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(deployment.user_id)
         .bind(deployment.app_id)
         .bind(deployment.cluster_id)
+        .bind(deployment.resource_multiplier.max(1))
         .bind(deployment.subscription_line_item_id)
         .bind(&deployment.name)
         .bind(&deployment.namespace)
@@ -3832,7 +3833,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()> {
         sqlx::query(
             "UPDATE app_deployment SET name = ?, namespace = ?, hostname = ?, custom_domain = ?, config = ?, \
-             desired_state = ?, status = ?, status_message = ?, deleted = ? WHERE id = ?",
+             desired_state = ?, status = ?, status_message = ?, resource_multiplier = ?, deleted = ? WHERE id = ?",
         )
         .bind(&deployment.name)
         .bind(&deployment.namespace)
@@ -3842,6 +3843,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(deployment.desired_state)
         .bind(deployment.status)
         .bind(&deployment.status_message)
+        .bind(deployment.resource_multiplier.max(1))
         .bind(deployment.deleted)
         .bind(deployment.id)
         .execute(&self.db)

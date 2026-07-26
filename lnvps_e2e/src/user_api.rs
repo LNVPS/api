@@ -1044,6 +1044,55 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
+        // Resource multiplier: a fresh deployment is base size, and the
+        // effective footprint is reported alongside it.
+        assert_eq!(dep["resource_multiplier"].as_u64(), Some(1));
+        assert!(dep["cpu_milli"].as_u64().is_some());
+
+        // Upgrades are increase-only and bounded, enforced before any pricing.
+        for bad in [1u64, 0, 1000] {
+            let resp = client
+                .post_auth(
+                    &format!("/api/v1/app-deployments/{dep_id}/upgrade-quote"),
+                    &serde_json::json!({ "resource_multiplier": bad }),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "multiplier {bad} must be rejected"
+            );
+        }
+
+        // A valid increase quotes a prorated cost without charging anything;
+        // an unpaid subscription has no expiry to prorate against, so a 4xx
+        // here is also acceptable. What must not happen is a 5xx.
+        let resp = client
+            .post_auth(
+                &format!("/api/v1/app-deployments/{dep_id}/upgrade-quote"),
+                &serde_json::json!({ "resource_multiplier": 2 }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success() || resp.status().is_client_error(),
+            "upgrade quote should not 5xx, got {}",
+            resp.status()
+        );
+
+        // The deployment must not have been resized by quoting alone.
+        let resp = client
+            .get_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["resource_multiplier"].as_u64(),
+            Some(1),
+            "a quote must never resize the deployment"
+        );
+
         pool.close().await;
     }
 
@@ -1246,7 +1295,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "custom_domain set should succeed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "custom_domain set should succeed"
+        );
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(
             body["data"]["custom_domain"].as_str().unwrap(),
@@ -1262,7 +1315,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_ne!(resp.status(), StatusCode::OK, "invalid domain {bad} rejected");
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "invalid domain {bad} rejected"
+            );
         }
         // Clearing with empty string removes it.
         let resp = client
@@ -1272,7 +1329,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "custom_domain clear should succeed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "custom_domain clear should succeed"
+        );
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert!(body["data"]["custom_domain"].is_null(), "cleared -> null");
         let _ = client
