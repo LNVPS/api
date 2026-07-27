@@ -105,7 +105,8 @@ pub fn build_namespace(deployment_id: u64) -> Namespace {
 /// dangerous pods (privileged, host namespaces/ports/PID/IPC, hostPath) but
 /// does not force `runAsNonRoot`, so a curated image that starts as root and
 /// drops privileges itself can be admitted. The per-container SecurityContext
-/// (no privilege escalation, drop ALL caps, read-only root fs) still applies.
+/// (no privilege escalation, read-only root fs, `drop: ALL` plus only
+/// [`ROOT_ENTRYPOINT_CAPABILITIES`]) still applies.
 pub fn build_namespace_baseline(deployment_id: u64) -> Namespace {
     build_namespace_with_level(deployment_id, "baseline")
 }
@@ -316,6 +317,23 @@ fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
     }
 }
 
+/// The capabilities a "start as root, then drop privileges" entrypoint needs
+/// after `drop: ALL` (issue #263).
+///
+/// `SETGID`/`SETUID` are what `gosu`/`su-exec` costs when the entrypoint drops
+/// to its service account — the first thing that fails today, with mariadb's
+/// `error: failed switching to 'mysql': operation not permitted`.
+/// `CHOWN`/`DAC_OVERRIDE`/`FOWNER` are what the `chown -R` of a freshly
+/// provisioned, root-owned data directory costs, which is the step after it.
+/// Dropping to a lower UID is not privilege escalation, so
+/// `allowPrivilegeEscalation: false` stays set.
+///
+/// All five are on the **baseline** PSS allow-list, which is the standard a
+/// deployment containing a root service already runs under
+/// ([`build_namespace_baseline`]).
+const ROOT_ENTRYPOINT_CAPABILITIES: [&str; 5] =
+    ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+
 /// A locked-down container security context: no privilege escalation, all
 /// capabilities dropped, read-only root filesystem.
 ///
@@ -323,6 +341,18 @@ fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
 /// only when the catalog compose service opts in via `user: root` — for images
 /// whose entrypoint must *start* as root and drop privileges itself (mariadb,
 /// postgres, redis). The other restrictions stay in force either way.
+///
+/// A root service additionally gets [`ROOT_ENTRYPOINT_CAPABILITIES`] added back
+/// on top of `drop: ALL`. Without them `user: root` is a trap: the container
+/// starts as uid 0 with an empty capability set, so the entrypoint's first
+/// privileged step — dropping to its own service account, then chowning the
+/// data directory — fails with `EPERM` and the platform bug reads as an app
+/// bug. Non-root services keep `drop: ALL` with nothing added, which is what
+/// the restricted PSS requires.
+///
+/// This is necessary but not sufficient for a database service: the read-only
+/// root filesystem then denies it a writable `/tmp` and runtime directory
+/// (#264).
 ///
 /// `run_as_user` is set from a numeric compose `user:`. It is required for
 /// images whose Dockerfile `USER` is a name (e.g. `USER nonroot`): the kubelet
@@ -341,7 +371,16 @@ fn container_security_context_for(
         run_as_user,
         capabilities: Some(Capabilities {
             drop: Some(vec!["ALL".to_string()]),
-            ..Default::default()
+            add: if run_as_non_root {
+                None
+            } else {
+                Some(
+                    ROOT_ENTRYPOINT_CAPABILITIES
+                        .iter()
+                        .map(|c| c.to_string())
+                        .collect(),
+                )
+            },
         }),
         ..Default::default()
     }
@@ -1402,8 +1441,9 @@ config:
         );
     }
 
-    /// A `user: root` service omits runAsNonRoot on its container; a normal
-    /// service keeps it (default-deny hardening).
+    /// A `user: root` service omits runAsNonRoot on its container and gets the
+    /// root-entrypoint capabilities back on top of `drop: ALL` (#263); a normal
+    /// service keeps runAsNonRoot and adds nothing (default-deny hardening).
     #[test]
     fn root_service_omits_run_as_non_root() {
         let root =
@@ -1424,12 +1464,21 @@ config:
         // The rest of the lockdown still applies.
         assert_eq!(sc.allow_privilege_escalation, Some(false));
         assert_eq!(sc.read_only_root_filesystem, Some(true));
+        let caps = sc.capabilities.as_ref().unwrap();
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]));
+        // Dropped to nothing, then handed back exactly the five a
+        // start-as-root-and-drop entrypoint needs — no more (#263).
         assert_eq!(
-            sc.capabilities.as_ref().unwrap().drop,
-            Some(vec!["ALL".to_string()])
+            caps.add,
+            Some(
+                ROOT_ENTRYPOINT_CAPABILITIES
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+            )
         );
 
-        // Default (no user:) stays runAsNonRoot.
+        // Default (no user:) stays runAsNonRoot with nothing added back.
         let plain = Compose::parse("services:\n  app:\n    image: x\n").unwrap();
         let d = build_deployment(
             7,
@@ -1442,10 +1491,50 @@ config:
             &[],
         );
         let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
-        assert_eq!(
-            ctr.security_context.as_ref().unwrap().run_as_non_root,
-            Some(true)
-        );
+        let sc = ctr.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(true));
+        let caps = sc.capabilities.as_ref().unwrap();
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(caps.add, None);
+    }
+
+    /// The same branch applies to `init:` steps, which share
+    /// [`container_security_context_for`]: a root init step that chowns a
+    /// volume before the service starts needs the same capabilities, and a
+    /// non-root one must not get them (#263).
+    #[test]
+    fn root_init_step_gets_capabilities() {
+        let c = Compose::parse(
+            "services:\n  db:\n    image: mariadb:11\n    user: root\n    volumes:\n      - { name: data, path: /var/lib/mysql, size: 1Gi }\n    init:\n      - name: fix-perms\n        image: busybox\n        user: root\n        command: [\"chown\", \"-R\", \"999:999\", \"/var/lib/mysql\"]\n      - name: check\n        image: busybox\n        user: \"1000\"\n        command: [\"true\"]\n",
+        )
+        .unwrap();
+        let init = c.resolve_init(&std::collections::HashMap::new()).unwrap();
+        let steps = &init["db"];
+        assert_eq!(steps.len(), 2);
+
+        let root = build_init_container(&steps[0], &[]);
+        let caps = root
+            .security_context
+            .as_ref()
+            .unwrap()
+            .capabilities
+            .clone()
+            .unwrap();
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]));
+        for cap in ROOT_ENTRYPOINT_CAPABILITIES {
+            assert!(caps.add.as_ref().unwrap().iter().any(|c| c == cap));
+        }
+
+        let nonroot = build_init_container(&steps[1], &[]);
+        let caps = nonroot
+            .security_context
+            .as_ref()
+            .unwrap()
+            .capabilities
+            .clone()
+            .unwrap();
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(caps.add, None);
     }
 
     /// Regression: an image whose Dockerfile `USER` is a *name* (e.g. haven's
@@ -2264,6 +2353,29 @@ config:
                      `docker inspect -f '{{{{.Config.User}}}}'`), or `user: root` if the \
                      entrypoint genuinely needs it"
                 );
+                // ...and a service that *did* opt into root must get the
+                // capabilities a root entrypoint actually needs (#263).
+                // `user: root` only satisfies the kubelet; without these the
+                // container starts as uid 0 with an empty capability set and
+                // dies on its first `chown`, which looks like an app bug.
+                if svc.runs_as_root() {
+                    let add = sc
+                        .capabilities
+                        .as_ref()
+                        .and_then(|c| c.add.as_ref())
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{name}/{sname}: `user: root` with no added capabilities — a \
+                                 root entrypoint cannot chown its data directory"
+                            )
+                        });
+                    for cap in ROOT_ENTRYPOINT_CAPABILITIES {
+                        assert!(
+                            add.iter().any(|c| c == cap),
+                            "{name}/{sname}: missing {cap}"
+                        );
+                    }
+                }
                 if let Some(uid) = sc.run_as_user {
                     // fsGroup follows runAsUser, otherwise a fresh PVC stays
                     // root-owned 0755 and the process cannot write its data.
